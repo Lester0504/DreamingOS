@@ -1,0 +1,169 @@
+.dwrt-sampled-glass {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  border-radius: var(--sampled-glass-radius, 32px);
+}
+
+.dwrt-sampled-glass-media {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+  opacity: 1;
+  visibility: visible;
+  transform: translateZ(0);
+  transition: opacity 120ms ease-out;
+  will-change: opacity;
+}
+
+/* Updating an SVG image inside a multi-stage filter on every wheel frame forces
+   Chromium/Safari to rasterize the refraction repeatedly. While a scroll gesture
+   is active, keep the last sampled frame and use the same optical tokens through
+   one compositor-friendly backdrop pass. Idle time then re-aligns the SVG. */
+.dwrt-sampled-glass-scroll-fallback {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  -webkit-backdrop-filter:
+    blur(var(--sampled-glass-base-blur, 3.2px))
+    saturate(var(--sampled-glass-saturation, 140%));
+  backdrop-filter:
+    blur(var(--sampled-glass-base-blur, 3.2px))
+    saturate(var(--sampled-glass-saturation, 140%));
+  transition:
+    opacity 120ms ease-out,
+    visibility 0s linear 120ms;
+}
+
+.dwrt-sampled-glass.is-scroll-tracking .dwrt-sampled-glass-media {
+  opacity: 0;
+  visibility: hidden;
+  transition: none;
+}
+
+.dwrt-sampled-glass.is-scroll-tracking .dwrt-sampled-glass-scroll-fallback {
+  opacity: 1;
+  visibility: visible;
+  transition: none;
+}
+
+.dwrt-sampled-glass.is-scroll-revealing .dwrt-sampled-glass-media {
+  opacity: 1;
+  visibility: visible;
+}
+
+.dwrt-sampled-glass.is-scroll-revealing .dwrt-sampled-glass-scroll-fallback {
+  opacity: 0;
+  visibility: visible;
+}
+
+.dwrt-sampled-glass-source {
+  pointer-events: none;
+}
+
+.dwrt-sampled-glass-absorption {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: inherit;
+  background: rgb(var(--sampled-glass-neutral-color, 10 16 25) / var(--sampled-glass-neutral-density, 0.06));
+  pointer-events: none;
+}
+
+.dwrt-sampled-glass-rim {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  padding: max(1px, var(--sampled-glass-border-width, 1px));
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(
+    var(--sampled-glass-highlight-angle, 135deg),
+    transparent 0%,
+    rgb(255 255 255 / calc(0.08 + var(--sampled-glass-highlight, 0.28) * 0.22)) 34%,
+    rgb(255 255 255 / calc(0.20 + var(--sampled-glass-highlight, 0.28) * 0.48)) 66%,
+    transparent 100%
+  );
+  box-shadow:
+    inset 0 0 0 0.5px var(--sampled-glass-border-color, rgba(255, 255, 255, 0.22)),
+    inset 0 1px 3px rgb(255 255 255 / 0.20),
+    0 1px 4px rgb(0 0 0 / 0.24);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+}
+
+.dwrt-sampled-glass-rim.is-screen {
+  opacity: 0.34;
+  mix-blend-mode: screen;
+}
+
+.dwrt-sampled-glass-rim.is-overlay {
+  mix-blend-mode: overlay;
+}
+
+.dwrt-sampled-glass-content {
+  position: relative;
+  z-index: 3;
+  width: 100%;
+  min-width: 0;
+  filter: none;
+}
+
+.dwrt-sampled-glass-content-layer {
+  z-index: 3;
+  filter: none;
+}
+
+.dwrt-sampled-glass-content-layer.is-static {
+  position: relative;
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .dwrt-sampled-glass {
+    background: rgba(22, 24, 36, 0.94) !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+
+  .dwrt-sampled-glass-media {
+    display: none;
+  }
+
+  .dwrt-sampled-glass-scroll-fallback {
+    display: none;
+  }
+
+  .dwrt-sampled-glass-absorption {
+    display: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .dwrt-sampled-glass {
+    border: 1px solid ButtonText !important;
+    background: Canvas !important;
+    box-shadow: none !important;
+  }
+
+  .dwrt-sampled-glass-media,
+  .dwrt-sampled-glass-scroll-fallback,
+  .dwrt-sampled-glass-absorption,
+  .dwrt-sampled-glass-rim {
+    display: none !important;
+  }
+
+  .dwrt-sampled-glass-content {
+    color: CanvasText;
+    text-shadow: none;
+  }
+}

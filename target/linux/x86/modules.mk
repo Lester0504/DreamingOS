@@ -5,7 +5,7 @@
 define KernelPackage/amd-xgbe
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=AMD Ethernet on SoC support
-  DEPENDS:=@PCI_SUPPORT @TARGET_x86_64 +kmod-ptp +kmod-libphy +kmod-mdio-devres
+  DEPENDS:=@PCI_SUPPORT @TARGET_x86_64 +kmod-ptp +kmod-libphy +kmod-mdio-devres +kmod-net-selftests
   KCONFIG:= \
 	CONFIG_AMD_XGBE \
 	CONFIG_AMD_XGBE_DCB=y
@@ -183,8 +183,8 @@ define KernelPackage/itco-wdt
 	CONFIG_ITCO_VENDOR_SUPPORT=y \
 	CONFIG_WATCHDOG_CORE=y
   FILES:=$(LINUX_DIR)/drivers/watchdog/iTCO_wdt.ko \
-         $(LINUX_DIR)/drivers/watchdog/iTCO_vendor_support.ko
-  AUTOLOAD:=$(call AutoLoad,50,iTCO_vendor_support iTCO_wdt,1)
+         
+  AUTOLOAD:=$(call AutoLoad,50, iTCO_wdt,1)
 endef
 
 define KernelPackage/itco-wdt/description

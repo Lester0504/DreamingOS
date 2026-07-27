@@ -1,0 +1,18 @@
+--- a/include/osdep_service_linux.h
++++ b/include/osdep_service_linux.h
+@@ -58,1 +58,15 @@
+ #include <linux/vmalloc.h>
++#include <linux/string.h>
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
++static inline char *rtw_legacy_strncpy(char *dst, const char *src, size_t count)
++{
++	size_t len = strnlen(src, count);
++
++	memcpy(dst, src, len);
++	if (len < count)
++		memset(dst + len, 0, count - len);
++	return dst;
++}
++#define strncpy rtw_legacy_strncpy
++#endif

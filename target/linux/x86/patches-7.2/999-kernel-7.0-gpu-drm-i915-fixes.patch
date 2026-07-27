@@ -1,0 +1,12 @@
+Index: linux-7.0-rc1/drivers/gpu/drm/i915/display/intel_vblank.c
+===================================================================
+--- linux-7.0-rc1.orig/drivers/gpu/drm/i915/display/intel_vblank.c
++++ linux-7.0-rc1/drivers/gpu/drm/i915/display/intel_vblank.c
+@@ -8,6 +8,7 @@
+ #include <drm/drm_print.h>
+ #include <drm/drm_vblank.h>
+ 
++#include "i915_drv.h"
+ #include "intel_color.h"
+ #include "intel_crtc.h"
+ #include "intel_de.h"

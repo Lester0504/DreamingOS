@@ -1,0 +1,671 @@
+.console-stage.is-multicast-service {
+  box-sizing: border-box;
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+  padding: var(--app-page-gutter-block, 12px) var(--app-page-gutter-inline, 16px);
+  overflow: hidden;
+}
+
+.console-stage.is-multicast-service .stage-header {
+  display: none;
+}
+
+.console-stage.is-multicast-service .route-preview.multicast-service-route-host {
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.multicast-service-route-host,
+.multicast-service-route-host * {
+  box-sizing: border-box;
+}
+
+.multicast-service-shell {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  color: var(--color-text-primary, var(--app-text));
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+}
+
+.multicast-page-header {
+  flex: 0 0 auto;
+  min-width: 0;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.multicast-tabs {
+  flex: 1 1 auto;
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+  min-height: 52px;
+  justify-content: flex-start;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: none;
+}
+
+.multicast-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.multicast-tabs .dwrt-kit-tab {
+  flex: 0 0 auto;
+  min-width: max-content;
+  height: 42px;
+  padding-inline: 16px;
+  white-space: nowrap;
+}
+
+.multicast-refresh {
+  flex: 0 0 auto;
+  min-height: 40px;
+  white-space: nowrap;
+}
+
+.multicast-refresh svg,
+.multicast-section-heading button svg {
+  width: 18px;
+  height: 18px;
+}
+
+.multicast-service-main {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.multicast-notice {
+  flex: 0 0 auto;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 16%, transparent));
+  border-radius: 6px;
+  padding: 9px 12px;
+  color: var(--color-text-primary, var(--app-text));
+  background: var(--color-surface-dense, color-mix(in srgb, var(--app-text) 6%, transparent));
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.multicast-notice.is-error {
+  border-color: color-mix(in srgb, var(--color-danger) 48%, transparent);
+  color: var(--color-danger);
+}
+
+.multicast-settings-surface {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  overflow: hidden;
+  border: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 14%, transparent));
+  border-radius: 8px;
+}
+
+.multicast-surface-header {
+  min-width: 0;
+  min-height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 10%, transparent));
+}
+
+.multicast-surface-header > span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.multicast-surface-header strong {
+  color: var(--color-text-primary, var(--app-text));
+  font-size: 16px;
+  font-weight: 740;
+  line-height: 1.35;
+}
+
+.multicast-surface-header small {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.multicast-surface-header > .dwrt-kit-status {
+  flex: 0 0 auto;
+}
+
+.multicast-surface-body {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+}
+
+.multicast-capability {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 10px 18px;
+  border-bottom: 1px solid color-mix(in srgb, var(--color-warning) 30%, transparent);
+  color: var(--color-text-primary, var(--app-text));
+  background: color-mix(in srgb, var(--color-warning) 7%, transparent);
+}
+
+.multicast-capability > svg {
+  width: 18px;
+  height: 18px;
+  color: var(--color-warning);
+}
+
+.multicast-capability > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.multicast-capability strong {
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.multicast-capability small {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.multicast-runtime-summary {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 10%, transparent));
+}
+
+.multicast-runtime-summary > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  padding: 2px 14px;
+}
+
+.multicast-runtime-summary > div:first-child {
+  padding-left: 0;
+}
+
+.multicast-runtime-summary > div + div {
+  border-left: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 9%, transparent));
+}
+
+.multicast-runtime-summary dt {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.multicast-runtime-summary dd {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--color-text-primary, var(--app-text));
+  font-size: 14px;
+  font-weight: 740;
+  line-height: 1.35;
+}
+
+.multicast-runtime-summary dd small {
+  overflow: hidden;
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 10px;
+  font-weight: 520;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.multicast-dependency {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  padding: 0 18px;
+}
+
+.multicast-dependency + .multicast-dependency,
+.multicast-inline-table {
+  border-top: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 10%, transparent));
+}
+
+.multicast-master-switch {
+  min-width: 0;
+  min-height: 58px;
+  padding: 10px 0;
+}
+
+.multicast-master-switch > span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.multicast-master-switch strong {
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.multicast-master-switch small {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.multicast-dependency-fields {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  gap: 14px;
+  margin: 0 0 16px 20px;
+  padding: 4px 0 0 20px;
+}
+
+.multicast-dependency-fields::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 2px;
+  border-radius: 999px;
+  background: var(--color-accent, var(--app-accent));
+  opacity: 0.62;
+}
+
+.multicast-dependency.is-inactive > .multicast-dependency-fields {
+  display: none;
+}
+
+.multicast-field-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 16px;
+}
+
+.multicast-field-grid > .is-wide {
+  grid-column: 1 / -1;
+}
+
+.multicast-field-grid select,
+.multicast-inline-table :is(input:not([type="checkbox"]), select) {
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  border: 1px solid var(--color-border-control, color-mix(in srgb, var(--app-text) 18%, transparent));
+  border-radius: 6px;
+  padding: 7px 10px;
+  color: var(--color-text-primary, var(--app-text));
+  background: var(--color-surface-control, color-mix(in srgb, var(--app-text) 5%, transparent));
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  letter-spacing: 0;
+}
+
+.multicast-multiselect {
+  min-width: 0;
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+
+.multicast-multiselect > legend {
+  margin-bottom: 8px;
+  padding: 0;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.multicast-multiselect > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.multicast-multiselect > div > label {
+  min-width: 0;
+  min-height: 44px;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--color-border-control, color-mix(in srgb, var(--app-text) 16%, transparent));
+  border-radius: 6px;
+  padding: 6px 10px;
+  background: var(--color-surface-control, color-mix(in srgb, var(--app-text) 4%, transparent));
+  cursor: pointer;
+}
+
+.multicast-multiselect input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--color-accent, var(--app-accent));
+}
+
+.multicast-multiselect label > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.multicast-multiselect label small,
+.multicast-multiselect > small {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.multicast-multiselect > small {
+  margin-top: 8px;
+}
+
+.multicast-empty-choice {
+  grid-column: 1 / -1;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 13px;
+}
+
+.multicast-inline-table {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+  margin: 0 -18px;
+  padding: 14px 18px 0;
+}
+
+.multicast-section-heading {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.multicast-section-heading > span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.multicast-section-heading strong {
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.multicast-section-heading small {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.multicast-table {
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+  margin: 14px 18px 18px;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.multicast-inline-table > .multicast-table {
+  width: 100%;
+  margin: 0 0 16px;
+}
+
+.multicast-table .dwrt-kit-table-scroll {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: visible;
+  overscroll-behavior-inline: contain;
+}
+
+.multicast-runtime-table .dwrt-kit-table,
+.multicast-udpxy-table .dwrt-kit-table {
+  min-width: 940px;
+}
+
+.multicast-allow-table .dwrt-kit-table {
+  min-width: 720px;
+}
+
+.multicast-inline-table td :is(input:not([type="checkbox"]), select) {
+  min-width: 92px;
+  min-height: 36px;
+  padding-block: 5px;
+}
+
+.multicast-inline-table td:first-child,
+.multicast-inline-table td:last-child {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.multicast-row-switch {
+  min-height: 36px;
+  gap: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.multicast-row-switch input[type="checkbox"] {
+  width: 40px;
+  height: 36px;
+  flex-basis: 40px;
+}
+
+.multicast-row-switch input[type="checkbox"]::before {
+  left: 2px;
+  top: 8px;
+}
+
+.multicast-row-switch input[type="checkbox"]::after {
+  left: 5px;
+  top: 11px;
+}
+
+.multicast-service-shell button svg {
+  flex: 0 0 auto;
+}
+
+.multicast-savebar {
+  z-index: 58;
+}
+
+@media (max-width: 900px) {
+  .console-stage.is-multicast-service {
+    padding: 10px 12px;
+  }
+
+  .multicast-page-header {
+    gap: 8px;
+  }
+
+  .multicast-tabs .dwrt-kit-tab {
+    padding-inline: 14px;
+  }
+
+  .multicast-runtime-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0;
+  }
+
+  .multicast-runtime-summary > div:nth-child(3) {
+    padding-left: 0;
+    border-left: 0;
+  }
+
+  .multicast-runtime-summary > div:nth-child(n + 3) {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 9%, transparent));
+  }
+}
+
+@media (max-width: 640px) {
+  .console-stage.is-multicast-service {
+    padding: 8px;
+  }
+
+  .multicast-service-shell {
+    gap: 8px;
+  }
+
+  .multicast-page-header {
+    min-height: 48px;
+  }
+
+  .multicast-tabs {
+    min-height: 48px;
+  }
+
+  .multicast-tabs .dwrt-kit-tab {
+    height: 40px;
+    padding-inline: 12px;
+  }
+
+  .multicast-refresh {
+    width: 40px;
+    min-width: 40px;
+    padding-inline: 0;
+  }
+
+  .multicast-refresh span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .multicast-surface-header {
+    min-height: 58px;
+    padding: 10px 12px;
+  }
+
+  .multicast-surface-header strong {
+    font-size: 15px;
+  }
+
+  .multicast-surface-header small {
+    font-size: 11px;
+  }
+
+  .multicast-capability {
+    padding: 9px 12px;
+  }
+
+  .multicast-runtime-summary {
+    padding-inline: 12px;
+  }
+
+  .multicast-runtime-summary > div {
+    padding-inline: 10px;
+  }
+
+  .multicast-field-grid,
+  .multicast-multiselect > div {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .multicast-dependency {
+    padding-inline: 12px;
+  }
+
+  .multicast-dependency-fields {
+    margin-left: 8px;
+    padding-left: 14px;
+  }
+
+  .multicast-inline-table {
+    margin-inline: -12px;
+    padding-inline: 12px;
+  }
+
+  .multicast-section-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .multicast-section-heading button {
+    align-self: flex-start;
+  }
+
+  .multicast-table {
+    margin: 12px;
+  }
+
+  .multicast-inline-table > .multicast-table {
+    margin: 0 0 12px;
+  }
+
+  .multicast-field-grid :is(input, select),
+  .multicast-multiselect {
+    font-size: 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .multicast-service-shell *,
+  .multicast-service-shell *::before,
+  .multicast-service-shell *::after {
+    scroll-behavior: auto;
+    transition-duration: 0.01ms;
+    animation-duration: 0.01ms;
+  }
+}

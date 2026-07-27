@@ -118,6 +118,17 @@ define Host/Configure
 	$(Host/Configure/Default)
 endef
 
+define Build/Configure
+	$(call Build/Configure/Default)
+ifeq ($(BUILD_VARIANT),none)
+	# GRUB 2.12 generates PACKAGE_* only in config.h for a cross-built
+	# platform=none utility tree, while its utility sources include
+	# config-util.h. Keep both generated headers consistent.
+	grep -E '^#  define (PACKAGE(_(NAME|TARNAME|VERSION|STRING|BUGREPORT|URL))?|VERSION) ' \
+		$(PKG_BUILD_DIR)/config.h >> $(PKG_BUILD_DIR)/config-util.h
+endif
+endef
+
 define Package/grub2/install
 	$(INSTALL_DIR) $(STAGING_DIR_IMAGE)/grub2
 	$(CP) $(PKG_BUILD_DIR)/grub-core/boot.img $(STAGING_DIR_IMAGE)/grub2/
@@ -149,8 +160,24 @@ define Package/grub2/install
 		-p /boot/grub \
 		-O i386-pc \
 		-c ./files/grub-early.cfg \
+		-o $(STAGING_DIR_IMAGE)/grub2/dreamingwrt-eltorito.img \
+		at_keyboard biosdisk boot chain configfile font gfxmenu gfxterm iso9660 jpeg linux ls \
+		normal png all_video part_msdos reboot search serial test
+	$(STAGING_DIR_HOST)/bin/grub-mkimage \
+		-d $(PKG_BUILD_DIR)/grub-core \
+		-p /boot/grub \
+		-O i386-pc \
+		-c ./files/grub-early.cfg \
 		-o $(STAGING_DIR_IMAGE)/grub2/legacy-core.img \
 		biosdisk boot chain configfile ext2 linux ls part_msdos reboot search serial vga
+	$(STAGING_DIR_HOST)/bin/grub-mkimage \
+		-d $(PKG_BUILD_DIR)/grub-core \
+		-p /boot/grub \
+		-O i386-pc \
+		-c ./files/dreamingwrt-early.cfg \
+		-o $(STAGING_DIR_IMAGE)/grub2/dreamingwrt-core.img \
+		at_keyboard biosdisk boot configfile echo ext2 fat font gfxmenu gfxterm jpeg linux \
+		loadenv ls normal png all_video part_gpt reboot search search_label serial test
 endef
 
 define Package/grub2-efi/install
@@ -169,6 +196,22 @@ define Package/grub2-efi/install
 		-c ./files/grub-early.cfg \
 		-o $(STAGING_DIR_IMAGE)/grub2/iso-boot$(if $(CONFIG_x86_64),x64,ia32).efi \
 		boot chain configfile fat iso9660 linux ls part_msdos part_gpt reboot serial test efi_gop efi_uga
+	$(STAGING_DIR_HOST)/bin/grub-mkimage \
+		-d $(PKG_BUILD_DIR)/grub-core \
+		-p /boot/grub \
+		-O $(CONFIG_ARCH)-efi \
+		-c ./files/grub-early.cfg \
+		-o $(STAGING_DIR_IMAGE)/grub2/dreamingwrt-iso-boot$(if $(CONFIG_x86_64),x64,ia32).efi \
+		boot chain configfile efi_gop efi_uga fat font gfxmenu gfxterm iso9660 jpeg linux ls \
+		normal png all_video part_msdos part_gpt reboot serial test
+	$(STAGING_DIR_HOST)/bin/grub-mkimage \
+		-d $(PKG_BUILD_DIR)/grub-core \
+		-p /boot/grub \
+		-O $(CONFIG_ARCH)-efi \
+		-c ./files/dreamingwrt-early.cfg \
+		-o $(STAGING_DIR_IMAGE)/grub2/dreamingwrt-boot$(if $(CONFIG_x86_64),x64,ia32).efi \
+		at_keyboard boot configfile echo efi_gop efi_uga ext2 fat font gfxmenu gfxterm jpeg \
+		linux loadenv ls normal png all_video part_gpt reboot search search_label serial test
 endef
 
 define Package/grub2-efi-arm/install

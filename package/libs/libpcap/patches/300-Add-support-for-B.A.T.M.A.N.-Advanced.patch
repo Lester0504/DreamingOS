@@ -1,42 +1,7 @@
-From 3d8d268320d2381021a409ff8d03533698dd6242 Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?Linus=20L=C3=BCssing?= <linus.luessing@c0d3.blue>
-Date: Mon, 23 Nov 2020 00:38:22 +0100
-Subject: [PATCH] Add support for B.A.T.M.A.N. Advanced
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-This adds support for the layer 2 mesh routing protocol
-B.A.T.M.A.N. Advanced. "batadv" can be used to filter on batman-adv
-packets. It also allows later filters to look at frames inside the
-tunnel when both "version" and "type" are specified.
-
-Documentation for the batman-adv protocol can be found at the following
-locations:
-
-https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/networking/batman-adv.rst
-https://www.open-mesh.org/
-
-Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
----
- Makefile.in            |   2 +
- batadv_legacy_packet.h |  77 +++++++++++++++++++
- batadv_packet.h        |  78 ++++++++++++++++++++
- ethertype.h            |   3 +
- gencode.c              | 164 +++++++++++++++++++++++++++++++++++++++++
- gencode.h              |   3 +
- grammar.y.in           |  32 +++++++-
- nametoaddr.c           |  59 +++++++++++++++
- pcap-filter.manmisc.in |  35 ++++++++-
- pcap/namedb.h          |   2 +
- scanner.l              |   1 +
- 11 files changed, 453 insertions(+), 3 deletions(-)
- create mode 100644 batadv_legacy_packet.h
- create mode 100644 batadv_packet.h
-
---- a/Makefile.in
-+++ b/Makefile.in
-@@ -130,6 +130,8 @@ PUBHDR = \
+diff -Nur libpcap-old/Makefile.in libpcap-new/Makefile.in
+--- a/Makefile.in	2025-12-31 07:26:14.000000000 +0800
++++ b/Makefile.in	2026-07-11 22:55:59.932683115 +0800
+@@ -130,6 +130,8 @@
  HDR = $(PUBHDR) \
  	arcnet.h \
  	atmuni31.h \
@@ -45,8 +10,9 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  	diag-control.h \
  	ethertype.h \
  	extract.h \
---- /dev/null
-+++ b/batadv_legacy_packet.h
+diff -Nur libpcap-old/batadv_legacy_packet.h libpcap-new/batadv_legacy_packet.h
+--- a/batadv_legacy_packet.h	1970-01-01 08:00:00.000000000 +0800
++++ b/batadv_legacy_packet.h	2026-07-11 22:55:59.933758653 +0800
 @@ -0,0 +1,77 @@
 +/* SPDX-License-Identifier: BSD-3 */
 +/* Copyright (C) 2020  Linus Lüssing */
@@ -125,8 +91,9 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
 +};
 +
 +#endif /* _BATADV_LEGACY_PACKET_H_ */
---- /dev/null
-+++ b/batadv_packet.h
+diff -Nur libpcap-old/batadv_packet.h libpcap-new/batadv_packet.h
+--- a/batadv_packet.h	1970-01-01 08:00:00.000000000 +0800
++++ b/batadv_packet.h	2026-07-11 22:55:59.934205527 +0800
 @@ -0,0 +1,78 @@
 +/* SPDX-License-Identifier: BSD-3 */
 +/* Copyright (C) 2020  Linus Lüssing */
@@ -206,8 +173,9 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
 +};
 +
 +#endif /* _BATADV_PACKET_H_ */
---- a/ethertype.h
-+++ b/ethertype.h
+diff -Nur libpcap-old/ethertype.h libpcap-new/ethertype.h
+--- a/ethertype.h	2025-12-31 07:26:14.000000000 +0800
++++ b/ethertype.h	2026-07-11 22:55:59.934530942 +0800
 @@ -49,6 +49,9 @@
  #ifndef ETHERTYPE_TRAIL
  #define ETHERTYPE_TRAIL		0x1000
@@ -218,8 +186,9 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  #ifndef	ETHERTYPE_MOPDL
  #define ETHERTYPE_MOPDL		0x6001
  #endif
---- a/gencode.c
-+++ b/gencode.c
+diff -Nur libpcap-old/gencode.c libpcap-new/gencode.c
+--- a/gencode.c	2025-12-31 07:26:14.000000000 +0800
++++ b/gencode.c	2026-07-11 22:55:59.939860426 +0800
 @@ -51,6 +51,8 @@
  #include "sunatmpos.h"
  #include "pflog.h"
@@ -229,7 +198,7 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  #include "pcap/sll.h"
  #include "pcap/ipnet.h"
  #include "arcnet.h"
-@@ -9846,6 +9848,168 @@ gen_geneve(compiler_state_t *cstate, bpf
+@@ -9846,6 +9848,168 @@
  	return b1;
  }
  
@@ -398,9 +367,10 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  /* Check that the encapsulated frame has a link layer header
   * for Ethernet filters. */
  static struct block *
---- a/gencode.h
-+++ b/gencode.h
-@@ -358,6 +358,9 @@ struct block *gen_pppoes(compiler_state_
+diff -Nur libpcap-old/gencode.h libpcap-new/gencode.h
+--- a/gencode.h	2025-12-31 07:26:14.000000000 +0800
++++ b/gencode.h	2026-07-11 22:55:59.940649799 +0800
+@@ -358,6 +358,9 @@
  
  struct block *gen_geneve(compiler_state_t *, bpf_u_int32, int);
  
@@ -410,9 +380,10 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  struct block *gen_atmfield_code(compiler_state_t *, int, bpf_u_int32,
      int, int);
  struct block *gen_atmtype_abbrev(compiler_state_t *, int);
---- a/grammar.y.in
-+++ b/grammar.y.in
-@@ -370,6 +370,7 @@ DIAG_OFF_BISON_BYACC
+diff -Nur libpcap-old/grammar.y.in libpcap-new/grammar.y.in
+--- a/grammar.y.in	2025-12-31 07:26:14.000000000 +0800
++++ b/grammar.y.in	2026-07-11 22:55:59.941663254 +0800
+@@ -370,6 +370,7 @@
  %type	<i>	mtp2type
  %type	<blk>	mtp3field
  %type	<blk>	mtp3fieldvalue mtp3value mtp3listvalue
@@ -420,7 +391,7 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  
  
  %token  DST SRC HOST GATEWAY
-@@ -388,7 +389,7 @@ DIAG_OFF_BISON_BYACC
+@@ -388,7 +389,7 @@
  %token  LEN
  %token  IPV6 ICMPV6 AH ESP
  %token	VLAN MPLS
@@ -429,7 +400,7 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  %token  ISO ESIS CLNP ISIS L1 L2 IIH LSP SNP CSNP PSNP
  %token  STP
  %token  IPX
-@@ -685,11 +686,40 @@ other:	  pqual TK_BROADCAST	{ CHECK_PTR_
+@@ -685,11 +686,40 @@
  	| PPPOES		{ CHECK_PTR_VAL(($$ = gen_pppoes(cstate, 0, 0))); }
  	| GENEVE pnum		{ CHECK_PTR_VAL(($$ = gen_geneve(cstate, $2, 1))); }
  	| GENEVE		{ CHECK_PTR_VAL(($$ = gen_geneve(cstate, 0, 0))); }
@@ -470,8 +441,9 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  pfvar:	  PF_IFNAME ID		{ CHECK_PTR_VAL($2); CHECK_PTR_VAL(($$ = gen_pf_ifname(cstate, $2))); }
  	| PF_RSET ID		{ CHECK_PTR_VAL($2); CHECK_PTR_VAL(($$ = gen_pf_ruleset(cstate, $2))); }
  	| PF_RNR NUM		{ CHECK_PTR_VAL(($$ = gen_pf_rnr(cstate, $2))); }
---- a/nametoaddr.c
-+++ b/nametoaddr.c
+diff -Nur libpcap-old/nametoaddr.c libpcap-new/nametoaddr.c
+--- a/nametoaddr.c	2025-12-31 07:26:14.000000000 +0800
++++ b/nametoaddr.c	2026-07-11 22:55:59.942705084 +0800
 @@ -109,8 +109,12 @@
  
  #include "diag-control.h"
@@ -485,7 +457,7 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  #include "nametoaddr.h"
  
  #include "thread-local.h"
-@@ -572,6 +576,7 @@ PCAP_API_DEF struct eproto eproto_db[] =
+@@ -572,6 +576,7 @@
  	{ "moprc", ETHERTYPE_MOPRC },
  	{ "rarp", ETHERTYPE_REVARP },
  	{ "sca", ETHERTYPE_SCA },
@@ -493,7 +465,7 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  	{ (char *)0, 0 }
  };
  
-@@ -606,6 +611,60 @@ pcap_nametollc(const char *s)
+@@ -606,6 +611,60 @@
  
  	while (p->s != 0) {
  		if (strcmp(p->s, s) == 0)
@@ -554,9 +526,22 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  			return p->p;
  		p += 1;
  	}
---- a/pcap-filter.manmisc.in
-+++ b/pcap-filter.manmisc.in
-@@ -98,6 +98,7 @@ protocols are:
+diff -Nur libpcap-old/pcap/namedb.h libpcap-new/pcap/namedb.h
+--- a/pcap/namedb.h	2025-12-31 07:26:14.000000000 +0800
++++ b/pcap/namedb.h	2026-07-11 22:56:07.738550961 +0800
+@@ -94,6 +94,8 @@
+ 
+ PCAP_AVAILABLE_0_9
+ PCAP_API int	pcap_nametollc(const char *);
++PCAP_API int	pcap_nametobatadvtype_v14(const char *);
++PCAP_API int	pcap_nametobatadvtype_v15(const char *);
+ 
+ /*
+  * If a protocol is unknown, PROTO_UNDEF is returned.
+diff -Nur libpcap-old/pcap-filter.manmisc.in libpcap-new/pcap-filter.manmisc.in
+--- a/pcap-filter.manmisc.in	2025-12-31 07:26:14.000000000 +0800
++++ b/pcap-filter.manmisc.in	2026-07-11 22:55:59.943803705 +0800
+@@ -98,6 +98,7 @@
  .BR arp ,
  .BR rarp ,
  .BR decnet ,
@@ -564,7 +549,7 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  .BR sctp ,
  .B tcp
  and
-@@ -400,7 +401,7 @@ True if the packet is an IPv6 multicast
+@@ -400,7 +401,7 @@
  .IP  "\fBether proto \fIprotocol\fR"
  True if the packet is of ether type \fIprotocol\fR.
  \fIProtocol\fP can be a number or one of the names
@@ -573,7 +558,7 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  \fBipx\fP, \fBiso\fP, \fBlat\fP, \fBloopback\fP, \fBmopdl\fP, \fBmoprc\fP, \fBnetbeui\fP,
  \fBrarp\fP, \fBsca\fP or \fBstp\fP.
  Note these identifiers (except \fBloopback\fP) are also keywords
-@@ -454,7 +455,7 @@ the filter checks for the IPX etype in a
+@@ -454,7 +455,7 @@
  DSAP in the LLC header, the 802.3-with-no-LLC-header encapsulation of
  IPX, and the IPX etype in a SNAP frame.
  .RE
@@ -582,7 +567,7 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  Abbreviations for:
  .in +.5i
  .nf
-@@ -795,6 +796,36 @@ For example:
+@@ -795,6 +796,36 @@
  filters IPv4 protocol encapsulated in Geneve with VNI 0xb. This will
  match both IPv4 directly encapsulated in Geneve as well as IPv4 contained
  inside an Ethernet frame.
@@ -619,20 +604,10 @@ Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
  .IP "\fBiso proto \fIprotocol\fR"
  True if the packet is an OSI packet of protocol type \fIprotocol\fP.
  \fIProtocol\fP can be a number or one of the names
---- a/pcap/namedb.h
-+++ b/pcap/namedb.h
-@@ -94,6 +94,8 @@ PCAP_API int	pcap_nametoeproto(const cha
- 
- PCAP_AVAILABLE_0_9
- PCAP_API int	pcap_nametollc(const char *);
-+PCAP_API int	pcap_nametobatadvtype_v14(const char *);
-+PCAP_API int	pcap_nametobatadvtype_v15(const char *);
- 
- /*
-  * If a protocol is unknown, PROTO_UNDEF is returned.
---- a/scanner.l
-+++ b/scanner.l
-@@ -343,6 +343,7 @@ mpls		return MPLS;
+diff -Nur libpcap-old/scanner.l libpcap-new/scanner.l
+--- a/scanner.l	2025-12-31 07:26:14.000000000 +0800
++++ b/scanner.l	2026-07-11 22:55:59.945019577 +0800
+@@ -343,6 +343,7 @@
  pppoed		return PPPOED;
  pppoes		return PPPOES;
  geneve		return GENEVE;

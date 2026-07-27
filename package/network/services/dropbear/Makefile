@@ -235,12 +235,22 @@ define Build/Configure/dropbear_headers
 	))
 endef
 
+ifeq ($(CONFIG_PACKAGE_dropbear),)
+define Build/Configure/localoptions
+	$(CP) ./files/dropbearconvert.localoptions $(PKG_BUILD_DIR)/localoptions.h
+endef
+else
+define Build/Configure/localoptions
+	: > $(PKG_BUILD_DIR)/localoptions.h
+	$(Build/Configure/dropbear_headers)
+endef
+endif
+
 define Build/Configure
 	rm -f $(PKG_BUILD_DIR)/localoptions.h
 	$(Build/Configure/Default)
 
-	: > $(PKG_BUILD_DIR)/localoptions.h
-	$(Build/Configure/dropbear_headers)
+	$(Build/Configure/localoptions)
 
 	# Enforce rebuild
 	rm -rf $(PKG_BUILD_DIR)/obj

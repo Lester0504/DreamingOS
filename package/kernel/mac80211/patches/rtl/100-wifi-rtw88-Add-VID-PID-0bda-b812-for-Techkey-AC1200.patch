@@ -1,0 +1,21 @@
+From 3aa3f5c616bdafea55fd9778d8fb35b67fc728ee Mon Sep 17 00:00:00 2001
+From: sbwml <admin@cooluc.com>
+Date: Wed, 20 Nov 2024 00:37:58 +0800
+Subject: [PATCH] wifi: rtw88: Add VID/PID 0bda:b812 for Techkey AC1200
+
+Signed-off-by: sbwml <admin@cooluc.com>
+---
+ drivers/net/wireless/realtek/rtw88/rtw8822bu.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/drivers/net/wireless/realtek/rtw88/rtw8822bu.c
++++ b/drivers/net/wireless/realtek/rtw88/rtw8822bu.c
+@@ -79,6 +79,8 @@ static const struct usb_device_id rtw_88
+ 	  .driver_info = (kernel_ulong_t)&(rtw8822b_hw_spec) }, /* D-Link DWA-T185 rev. A1 */
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(0x0411, 0x03d1, 0xff, 0xff, 0xff),
+ 	  .driver_info = (kernel_ulong_t)&(rtw8822b_hw_spec) }, /* BUFFALO WI-U2-866DM */
++	{ USB_DEVICE_AND_INTERFACE_INFO(0x0bda, 0xb812, 0xff, 0xff, 0xff),
++	  .driver_info = (kernel_ulong_t)&(rtw8822b_hw_spec) }, /* Techkey AC1200 */
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(usb, rtw_8822bu_id_table);

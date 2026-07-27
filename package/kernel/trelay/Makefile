@@ -15,6 +15,7 @@ include $(INCLUDE_DIR)/package.mk
 
 define KernelPackage/trelay
   SUBMENU:=Network Support
+  VERSION:=7.1.5
   TITLE:=Trivial Ethernet Relay
   FILES:=$(PKG_BUILD_DIR)/trelay.ko
   AUTOLOAD:=$(call AutoLoad,50,trelay)

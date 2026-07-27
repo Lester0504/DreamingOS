@@ -19,6 +19,17 @@ include $(INCLUDE_DIR)/nls.mk
 
 PKG_BUILD_PARALLEL:=1
 PKG_INSTALL:=1
+PKG_BUILD_FLAGS:=no-mold no-lto
+
+# Manually strip problematic flags from global CFLAGS/LDFLAGS
+# no-lto/no-mold only affect TARGET_LINKER and pkg_build_flag rules,
+# but TARGET_CFLAGS/TARGET_LDFLAGS are simply-expanded (:=) and already
+# captured the LTO/mold values before those rules run.
+# - gcc -r (relocatable link) is incompatible with --gc-sections
+# - LTO produces GIMPLE bytecode that breaks check_abi
+TARGET_CFLAGS:=$(subst -flto=auto,,$(subst -fno-fat-lto-objects,,$(TARGET_CFLAGS)))
+TARGET_CXXFLAGS:=$(subst -flto=auto,,$(subst -fno-fat-lto-objects,,$(TARGET_CXXFLAGS)))
+TARGET_LDFLAGS:=$(subst -flto=auto,,$(subst -fuse-linker-plugin,,$(subst -fuse-ld=mold,,$(subst -Wl$(comma)--gc-sections,,$(TARGET_LDFLAGS)))))
 
 define Package/libxdp
   SECTION:=libs

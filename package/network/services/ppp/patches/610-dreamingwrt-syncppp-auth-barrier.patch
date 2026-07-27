@@ -1,0 +1,266 @@
+diff -ruN ppp-2.5.2/pppd/auth.c ppp-2.5.2.syncnew/pppd/auth.c
+--- a/pppd/auth.c	2024-12-31 12:57:20.000000000 +0800
++++ b/pppd/auth.c	2026-05-21 22:13:09.431798931 +0800
+@@ -127,6 +127,7 @@
+ #include "multilink.h"
+ #include "pathnames.h"
+ #include "session.h"
++#include "syncppp.h"
+ 
+ 
+ /* Bits in scan_authfile return value */
+@@ -390,6 +391,14 @@
+     { "refuse-eap", o_bool, &refuse_eap,
+       "Don't agree to authenticate to peer with EAP", 1 },
+ 
++    { "syncppp", o_int, &syncppp,
++      "sync among multiple pppd when sending chap/pap respond", OPT_PRIO },
++    { "syncppp_name", o_string, syncppp_name,
++      "sync among multiple pppd group name", OPT_PRIO | OPT_STATIC,
++      NULL, MAXNAMELEN },
++    { "syncppp_timeout", o_int, &syncppp_timeout,
++      "Set timeout for syncppp authentication barrier", OPT_PRIO },
++
+     { "name", o_string, our_name,
+       "Set local name for authentication",
+       OPT_PRIO | OPT_PRIV | OPT_STATIC, NULL, MAXNAMELEN },
+diff -ruN ppp-2.5.2/pppd/chap.c ppp-2.5.2.syncnew/pppd/chap.c
+--- a/pppd/chap.c	2024-12-31 12:57:20.000000000 +0800
++++ b/pppd/chap.c	2026-05-21 22:13:09.432006782 +0800
+@@ -35,6 +35,7 @@
+ #include "session.h"
+ #include "chap.h"
+ #include "chap-md5.h"
++#include "syncppp.h"
+ 
+ #ifdef PPP_WITH_CHAPMS
+ #include "chap_ms.h"
+@@ -514,6 +515,15 @@
+ 	p[2] = len >> 8;
+ 	p[3] = len;
+ 
++	if (syncppp > 1) {
++		if (syncppp_auth_barrier() < 0)
++			notice("syncppp sync fail");
++		else
++			info("syncppp sync succeeded");
++	} else if (syncppp > 0) {
++		info("syncppp not active");
++	}
++
+ 	output(0, response, PPP_HDRLEN + len);
+ }
+ 
+diff -ruN ppp-2.5.2/pppd/Makefile.am ppp-2.5.2.syncnew/pppd/Makefile.am
+--- a/pppd/Makefile.am	2026-05-21 22:10:54.649377843 +0800
++++ b/pppd/Makefile.am	2026-05-21 22:13:09.431476174 +0800
+@@ -67,7 +67,8 @@
+     pppd-private.h \
+     spinlock.h \
+     tls.h \
+-    tdb.h
++    tdb.h \
++    syncppp.h
+ 
+ pppd_SOURCES = \
+     auth.c \
+@@ -76,6 +77,7 @@
+     chap.c \
+     demand.c \
+     eap.c \
++    syncppp.c \
+     ecp.c \
+     fsm.c \
+     ipcp.c \
+diff -ruN ppp-2.5.2/pppd/syncppp.c ppp-2.5.2.syncnew/pppd/syncppp.c
+--- a/pppd/syncppp.c	1970-01-01 08:00:00.000000000 +0800
++++ b/pppd/syncppp.c	2026-05-21 22:13:09.431397128 +0800
+@@ -0,0 +1,143 @@
++/*
++ * syncppp.c - synchronize PPPoE multi-dial authentication responses.
++ *
++ * Mirrors iKuai syncppp behaviour: multiple pppd processes in one group
++ * wait on POSIX named semaphores right before PAP/CHAP responses are sent.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <errno.h>
++#include <fcntl.h>
++#include <semaphore.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++#include <ctype.h>
++
++#include "pppd-private.h"
++#include "options.h"
++#include "syncppp.h"
++
++int syncppp = 0;
++int syncppp_timeout = 5;
++char syncppp_name[MAXNAMELEN];
++
++static int syncppp_finish = 0;
++
++static void
++syncppp_sanitize_name(char *dst, size_t dstlen)
++{
++    const char *src;
++    size_t i;
++
++    if (dstlen == 0)
++        return;
++
++    src = syncppp_name[0] ? syncppp_name : "default";
++    for (i = 0; i + 1 < dstlen && src[i] != '\0'; ++i) {
++        unsigned char c = (unsigned char) src[i];
++        if (isalnum(c) || c == '_' || c == '-' || c == '.')
++            dst[i] = (char)c;
++        else
++            dst[i] = '_';
++    }
++    dst[i] = '\0';
++
++    if (dst[0] == '\0')
++        strlcpy(dst, "default", dstlen);
++}
++
++int
++syncppp_auth_barrier(void)
++{
++    char group[MAXNAMELEN];
++    char count_name[MAXNAMELEN + 16];
++    char block_name[MAXNAMELEN + 16];
++    struct timespec ts;
++    sem_t *count_sem = SEM_FAILED;
++    sem_t *block_sem = SEM_FAILED;
++    int sem_value = 0;
++    int ret = -1;
++    int i;
++
++    if (syncppp_finish)
++        return 0;
++
++    if (syncppp <= 1) {
++        if (syncppp > 0)
++            notice("syncppp: number of pppd should be larger than 1");
++        syncppp_finish = 1;
++        return -1;
++    }
++
++    syncppp_sanitize_name(group, sizeof(group));
++    snprintf(count_name, sizeof(count_name), "/%s-count", group);
++    snprintf(block_name, sizeof(block_name), "/%s-block", group);
++
++    if (clock_gettime(CLOCK_REALTIME, &ts) < 0) {
++        notice("clock_gettime error");
++        syncppp_finish = 1;
++        return -1;
++    }
++    if (syncppp_timeout <= 0)
++        syncppp_timeout = 5;
++    ts.tv_sec += syncppp_timeout;
++
++    count_sem = sem_open(count_name, O_CREAT, 0644, 0);
++    block_sem = sem_open(block_name, O_CREAT, 0644, 0);
++    if (count_sem == SEM_FAILED || block_sem == SEM_FAILED) {
++        notice("syncppp: sem_open failed");
++        goto out;
++    }
++
++    if (sem_post(count_sem) < 0) {
++        notice("syncppp: sem_post failed");
++        goto out;
++    }
++
++    if (sem_getvalue(count_sem, &sem_value) < 0) {
++        notice("syncppp: sem_getvalue failed");
++        goto out;
++    }
++
++    info("%d pppd have arrived, waiting for the left %d",
++         sem_value, syncppp - sem_value);
++
++    if (sem_value >= syncppp) {
++        for (i = 1; i < syncppp; ++i) {
++            if (sem_post(block_sem) < 0) {
++                notice("syncppp: sem_post failed");
++                goto out;
++            }
++        }
++        ret = 0;
++        goto out_unlink;
++    }
++
++    while (sem_timedwait(block_sem, &ts) < 0) {
++        if (errno == EINTR)
++            continue;
++        if (errno == ETIMEDOUT)
++            notice("syncppp: sem_timewait time out");
++        else
++            notice("syncppp: sem_timewait error");
++        goto out;
++    }
++
++    ret = 0;
++
++out_unlink:
++    sem_unlink(count_name);
++    sem_unlink(block_name);
++out:
++    if (count_sem != SEM_FAILED)
++        sem_close(count_sem);
++    if (block_sem != SEM_FAILED)
++        sem_close(block_sem);
++    syncppp_finish = 1;
++    return ret;
++}
+diff -ruN ppp-2.5.2/pppd/syncppp.h ppp-2.5.2.syncnew/pppd/syncppp.h
+--- a/pppd/syncppp.h	1970-01-01 08:00:00.000000000 +0800
++++ b/pppd/syncppp.h	2026-05-21 22:13:09.431336709 +0800
+@@ -0,0 +1,14 @@
++/*
++ * syncppp.h - synchronize PPPoE multi-dial authentication responses.
++ */
++
++#ifndef PPP_SYNCPPP_H
++#define PPP_SYNCPPP_H
++
++extern int syncppp;
++extern int syncppp_timeout;
++extern char syncppp_name[MAXNAMELEN];
++
++int syncppp_auth_barrier(void);
++
++#endif /* PPP_SYNCPPP_H */
+diff -ruN ppp-2.5.2/pppd/upap.c ppp-2.5.2.syncnew/pppd/upap.c
+--- a/pppd/upap.c	2024-12-31 12:57:20.000000000 +0800
++++ b/pppd/upap.c	2026-05-21 22:13:09.432213230 +0800
+@@ -54,6 +54,7 @@
+ #include "pppd-private.h"
+ #include "options.h"
+ #include "upap.h"
++#include "syncppp.h"
+ 
+ 
+ static bool hide_password = 1;
+@@ -545,6 +546,15 @@
+     PUTCHAR(u->us_passwdlen, outp);
+     BCOPY(u->us_passwd, outp, u->us_passwdlen);
+ 
++    if (u->us_transmits == 0 && syncppp > 1) {
++        if (syncppp_auth_barrier() < 0)
++            notice("syncppp sync fail");
++        else
++            info("syncppp sync succeeded");
++    } else if (u->us_transmits == 0 && syncppp > 0) {
++        info("syncppp not active");
++    }
++
+     output(u->us_unit, outpacket_buf, outlen + PPP_HDRLEN);
+ 
+     TIMEOUT(upap_timeout, u, u->us_timeouttime);

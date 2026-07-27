@@ -9,7 +9,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=perf
-PKG_VERSION:=$(LINUX_VERSION)
+PKG_VERSION:=$(subst -,_,$(LINUX_VERSION))
 PKG_RELEASE:=7
 
 PKG_BUILD_FLAGS:=no-mips16 no-lto
@@ -22,15 +22,16 @@ PKG_FLAGS:=nonshared
 PKG_BUILD_DIR:=$(LINUX_DIR)/tools/perf-$(TARGET_DIR_NAME)
 
 include $(INCLUDE_DIR)/package.mk
+TARGET_LDFLAGS += -lintl -Wl,-rpath-link=$(STAGING_DIR)/usr/lib
 include $(INCLUDE_DIR)/nls.mk
 
 define Package/perf
   SECTION:=devel
   CATEGORY:=Development
-  DEPENDS:= +libelf +libdw +PACKAGE_libunwind:libunwind +libpthread +librt +objdump @!IN_SDK @KERNEL_PERF_EVENTS \
-	    +PACKAGE_libbfd:libbfd +PACKAGE_libopcodes:libopcodes +libtraceevent
+  DEPENDS:= +libzstd +libelf +libdw +PACKAGE_libunwind:libunwind +libpthread +libintl-full +librt +objdump @!IN_SDK @KERNEL_PERF_EVENTS \
+        +PACKAGE_libbfd:libbfd +PACKAGE_libopcodes:libopcodes +libtraceevent
   TITLE:=Linux performance monitoring tool
-  VERSION:=$(LINUX_VERSION)-r$(PKG_RELEASE)
+  VERSION:=$(PKG_VERSION)-r$(PKG_RELEASE)
   URL:=https://www.kernel.org
 endef
 
@@ -43,40 +44,50 @@ HOST_CFLAGS += -I$(LINUX_DIR)/tools/include
 TARGET_LDFLAGS += $(INTL_LDFLAGS)
 
 MAKE_FLAGS = \
-	ARCH="$(LINUX_KARCH)" \
-	NO_LIBPERL=1 \
-	NO_LIBPYTHON=1 \
-	NO_NEWT=1 \
-	NO_LZMA=1 \
-	NO_BACKTRACE=1 \
-	NO_LIBNUMA=1 \
-	NO_SLANG=1 \
-	NO_GTK2=1 \
-	NO_LIBAUDIT=1 \
-	NO_LIBCRYPTO=1 \
-	NO_LIBUNWIND=1 \
-	NO_LIBZSTD=1 \
-	NO_LIBCAP=1 \
-	NO_JEVENTS=1 \
-	NO_SHELLCHECK=1 \
-	BUILD_BPF_SKEL= \
-	CROSS_COMPILE="$(TARGET_CROSS)" \
-	CC="$(TARGET_CC)" \
-	LD="$(TARGET_CROSS)ld" \
-	EXTRA_CFLAGS="$(TARGET_CFLAGS) $(TARGET_CPPFLAGS)" \
-	LDFLAGS="$(TARGET_LDFLAGS)" \
-	KBUILD_HOSTCFLAGS="$(HOST_CFLAGS)" \
-	$(if $(findstring c,$(OPENWRT_VERBOSE)),V=1,V='') \
-	PKG_CONFIG="$(PKG_CONFIG)" \
-	PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" \
-	EXCLUDE_EXTLIBS="-lstdc++" \
-	EXTRA_PERFLIBS="$(shell $(TARGET_CC) -print-file-name=libstdc++.a)" \
-	WERROR=0 \
-	O=$(PKG_BUILD_DIR) \
-	prefix=/usr
+    ARCH="$(LINUX_KARCH)" \
+    NO_LIBPERL=1 \
+    NO_LIBPYTHON=1 \
+    NO_NEWT=1 \
+    NO_LZMA=1 \
+    NO_BACKTRACE=1 \
+    NO_LIBNUMA=1 \
+    NO_SLANG=1 \
+    NO_GTK2=1 \
+    NO_LIBAUDIT=1 \
+    NO_LIBCRYPTO=1 \
+    NO_LIBUNWIND=1 \
+    NO_BPF_SKEL=1 \
+    NO_LIBLLVM=1 \
+    NO_LIBCLANG=1 \
+    NO_JVMTI=1 \
+    NO_LIBBPF=1 \
+    NO_LIBCAP=1 \
+    NO_JEVENTS=1 \
+    NO_RUST=1 \
+    NO_SHELLCHECK=1 \
+    BUILD_BPF_SKEL= \
+    CROSS_COMPILE="$(TARGET_CROSS)" \
+    CC="$(TARGET_CC)" \
+    LD="$(TARGET_CROSS)ld" \
+    EXTRA_CFLAGS="$(TARGET_CFLAGS) $(TARGET_CPPFLAGS)" \
+    LDFLAGS="$(TARGET_LDFLAGS)" \
+    EXTRA_LDFLAGS="-lintl -Wl,-rpath-link=$(STAGING_DIR)/usr/lib -Wl,--defsym=stat64=stat -Wl,--defsym=open64=open -Wl,--defsym=fstat64=fstat -Wl,--defsym=mmap64=mmap -Wl,--defsym=lseek64=lseek" \
+    KBUILD_HOSTCFLAGS="$(HOST_CFLAGS)" \
+    $(if $(findstring c,$(OPENWRT_VERBOSE)),V=1,V='') \
+    PKG_CONFIG="$(PKG_CONFIG)" \
+    PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" \
+    EXCLUDE_EXTLIBS="-lstdc++" \
+    EXTRA_PERFLIBS="$(shell $(TARGET_CC) -print-file-name=libstdc++.a)" \
+    WERROR=0 \
+    O=$(PKG_BUILD_DIR) \
+    prefix=/usr
 
 ifneq ($(filter $(LINUX_KARCH),powerpc mips),)
-	MAKE_FLAGS += NO_AUXTRACE=1
+    MAKE_FLAGS += NO_AUXTRACE=1
+endif
+
+ifneq (,$(findstring clang,$(KERNEL_CC)))
+    MAKE_FLAGS += NO_LIBELF=1
 endif
 
 define Build/Compile

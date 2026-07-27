@@ -52,4 +52,3 @@ define Package/libpopt/install
 endef
 
 $(eval $(call BuildPackage,libpopt))
-

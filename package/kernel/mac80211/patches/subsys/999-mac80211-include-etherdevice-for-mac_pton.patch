@@ -1,0 +1,11 @@
+--- a/net/mac80211/debugfs_netdev.c
++++ b/net/mac80211/debugfs_netdev.c
+@@ -14,6 +14,7 @@
+ #include <linux/rtnetlink.h>
+ #include <linux/slab.h>
+ #include <linux/notifier.h>
++#include <linux/etherdevice.h>
+ #include <net/mac80211.h>
+ #include <net/cfg80211.h>
+ #include "ieee80211_i.h"
+ 

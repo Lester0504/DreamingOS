@@ -1,0 +1,31 @@
+From 334c855832e190007fa61385cc91377e22320493 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marcin=20=C5=9Alusarz?= <marcin.slusarz@gmail.com>
+Date: Fri, 14 Jun 2024 12:28:35 +0200
+Subject: [PATCH] wifi: rtw88: usb: unbreak multicast
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+High queue is not functioning, for some reason.
+Broken by 076f786a0ae14a81f40314b96a2d815e264bc213
+
+Signed-off-by: Marcin Ślusarz <mslusarz@renau.com>
+Cc: Po-Hao Huang <phhuang@realtek.com>
+Cc: Ping-Ke Shih <pkshih@realtek.com>
+Cc: Kalle Valo <kvalo@kernel.org>
+---
+ drivers/net/wireless/realtek/rtw88/usb.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+--- a/drivers/net/wireless/realtek/rtw88/usb.c
++++ b/drivers/net/wireless/realtek/rtw88/usb.c
+@@ -556,9 +556,6 @@ static u8 rtw_usb_tx_queue_mapping_to_qs
+ 
+ 	if (unlikely(ieee80211_is_mgmt(fc) || ieee80211_is_ctl(fc)))
+ 		qsel = TX_DESC_QSEL_MGMT;
+-	else if (is_broadcast_ether_addr(hdr->addr1) ||
+-		 is_multicast_ether_addr(hdr->addr1))
+-		qsel = TX_DESC_QSEL_HIGH;
+ 	else if (skb_get_queue_mapping(skb) <= IEEE80211_AC_BK)
+ 		qsel = skb->priority;
+ 	else

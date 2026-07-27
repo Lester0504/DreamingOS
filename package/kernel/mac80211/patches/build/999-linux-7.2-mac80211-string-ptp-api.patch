@@ -1,0 +1,84 @@
+--- a/net/mac80211/trace.h
++++ b/net/mac80211/trace.h
+@@ -1802,9 +1802,8 @@ TRACE_EVENT(drv_switch_vif_chanctx,
+ 				SWITCH_ENTRY_ASSIGN(vif.vif_type, vif->type);
+ 				SWITCH_ENTRY_ASSIGN(vif.p2p, vif->p2p);
+ 				SWITCH_ENTRY_ASSIGN(link_id, link_conf->link_id);
+-				strncpy(local_vifs[i].vif.vif_name,
+-					sdata->name,
+-					sizeof(local_vifs[i].vif.vif_name));
++				strscpy_pad(local_vifs[i].vif.vif_name,
++					    sdata->name);
+ 				SWITCH_ENTRY_ASSIGN(old_chandef.control_freq,
+ 						old_ctx->def.chan->center_freq);
+ 				SWITCH_ENTRY_ASSIGN(old_chandef.freq_offset,
+--- a/drivers/net/wireless/intel/iwlwifi/mld/ptp.c
++++ b/drivers/net/wireless/intel/iwlwifi/mld/ptp.c
+@@ -7,6 +7,7 @@
+ #include "hcmd.h"
+ #include "ptp.h"
+ #include <linux/timekeeping.h>
++#include <linux/version.h>
+ 
+ /* The scaled_ppm parameter is ppm (parts per million) with a 16-bit fractional
+  * part, which means that a value of 1 in one of those fields actually means
+@@ -251,7 +252,12 @@ iwl_mld_phc_get_crosstimestamp(struct pt
+ 	/* System (wall) time */
+ 	ktime_t sys_time;
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
++	if (xtstamp->clock_id != CLOCK_REALTIME)
++		return -ENOTSUPP;
++#else
+ 	memset(xtstamp, 0, sizeof(struct system_device_crosststamp));
++#endif
+ 
+ 	ret = iwl_mld_get_crosstimestamp_fw(mld, &gp2, &sys_time);
+ 	if (ret) {
+@@ -270,7 +276,11 @@ iwl_mld_phc_get_crosstimestamp(struct pt
+ 
+ 	/* System monotonic raw time is not used */
+ 	xtstamp->device = ns_to_ktime(gp2_ns);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
++	xtstamp->sys_systime = sys_time;
++#else
+ 	xtstamp->sys_realtime = sys_time;
++#endif
+ 
+ 	return ret;
+ }
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/ptp.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/ptp.c
+@@ -6,6 +6,7 @@
+ #include "iwl-debug.h"
+ #include <linux/timekeeping.h>
+ #include <linux/math64.h>
++#include <linux/version.h>
+ 
+ #define IWL_PTP_GP2_WRAP	0x100000000ULL
+ #define IWL_PTP_WRAP_TIME	(3600 * HZ)
+@@ -159,7 +160,12 @@ iwl_mvm_phc_get_crosstimestamp(struct pt
+ 	/* System (wall) time */
+ 	ktime_t sys_time;
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
++	if (xtstamp->clock_id != CLOCK_REALTIME)
++		return -ENOTSUPP;
++#else
+ 	memset(xtstamp, 0, sizeof(struct system_device_crosststamp));
++#endif
+ 
+ 	if (!mvm->ptp_data.ptp_clock) {
+ 		IWL_ERR(mvm, "No PHC clock registered\n");
+@@ -184,7 +190,11 @@ iwl_mvm_phc_get_crosstimestamp(struct pt
+ 
+ 	/* System monotonic raw time is not used */
+ 	xtstamp->device = (ktime_t)gp2_ns;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
++	xtstamp->sys_systime = sys_time;
++#else
+ 	xtstamp->sys_realtime = sys_time;
++#endif
+ 
+ out:
+ 	mutex_unlock(&mvm->mutex);

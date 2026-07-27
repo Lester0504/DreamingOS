@@ -82,8 +82,8 @@ define KernelPackage/crypto-blake2b
   TITLE:=Support for BLAKE2b cryptographic hash function (RFC 7693)
   DEPENDS:=+kmod-crypto-hash
   KCONFIG:=CONFIG_CRYPTO_BLAKE2B
-  FILES:=$(LINUX_DIR)/crypto/blake2b_generic.ko
-  AUTOLOAD:=$(call AutoLoad,09,blake2b_generic)
+  FILES:=$(LINUX_DIR)/crypto/blake2b.ko
+  AUTOLOAD:=$(call AutoLoad,09,blake2b)
   $(call AddDepends/crypto)
 endef
 
@@ -544,6 +544,10 @@ Kernel module to enable EIP-93 Crypto engine as found
 in Mediatek MT7621 and Airoha SoCs.
 It enables DES/3DES/AES ECB/CBC/CTR and
 IPSEC offload with authenc(hmac(sha1/sha256), aes/cbc/rfc3686)
+endef
+
+define KernelPackage/crypto-hw-eip93/airoha
+  FILES:=$(LINUX_DIR)/drivers/crypto/inside-secure/eip93/crypto-hw-eip93.ko
 endef
 
 $(eval $(call KernelPackage,crypto-hw-eip93))
@@ -1039,8 +1043,8 @@ define KernelPackage/crypto-sha3
   TITLE:=SHA3 digest CryptoAPI module
   DEPENDS:=+kmod-crypto-hash
   KCONFIG:= CONFIG_CRYPTO_SHA3
-  FILES:=$(LINUX_DIR)/crypto/sha3_generic.ko
-  AUTOLOAD:=$(call AutoLoad,09,sha3_generic)
+  FILES:=$(LINUX_DIR)/crypto/sha3.ko
+  AUTOLOAD:=$(call AutoLoad,09,sha3)
   $(call AddDepends/crypto)
 endef
 

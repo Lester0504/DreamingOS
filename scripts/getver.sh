@@ -4,6 +4,11 @@ export LC_ALL=C
 [ -n "$TOPDIR" ] && cd $TOPDIR
 
 GET_REV=$1
+GIT_SAFE_DIRECTORY="$(pwd -P)"
+
+git() {
+	command git -c safe.directory="$GIT_SAFE_DIRECTORY" "$@"
+}
 
 try_version() {
 	[ -f version ] || return 1

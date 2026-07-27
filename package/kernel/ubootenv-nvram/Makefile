@@ -9,6 +9,7 @@ include $(INCLUDE_DIR)/package.mk
 
 define KernelPackage/ubootenv-nvram
   SUBMENU:=Other modules
+  VERSION:=7.1.5
   TITLE:=NVRAM environment for uboot-envtools
   FILES:=$(PKG_BUILD_DIR)/ubootenv-nvram.ko
   AUTOLOAD:=$(call AutoLoad,30,ubootenv-nvram,1)

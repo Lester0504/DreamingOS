@@ -224,7 +224,7 @@ if VERSIONOPT
 			This is the release version homepage
 
 	config VERSION_MANUFACTURER
-		string
+		string "LesterWrt"
 		prompt "Manufacturer name"
 		help
 			This is the manufacturer name embedded in /etc/device_info
@@ -263,7 +263,7 @@ if VERSIONOPT
 			Useful for OEMs building OpenWrt based firmware
 
 	config VERSION_HWREV
-		string
+		string "R2012-05-17"
 		prompt "Hardware revision"
 		help
 			This is the hardware revision string embedded in /etc/device_info

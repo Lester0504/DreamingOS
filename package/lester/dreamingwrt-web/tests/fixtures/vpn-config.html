@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN" data-theme-resolved="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/vpn-config.css">
+  <style>
+    :root {
+      --app-menu-glass-width: 48px;
+      --app-text: rgb(239 245 252);
+      --app-text-secondary: rgb(214 224 238);
+      --app-text-muted: rgb(177 193 213);
+      --app-accent: rgb(46 139 255);
+      --color-text-primary: var(--app-text);
+      --color-text-secondary: var(--app-text-secondary);
+      --color-text-muted: var(--app-text-muted);
+      --color-accent: var(--app-accent);
+      --color-on-accent: white;
+      --color-danger: rgb(239 86 99);
+      --color-warning: rgb(238 177 52);
+      --color-border-control: rgb(255 255 255 / .2);
+      --color-border-subtle: rgb(255 255 255 / .12);
+      --color-surface-control: rgb(255 255 255 / .06);
+      --dwrt-kit-text: var(--app-text);
+      --dwrt-kit-muted: var(--app-text-muted);
+    }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body { color: var(--app-text); background: linear-gradient(135deg, rgb(17 48 79), rgb(80 44 29)); font-family: system-ui, sans-serif; }
+    .console-stage { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; }
+  </style>
+</head>
+<body>
+  <main class="console-stage"><div class="stage-header"></div><div class="route-preview" id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/vpn-config.js';
+
+    const root = document.getElementById('routePreview');
+    const requests = [];
+    const notFound = async (name, url) => {
+      requests.push({ name, url, method: 'GET' });
+      const error = new Error(`${name}: 404`);
+      error.status = 404;
+      throw error;
+    };
+    let instance = mount({
+      root,
+      item: { id: 'vpn-config' },
+      signal: new AbortController().signal,
+      capabilities: { vpn: true },
+      api: {
+        fetch: notFound,
+        request: async (name, url, init = {}) => {
+          requests.push({ name, url, method: init.method || 'GET' });
+          const error = new Error(`${name}: 404`);
+          error.status = 404;
+          throw error;
+        }
+      },
+      ui: {
+        mountAll: node => window.DWRT_UI_KIT.mountAll(node),
+        statusBadgeMarkup: (...args) => window.DWRT_UI_KIT.statusBadgeMarkup(...args)
+      },
+      utils: { escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]) }
+    });
+
+    window.VPN_FIXTURE = {
+      requests,
+      async ready() {
+        for (let index = 0; index < 80; index += 1) {
+          if (!root.querySelector('.vpn-loading')) return true;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        return false;
+      },
+      unmount() { instance?.unmount?.(); instance = null; }
+    };
+  </script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+# Dreaming OS standalone webd bridge for the nginx :80 LAN server.
+# Keep this scoped so legacy LuCI paths such as /cgi-bin/luci and /luci-static stay untouched.
+location ^~ /api/v1/ {
+	proxy_http_version 1.1;
+	proxy_set_header Host $host;
+	proxy_set_header X-Real-IP $remote_addr;
+	proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+	proxy_set_header X-Forwarded-Proto $scheme;
+	proxy_pass http://127.0.0.1:12517;
+}
+
+location = /login {
+	return 302 /login/;
+}
+
+location ^~ /login/ {
+	alias /www/dreamingwrt/login/;
+	index index.html;
+	add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+	try_files $uri $uri/ /login/index.html;
+}
+
+location = /app {
+	return 302 /app/;
+}
+
+location ^~ /app/ {
+	alias /www/dreamingwrt/app/;
+	index index.html;
+	add_header Cache-Control "no-cache, must-revalidate" always;
+	try_files $uri $uri/ /app/index.html;
+}
+
+location ^~ /static/ {
+	alias /www/dreamingwrt/static/;
+	add_header Cache-Control "no-cache, must-revalidate" always;
+	try_files $uri =404;
+}
+
+location ^~ /plugins/ {
+	alias /www/dreamingwrt/plugins/;
+	add_header Cache-Control "no-cache, must-revalidate" always;
+	try_files $uri =404;
+}
+
+location ^~ /dynamic/ {
+	alias /www/dreamingwrt/dynamic/;
+	add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+	try_files $uri =404;
+}

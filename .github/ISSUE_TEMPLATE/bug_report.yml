@@ -1,0 +1,61 @@
+name: Bug 报告 / Bug report
+description: 提交可复现的 DreamingOS 缺陷
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: 安全漏洞请使用私密报告入口，不要提交到公开 Issue。
+  - type: input
+    id: version
+    attributes:
+      label: DreamingOS 版本或 commit
+      placeholder: 26.07.1 / git SHA
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: 目标平台
+      placeholder: x86_64, device model, RAM/storage
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      placeholder: 请给出最小、稳定的复现步骤。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果与精简日志
+      description: 只提供错误附近的日志，并移除敏感值。
+    validations:
+      required: true
+  - type: dropdown
+    id: private-data
+    attributes:
+      label: 是否依赖未公开数据
+      options:
+        - 不依赖 / No
+        - 不确定 / Unsure
+        - 依赖私有 DPI、指纹或图库数据 / Yes
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交确认
+      options:
+        - label: 我已搜索现有 Issue。
+          required: true
+        - label: 我已移除密码、密钥、公网地址、设备标识和私人流量数据。
+          required: true

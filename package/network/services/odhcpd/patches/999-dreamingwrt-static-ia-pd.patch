@@ -1,0 +1,303 @@
+diff --git a/src/config.c b/src/config.c
+index 48aa2d6..1022d74 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -209,6 +209,9 @@ const struct blobmsg_policy lease_cfg_attrs[LEASE_CFG_ATTR_MAX] = {
+ 	[LEASE_CFG_ATTR_HOSTID] = { .name = "hostid", .type = BLOBMSG_TYPE_STRING },
+ 	[LEASE_CFG_ATTR_LEASETIME] = { .name = "leasetime", .type = BLOBMSG_TYPE_STRING },
+ 	[LEASE_CFG_ATTR_NAME] = { .name = "name", .type = BLOBMSG_TYPE_STRING },
++	[LEASE_CFG_ATTR_PD_PREFIXLEN] = { .name = "pd_prefixlen", .type = BLOBMSG_TYPE_INT32 },
++	[LEASE_CFG_ATTR_PD_INTERFACE] = { .name = "pd_interface", .type = BLOBMSG_TYPE_STRING },
++	[LEASE_CFG_ATTR_PD_ONLY] = { .name = "pd_only", .type = BLOBMSG_TYPE_BOOL },
+ };
+ 
+ const struct uci_blob_param_list lease_cfg_attr_list = {
+@@ -581,6 +584,7 @@ static void free_lease_cfg(struct lease_cfg *lease_cfg)
+ 		return;
+ 
+ 	free(lease_cfg->hostname);
++	free(lease_cfg->pd_interface);
+ 	free(lease_cfg);
+ }
+ 
+@@ -726,6 +730,32 @@ int config_set_lease_cfg_from_blobmsg(struct blob_attr *ba)
+ 		lease_cfg->leasetime = time;
+ 	}
+ 
++	if ((c = tb[LEASE_CFG_ATTR_PD_PREFIXLEN])) {
++		uint32_t prefix_len = blobmsg_get_u32(c);
++
++		if (prefix_len < 33 || prefix_len > 64)
++			goto err;
++		lease_cfg->pd_prefix_len = prefix_len;
++	}
++
++	if ((c = tb[LEASE_CFG_ATTR_PD_INTERFACE])) {
++		const char *ifname = blobmsg_get_string(c);
++
++		if (!ifname[0])
++			goto err;
++		lease_cfg->pd_interface = strdup(ifname);
++		if (!lease_cfg->pd_interface)
++			goto err;
++	}
++
++	if ((c = tb[LEASE_CFG_ATTR_PD_ONLY]))
++		lease_cfg->pd_only = blobmsg_get_bool(c);
++
++	if ((lease_cfg->pd_only || lease_cfg->pd_prefix_len || lease_cfg->pd_interface) &&
++	    (!lease_cfg->duid_count || !lease_cfg->hostid || !lease_cfg->pd_prefix_len ||
++	     !lease_cfg->pd_interface))
++		goto err;
++
+ 	INIT_LIST_HEAD(&lease_cfg->dhcpv6_leases);
+ 	vlist_add(&lease_cfgs, &lease_cfg->node, lease_cfg);
+ 	return 0;
+@@ -1894,6 +1924,11 @@ static int lease_cfg_cmp(const void *k1, const void *k2, _o_unused void *ptr)
+ static void lease_cfg_change(struct lease_cfg *lease_cfg_old, struct lease_cfg *lease_cfg_new)
+ {
+ 	bool update = false;
++	bool pd_changed = lease_cfg_old->pd_prefix_len != lease_cfg_new->pd_prefix_len ||
++		lease_cfg_old->pd_only != lease_cfg_new->pd_only ||
++		!!lease_cfg_old->pd_interface != !!lease_cfg_new->pd_interface ||
++		(lease_cfg_old->pd_interface && lease_cfg_new->pd_interface &&
++		 strcmp(lease_cfg_old->pd_interface, lease_cfg_new->pd_interface));
+ 
+ 	if ((!!lease_cfg_new->hostname != !!lease_cfg_old->hostname) ||
+ 	    (lease_cfg_new->hostname && strcmp(lease_cfg_new->hostname, lease_cfg_old->hostname))) {
+@@ -1921,6 +1956,15 @@ static void lease_cfg_change(struct lease_cfg *lease_cfg_old, struct lease_cfg *
+ 		lease_cfg_delete_dhcpv6_leases(lease_cfg_old);
+ 	}
+ 
++	if (pd_changed) {
++		free(lease_cfg_old->pd_interface);
++		lease_cfg_old->pd_interface = lease_cfg_new->pd_interface ?
++			strdup(lease_cfg_new->pd_interface) : NULL;
++		lease_cfg_old->pd_prefix_len = lease_cfg_new->pd_prefix_len;
++		lease_cfg_old->pd_only = lease_cfg_new->pd_only;
++		lease_cfg_delete_dhcpv6_leases(lease_cfg_old);
++	}
++
+ 	if (update)
+ 		lease_cfg_update_leases(lease_cfg_old);
+ 
+diff --git a/src/dhcpv6-ia.c b/src/dhcpv6-ia.c
+index 7096d47..e14712b 100644
+--- a/src/dhcpv6-ia.c
++++ b/src/dhcpv6-ia.c
+@@ -342,6 +342,7 @@ static void set_border_assignment_size(struct interface *iface, struct dhcpv6_le
+ static bool assign_pd(struct interface *iface, struct dhcpv6_lease *assign)
+ {
+ 	struct dhcpv6_lease *c;
++	bool strict = assign->lease_cfg && assign->lease_cfg->pd_prefix_len;
+ 
+ 	if (iface->addr6_len < 1)
+ 		return false;
+@@ -372,6 +373,10 @@ static bool assign_pd(struct interface *iface, struct dhcpv6_lease *assign)
+ 		}
+ 	}
+ 
++	/* A configured static PD must never drift to a different subnet slot. */
++	if (strict)
++		return false;
++
+ 	/* Fallback to a variable assignment */
+ 	current = 1;
+ 	list_for_each_entry(c, &iface->ia_assignments, head) {
+@@ -1043,6 +1048,8 @@ ssize_t dhcpv6_ia_handle_IAs(uint8_t *buf, size_t buflen, struct interface *ifac
+ 		uint8_t reqlen = (is_pd) ? 62 : 128;
+ 		uint32_t reqhint = 0;
+ 		struct lease_cfg *lease_cfg;
++		bool static_pd = false;
++		bool static_pd_iface = false;
+ 
+ 		lease_cfg = config_find_lease_cfg_by_duid_and_iaid(duid, duid_len, ntohl(ia->iaid));
+ 		if (!lease_cfg)
+@@ -1051,6 +1058,9 @@ ssize_t dhcpv6_ia_handle_IAs(uint8_t *buf, size_t buflen, struct interface *ifac
+ 		if (lease_cfg && lease_cfg->ignore6)
+ 			return -1;
+ 
++		static_pd = lease_cfg && lease_cfg->pd_prefix_len && lease_cfg->pd_interface;
++		static_pd_iface = static_pd && !strcmp(lease_cfg->pd_interface, iface->name);
++
+ 		/* Parse request hint for IA-PD */
+ 		if (is_pd) {
+ 			uint8_t *sdata;
+@@ -1095,6 +1105,17 @@ ssize_t dhcpv6_ia_handle_IAs(uint8_t *buf, size_t buflen, struct interface *ifac
+ 				     iface->dhcpv6_pd_min_len);
+ 				reqlen = iface->dhcpv6_pd_min_len;
+ 			}
++
++			if (static_pd) {
++				uint32_t slot_size;
++
++				reqlen = lease_cfg->pd_prefix_len;
++				reqhint = (uint32_t)lease_cfg->hostid;
++				slot_size = 1U << (64 - reqlen);
++				if (lease_cfg->hostid > UINT32_MAX || !reqhint ||
++				    (reqhint & (slot_size - 1)))
++					static_pd_iface = false;
++			}
+ 		} else if (is_na) {
+ 			uint8_t *sdata;
+ 			uint16_t stype, slen;
+@@ -1197,7 +1218,10 @@ proceed:
+ 			assigned = (a != NULL);
+ 
+ 			if (!a) {
+-				if ((!iface->no_dynamic_dhcp || (lease_cfg && is_na)) &&
++				if ((!iface->no_dynamic_dhcp || (lease_cfg &&
++				     ((is_na && !lease_cfg->pd_only) || (is_pd && static_pd_iface)))) &&
++				    (!lease_cfg || !lease_cfg->pd_only || is_pd) &&
++				    (!static_pd || static_pd_iface) &&
+ 				    (iface->dhcpv6_pd || iface->dhcpv6_na)) {
+ 					/* Create new binding */
+ 					a = dhcpv6_alloc_lease(duid_len);
+@@ -1210,6 +1234,7 @@ proceed:
+ 						a->peer = *addr;
+ 						a->iface = iface;
+ 						a->flags = is_pd ? OAF_DHCPV6_PD : OAF_DHCPV6_NA;
++						a->lease_cfg = lease_cfg;
+ 						a->valid_until = now;
+ 						a->preferred_until = now;
+ 
+@@ -1224,8 +1249,11 @@ proceed:
+ 							odhcpd_urandom(a->key, sizeof(a->key));
+ 
+ 						if (is_pd && iface->dhcpv6_pd) {
+-							while (!(assigned = assign_pd(iface, a)) &&
+-							       ++a->length <= 64);
++							if (static_pd)
++								assigned = assign_pd(iface, a);
++							else
++								while (!(assigned = assign_pd(iface, a)) &&
++								       ++a->length <= 64);
+ 						} else if (is_na && iface->dhcpv6_na) {
+ 							assigned = assign_na(iface, a);
+ 						}
+@@ -1240,7 +1268,6 @@ proceed:
+ 								a->leasetime = lease_cfg->leasetime;
+ 
+ 							list_add(&a->lease_cfg_list, &lease_cfg->dhcpv6_leases);
+-							a->lease_cfg = lease_cfg;
+ 						}
+ 					}
+ 				}
+diff --git a/src/odhcpd.h b/src/odhcpd.h
+index bde4f30..81ac5f7 100644
+--- a/src/odhcpd.h
++++ b/src/odhcpd.h
+@@ -322,6 +322,9 @@ struct lease_cfg {
+ 	struct duid *duids;
+ 	uint32_t leasetime;		// duration of granted leases, UINT32_MAX = inf
+ 	char *hostname;
++	char *pd_interface;
++	uint8_t pd_prefix_len;
++	bool pd_only;
+ 	bool ignore4;
+ 	bool ignore6;
+ };
+@@ -508,9 +511,13 @@ enum {
+ 	LEASE_CFG_ATTR_HOSTID,
+ 	LEASE_CFG_ATTR_LEASETIME,
+ 	LEASE_CFG_ATTR_NAME,
++	LEASE_CFG_ATTR_PD_PREFIXLEN,
++	LEASE_CFG_ATTR_PD_INTERFACE,
++	LEASE_CFG_ATTR_PD_ONLY,
+ 	LEASE_CFG_ATTR_MAX
+ };
+ extern const struct blobmsg_policy lease_cfg_attrs[LEASE_CFG_ATTR_MAX];
++extern struct vlist_tree lease_cfgs;
+ 
+ inline static bool ra_pio_expired(const struct ra_pio *pio, time_t now)
+ {
+diff --git a/src/ubus.c b/src/ubus.c
+index d6b3c0a..640d41a 100644
+--- a/src/ubus.c
++++ b/src/ubus.c
+@@ -178,6 +178,72 @@ static int handle_dhcpv6_leases(_o_unused struct ubus_context *ctx, _o_unused st
+ 	return 0;
+ }
+ 
++static int handle_static_leases(struct ubus_context *ctx, _o_unused struct ubus_object *obj,
++		struct ubus_request_data *req, _o_unused const char *method,
++		_o_unused struct blob_attr *msg)
++{
++	struct lease_cfg *cfg;
++	void *leases;
++
++	blob_buf_init(&b, 0);
++	leases = blobmsg_open_array(&b, "leases");
++	vlist_for_each_element(&lease_cfgs, cfg, node) {
++		struct dhcpv6_lease *lease;
++		void *entry, *duids, *bindings;
++		char hostid[sizeof(cfg->hostid) * 2 + 1];
++		bool bound = false;
++
++		entry = blobmsg_open_table(&b, NULL);
++		blobmsg_add_string(&b, "name", cfg->hostname ? cfg->hostname : "");
++		snprintf(hostid, sizeof(hostid), "%" PRIx64, cfg->hostid);
++		blobmsg_add_string(&b, "hostid", hostid);
++		blobmsg_add_u32(&b, "pd_prefixlen", cfg->pd_prefix_len);
++		blobmsg_add_string(&b, "pd_interface", cfg->pd_interface ? cfg->pd_interface : "");
++		blobmsg_add_u8(&b, "pd_only", cfg->pd_only);
++		blobmsg_add_u8(&b, "configured", true);
++
++		duids = blobmsg_open_array(&b, "duids");
++		for (size_t i = 0; i < cfg->duid_count; i++) {
++			void *d = blobmsg_open_table(&b, NULL);
++			char *buf = blobmsg_alloc_string_buffer(&b, "duid", DUID_HEXSTRLEN + 1);
++			odhcpd_hexlify(buf, cfg->duids[i].id, cfg->duids[i].len);
++			blobmsg_add_string_buffer(&b);
++			if (cfg->duids[i].iaid_set)
++				blobmsg_add_u32(&b, "iaid", cfg->duids[i].iaid);
++			blobmsg_close_table(&b, d);
++		}
++		blobmsg_close_array(&b, duids);
++
++		bindings = blobmsg_open_array(&b, "bindings");
++		list_for_each_entry(lease, &cfg->dhcpv6_leases, lease_cfg_list) {
++			void *binding, *prefixes;
++			char *buf;
++
++			if (!(lease->flags & OAF_DHCPV6_PD))
++				continue;
++			binding = blobmsg_open_table(&b, NULL);
++			buf = blobmsg_alloc_string_buffer(&b, "duid", DUID_HEXSTRLEN + 1);
++			odhcpd_hexlify(buf, lease->duid, lease->duid_len);
++			blobmsg_add_string_buffer(&b);
++			blobmsg_add_u32(&b, "iaid", ntohl(lease->iaid));
++			blobmsg_add_u8(&b, "bound", lease->bound);
++			prefixes = blobmsg_open_array(&b, "prefixes");
++			odhcpd_enum_addr6(lease->iface, lease, odhcpd_time(),
++					dhcpv6_blobmsg_ia_addr, NULL);
++			blobmsg_close_array(&b, prefixes);
++			blobmsg_close_table(&b, binding);
++			bound |= lease->bound;
++		}
++		blobmsg_close_array(&b, bindings);
++		blobmsg_add_u8(&b, "bound", bound);
++		blobmsg_close_table(&b, entry);
++	}
++	blobmsg_close_array(&b, leases);
++	ubus_send_reply(ctx, req, b.head);
++
++	return 0;
++}
++
+ static int handle_ra_pio(_o_unused struct ubus_context *ctx, _o_unused struct ubus_object *obj,
+ 		_o_unused struct ubus_request_data *req, _o_unused const char *method,
+ 		_o_unused struct blob_attr *msg)
+@@ -249,6 +315,7 @@ static struct ubus_method main_object_methods[] = {
+ 	{ .name = "ipv4leases", .handler = handle_dhcpv4_leases },
+ #endif /* DHCPV4_SUPPORT */
+ 	{ .name = "ipv6leases", .handler = handle_dhcpv6_leases },
++	{ .name = "static_leases", .handler = handle_static_leases },
+ 	{ .name = "ipv6ra", .handler = handle_ra_pio },
+ 	UBUS_METHOD("add_lease", handle_add_lease_cfg, lease_cfg_attrs),
+ };
+@@ -521,4 +588,3 @@ int ubus_init(void)
+ 
+ 	return 0;
+ }
+-

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>旧版日志中心恢复 Fixture</title>
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/log-center.css">
+  <style>
+    :root {
+      --app-text: rgb(238 244 252); --app-text-secondary: rgb(213 224 239); --app-text-muted: rgb(176 193 215);
+      --dwrt-ink: var(--app-text); --dwrt-muted: var(--app-text-muted); --dwrt-faint: rgb(176 193 215 / .65);
+      --app-accent: rgb(35 132 255); --app-page-gap: 14px; --app-page-gutter-block: 14px; --app-page-gutter-inline: 14px;
+      --app-radius-card: 20px; --app-radius-control: 9px; --app-radius-compact: 7px;
+    }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; color: var(--app-text); background: linear-gradient(135deg, rgb(22 49 83), rgb(19 97 91)); font-family: Lato, "PingFang SC", system-ui, sans-serif; }
+    .console-stage { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr); }
+    #routePreview { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+  </style>
+</head>
+<body>
+  <main class="console-stage is-log-center"><div class="route-preview" id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script src="../../files/www/dreamingwrt/static/js/log-center.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/log-center.js';
+
+    const rows = Array.from({ length: 120 }, (_, index) => ({
+      id: `legacy-${index + 1}`,
+      source: index % 4 === 0 ? 'kernel' : 'dreamingwrt-init',
+      module: index % 3 === 0 ? 'dnsmasq' : 'dreamingwrt-init',
+      severity: index % 17 === 0 ? 'VERY_HIGH' : index % 7 === 0 ? 'HIGH' : index % 3 === 0 ? 'MEDIUM' : 'LOW',
+      event: index % 4 === 0 ? 'KERNEL_LOG' : 'SYSTEM_LOG',
+      title: index % 4 === 0 ? '内核状态变化' : '系统服务事件',
+      message: `Fixture 旧版日志 ${index + 1}：接口状态与运行数据已更新`,
+      timestamp: Date.now() - index * 1000,
+      raw: `legacy raw fixture ${index + 1}`
+    }));
+
+    let instance = null;
+    let requestCount = 0;
+    window.LOGS_FIXTURE = {
+      async mount() {
+        instance?.unmount?.();
+        requestCount = 0;
+        const controller = new AbortController();
+        instance = await mount({
+          root: document.getElementById('routePreview'),
+          signal: controller.signal,
+          item: { id: 'log-center' },
+          route: '#/logs',
+          path: '/app/#/logs',
+          api: {
+            fetch: async () => {
+              requestCount += 1;
+              return { ok: true, data: { function_logs: rows, settings: { capabilities: { search: false } }, capabilities: { search: false } } };
+            },
+            authHeaders: (headers = {}) => headers,
+            routeTo: () => {}
+          },
+          ui: { mountAll: (node) => window.DWRT_UI_KIT.mountAll(node), scheduleGlassCardsRender: () => {} },
+          utils: {
+            escapeHtml: (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]),
+            formatInteger: (value) => Number(value || 0).toLocaleString('zh-CN')
+          }
+        });
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        return { requestCount };
+      },
+      requests() { return requestCount; },
+      unmount() { instance?.unmount?.(); return { children: document.getElementById('routePreview').childElementCount }; }
+    };
+    await window.LOGS_FIXTURE.mount();
+    window.LOGS_FIXTURE_READY = true;
+  </script>
+</body>
+</html>

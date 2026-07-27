@@ -1,0 +1,773 @@
+{
+  "version": "20260725-dreaming-os-01",
+  "generated_at": "2026-07-25T15:00:00+08:00",
+  "meta": {
+    "name": "Dreaming OS standalone console menu",
+    "schema": "dreamingwrt-menu-v1",
+    "runtime_override": "/dynamic/menu/1.json",
+    "source": [
+      "dreamingwrt-web/static/menu/main.json",
+      "dreamingwrt-web/static/js/menu-icons.js",
+      "dreamingwrt-web/plugins/native"
+    ],
+    "notes": "Static fallback belongs to the standalone Web. Installed native or advanced plugin entries are merged by webd/jmxd into /dynamic/menu/1.json."
+  },
+  "hidePages": ["/app/#/network/network-control"],
+  "hideFuncs": ["advanced_plugins", "advanced_plugins_index", "container_service"],
+  "addFuncs": [],
+  "items": [
+    {
+      "label": "仪表盘",
+      "func_name": "dashboard",
+      "id": "dashboard",
+      "icon": "dashboard",
+      "path": "/app/#/dashboard"
+    },
+    {
+      "label": "监控中心",
+      "func_name": "monitor",
+      "id": "monitor",
+      "icon": "monitor",
+      "path": "/app/#/monitor/topology",
+      "children": [
+        {
+          "label": "拓扑图",
+          "func_name": "topology",
+          "id": "topology",
+          "icon": "topology",
+          "path": "/app/#/monitor/topology"
+        },
+        {
+          "label": "线路状态",
+          "func_name": "line_status",
+          "id": "line-status",
+          "icon": "line_status",
+          "path": "/app/#/monitor/line-status"
+        },
+        {
+          "label": "无线状态",
+          "func_name": "wireless_status",
+          "id": "wireless-status",
+          "icon": "wireless_status",
+          "path": "/app/#/monitor/wireless-status",
+          "module": "native/wifi-management.js",
+          "module_version": "20260726-wifi-scan-reasons-01",
+          "style": "/static/css/wifi-management.css",
+          "style_version": "20260726-wifi-scan-reasons-01"
+        },
+        {
+          "label": "终端详情",
+          "func_name": "client_detail",
+          "id": "client-details",
+          "icon": "client_detail",
+          "path": "/app/#/monitor/client-details"
+        },
+        {
+          "label": "系统健康",
+          "func_name": "system_health",
+          "id": "system-health",
+          "icon": "system_health",
+          "path": "/app/#/monitor/system-health"
+        },
+        {
+          "label": "分流状态",
+          "func_name": "route_status_view",
+          "id": "policy-status",
+          "icon": "route_status_view",
+          "path": "/app/#/monitor/policy-status",
+          "module": "native/policy-status.js",
+          "module_version": "20260718-11",
+          "style": "/static/css/policy-status.css",
+          "style_version": "20260718-11"
+        }
+      ]
+    },
+    {
+      "label": "网络配置",
+      "func_name": "network_config",
+      "id": "network-config",
+      "icon": "network_config",
+      "path": "/app/#/network/global-config",
+      "children": [
+        {
+          "label": "全局配置",
+          "func_name": "global",
+          "id": "global-config",
+          "icon": "global_config",
+          "path": "/app/#/network/global-config",
+          "module": "native/global-config.js",
+          "module_version": "20260722-42",
+          "style": "/static/css/global-config.css",
+          "style_version": "20260722-42"
+        },
+        {
+          "label": "DHCP 服务",
+          "func_name": "dhcp",
+          "id": "dhcp-service",
+          "icon": "dhcp",
+          "path": "/app/#/network/dhcp-service",
+          "module": "native/network-services.js",
+          "module_version": "20260725-dns-02",
+          "style": "/static/css/network-services.css",
+          "style_version": "20260725-dns-02"
+        },
+        {
+          "label": "DNS 服务",
+          "func_name": "dns",
+          "id": "dns-service",
+          "icon": "dns",
+          "path": "/app/#/network/dns-service",
+          "module": "native/network-services.js",
+          "module_version": "20260725-dns-02",
+          "style": "/static/css/network-services.css",
+          "style_version": "20260725-dns-02"
+        },
+        {
+          "label": "UPnP IGD",
+          "func_name": "upnp",
+          "id": "upnp-service",
+          "icon": "upnp",
+          "path": "/app/#/network/upnp-service",
+          "module": "native/upnp-service.js",
+          "module_version": "20260724-upnp-service-02",
+          "style": "/static/css/upnp-service.css",
+          "style_version": "20260724-upnp-service-02",
+          "frontend_owned": true
+        },
+        {
+          "label": "流控分流",
+          "func_name": "flow",
+          "id": "flow-control",
+          "icon": "flow",
+          "path": "/app/#/network/flow-control",
+          "capability": "flow_control_workbench",
+          "availability": "unavailable",
+          "unavailable_reason": "当前固件未提供流控分流配置与应用 API。"
+        },
+        {
+          "label": "批量 IP 管理",
+          "func_name": "bulk_ip",
+          "id": "bulk-ip",
+          "icon": "bulk_ip",
+          "path": "/app/#/network/bulk-ip",
+          "capability": "bulk_ip_transaction",
+          "availability": "unavailable",
+          "unavailable_reason": "当前固件未提供批量 IP 冲突检查、事务应用与回滚 API。"
+        },
+        {
+          "label": "Wi-Fi",
+          "func_name": "wifi",
+          "id": "wifi-config",
+          "icon": "wifi",
+          "path": "/app/#/network/wifi-config",
+          "module": "native/wifi-management.js",
+          "module_version": "20260726-wifi-scan-reasons-01",
+          "style": "/static/css/wifi-management.css",
+          "style_version": "20260726-wifi-scan-reasons-01"
+        },
+        {
+          "label": "高级路由",
+          "func_name": "advanced_routes",
+          "id": "advanced-routing",
+          "icon": "advanced_routes",
+          "path": "/app/#/network/advanced-routing",
+          "capability": "advanced_routing_workbench",
+          "availability": "unavailable",
+          "unavailable_reason": "高级路由尚未形成独立能力合同，请使用策略引擎中的路由表。"
+        },
+        {
+          "label": "自定义",
+          "func_name": "custom",
+          "id": "custom-config",
+          "icon": "custom",
+          "path": "/app/#/network/custom-config",
+          "capability": "raw_network_config",
+          "availability": "unavailable",
+          "unavailable_reason": "当前固件未提供原始网络配置校验、差异预览与安全应用 API。"
+        },
+        {
+          "label": "组播服务",
+          "func_name": "multicast",
+          "id": "multicast-service",
+          "icon": "multicast",
+          "path": "/app/#/network/multicast-service",
+          "module": "native/multicast-service.js",
+          "module_version": "20260725-multicast-workbench-04",
+          "style": "/static/css/multicast-service.css",
+          "style_version": "20260725-multicast-workbench-04",
+          "availability": "available",
+          "frontend_owned": true
+        },
+        {
+          "label": "防火墙",
+          "func_name": "firewall",
+          "id": "firewall",
+          "icon": "firewall",
+          "path": "/app/#/network/firewall",
+          "capability": "firewall_policy",
+          "availability": "unavailable",
+          "unavailable_reason": "防火墙规则尚未提供独立合同，请使用策略表的防火墙视图。"
+        },
+        {
+          "label": "VPN",
+          "func_name": "vpn",
+          "id": "vpn-config",
+          "icon": "vpn",
+          "path": "/app/#/network/vpn-config",
+          "capability": "vpn",
+          "availability": "available",
+          "frontend_owned": true,
+          "module": "native/vpn-config.js",
+          "module_version": "20260723-vpn-01",
+          "style": "/static/css/vpn-config.css",
+          "style_version": "20260723-vpn-01"
+        },
+        {
+          "label": "QWRT模组管理",
+          "func_name": "qwrt_modules",
+          "id": "qwrt-modules",
+          "icon": "qwrt_modules",
+          "path": "/app/#/network/qwrt-modules",
+          "capability": "qwrt_modules",
+          "availability": "unavailable",
+          "unavailable_reason": "当前设备未提供 QWRT 模组清单与管理 API。"
+        }
+      ]
+    },
+    {
+      "label": "认证与管控",
+      "func_name": "user_authentication",
+      "id": "user-authentication",
+      "icon": "user_authentication",
+      "override_runtime_label": true,
+      "path": "/app/#/authentication/web",
+      "children": [
+        {
+          "label": "WEB认证",
+          "func_name": "authentication_web",
+          "id": "authentication-web",
+          "icon": "authentication_web",
+          "path": "/app/#/authentication/web",
+          "module": "native/user-authentication.js",
+          "module_version": "20260725-dreaming-os-01",
+          "style": "/static/css/user-authentication.css",
+          "style_version": "20260719-10"
+        },
+        {
+          "label": "在线用户",
+          "func_name": "authentication_online_users",
+          "id": "authentication-online-users",
+          "icon": "authentication_online_users",
+          "path": "/app/#/authentication/online-users",
+          "module": "native/user-authentication.js",
+          "module_version": "20260725-dreaming-os-01",
+          "style": "/static/css/user-authentication.css",
+          "style_version": "20260719-10"
+        },
+        {
+          "label": "账号管理",
+          "func_name": "authentication_accounts",
+          "id": "authentication-accounts",
+          "icon": "authentication_accounts",
+          "path": "/app/#/authentication/accounts",
+          "module": "native/user-authentication.js",
+          "module_version": "20260725-dreaming-os-01",
+          "style": "/static/css/user-authentication.css",
+          "style_version": "20260719-10"
+        },
+        {
+          "label": "代拨服务",
+          "func_name": "authentication_delegated",
+          "id": "authentication-delegated",
+          "icon": "authentication_delegated",
+          "path": "/app/#/authentication/delegated",
+          "module": "native/user-authentication.js",
+          "module_version": "20260725-dreaming-os-01",
+          "style": "/static/css/user-authentication.css",
+          "style_version": "20260719-10"
+        },
+        {
+          "label": "终端限速",
+          "func_name": "authentication_client_speed_limit",
+          "id": "authentication-client-speed-limit",
+          "icon": "authentication_client_speed_limit",
+          "path": "/app/#/authentication/client-speed-limit",
+          "capability": "client_speed_limit",
+          "availability": "unavailable",
+          "unavailable_reason": "当前固件尚未提供终端限速规则、应用与运行态读取 API。"
+        },
+        {
+          "label": "网址浏览控制",
+          "func_name": "authentication_web_access_control",
+          "id": "authentication-web-access-control",
+          "icon": "authentication_web_access_control",
+          "path": "/app/#/authentication/web-access-control",
+          "capability": "web_access_control",
+          "availability": "unavailable",
+          "unavailable_reason": "当前固件尚未提供网址访问规则、命中记录与应用 API。"
+        },
+        {
+          "label": "APP过滤",
+          "func_name": "authentication_app_filter",
+          "id": "authentication-app-filter",
+          "icon": "authentication_app_filter",
+          "path": "/app/#/authentication/app-filter",
+          "capability": "app_filter",
+          "availability": "unavailable",
+          "unavailable_reason": "当前固件尚未提供 APP 过滤策略、特征匹配与应用 API。"
+        },
+        {
+          "label": "终端联网控制",
+          "func_name": "authentication_client_network_control",
+          "id": "authentication-client-network-control",
+          "icon": "authentication_client_network_control",
+          "path": "/app/#/authentication/client-network-control",
+          "capability": "client_network_control",
+          "availability": "unavailable",
+          "unavailable_reason": "当前固件尚未提供终端联网控制规则、调度与应用 API。"
+        },
+        {
+          "label": "认证通知",
+          "func_name": "authentication_notifications",
+          "id": "authentication-notifications",
+          "icon": "authentication_notifications",
+          "path": "/app/#/authentication/notifications",
+          "module": "native/user-authentication.js",
+          "module_version": "20260725-dreaming-os-01",
+          "style": "/static/css/user-authentication.css",
+          "style_version": "20260719-10"
+        }
+      ]
+    },
+    {
+      "label": "原生插件",
+      "func_name": "native_plugins",
+      "id": "native-plugins",
+      "icon": "native_plugins",
+      "slot": "native_plugins",
+      "path": "/app/#/plugins/native",
+      "capability": "native_plugin_overview",
+      "availability": "unavailable",
+      "unavailable_reason": "这是插件分组入口，请选择已安装的原生插件。",
+      "children": [
+        {
+          "label": "快捷工具",
+          "func_name": "native_quick_tools",
+          "id": "native-quick-tools",
+          "icon": "quick_tools",
+          "path": "/app/#/plugins/native/quick-tools",
+          "module": "native/quick-tools.js",
+          "module_version": "20260711-05",
+          "style": "/static/css/quick-tools.css",
+          "style_version": "20260711-02"
+        },
+        {
+          "label": "Docker",
+          "func_name": "docker",
+          "id": "container-docker",
+          "icon": "docker",
+          "path": "/app/#/container/docker",
+          "module": "native/container-service.js",
+          "module_version": "20260722-overlay-01",
+          "style": "/static/css/container-service.css",
+          "style_version": "20260719-03",
+          "frontend_owned": true
+        },
+        {
+          "label": "LXC",
+          "func_name": "lxc",
+          "id": "container-lxc",
+          "icon": "lxc",
+          "path": "/app/#/container/lxc",
+          "module": "native/container-service.js",
+          "module_version": "20260722-overlay-01",
+          "style": "/static/css/container-service.css",
+          "style_version": "20260719-03",
+          "frontend_owned": true
+        },
+        {
+          "label": "插件市场",
+          "func_name": "plugin_market",
+          "id": "plugin-market",
+          "icon": "plugin_market",
+          "path": "/app/#/plugins/market",
+          "capability": "plugin_market",
+          "availability": "unavailable",
+          "unavailable_reason": "当前固件未提供插件目录、信任、安装进度与恢复 API。"
+        }
+      ]
+    },
+    {
+      "label": "存储服务",
+      "func_name": "storage_service",
+      "id": "storage-service",
+      "icon": "storage_service",
+      "path": "/app/#/storage",
+      "children": [
+        {
+          "label": "概览",
+          "func_name": "storage_overview",
+          "id": "storage-overview",
+          "icon": "storage_overview",
+          "path": "/app/#/storage",
+          "module": "native/storage-overview.js",
+          "module_version": "20260722-overlay-01",
+          "style": "/static/css/storage-overview.css",
+          "style_version": "20260722-overlay-01"
+        },
+        {
+          "label": "磁盘分区",
+          "func_name": "storage_partitions",
+          "id": "storage-partitions",
+          "icon": "storage_partitions",
+          "path": "/app/#/storage/partitions",
+          "module": "native/storage-partitions.js",
+          "module_version": "20260724-storage-partitions-01",
+          "style": "/static/css/storage-partitions.css",
+          "style_version": "20260724-storage-partitions-01",
+          "availability": "available",
+          "frontend_owned": true
+        },
+        {
+          "label": "挂载点",
+          "func_name": "storage_mounts",
+          "id": "storage-mounts",
+          "icon": "storage_mounts",
+          "path": "/app/#/storage/mounts",
+          "module": "native/system-settings.js",
+          "module_version": "20260727-pair-approve-01",
+          "style": "/static/css/system-settings.css",
+          "style_version": "20260720-03"
+        },
+        {
+          "label": "文件管理",
+          "func_name": "storage_files",
+          "id": "storage-files",
+          "icon": "storage_files",
+          "path": "/app/#/storage/files",
+          "module": "native/storage-files.js",
+          "module_version": "20260716-25",
+          "style": "/static/css/storage-files.css",
+          "style_version": "20260716-24"
+        },
+        {
+          "label": "RAID 管理",
+          "func_name": "storage_raid",
+          "id": "storage-raid",
+          "icon": "storage_raid",
+          "path": "/app/#/storage/raid",
+          "module": "native/storage-raid.js",
+          "module_version": "20260722-overlay-01",
+          "style": "/static/css/storage-raid.css",
+          "style_version": "20260716-20"
+        },
+        {
+          "label": "文件服务",
+          "func_name": "storage_file_services",
+          "id": "storage-file-services",
+          "icon": "storage_file_services",
+          "path": "/app/#/storage/file-services",
+          "module": "native/storage-file-services.js",
+          "module_version": "20260725-dreaming-os-01",
+          "style": "/static/css/storage-file-services.css",
+          "style_version": "20260719-01"
+        }
+      ]
+    },
+    {
+      "label": "洞察",
+      "func_name": "insights",
+      "id": "insights",
+      "icon": "insights",
+      "path": "/app/#/insights/flows",
+      "children": [
+        {
+          "label": "流量",
+          "func_name": "insights_flows",
+          "id": "insights-flows",
+          "icon": "insights",
+          "path": "/app/#/insights/flows"
+        },
+        {
+          "label": "活动",
+          "func_name": "insights_activity",
+          "id": "insights-activity",
+          "icon": "log_center",
+          "path": "/app/#/insights/activity"
+        },
+        {
+          "label": "URL 审计",
+          "func_name": "insights_url_audit",
+          "id": "insights-url-audit",
+          "icon": "audit_view",
+          "path": "/app/#/insights/activity/url-audit"
+        },
+        {
+          "label": "终端在线",
+          "func_name": "insights_online_records",
+          "id": "insights-online-records",
+          "icon": "client_detail",
+          "path": "/app/#/insights/activity/online-records"
+        },
+        {
+          "label": "IM 在线",
+          "func_name": "insights_im_records",
+          "id": "insights-im-records",
+          "icon": "advanced_audit",
+          "path": "/app/#/insights/activity/im-records"
+        },
+        {
+          "label": "协议与应用",
+          "func_name": "insights_protocol_app",
+          "id": "insights-protocol-app",
+          "icon": "audit_view",
+          "path": "/app/#/insights/activity/protocol-app"
+        },
+        {
+          "label": "审计状态",
+          "func_name": "insights_audit_status",
+          "id": "insights-audit-status",
+          "icon": "system_health",
+          "path": "/app/#/insights/activity/audit-status"
+        }
+      ]
+    },
+    {
+      "label": "策略引擎",
+      "func_name": "policy_engine",
+      "id": "policy-engine",
+      "icon": "policy_engine",
+      "path": "/app/#/policy-engine/aegisx",
+      "children": [
+        {
+          "label": "Aegisx",
+          "func_name": "policy_aegisx",
+          "id": "policy-aegisx",
+          "icon": "policy_aegisx",
+          "path": "/app/#/policy-engine/aegisx",
+          "module": "native/aegisx.js",
+          "module_version": "20260722-overlay-01",
+          "style": "/static/css/aegisx.css",
+          "style_version": "20260719-13"
+        },
+        {
+          "label": "策略表",
+          "func_name": "policy_table",
+          "id": "policy-table",
+          "icon": "policy_table",
+          "path": "/app/#/policy-engine/table",
+          "module": "native/policy-table.js",
+          "module_version": "20260715-06",
+          "style": "/static/css/policy-table.css",
+          "style_version": "20260715-03"
+        },
+        {
+          "label": "终端分组",
+          "func_name": "policy_terminal_groups",
+          "id": "policy-terminal-groups",
+          "icon": "policy_terminal_groups",
+          "path": "/app/#/policy-engine/terminal-groups",
+          "module": "native/terminal-groups.js",
+          "module_version": "20260711-02",
+          "style": "/static/css/terminal-groups.css",
+          "style_version": "20260711-01"
+        },
+        {
+          "label": "区域",
+          "func_name": "policy_region",
+          "id": "policy-region",
+          "icon": "policy_region",
+          "path": "/app/#/policy-engine/regions",
+          "module": "native/policy-regions.js",
+          "module_version": "20260721-02",
+          "style": "/static/css/policy-entities.css",
+          "style_version": "20260721-02"
+        },
+        {
+          "label": "对象",
+          "func_name": "policy_object",
+          "id": "policy-object",
+          "icon": "policy_object",
+          "path": "/app/#/policy-engine/objects",
+          "module": "native/policy-objects.js",
+          "module_version": "20260721-02",
+          "style": "/static/css/policy-entities.css",
+          "style_version": "20260721-02"
+        },
+        {
+          "label": "路由表",
+          "func_name": "policy_routes",
+          "id": "policy-routes",
+          "icon": "policy_routes",
+          "path": "/app/#/policy-engine/routes",
+          "module": "native/routing-table.js",
+          "module_version": "20260722-overlay-01",
+          "style": "/static/css/routing-table.css",
+          "style_version": "20260722-overlay-01"
+        }
+      ]
+    },
+    {
+      "label": "日志中心",
+      "func_name": "log_center",
+      "id": "log-center",
+      "icon": "log_center",
+      "path": "/app/#/logs",
+      "module": "native/log-center.js",
+      "module_version": "20260722-legacy-restore-01",
+      "style": "/static/css/log-center.css",
+      "style_version": "20260722-legacy-restore-01",
+      "frontend_owned": true,
+      "capability": "logs",
+      "bottom": true
+    },
+    {
+      "label": "系统设置",
+      "func_name": "system",
+      "id": "system",
+      "icon": "system",
+      "path": "/app/#/system/general",
+      "bottom": true,
+      "children": [
+        {
+          "label": "常规",
+          "func_name": "system_general",
+          "id": "system-general",
+          "icon": "general",
+          "path": "/app/#/system/general",
+          "module": "native/system-settings.js",
+      "module_version": "20260727-pair-approve-01",
+      "style": "/static/css/system-settings.css",
+      "style_version": "20260720-03"
+        },
+        {
+          "label": "管理员",
+          "func_name": "system_admin",
+          "id": "system-admin",
+          "icon": "system",
+          "path": "/app/#/system/admin",
+          "module": "native/system-settings.js",
+      "module_version": "20260727-pair-approve-01",
+      "style": "/static/css/system-settings.css",
+      "style_version": "20260720-03"
+        },
+        {
+          "label": "通知推送",
+          "func_name": "system_notifications",
+          "id": "system-notifications",
+          "icon": "system_notifications",
+          "path": "/app/#/system/notifications",
+          "module": "native/notification-push.js",
+          "module_version": "20260727-notify-catalog-01",
+          "style": "/static/css/notification-push.css",
+          "style_version": "20260722-overlay-01"
+        },
+        {
+          "label": "LLM 接入设置",
+          "func_name": "system_llm_settings",
+          "id": "system-llm-settings",
+          "icon": "ai",
+          "path": "/app/#/system/llm-settings",
+          "module": "native/ai-assistant.js",
+          "module_version": "20260725-dreaming-os-01",
+          "style": "/static/css/ai-assistant.css",
+          "style_version": "20260721-01",
+          "frontend_owned": true
+        },
+        {
+          "label": "启动项",
+          "func_name": "system_startup",
+          "id": "system-startup",
+          "icon": "qwrt_modules",
+          "path": "/app/#/system/startup",
+          "module": "native/system-settings.js",
+      "module_version": "20260727-pair-approve-01",
+      "style": "/static/css/system-settings.css",
+      "style_version": "20260720-03"
+        },
+        {
+          "label": "计划任务",
+          "func_name": "system_crontab",
+          "id": "system-crontab",
+          "icon": "log_center",
+          "path": "/app/#/system/crontab",
+          "module": "native/system-settings.js",
+      "module_version": "20260727-pair-approve-01",
+      "style": "/static/css/system-settings.css",
+      "style_version": "20260720-03"
+        },
+        {
+          "label": "终端",
+          "func_name": "system_terminal",
+          "id": "system-terminal",
+          "icon": "system_terminal",
+          "path": "/app/#/system/terminal",
+          "module": "native/system-terminal.js",
+          "module_version": "20260722-overlay-01",
+          "style": "/static/css/system-terminal.css",
+          "style_version": "20260722-overlay-01",
+          "frontend_owned": true
+        },
+        {
+          "label": "关机 / 重启",
+          "func_name": "system_power",
+          "id": "system-power",
+          "icon": "system_power",
+          "path": "/app/#/system/power",
+          "module": "native/system-power.js",
+          "module_version": "20260719-07",
+          "style": "/static/css/system-power.css",
+          "style_version": "20260719-07",
+          "frontend_owned": true
+        },
+        {
+          "label": "高级",
+          "func_name": "system_advanced",
+          "id": "system-advanced",
+          "icon": "advanced_plugins",
+          "path": "/app/#/system/advanced",
+          "module": "native/system-settings.js",
+          "module_version": "20260727-pair-approve-01",
+          "style": "/static/css/system-settings.css",
+          "style_version": "20260720-03"
+        },
+        {
+          "label": "备份 / 升级",
+          "func_name": "system_flash",
+          "id": "system-flash",
+          "icon": "wan",
+          "path": "/app/#/system/flash",
+          "module": "native/system-settings.js",
+          "module_version": "20260727-pair-approve-01",
+          "style": "/static/css/system-settings.css",
+          "style_version": "20260720-03"
+        },
+        {
+          "label": "外观",
+          "func_name": "system_appearance",
+          "id": "system-appearance",
+          "icon": "system",
+          "path": "/app/#/system/appearance",
+          "module": "native/appearance-settings.js",
+          "module_version": "20260725-dreaming-os-01",
+          "style": "/static/css/appearance-settings.css",
+          "style_version": "20260722-04",
+          "frontend_owned": true,
+          "capability": "appearance"
+        }
+      ]
+    },
+    {
+      "label": "用户",
+      "func_name": "system_users",
+      "id": "system-users",
+      "icon": "system_users",
+      "path": "/app/#/system/users",
+      "module": "native/system-users.js",
+      "module_version": "20260722-overlay-01",
+      "style": "/static/css/system-users.css",
+      "style_version": "20260710-02",
+      "bottom": true
+    }
+  ]
+}

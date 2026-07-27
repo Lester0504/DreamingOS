@@ -1,0 +1,24 @@
+--- a/net/wireless/sysfs.c
++++ b/net/wireless/sysfs.c
+@@ -154,12 +154,21 @@
+ #define WIPHY_PM_OPS NULL
+ #endif
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
++static const struct ns_common *wiphy_namespace(const struct device *d)
++{
++	struct wiphy *wiphy = container_of(d, struct wiphy, dev);
++
++	return &wiphy_net(wiphy)->ns;
++}
++#else
+ static const void *wiphy_namespace(const struct device *d)
+ {
+ 	struct wiphy *wiphy = container_of(d, struct wiphy, dev);
+ 
+ 	return wiphy_net(wiphy);
+ }
++#endif
+ 
+ struct class ieee80211_class = {
+ 	.name = "ieee80211",

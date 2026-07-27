@@ -1,0 +1,30 @@
+From f42b63871e0db6a2c8db5dc8aa33e462bb561571 Mon Sep 17 00:00:00 2001
+From: Chukun Pan <amadeus@jmu.edu.cn>
+Date: Thu, 12 Oct 2023 22:01:20 +0800
+Subject: [PATCH] wifi: rtw88: 8822b: disable call trace when write RF mode
+ table fail
+
+The rtw88 driver throws a useless Call Trace when the rtl8812bu
+or rtl8822be wifi modules fail to write the RF mode table.
+Since this does not affect normal use of the wifi modules,
+replace WARN() with driver warning to avoid useless panic.
+
+Signed-off-by: Chukun Pan <amadeus@jmu.edu.cn>
+---
+ drivers/net/wireless/realtek/rtw88/rtw8822b.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/realtek/rtw88/rtw8822b.c
++++ b/drivers/net/wireless/realtek/rtw88/rtw8822b.c
+@@ -821,8 +821,10 @@ static void rtw8822b_config_trx_mode(str
+ 			break;
+ 	}
+ 
+-	if (WARN(counter <= 0, "write RF mode table fail\n"))
++	if (counter <= 0) {
++		rtw_warn(rtwdev, "write RF mode table fail\n");
+ 		return;
++	}
+ 
+ 	rtw_write_rf(rtwdev, RF_PATH_A, RF_LUTWE, RFREG_MASK, 0x80000);
+ 	rtw_write_rf(rtwdev, RF_PATH_A, RF_LUTWA, RFREG_MASK, 0x00001);

@@ -1,0 +1,35 @@
+--- a/drivers/staging/rtl8723bs/core/rtw_security.c
++++ b/drivers/staging/rtl8723bs/core/rtw_security.c
+@@ -648,7 +648,7 @@
+ 	struct crypto_aes_ctx ctx;
+ 
+ 	aes_expandkey(&ctx, key, 16);
+-	aes_encrypt(&ctx, ciphertext, data);
++	aes_encrypt((aes_encrypt_arg){(const struct aes_enckey *)&ctx}, ciphertext, data);
+ 	memzero_explicit(&ctx, sizeof(ctx));
+ }
+ 
+@@ -1444,12 +1444,12 @@
+ 			}
+ 		}
+ 		if (left > AES_BLOCK_SIZE)
+-			aes_encrypt(&ctx, cbc, cbc);
++			aes_encrypt((aes_encrypt_arg){(const struct aes_enckey *)&ctx}, cbc, cbc);
+ 		left -= AES_BLOCK_SIZE;
+ 	}
+ 
+ 	memset(pad, 0, AES_BLOCK_SIZE);
+-	aes_encrypt(&ctx, pad, pad);
++	aes_encrypt((aes_encrypt_arg){(const struct aes_enckey *)&ctx}, pad, pad);
+ 	gf_mulx(pad);
+ 
+ 	if (left || total_len == 0) {
+@@ -1467,7 +1467,7 @@
+ 
+ 	for (i = 0; i < AES_BLOCK_SIZE; i++)
+ 		pad[i] ^= cbc[i];
+-	aes_encrypt(&ctx, pad, mac);
++	aes_encrypt((aes_encrypt_arg){(const struct aes_enckey *)&ctx}, pad, mac);
+ 	memzero_explicit(&ctx, sizeof(ctx));
+ 	return 0;
+ }

@@ -1033,9 +1033,12 @@ define KernelPackage/ip6tables
   TITLE:=IPv6 modules
   DEPENDS:=@IPV6 +kmod-nf-reject6 +kmod-nf-ipt6 +kmod-ipt-core
   KCONFIG:=$(KCONFIG_IPT_IPV6)
-  FILES:=$(foreach mod,$(IPT_IPV6-m),$(LINUX_DIR)/net/$(mod).ko)
-  AUTOLOAD:=$(call AutoLoad,42,$(notdir $(IPT_IPV6-m)))
+  FILES:= \
+    $(foreach mod,$(IPT_IPV6-m),$(LINUX_DIR)/net/$(mod).ko) \
+    $(LINUX_DIR)/net/ipv6/netfilter/ip6_tables.ko
+  AUTOLOAD:=$(call AutoLoad,42,$(notdir $(IPT_IPV6-m)) ip6_tables)
 endef
+
 
 define KernelPackage/ip6tables/description
  Netfilter IPv6 firewalling support

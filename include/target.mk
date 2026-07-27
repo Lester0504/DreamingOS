@@ -215,7 +215,7 @@ LINUX_RECONF_DIFF = $(SCRIPT_DIR)/kconfig.pl - '>' $(call __linux_confcmd,$(filt
 ifeq ($(DUMP),1)
   BuildTarget=$(BuildTargets/DumpCurrent)
 
-  CPU_CFLAGS = -Os -pipe
+  CPU_CFLAGS = -O3 -mtune=generic -pipe
   ifneq ($(findstring mips,$(ARCH)),)
     ifneq ($(findstring mips64,$(ARCH)),)
       CPU_TYPE ?= mips64
@@ -265,6 +265,14 @@ ifeq ($(DUMP),1)
     CPU_TYPE ?= generic
     CPU_CFLAGS := -O2 -pipe
     CPU_CFLAGS_generic:=-march=loongarch64
+  endif
+  ifeq ($(BOARD),armsr)
+    CPU_CFLAGS = -O3 -pipe
+    CPU_CFLAGS_generic = -march=armv8-a+crc+crypto
+  endif
+  ifeq ($(BOARD),rockchip)
+    CPU_CFLAGS = -O3 -Wl,--gc-sections -pipe
+    CPU_CFLAGS_generic = -march=armv8-a+crc+crypto
   endif
   ifneq ($(CPU_TYPE),)
     ifndef CPU_CFLAGS_$(CPU_TYPE)

@@ -1,0 +1,21 @@
+From c6ecd55782a51964a36249fdf043846ddcdd6550 Mon Sep 17 00:00:00 2001
+From: sbwml <admin@cooluc.com>
+Date: Wed, 20 Nov 2024 01:43:50 +0800
+Subject: [PATCH] wifi: rtw88: 8812au: Add CF-912AC device ID
+
+Signed-off-by: sbwml <admin@cooluc.com>
+---
+ drivers/net/wireless/realtek/rtw88/rtw8812au.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/drivers/net/wireless/realtek/rtw88/rtw8812au.c
++++ b/drivers/net/wireless/realtek/rtw88/rtw8812au.c
+@@ -77,6 +77,8 @@ static const struct usb_device_id rtw_88
+ 	  .driver_info = (kernel_ulong_t)&(rtw8812a_hw_spec) }, /* Tenda */
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(0x7392, 0xa822, 0xff, 0xff, 0xff),
+ 	  .driver_info = (kernel_ulong_t)&(rtw8812a_hw_spec) }, /* Edimax */
++	{ USB_DEVICE_AND_INTERFACE_INFO(0x0bda, 0x8812, 0xff, 0xff, 0xff),
++	  .driver_info = (kernel_ulong_t)&(rtw8812a_hw_spec) }, /* CF-912AC */
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(usb, rtw_8812au_id_table);

@@ -1,0 +1,242 @@
+:root {
+  --dwrt-notify-width: min(430px, calc(100vw - 32px));
+  --dwrt-notify-gap: 10px;
+  --dwrt-notify-z: 80;
+  --dwrt-notify-text: var(--app-text, var(--setup-text, rgba(248, 251, 255, 0.94)));
+  --dwrt-notify-muted: var(--app-text-muted, var(--setup-text-muted, rgba(219, 230, 244, 0.64)));
+  --dwrt-notify-shadow: rgba(3, 7, 18, 0.28);
+}
+
+.dwrt-notify-region {
+  position: fixed;
+  right: max(24px, env(safe-area-inset-right));
+  bottom: max(24px, env(safe-area-inset-bottom));
+  z-index: var(--dwrt-notify-z);
+  display: flex;
+  width: var(--dwrt-notify-width);
+  flex-direction: column;
+  gap: var(--dwrt-notify-gap);
+  pointer-events: none;
+}
+
+.dwrt-notify {
+  --dwrt-notify-accent: 74, 178, 255;
+  --dwrt-notify-text: var(--dwrt-glass-ink, rgba(248, 251, 255, 0.97));
+  --dwrt-notify-muted: var(--dwrt-glass-muted, rgba(215, 226, 240, 0.80));
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  min-height: 78px;
+  align-items: flex-start;
+  gap: 12px;
+  overflow: hidden;
+  padding: 14px 14px 14px 16px;
+  border: var(--lg-border-width, 1px) solid var(--lg-border-color, rgba(255, 255, 255, 0.15));
+  border-radius: min(24px, calc(var(--lg-corner-radius, 25px) - 1px));
+  background:
+    radial-gradient(circle at 18% 0%, rgba(255, 255, 255, calc(var(--lg-highlight, 0.28) * 0.25)), transparent 44%),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.06), rgba(var(--dwrt-notify-accent), 0.08) 52%, transparent),
+    linear-gradient(var(--dwrt-glass-absorption-raised, rgba(10, 19, 32, 0.72)), var(--dwrt-glass-absorption-raised, rgba(10, 19, 32, 0.72)));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.07),
+    0 18px 44px var(--dwrt-notify-shadow),
+    0 0 0 1px rgba(var(--dwrt-notify-accent), 0.08);
+  color: var(--dwrt-notify-text);
+  cursor: pointer;
+  pointer-events: auto;
+  transform-origin: right bottom;
+  animation: dwrtNotifyIn 340ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  backdrop-filter: blur(14px) saturate(118%);
+  -webkit-backdrop-filter: blur(14px) saturate(118%);
+}
+
+.dwrt-notify::before,
+.dwrt-notify::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.dwrt-notify::before {
+  z-index: 0;
+  padding: 1px;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.34), transparent 35%, rgba(var(--dwrt-notify-accent), 0.18));
+  opacity: 0.58;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  -webkit-mask-composite: xor;
+}
+
+.dwrt-notify::after {
+  z-index: 0;
+  height: 56%;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.035) 58%, transparent);
+  opacity: 0.72;
+}
+
+.dwrt-notify > * {
+  position: relative;
+  z-index: 1;
+}
+
+.dwrt-notify:hover {
+  transform: none;
+}
+
+.dwrt-notify.is-exiting {
+  animation: dwrtNotifyOut 260ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+.dwrt-notify--success { --dwrt-notify-accent: 57, 213, 133; }
+.dwrt-notify--warning { --dwrt-notify-accent: 245, 166, 35; }
+.dwrt-notify--error { --dwrt-notify-accent: 255, 88, 116; }
+.dwrt-notify--info { --dwrt-notify-accent: 74, 178, 255; }
+
+.dwrt-notify__icon {
+  display: inline-grid;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 13px;
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.24), rgba(var(--dwrt-notify-accent), 0.5)),
+    rgba(var(--dwrt-notify-accent), 0.25);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    0 10px 22px rgba(var(--dwrt-notify-accent), 0.18);
+  color: rgba(255, 255, 255, 0.96);
+}
+
+.dwrt-notify__icon svg {
+  width: 21px;
+  height: 21px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2.35;
+}
+
+.dwrt-notify__body {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 4px;
+}
+
+.dwrt-notify__head {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dwrt-notify__title {
+  overflow: hidden;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 740;
+  line-height: 1.28;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dwrt-notify__time {
+  flex: 0 0 auto;
+  color: var(--dwrt-notify-muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1;
+}
+
+.dwrt-notify__desc {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--dwrt-notify-muted);
+  font-size: 13px;
+  font-weight: 520;
+  line-height: 1.42;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.dwrt-notify__close {
+  display: inline-grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--dwrt-notify-muted);
+  cursor: pointer;
+  font-size: 19px;
+  line-height: 1;
+  transition: background 160ms ease, color 160ms ease, transform 160ms ease;
+}
+
+.dwrt-notify__close:hover,
+.dwrt-notify:hover .dwrt-notify__close {
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--dwrt-notify-text);
+  transform: none;
+}
+
+@keyframes dwrtNotifyIn {
+  from {
+    opacity: 0;
+    transform: translateX(56px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+@keyframes dwrtNotifyOut {
+  from {
+    opacity: 1;
+    max-height: 120px;
+    transform: translateX(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    max-height: 0;
+    margin: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    transform: translateX(56px) scale(0.92);
+  }
+}
+
+@media (max-width: 720px) {
+  .dwrt-notify-region {
+    right: 16px;
+    bottom: 16px;
+    width: calc(100vw - 32px);
+  }
+
+  .dwrt-notify {
+    border-radius: 20px;
+    padding: 13px;
+  }
+
+  .dwrt-notify__time {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dwrt-notify,
+  .dwrt-notify.is-exiting {
+    animation-duration: 1ms;
+  }
+}

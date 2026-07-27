@@ -1,0 +1,373 @@
+export function mount(context = {}) {
+  const root = context.root || document.getElementById('routePreview');
+  const api = context.api || {};
+  const ui = context.ui || {};
+  const utils = context.utils || {};
+  const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
+  const formatBytes = utils.formatBytes || fallbackFormatBytes;
+  const VERSION = '20260719-01';
+  const MODULE_CLASS = 'storage-overview-route-host';
+  const stage = root?.closest('.console-stage');
+  const RANGE_LABELS = { '1h': '近一小时', '1d': '近一天', '7d': '近七天' };
+  const RANGE_ALIASES = { '1h': '1h', '1d': '1d', '7d': '1w' };
+  const COLORS = ['#56a8ff', '#54d69a', '#f1ba55', '#ef7888', '#ad8cff', '#54c9d4'];
+  const state = {
+    mounted: true,
+    seq: 0,
+    loading: true,
+    refreshing: false,
+    loaded: false,
+    error: '',
+    range: '1h',
+    data: emptyData(),
+    charts: new Map(),
+    hiddenDisks: new Set(),
+    resizeObserver: null
+  };
+
+  function emptyData() {
+    return { disks: [], history: [], smart: [], summary: {}, aggregateOnly: false };
+  }
+
+  function firstText(...values) {
+    for (const value of values) {
+      if (value === undefined || value === null) continue;
+      const text = String(value).trim();
+      if (text) return text;
+    }
+    return '';
+  }
+
+  function finite(...values) {
+    for (const value of values) {
+      if (value === '' || value === undefined || value === null) continue;
+      const number = Number(value);
+      if (Number.isFinite(number)) return number;
+    }
+    return null;
+  }
+
+  function bool(value, fallback = false) {
+    if (value === undefined || value === null || value === '') return fallback;
+    if (typeof value === 'string') return !['0', 'false', 'off', 'no', 'disabled'].includes(value.toLowerCase());
+    return Boolean(value);
+  }
+
+  function asArray(value, keys = []) {
+    if (Array.isArray(value)) return value;
+    if (!value || typeof value !== 'object') return [];
+    for (const key of [...keys, 'items', 'rows', 'list', 'data', 'points']) if (Array.isArray(value[key])) return value[key];
+    return [];
+  }
+
+  function payloadData(result) {
+    if (!result || result.ok === false) return null;
+    if ('data' in result && result.ok === true) return result.data || {};
+    return result.data ?? result.body ?? result;
+  }
+
+  async function read(name, url) {
+    if (typeof api.fetch === 'function') {
+      const result = await api.fetch(name, `${url}${url.includes('?') ? '&' : '?'}_=${VERSION}`);
+      if (!result?.ok) throw result?.error || new Error(`${name} API 不可用`);
+      return result.data || {};
+    }
+    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
+      credentials: 'same-origin', cache: 'no-store', headers: typeof api.authHeaders === 'function' ? api.authHeaders() : {}
+    });
+    const json = await response.json();
+    if (!response.ok || json?.ok === false) throw new Error(firstText(json?.message, json?.error, `HTTP ${response.status}`));
+    return payloadData(json) || {};
+  }
+
+  function normalizeDisk(item = {}, index = 0) {
+    const id = firstText(item.id, item.uuid, item.device, item.path, item.name, `disk-${index + 1}`);
+    const name = firstText(item.label, item.name, item.device, item.path, id);
+    const total = finite(item.total_bytes, item.size_bytes, item.capacity_bytes, item.total, item.size);
+    const used = finite(item.used_bytes, item.used, item.usage_bytes);
+    const available = finite(item.available_bytes, item.free_bytes, item.available, item.free, total !== null && used !== null ? total - used : null);
+    const usedPercent = finite(item.used_percent, item.usage_percent, item.percent, total && used !== null ? used / total * 100 : null);
+    return {
+      ...item, id, name, total, used, available, usedPercent,
+      model: firstText(item.model, item.product),
+      serial: firstText(item.serial, item.serial_number),
+      transport: firstText(item.transport, item.tran, item.bus),
+      smartStatus: firstText(item.smart_status, item.health, item.status),
+      temperature: finite(item.temperature_c, item.temperature, item.temp_c)
+    };
+  }
+
+  function normalizeHistoryPoint(point = {}, diskId = '') {
+    return {
+      ts: finite(point.ts, point.time, point.timestamp),
+      diskId: firstText(point.disk_id, point.disk, point.device, point.name, diskId),
+      usage: finite(point.used_percent, point.usage_percent, point.disk_percent, point.disk_avg, point.usage),
+      read: finite(point.read_bps, point.read_bytes_per_second, point.read_rate, point.read),
+      write: finite(point.write_bps, point.write_bytes_per_second, point.write_rate, point.write),
+      readLatency: finite(point.read_latency_ms, point.await_read_ms, point.read_await_ms),
+      writeLatency: finite(point.write_latency_ms, point.await_write_ms, point.write_await_ms)
+    };
+  }
+
+  function normalizeOverview(payload = {}) {
+    const source = payload.storage && typeof payload.storage === 'object' ? payload.storage : payload;
+    const disks = asArray(source.disks, ['devices']).map(normalizeDisk);
+    const history = [];
+    asArray(source.history, ['metrics', 'points']).forEach((point) => history.push(normalizeHistoryPoint(point)));
+    disks.forEach((disk) => asArray(disk.history, ['metrics', 'points']).forEach((point) => history.push(normalizeHistoryPoint(point, disk.id))));
+    return {
+      disks,
+      history: history.filter((point) => point.ts !== null && point.diskId),
+      smart: asArray(source.smart, ['smart_devices', 'smart_info']),
+      summary: source.summary && typeof source.summary === 'object' ? source.summary : source,
+      aggregateOnly: false
+    };
+  }
+
+  function normalizeAggregate(healthPayload = {}, historyPayload = {}) {
+    const system = healthPayload.system && typeof healthPayload.system === 'object' ? healthPayload.system : healthPayload;
+    const total = finite(system.disk_total);
+    const used = finite(system.disk_used);
+    const available = total !== null && used !== null ? Math.max(0, total - used) : null;
+    const disk = normalizeDisk({ id: 'system-storage', name: '系统存储', total_bytes: total, used_bytes: used, available_bytes: available, used_percent: finite(system.disk_percent, total && used !== null ? used / total * 100 : null) });
+    const points = asArray(historyPayload, ['history']).map((point) => normalizeHistoryPoint(point, disk.id)).filter((point) => point.ts !== null && point.usage !== null);
+    return { disks: total !== null ? [disk] : [], history: points, smart: [], summary: { total_bytes: total, used_bytes: used, available_bytes: available }, aggregateOnly: true };
+  }
+
+  async function load(background = false) {
+    const seq = ++state.seq;
+    if (background) state.refreshing = true; else state.loading = true;
+    state.error = '';
+    if (background) patchRefreshState(); else render();
+    try {
+      let next;
+      try {
+        next = normalizeOverview(await read('storageOverview', `/api/v1/storage/overview?range=${encodeURIComponent(state.range)}`));
+      } catch (overviewError) {
+        const results = await Promise.allSettled([
+          read('systemHealth', '/api/v1/system/health'),
+          read('systemHealthHistory', `/api/v1/system/health/history?range=${encodeURIComponent(RANGE_ALIASES[state.range])}&aggregate=avg&points=120`)
+        ]);
+        if (results[0].status !== 'fulfilled') throw overviewError;
+        next = normalizeAggregate(results[0].value, results[1].status === 'fulfilled' ? results[1].value : {});
+        state.error = '后端暂未提供逐盘 I/O、延迟和 SMART 数据，当前仅显示系统存储聚合占用率。';
+      }
+      if (!state.mounted || seq !== state.seq) return;
+      state.data = next;
+      state.loaded = true;
+    } catch (error) {
+      if (!state.mounted || seq !== state.seq) return;
+      state.data = emptyData();
+      state.error = '存储概览后端接口暂不可用。';
+    } finally {
+      if (!state.mounted || seq !== state.seq) return;
+      state.loading = false;
+      state.refreshing = false;
+      render();
+    }
+  }
+
+  function icon(name) {
+    const paths = {
+      disk: '<ellipse cx="12" cy="6" rx="8" ry="3"></ellipse><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"></path>',
+      layers: '<path d="m12 2 9 5-9 5-9-5 9-5Z"></path><path d="m3 12 9 5 9-5M3 17l9 5 9-5"></path>',
+      available: '<path d="M12 2a10 10 0 1 0 10 10"></path><path d="M12 6v6l4 2M16 2h6v6"></path>',
+      refresh: '<path d="M20 11a8 8 0 1 0 1 4"></path><path d="M20 4v7h-7"></path>',
+      usage: '<path d="M4 19V9M10 19V5M16 19v-7M22 19V3"></path>',
+      io: '<path d="M4 7h13m0 0-4-4m4 4-4 4M20 17H7m0 0 4 4m-4-4 4-4"></path>',
+      latency: '<circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path>'
+    };
+    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.disk}</svg>`;
+  }
+
+  function summaryValues() {
+    const declared = state.data.summary || {};
+    const known = state.data.disks.filter((disk) => disk.total !== null);
+    const total = finite(declared.total_bytes, declared.total, known.length ? known.reduce((sum, disk) => sum + (disk.total || 0), 0) : null);
+    const available = finite(declared.available_bytes, declared.free_bytes, declared.available, known.length ? known.reduce((sum, disk) => sum + (disk.available || 0), 0) : null);
+    return { count: state.data.aggregateOnly ? null : finite(declared.disk_count, declared.count, state.data.disks.length || null), total, available };
+  }
+
+  function summaryMarkup() {
+    const values = summaryValues();
+    const renderer = ui.overviewCardsMarkup || window.DWRT_UI_KIT?.overviewCardsMarkup;
+    const cards = [
+      { key: 'count', label: '硬盘', value: values.count === null ? '--' : String(values.count), detail: values.count === null ? '等待逐盘清单' : '已识别物理磁盘', tone: 'info', icon: icon('disk') },
+      { key: 'total', label: '总容量', value: values.total === null ? '--' : formatBytes(values.total), detail: '所有已识别磁盘', tone: 'ok', icon: icon('layers') },
+      { key: 'available', label: '可用空间', value: values.available === null ? '--' : formatBytes(values.available), detail: '当前可分配容量', tone: 'info', icon: icon('available') }
+    ];
+    return typeof renderer === 'function'
+      ? renderer(cards, { label: '存储概览', className: 'storage-overview-summary' })
+      : `<section class="dwrt-kit-overview-grid storage-overview-summary">${cards.map((card) => `<article class="dwrt-kit-overview-card is-${card.tone}"><div class="dwrt-kit-overview-content"><span class="dwrt-kit-overview-label">${card.label}</span><strong>${card.value}</strong><small>${card.detail}</small></div><span class="dwrt-kit-overview-icon">${card.icon}</span></article>`).join('')}</section>`;
+  }
+
+  function metricAvailable(metric) {
+    const keys = metric === 'usage' ? ['usage'] : metric === 'io' ? ['read', 'write'] : ['readLatency', 'writeLatency'];
+    return state.data.history.some((point) => keys.some((key) => point[key] !== null));
+  }
+
+  function legendMarkup(metric) {
+    if (!metricAvailable(metric)) return '';
+    return `<div class="storage-chart-legend" role="group" aria-label="磁盘显示控制">${state.data.disks.map((disk, index) => `<button type="button" data-storage-disk="${escapeHtml(disk.id)}" aria-pressed="${state.hiddenDisks.has(disk.id) ? 'false' : 'true'}"><i style="--disk-color:${COLORS[index % COLORS.length]}"></i><span>${escapeHtml(disk.name)}</span></button>`).join('')}</div>`;
+  }
+
+  function chartCard(metric, title, subtitle, iconName) {
+    const available = metricAvailable(metric);
+    const empty = metric === 'usage' ? '暂无磁盘占用率历史' : metric === 'io' ? '后端尚未提供逐盘读写 I/O 历史' : '后端尚未提供逐盘读写延迟历史';
+    return `<article class="storage-chart-card dwrt-kit-glass-surface"><header><span class="storage-chart-icon">${icon(iconName)}</span><div><strong>${escapeHtml(title)}</strong><small>${escapeHtml(subtitle)}</small></div>${legendMarkup(metric)}</header><div class="storage-chart-body">${available ? `<div class="storage-chart" data-storage-chart="${metric}" role="img" aria-label="${escapeHtml(title)}"></div>` : `<div class="storage-chart-empty">${icon(iconName)}<strong>${escapeHtml(empty)}</strong><span>接口补齐后会自动按磁盘绘制，并支持显示或隐藏对应磁盘。</span></div>`}</div></article>`;
+  }
+
+  function smartMarkup() {
+    const rows = state.data.smart.length ? state.data.smart : state.data.disks.filter((disk) => disk.smartStatus || disk.temperature !== null);
+    return `<section class="storage-smart-card dwrt-kit-table-wrap dwrt-kit-datatable-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>SMART 信息</strong><span>磁盘健康、温度与寿命指标</span></div><span class="dwrt-kit-table-count">${state.data.smart.length ? `${state.data.smart.length} 块` : '--'}</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-datatable storage-smart-table"><thead><tr><th>磁盘</th><th>型号</th><th>序列号</th><th>接口</th><th>健康</th><th>温度</th><th>通电时间</th><th>坏扇区</th></tr></thead><tbody>${rows.length ? rows.map((item, index) => { const disk = normalizeDisk(item, index); const healthy = /pass|healthy|good|ok|正常/i.test(disk.smartStatus); return `<tr><td><strong>${escapeHtml(disk.name)}</strong></td><td>${escapeHtml(disk.model || '--')}</td><td><code>${escapeHtml(disk.serial || '--')}</code></td><td>${escapeHtml(disk.transport || '--')}</td><td>${ui.statusBadgeMarkup?.(disk.smartStatus || '--', healthy ? 'success' : 'error') || escapeHtml(disk.smartStatus || '--')}</td><td>${disk.temperature === null ? '--' : `${disk.temperature} °C`}</td><td>${escapeHtml(firstText(item.power_on_hours, item.power_hours, '--'))}</td><td>${escapeHtml(firstText(item.reallocated_sector_count, item.bad_sectors, '--'))}</td></tr>`; }).join('') : `<tr><td colspan="8" class="dwrt-kit-table-empty">后端尚未提供 SMART 信息</td></tr>`}</tbody></table></div></section>`;
+  }
+
+  function render() {
+    if (!root) return;
+    disposeCharts();
+    root.hidden = false;
+    root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
+    root.classList.add('route-workspace', MODULE_CLASS);
+    const notice = state.error ? `<div class="storage-overview-notice">${escapeHtml(state.error)}</div>` : '';
+    root.innerHTML = `<section class="storage-overview-shell"><header class="storage-overview-toolbar"><div class="storage-range" role="group" aria-label="历史范围">${Object.entries(RANGE_LABELS).map(([id, label]) => `<button type="button" data-storage-range="${id}" class="${state.range === id ? 'is-active' : ''}">${label}</button>`).join('')}</div><button class="policy-filter-button" type="button" data-storage-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '正在刷新' : '刷新'}</span></button></header><main class="storage-overview-scroll">${notice}${summaryMarkup()}<section class="storage-chart-grid">${chartCard('usage', '磁盘占用率变化', '各磁盘已用容量百分比', 'usage')}${chartCard('io', '磁盘 I/O 变化', '各磁盘读取与写入速率', 'io')}${chartCard('latency', '读写延迟变化', '各磁盘读取与写入等待时间', 'latency')}</section>${smartMarkup()}</main></section>`;
+    ui.mountAll?.(root);
+    requestAnimationFrame(renderCharts);
+  }
+
+  function patchRefreshState() {
+    const button = root?.querySelector('[data-storage-refresh]');
+    if (!button) return;
+    button.disabled = state.refreshing;
+    const label = button.querySelector('span');
+    if (label) label.textContent = state.refreshing ? '正在刷新' : '刷新';
+  }
+
+  function chartTimes() {
+    return [...new Set(state.data.history.map((point) => point.ts).filter((value) => value !== null))].sort((a, b) => a - b);
+  }
+
+  function formatTime(value) {
+    const raw = Number(value);
+    const date = new Date(raw > 1e12 ? raw : raw * 1000);
+    if (!Number.isFinite(date.getTime())) return '--';
+    const options = state.range === '1h' ? { hour: '2-digit', minute: '2-digit' } : { month: '2-digit', day: '2-digit', hour: '2-digit' };
+    return new Intl.DateTimeFormat('zh-CN', { ...options, hour12: false }).format(date);
+  }
+
+  function seriesFor(metric, times) {
+    const definitions = metric === 'usage'
+      ? [['usage', '占用率', '%']]
+      : metric === 'io'
+        ? [['read', '读取', 'B/s'], ['write', '写入', 'B/s']]
+        : [['readLatency', '读取', 'ms'], ['writeLatency', '写入', 'ms']];
+    return state.data.disks.flatMap((disk, diskIndex) => definitions.map(([key, label], kindIndex) => {
+      const byTime = new Map(state.data.history.filter((point) => point.diskId === disk.id).map((point) => [point.ts, point[key]]));
+      const color = COLORS[diskIndex % COLORS.length];
+      return {
+        name: `${disk.name} ${label}`,
+        type: 'line',
+        data: times.map((time) => byTime.get(time) ?? null),
+        connectNulls: false,
+        showSymbol: false,
+        smooth: 0.24,
+        animation: false,
+        symbol: 'none',
+        lineStyle: { width: 2, color, type: kindIndex ? 'dashed' : 'solid', opacity: kindIndex ? 0.72 : 1 },
+        itemStyle: { color },
+        emphasis: { focus: 'series', lineStyle: { width: 3 } },
+        silent: state.hiddenDisks.has(disk.id),
+        selected: !state.hiddenDisks.has(disk.id),
+        lineStyleOverride: undefined,
+        _diskId: disk.id,
+        _unit: definitions[0][2]
+      };
+    })).filter((series) => !state.hiddenDisks.has(series._diskId));
+  }
+
+  async function ensureEcharts() {
+    if (window.echarts) return window.echarts;
+    const existing = document.querySelector('script[src^="/static/vendor/echarts.min.js"]');
+    return new Promise((resolve, reject) => {
+      const script = existing || document.createElement('script');
+      script.addEventListener('load', () => window.echarts ? resolve(window.echarts) : reject(new Error('ECharts 不可用')), { once: true });
+      script.addEventListener('error', reject, { once: true });
+      if (!existing) { script.src = `/static/vendor/echarts.min.js?v=${VERSION}`; script.async = true; document.head.appendChild(script); }
+    });
+  }
+
+  async function renderCharts() {
+    if (!state.mounted) return;
+    let echarts;
+    try { echarts = await ensureEcharts(); } catch (_) { return; }
+    if (!state.mounted) return;
+    const times = chartTimes();
+    root?.querySelectorAll('[data-storage-chart]').forEach((node) => {
+      const metric = node.dataset.storageChart;
+      const series = seriesFor(metric, times);
+      let chart = state.charts.get(metric);
+      if (!chart || chart.isDisposed?.()) { chart = echarts.init(node, null, { renderer: 'canvas', useDirtyRect: true }); state.charts.set(metric, chart); }
+      chart.setOption({
+        animation: false,
+        grid: { left: 54, right: 20, top: 20, bottom: 42, containLabel: false },
+        tooltip: { trigger: 'axis', appendToBody: true, backgroundColor: 'rgba(17,27,42,.94)', borderColor: 'rgba(255,255,255,.18)', textStyle: { color: '#f7f9fd', fontSize: 11 }, valueFormatter: (value) => metric === 'io' ? formatBytes(value) + '/s' : metric === 'usage' ? `${Number(value).toFixed(1)}%` : `${Number(value).toFixed(1)} ms` },
+        xAxis: { type: 'category', boundaryGap: false, data: times.map(formatTime), axisLine: { lineStyle: { color: 'rgba(145,160,181,.24)' } }, axisTick: { show: false }, axisLabel: { color: 'rgba(145,160,181,.92)', fontSize: 10, hideOverlap: true } },
+        yAxis: { type: 'value', min: 0, max: metric === 'usage' ? 100 : undefined, axisLine: { show: false }, axisTick: { show: false }, axisLabel: { color: 'rgba(145,160,181,.92)', fontSize: 10, formatter: (value) => metric === 'io' ? compactBytes(value) + '/s' : metric === 'usage' ? `${value}%` : `${value}ms` }, splitLine: { lineStyle: { color: 'rgba(145,160,181,.13)', type: 'dashed' } } },
+        series
+      }, { notMerge: true, lazyUpdate: true });
+      chart.resize();
+    });
+  }
+
+  function fallbackFormatBytes(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    let current = bytes; let index = 0;
+    while (current >= 1024 && index < units.length - 1) { current /= 1024; index += 1; }
+    return `${current.toFixed(current >= 100 || index === 0 ? 0 : current >= 10 ? 1 : 2)} ${units[index]}`;
+  }
+
+  function compactBytes(value) {
+    return fallbackFormatBytes(value).replace(' ', '');
+  }
+
+  function disposeCharts() {
+    state.charts.forEach((chart) => { try { chart.dispose(); } catch (_) {} });
+    state.charts.clear();
+  }
+
+  function onClick(event) {
+    const range = event.target.closest('[data-storage-range]');
+    if (range && RANGE_LABELS[range.dataset.storageRange] && state.range !== range.dataset.storageRange) { state.range = range.dataset.storageRange; disposeCharts(); load(); return; }
+    if (event.target.closest('[data-storage-refresh]')) { load(true); return; }
+    const disk = event.target.closest('[data-storage-disk]');
+    if (disk) {
+      const id = disk.dataset.storageDisk;
+      if (state.hiddenDisks.has(id)) state.hiddenDisks.delete(id); else state.hiddenDisks.add(id);
+      root?.querySelectorAll(`[data-storage-disk="${CSS.escape(id)}"]`).forEach((button) => button.setAttribute('aria-pressed', state.hiddenDisks.has(id) ? 'false' : 'true'));
+      renderCharts();
+    }
+  }
+
+  root?.addEventListener('click', onClick);
+  stage?.classList.add('is-storage-overview');
+  state.resizeObserver = new ResizeObserver(() => state.charts.forEach((chart) => chart.resize()));
+  if (root) state.resizeObserver.observe(root);
+  render();
+  load();
+
+  return {
+    refresh() { return load(true); },
+    unmount() {
+      state.mounted = false;
+      state.seq += 1;
+      root?.removeEventListener('click', onClick);
+      state.resizeObserver?.disconnect();
+      disposeCharts();
+      root?.replaceChildren();
+      root?.classList.remove('route-workspace', MODULE_CLASS);
+      stage?.classList.remove('is-storage-overview');
+    }
+  };
+}
+
+export default { mount };

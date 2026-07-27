@@ -4,6 +4,7 @@
 
 include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/image.mk
+include ./dreamingwrt-installer.mk
 
 GRUB2_VARIANT =
 GRUB_TERMINALS =
@@ -107,34 +108,38 @@ endef
 
 define Build/iso
 	$(CP) $(KDIR)/$(KERNEL_NAME) $@.boot/boot/vmlinuz
+	$(if $(CONFIG_DREAMINGWRT_IMAGE_INSTALLER_ISO),$(call Build/dreamingwrt-iso-payload))
 	cat \
 		$(STAGING_DIR_IMAGE)/grub2/cdboot.img \
-		$(STAGING_DIR_IMAGE)/grub2/eltorito.img \
+		$(STAGING_DIR_IMAGE)/grub2/$(if $(CONFIG_DREAMINGWRT_IMAGE_INSTALLER_ISO),dreamingwrt-eltorito,eltorito).img \
 		> $@.boot/boot/grub/eltorito.img
 	-$(CP) $(STAGING_DIR_ROOT)/boot/. $@.boot/boot/
 	$(if $(filter $(1),efi),
 		mkfs.fat -C $@.boot/boot/grub/isoboot.img -S 512 1440
 		mmd -i $@.boot/boot/grub/isoboot.img ::/efi ::/efi/boot
 		mcopy -i $@.boot/boot/grub/isoboot.img \
-			$(STAGING_DIR_IMAGE)/grub2/iso-boot$(if $(CONFIG_x86_64),x64,ia32).efi \
+			$(STAGING_DIR_IMAGE)/grub2/$(if $(CONFIG_DREAMINGWRT_IMAGE_INSTALLER_ISO),dreamingwrt-iso-boot,iso-boot)$(if $(CONFIG_x86_64),x64,ia32).efi \
 			::/efi/boot/boot$(if $(CONFIG_x86_64),x64,ia32).efi
 	)
-	mkisofs -R -b boot/grub/eltorito.img -no-emul-boot -boot-info-table \
-		$(if $(filter $(1),efi),-boot-load-size 4 -c boot.cat -eltorito-alt-boot -b boot/grub/isoboot.img -no-emul-boot) \
-		-o $@ $@.boot $(TARGET_DIR)
+	$(if $(CONFIG_DREAMINGWRT_IMAGE_INSTALLER_ISO), \
+		$(call Build/dreamingwrt-iso-info,$(1)), \
+		mkisofs -R -b boot/grub/eltorito.img -no-emul-boot -boot-info-table \
+			$(if $(filter $(1),efi),-boot-load-size 4 -c boot.cat -eltorito-alt-boot -eltorito-platform efi -b boot/grub/isoboot.img -no-emul-boot) \
+			-o $@ $@.boot $(TARGET_DIR))
 endef
 
 DEVICE_VARS += GRUB2_VARIANT
 define Device/Default
-  ARTIFACT/image.iso := grub-config iso | iso
+  ARTIFACT/image.iso := grub-config $(if $(CONFIG_DREAMINGWRT_IMAGE_INSTALLER_ISO),dreamingwrt-installer,iso) | iso
+  ARTIFACT/dreamingwrt-firmware.bin := dreamingwrt-ota-bin
   IMAGE/combined.img := grub-config pc | combined | grub-install | append-metadata
   IMAGE/combined.img.gz := grub-config pc | combined | grub-install | gzip | append-metadata
   IMAGE/combined.vdi := grub-config pc | combined | grub-install | qemu-image vdi
   IMAGE/combined.vmdk := grub-config pc | combined | grub-install | qemu-image vmdk
   IMAGE/combined.vhdx := grub-config pc | combined | grub-install | qemu-image vhdx -o subformat=dynamic
-  IMAGE/rootfs.img := append-rootfs | pad-to $(ROOTFS_PARTSIZE)
-  IMAGE/rootfs.img.gz := append-rootfs | pad-to $(ROOTFS_PARTSIZE) | gzip
-  ARTIFACT/image-efi.iso := grub-config iso | iso efi
+  IMAGE/rootfs.img := dreamingwrt-reset-output | append-rootfs | pad-to $(ROOTFS_PARTSIZE)
+  IMAGE/rootfs.img.gz := dreamingwrt-reset-output | append-rootfs | pad-to $(ROOTFS_PARTSIZE) | gzip
+  ARTIFACT/image-efi.iso := grub-config $(if $(CONFIG_DREAMINGWRT_IMAGE_INSTALLER_ISO),dreamingwrt-installer,iso) | iso efi
   IMAGE/combined-efi.img := grub-config efi | combined efi | grub-install efi | append-metadata
   IMAGE/combined-efi.img.gz := grub-config efi | combined efi | grub-install efi | gzip | append-metadata
   IMAGE/combined-efi.vdi := grub-config efi | combined efi | grub-install efi | qemu-image vdi
@@ -158,6 +163,7 @@ define Device/Default
     ARTIFACTS-$$(CONFIG_GRUB_EFI_IMAGES) += image-efi.iso
   endif
   ARTIFACTS-$$(CONFIG_ONIE_INSTALLER_IMAGES) += onie-installer.bin
+  ARTIFACTS-$$(CONFIG_DREAMINGWRT_IMAGE_OTA_BIN) += dreamingwrt-firmware.bin
   ifeq ($(CONFIG_VDI_IMAGES),y)
     IMAGES-$$(CONFIG_GRUB_IMAGES) += combined.vdi
     IMAGES-$$(CONFIG_GRUB_EFI_IMAGES) += combined-efi.vdi

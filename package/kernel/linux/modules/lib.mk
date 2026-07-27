@@ -114,10 +114,9 @@ define KernelPackage/lib-lzo
   HIDDEN:=1
   FILES:= \
 	$(LINUX_DIR)/crypto/lzo.ko \
-	$(LINUX_DIR)/crypto/lzo-rle.ko \
 	$(LINUX_DIR)/lib/lzo/lzo_compress.ko \
 	$(LINUX_DIR)/lib/lzo/lzo_decompress.ko
-  AUTOLOAD:=$(call AutoProbe,lzo lzo-rle lzo_compress lzo_decompress)
+  AUTOLOAD:=$(call AutoProbe,lzo lzo_compress lzo_decompress)
 endef
 
 define KernelPackage/lib-lzo/description
@@ -239,7 +238,11 @@ define KernelPackage/lib-raid6
   TITLE:=RAID6 algorithm support
   HIDDEN:=1
   KCONFIG:=CONFIG_RAID6_PQ
+ifeq ($(KERNEL_PATCHVER),7.2)
+  FILES:=$(LINUX_DIR)/lib/raid/raid6/raid6_pq.ko
+else
   FILES:=$(LINUX_DIR)/lib/raid6/raid6_pq.ko
+endif
   AUTOLOAD:=$(call AutoProbe,raid6_pq)
 endef
 
@@ -257,11 +260,11 @@ define KernelPackage/lib-xor
   KCONFIG:=CONFIG_XOR_BLOCKS
 ifneq ($(wildcard $(LINUX_DIR)/arch/$(LINUX_KARCH)/lib/xor-neon.ko),)
   FILES:= \
-    $(LINUX_DIR)/crypto/xor.ko \
+    $(LINUX_DIR)/lib/raid/xor/xor.ko \
     $(LINUX_DIR)/arch/$(LINUX_KARCH)/lib/xor-neon.ko
   AUTOLOAD:=$(call AutoProbe,xor-neon xor)
 else
-  FILES:=$(LINUX_DIR)/crypto/xor.ko
+  FILES:=$(LINUX_DIR)/lib/raid/xor/xor.ko
   AUTOLOAD:=$(call AutoProbe,xor)
 endif
 endef
@@ -364,7 +367,6 @@ $(eval $(call KernelPackage,oid-registry))
 define KernelPackage/lib-objagg
   SUBMENU:=$(LIB_MENU)
   TITLE:=objagg support
-  HIDDEN:=1
   FILES:=$(LINUX_DIR)/lib/objagg.ko
   KCONFIG:= \
   CONFIG_OBJAGG \
@@ -378,7 +380,6 @@ $(eval $(call KernelPackage,lib-objagg))
 define KernelPackage/lib-parman
   SUBMENU:=$(LIB_MENU)
   TITLE:=parman support
-  HIDDEN:=1
   FILES:=$(LINUX_DIR)/lib/parman.ko
   KCONFIG:= \
   CONFIG_PARMAN \
@@ -387,3 +388,41 @@ define KernelPackage/lib-parman
 endef
 
 $(eval $(call KernelPackage,lib-parman))
+
+
+define KernelPackage/libwx
+  SUBMENU:=$(NETWORK_DEVICES_MENU)
+  TITLE:=Wangxun(R) Ethernet driver common library
+  DEPENDS:=@PCI_SUPPORT +kmod-phylink +kmod-ptp
+  KCONFIG:=CONFIG_LIBWX
+  FILES:=$(LINUX_DIR)/drivers/net/ethernet/wangxun/libwx/libwx.ko
+  AUTOLOAD:=$(call AutoProbe,libwx)
+endef
+
+define KernelPackage/libwx/description
+ Common library for Wangxun(R) Ethernet drivers
+endef
+
+$(eval $(call KernelPackage,libwx))
+
+
+define KernelPackage/libie-fwlog
+  SUBMENU:=$(NETWORK_DEVICES_MENU)
+  TITLE:=LIBIE_FWLOG
+  KCONFIG:=CONFIG_LIBIE_FWLOG
+  FILES:=$(LINUX_DIR)/drivers/net/ethernet/intel/libie/libie_fwlog.ko
+  AUTOLOAD:=$(call AutoLoad,15,libie_fwlog,1)
+endef
+
+$(eval $(call KernelPackage,libie-fwlog))
+
+
+define KernelPackage/libie-adminq
+  SUBMENU:=$(NETWORK_DEVICES_MENU)
+  TITLE:=LIBIE_ADMINQ
+  KCONFIG:=CONFIG_LIBIE_ADMINQ
+  FILES:=$(LINUX_DIR)/drivers/net/ethernet/intel/libie/libie_adminq.ko
+  AUTOLOAD:=$(call AutoLoad,15,libie_adminq,1)
+endef
+
+$(eval $(call KernelPackage,libie-adminq))

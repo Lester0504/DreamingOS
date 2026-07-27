@@ -16,6 +16,7 @@ include $(INCLUDE_DIR)/package.mk
 
 define KernelPackage/gpio-button-hotplug
   SUBMENU:=GPIO support
+  VERSION:=7.1.5
   TITLE:=Simple GPIO Button Hotplug driver
   FILES:=$(PKG_BUILD_DIR)/gpio-button-hotplug.ko
   AUTOLOAD:=$(call AutoLoad,30,gpio-button-hotplug,1)

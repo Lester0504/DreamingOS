@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "authd_internal.h"
+
+sqlite3 *g_authd_db;
+struct ubus_context *g_authd_ubus;
+struct blob_buf g_authd_blob;
+int64_t g_authd_started_at;
+
+int64_t authd_now_s(void)
+{
+    return (int64_t)time(NULL);
+}
+
+const char *authd_sqlite_text(sqlite3_stmt *st, int col, const char *def)
+{
+    const unsigned char *value;
+
+    if (!st)
+        return def;
+    value = sqlite3_column_text(st, col);
+    return value ? (const char *)value : def;
+}
+
+struct json_object *authd_json_from_blob(struct blob_attr *msg)
+{
+    struct json_object *obj = NULL;
+    char *text;
+
+    if (!msg)
+        return json_object_new_object();
+    text = blobmsg_format_json(msg, true);
+    if (text) {
+        obj = json_tokener_parse(text);
+        free(text);
+    }
+    if (!obj || !json_object_is_type(obj, json_type_object)) {
+        if (obj)
+            json_object_put(obj);
+        obj = json_object_new_object();
+    }
+    return obj;
+}
+
+struct json_object *authd_capabilities_json(void)
+{
+    struct json_object *cap = json_object_new_object();
+
+    json_object_object_add(cap, "read", json_object_new_boolean(1));
+    json_object_object_add(cap, "update_web", json_object_new_boolean(1));
+    json_object_object_add(cap, "web_config_write", json_object_new_boolean(1));
+    json_object_object_add(cap, "portal_config_write", json_object_new_boolean(1));
+    json_object_object_add(cap, "access_rule_crud", json_object_new_boolean(1));
+    json_object_object_add(cap, "portal_publish", json_object_new_boolean(0));
+    json_object_object_add(cap, "portal_asset_upload", json_object_new_boolean(0));
+    json_object_object_add(cap, "extend_session", json_object_new_boolean(0));
+    json_object_object_add(cap, "disconnect", json_object_new_boolean(0));
+    json_object_object_add(cap, "write_accounts", json_object_new_boolean(0));
+    json_object_object_add(cap, "account_crud", json_object_new_boolean(1));
+    json_object_object_add(cap, "package_crud", json_object_new_boolean(1));
+    json_object_object_add(cap, "voucher_crud", json_object_new_boolean(1));
+    json_object_object_add(cap, "account_bulk", json_object_new_boolean(1));
+    json_object_object_add(cap, "account_import", json_object_new_boolean(1));
+    json_object_object_add(cap, "ledger_write", json_object_new_boolean(1));
+    json_object_object_add(cap, "password_policy_write", json_object_new_boolean(1));
+    json_object_object_add(cap, "voucher_one_time_reveal", json_object_new_boolean(1));
+    json_object_object_add(cap, "accounts_runtime_auth", json_object_new_boolean(0));
+    json_object_object_add(cap, "write_delegated", json_object_new_boolean(1));
+    json_object_object_add(cap, "delegated_crud", json_object_new_boolean(1));
+    json_object_object_add(cap, "delegated_import", json_object_new_boolean(1));
+    json_object_object_add(cap, "delegated_runtime_apply", json_object_new_boolean(0));
+    json_object_object_add(cap, "write_notifications", json_object_new_boolean(1));
+    json_object_object_add(cap, "notification_config_write", json_object_new_boolean(1));
+    json_object_object_add(cap, "notification_periodic_crud", json_object_new_boolean(1));
+    json_object_object_add(cap, "notification_rich_text_sanitization", json_object_new_boolean(1));
+    json_object_object_add(cap, "notification_delivery", json_object_new_boolean(0));
+    json_object_object_add(cap, "notification_preview", json_object_new_boolean(1));
+    json_object_object_add(cap, "portal_runtime", json_object_new_boolean(0));
+    json_object_object_add(cap, "radius_accounting", json_object_new_boolean(0));
+    json_object_object_add(cap, "radius_disconnect", json_object_new_boolean(0));
+    json_object_object_add(cap, "websocket_sessions", json_object_new_boolean(0));
+    return cap;
+}
+
+struct json_object *authd_envelope(struct json_object *data)
+{
+    struct json_object *root = json_object_new_object();
+
+    json_object_object_add(root, "ok", json_object_new_boolean(1));
+    json_object_object_add(root, "data", data ? data : json_object_new_object());
+    return root;
+}
+
+struct json_object *authd_error(const char *error, const char *message)
+{
+    struct json_object *root = json_object_new_object();
+    struct json_object *data = json_object_new_object();
+
+    json_object_object_add(data, "ok", json_object_new_boolean(0));
+    json_object_object_add(data, "error", json_object_new_string(error ? error : "internal_error"));
+    json_object_object_add(data, "message", json_object_new_string(message ? message : "request failed"));
+    json_object_object_add(root, "ok", json_object_new_boolean(0));
+    json_object_object_add(root, "code", json_object_new_int(4000));
+    json_object_object_add(root, "data", data);
+    return root;
+}

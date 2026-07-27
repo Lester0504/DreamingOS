@@ -1,0 +1,60 @@
+From 3e42cdc92f794dfac521908c0218773d81197205 Mon Sep 17 00:00:00 2001
+From: sbwml <admin@cooluc.com>
+Date: Tue, 28 Oct 2025 22:36:09 +0800
+Subject: [PATCH] r8101_n: update timer API usage for kernel 6.16 compatibility
+
+Signed-off-by: sbwml <admin@cooluc.com>
+---
+ r8101_n.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+--- a/r8101_n.c
++++ b/r8101_n.c
+@@ -10163,7 +10163,11 @@ rtl8101_hw_phy_config(struct net_device
+ 
+ static inline void rtl8101_delete_link_timer(struct net_device *dev, struct timer_list *timer)
+ {
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6,16,0)
+         del_timer_sync(timer);
++#else
++        timer_delete_sync(timer);
++#endif
+ }
+ 
+ static inline void rtl8101_request_link_timer(struct net_device *dev)
+@@ -10181,7 +10185,11 @@ static inline void rtl8101_request_link_
+ 
+ static inline void rtl8101_delete_esd_timer(struct net_device *dev, struct timer_list *timer)
+ {
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6,16,0)
+         del_timer_sync(timer);
++#else
++        timer_delete_sync(timer);
++#endif
+ }
+ 
+ static inline void rtl8101_request_esd_timer(struct net_device *dev)
+@@ -11600,7 +11608,11 @@ rtl8101_esd_timer(struct timer_list *t)
+         struct rtl8101_private *tp = netdev_priv(dev);
+         struct timer_list *timer = &tp->esd_timer;
+ #else
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6,16,0)
+         struct rtl8101_private *tp = from_timer(tp, t, esd_timer);
++#else
++        struct rtl8101_private *tp = timer_container_of(tp, t, esd_timer);
++#endif
+         struct net_device *dev = tp->dev;
+         struct timer_list *timer = t;
+ #endif
+@@ -11776,7 +11788,11 @@ rtl8101_link_timer(struct timer_list *t)
+         struct rtl8101_private *tp = netdev_priv(dev);
+         struct timer_list *timer = &tp->link_timer;
+ #else
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6,16,0)
+         struct rtl8101_private *tp = from_timer(tp, t, link_timer);
++#else
++        struct rtl8101_private *tp = timer_container_of(tp, t, link_timer);
++#endif
+         struct net_device *dev = tp->dev;
+         struct timer_list *timer = t;
+ #endif

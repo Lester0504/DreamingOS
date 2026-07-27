@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex,nofollow">
+    <meta name="theme-color" content="#070a12">
+    <title>Dreaming OS 控制台</title>
+    <link rel="icon" href="/static/images/logo-64.png">
+    <link rel="stylesheet" href="/static/ui-kit/dwrt-ui-kit.css?v=20260723-status-compact-01">
+    <link rel="stylesheet" href="/static/ui-kit/dwrt-sampled-liquid-glass.css?v=20260713-17">
+    <link rel="stylesheet" href="/static/css/menu-shell.css?v=20260721-01">
+    <link rel="stylesheet" href="/static/css/notifications.css?v=20260712-10">
+    <link rel="stylesheet" href="/static/css/dwrt-theme.css?v=20260722-03">
+    <link id="dwrtControlMaterial" rel="stylesheet" href="/static/ui-kit/dwrt-control-material.css?v=20260719-16">
+  </head>
+  <body>
+    <div class="dwrt-app" id="appShell">
+      <div class="app-backdrop" aria-hidden="true">
+        <img class="app-wallpaper" id="appWallpaper" src="/static/background/dwrt-default-bg.jpg" alt="" decoding="async">
+        <div class="app-scrim"></div>
+      </div>
+      <div class="app-menu-glass" id="appMenuGlass" aria-hidden="true"></div>
+
+      <header class="menu-brand" aria-label="Dreaming OS">
+        <img class="brand-logo-full" src="/static/images/logo-wide.png?v=20260725-wide-01" alt="Dreaming OS">
+        <img class="brand-logo-compact" src="/static/images/logo-64.png" alt="Dreaming OS">
+        <div class="menu-search-region" aria-label="菜单搜索">
+          <button class="menu-search-trigger" id="menuSearchTrigger" type="button" aria-haspopup="dialog" aria-controls="commandPalette">
+            <span class="search-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            </span>
+            <span class="search-label">搜索</span>
+            <kbd>⌘K</kbd>
+          </button>
+        </div>
+      </header>
+
+      <aside class="glass-sidebar" id="sidebar" aria-label="主菜单">
+        <nav class="primary-menu" id="primaryMenu" aria-label="一级菜单">
+          <span class="menu-active-pill" id="primaryActivePill" aria-hidden="true"></span>
+        </nav>
+
+        <footer class="sidebar-footer">
+          <nav class="bottom-menu" id="bottomMenu" aria-label="系统菜单">
+            <span class="menu-active-pill" id="bottomActivePill" aria-hidden="true"></span>
+          </nav>
+          <span id="menuSource">菜单加载中</span>
+          <div class="sidebar-actions" aria-label="菜单操作">
+            <button class="sidebar-action" id="userButton" type="button" title="管理员" aria-label="管理员">
+              <span class="action-icon user"></span>
+            </button>
+            <button class="sidebar-action text-action" id="themeButton" type="button" title="外观" aria-label="外观">A</button>
+            <button class="sidebar-action" id="sidebarToggle" type="button" title="折叠菜单" aria-label="折叠菜单" aria-expanded="true">
+              <span class="action-icon collapse"></span>
+            </button>
+          </div>
+        </footer>
+      </aside>
+
+      <aside class="glass-submenu" id="submenu" aria-label="二级菜单">
+        <div class="submenu-heading">
+          <span>Section</span>
+          <strong id="submenuTitle">仪表盘</strong>
+        </div>
+        <nav id="secondaryMenu" aria-label="当前分组">
+          <span class="menu-active-pill" id="secondaryActivePill" aria-hidden="true"></span>
+        </nav>
+      </aside>
+
+      <aside class="dashboard-status-rail dwrt-glass-card" id="dashboardStatusRail" aria-label="设备详情" hidden>
+        <div class="rail-card-status" id="railCardStatus">正在读取真实状态</div>
+
+        <section class="rail-card gateway-card">
+          <div class="gateway-visual" aria-hidden="true">
+            <img src="/static/images/gateway-wide.svg" alt="">
+          </div>
+          <h2 id="railModel">--</h2>
+          <p id="railVersion">--</p>
+          <dl>
+            <div>
+              <dt>网关 IP</dt>
+              <dd id="railGatewayIp">--</dd>
+            </div>
+            <div>
+              <dt>运行时间</dt>
+              <dd id="railUptime">--</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="rail-card isp-health">
+          <div class="rail-title">
+            <strong>Internet</strong>
+            <span id="railWanTotal">--</span>
+          </div>
+          <div class="rail-isp-list" id="railIspList">
+            <div class="rail-empty">等待 WAN 数据</div>
+          </div>
+        </section>
+
+        <section class="rail-card rail-ports-card">
+          <div class="rail-title">
+            <strong>Ports</strong>
+            <span id="railPortTotal">--</span>
+          </div>
+          <div class="rail-port-grid" id="railPortGrid">
+            <div class="rail-empty">等待端口数据</div>
+          </div>
+        </section>
+      </aside>
+
+      <main class="console-main" id="consoleMain">
+        <section class="console-stage" aria-label="控制台工作区">
+          <div class="stage-header">
+            <span id="pageEyebrow">Console shell</span>
+            <h1 id="pageTitle">仪表盘</h1>
+            <p id="pageDescription">当前阶段只搭建菜单和路由骨架，具体页面会逐个迁移。</p>
+          </div>
+          <div class="route-preview" id="routePreview" aria-live="polite">
+            <span>当前路径</span>
+            <code id="routePath">/app/#/dashboard</code>
+          </div>
+          <section class="dashboard-workspace" id="dashboardWorkspace" aria-label="仪表盘" hidden>
+            <section class="dashboard-main-panel" aria-label="仪表盘内容">
+              <div class="dashboard-metric-grid" id="dashboardMetricGrid" aria-label="实时概览"></div>
+              <section class="dashboard-monitor-card dwrt-glass-card" id="routerMonitorCard" aria-label="实时速率"></section>
+              <section class="dashboard-rank-grid" id="dashboardRankGrid" aria-label="实时排行"></section>
+              <section class="dashboard-active-url-card dwrt-glass-card" id="dashboardActiveUrlCard" aria-label="Active URLs"></section>
+            </section>
+          </section>
+          <section class="topology-workspace" id="topologyWorkspace" aria-label="拓扑图" hidden>
+            <div class="topology-shell" id="topologyShell">
+              <aside class="topology-control-panel" id="topologyControlPanel" aria-label="拓扑控制">
+                <div class="topology-panel-tabs" role="tablist" aria-label="拓扑视图">
+                  <button type="button" class="topology-panel-tab" data-topology-view="topology" role="tab" aria-selected="true">
+                    <span class="topology-tab-icon" aria-hidden="true">
+                      <svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 2a1.25 1.25 0 0 1 .5 2.4v2.18a3.5 3.5 0 0 1 2.12 1.22l1.9-1.1a1.25 1.25 0 1 1 .5.86l-1.9 1.1c.08.3.13.6.13.94s-.05.64-.13.94l1.9 1.1a1.25 1.25 0 1 1-.5.86l-1.9-1.1a3.5 3.5 0 0 1-2.12 1.22v2.18a1.25 1.25 0 1 1-1 0v-2.18a3.5 3.5 0 0 1-2.12-1.22l-1.9 1.1a1.25 1.25 0 1 1-.5-.86l1.9-1.1a3.53 3.53 0 0 1-.13-.94c0-.33.05-.65.13-.94l-1.9-1.1a1.25 1.25 0 1 1 .5-.86l1.9 1.1A3.5 3.5 0 0 1 9.5 6.58V4.4A1.25 1.25 0 0 1 10 2Zm0 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z"/></svg>
+                    </span>
+                    <span>拓扑</span>
+                  </button>
+                  <button type="button" class="topology-panel-tab" data-topology-view="infrastructure" role="tab" aria-selected="false">
+                    <span class="topology-tab-icon" aria-hidden="true">
+                      <svg viewBox="0 0 20 20" fill="currentColor"><path d="M4 3.5A1.5 1.5 0 0 1 5.5 2h9A1.5 1.5 0 0 1 16 3.5v3A1.5 1.5 0 0 1 14.5 8h-9A1.5 1.5 0 0 1 4 6.5v-3Zm1.5-.25a.25.25 0 0 0-.25.25v3c0 .14.11.25.25.25h9c.14 0 .25-.11.25-.25v-3a.25.25 0 0 0-.25-.25h-9ZM4 13.5A1.5 1.5 0 0 1 5.5 12h9a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 4 16.5v-3Zm1.5-.25a.25.25 0 0 0-.25.25v3c0 .14.11.25.25.25h9c.14 0 .25-.11.25-.25v-3a.25.25 0 0 0-.25-.25h-9ZM6.5 4.5h1v1h-1v-1Zm0 10h1v1h-1v-1ZM9 4.5h4.5v1H9v-1Zm0 10h4.5v1H9v-1ZM9.5 8.75h1v2.5h-1v-2.5Z"/></svg>
+                    </span>
+                    <span>基础设施</span>
+                  </button>
+                </div>
+                <button type="button" class="topology-panel-collapse topology-icon-button" data-topology-action="panel-collapse" aria-label="折叠拓扑控制面板" aria-pressed="false">
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m12.5 5-5 5 5 5"/></svg>
+                </button>
+                <div class="topology-filter-scroll">
+                  <section class="topology-filter-section topology-filter-section--infra-only" aria-label="基础设施时间机器">
+                    <label class="topology-switch-row">
+                      <span>Time Machine</span>
+                      <input type="checkbox" data-topology-action="time-machine">
+                      <span class="topology-switch-ui" aria-hidden="true"></span>
+                    </label>
+                  </section>
+                  <section class="topology-filter-section topology-filter-section--switch topology-filter-section--topology-only">
+                    <label class="topology-switch-row">
+                      <span>显示互联网流量</span>
+                      <input type="checkbox" data-topology-action="traffic" checked>
+                      <span class="topology-switch-ui" aria-hidden="true"></span>
+                    </label>
+                  </section>
+                  <section class="topology-filter-section topology-filter-section--topology-only" data-topology-section="status">
+                    <button type="button" class="topology-section-title" data-topology-section-toggle aria-expanded="true">设备状态</button>
+                    <label class="topology-check-row">
+                      <input type="checkbox" data-topology-filter="statusOnline" checked>
+                      <span class="topology-check-ui" aria-hidden="true"></span>
+                      <span>在线</span>
+                      <em id="topologyOnlineCount">0</em>
+                    </label>
+                    <label class="topology-check-row">
+                      <input type="checkbox" data-topology-filter="statusOffline" checked>
+                      <span class="topology-check-ui" aria-hidden="true"></span>
+                      <span>离线</span>
+                      <em id="topologyOfflineCount">0</em>
+                    </label>
+                  </section>
+                  <section class="topology-filter-section topology-filter-section--topology-only" data-topology-section="clients">
+                    <div class="topology-section-heading">
+                      <button type="button" class="topology-section-title" data-topology-section-toggle aria-expanded="true">客户端设备</button>
+                      <label class="topology-mini-switch" title="显示客户端设备">
+                        <input type="checkbox" data-topology-action="clients-toggle" checked>
+                        <span class="topology-switch-ui" aria-hidden="true"></span>
+                      </label>
+                    </div>
+                    <label class="topology-check-row">
+                      <input type="checkbox" data-topology-filter="wiredClients" checked>
+                      <span class="topology-check-ui" aria-hidden="true"></span>
+                      <span>有线</span>
+                      <em id="topologyWiredCount">0</em>
+                    </label>
+                    <label class="topology-check-row">
+                      <input type="checkbox" data-topology-filter="wirelessClients" checked>
+                      <span class="topology-check-ui" aria-hidden="true"></span>
+                      <span>无线</span>
+                      <em id="topologyWirelessCount">0</em>
+                    </label>
+                  </section>
+                  <section class="topology-filter-section topology-filter-section--topology-only" data-topology-section="vlan">
+                    <button type="button" class="topology-section-title" data-topology-section-toggle aria-expanded="true">VLAN</button>
+                    <label class="topology-check-row">
+                      <input type="checkbox" data-topology-filter="vlanDefault" checked>
+                      <span class="topology-check-ui" aria-hidden="true"></span>
+                      <span>Default</span>
+                      <em id="topologyVlanDefaultCount">0</em>
+                    </label>
+                  </section>
+                  <section class="topology-filter-section topology-filter-section--topology-only" data-topology-section="labels">
+                    <button type="button" class="topology-section-title" data-topology-section-toggle aria-expanded="true">标签</button>
+                    <label class="topology-check-row">
+                      <input type="checkbox" data-topology-label="ssid" checked>
+                      <span class="topology-check-ui" aria-hidden="true"></span>
+                      <span>SSID</span>
+                    </label>
+                    <label class="topology-check-row">
+                      <input type="checkbox" data-topology-label="signal" checked>
+                      <span class="topology-check-ui" aria-hidden="true"></span>
+                      <span>信号</span>
+                    </label>
+                    <label class="topology-check-row">
+                      <input type="checkbox" data-topology-label="channel" checked>
+                      <span class="topology-check-ui" aria-hidden="true"></span>
+                      <span>信道</span>
+                    </label>
+                    <label class="topology-check-row">
+                      <input type="checkbox" data-topology-label="wifi" checked>
+                      <span class="topology-check-ui" aria-hidden="true"></span>
+                      <span>WiFi</span>
+                    </label>
+                    <label class="topology-check-row">
+                      <input type="checkbox" data-topology-label="wired" checked>
+                      <span class="topology-check-ui" aria-hidden="true"></span>
+                      <span>有线</span>
+                    </label>
+                    <label class="topology-check-row">
+                      <input type="checkbox" data-topology-label="stp" checked>
+                      <span class="topology-check-ui" aria-hidden="true"></span>
+                      <span>STP 优先级</span>
+                    </label>
+                  </section>
+                  <section class="topology-filter-section topology-filter-section--topology-only">
+                    <h3>导航模式</h3>
+                    <div class="topology-nav-mode" role="group" aria-label="导航模式">
+                      <button type="button" class="topology-nav-button topology-icon-button" data-topology-nav="pointer" aria-pressed="false" title="选择模式">
+                        <svg viewBox="0 0 20 20" fill="currentColor"><path d="M5.2 2.5 16.5 9l-5.15 1.2 2.74 4.74-1.73 1-2.72-4.72-3.5 3.9L5.2 2.5Z"/></svg>
+                      </button>
+                      <button type="button" class="topology-nav-button topology-icon-button" data-topology-nav="hand" aria-pressed="true" title="拖动画布">
+                        <svg viewBox="0 0 20 20" fill="currentColor"><path d="M7.25 3.25a1.25 1.25 0 0 1 2.5 0v4.32h.5V4.25a1.25 1.25 0 0 1 2.5 0v3.57h.5V5.75a1.25 1.25 0 0 1 2.5 0V11a6 6 0 0 1-6 6H9.4a4 4 0 0 1-3.1-1.47L3.08 11.6a1.24 1.24 0 0 1 1.86-1.64l1.06 1.2V3.25a1.25 1.25 0 0 1 1.25-1.25Zm0 0V12.5h-.88l-2.18-2.45a.24.24 0 0 0-.36.32l3.24 3.93A3 3 0 0 0 9.4 15.5h.85A4.5 4.5 0 0 0 14.75 11V5.75a.25.25 0 0 0-.5 0v4.5h-1.5v-6a.25.25 0 0 0-.5 0v6h-1.5v-7a.25.25 0 0 0-.5 0v7h-1.5v-7a.25.25 0 0 0-.5 0Z"/></svg>
+                      </button>
+                    </div>
+                  </section>
+                </div>
+                <footer class="topology-panel-footer">
+                  <button type="button" class="topology-clear-button" data-topology-action="clear-filters">清除筛选条件</button>
+                </footer>
+              </aside>
+              <div class="topology-canvas" id="topologyCanvas">
+                <div class="topology-empty" id="topologyEmpty" hidden>
+                  <strong>暂无拓扑数据</strong>
+                  <span>等待后端返回设备与链路关系后，拓扑图会自动绘制。</span>
+                </div>
+                <div class="topology-view-empty" id="topologyInfrastructureEmpty" hidden>
+                  <strong>正在读取基础设施</strong>
+                  <span>读取 /api/v1/topology/infrastructure 中的真实 infrastructure contract。</span>
+                </div>
+                <aside class="topology-time-machine" id="topologyTimeMachine" aria-label="基础设施历史时间轴" hidden></aside>
+                <div id="topology-content-container" class="topology-content-container">
+                  <div id="topology-zoom-container" class="topology-zoom-container">
+                    <svg id="topology-link-layer" class="topology-link-layer" width="100%" height="100%" aria-hidden="true"></svg>
+                    <div id="topology-node-layer" class="topology-node-layer"></div>
+                    <div id="label-layer" class="topology-label-layer" aria-hidden="true"></div>
+                    <div id="toggle-layer" class="topology-toggle-layer" aria-hidden="true"></div>
+                  </div>
+                </div>
+                <div class="topology-canvas-tools" aria-label="拓扑画布工具">
+                  <button type="button" class="topology-canvas-tool topology-icon-button" data-topology-action="rotate" title="旋转布局" aria-pressed="false">
+                    <svg viewBox="0 0 20 20" fill="currentColor" xmlns="http://www.w3.org/2000/svg" width="20px" height="20px" stroke="currentColor" stroke-width="0" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M8.225 2.196A8.035 8.035 0 0 1 9.983 2a8.034 8.034 0 0 1 7.814 6.247 7.975 7.975 0 0 1-2.135 7.425l-.682-.738a6.982 6.982 0 0 0 1.843-6.467A7.04 7.04 0 0 0 9.979 3a6.95 6.95 0 0 0-6.302 4.003h1.822a.5.5 0 0 1 0 1H2.5a.5.5 0 0 1-.5-.5v-3a.5.5 0 1 1 .999 0v1.62a7.935 7.935 0 0 1 5.226-3.927ZM2.999 6.988v.015h.024l-.024-.015Z" fill="currentColor"></path><path fill-rule="evenodd" clip-rule="evenodd" d="M5.707 10.707a1 1 0 0 1 0-1.414l3.586-3.586a1 1 0 0 1 1.414 0l3.586 3.586a1 1 0 0 1 0 1.414l-3.586 3.586a1 1 0 0 1-1.414 0l-3.586-3.586ZM6.414 10 10 6.414 13.586 10 10 13.586 6.414 10Z" fill="currentColor"></path></svg>
+                  </button>
+                  <button type="button" class="topology-canvas-tool topology-icon-button" data-topology-action="fit" title="适配画布">
+                    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3H3v4"/><path d="M13 3h4v4"/><path d="M17 13v4h-4"/><path d="M7 17H3v-4"/></svg>
+                  </button>
+                  <button type="button" class="topology-canvas-tool topology-icon-button" data-topology-action="zoom-in" title="放大">
+                    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M10 5v10"/><path d="M5 10h10"/></svg>
+                  </button>
+                  <button type="button" class="topology-canvas-tool topology-icon-button" data-topology-action="zoom-out" title="缩小">
+                    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M5 10h10"/></svg>
+                  </button>
+                </div>
+                <button type="button" class="topology-add-button topology-icon-button" data-topology-action="add" title="添加拓扑对象" aria-label="添加拓扑对象">
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M10 5v10"/><path d="M5 10h10"/></svg>
+                </button>
+                <aside class="topology-property-panel dwrt-glass-card" id="topologyDetailDrawer" aria-label="拓扑节点详情" hidden></aside>
+                <div class="topology-status-toast" id="topologyStatus" aria-live="polite"></div>
+              </div>
+            </div>
+          </section>
+        </section>
+        <footer class="console-page-footer" id="consolePageFooter" aria-label="系统版本">
+          <span id="consolePageFooterVersion">Dreaming OS 7.2-RC3 Build202607180016</span>
+        </footer>
+      </main>
+
+      <div class="account-popover" id="accountPopover" role="menu" aria-label="管理员菜单" hidden>
+        <div class="account-card">
+          <strong>root</strong>
+          <span>超级管理员</span>
+          <a href="/app/#/system/admin" role="menuitem">管理员设置</a>
+          <a href="/login/" role="menuitem">重新登录</a>
+        </div>
+      </div>
+
+      <div class="command-palette" id="commandPalette" role="dialog" aria-modal="true" aria-label="搜索菜单" hidden>
+        <button class="command-backdrop" id="commandPaletteBackdrop" type="button" aria-label="关闭搜索"></button>
+        <section class="command-panel dwrt-glass-card" aria-labelledby="commandPaletteTitle">
+          <div class="command-glow" aria-hidden="true"></div>
+          <div class="command-input-row">
+            <span class="command-search-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            </span>
+            <input id="commandPaletteInput" type="search" autocomplete="off" spellcheck="false" placeholder="搜索菜单、IP、MAC、eth0、lan、wan…" aria-labelledby="commandPaletteTitle">
+            <kbd class="command-shortcut">⌘K</kbd>
+            <div class="command-mode-controls" role="group" aria-label="搜索模式">
+              <button class="command-mode-button is-active" id="commandSearchMode" type="button" data-command-mode="search" aria-pressed="true" data-tooltip="搜索路由器" aria-label="搜索路由器">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+              </button>
+              <button class="command-mode-button" id="commandAiMode" type="button" data-command-mode="ai" aria-pressed="false" data-tooltip="直接问 AI" aria-label="直接问 AI">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3-1.4 3.6a3 3 0 0 1-1.7 1.7L5.3 9.7l3.6 1.4a3 3 0 0 1 1.7 1.7l1.4 3.6 1.4-3.6a3 3 0 0 1 1.7-1.7l3.6-1.4-3.6-1.4a3 3 0 0 1-1.7-1.7L12 3Z"/><path d="m19 17-.5 1.3a1.5 1.5 0 0 1-.8.8l-1.3.5 1.3.5a1.5 1.5 0 0 1 .8.8L19 22l.5-1.1a1.5 1.5 0 0 1 .8-.8l1.3-.5-1.3-.5a1.5 1.5 0 0 1-.8-.8L19 17Z"/></svg>
+              </button>
+            </div>
+          </div>
+          <h2 id="commandPaletteTitle">快速打开</h2>
+          <div class="command-results" id="commandPaletteResults" role="listbox" aria-label="搜索结果"></div>
+          <div class="command-empty" id="commandPaletteEmpty" hidden>没有找到匹配的菜单</div>
+          <div class="command-footer" aria-hidden="true">
+            <span><kbd>↑↓</kbd> 选择</span>
+            <span><kbd>Enter</kbd> <b id="commandEnterAction">打开</b></span>
+            <span><kbd>Esc</kbd> 关闭</span>
+          </div>
+        </section>
+      </div>
+
+      <div class="ai-global-root" id="aiGlobalRoot" aria-live="polite">
+        <button class="ai-bootstrap-orb" id="aiBootstrap" type="button" aria-label="打开 AI 助手" aria-haspopup="dialog">
+          <span aria-hidden="true"></span>
+        </button>
+      </div>
+
+      <div class="dwrt-kit-modal-layer" id="sessionRecovery" data-dwrt-component="modal" hidden>
+        <div class="dwrt-kit-modal-backdrop" aria-hidden="true"></div>
+        <section class="dwrt-kit-modal" role="alertdialog" aria-modal="true" aria-labelledby="sessionRecoveryTitle" aria-describedby="sessionRecoveryDescription">
+          <header class="dwrt-kit-modal-header">
+            <div>
+              <h2 id="sessionRecoveryTitle">登录状态已失效</h2>
+              <p id="sessionRecoveryDescription">当前页面保持不变。重新登录后将返回此路径。</p>
+            </div>
+          </header>
+          <div class="dwrt-kit-modal-body">
+            <section data-dwrt-component="state-panel" data-dwrt-state="forbidden">
+              <strong>需要重新验证身份</strong>
+              <p>访问令牌和刷新令牌均无法继续使用。</p>
+            </section>
+          </div>
+          <footer class="dwrt-kit-modal-footer">
+            <a id="sessionRecoveryLogin" data-dwrt-component="button" data-variant="primary" href="/login/">重新登录</a>
+          </footer>
+        </section>
+      </div>
+    </div>
+
+    <script src="/static/ui-kit/lucide.min.js?v=1.25.0" defer></script>
+    <script src="/static/ui-kit/dwrt-ui-kit.js?v=20260723-airview-radio-sheet-01" defer></script>
+    <script src="/static/js/menu-icons.js?v=20260722-auth-control-01" defer></script>
+    <script src="/static/js/device-images.js?v=20260723-airview-radio-sheet-01" defer></script>
+    <script src="/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260725-ui-kit-filter-edge-05" defer></script>
+    <script src="/static/js/shell-prewarm.js?v=20260725-route-resource-version-02" defer></script>
+    <script src="/static/js/dwrt-session-gate.js?v=20260720-01" defer></script>
+    <script src="/static/js/dwrt-data-registry.js?v=20260721-02" defer></script>
+    <script src="/static/js/dwrt-realtime.js?v=20260720-05" defer></script>
+    <script src="/static/js/notifications.js?v=20260704-1" defer></script>
+    <script src="/static/js/notify-realtime.js?v=20260704-1" defer></script>
+    <script src="/static/js/menu-shell.js?v=20260725-route-resource-version-02" defer></script>
+  </body>
+</html>

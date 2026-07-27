@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/wifi-management.css">
+  <style>
+    :root { --wifi-accent:#2878ff; --wifi-ok:#23a566; --wifi-warn:#d89a23; --wifi-bad:#d64a4a; --wifi-line:rgba(30,40,55,.18); --wifi-soft-line:rgba(30,40,55,.09); --wifi-muted:#667085; }
+    * { box-sizing:border-box; }
+    html, body, .console-stage { width:100%; height:100%; margin:0; }
+    body { color:#172033; background:#dfe7ef; font:13px/1.45 system-ui,sans-serif; }
+    .console-stage { padding:12px; }
+    .route-preview { height:100%; }
+    .policy-stable-glass { border:1px solid rgba(255,255,255,.48); background:rgba(255,255,255,.48); backdrop-filter:blur(12px); }
+  </style>
+</head>
+<body>
+  <img id="appWallpaper" src="../../files/www/dreamingwrt/static/images/gateway-wide.svg" alt="" hidden>
+  <div class="console-stage"><main id="routePreview" class="route-preview"></main></div>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    const AP_ID = '067c4735-bf9f-499d-9e95-55d7b50cdedf';
+    const radio = (phy, band, channel, width, power) => ({
+      id:`ap:${AP_ID}:radio:${phy}`, phy, ap_id:AP_ID, ap_name:'', model:'Xiaomi Router BE10000 (Wi-Fi 7)',
+      source:'managed_ap', online:true, configured_enabled:true, band, channel, width,
+      image_url:'/files/www/dreamingwrt/static/images/gateway-wide.svg', image_available:true,
+      image_source:'fingerprint_model_catalog', image_model_match:'Xiaomi Router BE10000',
+      interfaces:[{ txpower_dbm:power }]
+    });
+    const ssid = (id, name, radioId, band) => ({
+      id:`ap:${AP_ID}:ssid:${id}`, local_id:id, name, ssid:name, ap_id:AP_ID,
+      radio_id:`ap:${AP_ID}:radio:${radioId}`, bands:[band], source:'managed_ap', online:true
+    });
+    const status = {
+      capabilities:{
+        wifi:true, radio_runtime:true, remote_telemetry:true, radio_update:false,
+        airview_realtime:false, airview_history:false, station_metrics:false, websocket:false, scan:true, scan_execution:true,
+        reasons:{ radio_update:'managed_ap_transaction_pending', airview_history:'airview_history_store_pending', station_metrics:'station_source_not_reported' }
+      },
+      managed_aps:{items:[{
+        ap_id:AP_ID, name:'Xiaomi Router BE10000 (Wi-Fi 7)', model:'Xiaomi Router BE10000 (Wi-Fi 7)',
+        image_url:'/files/www/dreamingwrt/static/images/gateway-wide.svg', online:true,
+        ip_address:'192.168.1.2', mac_address:'02:11:22:33:44:55', firmware_version:'1.0.0', uptime_text:'3 天 2 小时'
+      }]},
+      summary:{ managed_ap_count:1, managed_ap_online:1, radio_count:3, ssid_count:4, station_count:0 },
+      radios:[radio('phy3','6GHz',33,320,24), radio('phy2','5GHz',36,160,27), radio('phy1','2.4GHz',10,40,28)],
+      ssids:[ssid('ath2','Xiaomi_DE23','phy3','6GHz'), ssid('ath1','Xiaomi_DE23','phy2','5GHz'), ssid('ath0','Xiaomi_DE23','phy1','2.4GHz'), ssid('ath11','Xiaomi_52A3-IoT','phy2','5GHz')],
+      stations:[], interference:[], connectivity_events:[], runtime:{ available:true, complete:false, reason:'partial_runtime_sources' }
+    };
+    let scanIndex = 0;
+    window.fetch = async (url, options = {}) => {
+      if (String(url).includes('/api/v1/wifi/scan/jobs/')) {
+        const jobId = String(url).match(/jobs\/([^?]+)/)?.[1] || 'job';
+        return { ok:true, status:200, text:async () => JSON.stringify({ data:{ item:{ job_id:jobId, state:'failed', error_code:'iw_neighbor_scan_failed_or_unsupported', result_count:0 } } }) };
+      }
+      if (String(url).includes('/api/v1/wifi/scan') && options.method === 'POST') {
+        scanIndex += 1;
+        return { ok:true, status:200, text:async () => JSON.stringify({ data:{ operation:'radio_job_create', item:{ job_id:`job-${scanIndex}`, state:'queued' }, accepted:true } }) };
+      }
+      return { ok:true, status:200, text:async () => JSON.stringify({ data:status }) };
+    };
+    const { mount } = await import('../../files/www/dreamingwrt/plugins/native/wifi-management.js');
+    window.fixtureController = mount({
+      root:document.getElementById('routePreview'), item:{ id:'wireless-status' },
+      utils:{ escapeHtml:value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character])) }
+    });
+  </script>
+</body>
+</html>

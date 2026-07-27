@@ -10,7 +10,8 @@ PKG_SOURCE_URL:=https://github.com/openwrt/mt76
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2026-07-01
 PKG_SOURCE_VERSION:=59676919ea408b0b13a9d23f2e2e1a1ab407fba1
-PKG_MIRROR_HASH:=8a6dc6dac37ed56fcbfd874359f5c25acb65bcfaa795d50494cba17c98405dd5
+PKG_MIRROR_HASH:=799ac1ec9b40be66943a65892cb17796a62341703765b671d96e9a5510475680
+MT76_KMOD_VERSION:=$(subst -,.,$(PKG_SOURCE_DATE))
 
 PKG_MAINTAINER:=Felix Fietkau <nbd@nbd.name>
 PKG_USE_NINJA:=0
@@ -38,6 +39,7 @@ CMAKE_BINARY_DIR:=$(PKG_BUILD_DIR)/tools
 
 define KernelPackage/mt76-default
   SUBMENU:=Wireless Drivers
+  VERSION:=$(MT76_KMOD_VERSION)
   DEPENDS:= \
 	+kmod-mac80211 \
 	+@DRIVER_11AC_SUPPORT \
@@ -48,6 +50,7 @@ endef
 define KernelPackage/mt76
   SUBMENU:=Wireless Drivers
   TITLE:=MediaTek MT76x2/MT7603 wireless driver (metapackage)
+  VERSION:=$(MT76_KMOD_VERSION)
   DEPENDS:= \
 	+kmod-mt76-core +kmod-mt76x2 +kmod-mt7603
 endef

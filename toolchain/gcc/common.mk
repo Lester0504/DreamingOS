@@ -30,6 +30,8 @@ PKG_SOURCE_URL:=@GNU/gcc/gcc-$(PKG_VERSION)
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.xz
 PKG_CPE_ID:=cpe:/a:gnu:gcc
 
+PKGVERSION:=DreamingWrt GCC $(PKG_VERSION) $(REVISION)
+
 ifeq ($(PKG_VERSION),13.4.0)
   PKG_HASH:=9c4ce6dbb040568fdc545588ac03c5cbc95a8dbf0c7aa490170843afb59ca8f5
 endif
@@ -42,10 +44,13 @@ ifeq ($(PKG_VERSION),15.3.0)
   PKG_HASH:=fa59c1beef8995f27c4d71c1df227587189315d3e6faff1bb4306e61b0c530eb
 endif
 
+ifeq ($(PKG_VERSION),16.1.0)
+  PKG_HASH:=50efb4d94c3397aff3b0d61a5abd748b4dd31d9d3f2ab7be05b171d36a510f79
+endif
+
 PATCH_DIR=../patches-$(GCC_MAJOR_VERSION).x
 
 BUGURL=http://bugs.openwrt.org/
-PKGVERSION=OpenWrt GCC $(PKG_VERSION) $(REVISION)
 
 HOST_BUILD_PARALLEL:=1
 

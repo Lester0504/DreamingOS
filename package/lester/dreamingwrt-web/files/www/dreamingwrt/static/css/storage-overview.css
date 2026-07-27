@@ -1,0 +1,171 @@
+@import url('/static/css/policy-table.css?v=20260718-18');
+
+.console-stage.is-storage-overview {
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+  padding: var(--app-page-gutter-block) var(--app-page-gutter-inline);
+  overflow: hidden;
+}
+
+.console-stage.is-storage-overview .stage-header { display: none; }
+.console-stage.is-storage-overview .route-preview.storage-overview-route-host {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.storage-overview-route-host,
+.storage-overview-route-host * { box-sizing: border-box; }
+
+.storage-overview-shell {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 48px minmax(0, 1fr);
+  gap: var(--app-page-gap, 14px);
+  overflow: hidden;
+  color: var(--app-text);
+}
+
+.storage-overview-toolbar {
+  min-width: 0;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.storage-overview-toolbar svg,
+.storage-chart-icon svg,
+.storage-chart-empty svg { width: 19px; height: 19px; display: block; }
+
+.storage-range {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 42px;
+  padding: 4px;
+  border-radius: var(--app-radius-control, 10px);
+  background: var(--dwrt-glass-surface);
+  box-shadow: inset 0 0 0 1px var(--dwrt-glass-edge);
+  backdrop-filter: var(--dwrt-glass-backdrop);
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop);
+}
+
+.storage-range button {
+  height: 34px;
+  min-width: 86px;
+  border: 0;
+  border-radius: var(--app-radius-compact, 8px);
+  padding: 0 13px;
+  color: var(--app-text-muted);
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 680;
+  cursor: pointer;
+}
+
+.storage-range button:hover { color: var(--app-text); background: var(--dwrt-interactive-hover-bg); }
+.storage-range button.is-active { color: var(--app-selected-text, var(--app-text)); background: var(--dwrt-active-pill-bg); box-shadow: inset 0 0 0 1px var(--dwrt-glass-edge-strong); }
+
+.storage-overview-scroll {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  align-content: start;
+  gap: var(--app-page-gap, 14px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding-bottom: 2px;
+}
+
+.storage-overview-notice {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  padding: 9px 12px;
+  border-radius: var(--app-radius-control, 10px);
+  color: color-mix(in srgb, #f4c367 82%, var(--app-text) 18%);
+  background: rgba(230, 155, 43, .09);
+  box-shadow: inset 0 0 0 1px rgba(243, 185, 88, .17);
+  font-size: 12px;
+}
+
+.storage-overview-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.storage-overview-summary .dwrt-kit-overview-card { min-height: 124px; padding: 17px 18px; }
+.storage-overview-summary .dwrt-kit-overview-content strong { font-size: clamp(24px, 2vw, 30px); }
+
+.storage-chart-grid { min-width: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--app-page-gap, 14px); }
+.storage-chart-card { min-width: 0; min-height: 360px; display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; border-radius: var(--app-radius-card); }
+.storage-chart-card > header { min-width: 0; min-height: 78px; display: grid; grid-template-columns: 40px minmax(0, 1fr); align-items: center; gap: 12px; padding: 13px 15px; border-bottom: 1px solid rgba(255,255,255,.09); }
+.storage-chart-card > header > div:nth-child(2) { min-width: 0; display: grid; gap: 3px; }
+.storage-chart-card > header strong { font-size: 14px; font-weight: 760; }
+.storage-chart-card > header small { color: var(--app-text-muted); font-size: 10px; }
+.storage-chart-icon { width: 40px; height: 40px; display: grid; place-items: center; border-radius: var(--app-radius-control, 10px); color: #6fb1ff; background: rgba(63,139,242,.11); box-shadow: inset 0 0 0 1px rgba(102,166,255,.17); }
+.storage-chart-body { min-width: 0; min-height: 0; position: relative; padding: 8px; }
+.storage-chart { width: 100%; height: 260px; min-height: 260px; }
+
+.storage-chart-legend { grid-column: 1 / -1; min-width: 0; display: flex; align-items: center; gap: 5px; overflow-x: auto; padding-top: 5px; scrollbar-width: none; }
+.storage-chart-legend::-webkit-scrollbar { display: none; }
+.storage-chart-legend button { min-width: max-content; height: 28px; display: inline-flex; align-items: center; gap: 6px; border: 0; border-radius: 7px; padding: 0 8px; color: var(--app-text-secondary); background: transparent; font: inherit; font-size: 10px; cursor: pointer; }
+.storage-chart-legend button:hover { background: var(--dwrt-interactive-hover-bg); }
+.storage-chart-legend button[aria-pressed="false"] { opacity: .42; }
+.storage-chart-legend i { width: 7px; height: 7px; border-radius: 50%; background: var(--disk-color); box-shadow: 0 0 8px color-mix(in srgb, var(--disk-color) 48%, transparent); }
+
+.storage-chart-empty { height: 100%; min-height: 250px; display: grid; place-content: center; justify-items: center; gap: 8px; padding: 24px; color: var(--app-text-muted); text-align: center; }
+.storage-chart-empty svg { width: 28px; height: 28px; opacity: .68; }
+.storage-chart-empty strong { color: var(--app-text-secondary); font-size: 12px; }
+.storage-chart-empty span { max-width: 330px; font-size: 10px; line-height: 1.5; }
+
+.storage-smart-card { min-width: 0; min-height: 260px; display: grid; grid-template-rows: auto minmax(0, 1fr); border-radius: var(--app-radius-card); }
+.storage-smart-card .dwrt-kit-table-scroll { min-width: 0; min-height: 0; max-height: 340px; overflow: auto; }
+.storage-smart-table { width: 100%; min-width: 980px; }
+.storage-smart-table td { color: var(--app-text-secondary); white-space: nowrap; }
+.storage-smart-table td strong { color: var(--app-text); }
+.storage-smart-table code { color: inherit; font: inherit; font-size: 11px; }
+.storage-smart-state { display: inline-flex; align-items: center; gap: 7px; }
+.storage-smart-state i { width: 7px; height: 7px; border-radius: 50%; background: #8994a4; }
+.storage-smart-state.is-ok i { background: #48d488; box-shadow: 0 0 8px rgba(72,212,136,.34); }
+
+@media (max-width: 1280px) {
+  .storage-chart-grid { grid-template-columns: 1fr; }
+  .storage-chart-card { min-height: 340px; }
+  .storage-chart { height: 250px; }
+}
+
+@media (max-width: 760px) {
+  .console-stage.is-storage-overview { height: 100%; padding: 10px; }
+  .storage-overview-shell { grid-template-rows: 44px minmax(0, 1fr); gap: 9px; }
+  .storage-range { min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .storage-range button { min-width: max-content; padding-inline: 11px; }
+  .storage-overview-toolbar .policy-filter-button { width: 42px; min-width: 42px; padding: 0; justify-content: center; }
+  .storage-overview-toolbar .policy-filter-button span { display: none; }
+  .storage-overview-summary { grid-template-columns: 1fr; }
+  .storage-overview-summary .dwrt-kit-overview-card { min-height: 104px; }
+  .storage-chart-card > header { min-height: 72px; }
+  .storage-chart { height: 230px; min-height: 230px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .storage-range button { transition: none; }
+}

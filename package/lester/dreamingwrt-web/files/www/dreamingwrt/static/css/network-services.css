@@ -1,0 +1,614 @@
+@import url('/static/css/policy-table.css?v=20260716-09');
+
+.console-stage.is-network-services {
+  grid-template-rows: minmax(0, 1fr);
+  align-items: start;
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+  padding: var(--app-page-gutter-block) var(--app-page-gutter-inline);
+  overflow: hidden;
+}
+
+.console-stage.is-network-services .stage-header { display: none; }
+
+.console-stage.is-network-services .route-preview.network-service-route-host {
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.network-service-route-host,
+.network-service-route-host * { box-sizing: border-box; }
+
+.network-service-shell {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  overflow: hidden;
+}
+
+.network-service-page-header {
+  min-width: 0;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.network-service-tabs {
+  max-width: 100%;
+  min-height: 52px;
+  justify-self: start;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.network-service-tabs::-webkit-scrollbar { display: none; }
+.network-service-tabs .dwrt-kit-tab { min-width: 112px; height: 42px; flex: 0 0 auto; }
+.is-dhcp .network-service-tabs .dwrt-kit-tab { min-width: 142px; }
+
+.network-service-workbench {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto;
+  align-content: start;
+  gap: 12px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.network-service-toolbar {
+  min-width: 0;
+  min-height: 48px;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  flex: 0 0 auto;
+}
+
+.network-service-toolbar .policy-toolbar-actions { display: flex; align-items: center; gap: 9px; }
+.network-service-toolbar svg,
+.network-service-name svg,
+.network-service-icon-button svg,
+.network-service-capability svg,
+.network-service-drawer-hero svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.network-service-refresh:disabled { opacity: 0.62; cursor: wait; }
+
+@media (max-width: 980px) {
+  .network-service-page-header { overflow-x: auto; scrollbar-width: none; }
+  .network-service-page-header::-webkit-scrollbar { display: none; }
+  .network-service-tabs { overflow: visible; }
+  .network-service-toolbar { position: sticky; right: 0; }
+}
+
+.network-service-notice {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  padding: 9px 12px;
+  border-radius: var(--app-radius-control, 10px);
+  color: #77dda7;
+  background: rgba(49, 190, 129, 0.10);
+  box-shadow: inset 0 0 0 1px rgba(77, 211, 151, 0.17);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.network-service-notice.is-warning {
+  color: #f5c166;
+  background: rgba(245, 166, 35, 0.10);
+  box-shadow: inset 0 0 0 1px rgba(245, 166, 35, 0.17);
+}
+
+.network-service-notice.is-error {
+  color: #ff8d99;
+  background: rgba(255, 93, 113, 0.10);
+  box-shadow: inset 0 0 0 1px rgba(255, 93, 113, 0.17);
+}
+
+.network-service-overview { flex: 0 0 auto; }
+.network-service-overview .dwrt-kit-overview-card { min-height: 118px; }
+
+/* DNS keeps one shared Kit surface; these rules only define information order. */
+.is-dns .dns-control-surface {
+  min-width: 0;
+  overflow: hidden;
+  border-radius: var(--app-radius-card);
+}
+
+.is-dns .dns-control-heading {
+  min-height: 76px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 16px 20px;
+  border-bottom: 1px solid color-mix(in srgb, var(--app-text) 10%, transparent);
+}
+
+.is-dns .dns-control-heading > div { min-width: 0; display: grid; gap: 3px; }
+.is-dns .dns-control-heading > div > span,
+.is-dns .dns-control-kicker { color: var(--app-text-muted); font-size: 10px; font-weight: 760; }
+.is-dns .dns-control-heading > div > strong { color: var(--app-text); font-size: 17px; font-weight: 740; }
+.is-dns .dns-control-heading > div > small { color: var(--app-text-secondary); font-size: 11px; line-height: 1.45; }
+
+.is-dns .dns-control-health {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+  border-radius: 999px;
+  color: var(--app-text-secondary);
+  font-size: 10px;
+  font-weight: 760;
+}
+
+.is-dns .dns-control-health.is-ok { color: var(--dwrt-semantic-success, #48d58b); }
+.is-dns .dns-control-health.is-warn { color: var(--dwrt-semantic-warning, #f5bd61); }
+.is-dns .dns-control-health.is-bad { color: var(--dwrt-semantic-danger, #ff7d8c); }
+.is-dns .dns-control-health.is-info { color: var(--dwrt-semantic-info, #77adff); }
+
+.is-dns .dns-control-groups { display: grid; }
+.is-dns .dns-control-group { min-width: 0; border-bottom: 1px solid color-mix(in srgb, var(--app-text) 8%, transparent); }
+.is-dns .dns-control-group:last-child { border-bottom: 0; }
+
+.is-dns .dns-control-group-trigger {
+  width: 100%;
+  min-height: 64px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 12px;
+  border: 0;
+  padding: 10px 18px;
+  color: var(--app-text);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.is-dns .dns-control-group-trigger:hover { background: var(--dwrt-interactive-hover-bg); }
+.is-dns .dns-control-group-trigger:focus-visible { outline: 2px solid var(--dwrt-accent, #378cff); outline-offset: -3px; }
+.is-dns .dns-control-group-trigger:disabled { cursor: not-allowed; opacity: 0.58; }
+.is-dns .dns-control-group-index { color: var(--app-text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.is-dns .dns-control-group-trigger > span:nth-child(2) { min-width: 0; display: grid; gap: 3px; }
+.is-dns .dns-control-group-trigger strong { color: var(--app-text); font-size: 13px; font-weight: 740; }
+.is-dns .dns-control-group-trigger small { overflow: hidden; color: var(--app-text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.is-dns .dns-control-group-chevron { width: 28px; height: 28px; display: grid; place-items: center; color: var(--app-text-muted); transition: transform 160ms ease; }
+.is-dns .dns-control-group-chevron svg { width: 16px; height: 16px; }
+.is-dns .dns-control-group.is-open .dns-control-group-chevron { transform: rotate(90deg); }
+
+.is-dns .dns-control-group-body {
+  display: grid;
+  gap: 14px;
+  margin: 0 18px 16px 52px;
+  padding: 15px 16px 15px 18px;
+  border-left: 2px solid color-mix(in srgb, var(--dwrt-accent, #378cff) 62%, transparent);
+}
+
+.is-dns .dns-core-status { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.is-dns .dns-core-status > div:first-child { min-width: 0; display: grid; gap: 3px; }
+.is-dns .dns-core-status > div:first-child > strong { color: var(--app-text); font-size: 15px; font-weight: 740; }
+.is-dns .dns-core-status > div:first-child > small { color: var(--app-text-secondary); font-size: 11px; line-height: 1.45; }
+.is-dns .dns-core-action { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; }
+.is-dns .dns-core-mode { max-width: 360px; }
+
+.is-dns .dns-inline-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0;
+  margin: 0;
+  border-top: 1px solid color-mix(in srgb, var(--app-text) 8%, transparent);
+}
+
+.is-dns .dns-inline-facts > div { min-width: 0; display: grid; gap: 3px; padding: 12px 12px 0 0; }
+.is-dns .dns-inline-facts dt { color: var(--app-text-muted); font-size: 10px; }
+.is-dns .dns-inline-facts dd { min-width: 0; margin: 0; overflow: hidden; color: var(--app-text); font-size: 12px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+
+.is-dns .dns-field-grid,
+.is-dns .dns-switch-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; }
+.is-dns .dns-field-grid .network-service-field.is-wide { grid-column: 1 / -1; }
+
+.is-dns .dns-inline-switch {
+  min-width: 0;
+  min-height: 52px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 40px;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--app-text) 7%, transparent);
+}
+
+.is-dns .dns-inline-switch > span { min-width: 0; display: grid; gap: 3px; }
+.is-dns .dns-inline-switch strong { color: var(--app-text); font-size: 12px; font-weight: 710; }
+.is-dns .dns-inline-switch small { color: var(--app-text-muted); font-size: 10px; line-height: 1.4; }
+.is-dns .dns-dependent-fields { max-width: 360px; padding-left: 12px; border-left: 2px solid color-mix(in srgb, var(--dwrt-accent, #378cff) 45%, transparent); }
+
+.is-dns .dns-routing-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.is-dns .dns-routing-summary > div { min-width: 0; display: grid; grid-template-columns: 24px minmax(0, 1fr); align-items: center; column-gap: 8px; }
+.is-dns .dns-routing-summary svg { width: 18px; height: 18px; grid-row: 1 / span 2; color: var(--app-text-muted); }
+.is-dns .dns-routing-summary strong { color: var(--app-text); font-size: 13px; }
+.is-dns .dns-routing-summary small { color: var(--app-text-muted); font-size: 10px; }
+.is-dns .dns-routing-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.is-dns .dns-routing-actions .policy-secondary { min-height: 36px; }
+
+.network-service-settings {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(300px, 0.9fr) minmax(360px, 1.1fr);
+  gap: 0;
+  overflow: hidden;
+  border-radius: var(--app-radius-card);
+}
+
+.network-service-setting-list {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  padding: 8px 18px;
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.network-service-setting-list.is-compact {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 18px;
+  padding: 10px 18px;
+}
+
+.network-service-setting-list.is-compact .network-service-setting-row { min-height: 50px; }
+.network-service-setting-list.is-compact .network-service-setting-row:nth-last-child(-n + 2) { border-bottom: 0; }
+
+.network-service-setting-row {
+  min-height: 58px;
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px;
+  align-items: center;
+  gap: 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.network-service-setting-row:last-child { border-bottom: 0; }
+.network-service-setting-row.is-editor { padding: 0 4px 13px; }
+.network-service-setting-row > span { min-width: 0; display: grid; gap: 3px; }
+.network-service-setting-row strong { color: var(--app-text); font-size: 13px; font-weight: 720; }
+.network-service-setting-row small { overflow: hidden; color: var(--app-text-muted); font-size: 10px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+
+.network-service-switch {
+  width: 40px;
+  height: 22px;
+  position: relative;
+  display: block;
+}
+
+.network-service-switch input { position: absolute; opacity: 0; pointer-events: none; }
+.network-service-switch i {
+  width: 40px;
+  height: 22px;
+  position: relative;
+  display: block;
+  border-radius: 999px;
+  background: rgba(128, 140, 158, 0.28);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.10);
+  cursor: pointer;
+}
+
+.network-service-switch i::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #e7edf5;
+  transition: transform 160ms ease;
+}
+
+.network-service-switch input:checked + i { background: rgba(46, 139, 255, 0.78); }
+.network-service-switch input:checked + i::after { transform: translateX(18px); }
+.network-service-switch.is-disabled { opacity: 0.52; }
+.network-service-switch.is-disabled i { cursor: not-allowed; }
+
+.network-service-form {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start;
+  gap: 14px;
+  padding: 18px;
+}
+
+.network-service-field {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 6px;
+}
+
+.network-service-field.is-wide { grid-column: 1 / -1; }
+.network-service-field > span { color: var(--app-text-secondary); font-size: 12px; font-weight: 720; }
+.network-service-field small { color: var(--app-text-muted); font-size: 10px; line-height: 1.35; }
+.network-service-field input,
+.network-service-field select,
+.network-service-table input,
+.network-service-table select {
+  width: 100%;
+  min-width: 0;
+  height: 40px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: var(--app-radius-control, 10px);
+  padding: 0 11px;
+  color: var(--app-text);
+  background: rgba(8, 14, 26, 0.20);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), inset 0 -12px 22px rgba(2, 8, 18, 0.08);
+  font: inherit;
+  font-size: 12px;
+  outline: 0;
+}
+
+.network-service-field input:focus,
+.network-service-field select:focus,
+.network-service-table input:focus,
+.network-service-table select:focus {
+  border-color: rgba(74, 153, 255, 0.48);
+  box-shadow: 0 0 0 3px rgba(43, 123, 255, 0.10), inset 0 -12px 22px rgba(2, 8, 18, 0.08);
+}
+
+.network-service-field input:disabled,
+.network-service-field select:disabled { opacity: 0.58; cursor: not-allowed; }
+
+.network-service-capability {
+  min-height: 46px;
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: var(--app-radius-control, 10px);
+  color: #f5c166;
+  background: rgba(245, 166, 35, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(245, 166, 35, 0.15);
+}
+
+.network-service-capability > svg { width: 20px; height: 20px; margin: auto; }
+.network-service-capability > span { min-width: 0; display: grid; gap: 2px; }
+.network-service-capability strong { font-size: 12px; font-weight: 720; }
+.network-service-capability small { color: color-mix(in srgb, currentColor 78%, var(--app-text-muted)); font-size: 10px; line-height: 1.4; }
+
+.network-service-table-card {
+  min-width: 0;
+  min-height: 260px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 0;
+  border-radius: var(--app-radius-card);
+}
+
+.network-service-table-card .dwrt-kit-table-scroll {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
+}
+
+.network-service-table { width: 100%; min-width: 880px; table-layout: auto; }
+.is-dhcp .network-service-table { min-width: 1120px; }
+.network-service-table td { color: var(--app-text-secondary); white-space: nowrap; }
+.network-service-table td strong { color: var(--app-text); }
+.network-service-table input { min-width: 122px; height: 34px; }
+.network-service-table select { min-width: 118px; height: 34px; }
+.dns-policy-table { min-width: 1060px; }
+
+.network-service-name,
+.network-service-link {
+  min-width: 0;
+  display: inline-grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.network-service-link { display: inline-flex; }
+.network-service-name > span:first-child {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  color: #82b8ff;
+  background: rgba(57, 130, 255, 0.10);
+  box-shadow: inset 0 0 0 1px rgba(91, 157, 255, 0.16);
+}
+
+.network-service-name > span:last-child,
+.network-service-line { min-width: 0; display: grid; gap: 2px; }
+.network-service-name strong,
+.network-service-name small,
+.network-service-line strong,
+.network-service-line small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.network-service-name strong,
+.network-service-line strong { color: var(--app-text); font-size: 12px; }
+.network-service-name small,
+.network-service-line small { color: var(--app-text-muted); font-size: 10px; }
+
+.network-service-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--app-text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.network-service-status i { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #8994a4; }
+.network-service-status.is-up i { background: #47d486; box-shadow: 0 0 8px rgba(71, 212, 134, 0.35); }
+
+.network-service-icon-button {
+  width: 32px;
+  height: 32px;
+  display: inline-grid;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  color: var(--app-text-muted);
+  background: rgba(8, 14, 26, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  cursor: pointer;
+}
+
+.network-service-icon-button:hover {
+  color: var(--app-text);
+  background: var(--dwrt-interactive-hover-bg);
+  box-shadow: inset 0 0 0 1px var(--dwrt-interactive-hover-border);
+}
+
+.network-service-drawer { --dwrt-kit-sheet-z: 76; --dwrt-kit-sheet-width: min(92vw, 660px); }
+.network-service-drawer.dwrt-kit-sheet,
+.network-service-drawer.dwrt-kit-sheet.dwrt-page-glass-surface {
+  position: fixed;
+  inset: 0 0 0 auto;
+  width: min(var(--dwrt-kit-sheet-width), var(--dwrt-kit-sheet-max-width));
+  height: 100dvh;
+  max-height: 100dvh;
+}
+.network-service-drawer .dwrt-kit-sheet-header span { display: block; color: var(--app-text-muted); font-size: 10px; font-weight: 760; }
+.network-service-drawer .dwrt-kit-sheet-header strong { display: block; margin-top: 2px; font-size: 17px; }
+.network-service-drawer-body { display: grid; align-content: start; gap: 16px; padding: 18px var(--dwrt-kit-sheet-padding-x); }
+
+.network-service-drawer-hero {
+  min-height: 76px;
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.network-service-drawer-hero > span:first-child {
+  width: 46px;
+  height: 46px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  color: #82b8ff;
+  background: rgba(57, 130, 255, 0.10);
+  box-shadow: inset 0 0 0 1px rgba(91, 157, 255, 0.16);
+}
+
+.network-service-drawer-hero > span:first-child svg { width: 24px; height: 24px; }
+.network-service-drawer-hero > div { min-width: 0; display: grid; gap: 3px; }
+.network-service-drawer-hero > div strong { overflow: hidden; color: var(--app-text); font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
+.network-service-drawer-hero > div small { color: var(--app-text-muted); font-size: 11px; }
+
+.network-service-detail-list { display: grid; gap: 0; margin: 0; }
+.network-service-detail-list > div {
+  min-height: 44px;
+  display: grid;
+  grid-template-columns: minmax(120px, 0.42fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.network-service-detail-list dt { color: var(--app-text-muted); font-size: 11px; }
+.network-service-detail-list dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: var(--app-text); font-size: 12px; font-weight: 650; }
+.network-service-editor-footer { justify-content: space-between; }
+.network-service-editor-footer > div { display: flex; align-items: center; gap: 9px; }
+
+html[data-theme-resolved="light"] .network-service-setting-list,
+html[data-theme-resolved="light"] .network-service-setting-row,
+html[data-theme-resolved="light"] .network-service-drawer-hero,
+html[data-theme-resolved="light"] .network-service-detail-list > div { border-color: rgba(35, 54, 79, 0.11); }
+
+html[data-theme-resolved="light"] .network-service-field input,
+html[data-theme-resolved="light"] .network-service-field select,
+html[data-theme-resolved="light"] .network-service-table input,
+html[data-theme-resolved="light"] .network-service-table select,
+html[data-theme-resolved="light"] .network-service-icon-button {
+  background: rgba(255, 255, 255, 0.28);
+  border-color: rgba(35, 54, 79, 0.14);
+  box-shadow: inset 0 0 0 1px rgba(35, 54, 79, 0.06);
+}
+
+@media (max-width: 980px) {
+  .network-service-settings { grid-template-columns: 1fr; }
+  .network-service-setting-list { border-right: 0; border-bottom: 1px solid rgba(255, 255, 255, 0.08); }
+  .network-service-setting-list.is-compact .network-service-setting-row:nth-last-child(-n + 2) { border-bottom: 1px solid rgba(255, 255, 255, 0.07); }
+  .network-service-setting-list.is-compact .network-service-setting-row:last-child { border-bottom: 0; }
+}
+
+@media (max-width: 760px) {
+  .console-stage.is-network-services { height: 100%; padding: 10px; }
+  .network-service-shell { gap: 8px; }
+  .network-service-tabs { width: 100%; justify-self: stretch; }
+  .network-service-tabs .dwrt-kit-tab,
+  .is-dhcp .network-service-tabs .dwrt-kit-tab { min-width: max-content; padding-inline: 16px; }
+  .network-service-toolbar { align-items: center; flex-direction: row; flex-wrap: nowrap; }
+  .network-service-toolbar .policy-search-main { flex: 0 0 40px; width: 40px; max-width: min(100%, 360px); }
+  .network-service-toolbar .policy-toolbar-actions { width: auto; margin: 0 0 0 auto; }
+  .network-service-toolbar .policy-toolbar-actions > button { flex: 0 0 auto; }
+  .network-service-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .network-service-form { grid-template-columns: 1fr; }
+  .network-service-setting-list.is-compact { grid-template-columns: 1fr; gap: 0; padding-inline: 14px; }
+  .network-service-field.is-wide { grid-column: auto; }
+  .network-service-drawer-hero { grid-template-columns: 42px minmax(0, 1fr); }
+  .network-service-drawer-hero > .network-service-status { grid-column: 2; }
+  .network-service-detail-list > div { grid-template-columns: 1fr; gap: 4px; padding: 9px 0; }
+  .network-service-editor-footer { align-items: stretch; }
+  .network-service-editor-footer > div { flex: 1 1 auto; }
+  .network-service-editor-footer > div button { flex: 1 1 0; }
+  .is-dns .dns-control-heading { align-items: flex-start; padding-inline: 14px; }
+  .is-dns .dns-control-group-trigger { grid-template-columns: 26px minmax(0, 1fr) 24px; padding-inline: 14px; }
+  .is-dns .dns-control-group-body { margin: 0 12px 14px 27px; padding: 13px 12px; }
+  .is-dns .dns-core-status { align-items: flex-start; }
+  .is-dns .dns-core-action { flex-direction: column-reverse; align-items: flex-end; }
+  .is-dns .dns-inline-facts,
+  .is-dns .dns-routing-summary { grid-template-columns: 1fr; gap: 10px; }
+  .is-dns .dns-field-grid,
+  .is-dns .dns-switch-grid { grid-template-columns: 1fr; }
+  .is-dns .dns-field-grid .network-service-field.is-wide { grid-column: auto; }
+  .is-dns .dns-routing-actions .policy-secondary { flex: 1 1 calc(50% - 4px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .network-service-switch i::after,
+  .is-dns .dns-control-group-chevron { transition: none; }
+}

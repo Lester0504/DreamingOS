@@ -1,0 +1,44 @@
+#!/bin/sh /etc/rc.common
+
+# Start immediately after the base firewall/network stage.  Waiting until S95
+# makes the control plane depend on every optional S25-S95 plugin completing.
+START=21
+STOP=10
+USE_PROCD=1
+
+INIT_BIN="/usr/bin/dreamingwrt-init"
+
+start_service(){
+	[ -x "$INIT_BIN" ] || return 1
+
+	procd_open_instance
+	procd_set_param respawn 60 5 5
+	procd_set_param term_timeout 15
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param command "$INIT_BIN" run
+	procd_close_instance
+}
+
+stop_service(){
+	[ -x "$INIT_BIN" ] && "$INIT_BIN" stop all || true
+	rm -f /var/run/dreamingwrt-init.sock
+}
+
+restart(){
+	local component="${1:-all}"
+
+	[ -x "$INIT_BIN" ] || return 1
+	if [ "$component" != "all" ]; then
+		"$INIT_BIN" restart "$component"
+		return $?
+	fi
+
+	# No component means the supervisor service itself is being restarted.
+	stop
+	start
+}
+
+status_service(){
+	[ -x "$INIT_BIN" ] && "$INIT_BIN" status "${1:-all}" || return 1
+}

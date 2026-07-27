@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "policy_version": 1,
+  "minimum_security_epoch": 1,
+  "allow_security_epoch_downgrade": false,
+  "allow_build_downgrade": false,
+  "allow_same_build": false,
+  "keys": []
+}

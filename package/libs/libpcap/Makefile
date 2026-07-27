@@ -22,11 +22,7 @@ PKG_CPE_ID:=cpe:/a:tcpdump:libpcap
 
 PKG_ASLR_PIE_REGULAR:=1
 
-PKG_CONFIG_DEPENDS := \
-	CONFIG_PACKAGE_rpcapd \
-	CONFIG_PCAP_HAS_USB \
-	CONFIG_PCAP_HAS_BT \
-	CONFIG_PCAP_HAS_NETFILTER
+PKG_CONFIG_DEPENDS := CONFIG_PACKAGE_rpcapd
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
@@ -35,7 +31,7 @@ define Package/libpcap
   SECTION:=libs
   CATEGORY:=Libraries
   TITLE:=Low-level packet capture library
-  URL:=https://www.tcpdump.org/
+  URL:=http://www.tcpdump.org/
   MENU:=1
   ABI_VERSION:=1
 endef
@@ -53,8 +49,8 @@ define Package/rpcapd
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Capture daemon to be controlled by a remote libpcap application
-  URL:=https://www.tcpdump.org/
-  DEPENDS+= +USE_GLIBC:libcrypt-compat +libpcap
+  URL:=http://www.tcpdump.org/
+  DEPENDS+= +libpcap
 endef
 
 ifdef CONFIG_PACKAGE_rpcapd

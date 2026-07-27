@@ -194,6 +194,13 @@ menu "Target Images"
 			  Specify the number of parallel small file reader threads
 			  (for files less than the squashfs block size).
 
+		config TARGET_ROOTFS_SQUASHFS_ZSTD
+			bool "SquashFS Zstd"
+			depends on TARGET_ROOTFS_SQUASHFS
+			default n
+			help
+			  Build a squashfs root filesystem using zstd compression.
+
 	menuconfig TARGET_ROOTFS_UBIFS
 		bool "ubifs"
 		default y if USES_UBIFS
@@ -371,5 +378,13 @@ menu "Target Images"
 		  Do not symlink /var to /tmp, so that its content will persist
 		  across reboots. When enabled, /var/run will still be linked
 		  to /tmp/run.
+
+	config TARGET_ROOTFS_LOCAL_PACKAGES
+		bool "Create a local target package opkg installation source"
+		select ALL_KMODS
+		default n
+		help
+		  Copy target packages to rootfs and overwrite the original
+		  openwrt_core installation source with local files.
 
 endmenu

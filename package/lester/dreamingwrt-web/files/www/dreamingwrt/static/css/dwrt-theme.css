@@ -1,0 +1,379 @@
+/*
+ * Dreaming OS shared readability tokens.
+ *
+ * Page CSS should consume these semantic variables instead of hardcoding
+ * neutral text colors. Keep status and chart colors semantic too, so light and
+ * dark surfaces can change contrast without losing meaning.
+ */
+
+:root {
+  --dwrt-ink: var(--adaptive-ink, rgba(248, 251, 255, 0.97));
+  --dwrt-text: var(--adaptive-text, rgba(234, 242, 252, 0.92));
+  --dwrt-muted: var(--adaptive-muted, rgba(215, 226, 240, 0.80));
+  --dwrt-faint: var(--adaptive-faint, rgba(214, 225, 240, 0.62));
+  --dwrt-selected: var(--adaptive-selected, var(--dwrt-ink));
+  --dwrt-text-shadow: var(--adaptive-text-shadow, 0 1px 1px rgba(0, 0, 0, 0.22));
+
+  --dwrt-status-ok-text: rgba(172, 255, 217, 0.95);
+  --dwrt-status-ok-solid-text: rgba(228, 255, 241, 0.96);
+  --dwrt-status-ok-bg: rgba(48, 214, 139, 0.16);
+  --dwrt-status-warn-text: rgba(255, 217, 151, 0.94);
+  --dwrt-status-warn-bg: rgba(255, 187, 82, 0.12);
+  --dwrt-status-error-text: rgba(255, 190, 190, 0.95);
+  --dwrt-status-error-bg: rgba(255, 107, 138, 0.13);
+
+  --app-text: var(--dwrt-ink);
+  --app-text-secondary: var(--dwrt-text);
+  --app-text-muted: var(--dwrt-muted);
+  --app-selected-text: var(--dwrt-selected);
+
+  --dashboard-ink: var(--dwrt-ink);
+  --dashboard-text: var(--dwrt-text);
+  --dashboard-muted: var(--dwrt-muted);
+  --dashboard-shadow: var(--dwrt-text-shadow);
+
+  --dwrt-kit-text: var(--dwrt-ink);
+  --dwrt-kit-muted: var(--dwrt-muted);
+
+  --color-accent: var(--app-accent, #5ec7ff);
+  --color-on-accent: #07101c;
+  --color-text-primary: var(--app-text);
+  --color-text-secondary: var(--app-text-secondary);
+  --color-text-muted: var(--app-text-muted);
+  --color-border-control: color-mix(in srgb, var(--app-text) 18%, transparent);
+  --color-border-subtle: color-mix(in srgb, var(--app-text) 12%, transparent);
+  --color-surface-control: color-mix(in srgb, var(--app-text) 6%, transparent);
+  --color-surface-stable: var(--dwrt-glass-surface);
+  --color-surface-dense: rgb(10 16 25 / 0.78);
+  --color-surface-popover: rgb(10 16 25 / 0.94);
+  --color-surface-solid: rgb(18 27 40);
+  --color-success: var(--app-success, #53dda0);
+  --color-warning: #f3b228;
+  --color-danger: var(--app-danger, #ff6b8a);
+  --color-info: #20bde8;
+
+  --setup-text: var(--dwrt-ink);
+  --setup-text-secondary: var(--dwrt-text);
+  --setup-text-muted: var(--dwrt-muted);
+
+  --dwrt-notify-text: var(--dwrt-ink);
+  --dwrt-notify-muted: var(--dwrt-muted);
+
+  /* Shared optical baseline. Login, navigation and page cards keep these
+     material values; performance tiers may only change sampling cost. */
+  --dwrt-glass-base-blur: 3.2px;
+  --dwrt-glass-neutral-density: 0.06;
+  --dwrt-glass-neutral-density-raised: 0.18;
+  --dwrt-glass-neutral-color: 10 16 25;
+  --dwrt-glass-saturation: 140%;
+  --dwrt-glass-highlight-strength: 0.28;
+  --dwrt-glass-absorption: rgb(var(--dwrt-glass-neutral-color) / var(--dwrt-glass-neutral-density));
+  --dwrt-glass-absorption-raised: rgb(var(--dwrt-glass-neutral-color) / var(--dwrt-glass-neutral-density-raised));
+  --dwrt-glass-highlight: rgba(255, 255, 255, 0.055);
+  --dwrt-glass-edge: rgba(255, 255, 255, 0.13);
+  --dwrt-glass-edge-strong: rgba(255, 255, 255, 0.19);
+  --dwrt-glass-shadow: 0 12px 28px rgba(0, 0, 0, 0.12);
+  --dwrt-glass-shadow-raised: 0 18px 44px rgba(0, 0, 0, 0.24);
+  --dwrt-glass-ink: var(--adaptive-ink, rgba(248, 251, 255, 0.97));
+  --dwrt-glass-text: var(--adaptive-text, rgba(234, 242, 252, 0.92));
+  --dwrt-glass-muted: var(--adaptive-muted, rgba(215, 226, 240, 0.80));
+  --dwrt-glass-surface:
+    radial-gradient(ellipse at 44% -20%, rgba(255, 255, 255, calc(var(--dwrt-glass-highlight-strength) * 0.09)), transparent 46%),
+    linear-gradient(150deg, var(--dwrt-glass-highlight), transparent 54%),
+    linear-gradient(var(--dwrt-glass-absorption), var(--dwrt-glass-absorption));
+  --dwrt-glass-surface-raised:
+    radial-gradient(ellipse at 44% -18%, rgba(255, 255, 255, calc(var(--lg-highlight, 0.34) * 0.13)), transparent 48%),
+    linear-gradient(150deg, rgba(255, 255, 255, 0.07), transparent 42%, var(--dwrt-glass-absorption-raised) 100%),
+    linear-gradient(var(--dwrt-glass-absorption-raised), var(--dwrt-glass-absorption-raised));
+  --dwrt-glass-backdrop: blur(var(--dwrt-glass-base-blur)) saturate(var(--dwrt-glass-saturation)) brightness(0.98);
+
+  --dwrt-type-title: 18px;
+  --dwrt-type-section: 16px;
+  --dwrt-type-body: 14px;
+  --dwrt-type-label: 13px;
+  --dwrt-type-meta: 12px;
+  --dwrt-leading-body: 1.55;
+}
+
+html[data-theme-resolved="light"] {
+  --dwrt-ink: rgba(8, 13, 21, 0.98);
+  --dwrt-text: rgba(8, 13, 21, 0.96);
+  --dwrt-muted: rgba(8, 13, 21, 0.88);
+  --dwrt-faint: rgba(8, 13, 21, 0.78);
+  --dwrt-selected: rgba(8, 13, 21, 0.99);
+  --dwrt-text-shadow: none;
+
+  --dwrt-status-ok-text: #12643f;
+  --dwrt-status-ok-solid-text: #f7fff9;
+  --dwrt-status-ok-bg: rgba(38, 196, 114, 0.18);
+  --dwrt-status-warn-text: #795000;
+  --dwrt-status-warn-bg: rgba(255, 187, 82, 0.20);
+  --dwrt-status-error-text: #8b2334;
+  --dwrt-status-error-bg: rgba(255, 107, 138, 0.18);
+
+  --dwrt-glass-shadow: 0 12px 28px rgba(38, 52, 74, 0.12);
+  --dwrt-glass-shadow-raised: 0 18px 44px rgba(27, 42, 64, 0.20);
+  --color-on-accent: #ffffff;
+  --color-surface-dense: rgb(248 251 255 / 0.86);
+  --color-surface-solid: rgb(245 248 252);
+}
+
+html[data-theme-resolved="dark"] {
+  --dwrt-ink: rgba(248, 251, 255, 0.97);
+  --dwrt-text: rgba(234, 242, 252, 0.92);
+  --dwrt-muted: rgba(215, 226, 240, 0.80);
+  --dwrt-faint: rgba(214, 225, 240, 0.62);
+  --dwrt-selected: rgba(248, 251, 255, 0.98);
+  --dwrt-text-shadow: 0 1px 1px rgba(0, 0, 0, 0.22);
+
+  --dwrt-status-ok-text: rgba(172, 255, 217, 0.95);
+  --dwrt-status-ok-solid-text: rgba(228, 255, 241, 0.96);
+  --dwrt-status-ok-bg: rgba(48, 214, 139, 0.16);
+  --dwrt-status-warn-text: rgba(255, 217, 151, 0.94);
+  --dwrt-status-warn-bg: rgba(255, 187, 82, 0.12);
+  --dwrt-status-error-text: rgba(255, 190, 190, 0.95);
+  --dwrt-status-error-bg: rgba(255, 107, 138, 0.13);
+  --color-on-accent: #07101c;
+  --color-surface-dense: rgb(10 16 25 / 0.78);
+  --color-surface-solid: rgb(18 27 40);
+}
+
+html[data-adaptive-foreground="dark"] {
+  --dwrt-ink: rgba(8, 13, 21, 0.98);
+  --dwrt-text: rgba(8, 13, 21, 0.96);
+  --dwrt-muted: rgba(8, 13, 21, 0.88);
+  --dwrt-faint: rgba(8, 13, 21, 0.78);
+  --dwrt-selected: rgba(8, 13, 21, 0.99);
+  --dwrt-text-shadow: none;
+
+  --dwrt-status-ok-text: #12643f;
+  --dwrt-status-ok-solid-text: #f7fff9;
+  --dwrt-status-ok-bg: rgba(38, 196, 114, 0.18);
+  --dwrt-status-warn-text: #795000;
+  --dwrt-status-warn-bg: rgba(255, 187, 82, 0.20);
+  --dwrt-status-error-text: #8b2334;
+  --dwrt-status-error-bg: rgba(255, 107, 138, 0.18);
+}
+
+html[data-adaptive-foreground="light"] {
+  --dwrt-ink: rgba(251, 253, 255, 0.99);
+  --dwrt-text: rgba(251, 253, 255, 0.96);
+  --dwrt-muted: rgba(251, 253, 255, 0.88);
+  --dwrt-faint: rgba(251, 253, 255, 0.78);
+  --dwrt-selected: rgba(251, 253, 255, 0.99);
+  --dwrt-text-shadow: 0 1px 1px rgba(0, 0, 0, 0.28);
+
+  --dwrt-status-ok-text: rgba(172, 255, 217, 0.95);
+  --dwrt-status-ok-solid-text: rgba(228, 255, 241, 0.96);
+  --dwrt-status-ok-bg: rgba(48, 214, 139, 0.16);
+  --dwrt-status-warn-text: rgba(255, 217, 151, 0.94);
+  --dwrt-status-warn-bg: rgba(255, 187, 82, 0.12);
+  --dwrt-status-error-text: rgba(255, 190, 190, 0.95);
+  --dwrt-status-error-bg: rgba(255, 107, 138, 0.13);
+}
+
+/* Wallpaper luminance is spatial, not a theme-wide constant. Runtime sampling
+   applies one of these binary foreground pairs to each visible glass/text
+   region. Hierarchy comes from alpha only; intermediate gray ink is avoided. */
+:where([data-adaptive-region="dark"]) {
+  --adaptive-ink: rgba(8, 13, 21, 0.98);
+  --adaptive-text: rgba(8, 13, 21, 0.96);
+  --adaptive-muted: rgba(8, 13, 21, 0.88);
+  --adaptive-faint: rgba(8, 13, 21, 0.78);
+  --adaptive-selected: rgba(8, 13, 21, 0.99);
+  --adaptive-text-shadow: none;
+  --dwrt-ink: var(--adaptive-ink);
+  --dwrt-text: var(--adaptive-text);
+  --dwrt-muted: var(--adaptive-muted);
+  --dwrt-faint: var(--adaptive-faint);
+  --dwrt-selected: var(--adaptive-selected);
+  --dwrt-text-shadow: var(--adaptive-text-shadow);
+  --dwrt-glass-ink: var(--adaptive-ink);
+  --dwrt-glass-text: var(--adaptive-text);
+  --dwrt-glass-muted: var(--adaptive-muted);
+  --app-text: var(--dwrt-ink);
+  --app-text-secondary: var(--dwrt-text);
+  --app-text-muted: var(--dwrt-muted);
+  --app-selected-text: var(--dwrt-selected);
+  --dashboard-ink: var(--dwrt-ink);
+  --dashboard-text: var(--dwrt-text);
+  --dashboard-muted: var(--dwrt-muted);
+  --dashboard-shadow: var(--dwrt-text-shadow);
+  --dwrt-kit-text: var(--dwrt-ink);
+  --dwrt-kit-muted: var(--dwrt-muted);
+  --color-text-primary: var(--adaptive-ink);
+  --color-text-secondary: var(--adaptive-text);
+  --color-text-muted: var(--adaptive-muted);
+  --text-primary: var(--dwrt-ink);
+  --text-secondary: var(--dwrt-text);
+  --text-muted: var(--dwrt-muted);
+}
+
+:where([data-adaptive-region="light"]) {
+  --adaptive-ink: rgba(251, 253, 255, 0.99);
+  --adaptive-text: rgba(251, 253, 255, 0.96);
+  --adaptive-muted: rgba(251, 253, 255, 0.88);
+  --adaptive-faint: rgba(251, 253, 255, 0.78);
+  --adaptive-selected: rgba(251, 253, 255, 0.99);
+  --adaptive-text-shadow: 0 1px 1px rgba(0, 0, 0, 0.28);
+  --dwrt-ink: var(--adaptive-ink);
+  --dwrt-text: var(--adaptive-text);
+  --dwrt-muted: var(--adaptive-muted);
+  --dwrt-faint: var(--adaptive-faint);
+  --dwrt-selected: var(--adaptive-selected);
+  --dwrt-text-shadow: var(--adaptive-text-shadow);
+  --dwrt-glass-ink: var(--adaptive-ink);
+  --dwrt-glass-text: var(--adaptive-text);
+  --dwrt-glass-muted: var(--adaptive-muted);
+  --app-text: var(--dwrt-ink);
+  --app-text-secondary: var(--dwrt-text);
+  --app-text-muted: var(--dwrt-muted);
+  --app-selected-text: var(--dwrt-selected);
+  --dashboard-ink: var(--dwrt-ink);
+  --dashboard-text: var(--dwrt-text);
+  --dashboard-muted: var(--dwrt-muted);
+  --dashboard-shadow: var(--dwrt-text-shadow);
+  --dwrt-kit-text: var(--dwrt-ink);
+  --dwrt-kit-muted: var(--dwrt-muted);
+  --color-text-primary: var(--adaptive-ink);
+  --color-text-secondary: var(--adaptive-text);
+  --color-text-muted: var(--adaptive-muted);
+  --text-primary: var(--dwrt-ink);
+  --text-secondary: var(--dwrt-text);
+  --text-muted: var(--dwrt-muted);
+}
+
+/* Route and Kit styles may define their own neutral aliases on a card. Once a
+   region has been sampled, the sampled pair is the final neutral foreground
+   contract for that region. Semantic status/chart colors are intentionally not
+   listed here. */
+.dwrt-app [data-adaptive-region] {
+  color: var(--adaptive-text);
+  text-shadow: var(--adaptive-text-shadow);
+  --dwrt-ink: var(--adaptive-ink) !important;
+  --dwrt-text: var(--adaptive-text) !important;
+  --dwrt-muted: var(--adaptive-muted) !important;
+  --dwrt-faint: var(--adaptive-faint) !important;
+  --dwrt-selected: var(--adaptive-selected) !important;
+  --dwrt-text-shadow: var(--adaptive-text-shadow) !important;
+  --dwrt-glass-ink: var(--adaptive-ink) !important;
+  --dwrt-glass-text: var(--adaptive-text) !important;
+  --dwrt-glass-muted: var(--adaptive-muted) !important;
+  --app-text: var(--adaptive-ink) !important;
+  --app-text-secondary: var(--adaptive-text) !important;
+  --app-text-muted: var(--adaptive-muted) !important;
+  --app-selected-text: var(--adaptive-selected) !important;
+  --dashboard-ink: var(--adaptive-ink) !important;
+  --dashboard-text: var(--adaptive-text) !important;
+  --dashboard-muted: var(--adaptive-muted) !important;
+  --dashboard-shadow: var(--adaptive-text-shadow) !important;
+  --dwrt-kit-text: var(--adaptive-ink) !important;
+  --dwrt-kit-muted: var(--adaptive-muted) !important;
+  --dwrt-kit-datatable-text: var(--adaptive-ink) !important;
+  --dwrt-kit-datatable-muted: var(--adaptive-muted) !important;
+  --text-primary: var(--adaptive-ink) !important;
+  --text-secondary: var(--adaptive-text) !important;
+  --text-muted: var(--adaptive-muted) !important;
+  --setup-text: var(--adaptive-ink) !important;
+  --setup-text-secondary: var(--adaptive-text) !important;
+  --setup-text-muted: var(--adaptive-muted) !important;
+  --dwrt-notify-text: var(--adaptive-ink) !important;
+  --dwrt-notify-muted: var(--adaptive-muted) !important;
+  --system-ink: var(--adaptive-ink) !important;
+  --system-text: var(--adaptive-text) !important;
+  --system-muted: var(--adaptive-muted) !important;
+  --ai-ink: var(--adaptive-ink) !important;
+  --ai-text: var(--adaptive-text) !important;
+  --ai-muted: var(--adaptive-muted) !important;
+}
+
+:where([data-adaptive-region="dark"][data-adaptive-mixed]) {
+  --adaptive-text-shadow: 0 1px 1px rgba(255, 255, 255, 0.24);
+  --dwrt-text-shadow: var(--adaptive-text-shadow);
+  --dashboard-shadow: var(--adaptive-text-shadow);
+}
+
+:where([data-adaptive-region="light"][data-adaptive-mixed]) {
+  --adaptive-text-shadow: 0 1px 1px rgba(0, 0, 0, 0.38);
+  --dwrt-text-shadow: var(--adaptive-text-shadow);
+  --dashboard-shadow: var(--adaptive-text-shadow);
+}
+
+:where([data-adaptive-region]) {
+  color: var(--dwrt-text);
+  text-shadow: var(--dwrt-text-shadow);
+}
+
+/* A black/white foreground decision is discrete. Do not interpolate through
+   the low-contrast gray that the adaptation is specifically avoiding. */
+.dwrt-adaptive-foreground-snap,
+.dwrt-adaptive-foreground-snap :where(
+  .menu-label,
+  .menu-icon,
+  h1,
+  h2,
+  h3,
+  h4,
+  p,
+  strong,
+  small,
+  span,
+  label,
+  a,
+  button,
+  th,
+  td,
+  dt,
+  dd
+) {
+  transition-property: none !important;
+}
+
+:root,
+html[data-theme-resolved],
+html[data-adaptive-foreground] {
+  --app-text: var(--dwrt-ink);
+  --app-text-secondary: var(--dwrt-text);
+  --app-text-muted: var(--dwrt-muted);
+  --app-selected-text: var(--dwrt-selected);
+
+  --dashboard-ink: var(--dwrt-ink);
+  --dashboard-text: var(--dwrt-text);
+  --dashboard-muted: var(--dwrt-muted);
+  --dashboard-shadow: var(--dwrt-text-shadow);
+
+  --dwrt-kit-text: var(--dwrt-ink);
+  --dwrt-kit-muted: var(--dwrt-muted);
+
+  --setup-text: var(--dwrt-ink);
+  --setup-text-secondary: var(--dwrt-text);
+  --setup-text-muted: var(--dwrt-muted);
+
+  --dwrt-notify-text: var(--dwrt-ink);
+  --dwrt-notify-muted: var(--dwrt-muted);
+
+  --text-primary: var(--dwrt-ink);
+  --text-secondary: var(--dwrt-text);
+  --text-muted: var(--dwrt-muted);
+}
+
+:where(.dwrt-app, .setup-page, .dwrt-login-page) {
+  color: var(--dwrt-text);
+  text-shadow: var(--dwrt-text-shadow);
+}
+
+:where(.dwrt-app, .setup-page, .dwrt-login-page) :where(h1, h2, h3, h4, strong) {
+  color: var(--dwrt-ink);
+}
+
+:where(.dwrt-app, .setup-page, .dwrt-login-page) :where(p, small, summary, label, input, textarea, select) {
+  color: inherit;
+}
+
+:where(.dwrt-app, .setup-page, .dwrt-login-page) :where(input::placeholder, textarea::placeholder) {
+  color: var(--dwrt-faint);
+}
+
+.dwrt-notify {
+  color: var(--dwrt-notify-text);
+}

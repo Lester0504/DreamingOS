@@ -1,0 +1,10 @@
+--- a/drivers/net/wireless/ath/ath6kl/debug.c
++++ b/drivers/net/wireless/ath/ath6kl/debug.c
+@@ -21,6 +21,7 @@
+ #include <linux/fs.h>
+ #include <linux/vmalloc.h>
+ #include <linux/export.h>
++#include <linux/etherdevice.h>
+ 
+ #include "debug.h"
+ #include "target.h"

@@ -35,7 +35,7 @@ else
     KERNEL_CC?=$(HOSTCC)
     KERNEL_CROSS?=
   else
-    KERNEL_CC?=$(TARGET_CC)
+    KERNEL_CC?=$(call qstrip,$(CONFIG_KERNEL_CC))
     KERNEL_CROSS?=$(TARGET_CROSS)
   endif
 
@@ -59,7 +59,7 @@ else
   ifneq (,$(findstring -rc,$(LINUX_VERSION)))
       LINUX_SOURCE:=linux-$(LINUX_VERSION).tar.gz
   else
-      LINUX_SOURCE:=linux-$(LINUX_VERSION).tar.xz
+      LINUX_SOURCE:=linux-$(LINUX_VERSION).tar.gz
   endif
 
   ifneq (,$(findstring -rc,$(LINUX_VERSION)))
@@ -108,17 +108,28 @@ KERNEL_MAKE_FLAGS = \
 	KBUILD_HAVE_NLS=no \
 	KBUILD_BUILD_USER="$(call qstrip,$(CONFIG_KERNEL_BUILD_USER))" \
 	KBUILD_BUILD_HOST="$(call qstrip,$(CONFIG_KERNEL_BUILD_DOMAIN))" \
-	KBUILD_BUILD_TIMESTAMP="$(KBUILD_BUILD_TIMESTAMP)" \
-	KBUILD_BUILD_VERSION="0" \
+	KBUILD_BUILD_TIMESTAMP="SMP Sun May 17 12:05:17 2027" \
+	KBUILD_BUILD_VERSION="2012.05.17" \
 	KBUILD_HOSTLDFLAGS="-L$(STAGING_DIR_HOST)/lib" \
 	CONFIG_SHELL="$(BASH)" \
 	$(if $(findstring c,$(OPENWRT_VERBOSE)),V=1,V='') \
 	$(if $(PKG_BUILD_ID),LDFLAGS_MODULE=--build-id=0x$(PKG_BUILD_ID)) \
-	cmd_syscalls= \
+	$(if $(filter 7.2%,$(LINUX_VERSION)),,cmd_syscalls=) \
 	$(if $(__package_mk),KBUILD_EXTRA_SYMBOLS="$(wildcard $(PKG_SYMVERS_DIR)/*.symvers)")
 
 ifneq (,$(KERNEL_CC))
   KERNEL_MAKE_FLAGS += CC="$(KERNEL_CC)"
+endif
+
+ifneq (,$(findstring clang,$(KERNEL_CC)))
+  ifneq (,$(filter clang-%,$(KERNEL_CC)))
+    LLVM := $(subst clang-,,$(KERNEL_CC))
+    LLVM_LLD := ld.lld-$(subst clang-,,$(KERNEL_CC))
+  else
+    LLVM := 1
+    LLVM_LLD := ld.lld
+  endif
+  KERNEL_MAKE_FLAGS += LD="$(LLVM_LLD)" LLVM=$(LLVM) LLVM_IAS=1
 endif
 
 KERNEL_NOSTDINC_FLAGS = \
@@ -145,7 +156,7 @@ define collect_module_symvers
 		grep -F $(PKG_BUILD_DIR) $(PKG_BUILD_DIR)/$$$$subdir/Module.symvers >> $(PKG_BUILD_DIR)/Module.symvers.tmp; \
 		[ "$(PKG_BUILD_DIR)" = "$$$$realdir" ] || \
 			grep -F $$$$realdir $(PKG_BUILD_DIR)/$$$$subdir/Module.symvers >> $(PKG_BUILD_DIR)/Module.symvers.tmp; \
-		[ -s "$(PKG_BUILD_DIR)/Module.symvers.tmp" ] || [ "$(KERNEL_PATCHVER)" = "6.18" ] && \
+		[ -s "$(PKG_BUILD_DIR)/Module.symvers.tmp" ] || [ -n "$(filter 6.18 7.2,$(KERNEL_PATCHVER))" ] && \
 			sed 's/\.o$$$$//' $(PKG_BUILD_DIR)/$$$$subdir/modules.order | \
 			grep -Ff - $(PKG_BUILD_DIR)/$$$$subdir/Module.symvers >> $(PKG_BUILD_DIR)/Module.symvers.tmp; \
 	done; \
@@ -207,7 +218,10 @@ define KernelPackage
     SECTION:=kernel
     CATEGORY:=Kernel modules
     EXTRA_DEPENDS:=kernel (=$(subst -rc,_rc,$(LINUX_VERSION))~$(LINUX_VERMAGIC)-r$(LINUX_RELEASE))
-    VERSION:=$(subst -rc,_rc,$(LINUX_VERSION))$(if $(PKG_VERSION),.$(PKG_VERSION))-r$(if $(PKG_RELEASE),$(PKG_RELEASE),$(LINUX_RELEASE))
+    VERSION:=$(if $(PKG_VERSION),\
+      $(if $(findstring -rc,$(LINUX_VERSION)),\
+        $(subst -rc,.$(PKG_VERSION)_rc,$(LINUX_VERSION)),$(LINUX_VERSION).$(PKG_VERSION)),\
+      $(subst -rc,_rc,$(LINUX_VERSION)))-r$(if $(PKG_RELEASE),$(PKG_RELEASE),$(LINUX_RELEASE))
     PKGFLAGS:=$(PKGFLAGS)
     $(call KernelPackage/$(1))
     $(call KernelPackage/$(1)/$(BOARD))

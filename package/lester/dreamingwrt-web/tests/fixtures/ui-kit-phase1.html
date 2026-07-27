@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <style>
+    body { margin: 0; min-height: 100vh; color: var(--app-text); background: rgb(11 16 24); font-family: system-ui, sans-serif; }
+    body[data-wallpaper="bright"] { background: rgb(244 247 251); }
+    body[data-wallpaper="dark"] { background: rgb(11 16 24); }
+    main { max-width: 960px; margin: 16px auto; }
+  </style>
+</head>
+<body data-wallpaper="dark">
+  <img id="appWallpaper" src="../../files/www/dreamingwrt/static/background/dwrt-default-bg.jpg" alt="" style="position:fixed;inset:0;width:100%;height:100%;object-fit:cover;z-index:-1">
+  <main data-dwrt-component="page-shell" data-dwrt-page-shell="settings-workbench" data-adaptive-region="light">
+    <h1>UI Kit Phase 1 Fixture</h1>
+    <nav class="dwrt-kit-tabs" data-dwrt-component="tabs" aria-label="测试视图">
+      <button class="dwrt-kit-tab is-active" data-value="one" aria-selected="true">视图一</button>
+      <button class="dwrt-kit-tab" data-value="two" aria-selected="false">视图二</button>
+    </nav>
+    <div data-dwrt-component="toolbar" aria-label="测试操作">
+      <button data-dwrt-component="button" data-variant="primary">新增对象</button>
+      <button data-dwrt-component="icon-button" aria-label="刷新"><span data-lucide="refresh-cw"></span></button>
+      <button data-dwrt-component="async-button" data-dwrt-state="loading">保存</button>
+      <button id="sheetTrigger" data-dwrt-component="button">打开侧栏</button>
+    </div>
+    <section data-dwrt-component="dependency-group">
+      <label data-dwrt-component="switch" data-dwrt-dependency-master><input type="checkbox"><span>启用服务</span></label>
+      <div data-dwrt-dependency-panel>
+        <label data-dwrt-component="field">
+          <span data-dwrt-field-label>监听端口</span>
+          <input type="number" value="53">
+          <small data-dwrt-field-description>仅允许有效端口。</small>
+        </label>
+        <label data-dwrt-component="field">
+          <span data-dwrt-field-label>上游</span>
+          <select data-dwrt-component="select"><option>自动</option><option>自定义</option></select>
+        </label>
+      </div>
+    </section>
+    <section data-dwrt-component="disclosure">
+      <button data-dwrt-disclosure-trigger aria-expanded="false">高级设置</button>
+      <div data-dwrt-disclosure-panel hidden>高级字段</div>
+    </section>
+    <section data-dwrt-component="state-panel" data-dwrt-state="unavailable"><strong>能力不可用</strong><p>当前固件未提供测试 API。</p></section>
+    <section data-dwrt-component="data-table">
+      <table><thead><tr><th data-sort-key="name">名称</th><th>状态</th></tr></thead><tbody><tr><td>WAN</td><td>运行中</td></tr></tbody></table>
+    </section>
+  </main>
+  <button id="sheetOverlay" class="dwrt-kit-sheet-overlay" type="button" aria-label="关闭侧栏" hidden></button>
+  <aside id="fixtureSheet" class="dwrt-kit-sheet" data-dwrt-component="sheet" aria-label="测试侧栏">
+    <header class="dwrt-kit-sheet-header">
+      <strong>测试侧栏</strong>
+      <button id="sheetClose" class="dwrt-kit-sheet-close" type="button" aria-label="关闭侧栏">X</button>
+    </header>
+    <div class="dwrt-kit-sheet-body"><input aria-label="侧栏字段"></div>
+  </aside>
+  <button id="fullSheetOverlay" class="dwrt-kit-sheet-overlay" type="button" aria-label="关闭全屏侧栏" hidden></button>
+  <aside id="fullFixtureSheet" class="dwrt-kit-sheet" data-dwrt-component="sheet" aria-label="测试全屏侧栏" style="--dwrt-kit-sheet-width:100vw;--dwrt-kit-sheet-max-width:100vw">
+    <header class="dwrt-kit-sheet-header"><strong>测试全屏侧栏</strong><button id="fullSheetClose" class="dwrt-kit-sheet-close" type="button" aria-label="关闭全屏侧栏">X</button></header>
+    <div class="dwrt-kit-sheet-body"><input aria-label="全屏侧栏字段"></div>
+  </aside>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script>
+    const sheetTrigger = document.getElementById('sheetTrigger');
+    const sheetOverlay = document.getElementById('sheetOverlay');
+    const fixtureSheet = document.getElementById('fixtureSheet');
+    const sheetClose = document.getElementById('sheetClose');
+    const fullSheetOverlay = document.getElementById('fullSheetOverlay');
+    const fullFixtureSheet = document.getElementById('fullFixtureSheet');
+    const fullSheetClose = document.getElementById('fullSheetClose');
+    sheetTrigger.addEventListener('click', () => {
+      sheetOverlay.hidden = false;
+      sheetOverlay.classList.add('is-open');
+      fixtureSheet.classList.add('is-open');
+    });
+    const closeFixtureSheet = () => {
+      sheetOverlay.classList.remove('is-open');
+      sheetOverlay.hidden = true;
+      fixtureSheet.classList.remove('is-open');
+    };
+    sheetOverlay.addEventListener('click', closeFixtureSheet);
+    sheetClose.addEventListener('click', closeFixtureSheet);
+    window.openFullFixtureSheet = () => {
+      fullSheetOverlay.hidden = false;
+      fullSheetOverlay.classList.add('is-open');
+      fullFixtureSheet.classList.add('is-open');
+    };
+    const closeFullFixtureSheet = () => {
+      fullSheetOverlay.classList.remove('is-open');
+      fullSheetOverlay.hidden = true;
+      fullFixtureSheet.classList.remove('is-open');
+    };
+    fullSheetOverlay.addEventListener('click', closeFullFixtureSheet);
+    fullSheetClose.addEventListener('click', closeFullFixtureSheet);
+  </script>
+</body>
+</html>

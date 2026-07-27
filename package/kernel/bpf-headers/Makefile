@@ -13,16 +13,16 @@ include $(INCLUDE_DIR)/kernel.mk
 
 
 PKG_NAME:=linux
-PKG_PATCHVER:=6.12
+PKG_PATCHVER:=7.0
 
 # Manually include kernel version and hash from kernel details file
 GENERIC_PLATFORM_DIR := $(CURDIR)/../../../target/linux/generic
 include $(GENERIC_PLATFORM_DIR)/kernel-$(PKG_PATCHVER)
 
 PKG_VERSION:=$(PKG_PATCHVER)$(strip $(LINUX_VERSION-$(PKG_PATCHVER)))
-PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.xz
-PKG_SOURCE_URL:=@KERNEL/linux/kernel/v$(word 1,$(subst ., ,$(PKG_PATCHVER))).x
-PKG_HASH:=$(LINUX_KERNEL_HASH-$(strip $(PKG_VERSION)))
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+PKG_SOURCE_URL:=https://cdn.kernel.org/pub/linux/kernel/v7.x
+PKG_HASH:=f637b5aac9c7eaa387ec07b5afdd2bceab4f3bd12e1b85211b61fdcad23d0fc4
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/bpf-headers/$(PKG_NAME)-$(PKG_VERSION)
 
 GENERIC_BACKPORT_DIR := $(GENERIC_PLATFORM_DIR)/backport$(if $(wildcard $(GENERIC_PLATFORM_DIR)/backport-$(PKG_PATCHVER)),-$(PKG_PATCHVER))
@@ -65,6 +65,10 @@ KERNEL_MAKE := \
 
 define Build/Patch
 	$(Kernel/Patch/Default)
+	$(SED) '/^source "drivers\/net\/phy\/rtl8261n\/Kconfig"$$$$/d' \
+		$(PKG_BUILD_DIR)/drivers/net/phy/Kconfig
+	$(SED) '/^obj-y[[:space:]]*+=[[:space:]]*rtl8261n\/[[:space:]]*$$$$/d' \
+		$(PKG_BUILD_DIR)/drivers/net/phy/Makefile
 endef
 
 define Quilt/Refresh/Package

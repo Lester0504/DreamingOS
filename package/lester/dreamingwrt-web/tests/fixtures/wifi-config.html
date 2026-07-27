@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/wifi-management.css">
+  <style>
+    :root {
+      --app-page-gutter-block:14px; --app-page-gutter-inline:14px; --app-page-gap:16px;
+      --app-radius-card:20px; --app-radius-panel:18px; --app-radius-control:12px; --app-radius-compact:8px;
+      --dwrt-kit-radius:20px; --dwrt-kit-text:#172033; --dwrt-kit-muted:#667085;
+      --dwrt-kit-liquid-surface:rgba(255,255,255,.28); --dwrt-kit-liquid-backdrop:blur(3px) saturate(130%);
+      --dwrt-glass-edge:rgba(255,255,255,.5); --dwrt-glass-shadow:0 12px 28px rgba(0,0,0,.10);
+    }
+    * { box-sizing:border-box; }
+    html, body, .console-stage { width:100%; height:100%; margin:0; }
+    body { color:#172033; background:linear-gradient(135deg,#b9d4e5,#e6c3a0); font:13px/1.45 system-ui,sans-serif; }
+    .console-stage { display:grid; }
+    .route-preview { height:100%; }
+    .policy-create-button { min-height:38px; padding:0 14px; border:0; border-radius:999px; color:#fff; background:#1677ff; display:inline-flex; align-items:center; gap:7px; }
+    .dwrt-kit-page-tabs { display:flex; }
+  </style>
+</head>
+<body>
+  <div class="console-stage"><main id="routePreview" class="route-preview"></main></div>
+  <script type="module">
+    const radios = [
+      { id:'radio0', name:'phy0', band:'2.4GHz', channel:6, width:40, tx_power:24, online:true, supported_widths:[20,40], excluded_channels:[] },
+      { id:'radio1', name:'phy1', band:'5GHz', channel:36, width:160, tx_power:27, online:true, supported_widths:[20,40,80,160], excluded_channels:[] },
+      { id:'radio2', name:'phy2', band:'6GHz', channel:33, width:320, tx_power:24, online:false, supported_widths:[20,40,80,160,320], excluded_channels:[] }
+    ];
+    const config = {
+      capabilities:{ wifi:true, bands:['2g','5g','6g'], save_config:true, apply_config:true, scan:false },
+      regdomains:[{code:'CN',name:'中国'}],
+      global:{ country:'CN', speed_profile:'conservative', widths:{'2g':40,'5g':160,'6g':320}, mesh:false, mesh_monitor:'gateway', band_steering:true, fast_roaming:true, mlo:true },
+      radios,
+      ssids:[{ id:'default', name:'DreamingWrt', network:'lan', broadcast:'全部 AP', bands:['2g','5g','6g'], clients:4, enabled:true, security:'wpa3-personal' }],
+      speed_limits:[{ id:'default', name:'Default', download_mbps:0, upload_mbps:0 }]
+    };
+    window.fetch = async () => ({ ok:true, status:200, text:async () => JSON.stringify({ data:config }) });
+    const { mount } = await import('../../files/www/dreamingwrt/plugins/native/wifi-management.js');
+    window.fixtureController = mount({ root:document.getElementById('routePreview'), item:{ id:'wifi-config' }, utils:{ escapeHtml:value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character])) } });
+  </script>
+</body>
+</html>

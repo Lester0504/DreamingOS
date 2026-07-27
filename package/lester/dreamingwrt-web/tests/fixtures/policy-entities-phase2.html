@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/policy-entities.css">
+  <style>
+    :root {
+      --app-text: rgb(238 244 252);
+      --app-text-secondary: rgb(213 224 239);
+      --app-text-muted: rgb(176 193 215);
+      --app-accent: rgb(35 132 255);
+      --color-text-primary: var(--app-text);
+      --color-text-secondary: var(--app-text-secondary);
+      --color-text-muted: var(--app-text-muted);
+      --color-accent: var(--app-accent);
+      --color-on-accent: white;
+      --color-danger: rgb(238 84 96);
+      --color-warning: rgb(242 177 45);
+      --color-success: rgb(39 195 115);
+      --color-border-subtle: rgb(255 255 255 / .13);
+      --color-border-control: rgb(255 255 255 / .2);
+      --color-surface-control: rgb(255 255 255 / .06);
+      --color-surface-dense: rgb(12 21 34 / .86);
+      --color-surface-stable: rgb(14 24 39 / .78);
+      --dwrt-glass-edge: rgb(255 255 255 / .16);
+      --dwrt-glass-shadow: 0 18px 48px rgb(0 0 0 / .2);
+      --dwrt-interactive-hover-bg: rgb(255 255 255 / .09);
+    }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; color: var(--app-text); background: linear-gradient(135deg, rgb(22 49 83), rgb(19 97 91)); font-family: Lato, "PingFang SC", system-ui, sans-serif; }
+    .console-stage { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr); }
+    #routePreview { width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: auto; }
+  </style>
+</head>
+<body>
+  <main class="console-stage"><div class="route-preview" id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    import { mount as mountObjects } from '../../files/www/dreamingwrt/plugins/native/policy-objects.js';
+    import { mount as mountRegions } from '../../files/www/dreamingwrt/plugins/native/policy-regions.js';
+
+    const makeZones = (count = 5) => Array.from({ length: count }, (_, index) => {
+      const names = ['lan', 'wan', 'wan2', 'guest', 'iot', 'office', 'vpn', 'dmz'];
+      const labels = ['LAN', '中国联通', '中国移动', '访客', 'IoT', '办公', 'VPN', 'DMZ'];
+      const name = names[index] || `zone${index + 1}`;
+      return {
+        id: name, section_id: `cfg-${name}`, name, display_name: labels[index] || name,
+        type: index < 3 ? 'default' : 'custom', members: [name], locked: index < 3,
+        delete_locked: index < 3, locked_fields: index < 3 ? ['name'] : [],
+        default_actions: { input: index === 0 ? 'ACCEPT' : 'REJECT', output: 'ACCEPT', forward: index === 0 ? 'ACCEPT' : 'REJECT', masq: index > 0, mtu_fix: index > 0 },
+        rule_count: index + 1, forwarding_count: index % 2, reference_count: index + 2
+      };
+    });
+    const zonePayload = (count = 5) => ({
+      zones: makeZones(count),
+      virtual_zones: [],
+      source: 'uci.firewall',
+      network_membership_unique: true,
+      capabilities: { zones_list: true, zones_crud: true, zone_member_uniqueness: true, zone_matrix: true }
+    });
+    const matrixPayload = (count = 5) => {
+      const zones = makeZones(count).map((zone) => zone.id);
+      return {
+        zones,
+        source: 'firewall.effective',
+        capabilities: { zone_matrix: true },
+        pairs: zones.flatMap((source, row) => zones.map((destination, column) => ({
+          source_zone_id: source, destination_zone_id: destination,
+          effective_action: source === destination || (row === 0 && column > 0) ? 'allow' : 'block',
+          return_action: 'allow_return', forwarding_enabled: row === 0 && column > 0,
+          policy_count: row === 0 && column === 1 ? 1 : 0,
+          ipv4_policy_count: row === 0 && column === 1 ? 1 : 0,
+          ipv6_policy_count: 0,
+          rule_ids: row === 0 && column === 1 ? ['rule-1'] : []
+        })))
+      };
+    };
+    const objectPayload = {
+      items: [
+        { id: 'servers', name: '服务器', object_type: 'device_group', family: 'ipv4', enabled: true, comment: '核心服务终端' },
+        { id: 'streaming', name: '流媒体', object_type: 'application_group', family: 'mixed', enabled: true }
+      ],
+      legacy_route_objects: [{ id: 'legacy-vpn', name: '旧 VPN 目标', type: 'route_object', family: 'ipv4', value: '10.8.0.0/24', enabled: false }],
+      source: 'policy-engine', read_only: true,
+      capabilities: { objects_list: true, objects_crud: false, objects_atomic_apply: false, objects_write_blocked_reason: 'cross_component_firewall_pbr_sqm_flowd_transaction_pending' }
+    };
+
+    const stateScenario = (name, value) => ({
+      status: name === 'ready' || name === 'stale' || name === 'empty' || name === 'large' ? 'ready' : name,
+      value: ['ready', 'stale', 'empty', 'large'].includes(name) ? value : undefined,
+      stale: name === 'stale',
+      error: ['error', 'forbidden', 'unavailable'].includes(name) ? new Error(`fixture ${name}`) : name === 'stale' ? new Error('refresh offline') : null
+    });
+
+    class FixtureRegistry {
+      constructor(kind, scenario) {
+        this.kind = kind;
+        this.scenario = scenario;
+        this.listeners = new Map();
+        this.requests = {};
+        this.invalidations = [];
+        this.active = 0;
+      }
+      value(key) {
+        if (this.kind === 'objects') return this.scenario === 'empty' ? { ...objectPayload, items: [], legacy_route_objects: [] } : objectPayload;
+        const count = this.scenario === 'large' ? 8 : 5;
+        if (key === 'policy.regions') return this.scenario === 'empty' ? zonePayload(0) : zonePayload(count);
+        if (key === 'policy.zoneMatrix') return this.scenario === 'empty' ? matrixPayload(0) : matrixPayload(count);
+        if (key === 'policy.table') return { rows: [{ id: 'rule-1', name: 'LAN 访问 WAN', source_zone: 'lan', destination_zone: 'wan', action: '允许', protocol: '全部', ip_version: '两者' }] };
+        if (key === 'network.lans') return { lans: [{ id: 'lan', name: 'LAN', device: 'br-lan' }, { id: 'guest', name: '访客', device: 'br-guest' }, { id: 'iot', name: 'IoT', device: 'br-iot' }, { id: 'labnet', name: '实验网络', device: 'br-lab' }] };
+        if (key === 'network.wans') return { wans: [{ id: 'wan', note: '中国联通', ifname: 'wan' }, { id: 'wan2', note: '中国移动', ifname: 'wan2' }] };
+        return {};
+      }
+      snapshot(key) {
+        const scenario = this.scenario;
+        const state = stateScenario(scenario, this.value(key));
+        return { key, schema_key: key, cache_key: '', observed_at: state.value ? Date.now() - 1000 : null, ...state };
+      }
+      subscribe(key, listener) {
+        const bucket = this.listeners.get(key) || new Set();
+        bucket.add(listener);
+        this.listeners.set(key, bucket);
+        this.active += 1;
+        listener(this.snapshot(key));
+        return () => { if (bucket.delete(listener)) this.active -= 1; };
+      }
+      request(key) {
+        this.requests[key] = (this.requests[key] || 0) + 1;
+        const snapshot = this.snapshot(key);
+        const bucket = this.listeners.get(key);
+        if (bucket) queueMicrotask(() => bucket.forEach((listener) => listener(snapshot)));
+        return Promise.resolve(snapshot);
+      }
+      invalidate(key) { this.invalidations.push(key); }
+      activeSubscriptions() { return this.active; }
+    }
+
+    let instance = null;
+    let registry = null;
+    let apiCalls = [];
+    let conflict = false;
+    const root = document.getElementById('routePreview');
+    const mount = async (kind, scenario = 'ready') => {
+      instance?.unmount?.();
+      registry = new FixtureRegistry(kind, scenario);
+      apiCalls = [];
+      conflict = false;
+      const options = {
+        root, registry, signal: new AbortController().signal,
+        ui: { mountAll: (node) => window.DWRT_UI_KIT.mountAll(node) },
+        api: { request: async (name, url, init = {}) => {
+          apiCalls.push({ name, url, method: init.method || 'GET', body: init.body || null });
+          if (conflict) {
+            const error = new Error('network already belongs to zone');
+            error.status = 409;
+            error.payload = { message: '网络成员已属于其他区域', conflicting_network: 'guest' };
+            throw error;
+          }
+          return { ok: true };
+        } },
+        utils: { escapeHtml: (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]) }
+      };
+      instance = (kind === 'objects' ? mountObjects : mountRegions)(options);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return { requests: { ...registry.requests }, subscriptions: registry.activeSubscriptions() };
+    };
+
+    window.POLICY_ENTITIES_FIXTURE = {
+      mount,
+      setConflict(value) { conflict = Boolean(value); },
+      contract() { return { requests: { ...registry.requests }, subscriptions: registry.activeSubscriptions(), invalidations: [...registry.invalidations], apiCalls: structuredClone(apiCalls) }; },
+      unmount() { instance?.unmount?.(); return { subscriptions: registry?.activeSubscriptions() || 0, children: root.childElementCount }; }
+    };
+    await mount('objects', 'ready');
+    window.POLICY_ENTITIES_FIXTURE_READY = true;
+  </script>
+</body>
+</html>

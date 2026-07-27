@@ -46,6 +46,7 @@ WMENU:=Wireless Drivers
 
 define KernelPackage/mac80211/Default
   SUBMENU:=$(WMENU)
+  VERSION:=7.1.5
   URL:=https://wireless.wiki.kernel.org/
   MAINTAINER:=Felix Fietkau <nbd@nbd.name>
 endef
@@ -101,6 +102,7 @@ PKG_CONFIG_DEPENDS += \
 define KernelPackage/cfg80211
   $(call KernelPackage/mac80211/Default)
   TITLE:=cfg80211 - wireless configuration API
+  VERSION:=7.1.5
   DEPENDS+= +iw +!WIFI_SCRIPTS_UCODE:iwinfo +wifi-scripts +wireless-regdb +USE_RFKILL:kmod-rfkill
   ABI_VERSION:=$(PKG_VERSION)-$(PKG_RELEASE)
   FILES:= \
@@ -129,6 +131,7 @@ endef
 define KernelPackage/mac80211
   $(call KernelPackage/mac80211/Default)
   TITLE:=Linux 802.11 Wireless Networking Stack
+  VERSION:=7.1.5
   # +kmod-crypto-cmac is a runtime only dependency of net/mac80211/aes_cmac.c
   DEPENDS+= +kmod-cfg80211 +kmod-crypto-cmac +kmod-crypto-ccm +kmod-crypto-gcm +hostapd-common
   KCONFIG:=\
@@ -172,6 +175,7 @@ endef
 define KernelPackage/mac80211-hwsim
   $(call KernelPackage/mac80211/Default)
   TITLE:=mac80211 HW simulation device
+  VERSION:=7.1.5
   DEPENDS+= +kmod-mac80211 +@DRIVER_11BE_SUPPORT +@DRIVER_11AX_SUPPORT +@DRIVER_11AC_SUPPORT
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/virtual/mac80211_hwsim.ko
   AUTOLOAD:=$(call AutoProbe,mac80211_hwsim)
@@ -181,6 +185,7 @@ endef
 define KernelPackage/mt7601u
   $(call KernelPackage/mac80211/Default)
   TITLE:=MT7601U-based USB dongles Wireless Driver
+  VERSION:=7.1.5
   DEPENDS+= +kmod-mac80211 @USB_SUPPORT +kmod-usb-core +mt7601u-firmware
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/mediatek/mt7601u/mt7601u.ko
   AUTOLOAD:=$(call AutoProbe,mt7601u)
@@ -189,6 +194,7 @@ endef
 define KernelPackage/rsi91x
   $(call KernelPackage/mac80211/Default)
   TITLE:=Redpine Signals Inc 91x WLAN driver support
+  VERSION:=7.1.5
   DEPENDS+= +kmod-mac80211 +rs9113-firmware
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/rsi/rsi_91x.ko
 endef
@@ -196,6 +202,7 @@ endef
 define KernelPackage/rsi91x-usb
   $(call KernelPackage/mac80211/Default)
   TITLE:=Redpine Signals USB bus support
+  VERSION:=7.1.5
   DEPENDS+=@USB_SUPPORT +kmod-usb-core +kmod-mac80211 +kmod-rsi91x +rs9113-firmware
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/rsi/rsi_usb.ko
   AUTOLOAD:=$(call AutoProbe,rsi_usb)
@@ -204,6 +211,7 @@ endef
 define KernelPackage/rsi91x-sdio
   $(call KernelPackage/mac80211/Default)
   TITLE:=Redpine Signals SDIO bus support
+  VERSION:=7.1.5
   DEPENDS+= +kmod-mac80211 +kmod-mmc +kmod-rsi91x +rs9113-firmware
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/rsi/rsi_sdio.ko
   AUTOLOAD:=$(call AutoProbe,rsi_sdio)
@@ -213,6 +221,7 @@ endef
 define KernelPackage/wlcore
   $(call KernelPackage/mac80211/Default)
   TITLE:=TI common driver part
+  VERSION:=7.1.5
   DEPENDS+= +kmod-mmc +kmod-mac80211
   FILES:= \
 	$(PKG_BUILD_DIR)/drivers/net/wireless/ti/wlcore/wlcore.ko \
@@ -227,6 +236,7 @@ endef
 define KernelPackage/wl12xx
   $(call KernelPackage/mac80211/Default)
   TITLE:=Driver for TI WL12xx
+  VERSION:=7.1.5
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/wl12xx
   DEPENDS+= +kmod-wlcore +wl12xx-firmware
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ti/wl12xx/wl12xx.ko
@@ -240,6 +250,7 @@ endef
 define KernelPackage/wl18xx
   $(call KernelPackage/mac80211/Default)
   TITLE:=Driver for TI WL18xx
+  VERSION:=7.1.5
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/wl18xx
   DEPENDS+= +kmod-wlcore +wl18xx-firmware
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ti/wl18xx/wl18xx.ko
@@ -372,6 +383,8 @@ define Quilt/Refresh/Package
 	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/brcm,brcm/)
 	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/rtl,rtl/)
 endef
+
+
 
 define Build/Compile
 	$(SH_FUNC) var2file "$(call shvar,mac80211_config)" $(PKG_BUILD_DIR)/.config

@@ -1,0 +1,640 @@
+syntax = "proto3";
+
+message APP {
+    uint32 http_id = 1;
+    uint32 ftp_id = 2;
+    uint32 tcp_max_seq = 3;
+    uint32 udp_max_seq = 4;
+    optional EXTENDIKDATA extend_ik_data = 5;
+}
+
+message AppData {
+    uint32 max_seq = 1;
+    repeated AppMatchData match_data = 2;
+    repeated AppNrData nr_data = 3;
+    repeated Range valid_nr_symbs = 4;
+    uint32 max_nr_cnt = 5;
+    optional AppMatchData logout_match = 6;
+    optional bool multi_login = 7;
+    optional uint32 same_id_cnt = 8;
+    optional bool check_uniq_id = 9;
+}
+
+message AppIDRange {
+    uint32 min = 1;
+    uint32 max = 2;
+}
+
+message AppMatchData {
+    uint32 dir = 1;
+    repeated uint32 pkt_seq = 2;
+    repeated uint32 port = 3;
+    repeated Range len_range = 4;
+    bytes match_str = 5;
+    optional int32 offset = 6;
+    repeated Range port_range = 7;
+    optional ImAuditProto proto = 8;
+    repeated Range fwd_port_range = 9;
+    optional uint32 min_pkt_seq = 10;
+}
+
+message AppNrData {
+    uint32 dir = 1;
+    repeated uint32 pkt_seq = 2;
+    repeated uint32 port = 3;
+    optional bytes prefix_match = 4;
+    optional uint32 prefix_offset = 5;
+    optional int32 match_offset = 6;
+    optional uint32 disc_logout = 7;
+    repeated Range port_range = 8;
+    optional ImAuditProto proto = 9;
+    repeated Range fwd_port_range = 10;
+    optional uint32 min_pkt_seq = 11;
+    optional bool is_uniq_id = 12;
+    optional string id_name = 13;
+    optional bool is_audit_log = 14;
+}
+
+enum AuthAction {
+    AUTH_UNSPECIFIED = 0;
+    AUTH_REDIRECT = 1;
+    AUTH_401_UNAUTH = 2;
+    AUTH_ACCEPT = 3;
+    AUTH_DROP = 4;
+    AUTH_RETURN = 5;
+    AUTH_RESET = 6;
+}
+
+message AuthDomains {
+    repeated string auth_domain = 1;
+}
+
+message AuthFilter {
+    repeated AuthMatchRule match_rules = 1;
+}
+
+message AuthMatchHeader {
+    uint32 index = 1;
+    string data = 2;
+    optional bool invert = 3;
+}
+
+message AuthMatchRule {
+    repeated AuthMatchHeader headers = 1;
+    AuthAction action = 2;
+}
+
+message AuthMethodConfig {
+    uint32 auth_method = 1;
+    uint32 max_auth_time = 2;
+    uint32 max_idle_time = 3;
+}
+
+message AuthUrl {
+    repeated string url = 1;
+}
+
+message CaptureIPLoc {
+    uint32 header_index = 1;
+    string regstr = 2;
+}
+
+message DateRange {
+    optional uint32 months = 1;
+    optional uint32 start_date = 2;
+    optional uint32 end_date = 3;
+    optional uint32 weekdays = 4;
+    optional uint32 start_daytime = 5;
+    optional uint32 end_daytime = 6;
+}
+
+message DevCheckRules {
+    repeated uint32 check_dev_appid = 1;
+}
+
+enum DIR {
+    BOTH = 0;
+    ORIGINAL = 1;
+    REPLY = 2;
+}
+
+message DNSCacheSetting {
+    repeated DNSResItem dns_res = 1;
+}
+
+message DNSResItem {
+    string domain = 1;
+    uint32 ip = 2;
+}
+
+message DummyDNS {
+    repeated string domain = 1;
+    uint32 port = 2;
+}
+
+message DupBytes {
+    uint32 offset = 1;
+    uint32 count = 2;
+}
+
+message DupBytesBlock {
+    uint32 offset1 = 1;
+    uint32 offset2 = 2;
+    uint32 len = 3;
+}
+
+message EraseHeader {
+    uint32 index = 1;
+    optional string new_header = 2;
+}
+
+message EXPECT {
+    Proto proto = 1;
+    ExpectType type = 2;
+    ExpectAge age = 3;
+    uint32 count = 4;
+    ExpectAfter after = 5;
+    bool before = 6;
+    uint32 app_id = 7;
+    optional Flag match_flag = 8;
+    optional uint32 timeout = 9;
+}
+
+enum ExpectAfter {
+    AFTER_ANY = 0;
+    AFTER_DROP = 1;
+    AFTER_ACCEPT = 2;
+}
+
+enum ExpectAge {
+    INIT = 0;
+    DNS = 1;
+    TCP = 2;
+    TCP_SYN = 3;
+    TCP_FIN = 4;
+    UDP = 5;
+    ICMP = 6;
+    OTHER = 7;
+    MAX = 8;
+}
+
+enum ExpectType {
+    TYPE_UNSPECIFIED = 0;
+    SPORT = 1;
+    DADDR_SPORT = 2;
+    DADDR_DPORT = 4;
+    DADDR = 8;
+}
+
+message EXTENDIKDATA {
+    repeated IKAPPSLOT slot = 1;
+    repeated IKHTTPAPP http_app = 2;
+    optional uint32 dst_match_hcnt = 6;
+    optional IKAPPS dst_apps = 7;
+    optional uint32 subnet_match_hcnt = 8;
+    optional IKAPPS subnet_apps = 9;
+    optional uint32 seq_len_match_hcnt = 10;
+    optional IKAPPS seq_len_apps = 11;
+    optional uint32 exact_host_hcnt = 12;
+    optional IKHTTPAPPS exact_host_happs = 13;
+    repeated OffsetMatchHTTP prefix_match_happs = 14;
+    repeated OneHeaderHTTP one_header_happs = 15;
+    repeated OffsetMatchHTTP postfix_match_happs = 16;
+    repeated OffsetMatchAPP prefix_match_apps = 17;
+    repeated MultifastHTTP multifast_happs = 18;
+}
+
+enum Flag {
+    FT_DEFAULT = 0;
+    FT_WEAK = 1;
+}
+
+message HostPortList {
+    repeated string host = 1;
+    repeated uint32 port = 2;
+}
+
+message HTTPCaptureIP {
+    uint32 appid = 1;
+    uint32 dir = 2;
+    uint32 pkt_cnt = 3;
+    repeated CaptureIPLoc ip_loc = 4;
+}
+
+message HttpData {
+    uint32 max_seq = 1;
+    repeated HttpMatchData match_data = 2;
+    repeated HttpNrData nr_data = 3;
+    repeated Range valid_nr_symbs = 4;
+    uint32 max_nr_cnt = 5;
+    optional HttpMatchData logout_match = 6;
+    optional bool multi_login = 7;
+    optional uint32 same_id_cnt = 8;
+    optional bool check_uniq_id = 9;
+}
+
+message HTTPHEADER {
+    string data = 1;
+    uint32 index = 2;
+    optional MatchMethod match_method = 3;
+}
+
+message HTTPINFO {
+    repeated HTTPHEADER header = 1;
+}
+
+message HttpMatchData {
+    uint32 dir = 1;
+    repeated uint32 pkt_seq = 2;
+    repeated uint32 port = 3;
+    uint32 index = 4;
+    bytes match_str = 5;
+    optional int32 offset = 6;
+    repeated Range port_range = 7;
+    optional ImAuditProto proto = 8;
+    repeated Range fwd_port_range = 9;
+    optional uint32 min_pkt_seq = 10;
+}
+
+message HttpNrData {
+    uint32 dir = 1;
+    repeated uint32 pkt_seq = 2;
+    repeated uint32 port = 3;
+    uint32 index = 4;
+    optional bytes prefix_match = 5;
+    optional uint32 prefix_offset = 6;
+    optional int32 match_offset = 7;
+    optional uint32 disc_logout = 8;
+    repeated Range port_range = 9;
+    optional ImAuditProto proto = 10;
+    repeated Range fwd_port_range = 11;
+    optional uint32 min_pkt_seq = 12;
+    optional bool is_uniq_id = 13;
+    optional string id_name = 14;
+    optional bool is_audit_log = 15;
+}
+
+enum HttpsTls {
+    MATCH_DEFAULT = 0;
+    MATCH_SERVER_NAME = 1;
+    MATCH_TLS_DATA = 2;
+}
+
+message IKAPP {
+    Proto proto = 2;
+    DIR dir = 3;
+    uint32 pkt_seq = 4;
+    bytes data = 5;
+    optional Flag match_flag = 6;
+    uint32 appid = 7;
+    optional int32 offset = 8;
+    optional MatchMethod match_method = 9;
+    repeated PortRange port_range = 10;
+    repeated L7DataLen l7_data_len_range = 11;
+    optional EXPECT expect_conn = 12;
+    repeated DupBytes dup_bytes = 13;
+    repeated DupBytesBlock dup_block = 14;
+    optional MultiData multi_data = 15;
+    optional MultiPktSeq multi_seq = 16;
+    optional MultiDstAddr multi_dst_addr = 17;
+    repeated MultiSubnet multi_subnet = 18;
+    optional uint32 priority = 19;
+    optional uint32 rule_id = 20;
+    optional HttpsTls https_tls = 21;
+}
+
+message IKAPPS {
+    repeated IKAPP ik_app = 1;
+}
+
+message IKAPPSLOT {
+    repeated IKAPP ik_app = 1;
+    optional IKAPPS multi_str_apps = 2;
+}
+
+message IkAuditData {
+    repeated ImAuditHttp im_http_data = 1;
+    repeated ImAuditApp im_app_data = 2;
+}
+
+message IKHTTPAPP {
+    uint32 appid = 1;
+    HTTPINFO http_info = 2;
+    optional Flag match_flag = 3;
+    DIR dir = 4;
+    uint32 pkt_seq = 5;
+    optional uint32 priority = 6;
+    optional HTTPCaptureIP capture_ip = 7;
+    optional uint32 rule_id = 8;
+}
+
+message IKHTTPAPPS {
+    repeated IKHTTPAPP http_app = 1;
+}
+
+message ImAuditApp {
+    uint32 appid = 1;
+    AppData app_data = 2;
+    string name = 3;
+    ImAuditEvt event = 4;
+}
+
+enum ImAuditEvt {
+    IM_LOGIN = 0;
+    IM_LOGOUT = 1;
+}
+
+message ImAuditHttp {
+    uint32 appid = 1;
+    HttpData http_data = 2;
+    string name = 3;
+    ImAuditEvt event = 4;
+}
+
+enum ImAuditProto {
+    IM_UDP = 0;
+    IM_TCP = 1;
+}
+
+message IPortRange {
+    uint32 start = 1;
+    uint32 end = 2;
+}
+
+message IPRange {
+    uint32 start_ip = 1;
+    uint32 end_ip = 2;
+}
+
+message IPSet {
+    repeated IPRange ip_range = 1;
+    optional string src_ipset = 2;
+}
+
+message IPSetMac {
+    optional string src_ipset_mac = 1;
+}
+
+message L4DpiItem {
+    uint32 ip = 1;
+    uint32 port = 2;
+    uint32 proto = 3;
+    uint32 priority = 4;
+    uint32 appid = 5;
+    uint32 percent = 6;
+}
+
+message L4DpiSetting {
+    repeated L4DpiItem item = 1;
+}
+
+message L7DataLen {
+    uint32 min_len = 1;
+    uint32 max_len = 2;
+}
+
+message LbDev {
+    string ifname = 1;
+    uint32 routeid = 2;
+    uint32 factor = 3;
+}
+
+message LbList {
+    repeated LbNode node = 1;
+}
+
+message LbNode {
+    optional string route_find = 1;
+    optional string data = 2;
+    optional uint32 disable = 3;
+    optional uint32 ipset_id = 4;
+    optional uint32 n_active_dev = 5;
+    repeated LbDev lb_dev = 6;
+    optional string type = 7;
+    optional string ipset = 8;
+    optional string config_load = 9;
+    optional string prepare_release = 10;
+    optional string rcu_release = 11;
+}
+
+message MatchData {
+    int32 offset = 1;
+    bytes data = 2;
+}
+
+message MatchHeader {
+    uint32 index = 1;
+    string data = 2;
+    optional bool excl_flag = 3;
+}
+
+enum MatchMethod {
+    MATCH_EXACT_MATCH = 0;
+    MATCH_REGULAR_MATCH = 1;
+    MATCH_NO_FIXED_DATA_MATCH = 2;
+    MATCH_MATCH_MULTI_DATA = 3;
+    MATCH_PART_EXACT_MATCH = 4;
+    MATCH_BM_MATCH_STR = 5;
+}
+
+message MultiData {
+    uint32 threshold = 1;
+    repeated MatchData match_data = 2;
+}
+
+message MultiDstAddr {
+    repeated uint32 ip = 1;
+}
+
+message MultifastHTTP {
+    uint32 index = 1;
+    repeated IKHTTPAPP http_app = 2;
+}
+
+message MultiPktSeq {
+    repeated uint32 pkt_seq = 1;
+}
+
+message MultiSubnet {
+    uint32 net = 1;
+    uint32 mask = 2;
+}
+
+message OffsetMatchAPP {
+    int32 offset = 1;
+    uint32 hslot_cnt = 2;
+    IKAPPS apps = 3;
+}
+
+message OffsetMatchHTTP {
+    uint32 index = 1;
+    int32 offset = 2;
+    uint32 hslot_cnt = 3;
+    IKHTTPAPPS happs = 4;
+}
+
+message OneHeaderHTTP {
+    uint32 index = 1;
+    IKHTTPAPPS happs = 2;
+    optional IKHTTPAPPS multi_str_happs = 3;
+}
+
+message PermitHttpsDomains {
+    repeated string domain = 1;
+}
+
+message PortRange {
+    uint32 min_port = 1;
+    uint32 max_port = 2;
+}
+
+enum Proto {
+    _ANY = 0;
+    _TCP = 6;
+    _UDP = 17;
+}
+
+message QQAclList {
+    repeated QQNode qq_node = 1;
+}
+
+message QQDateRange {
+    optional uint32 start_daytime = 1;
+    optional uint32 end_daytime = 2;
+    optional uint32 weekdays = 3;
+}
+
+message QQNode {
+    bool acl_mode = 1;
+    optional QQDateRange date_range = 2;
+    optional uint32 ip_set_id = 3;
+    optional string ip_set = 4;
+    repeated string qq = 5;
+    optional string qq_regexp = 6;
+    optional uint32 qq_regexp_len = 7;
+}
+
+message Range {
+    uint32 min = 1;
+    uint32 max = 2;
+}
+
+message UrlData {
+    repeated UrlFilter filter = 1;
+}
+
+message UrlDateRange {
+    optional uint32 start_daytime = 1;
+    optional uint32 end_daytime = 2;
+}
+
+message UrlFilter {
+    UrlMatchAction action = 1;
+    string orig_host_url = 2;
+    optional string param = 3;
+    optional string replace_param_value = 4;
+    optional string redirect_url = 5;
+    optional UrlMatchMethod match_method = 6;
+    repeated DateRange date_range = 7;
+    optional uint32 hit_rate = 8;
+    optional string url_keywords = 9;
+    optional string orig_keywords = 10;
+    optional string name = 11;
+    optional string excluded_keywords = 12;
+    optional uint32 hidden = 13;
+    optional uint32 data_id = 15;
+    optional string src_ipset = 16;
+    repeated string mm_url_param = 17;
+    repeated string mm_url_pv = 18;
+    repeated string mm_referer_param = 19;
+    repeated string mm_referer_pv = 20;
+    repeated string mul_hosts = 21;
+    repeated string excl_mul_hosts = 22;
+    repeated AppIDRange excl_appid_ranges = 23;
+    repeated AppIDRange match_appid_ranges = 24;
+    repeated uint32 match_appids = 25;
+    optional bool valid_html_request = 26;
+    optional string match_ua = 27;
+    optional string excl_ua = 28;
+    optional string excl_src_ipset = 29;
+    repeated MatchHeader match_headers = 30;
+    repeated EraseHeader erase_headers = 31;
+    optional uint32 prio = 32;
+}
+
+enum UrlMatchAction {
+    ACTION_UNSPECIFIED = 0;
+    ACTION_DROP = 1;
+    ACTION_REPLACE_PARAM = 2;
+    ACTION_URL_REDIRECT = 3;
+    ACTION_MATCH_STATISTICS = 4;
+    ACTION_REPLACE_KEYWORDS = 5;
+    ACTION_HIJACK_DATA = 6;
+    ACTION_SUPER_MM = 7;
+    ACTION_WHITE_DOMAIN = 8;
+    ACTION_BLACK_DOMAIN = 9;
+    ACTION_INSERT_JS = 10;
+    ACTION_ERASE_FOOTPRINT = 11;
+}
+
+enum UrlMatchMethod {
+    METHOD_UNSPECIFIED = 0;
+    METHOD_EXACT_MATCH = 1;
+    METHOD_REGULAR_EXPRESSION = 2;
+    METHOD_EXACT_MATCH_HOST_AND_PARAM = 3;
+    METHOD_REGULAR_HOST_EXACT_PARAM = 4;
+    METHOD_REGULAR_HOST_AND_KEYWORDS = 5;
+    METHOD_EXACT_HOST_REGULAR_PARAM = 6;
+    METHOD_IPSET_MATCH = 7;
+    METHOD_EXACT_MATCH_REFERER = 8;
+    METHOD_REGULAR_MATCH_REFERER = 9;
+    METHOD_EXACT_MATCH_DOMAIN = 10;
+}
+
+message WansSnat {
+    optional uint32 src_ipset = 1;
+    optional uint32 dst_ipset = 2;
+    optional uint32 proto_type = 3;
+    optional uint32 n_active_dev = 4;
+    repeated IPortRange sport_range = 5;
+    repeated IPortRange dport_range = 6;
+    optional string proto = 7;
+    repeated string out = 8;
+    repeated string in = 9;
+    optional string in_devs = 10;
+    optional string src_ip = 11;
+    optional string dst_ip = 12;
+}
+
+message WansSnatList {
+    repeated WansSnat node = 1;
+}
+
+message WhiteHTTPS {
+    repeated string domain = 1;
+    uint32 redirect_port = 2;
+    optional string white_https_ipset = 3;
+}
+
+message WhiteUrl {
+    string url = 1;
+}
+
+message WhiteUrlList {
+    repeated WhiteUrl white_url = 1;
+    optional UrlDateRange date_range = 2;
+    optional AuthDomains auth_domains = 3;
+    optional PermitHttpsDomains permit_https_domains = 4;
+    optional AuthUrl auth_url = 5;
+    bool permit_no_http = 6;
+    optional AuthDomains black_domains = 7;
+    optional AuthUrl black_urls = 8;
+    repeated string detect_uas = 9;
+    optional AuthUrl redirect_urls = 10;
+    repeated string auth_ifs = 11;
+    optional string white_ip_set = 12;
+    optional AuthFilter filter = 13;
+    optional DummyDNS dummy_dns = 14;
+    optional WhiteHTTPS white_https = 15;
+    repeated AuthMethodConfig auth_method_config = 17;
+}

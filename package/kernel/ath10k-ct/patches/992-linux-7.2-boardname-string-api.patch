@@ -1,0 +1,12 @@
+--- a/ath10k-6.15/core.c
++++ b/ath10k-6.15/core.c
+@@ -1627,8 +1627,7 @@ static int ath10k_core_fetch_board_data_
+ 		scnprintf(boardname, sizeof(boardname), "board-%s-%s.bin",
+ 			  ath10k_bus_str(ar->hif.bus), dev_name(ar->dev));
+ 		if (ar->fwcfg.bname[0]) {
+-			strncpy(boardname, ar->fwcfg.bname, sizeof(boardname) - 1);
+-			boardname[sizeof(boardname) - 1] = 0;
++			strscpy(boardname, ar->fwcfg.bname, sizeof(boardname));
+ 		}
+ 
+ 		ar->normal_mode_fw.board = ath10k_fetch_fw_file(ar,

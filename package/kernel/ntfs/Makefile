@@ -9,7 +9,7 @@ PKG_SOURCE_DATE:=2026-05-03
 PKG_SOURCE_URL:=https://github.com/namjaejeon/linux-ntfs
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_VERSION:=9e031cf453d8b3c226aac7cb7105af46efd79690
-PKG_MIRROR_HASH:=142b99c910b1dbf35ec97abee65f5f497e4a4fdf4619999f83742ed4f2e83d79
+PKG_MIRROR_HASH:=f5b4d9edc8010d7a0984aee3066c2c80ab330c41ea23b37da65082237420a32c
 
 PKG_LICENSE:=GPL-2.0-or-later
 
@@ -21,6 +21,7 @@ define KernelPackage/fs-ntfs
   SECTION:=kernel
   CATEGORY:=Kernel modules
   SUBMENU:=Filesystems
+  VERSION:=7.1.5
   TITLE:=NTFS file system support
   DEPENDS:=+kmod-nls-base
   URL:=$(PKG_SOURCE_URL)

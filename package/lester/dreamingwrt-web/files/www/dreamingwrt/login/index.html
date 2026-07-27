@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex,nofollow">
+    <title>Dreaming OS 登录</title>
+    <link rel="icon" href="/static/images/logo-64.png">
+    <link rel="stylesheet" href="/login/login.css?v=20260725-corner-clip-01">
+    <link rel="stylesheet" href="/static/css/notifications.css?v=20260712-10">
+    <link rel="stylesheet" href="/static/css/dwrt-theme.css?v=20260722-03">
+    <link rel="stylesheet" href="/static/ui-kit/dwrt-sampled-liquid-glass.css?v=20260713-17">
+  </head>
+  <body>
+    <main class="dwrt-login-page" id="loginPage">
+      <img class="dwrt-login-bg" id="loginBg" src="/static/background/dwrt-default-bg.jpg" alt="" aria-hidden="true">
+      <img class="dwrt-login-bg next" id="loginBgNext" alt="" aria-hidden="true">
+      <div class="dwrt-login-scrim" aria-hidden="true"></div>
+      <div class="dwrt-login-particles" aria-hidden="true">
+        <span style="--x: 7; --d: 9s; --delay: -1s"></span>
+        <span style="--x: 13; --d: 12s; --delay: -7s"></span>
+        <span style="--x: 21; --d: 10s; --delay: -3s"></span>
+        <span style="--x: 29; --d: 14s; --delay: -10s"></span>
+        <span style="--x: 36; --d: 11s; --delay: -5s"></span>
+        <span style="--x: 44; --d: 13s; --delay: -8s"></span>
+        <span style="--x: 51; --d: 9s; --delay: -4s"></span>
+        <span style="--x: 59; --d: 15s; --delay: -11s"></span>
+        <span style="--x: 67; --d: 12s; --delay: -2s"></span>
+        <span style="--x: 75; --d: 10s; --delay: -6s"></span>
+        <span style="--x: 84; --d: 13s; --delay: -9s"></span>
+        <span style="--x: 92; --d: 11s; --delay: -5s"></span>
+      </div>
+
+      <section class="login-shell" id="loginShell" aria-label="Dreaming OS 登录">
+        <div class="avatar-stage" aria-hidden="true">
+          <div class="avatar-glow"></div>
+          <img class="avatar-face" id="avatarFace" src="/static/images/logo-64.png" alt="">
+          <div class="avatar-check">✓</div>
+        </div>
+
+        <div class="login-card-clip">
+          <div class="liquid-card" id="liquidCard">
+            <div class="dwrt-sampled-glass-content">
+            <h1 id="formTitle">Welcome Back</h1>
+            <p class="subtitle" id="formSubtitle">Enter your <span>Dreaming OS</span></p>
+
+            <form id="loginForm" autocomplete="on">
+              <label class="field username-field">
+                <span class="visually-hidden">用户名</span>
+                <input id="username" name="username" type="text" placeholder="用户名" autocomplete="username">
+                <span class="field-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24"><path d="M12 12c2.76 0 5-2.24 5-5s-2.24-5-5-5-5 2.24-5 5 2.24 5 5 5Zm0 2c-4.42 0-8 2.24-8 5v1.2c0 1 .8 1.8 1.8 1.8h12.4c1 0 1.8-.8 1.8-1.8V19c0-2.76-3.58-5-8-5Z"></path></svg>
+                </span>
+              </label>
+
+              <label class="field password-field">
+                <span class="visually-hidden">密码</span>
+                <input id="password" name="password" type="password" placeholder="密码" autocomplete="current-password">
+                <button class="field-icon icon-button" type="button" id="togglePassword" aria-label="显示密码">
+                  <svg viewBox="0 0 24 24"><path d="M17 9V7a5 5 0 0 0-10 0v2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1Zm-8 0V7a3 3 0 1 1 6 0v2H9Zm3 4a1.7 1.7 0 0 1 .85 3.17V18h-1.7v-1.83A1.7 1.7 0 0 1 12 13Z"></path></svg>
+                </button>
+              </label>
+
+              <label class="field password-field setup-only" id="confirmPasswordField" hidden>
+                <span class="visually-hidden">确认密码</span>
+                <input id="confirmPassword" name="confirm_password" type="password" placeholder="确认密码" autocomplete="new-password">
+                <span class="field-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24"><path d="M17 9V7a5 5 0 0 0-10 0v2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1Zm-8 0V7a3 3 0 1 1 6 0v2H9Zm7.5 4.3-5.1 5.1-2.3-2.3 1.2-1.2 1.1 1.1 3.9-3.9 1.2 1.2Z"></path></svg>
+                </span>
+              </label>
+
+              <button class="login-button" type="submit" id="loginButton">
+                <span>登录</span>
+                <i aria-hidden="true"></i>
+              </button>
+
+              <p class="login-message" id="loginMessage" role="status"></p>
+            </form>
+
+            <footer>
+              <strong>Powered By Dreaming OS</strong>
+              <span id="deviceLine">Dreaming OS</span>
+            </footer>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/js/notifications.js?v=20260622-1"></script>
+    <script src="/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260725-ui-kit-filter-edge-05"></script>
+    <script src="/static/js/shell-prewarm.js?v=20260724-line-health-history-01"></script>
+    <script>
+      const LIQUID_GLASS = {
+        cornerRadius: 25,
+        displacementScale: 80,
+        baseBlur: 3.2,
+        blurAmount: 0,
+        saturation: 140,
+        aberrationIntensity: 2,
+        neutralDensity: 0.06,
+        neutralColor: '10 16 25',
+        preserveCenter: true,
+        borderWidth: 1,
+        opacity: 1,
+        highlight: 0.28,
+        borderColor: '#25FFFFFF'
+      };
+
+      const shell = document.getElementById('loginShell');
+      const avatar = document.getElementById('avatarFace');
+      const formTitle = document.getElementById('formTitle');
+      const formSubtitle = document.getElementById('formSubtitle');
+      const username = document.getElementById('username');
+      const password = document.getElementById('password');
+      const confirmPassword = document.getElementById('confirmPassword');
+      const confirmPasswordField = document.getElementById('confirmPasswordField');
+      const togglePassword = document.getElementById('togglePassword');
+      const form = document.getElementById('loginForm');
+      const button = document.getElementById('loginButton');
+      const message = document.getElementById('loginMessage');
+      const liquidCard = document.getElementById('liquidCard');
+      const bg = document.getElementById('loginBg');
+      const bgNext = document.getElementById('loginBgNext');
+      const glassRenderer = window.DWRTSampledLiquidGlass.create({
+        root: liquidCard,
+        backgroundElement: bg,
+        options: LIQUID_GLASS
+      });
+      let formMode = 'login';
+      let setupToken = '';
+      const BACKGROUND_FADE_MS = 2800;
+      let backgroundTransitioning = false;
+      const nextPath = (() => {
+        try {
+          const value = new URLSearchParams(location.search).get('next') || '/app/';
+          return value.startsWith('/') && !value.startsWith('//') ? value : '/app/';
+        } catch (_) {
+          return '/app/';
+        }
+      })();
+      liquidCard.dataset.glassRenderer = 'svg-explicit-sampling';
+
+      function setMessage(text, type = '') {
+        message.textContent = text || '';
+        message.dataset.type = type;
+        shell.classList.toggle('has-error', type === 'error');
+      }
+
+      function updateAvatar() {
+        const len = Math.min((username.value || '').length, 14);
+        avatar.style.transform = len ? `translateX(${len * 1.05}px) rotate(${len * 0.32}deg)` : '';
+      }
+
+      function setFormMode(mode, options = {}) {
+        formMode = mode;
+        setupToken = options.setupToken || setupToken || '';
+        const isSetup = mode === 'setup';
+        shell.classList.toggle('is-first-run', isSetup);
+        confirmPasswordField.hidden = !isSetup;
+        username.autocomplete = isSetup ? 'username' : 'username';
+        password.autocomplete = isSetup ? 'new-password' : 'current-password';
+        password.placeholder = isSetup ? '新密码' : '密码';
+        confirmPassword.required = isSetup;
+        formTitle.textContent = isSetup ? 'Create Admin' : 'Welcome Back';
+        formSubtitle.innerHTML = isSetup ? 'Set your <span>Dreaming OS</span> account' : 'Enter your <span>Dreaming OS</span>';
+        button.querySelector('span').textContent = isSetup ? '创建管理员' : '登录';
+        if (isSetup) {
+          username.value = options.username || '';
+          password.value = '';
+          confirmPassword.value = '';
+          setMessage('默认账号已验证，请创建新的管理账号。', 'info');
+          setTimeout(() => username.focus(), 80);
+        }
+      }
+
+      function responseMessage(body, fallback) {
+        if (!body) return fallback;
+        if (body.error && body.error.message) return body.error.message;
+        if (body.message) return body.message;
+        if (body.data && body.data.message) return body.data.message;
+        if (body.data && body.data.error) return body.data.error;
+        return fallback;
+      }
+
+      function sessionData(body) {
+        return body && body.data ? body.data : null;
+      }
+
+      function firstText(...values) {
+        for (const value of values) {
+          if (value === undefined || value === null) continue;
+          if (typeof value === 'object') continue;
+          const text = String(value).trim();
+          if (text) return text;
+        }
+        return '';
+      }
+
+      const SESSION_KEYS = {
+        access: 'dreamingwrt.web.accessToken',
+        refresh: 'dreamingwrt.web.refreshToken',
+        expiresAt: 'dreamingwrt.web.expiresAt',
+        username: 'dreamingwrt.web.username',
+        role: 'dreamingwrt.web.role'
+      };
+
+      function saveSession(data) {
+        if (!data || !data.access_token) return;
+        try {
+          localStorage.setItem(SESSION_KEYS.access, data.access_token);
+          if (data.refresh_token) localStorage.setItem(SESSION_KEYS.refresh, data.refresh_token);
+          if (data.expires_in) localStorage.setItem(SESSION_KEYS.expiresAt, String(Date.now() + Number(data.expires_in) * 1000));
+          if (data.username) localStorage.setItem(SESSION_KEYS.username, data.username);
+          if (data.role) localStorage.setItem(SESSION_KEYS.role, data.role);
+        } catch (_) {}
+      }
+
+      username.addEventListener('focus', () => {
+        shell.classList.add('is-user');
+        shell.classList.remove('is-password', 'has-error');
+        updateAvatar();
+      });
+      username.addEventListener('input', updateAvatar);
+      username.addEventListener('blur', () => setTimeout(() => {
+        if (document.activeElement !== password) {
+          shell.classList.remove('is-user');
+          avatar.style.transform = '';
+        }
+      }, 0));
+
+      password.addEventListener('focus', () => {
+        shell.classList.add('is-password');
+        shell.classList.remove('is-user', 'has-error');
+        avatar.style.transform = '';
+      });
+      password.addEventListener('blur', () => setTimeout(() => {
+        if (document.activeElement !== username && document.activeElement !== confirmPassword) shell.classList.remove('is-password');
+      }, 0));
+
+      confirmPassword.addEventListener('focus', () => {
+        shell.classList.add('is-password');
+        shell.classList.remove('is-user', 'has-error');
+        avatar.style.transform = '';
+      });
+      confirmPassword.addEventListener('blur', () => setTimeout(() => {
+        if (document.activeElement !== username && document.activeElement !== password) shell.classList.remove('is-password');
+      }, 0));
+
+      togglePassword.addEventListener('click', () => {
+        const showing = password.type === 'text';
+        password.type = showing ? 'password' : 'text';
+        confirmPassword.type = showing ? 'password' : 'text';
+        togglePassword.setAttribute('aria-label', showing ? '显示密码' : '隐藏密码');
+        password.focus();
+      });
+
+      function apiFallbackUrl(url) {
+        if (!url || !url.startsWith('/api/v1/') || location.port === '12517') return '';
+        const port = '12517';
+        return `${location.protocol}//${location.hostname}:${port}${url}`;
+      }
+
+      function apiCandidateUrls(url) {
+        const urls = [url];
+        const fallback = apiFallbackUrl(url);
+        if (fallback) urls.push(fallback);
+        return urls.filter((item, index, list) => item && list.indexOf(item) === index);
+      }
+
+      function requestOptions(options = {}) {
+        return {
+          credentials: 'same-origin',
+          cache: 'no-store',
+          ...options,
+          headers: {
+            Accept: 'application/json',
+            ...(options.headers || {})
+          }
+        };
+      }
+
+      async function getJson(url, options) {
+        const res = await fetch(url, requestOptions(options));
+        const text = await res.text();
+        try { return { res, body: JSON.parse(text) }; }
+        catch (_) { return { res, body: null, text }; }
+      }
+
+      function xhrJson(url, options = {}) {
+        return new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open(options.method || 'GET', url, true);
+          xhr.responseType = 'text';
+          xhr.timeout = 12000;
+          const headers = requestOptions(options).headers || {};
+          Object.keys(headers).forEach((key) => xhr.setRequestHeader(key, headers[key]));
+          xhr.onload = () => {
+            const text = xhr.responseText || '';
+            let body = null;
+            try { body = text ? JSON.parse(text) : null; } catch (_) {}
+            resolve({
+              res: { ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status, statusText: xhr.statusText },
+              body,
+              text
+            });
+          };
+          xhr.onerror = () => reject(new Error(`XHR network error ${url}`));
+          xhr.ontimeout = () => reject(new Error(`XHR timeout ${url}`));
+          xhr.send(options.body || null);
+        });
+      }
+
+      async function postApiJson(url, payload) {
+        const options = {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        };
+        let lastError = null;
+        for (const targetUrl of apiCandidateUrls(url)) {
+          try {
+            return await getJson(targetUrl, targetUrl === url ? options : { ...options, credentials: 'omit' });
+          } catch (fetchError) {
+            lastError = fetchError;
+          }
+          try {
+            return await xhrJson(targetUrl, targetUrl === url ? options : { ...options, credentials: 'omit' });
+          } catch (xhrError) {
+            xhrError.primaryError = lastError;
+            xhrError.targetUrl = targetUrl;
+            lastError = xhrError;
+          }
+        }
+        throw lastError || new Error(`XHR network error ${url}`);
+      }
+
+      function applyBackground(url, opacity = 1) {
+        if (!url) return;
+        bg.style.opacity = opacity;
+        bg.src = url;
+        glassRenderer.setBackground(bg, url);
+      }
+
+      function commitBackground(url, opacity = 1) {
+        const finish = () => {
+          bg.style.opacity = opacity;
+          bgNext.style.opacity = 0;
+          glassRenderer.setBackground(bg, url);
+          backgroundTransitioning = false;
+        };
+        if (bg.getAttribute('src') !== url) bg.src = url;
+        if (bg.complete && bg.naturalWidth) {
+          finish();
+        } else {
+          bg.addEventListener('load', finish, { once: true });
+        }
+      }
+
+      async function prepareBackground(element, url) {
+        element.style.opacity = 0;
+        if (element.getAttribute('src') !== url || !element.complete || !element.naturalWidth) {
+          await new Promise((resolve, reject) => {
+            const cleanup = () => {
+              element.removeEventListener('load', handleLoad);
+              element.removeEventListener('error', handleError);
+            };
+            const handleLoad = () => { cleanup(); resolve(); };
+            const handleError = () => { cleanup(); reject(new Error('Background image failed to load.')); };
+            element.addEventListener('load', handleLoad, { once: true });
+            element.addEventListener('error', handleError, { once: true });
+            if (element.getAttribute('src') !== url) element.src = url;
+            if (element.complete) {
+              if (element.naturalWidth) handleLoad();
+              else handleError();
+            }
+          });
+        }
+        try { if (typeof element.decode === 'function') await element.decode(); } catch (_) {}
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      }
+
+      function numberFromTheme(data, keys, fallback) {
+        for (const key of keys) {
+          if (data && data[key] !== undefined && data[key] !== null && data[key] !== '') {
+            const value = Number(data[key]);
+            if (Number.isFinite(value)) return value;
+          }
+        }
+        return fallback;
+      }
+
+      function stringFromTheme(data, keys, fallback) {
+        for (const key of keys) {
+          if (data && data[key] !== undefined && data[key] !== null && data[key] !== '') return String(data[key]);
+        }
+        return fallback;
+      }
+
+      function androidColorToCss(value) {
+        const raw = String(value || '').trim();
+        const hex = raw.startsWith('#') ? raw.slice(1) : raw;
+        if (/^[0-9a-fA-F]{8}$/.test(hex)) {
+          const aa = hex.slice(0, 2);
+          const rrggbb = hex.slice(2);
+          return `#${rrggbb}${aa}`;
+        }
+        return raw || '#ffffff25';
+      }
+
+      function materialDensityFromLegacyOpacity(value) {
+        const legacy = Math.max(0, Math.min(1, Number.isFinite(Number(value)) ? Number(value) : 1));
+        return 0.025 + legacy * 0.035;
+      }
+
+      function relativeLumaChannel(value) {
+        const channel = value / 255;
+        return channel <= 0.04045 ? channel / 12.92 : Math.pow((channel + 0.055) / 1.055, 2.4);
+      }
+
+      function readableForegroundMode(backgroundLuma, previous) {
+        const darkInkLuma = 0.004;
+        const lightInkLuma = 0.982;
+        const darkContrast = (backgroundLuma + 0.05) / (darkInkLuma + 0.05);
+        const lightContrast = (lightInkLuma + 0.05) / (backgroundLuma + 0.05);
+        if (previous === 'dark' && darkContrast >= 4.5) return 'dark';
+        if (previous === 'light' && lightContrast >= 4.5) return 'light';
+        return darkContrast >= lightContrast ? 'dark' : 'light';
+      }
+
+      function sampleLoginForeground(sourceImage = bg) {
+        if (!sourceImage.complete || !sourceImage.naturalWidth || !liquidCard.offsetWidth || !liquidCard.offsetHeight) return;
+        const rect = liquidCard.getBoundingClientRect();
+        const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1;
+        const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 1;
+        const scale = Math.max(viewportWidth / sourceImage.naturalWidth, viewportHeight / sourceImage.naturalHeight);
+        const drawWidth = sourceImage.naturalWidth * scale;
+        const drawHeight = sourceImage.naturalHeight * scale;
+        const drawX = (viewportWidth - drawWidth) / 2;
+        const drawY = (viewportHeight - drawHeight) / 2;
+        const canvas = document.createElement('canvas');
+        const size = 36;
+        canvas.width = size;
+        canvas.height = size;
+        const context = canvas.getContext('2d', { willReadFrequently: true });
+        if (!context) return;
+        const scaleX = size / Math.max(1, rect.width);
+        const scaleY = size / Math.max(1, rect.height);
+        try {
+          context.drawImage(sourceImage, (drawX - rect.left) * scaleX, (drawY - rect.top) * scaleY, drawWidth * scaleX, drawHeight * scaleY);
+          const pixels = context.getImageData(0, 0, size, size).data;
+          let luma = 0;
+          let lumaSq = 0;
+          const count = size * size;
+          for (let index = 0; index < pixels.length; index += 4) {
+            const value = 0.2126 * relativeLumaChannel(pixels[index])
+              + 0.7152 * relativeLumaChannel(pixels[index + 1])
+              + 0.0722 * relativeLumaChannel(pixels[index + 2]);
+            luma += value;
+            lumaSq += value * value;
+          }
+          const mean = luma / count;
+          const contrast = Math.sqrt(Math.max(0, lumaSq / count - mean * mean));
+          const density = Math.max(0, Math.min(0.35, Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--dwrt-glass-neutral-density')) || LIQUID_GLASS.neutralDensity));
+          const effectiveLuma = mean * (1 - density);
+          const previous = document.documentElement.dataset.loginForeground || '';
+          document.documentElement.dataset.loginForeground = readableForegroundMode(effectiveLuma, previous);
+          document.documentElement.toggleAttribute('data-login-foreground-mixed', contrast > 0.11);
+          liquidCard.dataset.sampledLuma = mean.toFixed(3);
+          liquidCard.dataset.effectiveLuma = effectiveLuma.toFixed(3);
+        } catch (_) {}
+      }
+
+      function applyLiquidGlass(data) {
+        const material = data && data.material_glass && typeof data.material_glass === 'object'
+          ? data.material_glass
+          : null;
+        const source = data && data.liquid_glass ? { ...data, ...data.liquid_glass } : data;
+        const rawOpacity = numberFromTheme(source, ['login_glass_opacity', 'glass_opacity'], LIQUID_GLASS.opacity);
+        const legacyBlur = numberFromTheme(source, ['login_glass_blur', 'glass_blur', 'blur_radius'], 6);
+        const legacyRefraction = numberFromTheme(source, ['login_glass_refraction_offset', 'refraction_offset'], 120);
+        const legacyDispersion = numberFromTheme(source, ['login_glass_dispersion', 'dispersion'], 0);
+        const vars = {
+          cornerRadius: numberFromTheme(source, ['login_glass_corner_radius', 'glass_corner_radius', 'corner_radius'], LIQUID_GLASS.cornerRadius),
+          mode: material?.mode || LIQUID_GLASS.mode || 'shader',
+          displacementScale: material
+            ? Math.max(0, Math.min(180, Number(material.displacement_scale ?? LIQUID_GLASS.displacementScale)))
+            : Math.max(0, Math.min(180, legacyRefraction * (80 / 120))),
+          baseBlur: material
+            ? Math.max(0, Math.min(16, Number(material.base_blur ?? LIQUID_GLASS.baseBlur)))
+            : Math.max(2.4, Math.min(6, 3.2 + (legacyBlur - 6) * 0.08)),
+          blurAmount: 0,
+          saturation: material
+            ? Math.max(70, Math.min(220, Number(material.saturation ?? LIQUID_GLASS.saturation)))
+            : LIQUID_GLASS.saturation,
+          aberrationIntensity: material
+            ? Math.max(0, Math.min(8, Number(material.aberration_intensity ?? LIQUID_GLASS.aberrationIntensity)))
+            : Math.max(0, Math.min(8, 2 + legacyDispersion)),
+          neutralDensity: material
+            ? Math.max(0.025, Math.min(0.18, Number(material.neutral_density ?? LIQUID_GLASS.neutralDensity)))
+            : materialDensityFromLegacyOpacity(rawOpacity),
+          neutralColor: material?.neutral_color || LIQUID_GLASS.neutralColor,
+          preserveCenter: material ? material.preserve_center !== false : true,
+          borderWidth: material
+            ? Math.max(0, Math.min(2, Number(material.border_width ?? LIQUID_GLASS.borderWidth)))
+            : numberFromTheme(source, ['login_glass_border_width', 'border_width'], LIQUID_GLASS.borderWidth),
+          opacity: Math.max(0, Math.min(1, rawOpacity)),
+          highlight: material
+            ? Math.max(0, Math.min(0.65, Number(material.highlight ?? LIQUID_GLASS.highlight)))
+            : numberFromTheme(source, ['login_glass_highlight', 'highlight_strength'], LIQUID_GLASS.highlight),
+          highlightAngle: material
+            ? Math.max(0, Math.min(360, Number(material.highlight_angle ?? 135)))
+            : 135,
+          borderColor: androidColorToCss(material?.border_color || stringFromTheme(source, ['login_glass_border_color', 'border_color'], LIQUID_GLASS.borderColor))
+        };
+        document.documentElement.style.setProperty('--lg-corner-radius', `${vars.cornerRadius}px`);
+        document.documentElement.style.setProperty('--lg-blur-radius', `${legacyBlur}px`);
+        document.documentElement.style.setProperty('--lg-refraction-offset', `${legacyRefraction}px`);
+        document.documentElement.style.setProperty('--lg-refraction-height', `${numberFromTheme(source, ['login_glass_refraction_height', 'refraction_height'], 12)}px`);
+        document.documentElement.style.setProperty('--lg-dispersion', `${legacyDispersion}`);
+        document.documentElement.style.setProperty('--lg-border-width', `${vars.borderWidth}px`);
+        document.documentElement.style.setProperty('--lg-glass-opacity', `${vars.opacity}`);
+        document.documentElement.style.setProperty('--dwrt-glass-base-blur', `${vars.baseBlur}px`);
+        document.documentElement.style.setProperty('--dwrt-glass-neutral-density', `${vars.neutralDensity}`);
+        document.documentElement.style.setProperty('--dwrt-glass-saturation', `${vars.saturation}%`);
+        document.documentElement.style.setProperty('--dwrt-glass-highlight-strength', `${vars.highlight}`);
+        document.documentElement.style.setProperty('--lg-highlight', `${vars.highlight}`);
+        document.documentElement.style.setProperty('--lg-border-color', vars.borderColor);
+        glassRenderer.update(vars);
+        requestAnimationFrame(sampleLoginForeground);
+      }
+
+      async function initTheme() {
+        try {
+          const { body } = await getJson('/api/v1/bootstrap?appearance=1');
+          const bootstrap = body && body.data ? body.data : body;
+          const appearance = bootstrap && bootstrap.appearance && typeof bootstrap.appearance === 'object' ? bootstrap.appearance : null;
+          const data = appearance && appearance.login && typeof appearance.login === 'object' ? appearance.login : appearance;
+          if (!data) return;
+          window.DWRTShellPrewarm?.writeThemeSnapshot(data);
+          applyLiquidGlass(data);
+          const selected = data.selected && data.selected.url;
+          applyBackground(selected || (data.images && data.images[0]), data.opacity ?? 1);
+          const images = Array.isArray(data.images) ? data.images.filter(Boolean) : [];
+          if (images.length > 1 && data.mode !== 'fixed') {
+            let index = Math.max(0, images.indexOf(selected));
+            const interval = Math.max(14000, Number(data.interval_ms || 18000), BACKGROUND_FADE_MS + 5000);
+            setInterval(async () => {
+              if (backgroundTransitioning) return;
+              const nextIndex = (index + 1) % images.length;
+              const nextUrl = images[nextIndex];
+              backgroundTransitioning = true;
+              try {
+                await prepareBackground(bgNext, nextUrl);
+                index = nextIndex;
+                bgNext.style.opacity = data.opacity ?? 1;
+                glassRenderer.transitionBackground(bgNext, nextUrl, BACKGROUND_FADE_MS);
+                setTimeout(() => sampleLoginForeground(bgNext), BACKGROUND_FADE_MS * 0.45);
+                setTimeout(() => {
+                  commitBackground(nextUrl, data.opacity ?? 1);
+                }, BACKGROUND_FADE_MS);
+              } catch (_) {
+                backgroundTransitioning = false;
+              }
+            }, interval);
+          }
+        } catch (_) {}
+      }
+
+      async function initSession() {
+        try {
+          const { body } = await getJson('/api/v1/session/init');
+          const data = sessionData(body);
+          if (data && data.initialized === false) {
+            username.value = data.default_username || 'root';
+            setMessage('首次使用请用默认密码登录，然后创建管理账号。', 'info');
+          }
+        } catch (_) {}
+      }
+
+      form.addEventListener('submit', async event => {
+        event.preventDefault();
+        setMessage('', '');
+        if (!username.value.trim() || !password.value) {
+          setMessage('请输入用户名和密码。', 'error');
+          return;
+        }
+        if (formMode === 'setup') {
+          if (!confirmPassword.value) {
+            setMessage('请再次输入新密码。', 'error');
+            return;
+          }
+          if (password.value !== confirmPassword.value) {
+            setMessage('两次输入的密码不一致。', 'error');
+            return;
+          }
+          if (password.value.length < 8) {
+            setMessage('密码至少需要 8 个字符。', 'error');
+            return;
+          }
+        }
+        shell.classList.add('is-submitting');
+        button.disabled = true;
+        try {
+          const payload = formMode === 'setup'
+            ? { username: username.value.trim(), password: password.value, confirm_password: confirmPassword.value, setup_token: setupToken }
+            : { username: username.value.trim(), password: password.value };
+          const endpoint = formMode === 'setup' ? '/api/v1/session/init' : '/api/v1/session/login';
+          const { res, body } = await postApiJson(endpoint, payload);
+          const data = sessionData(body);
+          if (res.ok && data && data.access_token) saveSession(data);
+          if (res.ok && data && data.requires_initial_setup) {
+            setFormMode('setup', { username: '', setupToken: data.setup_token || '' });
+          } else if (res.ok && formMode === 'setup' && data && data.initialized) {
+            setMessage('管理账号已创建，下一步进入初始化配网。', 'success');
+            setupToken = '';
+          } else if (res.ok && data && data.access_token) {
+            setMessage('登录成功，正在进入控制台。', 'success');
+            setTimeout(() => { location.href = nextPath; }, 500);
+          } else {
+            setMessage(responseMessage(body, formMode === 'setup' ? '创建管理账号失败。' : '登录失败，请检查用户名和密码。'), 'error');
+          }
+        } catch (err) {
+          const detail = firstText(
+            err && err.targetUrl ? `${err.message} @ ${err.targetUrl}` : '',
+            err && err.message,
+            err && err.primaryError && err.primaryError.message
+          );
+          setMessage(detail ? `无法连接 webd 登录接口：${detail}` : '无法连接 webd 登录接口。', 'error');
+        } finally {
+          shell.classList.remove('is-submitting');
+          button.disabled = false;
+        }
+      });
+
+      applyLiquidGlass({});
+
+      bg.addEventListener('load', () => requestAnimationFrame(sampleLoginForeground));
+      window.addEventListener('resize', () => requestAnimationFrame(sampleLoginForeground), { passive: true });
+      initTheme();
+      initSession();
+      window.DWRTShellPrewarm?.schedule();
+      password.focus();
+    </script>
+  </body>
+</html>

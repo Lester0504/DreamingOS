@@ -1,0 +1,216 @@
+@import url('/static/css/policy-table.css?v=20260716-09');
+
+.console-stage.is-container-service {
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+  padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
+  overflow: hidden;
+}
+
+.console-stage.is-container-service .stage-header { display: none; }
+
+.console-stage.is-container-service .route-preview.container-service-route-host {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  overflow: hidden;
+}
+
+.container-service-route-host,
+.container-service-route-host * { box-sizing: border-box; }
+
+.container-service-shell {
+  width: min(100%, 1480px);
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  align-content: start;
+  gap: var(--app-page-gap, 14px);
+  margin: 0 auto;
+  overflow: hidden;
+  color: var(--app-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.container-service-overview { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.container-service-overview .dwrt-kit-overview-card { min-height: 124px; }
+.container-service-overview .dwrt-kit-overview-content strong { font-size: clamp(22px, 2vw, 30px); }
+.container-service-header {
+  min-width: 0;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.container-service-tabs {
+  width: max-content;
+  max-width: 100%;
+  min-height: 52px;
+  flex: 0 1 auto;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.container-service-tabs::-webkit-scrollbar { display: none; }
+.container-service-tabs .dwrt-kit-tab { min-width: 94px; height: 42px; flex: 0 0 auto; }
+
+.container-service-actions {
+  min-width: 0;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  margin-left: auto;
+}
+
+.container-service-search { flex: 0 0 40px; width: 40px; min-width: 40px; }
+.container-service-actions svg,
+.container-service-overview svg {
+  display: block;
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.container-service-workbench {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  align-content: start;
+  gap: var(--app-page-gap, 14px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.container-service-panel {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: var(--app-page-gap, 14px);
+  padding-bottom: 2px;
+}
+
+.container-service-notice {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  padding: 9px 12px;
+  border-radius: var(--app-radius-control, 10px);
+  color: #f5c166;
+  background: rgba(245, 166, 35, 0.10);
+  box-shadow: inset 0 0 0 1px rgba(245, 166, 35, 0.17);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.container-service-notice.is-error {
+  color: #ff8d99;
+  background: rgba(255, 93, 113, 0.10);
+  box-shadow: inset 0 0 0 1px rgba(255, 93, 113, 0.17);
+}
+
+.container-service-table { min-width: 0; overflow: hidden; border-radius: var(--app-radius-card); }
+.container-service-table .dwrt-kit-table-scroll { min-height: 0; overflow: auto; }
+.container-service-table .dwrt-kit-table { width: 100%; min-width: 760px; }
+.container-service-table th,
+.container-service-table td { height: 42px; padding: 0 14px; }
+.container-service-table th { color: var(--app-text-muted); background: rgba(255,255,255,.043); font-size: 11px; }
+.container-service-table td { max-width: 320px; overflow: hidden; color: var(--app-text); text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.container-service-table tbody tr:hover { background: var(--dwrt-interactive-hover-bg); }
+.container-service-table code,
+.container-service-info dd { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; letter-spacing: 0; }
+
+.container-service-name { min-width: 0; display: grid; gap: 3px; }
+.container-service-name strong,
+.container-service-name small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.container-service-name strong { color: var(--app-text); font-size: 12px; }
+.container-service-name small { color: var(--app-text-muted); font-size: 10px; }
+
+.container-service-config-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--app-page-gap, 14px);
+}
+
+.container-service-info {
+  min-width: 0;
+  overflow: hidden;
+  border-radius: var(--app-radius-card);
+}
+
+.container-service-info > header {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 16px;
+  border-bottom: 1px solid rgba(255,255,255,.08);
+}
+
+.container-service-info > header strong { color: var(--app-text); font-size: 13px; }
+.container-service-info > header span { color: var(--app-text-muted); font-size: 11px; }
+.container-service-info dl { max-height: 440px; margin: 0; overflow: auto; }
+.container-service-info dl > div {
+  min-height: 44px;
+  display: grid;
+  grid-template-columns: minmax(130px, .42fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  padding: 7px 16px;
+  border-bottom: 1px solid rgba(255,255,255,.065);
+}
+.container-service-info dl > div:last-child { border-bottom: 0; }
+.container-service-info dt { min-width: 0; overflow: hidden; color: var(--app-text-muted); text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 680; }
+.container-service-info dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: var(--app-text); font-size: 11px; }
+.container-service-empty { min-height: 112px; display: grid; place-items: center; padding: 20px; color: var(--app-text-muted); font-size: 11px; text-align: center; }
+
+html[data-theme-resolved="light"] .container-service-info > header,
+html[data-theme-resolved="light"] .container-service-info dl > div { border-color: rgba(35,54,79,.10); }
+
+@media (max-width: 1180px) {
+  .container-service-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 820px) {
+  .console-stage.is-container-service { height: 100%; padding: 10px; }
+  .container-service-shell { gap: 10px; }
+  .container-service-header { overflow-x: auto; scrollbar-width: none; }
+  .container-service-header::-webkit-scrollbar { display: none; }
+  .container-service-tabs { overflow: visible; }
+  .container-service-actions { position: sticky; right: 0; flex: 0 0 auto; }
+  .container-service-actions .policy-filter-button span { display: none; }
+  .container-service-actions .policy-filter-button { width: 40px; min-width: 40px; padding: 0; }
+  .container-service-config-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 620px) {
+  .container-service-overview { grid-template-columns: minmax(0, 1fr); }
+  .container-service-overview .dwrt-kit-overview-card { min-height: 108px; }
+  .container-service-tabs .dwrt-kit-tab { min-width: 82px; }
+  .container-service-info dl > div { grid-template-columns: minmax(100px, .38fr) minmax(0, 1fr); }
+}

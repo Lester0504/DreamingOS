@@ -1,0 +1,26 @@
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -71,6 +71,10 @@ static void nft_flow_offload_eval(const
+ 	if (!ct)
+ 		goto out;
+ 
++	if ((ct->jmx_data.match_status & NF_JMX_MATCH_STATUS_NO_OFFLOAD) ||
++	    ct->jmx_data.action || ct->jmx_data.route_mark)
++		goto out;
++
+ 	switch (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.protonum) {
+ 	case IPPROTO_TCP:
+ 		tcph = skb_header_pointer(pkt->skb, nft_thoff(pkt),
+--- a/net/netfilter/xt_FLOWOFFLOAD.c
++++ b/net/netfilter/xt_FLOWOFFLOAD.c
+@@ -532,6 +532,10 @@ flowoffload_tg(struct sk_buff *skb, cons
+ 	if (ct == NULL)
+ 		return XT_CONTINUE;
+ 
++	if ((ct->jmx_data.match_status & NF_JMX_MATCH_STATUS_NO_OFFLOAD) ||
++	    ct->jmx_data.action || ct->jmx_data.route_mark)
++		return XT_CONTINUE;
++
+ 	switch (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.protonum) {
+ 	case IPPROTO_TCP:
+ 		if (ct->proto.tcp.state != TCP_CONNTRACK_ESTABLISHED)

@@ -35,3 +35,11 @@ git-src
 .cproject
 .ccache
 .vscode*
+__pycache__/
+*.pyc
+*.pyo
+*.ko
+*.ipk
+*.apk
+Module.symvers
+modules.order

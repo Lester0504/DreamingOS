@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN" data-theme-resolved="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/appearance-settings.css">
+  <style>
+    html, body { width: 100%; min-height: 100%; margin: 0; }
+    body { min-height: 100vh; color: var(--app-text); background: rgb(11 16 24); font-family: system-ui, sans-serif; }
+    body[data-wallpaper="bright"] { background: rgb(244 247 251); }
+    .console-stage { width: 100%; height: 100vh; display: grid; }
+    #appWallpaper { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: .32; pointer-events: none; }
+  </style>
+</head>
+<body data-wallpaper="dark">
+  <img id="appWallpaper" src="../../files/www/dreamingwrt/static/background/dwrt-default-bg.jpg" alt="">
+  <main class="console-stage"><div class="stage-header"></div><div class="route-preview" id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/appearance-settings.js';
+
+    const BASE = {
+      dreamingwrt: {
+        accent_color: 'blue',
+        material_glass: {
+          version: 1, mode: 'shader', base_blur: 3.2, neutral_density: .06,
+          neutral_color: '10 16 25', saturation: 140, displacement_scale: 80,
+          aberration_intensity: 2, border_width: 1, border_color: '#25FFFFFF',
+          highlight: .28, highlight_angle: 135, preserve_center: true
+        },
+        wallpaper: {
+          enabled: true, directory: '/www/dreamingwrt/static/background', image: 'dwrt-default-bg.jpg',
+          opacity: .16, mode: 'argon', interval: 'medium', login_enabled: true,
+          login_image: 'dwrt-default-bg.jpg', login_opacity: 1, login_mode: 'argon', login_interval: 'medium'
+        },
+        dashboard: { animation_level: 'balanced' }
+      },
+      capabilities: {
+        appearance_accent_write: true, appearance_wallpaper_write: true,
+        appearance_glass_write: true, appearance_runtime_apply: true
+      }
+    };
+    const MEDIA = { appearance: { login: { media: [
+      { filename: 'dwrt-default-bg.jpg', label: '默认壁纸', url: '../../files/www/dreamingwrt/static/background/dwrt-default-bg.jpg' },
+      { filename: 'bright.jpg', label: '明亮壁纸', url: '../../files/www/dreamingwrt/static/background/dwrt-default-bg.jpg' }
+    ] } } };
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+    const merge = (base, patch) => {
+      if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return clone(patch);
+      const next = base && typeof base === 'object' && !Array.isArray(base) ? clone(base) : {};
+      Object.entries(patch).forEach(([key, value]) => {
+        next[key] = value && typeof value === 'object' && !Array.isArray(value) ? merge(next[key], value) : clone(value);
+      });
+      return next;
+    };
+
+    class FixtureRegistry {
+      constructor(scenario) {
+        this.scenario = scenario;
+        this.settings = clone(BASE);
+        this.listeners = new Map();
+        this.requestCounts = {};
+      }
+      snapshot(key) {
+        const status = key === 'appearance.settings' ? this.scenario.status : this.scenario.mediaStatus;
+        if (status && status !== 'stale') return { key, status, value: undefined, stale: false, error: status === 'error' ? new Error('fixture failure') : null };
+        const value = key === 'appearance.settings' ? this.settings : MEDIA;
+        return { key, status: status === 'stale' ? 'stale' : 'ready', value: clone(value), stale: status === 'stale', error: status === 'stale' ? new Error('refresh failed') : null, observed_at: Date.now() };
+      }
+      subscribe(key, listener) {
+        const bucket = this.listeners.get(key) || new Set();
+        bucket.add(listener); this.listeners.set(key, bucket); listener(this.snapshot(key));
+        return () => bucket.delete(listener);
+      }
+      request(key) {
+        this.requestCounts[key] = (this.requestCounts[key] || 0) + 1;
+        const snapshot = this.snapshot(key);
+        for (const listener of this.listeners.get(key) || []) listener(snapshot);
+        return Promise.resolve(snapshot);
+      }
+      invalidate() {}
+      patch(key, value) { if (key === 'appearance.settings') this.settings = clone(value); }
+      commit(payload) { this.settings = merge(this.settings, payload); }
+      activeSubscriptions() { return [...this.listeners.values()].reduce((total, bucket) => total + bucket.size, 0); }
+    }
+
+    const root = document.getElementById('routePreview');
+    const rootListeners = new Map();
+    const originalAdd = root.addEventListener.bind(root);
+    const originalRemove = root.removeEventListener.bind(root);
+    root.addEventListener = (type, listener, options) => {
+      const bucket = rootListeners.get(type) || new Set(); bucket.add(listener); rootListeners.set(type, bucket);
+      return originalAdd(type, listener, options);
+    };
+    root.removeEventListener = (type, listener, options) => {
+      rootListeners.get(type)?.delete(listener);
+      return originalRemove(type, listener, options);
+    };
+
+    let instance = null;
+    let registry = null;
+    let scenario = null;
+    const previews = [];
+    window.addEventListener('dwrt:appearance-preview', (event) => previews.push(clone(event.detail || {})));
+    window.APPEARANCE_FIXTURE = {
+      async mountScenario(name = 'ready', options = {}) {
+        instance?.unmount?.();
+        document.querySelector('.console-stage').className = 'console-stage';
+        scenario = {
+          status: ['loading', 'error', 'forbidden', 'unavailable', 'stale'].includes(name) ? name : '',
+          mediaStatus: options.mediaStatus || '', saveMode: options.saveMode || 'applied'
+        };
+        registry = new FixtureRegistry(scenario);
+        previews.length = 0;
+        instance = mount({
+          root, registry, signal: new AbortController().signal,
+          capabilities: options.capabilities || { appearance: true },
+          ui: {
+            mountAll: (node) => window.DWRT_UI_KIT.mountAll(node),
+            scheduleAdaptiveForegroundSample: () => {},
+            floatingSavebarMarkup: (...args) => window.DWRT_UI_KIT.floatingSavebarMarkup(...args)
+          },
+          api: {
+            request: async (_name, _url, init) => {
+              if (scenario.saveMode === 'error') throw new Error('fixture save failed');
+              if (scenario.saveMode === 'applied') registry.commit(init.body);
+              return {};
+            }
+          },
+          utils: { escapeHtml: (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]) }
+        });
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return this.contract();
+      },
+      contract() {
+        return {
+          requests: { ...registry.requestCounts }, subscriptions: registry.activeSubscriptions(),
+          listeners: [...rootListeners.values()].reduce((total, bucket) => total + bucket.size, 0),
+          previews: clone(previews)
+        };
+      },
+      requests() { return { ...registry.requestCounts }; },
+      previews() { return clone(previews); },
+      async previewTone(tone) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 64; canvas.height = 64;
+        const context = canvas.getContext('2d');
+        context.fillStyle = tone === 'bright' ? '#ffffff' : '#000000';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        const image = root.querySelector('[data-appearance-preview-image]');
+        image.src = canvas.toDataURL('image/png');
+        await image.decode();
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        const glass = root.querySelector('.appearance-preview-glass');
+        return {
+          region: glass.dataset.adaptiveRegion || '',
+          color: getComputedStyle(glass).color,
+          luma: glass.style.getPropertyValue('--adaptive-region-luma')
+        };
+      },
+      unmount() { instance?.unmount?.(); return this.contract(); }
+    };
+    await window.APPEARANCE_FIXTURE.mountScenario('ready');
+    window.APPEARANCE_FIXTURE_READY = true;
+  </script>
+</body>
+</html>

@@ -67,6 +67,7 @@ tools-y += pkgconf
 tools-y += quilt
 tools-y += squashfs4
 tools-y += sstrip
+tools-y += upx
 tools-y += util-linux
 tools-y += xz
 tools-y += zip

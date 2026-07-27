@@ -40,7 +40,12 @@ ifdef CONFIG_PACKAGE_MAC80211_TRACING
 	WIL6210_TRACING
 endif
 
-config-$(call config_package,qcom-qmi-helpers) += QCOM_QMI_HELPERS
+config-$(call config_package,qcom-qmi-helpers,$(ALL_VARIANTS)) += QCOM_QMI_HELPERS
+config-$(if $(filter m,$(CONFIG_PACKAGE_kmod-qcom-qmi-helpers)),m) += QCOM_QMI_HELPERS
+config-$(if $(filter m,$(CONFIG_PACKAGE_kmod-ath11k)),m) += ATH11K
+config-$(if $(filter m,$(CONFIG_PACKAGE_kmod-ath11k-ahb)),m) += ATH11K_AHB
+config-$(if $(filter m,$(CONFIG_PACKAGE_kmod-ath11k-pci)),m) += ATH11K_PCI
+config-$(if $(filter m,$(CONFIG_PACKAGE_kmod-ath12k)),m) += ATH12K
 config-$(call config_package,ath,regular smallbuffers) += ATH_CARDS ATH_COMMON
 config-$(CONFIG_PACKAGE_ATH_DEBUG) += ATH_DEBUG ATH10K_DEBUG ATH11K_DEBUG ATH12K_DEBUG ATH9K_STATION_STATISTICS
 config-$(CONFIG_PACKAGE_ATH_DFS) += ATH9K_DFS_CERTIFIED ATH10K_DFS_CERTIFIED
@@ -65,10 +70,10 @@ config-$(CONFIG_ATH12K_THERMAL) += ATH12K_THERMAL
 config-$(call config_package,ath9k-htc) += ATH9K_HTC
 config-$(call config_package,ath10k,regular) += ATH10K ATH10K_PCI
 config-$(call config_package,ath10k-smallbuffers,smallbuffers) += ATH10K ATH10K_PCI ATH10K_SMALLBUFFERS
-config-$(call config_package,ath11k) += ATH11K
-config-$(call config_package,ath11k-ahb) += ATH11K_AHB
-config-$(call config_package,ath11k-pci) += ATH11K_PCI
-config-$(call config_package,ath12k) += ATH12K
+config-$(call config_package,ath11k,$(ALL_VARIANTS)) += ATH11K
+config-$(call config_package,ath11k-ahb,$(ALL_VARIANTS)) += ATH11K_AHB
+config-$(call config_package,ath11k-pci,$(ALL_VARIANTS)) += ATH11K_PCI
+config-$(call config_package,ath12k,$(ALL_VARIANTS)) += ATH12K
 
 config-$(call config_package,ath5k) += ATH5K ATH5K_PCI
 

@@ -83,7 +83,7 @@ $(eval tolower = $(call __tr_template,$(chars_upper),$(chars_lower)))
 ##@
 # @brief Abbreviate version. Truncate to 8 characters.
 ##
-version_abbrev = $(if $(if $(CHECK),,$(DUMP)),$(1),$(shell printf '%.8s' $(1)))
+version_abbrev = $(if $(if $(CHECK),,$(DUMP)),$(1),$(shell printf '%d' 0x$$(printf '%.8s' $(1))))
 
 _SINGLE=export MAKEFLAGS=$(space);
 CFLAGS:=

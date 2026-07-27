@@ -477,6 +477,14 @@ define Package/ldconfig/config
 	endmenu
 endef
 
+define Package/glibc-common
+$(call Package/libc/Default)
+  DEPENDS:=@!USE_MUSL
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Common binaries and locale data for glibc
+endef
+
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 endef
@@ -622,12 +630,34 @@ ifeq ($(CONFIG_EXTERNAL_TOOLCHAIN),)
   define Package/ldd/install
 	$(INSTALL_DIR) $(1)/usr/bin/
 	$(CP) $(TOOLCHAIN_DIR)/bin/ldd $(1)/usr/bin/
-	sed -i 's,^#!.*,#!/bin/sh,' $(1)/usr/bin/ldd
   endef
 
   define Package/ldconfig/install
 	$(INSTALL_DIR) $(1)/sbin/
 	$(CP) $(TOOLCHAIN_DIR)/sbin/ldconfig $(1)/sbin/
+  endef
+
+  define Package/glibc-common/install
+	$(INSTALL_DIR) $(1)/lib/locale/
+	$(CP) ./glibc-locale/locale-archive $(1)/lib/locale/
+	$(INSTALL_DIR) $(1)/usr/bin/
+	$(CP) $(TOOLCHAIN_DIR)/bin/gencat $(1)/usr/bin/
+	$(CP) $(TOOLCHAIN_DIR)/bin/getconf $(1)/usr/bin/
+	$(CP) $(TOOLCHAIN_DIR)/bin/getent $(1)/usr/bin/
+	$(CP) $(TOOLCHAIN_DIR)/bin/iconv $(1)/usr/bin/
+	$(CP) $(TOOLCHAIN_DIR)/bin/locale $(1)/usr/bin/
+	$(CP) $(TOOLCHAIN_DIR)/bin/localedef $(1)/usr/bin/
+	$(CP) $(TOOLCHAIN_DIR)/bin/makedb $(1)/usr/bin/
+	$(CP) $(TOOLCHAIN_DIR)/bin/pldd $(1)/usr/bin/
+	$(CP) $(TOOLCHAIN_DIR)/bin/sotruss $(1)/usr/bin/
+	$(CP) $(TOOLCHAIN_DIR)/bin/sprof $(1)/usr/bin/
+	$(CP) $(TOOLCHAIN_DIR)/bin/tzselect $(1)/usr/bin/
+	$(CP) $(TOOLCHAIN_DIR)/bin/zdump $(1)/usr/bin/
+	$(INSTALL_DIR) $(1)/sbin/
+	$(CP) $(TOOLCHAIN_DIR)/sbin/zic $(1)/sbin/
+	$(INSTALL_DIR) $(1)/usr/share/
+	$(CP) $(TOOLCHAIN_DIR)/share/i18n $(1)/usr/share/
+	$(CP) $(TOOLCHAIN_DIR)/share/locale $(1)/usr/share/
   endef
 
 else
@@ -798,3 +828,4 @@ $(eval $(call BuildPackage,libgfortran))
 $(eval $(call BuildPackage,libgomp))
 $(eval $(call BuildPackage,ldd))
 $(eval $(call BuildPackage,ldconfig))
+$(eval $(call BuildPackage,glibc-common))

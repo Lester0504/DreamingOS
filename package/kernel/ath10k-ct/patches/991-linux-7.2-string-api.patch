@@ -1,0 +1,77 @@
+--- a/ath10k-6.15/debug.c
++++ b/ath10k-6.15/debug.c
+@@ -1737,8 +1737,7 @@ static ssize_t ath10k_write_txo_stats_ov
+ 	if ((tok = strstr(bufptr, " " #a "="))) {			\
+ 		char* tspace;						\
+ 		tok += 1; /* move past initial space */			\
+-		strncpy(tmp, tok + strlen(#a "="), sizeof(tmp) - 1);	\
+-		tmp[sizeof(tmp) - 1] = 0;				\
++		strscpy(tmp, tok + strlen(#a "="), sizeof(tmp));	\
+ 		tspace = strstr(tmp, " ");				\
+ 		if (tspace) { *tspace = 0; }				\
+ 		if (kstrtol(tmp, 0, &rc) != 0) {			\
+--- a/ath10k-6.15/core.c
++++ b/ath10k-6.15/core.c
+@@ -1346,8 +1346,7 @@ static int ath10k_fetch_cal_file(struct
+ 
+ 	if (ar->fwcfg.calname[0]) {
+ 		/* Use user-specified file name. */
+-		strncpy(filename, ar->fwcfg.calname, sizeof(filename));
+-		filename[sizeof(filename) - 1] = 0;
++		strscpy(filename, ar->fwcfg.calname, sizeof(filename));
+ 	} else {
+ 		/* cal-<bus>-<id>.bin */
+ 		scnprintf(filename, sizeof(filename), "cal-%s-%s.bin",
+@@ -1477,22 +1476,18 @@ static int ath10k_fetch_fwcfg_file(struc
+ 		/* Assign key and values as appropriate */
+ 		if (strcasecmp(filename, "calname") == 0) {
+ 			sz = sizeof(ar->fwcfg.calname);
+-			strncpy(ar->fwcfg.calname, val, sz);
+-			ar->fwcfg.calname[sz - 1] = 0; /* ensure null term */
++			strscpy(ar->fwcfg.calname, val, sz);
+ 		}
+ 		else if (strcasecmp(filename, "bname") == 0) {
+ 			sz = sizeof(ar->fwcfg.bname);
+-			strncpy(ar->fwcfg.bname, val, sz);
+-			ar->fwcfg.bname[sz - 1] = 0; /* ensure null term */
++			strscpy(ar->fwcfg.bname, val, sz);
+ 		}
+ 		else if (strcasecmp(filename, "bname_ext") == 0) {
+ 			sz = sizeof(ar->fwcfg.bname_ext);
+-			strncpy(ar->fwcfg.bname_ext, val, sz);
+-			ar->fwcfg.bname_ext[sz - 1] = 0; /* ensure null term */
++			strscpy(ar->fwcfg.bname_ext, val, sz);
+ 		}
+ 		else if (strcasecmp(filename, "fwname") == 0) {
+ 			sz = sizeof(ar->fwcfg.fwname);
+-			strncpy(ar->fwcfg.fwname, val, sz);
+-			ar->fwcfg.fwname[sz - 1] = 0; /* ensure null term */
++			strscpy(ar->fwcfg.fwname, val, sz);
+ 		}
+ 		else if (strcasecmp(filename, "fwver") == 0) {
+ 			if (kstrtol(val, 0, &t) == 0) {
+@@ -1632,8 +1627,7 @@ static int ath10k_core_fetch_board_data_
+ 		scnprintf(boardname, sizeof(boardname), "board-%s-%s.bin",
+ 			  ath10k_bus_str(ar->hif.bus), dev_name(ar->dev));
+ 		if (ar->fwcfg.bname[0]) {
+-			strncpy(boardname, ar->fwcfg.bname, sizeof(boardname) - 1);
+-			boardname[sizeof(boardname) - 1] = 0;
++			strscpy(boardname, ar->fwcfg.bname, sizeof(boardname));
+ 		}
+ 
+ 		ar->normal_mode_fw.board = ath10k_fetch_fw_file(ar,
+--- a/ath10k-6.15/wmi.c
++++ b/ath10k-6.15/wmi.c
+@@ -4577,10 +4577,8 @@ radar_detected:
+ /* so we can compile out-of-tree easier */
+ #if defined(ATH_HAVE_PULSE_EVENT_MSG) && defined(CONFIG_ATH10K_DEBUGFS)
+ 	if (pe.msg[0]) {
+-		strncpy(ar->debug.dfs_last_msg, pe.msg,
+-			sizeof(ar->debug.dfs_last_msg));
+-		/* ensure null term */
+-		ar->debug.dfs_last_msg[sizeof(ar->debug.dfs_last_msg) - 1] = 0;
++		strscpy(ar->debug.dfs_last_msg, pe.msg,
++			sizeof(ar->debug.dfs_last_msg));
+ 	}
+ #endif
+ 

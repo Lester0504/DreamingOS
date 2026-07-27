@@ -1,0 +1,92 @@
+From d39a6429c0ec67f51478737f7a13f6295ca8b3c0 Mon Sep 17 00:00:00 2001
+From: Yousuk Seung <ysseung@google.com>
+Date: Wed, 23 May 2018 17:55:54 -0700
+Subject: [PATCH 09/19] net-tcp: add new ca opts flag TCP_CONG_WANTS_CE_EVENTS
+
+Add a a new ca opts flag TCP_CONG_WANTS_CE_EVENTS that allows a
+congestion control module to receive CE events.
+
+Currently congestion control modules have to set the TCP_CONG_NEEDS_ECN
+bit in opts flag to receive CE events but this may incur changes in ECN
+behavior elsewhere. This patch adds a new bit TCP_CONG_WANTS_CE_EVENTS
+that allows congestion control modules to receive CE events
+independently of TCP_CONG_NEEDS_ECN.
+
+Effort: net-tcp
+Origin-9xx-SHA1: 9f7e14716cde760bc6c67ef8ef7e1ee48501d95b
+Change-Id: I2255506985242f376d910c6fd37daabaf4744f24
+Signed-off-by: Alexandre Frade <kernel@xanmod.org>
+---
+ include/net/tcp.h    | 14 +++++++++++++-
+ net/ipv4/tcp_input.c |  4 ++--
+ 2 files changed, 15 insertions(+), 3 deletions(-)
+
+Index: linux-7.0-rc1/include/net/tcp.h
+===================================================================
+--- linux-7.0-rc1.orig/include/net/tcp.h
++++ linux-7.0-rc1/include/net/tcp.h
+@@ -1239,9 +1239,17 @@ enum tcp_ca_ack_event_flags {
+ #define TCP_CONG_ECT_1_NEGOTIATION	BIT(3)
+ /* Cannot fallback to RFC3168 during AccECN negotiation */
+ #define TCP_CONG_NO_FALLBACK_RFC3168	BIT(4)
+-#define TCP_CONG_MASK  (TCP_CONG_NON_RESTRICTED | TCP_CONG_NEEDS_ECN | \
+-			TCP_CONG_NEEDS_ACCECN | TCP_CONG_ECT_1_NEGOTIATION | \
+-			TCP_CONG_NO_FALLBACK_RFC3168)
++/* ... 上面是官方其他的 BIT(x) 定义 ... */
++
++/* Wants notification of CE events (CA_EVENT_ECN_IS_CE, CA_EVENT_ECN_NO_CE). */
++#define TCP_CONG_WANTS_CE_EVENTS       BIT(5)  /* <--- 注意这里的数字，不要和上面的冲突 */
++
++#define TCP_CONG_MASK  (TCP_CONG_NON_RESTRICTED | \
++                        TCP_CONG_NEEDS_ECN | \
++                        TCP_CONG_NEEDS_ACCECN | \
++                        TCP_CONG_ECT_1_NEGOTIATION | \
++                        TCP_CONG_NO_FALLBACK_RFC3168 | \
++                        TCP_CONG_WANTS_CE_EVENTS)
+ 
+ union tcp_cc_info;
+ 
+@@ -1426,21 +1434,6 @@ static inline bool tcp_skb_sent_after(u6
+ 	return t1 > t2 || (t1 == t2 && after(seq1, seq2));
+ }
+ 
+-/* If a retransmit failed due to local qdisc congestion or other local issues,
+- * then we may have called tcp_set_skb_tso_segs() to increase the number of
+- * segments in the skb without increasing the tx.in_flight. In all other cases,
+- * the tx.in_flight should be at least as big as the pcount of the sk_buff.  We
+- * do not have the state to know whether a retransmit failed due to local qdisc
+- * congestion or other local issues, so to avoid spurious warnings we consider
+- * that any skb marked lost may have suffered that fate.
+- */
+-static inline bool tcp_skb_tx_in_flight_is_suspicious(u32 skb_pcount,
+-						      u32 skb_sacked_flags,
+-						      u32 tx_in_flight)
+-{
+-	return (skb_pcount > tx_in_flight) && !(skb_sacked_flags & TCPCB_LOST);
+-}
+-
+ /* These functions determine how the current flow behaves in respect of SACK
+  * handling. SACK is negotiated with the peer, and therefore it can vary
+  * between different flows.
+Index: linux-7.0-rc1/net/ipv4/tcp_input.c
+===================================================================
+--- linux-7.0-rc1.orig/net/ipv4/tcp_input.c
++++ linux-7.0-rc1/net/ipv4/tcp_input.c
+@@ -358,7 +358,7 @@ static void tcp_data_ecn_check(struct so
+ 			tcp_enter_quickack_mode(sk, 2);
+ 		break;
+ 	case INET_ECN_CE:
+-		if (tcp_ca_needs_ecn(sk))
++		if (tcp_ca_wants_ce_events(sk))
+ 			tcp_ca_event(sk, CA_EVENT_ECN_IS_CE);
+ 
+ 		if (!(tp->ecn_flags & TCP_ECN_DEMAND_CWR) &&
+@@ -376,7 +376,7 @@ static void tcp_data_ecn_check(struct so
+ 		tp->ecn_flags |= TCP_ECN_SEEN;
+ 		break;
+ 	default:
+-		if (tcp_ca_needs_ecn(sk))
++		if (tcp_ca_wants_ce_events(sk))
+ 			tcp_ca_event(sk, CA_EVENT_ECN_NO_CE);
+ 		if (!tcp_ecn_mode_rfc3168(tp))
+ 			break;

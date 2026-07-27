@@ -17,12 +17,14 @@ cat << EOF
 EOF
 fi
 
-export PATH="%PATH%"
+export PATH="%PATH%:/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin"
 HOME=$(grep -E "^${USER:-root}:" /etc/passwd | cut -d ":" -f 6)
 HOME=${HOME:-/root}
 export HOME
-export PS1='\u@\h:\w\$ '
+export PS1='\[\e[32;1m\][\u@\h\[\e[0m\] \[\033[01;34m\]\W\[\033[00m\]\[\e[32;1m\]]\[\e[0m\]\$ '
+export TERM=xterm-color
 export ENV=/etc/shinit
+export HISTCONTROL=ignoredups
 
 case "$TERM" in
 	xterm*|rxvt*)

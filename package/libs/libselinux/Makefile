@@ -109,15 +109,27 @@ $(foreach a,$(LIBSELINUX_UTILS),$(eval $(call GenUtilPkg,libselinux-$(a),$(a))))
 # $(STAGING_DIR_HOSTPKG).
 HOST_LDFLAGS += -Wl,-rpath="$(STAGING_DIR_HOSTPKG)/lib"
 
+TARGET_CFLAGS += -std=gnu17
+
+TARGET_CFLAGS += -std=gnu17
+
 HOST_MAKE_FLAGS += \
 	PREFIX=$(STAGING_DIR_HOSTPKG) \
 	SHLIBDIR=$(STAGING_DIR_HOSTPKG)/lib \
 	FTS_LDLIBS=-lfts
 
 ifeq ($(CONFIG_USE_MUSL),y)
+TARGET_CFLAGS += -std=gnu17
+
+TARGET_CFLAGS += -std=gnu17
+
 MAKE_FLAGS += FTS_LDLIBS=-lfts
 TARGET_CFLAGS += -D_LARGEFILE64_SOURCE
 endif
+
+TARGET_CFLAGS += -std=gnu17
+
+TARGET_CFLAGS += -std=gnu17
 
 MAKE_FLAGS += \
 	SHLIBDIR=/usr/lib \

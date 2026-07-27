@@ -1,0 +1,250 @@
+code,name_en,name_zh,continent,sort_order
+AD,Andorra,安道尔,Europe,1
+AE,United Arab Emirates,阿拉伯联合酋长国,Asia,2
+AF,Afghanistan,阿富汗,Asia,3
+AG,Antigua & Barbuda,安提瓜和巴布达,North America,4
+AI,Anguilla,安圭拉,North America,5
+AL,Albania,阿尔巴尼亚,Europe,6
+AM,Armenia,亚美尼亚,Asia,7
+AO,Angola,安哥拉,Africa,8
+AQ,Antarctica,南极洲,Antarctica,9
+AR,Argentina,阿根廷,South America,10
+AS,Samoa (American),美属萨摩亚,Oceania,11
+AT,Austria,奥地利,Europe,12
+AU,Australia,澳大利亚,Oceania,13
+AW,Aruba,阿鲁巴,North America,14
+AX,Åland Islands,奥兰群岛,Europe,15
+AZ,Azerbaijan,阿塞拜疆,Asia,16
+BA,Bosnia & Herzegovina,波斯尼亚和黑塞哥维那,Europe,17
+BB,Barbados,巴巴多斯,North America,18
+BD,Bangladesh,孟加拉国,Asia,19
+BE,Belgium,比利时,Europe,20
+BF,Burkina Faso,布基纳法索,Africa,21
+BG,Bulgaria,保加利亚,Europe,22
+BH,Bahrain,巴林,Asia,23
+BI,Burundi,布隆迪,Africa,24
+BJ,Benin,贝宁,Africa,25
+BL,St Barthelemy,圣巴泰勒米,North America,26
+BM,Bermuda,百慕大,North America,27
+BN,Brunei,文莱,Asia,28
+BO,Bolivia,玻利维亚,South America,29
+BQ,Caribbean NL,荷属加勒比区,North America,30
+BR,Brazil,巴西,South America,31
+BS,Bahamas,巴哈马,North America,32
+BT,Bhutan,不丹,Asia,33
+BV,Bouvet Island,布韦岛,South America,34
+BW,Botswana,博茨瓦纳,Africa,35
+BY,Belarus,白俄罗斯,Europe,36
+BZ,Belize,伯利兹,North America,37
+CA,Canada,加拿大,North America,38
+CC,Cocos (Keeling) Islands,科科斯（基林）群岛,Oceania,39
+CD,Congo (Dem. Rep.),刚果（金）,Africa,40
+CF,Central African Rep.,中非共和国,Africa,41
+CG,Congo (Rep.),刚果（布）,Africa,42
+CH,Switzerland,瑞士,Europe,43
+CI,Côte d'Ivoire,科特迪瓦,Africa,44
+CK,Cook Islands,库克群岛,Oceania,45
+CL,Chile,智利,South America,46
+CM,Cameroon,喀麦隆,Africa,47
+CN,China,中国大陆,Asia,48
+CO,Colombia,哥伦比亚,South America,49
+CR,Costa Rica,哥斯达黎加,North America,50
+CU,Cuba,古巴,North America,51
+CV,Cape Verde,佛得角,Africa,52
+CW,Curaçao,库拉索,North America,53
+CX,Christmas Island,圣诞岛,Oceania,54
+CY,Cyprus,塞浦路斯,Asia,55
+CZ,Czech Republic,捷克,Europe,56
+DE,Germany,德国,Europe,57
+DJ,Djibouti,吉布提,Africa,58
+DK,Denmark,丹麦,Europe,59
+DM,Dominica,多米尼克,North America,60
+DO,Dominican Republic,多米尼加共和国,North America,61
+DZ,Algeria,阿尔及利亚,Africa,62
+EC,Ecuador,厄瓜多尔,South America,63
+EE,Estonia,爱沙尼亚,Europe,64
+EG,Egypt,埃及,Africa,65
+EH,Western Sahara,西撒哈拉,Africa,66
+ER,Eritrea,厄立特里亚,Africa,67
+ES,Spain,西班牙,Europe,68
+ET,Ethiopia,埃塞俄比亚,Africa,69
+FI,Finland,芬兰,Europe,70
+FJ,Fiji,斐济,Oceania,71
+FK,Falkland Islands,福克兰群岛,South America,72
+FM,Micronesia,密克罗尼西亚,Oceania,73
+FO,Faroe Islands,法罗群岛,Europe,74
+FR,France,法国,Europe,75
+GA,Gabon,加蓬,Africa,76
+GB,Britain (UK),英国,Europe,77
+GD,Grenada,格林纳达,North America,78
+GE,Georgia,格鲁吉亚,Asia,79
+GF,French Guiana,法属圭亚那,South America,80
+GG,Guernsey,根西岛,Europe,81
+GH,Ghana,加纳,Africa,82
+GI,Gibraltar,直布罗陀,Europe,83
+GL,Greenland,格陵兰,North America,84
+GM,Gambia,冈比亚,Africa,85
+GN,Guinea,几内亚,Africa,86
+GP,Guadeloupe,瓜德罗普,North America,87
+GQ,Equatorial Guinea,赤道几内亚,Africa,88
+GR,Greece,希腊,Europe,89
+GS,South Georgia & the South Sandwich Islands,南乔治亚和南桑威奇群岛,South America,90
+GT,Guatemala,危地马拉,North America,91
+GU,Guam,关岛,Oceania,92
+GW,Guinea-Bissau,几内亚比绍,Africa,93
+GY,Guyana,圭亚那,South America,94
+HK,Hong Kong,香港,Asia,95
+HM,Heard Island & McDonald Islands,赫德岛和麦克唐纳群岛,Oceania,96
+HN,Honduras,洪都拉斯,North America,97
+HR,Croatia,克罗地亚,Europe,98
+HT,Haiti,海地,North America,99
+HU,Hungary,匈牙利,Europe,100
+ID,Indonesia,印度尼西亚,Asia,101
+IE,Ireland,爱尔兰,Europe,102
+IL,Israel,以色列,Asia,103
+IM,Isle of Man,马恩岛,Europe,104
+IN,India,印度,Asia,105
+IO,British Indian Ocean Territory,查戈斯群岛,Africa,106
+IQ,Iraq,伊拉克,Asia,107
+IR,Iran,伊朗,Asia,108
+IS,Iceland,冰岛,Europe,109
+IT,Italy,意大利,Europe,110
+JE,Jersey,泽西岛,Europe,111
+JM,Jamaica,牙买加,North America,112
+JO,Jordan,约旦,Asia,113
+JP,Japan,日本,Asia,114
+KE,Kenya,肯尼亚,Africa,115
+KG,Kyrgyzstan,吉尔吉斯斯坦,Asia,116
+KH,Cambodia,柬埔寨,Asia,117
+KI,Kiribati,基里巴斯,Oceania,118
+KM,Comoros,科摩罗,Africa,119
+KN,St Kitts & Nevis,圣基茨和尼维斯,North America,120
+KP,Korea (North),朝鲜,Asia,121
+KR,Korea (South),韩国,Asia,122
+KW,Kuwait,科威特,Asia,123
+KY,Cayman Islands,开曼群岛,North America,124
+KZ,Kazakhstan,哈萨克斯坦,Asia,125
+LA,Laos,老挝,Asia,126
+LB,Lebanon,黎巴嫩,Asia,127
+LC,St Lucia,圣卢西亚,North America,128
+LI,Liechtenstein,列支敦士登,Europe,129
+LK,Sri Lanka,斯里兰卡,Asia,130
+LR,Liberia,利比里亚,Africa,131
+LS,Lesotho,莱索托,Africa,132
+LT,Lithuania,立陶宛,Europe,133
+LU,Luxembourg,卢森堡,Europe,134
+LV,Latvia,拉脱维亚,Europe,135
+LY,Libya,利比亚,Africa,136
+MA,Morocco,摩洛哥,Africa,137
+MC,Monaco,摩纳哥,Europe,138
+MD,Moldova,摩尔多瓦,Europe,139
+ME,Montenegro,黑山,Europe,140
+MF,St Martin (French),法属圣马丁,North America,141
+MG,Madagascar,马达加斯加,Africa,142
+MH,Marshall Islands,马绍尔群岛,Oceania,143
+MK,North Macedonia,北马其顿,Europe,144
+ML,Mali,马里,Africa,145
+MM,Myanmar (Burma),缅甸,Asia,146
+MN,Mongolia,蒙古,Asia,147
+MO,Macau,澳门,Asia,148
+MP,Northern Mariana Islands,北马里亚纳群岛,Oceania,149
+MQ,Martinique,马提尼克,North America,150
+MR,Mauritania,毛里塔尼亚,Africa,151
+MS,Montserrat,蒙特塞拉特,North America,152
+MT,Malta,马耳他,Europe,153
+MU,Mauritius,毛里求斯,Africa,154
+MV,Maldives,马尔代夫,Asia,155
+MW,Malawi,马拉维,Africa,156
+MX,Mexico,墨西哥,North America,157
+MY,Malaysia,马来西亚,Asia,158
+MZ,Mozambique,莫桑比克,Africa,159
+NA,Namibia,纳米比亚,Africa,160
+NC,New Caledonia,新喀里多尼亚,Oceania,161
+NE,Niger,尼日尔,Africa,162
+NF,Norfolk Island,诺福克岛,Oceania,163
+NG,Nigeria,尼日利亚,Africa,164
+NI,Nicaragua,尼加拉瓜,North America,165
+NL,Netherlands,荷兰,Europe,166
+NO,Norway,挪威,Europe,167
+NP,Nepal,尼泊尔,Asia,168
+NR,Nauru,瑙鲁,Oceania,169
+NU,Niue,纽埃,Oceania,170
+NZ,New Zealand,新西兰,Oceania,171
+OM,Oman,阿曼,Asia,172
+PA,Panama,巴拿马,North America,173
+PE,Peru,秘鲁,South America,174
+PF,French Polynesia,法属波利尼西亚,Oceania,175
+PG,Papua New Guinea,巴布亚新几内亚,Oceania,176
+PH,Philippines,菲律宾,Asia,177
+PK,Pakistan,巴基斯坦,Asia,178
+PL,Poland,波兰,Europe,179
+PM,St Pierre & Miquelon,圣皮埃尔和密克隆群岛,North America,180
+PN,Pitcairn,皮特凯恩群岛,Oceania,181
+PR,Puerto Rico,波多黎各,North America,182
+PS,Palestine,巴勒斯坦领土,Asia,183
+PT,Portugal,葡萄牙,Europe,184
+PW,Palau,帕劳,Oceania,185
+PY,Paraguay,巴拉圭,South America,186
+QA,Qatar,卡塔尔,Asia,187
+RE,Réunion,留尼汪,Africa,188
+RO,Romania,罗马尼亚,Europe,189
+RS,Serbia,塞尔维亚,Europe,190
+RU,Russia,俄罗斯,Europe,191
+RW,Rwanda,卢旺达,Africa,192
+SA,Saudi Arabia,沙特阿拉伯,Asia,193
+SB,Solomon Islands,所罗门群岛,Oceania,194
+SC,Seychelles,塞舌尔,Africa,195
+SD,Sudan,苏丹,Africa,196
+SE,Sweden,瑞典,Europe,197
+SG,Singapore,新加坡,Asia,198
+SH,St Helena,圣赫勒拿,Africa,199
+SI,Slovenia,斯洛文尼亚,Europe,200
+SJ,Svalbard & Jan Mayen,斯瓦尔巴和扬马延,Europe,201
+SK,Slovakia,斯洛伐克,Europe,202
+SL,Sierra Leone,塞拉利昂,Africa,203
+SM,San Marino,圣马力诺,Europe,204
+SN,Senegal,塞内加尔,Africa,205
+SO,Somalia,索马里,Africa,206
+SR,Suriname,苏里南,South America,207
+SS,South Sudan,南苏丹,Africa,208
+ST,Sao Tome & Principe,圣多美和普林西比,Africa,209
+SV,El Salvador,萨尔瓦多,North America,210
+SX,St Maarten (Dutch),荷属圣马丁,North America,211
+SY,Syria,叙利亚,Asia,212
+SZ,Eswatini (Swaziland),斯威士兰,Africa,213
+TC,Turks & Caicos Is,特克斯和凯科斯群岛,North America,214
+TD,Chad,乍得,Africa,215
+TF,French S. Terr.,法属南部领地,Africa,216
+TG,Togo,多哥,Africa,217
+TH,Thailand,泰国,Asia,218
+TJ,Tajikistan,塔吉克斯坦,Asia,219
+TK,Tokelau,托克劳,Oceania,220
+TL,East Timor,东帝汶,Asia,221
+TM,Turkmenistan,土库曼斯坦,Asia,222
+TN,Tunisia,突尼斯,Africa,223
+TO,Tonga,汤加,Oceania,224
+TR,Turkey,土耳其,Asia,225
+TT,Trinidad & Tobago,特立尼达和多巴哥,North America,226
+TV,Tuvalu,图瓦卢,Oceania,227
+TW,Taiwan,台湾,Asia,228
+TZ,Tanzania,坦桑尼亚,Africa,229
+UA,Ukraine,乌克兰,Europe,230
+UG,Uganda,乌干达,Africa,231
+UM,US minor outlying islands,美国本土外小岛屿,Oceania,232
+US,United States,美国,North America,233
+UY,Uruguay,乌拉圭,South America,234
+UZ,Uzbekistan,乌兹别克斯坦,Asia,235
+VA,Vatican City,梵蒂冈,Europe,236
+VC,St Vincent,圣文森特和格林纳丁斯,North America,237
+VE,Venezuela,委内瑞拉,South America,238
+VG,Virgin Islands (UK),英属维尔京群岛,North America,239
+VI,Virgin Islands (US),美属维尔京群岛,North America,240
+VN,Vietnam,越南,Asia,241
+VU,Vanuatu,瓦努阿图,Oceania,242
+WF,Wallis & Futuna,瓦利斯和富图纳,Oceania,243
+WS,Samoa (western),萨摩亚,Oceania,244
+YE,Yemen,也门,Asia,245
+YT,Mayotte,马约特,Africa,246
+ZA,South Africa,南非,Africa,247
+ZM,Zambia,赞比亚,Africa,248
+ZW,Zimbabwe,津巴布韦,Africa,249

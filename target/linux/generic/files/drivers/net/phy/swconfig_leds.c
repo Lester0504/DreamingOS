@@ -13,6 +13,7 @@
 #ifdef CONFIG_SWCONFIG_LEDS
 
 #include <linux/leds.h>
+#include <linux/string.h>
 #include <linux/ctype.h>
 #include <linux/device.h>
 #include <linux/workqueue.h>

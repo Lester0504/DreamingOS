@@ -1,0 +1,67 @@
+Index: linux-7.0-rc1/include/net/tcp.h
+===================================================================
+--- linux-7.0-rc1.orig/include/net/tcp.h
++++ linux-7.0-rc1/include/net/tcp.h
+@@ -1106,6 +1106,8 @@ struct tcp_skb_cb {
+ 			u32 first_tx_mstamp;
+ 			/* when we reached the "delivered" count */
+ 			u32 delivered_mstamp;
++            u32 lost;
++
+ #define TCPCB_IN_FLIGHT_BITS 20
+ #define TCPCB_IN_FLIGHT_MAX ((1U << TCPCB_IN_FLIGHT_BITS) - 1)
+ 			u32 in_flight:20,   /* packets in flight at transmit */
+@@ -1282,6 +1284,9 @@ struct ack_sample {
+ struct rate_sample {
+ 	u64  prior_mstamp; /* starting timestamp for interval */
+ 	u32  prior_delivered;	/* tp->delivered at "prior_mstamp" */
++    u32  prior_lost;
++    u32  lost;
++    bool is_ece;
+ 	u32  prior_delivered_ce;/* tp->delivered_ce at "prior_mstamp" */
+ 	u32 tx_in_flight;	/* packets in flight at starting timestamp */
+ 	s32  delivered;		/* number of packets delivered over interval */
+@@ -3031,4 +3036,17 @@ enum skb_drop_reason tcp_inbound_hash(st
+ 		const void *saddr, const void *daddr,
+ 		int family, int dif, int sdif);
+ 
++static inline bool tcp_ca_wants_ce_events(const struct sock *sk)
++{
++        return inet_csk(sk)->icsk_ca_ops->flags & TCP_CONG_WANTS_CE_EVENTS;
++}
++
++static inline bool tcp_skb_tx_in_flight_is_suspicious(int old_factor, int sacked, int in_flight)
++{
++        /* 忽略前两个参数，防止编译器报警告 */
++        (void)old_factor;
++        (void)sacked;
++        return in_flight < 0 || in_flight > 1048576;
++}
++
+ #endif	/* _TCP_H */
+Index: linux-7.0-rc1/net/netfilter/xt_FLOWOFFLOAD.c
+===================================================================
+--- linux-7.0-rc1.orig/net/netfilter/xt_FLOWOFFLOAD.c
++++ linux-7.0-rc1/net/netfilter/xt_FLOWOFFLOAD.c
+@@ -15,6 +15,7 @@
+ #include <net/netfilter/nf_conntrack_extend.h>
+ #include <net/netfilter/nf_conntrack_helper.h>
+ #include <net/netfilter/nf_flow_table.h>
++#include <linux/netfilter/x_tables.h>
+ 
+ struct xt_flowoffload_hook {
+ 	struct hlist_node list;
+Index: linux-7.0-rc1/net/netfilter/xt_connmark.c
+===================================================================
+--- linux-7.0-rc1.orig/net/netfilter/xt_connmark.c
++++ linux-7.0-rc1/net/netfilter/xt_connmark.c
+@@ -14,6 +14,9 @@
+ #include <net/netfilter/nf_conntrack_ecache.h>
+ #include <linux/netfilter/x_tables.h>
+ #include <linux/netfilter/xt_connmark.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <net/dsfield.h>
+ 
+ MODULE_AUTHOR("Henrik Nordstrom <hno@marasystems.com>");
+ MODULE_DESCRIPTION("Xtables: connection mark operations");

@@ -1,8 +1,3 @@
-# SPDX-License-Identifier: GPL-2.0-only
-#
-# Copyright (C) 2012-2015 OpenWrt.org
-# Copyright (C) 2016 LEDE Project
-
 # Substituted by SDK, do not remove
 # REVISION:=x
 # SOURCE_DATE_EPOCH:=x

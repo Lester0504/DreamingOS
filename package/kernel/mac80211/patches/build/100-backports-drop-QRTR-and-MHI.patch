@@ -44,7 +44,15 @@ Signed-off-by: Robert Marko <robimarko@gmail.com>
  
 --- a/drivers/net/wireless/ath/ath11k/Kconfig
 +++ b/drivers/net/wireless/ath/ath11k/Kconfig
-@@ -25,9 +25,9 @@ config ATH11K_PCI
+@@ -4,7 +4,6 @@ config ATH11K
+ 	tristate "Qualcomm Technologies 802.11ax chipset support"
+ 	depends on m
+ 	depends on MAC80211 && HAS_DMA
+-	depends on CRYPTO_MICHAEL_MIC
+ 	select ATH_COMMON
+ 	select QCOM_QMI_HELPERS
+ 	help
+@@ -25,9 +24,9 @@ config ATH11K_PCI
  	tristate "Atheros ath11k PCI support"
  	depends on m
  	depends on ATH11K && PCI
@@ -57,6 +65,16 @@ Signed-off-by: Robert Marko <robimarko@gmail.com>
  	select PCI_PWRCTRL_PWRSEQ if HAVE_PWRCTRL
  	help
  	  This module adds support for PCIE bus
+--- a/drivers/net/wireless/ath/ath12k/Kconfig
++++ b/drivers/net/wireless/ath/ath12k/Kconfig
+@@ -3,7 +3,6 @@ config ATH12K
+ 	tristate "Qualcomm Technologies Wi-Fi 7 support (ath12k)"
+ 	depends on m
+ 	depends on MAC80211 && HAS_DMA && PCI
+-	depends on CRYPTO_MICHAEL_MIC
+ 	select QCOM_QMI_HELPERS
+ 	select MHI_BUS
+ 	select QRTR
 --- a/local-symbols
 +++ b/local-symbols
 @@ -53,14 +53,6 @@ MAC80211_MESH_PS_DEBUG=

@@ -1,0 +1,8 @@
+{
+	"user": "nobody",
+	"access": {
+		"dreamingwrt.aegis": {
+			"methods": [ "honeypot_event_ingest" ]
+		}
+	}
+}

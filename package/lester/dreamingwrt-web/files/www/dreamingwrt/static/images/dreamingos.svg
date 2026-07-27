@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 140" role="img" aria-labelledby="title desc">
+  <title id="title">Dreaming OS</title>
+  <desc id="desc">Dreaming OS wordmark</desc>
+  <defs>
+    <linearGradient id="wordmark" x1="40" y1="28" x2="578" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffb9cf"/>
+      <stop offset="0.48" stop-color="#d9d3ff"/>
+      <stop offset="1" stop-color="#9bd7ff"/>
+    </linearGradient>
+    <filter id="glass" x="-12%" y="-24%" width="124%" height="160%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="8" stdDeviation="7" flood-color="#050816" flood-opacity=".22"/>
+    </filter>
+  </defs>
+  <text x="310" y="96" text-anchor="middle" fill="url(#wordmark)" stroke="#fff" stroke-opacity=".68" stroke-width="1.4" paint-order="stroke fill" filter="url(#glass)" font-family="Arial Rounded MT Bold, SF Pro Rounded, ui-rounded, system-ui, sans-serif" font-size="82" font-weight="700">Dreaming OS</text>
+</svg>

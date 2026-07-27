@@ -1,12 +1,18 @@
-OpenWrt is provided under:
+DreamingOS is provided as a multi-license source tree.
+
+The OpenWrt baseline is provided under:
 
 	SPDX-License-Identifier: GPL-2.0-only
 
-Being under the terms of the GNU General Public License version 2 only,
-according with:
+according to the text in:
 
 	LICENSES/GPL-2.0
 
-In addition, other licenses may also apply.
+Other licenses also apply to individual files and components. SPDX identifiers,
+copyright notices, component license files, and THIRD_PARTY_NOTICES.md identify
+those terms. No repository-wide license statement overrides a more specific
+license attached to a file or component.
 
-All contributions to OpenWrt are subject to this COPYING file.
+DreamingOS-authored components under package/lester are licensed as declared in
+their package metadata and source headers. Derived third-party files retain their
+original notices and license requirements.

@@ -1,0 +1,40 @@
+# DreamingWrt GRUB theme, derived from Elegant forest/window/left/dark/1080p.
+
+title-text: ""
+desktop-image: "background.jpg"
+desktop-color: "#202027"
+
++ boot_menu {
+  left = 54%
+  top = 30%
+  width = 30%
+  height = 30%
+  item_font = "Terminus Regular 14"
+  item_color = "#e7e7eb"
+  selected_item_color = "#ffffff"
+  item_height = 48
+  item_padding = 3
+  item_spacing = 6
+  selected_item_pixmap_style = "select_*.png"
+}
+
++ label {
+  left = 55%
+  top = 22%
+  width = 28%
+  align = "center"
+  text = "DreamingWrt"
+  color = "#ffffff"
+  font = "Terminus Regular 14"
+}
+
++ label {
+  left = 55%
+  top = 66%
+  width = 28%
+  align = "center"
+  id = "__timeout__"
+  text = "Booting in %d seconds"
+  color = "#d7d7dc"
+  font = "Terminus Regular 14"
+}

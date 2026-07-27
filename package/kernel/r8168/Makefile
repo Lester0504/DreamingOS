@@ -17,6 +17,7 @@ include $(INCLUDE_DIR)/package.mk
 
 define KernelPackage/r8168
   SUBMENU:=Network Devices
+  VERSION:=7.1.5
   TITLE:=Realtek RTL8168 PCI Gigabit Ethernet driver
   DEPENDS:=@PCI_SUPPORT +kmod-libphy
   FILES:=$(PKG_BUILD_DIR)/src/r8168.ko

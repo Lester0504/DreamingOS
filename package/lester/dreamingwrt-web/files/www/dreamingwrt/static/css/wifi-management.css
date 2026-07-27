@@ -1,0 +1,1741 @@
+@import url('/static/css/policy-table.css?v=20260718-18');
+
+.console-stage.is-wifi-management {
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+  padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
+  overflow: hidden;
+}
+
+.console-stage.is-wifi-management .stage-header { display: none; }
+
+.console-stage.is-wifi-management:has(.wireless-status-route-host) {
+  padding: 0;
+}
+
+.console-stage.is-wifi-management .wifi-management-route-host {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.console-stage.is-wifi-management .wifi-config-route-host {
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  border-radius: var(--app-radius-card);
+}
+
+.console-stage.is-wifi-management .wireless-status-route-host {
+  overflow: hidden;
+  scrollbar-gutter: auto;
+  border-radius: 0;
+}
+
+.wifi-management-route-host {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: visible;
+}
+
+.wifi-management-shell {
+  --wifi-line: color-mix(in srgb, currentColor 14%, transparent);
+  --wifi-soft-line: color-mix(in srgb, currentColor 8%, transparent);
+  --wifi-muted: color-mix(in srgb, currentColor 62%, transparent);
+  --wifi-accent: #1677ff;
+  --wifi-ok: #31c96b;
+  --wifi-warn: #eeb34b;
+  --wifi-bad: #e15c66;
+  display: flex;
+  flex-direction: column;
+  gap: var(--app-page-gap, 16px);
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0;
+  color: var(--dwrt-page-fg, inherit);
+}
+
+.wifi-management-shell *,
+.wifi-management-shell *::before,
+.wifi-management-shell *::after {
+  box-sizing: border-box;
+}
+
+.wifi-management-shell button,
+.wifi-management-shell input,
+.wifi-management-shell select {
+  font: inherit;
+  letter-spacing: 0;
+}
+
+.wifi-management-shell button svg,
+.wifi-management-shell a svg {
+  display: block;
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.wifi-config-header,
+.wifi-config-navigation,
+.wifi-page-toolbar,
+.airview-topbar,
+.airview-top-actions {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.wifi-config-navigation {
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+}
+
+.wifi-config-tabs {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.wifi-config-tabs::-webkit-scrollbar { display: none; }
+.wifi-config-tabs .dwrt-kit-tab { white-space: nowrap; }
+
+.wifi-page-toolbar,
+.airview-top-actions {
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.wifi-search {
+  flex: 0 0 auto;
+}
+
+.wifi-icon-button,
+.wifi-row-button {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 1px solid var(--wifi-line);
+  border-radius: var(--app-radius-compact);
+  color: inherit;
+  background: color-mix(in srgb, currentColor 5%, transparent);
+  cursor: pointer;
+}
+
+.wifi-row-button {
+  width: 30px;
+  height: 30px;
+  border-color: transparent;
+  background: transparent;
+}
+
+.wifi-icon-button:hover:not(:disabled),
+.wifi-row-button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--wifi-accent) 58%, transparent);
+  color: var(--wifi-accent);
+  background: color-mix(in srgb, var(--wifi-accent) 11%, transparent);
+}
+
+.wifi-management-shell button:disabled,
+.wifi-management-shell input:disabled,
+.wifi-management-shell select:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+.airview-sidebar,
+.airview-radio-table,
+.airview-radio-card {
+  position: relative;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--wifi-line);
+  border-radius: var(--app-radius-card);
+}
+
+.wifi-config-surface {
+  min-width: 0;
+  overflow: hidden;
+  border-radius: var(--app-radius-card);
+}
+
+.wifi-config-surface .dwrt-kit-state-panel { min-height: 240px; }
+
+.wifi-panel-section {
+  min-width: 0;
+  padding: 20px;
+}
+
+.wifi-panel-section + .wifi-panel-section,
+.wifi-panel-section + .wifi-notice,
+.wifi-notice + .wifi-panel-section {
+  border-top: 1px solid var(--wifi-soft-line);
+}
+
+.wifi-panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 44px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--wifi-soft-line);
+}
+
+.wifi-panel-heading > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.wifi-panel-heading strong { font-size: 14px; font-weight: 650; }
+.wifi-panel-heading small { color: var(--wifi-muted); font-size: 11px; }
+
+.wifi-config-surface > .wifi-notice {
+  margin: 16px 20px 0;
+  border-radius: var(--app-radius-control);
+}
+
+.wifi-config-surface > .wifi-notice + .wifi-panel-section { margin-top: 16px; }
+
+.wifi-table-scroll,
+.wifi-channel-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow: auto;
+  overscroll-behavior-inline: contain;
+  scrollbar-gutter: stable;
+}
+
+.wifi-management-shell table {
+  width: 100%;
+  min-width: 820px;
+  border-collapse: collapse;
+  table-layout: auto;
+}
+
+.wifi-management-shell th,
+.wifi-management-shell td {
+  height: 48px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--wifi-soft-line);
+  text-align: left;
+  vertical-align: middle;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.wifi-management-shell th {
+  height: 44px;
+  color: var(--wifi-muted);
+  font-weight: 600;
+}
+
+.wifi-management-shell tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.wifi-management-shell tbody tr[data-wifi-edit],
+.wifi-management-shell tbody tr[data-wifi-speed-edit] {
+  cursor: pointer;
+}
+
+.wifi-management-shell tbody tr:hover td {
+  background: color-mix(in srgb, var(--wifi-accent) 7%, transparent);
+}
+
+.wifi-name-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.wifi-name-cell > i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--wifi-muted);
+  box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 4%, transparent);
+}
+
+.wifi-name-cell > i.is-on {
+  background: var(--wifi-ok);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--wifi-ok) 14%, transparent);
+}
+
+.wifi-band-list,
+.wifi-band-picker,
+.wifi-channel-legend,
+.wifi-radio-options,
+.airview-filter-list {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wifi-band-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 1px solid var(--wifi-line);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.wifi-band-pill.is-2g { color: #23895a; background: color-mix(in srgb, #31c96b 11%, transparent); }
+.wifi-band-pill.is-5g { color: #286fc0; background: color-mix(in srgb, #3c91ee 11%, transparent); }
+.wifi-band-pill.is-6g { color: #9d6112; background: color-mix(in srgb, #eeb34b 13%, transparent); }
+
+.wifi-table-empty,
+.airview-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 170px;
+  padding: 28px;
+  text-align: center;
+}
+
+.wifi-table-empty > span,
+.airview-empty > span {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--wifi-line);
+  border-radius: 50%;
+  color: var(--wifi-accent);
+  background: color-mix(in srgb, var(--wifi-accent) 8%, transparent);
+}
+
+.wifi-table-empty > span svg,
+.airview-empty > span svg {
+  width: 22px;
+  height: 22px;
+}
+
+.wifi-table-empty small,
+.airview-empty small {
+  max-width: 520px;
+  color: var(--wifi-muted);
+  line-height: 1.55;
+}
+
+.wifi-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-height: 40px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--wifi-accent) 24%, transparent);
+  border-radius: var(--app-radius-control);
+  color: color-mix(in srgb, var(--dwrt-page-fg, currentColor) 90%, var(--wifi-accent));
+  background: color-mix(in srgb, var(--wifi-accent) 9%, transparent);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.wifi-notice svg,
+.wifi-inline-warning svg {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+}
+
+.wifi-notice.is-error { border-color: color-mix(in srgb, var(--wifi-bad) 32%, transparent); background: color-mix(in srgb, var(--wifi-bad) 10%, transparent); }
+.wifi-notice.is-warn { border-color: color-mix(in srgb, var(--wifi-warn) 34%, transparent); background: color-mix(in srgb, var(--wifi-warn) 10%, transparent); }
+.wifi-notice.is-ok { border-color: color-mix(in srgb, var(--wifi-ok) 30%, transparent); background: color-mix(in srgb, var(--wifi-ok) 9%, transparent); }
+
+.wifi-section { padding: 16px; }
+
+.wifi-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 36px;
+  margin-bottom: 14px;
+}
+
+.wifi-section-head > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.wifi-section-head strong,
+.wifi-sheet-body h3 {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.wifi-section-head small,
+.wifi-setting-row small,
+.wifi-inline-setting small,
+.wifi-field small {
+  color: var(--wifi-muted);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.wifi-channel-band {
+  min-width: 1020px;
+  padding: 4px 0 18px;
+}
+
+.wifi-channel-band + .wifi-channel-band {
+  border-top: 1px solid var(--wifi-soft-line);
+  padding-top: 18px;
+}
+
+.wifi-channel-band header {
+  display: flex;
+  align-items: baseline;
+  gap: 24px;
+  margin-bottom: 11px;
+}
+
+.wifi-channel-band header strong { min-width: 64px; font-size: 13px; }
+.wifi-channel-band header span { color: var(--wifi-muted); font-size: 12px; }
+
+.wifi-channel-grid {
+  display: grid;
+  grid-template-columns: 66px repeat(var(--channel-count), minmax(20px, 1fr));
+  align-items: center;
+  gap: 5px;
+  min-width: max-content;
+}
+
+.wifi-channel-axis,
+.wifi-channel-number {
+  display: flex;
+  align-items: center;
+  height: 20px;
+  color: var(--wifi-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.wifi-channel-axis { font-size: 11px; }
+.wifi-channel-number { justify-content: center; }
+
+.wifi-channel-cell {
+  display: block;
+  width: 100%;
+  min-width: 20px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+  border-radius: 2px;
+  background: color-mix(in srgb, currentColor 5%, transparent);
+  cursor: pointer;
+}
+
+.wifi-channel-cell.is-using { border-color: var(--wifi-ok); background: var(--wifi-ok); }
+.wifi-channel-cell.is-dfs { background: repeating-linear-gradient(135deg, color-mix(in srgb, currentColor 10%, transparent) 0 2px, transparent 2px 5px); }
+.wifi-channel-cell.is-unavailable { border-color: color-mix(in srgb, var(--wifi-warn) 46%, transparent); background: color-mix(in srgb, var(--wifi-warn) 24%, transparent); }
+.wifi-channel-cell.is-excluded { border-color: color-mix(in srgb, var(--wifi-bad) 38%, transparent); background: color-mix(in srgb, var(--wifi-bad) 22%, transparent); }
+.wifi-channel-cell:disabled { opacity: .58; }
+
+.wifi-channel-legend {
+  flex-wrap: wrap;
+  margin-top: 12px;
+  color: var(--wifi-muted);
+  font-size: 11px;
+}
+
+.wifi-channel-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.wifi-channel-legend span::before {
+  content: '';
+  width: 9px;
+  height: 9px;
+  border: 1px solid var(--wifi-line);
+  border-radius: 2px;
+  background: color-mix(in srgb, currentColor 5%, transparent);
+}
+
+.wifi-channel-legend .using::before { border-color: var(--wifi-ok); background: var(--wifi-ok); }
+.wifi-channel-legend .dfs::before { background: repeating-linear-gradient(135deg, color-mix(in srgb, currentColor 14%, transparent) 0 2px, transparent 2px 4px); }
+.wifi-channel-legend .unavailable::before { border-color: color-mix(in srgb, var(--wifi-warn) 50%, transparent); background: color-mix(in srgb, var(--wifi-warn) 24%, transparent); }
+.wifi-channel-legend .excluded::before { border-color: color-mix(in srgb, var(--wifi-bad) 44%, transparent); background: color-mix(in srgb, var(--wifi-bad) 22%, transparent); }
+
+.wifi-link-button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  margin-top: 10px;
+  padding: 4px 0;
+  border: 0;
+  color: var(--wifi-accent);
+  background: transparent;
+  cursor: pointer;
+}
+
+.wifi-speed-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, .7fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.wifi-radio-setting-grid {
+  display: grid;
+  grid-template-columns: minmax(180px, .34fr) minmax(0, 1fr);
+  gap: 28px;
+  align-items: start;
+}
+
+.wifi-radio-label { display: grid; gap: 4px; padding-top: 8px; }
+.wifi-radio-label strong { font-size: 14px; font-weight: 650; }
+.wifi-radio-label small { color: var(--wifi-muted); font-size: 12px; line-height: 1.45; }
+.wifi-speed-controls { min-width: 0; display: grid; gap: 16px; }
+.wifi-speed-controls .wifi-radio-options { display: flex; align-items: center; gap: 8px; }
+.wifi-link-button.is-inline { margin: 0 0 0 8px; }
+
+.wifi-width-picker { min-width: 0; display: grid; gap: 10px; }
+.wifi-width-picker > strong { color: var(--wifi-muted); font-size: 12px; font-weight: 560; }
+.wifi-width-picker > div { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.wifi-width-picker fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.wifi-width-picker legend { margin-bottom: 7px; color: var(--wifi-muted); font-size: 11px; }
+.wifi-width-picker fieldset > span { display: flex; flex-wrap: wrap; gap: 6px; }
+.wifi-width-picker button {
+  width: 46px;
+  height: 38px;
+  border: 1px solid var(--wifi-line);
+  border-radius: var(--app-radius-compact);
+  color: inherit;
+  background: color-mix(in srgb, currentColor 4%, transparent);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.wifi-width-picker button:hover:not(:disabled) { background: var(--dwrt-interactive-hover-bg); }
+.wifi-width-picker button.is-active { border-color: var(--wifi-accent); color: var(--wifi-accent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--wifi-accent) 22%, transparent); }
+.wifi-width-picker button:disabled { cursor: not-allowed; opacity: .45; }
+
+.wifi-radio-options {
+  flex-wrap: wrap;
+}
+
+.wifi-radio-options label {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  cursor: pointer;
+}
+
+.wifi-radio-options label input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.wifi-radio-options label span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  padding: 5px 11px;
+  border: 1px solid var(--wifi-line);
+  border-radius: var(--app-radius-compact);
+}
+
+.wifi-radio-options label input:checked + span {
+  border-color: color-mix(in srgb, var(--wifi-accent) 54%, transparent);
+  color: var(--wifi-accent);
+  background: color-mix(in srgb, var(--wifi-accent) 11%, transparent);
+}
+
+.wifi-radio-options.compact { justify-content: flex-end; }
+
+.wifi-width-summary {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--wifi-soft-line);
+  border-radius: var(--app-radius-control);
+}
+
+.wifi-width-summary > strong { grid-column: 1 / -1; color: var(--wifi-muted); font-size: 11px; }
+.wifi-width-summary > span { display: flex; flex-direction: column; gap: 3px; }
+.wifi-width-summary b { font-size: 11px; font-weight: 500; }
+.wifi-width-summary em { font-size: 14px; font-style: normal; font-weight: 650; }
+
+.wifi-settings-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.wifi-settings-list.two-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 22px;
+}
+
+.wifi-setting-row,
+.wifi-inline-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-width: 0;
+  min-height: 58px;
+  padding: 10px 2px;
+  border-bottom: 1px solid var(--wifi-soft-line);
+}
+
+.wifi-setting-row > span,
+.wifi-inline-setting > span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.wifi-setting-row strong,
+.wifi-inline-setting strong { font-size: 13px; font-weight: 600; }
+
+.airview-switch input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.airview-switch > i {
+  position: relative;
+  display: block;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 20px;
+  border: 1px solid var(--wifi-line);
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+.airview-switch > i::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: .68;
+  transition: transform 160ms ease, opacity 160ms ease;
+}
+
+.airview-switch input:checked + i {
+  border-color: var(--wifi-accent);
+  background: var(--wifi-accent);
+  color: white;
+}
+
+.airview-switch input:checked + i::after { transform: translateX(16px); opacity: 1; }
+
+.wifi-setting-row.dwrt-kit-switch {
+  flex-direction: row;
+  justify-content: space-between;
+}
+
+.wifi-setting-row.dwrt-kit-switch > input { order: 2; }
+
+.wifi-dependency-panel {
+  display: none;
+}
+
+.wifi-dependency-panel.is-active {
+  display: block;
+  margin-left: 14px;
+  padding-left: 18px;
+  border-left: 2px solid color-mix(in srgb, var(--wifi-accent) 68%, transparent);
+}
+
+.wifi-dependency-panel [data-dwrt-dependency-panel] {
+  margin-left: 0;
+  padding-left: 0;
+}
+
+.wifi-dependency-panel [data-dwrt-dependency-panel]::before { display: none; }
+
+.wifi-inline-setting > a {
+  flex: 0 0 auto;
+  color: var(--wifi-accent);
+  text-decoration: none;
+}
+
+.wifi-inline-setting > input {
+  width: min(220px, 45%);
+  min-height: 36px;
+  padding: 7px 10px;
+  border: 1px solid var(--wifi-line);
+  border-radius: var(--app-radius-compact);
+  color: inherit;
+  background: color-mix(in srgb, currentColor 5%, transparent);
+  outline: none;
+}
+
+.wifi-extension-grid,
+.wifi-sheet-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.wifi-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+  color: inherit;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.wifi-field.is-wide { grid-column: 1 / -1; }
+
+.wifi-field input,
+.wifi-field select,
+.airview-broadcast-select select {
+  width: 100%;
+  min-width: 0;
+  height: 38px;
+  padding: 7px 10px;
+  border: 1px solid var(--wifi-line);
+  border-radius: var(--app-radius-compact);
+  color: inherit;
+  background: color-mix(in srgb, currentColor 5%, transparent);
+  outline: none;
+}
+
+.wifi-field input:focus,
+.wifi-field select:focus,
+.wifi-inline-setting > input:focus {
+  border-color: color-mix(in srgb, var(--wifi-accent) 62%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--wifi-accent) 12%, transparent);
+}
+
+.wifi-field-unit { display: flex; align-items: center; gap: 8px; }
+.wifi-field-unit input { flex: 1; }
+.wifi-field-unit b { color: var(--wifi-muted); font-size: 11px; }
+
+.wifi-sheet {
+  width: min(620px, calc(100vw - 24px));
+  max-width: 100vw;
+  border-left: 1px solid var(--wifi-line);
+}
+
+.wifi-sheet.compact { width: min(500px, calc(100vw - 24px)); }
+
+.wifi-sheet .dwrt-kit-sheet-header {
+  min-height: 72px;
+  padding: 14px 18px;
+}
+
+.wifi-sheet .dwrt-kit-sheet-header > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.wifi-sheet .dwrt-kit-sheet-header strong { font-size: 15px; }
+.wifi-sheet .dwrt-kit-sheet-header small { color: var(--wifi-muted); font-size: 12px; }
+
+.wifi-sheet-body {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 0 18px 28px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.wifi-sheet-body section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 18px;
+  border-top: 1px solid var(--wifi-soft-line);
+}
+
+.wifi-sheet-body section:first-child { border-top: 0; }
+.wifi-sheet-body h3 { margin: 0; }
+
+.wifi-band-picker {
+  align-items: stretch;
+  flex-wrap: wrap;
+}
+
+.wifi-band-picker > span {
+  flex: 0 0 100%;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.wifi-band-picker label {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 5px 10px;
+  border: 1px solid var(--wifi-line);
+  border-radius: var(--app-radius-compact);
+  cursor: pointer;
+}
+
+.wifi-band-picker label input { position: absolute; opacity: 0; }
+.wifi-band-picker label i { width: 13px; height: 13px; border: 1px solid var(--wifi-line); border-radius: 3px; }
+.wifi-band-picker label:has(input:checked) { border-color: color-mix(in srgb, var(--wifi-accent) 55%, transparent); color: var(--wifi-accent); background: color-mix(in srgb, var(--wifi-accent) 10%, transparent); }
+.wifi-band-picker label input:checked + i { border-color: var(--wifi-accent); background: var(--wifi-accent); box-shadow: inset 0 0 0 3px color-mix(in srgb, white 90%, transparent); }
+
+.wifi-inline-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--wifi-warn) 32%, transparent);
+  border-radius: var(--app-radius-control);
+  background: color-mix(in srgb, var(--wifi-warn) 10%, transparent);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.wireless-status-route-host .airview-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  height: 100%;
+  min-height: 0;
+}
+
+.wireless-status-route-host .airview-layout {
+  flex: 1 1 auto;
+}
+
+.airview-topbar {
+  justify-content: flex-start;
+  gap: 16px;
+}
+
+.wireless-status-route-host .airview-topbar {
+  min-height: 58px;
+  padding: 10px 12px 8px;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  border-bottom: 1px solid var(--wifi-soft-line);
+}
+
+.airview-view-tabs {
+  flex: 0 0 auto;
+}
+
+.wireless-status-route-host .airview-view-tabs {
+  width: 100%;
+  min-width: 0;
+  flex: 1 1 auto;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.airview-view-tabs.topology-panel-tabs { flex: 0 1 auto; height: 40px; padding: 2px; border: 0; border-radius: 12px; background: color-mix(in srgb, currentColor 6%, transparent); }
+.airview-view-tabs .topology-panel-tab { flex: 1 1 0; width: auto; height: 36px; padding: 0 8px; border-radius: 10px; }
+.airview-view-tabs .topology-panel-tab[aria-selected="true"] { flex-grow: 1.7; width: auto; min-width: 88px; }
+.airview-view-tabs .topology-panel-tab span { display: none; white-space: nowrap; }
+.airview-view-tabs .topology-panel-tab[aria-selected="true"] span { display: inline; }
+.airview-view-tabs .topology-panel-tab svg { width: 20px; height: 20px; fill: currentColor; stroke: none; }
+
+.airview-layout {
+  display: grid;
+  grid-template-columns: 270px minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+  height: min(760px, calc(100vh - 190px));
+  min-height: 540px;
+}
+
+.wireless-status-route-host .airview-layout {
+  grid-template-columns: clamp(264px, 23vw, 304px) minmax(0, 1fr);
+  gap: 0;
+  height: 100%;
+  min-height: 0;
+}
+
+.airview-sidebar {
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+}
+
+.wireless-status-route-host .airview-sidebar {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  border-block: 0;
+  border-left: 0;
+  border-radius: 0;
+  position: relative;
+  inset: auto;
+  width: auto;
+  transform: none;
+}
+
+.airview-sidebar-scroll {
+  min-height: 0;
+  padding: 12px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.wireless-status-route-host .airview-sidebar-scroll {
+  padding: 16px 18px;
+}
+
+.airview-ai-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.airview-switch { position: relative; cursor: pointer; }
+
+.airview-ai-map {
+  display: grid;
+  grid-template-columns: repeat(10, 1fr);
+  gap: 6px;
+  min-height: 72px;
+  padding: 8px 2px 12px;
+}
+
+.airview-ai-map i {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 10%, transparent);
+}
+
+.airview-ai-map i.is-active { background: color-mix(in srgb, var(--wifi-ok) 68%, transparent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--wifi-ok) 18%, transparent); }
+.airview-ai-map i.is-alert { background: color-mix(in srgb, var(--wifi-bad) 18%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--wifi-bad) 24%, transparent); }
+.airview-ai-map i.is-unknown { background: color-mix(in srgb, currentColor 5%, transparent); }
+.airview-ai-map.is-unavailable { opacity: .48; }
+
+.airview-broadcast-select {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin: 2px 0 10px;
+}
+
+.airview-broadcast-select > svg {
+  position: absolute;
+  left: 10px;
+  z-index: 1;
+  width: 15px;
+  height: 15px;
+  pointer-events: none;
+  fill: none !important;
+  stroke: currentColor !important;
+}
+
+.airview-broadcast-select select { height: 38px; padding-left: 32px; font-size: 12px; }
+
+.airview-sidebar details {
+  border-top: 1px solid var(--wifi-soft-line);
+}
+
+.airview-sidebar summary {
+  min-height: 42px;
+  padding: 13px 0 9px;
+  list-style: none;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.airview-sidebar summary::-webkit-details-marker { display: none; }
+.airview-sidebar summary::after { content: '⌃'; float: right; color: var(--wifi-muted); }
+.airview-sidebar details:not([open]) summary::after { content: '⌄'; }
+
+.airview-filter-list {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 0 0 10px;
+}
+
+.airview-filter-list.two-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+.airview-range-picker {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  min-height: 38px;
+  margin-bottom: 12px;
+  overflow: hidden;
+  border: 1px solid var(--wifi-line);
+  border-radius: 8px;
+}
+
+.airview-range-picker.compact { grid-template-columns: repeat(5, minmax(0, 1fr)); margin: 0 0 12px; }
+.airview-range-picker button { min-width: 0; border: 0; border-right: 1px solid var(--wifi-soft-line); color: var(--wifi-muted); background: transparent; cursor: pointer; font-size: 10px; white-space: nowrap; }
+.airview-range-picker button:last-child { border-right: 0; }
+.airview-range-picker button[aria-pressed="true"] { color: var(--wifi-accent); background: color-mix(in srgb, var(--wifi-accent) 10%, transparent); }
+
+.airview-ap-picker { display: grid; grid-template-columns: minmax(0, 1fr) 38px; align-items: center; gap: 8px; margin-bottom: 8px; }
+.airview-ap-select { position: relative; display: grid; grid-template-columns: 28px minmax(0, 1fr) 18px; align-items: center; min-width: 0; min-height: 40px; padding: 4px 6px; border: 1px solid var(--wifi-line); border-radius: var(--app-radius-control); background: color-mix(in srgb, currentColor 5%, transparent); }
+.airview-ap-select .airview-filter-device-image { grid-column: 1; grid-row: 1; }
+.airview-ap-select select { grid-column: 1 / -1; grid-row: 1; z-index: 1; width: 100%; min-width: 0; height: 32px; padding: 0 24px 0 34px; overflow: hidden; border: 0; color: inherit; background: transparent; font: inherit; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; appearance: none; cursor: pointer; }
+.airview-ap-select select:focus-visible { outline: 2px solid color-mix(in srgb, var(--wifi-accent) 62%, transparent); outline-offset: 3px; }
+.airview-ap-chevron { grid-column: 3; grid-row: 1; display: grid; place-items: center; z-index: 2; pointer-events: none; color: var(--wifi-muted); }
+.airview-ap-chevron svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; transform: rotate(90deg); }
+.airview-ap-insights { display: grid; place-items: center; width: 38px; height: 38px; padding: 0; border: 0; border-radius: var(--app-radius-control); color: var(--wifi-muted); background: transparent; cursor: pointer; }
+.airview-ap-insights:hover:not(:disabled),
+.airview-ap-insights:focus-visible { color: var(--wifi-accent); background: var(--dwrt-interactive-hover-bg); }
+.airview-ap-insights:disabled { cursor: not-allowed; opacity: .45; }
+.airview-ap-insights svg { width: 20px; height: 20px; fill: currentColor; stroke: none; }
+
+.airview-link-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.airview-link-actions .wifi-link-button { margin-top: 10px; }
+.airview-link-actions > .airview-column-editor { flex-basis: 100%; }
+.airview-column-editor { display: flex; flex-direction: column; gap: 4px; width: 100%; padding-top: 8px; }
+.airview-column-editor h2 { margin: 0 0 8px; font-size: 13px; }
+.airview-column-editor footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px; }
+.airview-column-editor footer .wifi-link-button { margin-top: 0; }
+.airview-column-editor .policy-primary.compact { min-height: 32px; padding: 0 14px; }
+
+.airview-signal-range { display: grid; grid-template-columns: auto auto; justify-content: space-between; gap: 7px; padding: 3px 2px 12px; color: var(--wifi-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.airview-signal-range > div { position: relative; grid-column: 1 / -1; height: 24px; }
+.airview-signal-track { position: absolute; top: 10px; right: 0; left: 0; height: 4px; border-radius: 999px; background: linear-gradient(90deg, color-mix(in srgb, currentColor 10%, transparent) 0 var(--signal-min), var(--wifi-accent) var(--signal-min) var(--signal-max), color-mix(in srgb, currentColor 10%, transparent) var(--signal-max) 100%); }
+.airview-signal-range input[type="range"] { position: absolute; inset: 0; width: 100%; height: 24px; margin: 0; appearance: none; border: 0; background: transparent; pointer-events: none; }
+.airview-signal-range input[type="range"]::-webkit-slider-runnable-track { height: 4px; background: transparent; }
+.airview-signal-range input[type="range"]::-webkit-slider-thumb { width: 14px; height: 14px; margin-top: -5px; appearance: none; border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 50%; background: var(--app-surface); box-shadow: 0 1px 4px color-mix(in srgb, currentColor 20%, transparent); pointer-events: auto; cursor: grab; }
+.airview-signal-range input[type="range"]::-moz-range-track { height: 4px; background: transparent; }
+.airview-signal-range input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 50%; background: var(--app-surface); box-shadow: 0 1px 4px color-mix(in srgb, currentColor 20%, transparent); pointer-events: auto; cursor: grab; }
+.airview-signal-range input[type="range"].is-min { z-index: 2; }
+.airview-signal-range input[type="range"].is-max { z-index: 3; }
+
+.airview-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.airview-check input { position: absolute; opacity: 0; }
+.airview-check > i { flex: 0 0 auto; width: 15px; height: 15px; border: 1px solid var(--wifi-line); border-radius: 4px; }
+.airview-check input:checked + i { border-color: var(--wifi-accent); background: var(--wifi-accent); box-shadow: inset 0 0 0 3px color-mix(in srgb, white 90%, transparent); }
+.airview-check > span { display: flex; align-items: center; flex: 1 1 auto; gap: 7px; min-width: 0; white-space: nowrap; }
+.airview-check > span > :last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.airview-check.is-disabled { cursor: default; opacity: .48; }
+
+.airview-filter-device-image,
+.airview-device-image,
+.airview-chip-device-image,
+.airview-metric-device-image {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  overflow: hidden;
+  color: var(--wifi-accent);
+  background: color-mix(in srgb, currentColor 4%, transparent);
+}
+
+.airview-filter-device-image { width: 24px; height: 24px; border-radius: 5px; }
+.airview-device-image { width: 32px; height: 32px; border-radius: 6px; }
+.airview-chip-device-image { width: 22px; height: 22px; border-radius: 5px; }
+.airview-metric-device-image { width: 28px; height: 28px; border-radius: 6px; }
+
+.airview-filter-device-image img,
+.airview-device-image img,
+.airview-chip-device-image img,
+.airview-metric-device-image img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.airview-filter-device-image > span,
+.airview-device-image > span,
+.airview-chip-device-image > span,
+.airview-metric-device-image > span,
+.airview-filter-device-image.is-fallback,
+.airview-device-image.is-fallback,
+.airview-chip-device-image.is-fallback,
+.airview-metric-device-image.is-fallback { padding: 5px; }
+
+.airview-filter-device-image svg,
+.airview-device-image svg,
+.airview-chip-device-image svg,
+.airview-metric-device-image svg { width: 100%; height: 100%; fill: currentColor; stroke: none; }
+
+.airview-filter-empty { padding: 4px 0 8px; color: var(--wifi-muted); }
+
+.airview-mini-plan {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 0 0 12px;
+}
+
+.airview-mini-plan > div { display: grid; grid-template-columns: 38px 1fr; gap: 7px; align-items: center; }
+.airview-mini-plan > div > span { color: var(--wifi-muted); font-size: 9px; }
+.airview-mini-plan > div > b { display: grid; grid-template-columns: repeat(18, minmax(3px, 1fr)); gap: 2px; }
+.airview-mini-plan > div > b i { height: 7px; border-radius: 1px; background: color-mix(in srgb, var(--wifi-ok) 18%, transparent); }
+.airview-mini-plan i.is-unknown { background: color-mix(in srgb, currentColor 5%, transparent); }
+.airview-mini-plan i.is-enabled { background: color-mix(in srgb, var(--wifi-ok) 18%, transparent); }
+.airview-mini-plan i.is-dfs { background: repeating-linear-gradient(135deg, color-mix(in srgb, currentColor 16%, transparent) 0 1px, transparent 1px 3px); }
+.airview-mini-plan i.is-unavailable { background: color-mix(in srgb, var(--wifi-warn) 24%, transparent); }
+.airview-mini-plan i.is-using { background: var(--wifi-ok); }
+.airview-mini-plan i.is-excluded { background: color-mix(in srgb, var(--wifi-bad) 22%, transparent); }
+.airview-mini-plan small { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; color: var(--wifi-muted); font-size: 8px; }
+.airview-mini-plan small i { display: inline-block; width: 7px; height: 7px; border: 1px solid var(--wifi-line); }
+
+.airview-results {
+  min-width: 0;
+  height: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.wireless-status-route-host .airview-results {
+  padding: 16px;
+  border-left: 1px solid var(--wifi-soft-line);
+}
+
+.airview-connectivity-empty { min-height: 180px; display: flex; flex-direction: column; justify-content: center; align-items: flex-start; gap: 5px; padding: 24px; }
+.airview-connectivity-empty strong { font-size: 13px; }
+.airview-connectivity-empty span { color: var(--wifi-muted); font-size: 11px; }
+
+.airview-scan-button {
+  width: 100%;
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+.airview-scan-button svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; }
+
+.airview-scan-jobs { display: grid; gap: 6px; margin: 8px 0 12px; padding: 9px; border: 1px solid var(--wifi-soft-line); border-radius: var(--app-radius-control); background: color-mix(in srgb, var(--app-surface) 22%, transparent); }
+.airview-scan-jobs header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px; font-size: 10px; }
+.airview-scan-jobs header span { color: var(--wifi-muted); font-variant-numeric: tabular-nums; }
+.airview-scan-jobs > div { display: grid; grid-template-columns: 7px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 31px; }
+.airview-scan-jobs > div > i { width: 7px; height: 7px; border-radius: 50%; background: var(--wifi-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--wifi-accent) 12%, transparent); }
+.airview-scan-jobs > div.is-success > i { background: var(--wifi-ok); box-shadow-color: color-mix(in srgb, var(--wifi-ok) 12%, transparent); }
+.airview-scan-jobs > div.is-warning > i { background: var(--wifi-warn); box-shadow-color: color-mix(in srgb, var(--wifi-warn) 12%, transparent); }
+.airview-scan-jobs > div.is-error > i { background: var(--wifi-bad); box-shadow-color: color-mix(in srgb, var(--wifi-bad) 12%, transparent); }
+.airview-scan-jobs > div > span { display: flex; flex-direction: column; min-width: 0; }
+.airview-scan-jobs > div strong { font-size: 10px; }
+.airview-scan-jobs > div small { overflow: hidden; color: var(--wifi-muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.airview-scan-jobs > div b { color: var(--wifi-muted); font-size: 9px; font-weight: 600; white-space: nowrap; }
+
+.airview-spectrum-view { min-width: 0; height: 100%; display: grid; grid-template-rows: auto auto minmax(260px, 1fr) minmax(170px, auto); gap: 12px; }
+.airview-spectrum-view > header { font-size: 13px; font-weight: 700; }
+.airview-environment-status { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.airview-environment-status > div { min-width: 0; display: grid; gap: 3px; padding: 10px 12px; border: 1px solid var(--wifi-soft-line); border-radius: var(--app-radius-compact); background: color-mix(in srgb, var(--app-surface) 30%, transparent); }
+.airview-environment-status span { color: var(--wifi-muted); font-size: 9px; }
+.airview-environment-status strong { overflow: hidden; color: var(--app-text); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.airview-environment-status small { overflow: hidden; color: var(--wifi-muted); font-size: 9px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.airview-environment-status > .is-ready { border-color: color-mix(in srgb, var(--dwrt-status-success-text, #55d98b) 30%, transparent); }
+.airview-spectrum-chart { position: relative; min-height: 280px; padding: 12px 10px 34px 44px; }
+.airview-spectrum-grid { position: absolute; inset: 12px 10px 34px 44px; display: grid; grid-template-rows: repeat(5, 1fr); background: repeating-linear-gradient(90deg, var(--wifi-soft-line) 0 1px, transparent 1px calc(100% / 23)); border: 1px solid var(--wifi-soft-line); }
+.airview-spectrum-grid i { border-bottom: 1px solid var(--wifi-soft-line); }
+.airview-spectrum-grid i:last-child { border-bottom: 0; }
+.airview-spectrum-y { position: absolute; top: 8px; bottom: 30px; left: 0; display: flex; flex-direction: column; justify-content: space-between; width: 38px; color: var(--wifi-muted); font-size: 9px; text-align: right; }
+.airview-spectrum-x { position: absolute; right: 10px; bottom: 12px; left: 44px; display: flex; justify-content: space-between; color: var(--wifi-muted); font-size: 8px; }
+.airview-spectrum-db { position: absolute; top: 50%; left: 2px; color: var(--wifi-muted); font-size: 9px; transform: rotate(-90deg); }
+.airview-spectrum-channel { position: absolute; bottom: 10px; left: 8px; color: var(--wifi-muted); font-size: 9px; }
+.airview-environment-history-line { position: absolute; inset: 12px 10px 34px 44px; z-index: 1; width: calc(100% - 54px); height: calc(100% - 46px); overflow: visible; }
+.airview-environment-history-line polyline { fill: none; stroke: var(--wifi-accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.airview-environment-history-empty { position: absolute; inset: 12px 10px 34px 44px; z-index: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: 20px; color: var(--wifi-muted); text-align: center; }
+.airview-environment-history-empty strong { color: var(--app-text); font-size: 11px; }
+.airview-environment-history-empty span { max-width: 460px; font-size: 10px; line-height: 1.45; }
+.airview-spectrum-table { position: relative; min-height: 170px; border-top: 1px solid var(--wifi-soft-line); }
+.airview-spectrum-table table { min-width: 1120px; }
+.airview-spectrum-empty { min-height: 88px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--wifi-muted); font-size: 11px; }
+.airview-spectrum-empty svg { width: 22px; height: 22px; color: var(--wifi-accent); fill: none !important; stroke: currentColor !important; stroke-width: 1.8; }
+.airview-spectrum-empty svg * { fill: none !important; stroke: currentColor !important; }
+
+@media (max-width: 900px) {
+  .airview-environment-status { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.wifi-management-shell [data-adaptive-region] {
+  --wifi-line: color-mix(in srgb, var(--adaptive-text) 14%, transparent);
+  --wifi-soft-line: color-mix(in srgb, var(--adaptive-text) 8%, transparent);
+  --wifi-muted: var(--adaptive-muted);
+}
+
+.airview-empty { height: 100%; min-height: 360px; }
+.airview-radio-table { width: 100%; }
+.airview-radio-table table { min-width: 980px; }
+.airview-radio-table td small { display: block; margin-top: 2px; color: var(--wifi-muted); font-size: 10px; }
+.airview-radio-table th,
+.airview-radio-table td { white-space: nowrap; }
+.airview-radio-table .airview-select-column { width: 38px; min-width: 38px; padding-inline: 10px; text-align: center; }
+.airview-radio-table .airview-select-column input { width: 16px; height: 16px; margin: 0; accent-color: var(--wifi-accent); }
+.airview-radio-table tbody tr[data-airview-radio-row] { cursor: pointer; }
+.airview-radio-table tbody tr[data-airview-radio-row].is-selected td { background: color-mix(in srgb, var(--wifi-accent) 12%, transparent); }
+.airview-radio-table tbody tr[data-airview-radio-row]:focus-visible { outline: 2px solid color-mix(in srgb, var(--wifi-accent) 72%, transparent); outline-offset: -2px; }
+.airview-ap-cell { display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: center; gap: 9px; width: max-content; min-width: 220px; max-width: 300px; }
+.airview-ap-cell > span:last-child { display: block; min-width: 0; }
+.airview-ap-cell strong,
+.airview-ap-cell small { display: block; max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.airview-meter {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 104px;
+  height: 20px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: color-mix(in srgb, currentColor 7%, transparent);
+}
+
+.airview-meter > i { position: absolute; inset: 0 auto 0 0; background: color-mix(in srgb, var(--wifi-accent) 28%, transparent); }
+.airview-meter.is-warn > i { background: color-mix(in srgb, var(--wifi-warn) 36%, transparent); }
+.airview-meter.is-bad > i { background: color-mix(in srgb, var(--wifi-bad) 36%, transparent); }
+.airview-meter > b { position: relative; z-index: 1; padding: 0 7px; font-size: 10px; font-weight: 650; font-variant-numeric: tabular-nums; }
+
+.airview-environment-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.airview-radio-card { padding: 14px; }
+.airview-radio-card header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+.airview-radio-icon { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--wifi-line); border-radius: 7px; color: var(--wifi-accent); }
+.airview-radio-card header > div { display: flex; flex-direction: column; gap: 2px; }
+.airview-radio-card header small { color: var(--wifi-muted); }
+.airview-environment-bars { display: flex; flex-direction: column; gap: 9px; }
+.airview-environment-bars label { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; }
+.airview-radio-card footer { display: flex; justify-content: space-between; gap: 12px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--wifi-soft-line); color: var(--wifi-muted); font-size: 11px; }
+.airview-radio-card footer b { color: inherit; font-variant-numeric: tabular-nums; }
+
+.airview-radio-sheet {
+  --dwrt-kit-sheet-width: min(56vw, 760px);
+  --dwrt-kit-sheet-max-width: calc(100vw - 28px);
+}
+
+.dwrt-kit-sheet.airview-ap-sheet {
+  --dwrt-kit-sheet-width: min(50vw, 720px);
+  --dwrt-kit-sheet-max-width: calc(100vw - 28px);
+  grid-template-rows: var(--dwrt-kit-sheet-head-height) 82px minmax(0, 1fr);
+}
+
+.airview-ap-sheet > .dwrt-kit-sheet-wallpaper,
+.airview-ap-sheet > .dwrt-kit-sheet-material {
+  grid-area: 1 / 1 / -1 / -1;
+}
+
+.airview-ap-sheet > .dwrt-kit-sheet-header {
+  grid-row: 1;
+  grid-column: 1;
+}
+
+.airview-ap-sheet > .airview-ap-sheet-tabs {
+  grid-row: 2;
+  grid-column: 1;
+}
+
+.airview-ap-sheet > .airview-ap-sheet-body {
+  grid-row: 3;
+  grid-column: 1;
+}
+
+.airview-ap-sheet .dwrt-kit-sheet-header { justify-content: center; }
+.airview-ap-sheet .dwrt-kit-sheet-header > div { min-width: 0; text-align: center; }
+.airview-ap-sheet .dwrt-kit-sheet-header strong { display: block; overflow: hidden; font-size: 17px; text-overflow: ellipsis; white-space: nowrap; }
+.airview-ap-sheet .dwrt-kit-sheet-close { position: absolute; right: var(--dwrt-kit-sheet-padding-x); }
+.airview-ap-sheet-tabs { align-self: start; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; width: auto; height: 70px; min-height: 70px; margin: 0 20px 12px; padding: 7px; border: 1px solid var(--wifi-soft-line); border-radius: var(--app-radius-card); background: color-mix(in srgb, var(--app-surface) 20%, transparent); }
+.airview-ap-sheet-tabs button { display: grid; place-items: center; min-height: 54px; padding: 0; border: 0; border-radius: var(--app-radius-control); color: var(--wifi-muted); background: transparent; cursor: pointer; }
+.airview-ap-sheet-tabs button:hover { background: var(--dwrt-interactive-hover-bg); }
+.airview-ap-sheet-tabs button[aria-selected="true"] { color: var(--wifi-accent); background: color-mix(in srgb, var(--app-surface) 64%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 8%, transparent); }
+.airview-ap-sheet-tabs svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.7; }
+.airview-ap-sheet-tabs button:nth-child(2) svg { fill: currentColor; stroke: none; }
+.airview-ap-sheet-tabs span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.airview-ap-sheet-body { padding: 8px 20px 32px; overscroll-behavior: contain; }
+.airview-ap-sheet-stack { display: grid; gap: 14px; }
+.airview-ap-summary-card,
+.airview-ap-chart-card,
+.airview-ap-facts,
+.airview-ap-table-card,
+.airview-ap-insight-card,
+.airview-ap-settings-card { padding: 18px; border: 1px solid var(--wifi-soft-line); border-radius: var(--app-radius-card); background: color-mix(in srgb, var(--app-surface) 30%, transparent); }
+.airview-ap-summary-card { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 8px 14px; }
+.airview-ap-sheet-image { display: grid; place-items: center; grid-row: 1 / 3; width: 62px; height: 62px; overflow: hidden; border-radius: var(--app-radius-control); background: color-mix(in srgb, currentColor 4%, transparent); }
+.airview-ap-sheet-image img { width: 100%; height: 100%; object-fit: contain; }
+.airview-ap-sheet-image svg { width: 30px; height: 30px; fill: currentColor; stroke: none; }
+.airview-ap-summary-copy { display: flex; flex-direction: column; justify-content: center; min-width: 0; }
+.airview-ap-summary-copy strong { overflow: hidden; font-size: 17px; text-overflow: ellipsis; white-space: nowrap; }
+.airview-ap-summary-copy span { color: var(--wifi-muted); }
+.airview-ap-radio-list { grid-column: 1 / -1; display: grid; margin-top: 10px; }
+.airview-ap-radio-list > div { display: grid; grid-template-columns: minmax(0, 1.6fr) 54px 72px 52px; align-items: center; gap: 8px; min-height: 42px; border-bottom: 1px solid var(--wifi-soft-line); }
+.airview-ap-radio-list > div > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.airview-ap-radio-list > div > strong span { color: var(--wifi-muted); font-weight: 500; }
+.airview-ap-clients { display: inline-flex; align-items: center; gap: 5px; }
+.airview-ap-clients svg { width: 18px; height: 18px; fill: currentColor; stroke: none; color: var(--wifi-accent); }
+.airview-ap-warning { grid-column: 1 / -1; display: flex; align-items: flex-start; gap: 9px; padding: 10px 0; color: var(--wifi-muted); }
+.airview-ap-warning svg { flex: 0 0 auto; width: 19px; height: 19px; color: var(--wifi-warn); }
+.airview-ap-summary-card > footer { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; padding-top: 10px; }
+.airview-ap-chart-card > header,
+.airview-ap-table-card > header,
+.airview-ap-insight-card > header,
+.airview-ap-settings-card > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.airview-ap-chart-card > header span,
+.airview-ap-table-card > header span,
+.airview-ap-settings-card > header small { color: var(--wifi-muted); font-size: 11px; }
+.airview-ap-empty-chart { display: grid; place-items: center; min-height: 110px; border-top: 1px solid var(--wifi-soft-line); color: var(--wifi-muted); }
+.airview-ap-facts { display: grid; gap: 0; }
+.airview-ap-facts > div { display: grid; grid-template-columns: minmax(110px, .45fr) minmax(0, 1fr); gap: 12px; min-height: 42px; align-items: center; }
+.airview-ap-facts span { color: var(--wifi-muted); }
+.airview-ap-facts strong { overflow-wrap: anywhere; text-align: right; }
+.airview-ap-table-card { min-width: 0; }
+.airview-ap-table-card table { min-width: 620px; }
+.airview-ap-insight-card > header > div { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.airview-ap-insight-card > header span { display: flex; flex-direction: column; min-width: 0; }
+.airview-ap-insight-card > header small { color: var(--wifi-muted); }
+.airview-ap-insight-card > header b { color: var(--wifi-muted); font-size: 11px; white-space: nowrap; }
+.airview-ap-insight-card h4 { margin: 20px 0 9px; font-size: 12px; }
+.airview-ap-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.airview-ap-kpis > div { display: grid; gap: 4px; min-width: 0; padding: 10px; border: 1px solid var(--wifi-soft-line); border-radius: var(--app-radius-control); }
+.airview-ap-kpis span { color: var(--wifi-muted); font-size: 9px; }
+.airview-ap-kpis strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.airview-ap-settings-card h3 { margin: 0 0 14px; font-size: 14px; }
+.airview-ap-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+.airview-ap-settings-footer { position: sticky; bottom: -1px; display: flex; justify-content: flex-end; padding: 12px 0 0; background: linear-gradient(transparent, color-mix(in srgb, var(--app-surface) 84%, transparent) 28%); }
+
+.airview-radio-sheet .dwrt-kit-sheet-header > div {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.airview-radio-sheet .dwrt-kit-sheet-header span { font-size: 11px; }
+
+.airview-radio-sheet-body {
+  padding: 18px 24px 28px;
+  overscroll-behavior: contain;
+}
+
+.airview-radio-sheet-body > .wifi-inline-warning { margin: 0 0 18px; }
+
+.airview-radio-sheet-band {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 0 0 26px;
+}
+
+.airview-radio-sheet-band + .airview-radio-sheet-band {
+  padding-top: 24px;
+  border-top: 1px solid var(--wifi-soft-line);
+}
+
+.airview-radio-sheet-band > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 28px;
+}
+
+.airview-radio-sheet-band > header strong { font-size: 16px; }
+
+.airview-selected-aps {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.airview-selected-aps > button {
+  display: grid;
+  grid-template-columns: 22px minmax(0, auto) 16px;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  max-width: min(100%, 320px);
+  min-height: 42px;
+  padding: 6px 10px;
+  border: 1px solid var(--wifi-soft-line);
+  border-radius: 7px;
+  color: inherit;
+  background: color-mix(in srgb, currentColor 5%, transparent);
+  cursor: pointer;
+}
+
+.airview-selected-aps > button > span:nth-child(2) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.airview-selected-aps > button > svg { width: 14px; height: 14px; }
+
+.airview-radio-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(150px, .48fr);
+  gap: 18px;
+  align-items: end;
+}
+
+.airview-radio-controls fieldset,
+.airview-radio-power {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.airview-radio-controls legend,
+.airview-radio-controls label > span,
+.airview-radio-power legend {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0 0 8px;
+  color: var(--wifi-muted);
+  font-size: 12px;
+}
+
+.airview-radio-controls label { display: block; min-width: 0; }
+.airview-radio-controls select { width: 100%; height: 38px; }
+
+.airview-segmented {
+  display: inline-flex;
+  align-items: stretch;
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--wifi-line);
+  border-radius: 7px;
+}
+
+.airview-segmented.wrap {
+  display: flex;
+  flex-wrap: wrap;
+  width: fit-content;
+  overflow: visible;
+}
+
+.airview-segmented button {
+  flex: 0 0 auto;
+  min-width: 48px;
+  height: 38px;
+  padding: 0 12px;
+  border: 0;
+  border-right: 1px solid var(--wifi-line);
+  border-radius: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.airview-segmented button:last-child { border-right: 0; }
+.airview-segmented button[aria-pressed="true"] {
+  color: var(--wifi-accent);
+  background: color-mix(in srgb, var(--wifi-accent) 12%, transparent);
+  box-shadow: inset 0 0 0 1px var(--wifi-accent);
+}
+
+.airview-radio-power legend svg,
+.airview-min-rssi svg { width: 16px; height: 16px; color: var(--wifi-accent); }
+.airview-radio-power > small { display: block; margin-top: 8px; color: var(--wifi-muted); font-size: 11px; }
+
+.airview-custom-power,
+.airview-min-rssi {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 12px;
+}
+
+.airview-custom-power input,
+.airview-min-rssi input[type="number"] { width: 92px; height: 36px; }
+.airview-custom-power b,
+.airview-min-rssi b { color: var(--wifi-muted); font-size: 11px; font-weight: 500; }
+
+.airview-min-rssi { min-height: 38px; margin: 0; cursor: pointer; }
+.airview-min-rssi > input[type="checkbox"] { position: absolute; opacity: 0; pointer-events: none; }
+.airview-min-rssi > i { position: relative; flex: 0 0 auto; width: 18px; height: 18px; border: 1px solid var(--wifi-line); border-radius: 5px; }
+.airview-min-rssi > input:checked + i { border-color: var(--wifi-accent); background: var(--wifi-accent); }
+.airview-min-rssi > input:checked + i::after {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 2px;
+  width: 5px;
+  height: 9px;
+  border: solid white;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.airview-min-rssi > span { display: inline-flex; align-items: center; gap: 5px; }
+
+.airview-radio-metrics {
+  padding-top: 18px;
+  border-top: 1px solid var(--wifi-soft-line);
+}
+
+.airview-radio-metrics summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 30px;
+  list-style: none;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.airview-radio-metrics summary::-webkit-details-marker { display: none; }
+.airview-radio-metrics summary::after { content: '⌃'; color: var(--wifi-muted); font-size: 12px; }
+.airview-radio-metrics:not([open]) summary::after { content: '⌄'; }
+.airview-radio-metric-device { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; }
+.airview-radio-metric-device > span { display: grid; grid-template-columns: 28px minmax(0, 1fr); align-items: center; gap: 9px; min-width: 0; }
+.airview-radio-metric-device strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.airview-radio-metric-device button { display: grid; place-items: center; flex: 0 0 auto; width: 34px; height: 34px; padding: 0; border: 0; border-radius: 7px; color: var(--wifi-muted); background: transparent; cursor: pointer; }
+.airview-radio-metric-device button:hover { color: var(--wifi-accent); background: color-mix(in srgb, var(--wifi-accent) 9%, transparent); }
+.airview-radio-metrics > p { margin: 14px 0 8px; color: var(--wifi-muted); font-size: 12px; }
+.airview-radio-metrics h4 { margin: 22px 0 8px; color: var(--wifi-muted); font-size: 12px; font-weight: 500; }
+
+.airview-radio-history {
+  position: relative;
+  height: 168px;
+  min-height: 168px;
+  padding: 0 0 28px;
+}
+
+.airview-radio-chart-grid {
+  position: absolute;
+  inset: 0 0 28px;
+  border: 1px solid var(--wifi-soft-line);
+  background:
+    repeating-linear-gradient(0deg, transparent 0 calc(33.333% - 1px), var(--wifi-soft-line) calc(33.333% - 1px) 33.333%),
+    repeating-linear-gradient(90deg, transparent 0 calc(33.333% - 1px), var(--wifi-soft-line) calc(33.333% - 1px) 33.333%);
+}
+
+.airview-radio-history > svg { position: absolute; inset: 0 0 28px; width: 100%; height: calc(100% - 28px); overflow: visible; }
+.airview-radio-history polyline { fill: none; stroke: var(--wifi-accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.airview-radio-chart-axis { position: absolute; inset: auto 0 0; display: flex; justify-content: space-between; color: var(--wifi-muted); font-size: 10px; }
+
+.airview-radio-chart-empty {
+  position: absolute;
+  inset: 1px 1px 29px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 18px;
+  color: var(--wifi-muted);
+  text-align: center;
+}
+
+.airview-radio-chart-empty strong { color: inherit; font-size: 12px; }
+.airview-radio-chart-empty span { max-width: 360px; font-size: 10px; }
+
+.airview-signal-scale,
+.airview-signal-labels {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 3px;
+}
+
+.airview-signal-scale span { height: 18px; border-radius: 5px; background: hsl(calc(8deg + var(--signal-tone) * 31deg) 72% 78% / .36); }
+.airview-signal-labels { margin: 5px 0 8px; color: var(--wifi-muted); font-size: 10px; text-align: center; }
+.airview-signal-bars { position: relative; display: flex; align-items: flex-end; gap: 7px; height: 118px; padding: 10px 18px 0; border: 1px solid var(--wifi-soft-line); background: repeating-linear-gradient(0deg, transparent 0 calc(33.333% - 1px), var(--wifi-soft-line) calc(33.333% - 1px) 33.333%); }
+.airview-signal-bars > i { flex: 1 1 0; height: var(--bar); min-height: 3px; border-radius: 4px 4px 0 0; background: hsl(calc(8deg + var(--signal-tone) * 31deg) 68% 58% / .72); }
+.airview-signal-bars .airview-radio-chart-empty.compact { inset: 1px; }
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 980px) {
+  .wifi-speed-layout,
+  .wifi-radio-setting-grid,
+  .airview-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .wifi-width-picker > div { grid-template-columns: 1fr; }
+
+  .airview-layout {
+    height: auto;
+    min-height: 0;
+  }
+
+  .wireless-status-route-host .airview-layout {
+    grid-template-columns: minmax(0, 1fr);
+    height: 100%;
+    overflow: auto;
+  }
+
+  .airview-sidebar,
+  .airview-results {
+    height: auto;
+    max-height: none;
+  }
+
+  .airview-sidebar-scroll {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0 16px;
+    height: auto;
+    overflow: visible;
+  }
+
+  .wireless-status-route-host .airview-sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--wifi-soft-line);
+  }
+
+  .wireless-status-route-host .airview-results {
+    border-left: 0;
+  }
+
+  .airview-ai-row,
+  .airview-ai-map,
+  .airview-broadcast-select,
+  .airview-ap-select,
+  .airview-range-picker,
+  .airview-sidebar-scroll > .wifi-link-button { grid-column: 1 / -1; }
+}
+
+@media (max-width: 720px) {
+  .wifi-management-shell { gap: 12px; }
+  .wifi-config-header,
+  .wifi-config-navigation { align-items: stretch; flex-direction: column; }
+  .wifi-config-navigation .wifi-page-toolbar { justify-content: flex-end; }
+  .wifi-config-tabs { width: 100%; }
+  .wifi-page-toolbar,
+  .airview-top-actions { width: 100%; }
+  .wireless-status-route-host .airview-top-actions { width: auto; margin-left: auto; }
+  .airview-view-tabs .topology-panel-tab { width: auto; padding: 0 8px; }
+  .airview-view-tabs .topology-panel-tab[aria-selected="true"] { min-width: 76px; }
+  .wifi-search { margin-right: auto; }
+  .wifi-settings-list.two-columns,
+  .wifi-extension-grid,
+  .wifi-sheet-fields,
+  .airview-environment-grid { grid-template-columns: 1fr; }
+  .airview-radio-sheet {
+    --dwrt-kit-sheet-width: calc(100vw - 18px);
+    --dwrt-kit-sheet-max-width: calc(100vw - 18px);
+  }
+  .dwrt-kit-sheet.airview-ap-sheet {
+    --dwrt-kit-sheet-width: calc(100vw - 18px);
+    --dwrt-kit-sheet-max-width: calc(100vw - 18px);
+  }
+  .airview-radio-sheet-body { padding-inline: 16px; }
+  .airview-ap-sheet-body { padding-inline: 14px; }
+  .airview-ap-sheet-tabs { margin-inline: 14px; }
+  .airview-ap-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .airview-radio-controls { grid-template-columns: 1fr; }
+  .airview-segmented.wrap { width: 100%; }
+  .airview-segmented.wrap button { flex: 1 1 33.333%; }
+  .wifi-field.is-wide { grid-column: auto; }
+  .wifi-width-summary { grid-template-columns: 1fr; }
+  .wifi-width-summary > strong { grid-column: auto; }
+  .wifi-setting-row,
+  .wifi-inline-setting { gap: 12px; }
+  .wifi-section,
+  .wifi-panel-section { padding: 13px; }
+  .wifi-config-surface > .wifi-notice { margin-inline: 13px; }
+  .airview-sidebar-scroll { grid-template-columns: 1fr; }
+  .airview-sidebar-scroll > * { grid-column: auto; }
+}
+
+@media (max-width: 460px) {
+  .airview-top-actions .policy-filter-button span { display: none; }
+  .airview-top-actions .policy-filter-button { width: 38px; min-width: 38px; padding: 0; justify-content: center; }
+  .wifi-section-head { align-items: flex-start; }
+  .wifi-radio-options.compact { justify-content: flex-start; }
+  .wifi-inline-setting { align-items: flex-start; flex-direction: column; }
+  .wifi-inline-setting > input { width: 100%; }
+  .wifi-sheet { width: 100vw; }
+  .wifi-sheet-body { padding-inline: 14px; }
+  .wifi-sheet .dwrt-kit-sheet-header { padding-inline: 14px; }
+  .airview-meter { width: 88px; }
+  .airview-ap-summary-card { grid-template-columns: 48px minmax(0, 1fr); padding: 14px; }
+  .airview-ap-sheet-image { width: 48px; height: 48px; }
+  .airview-ap-radio-list > div { grid-template-columns: minmax(0, 1fr) 42px 58px 42px; gap: 5px; font-size: 10px; }
+  .airview-ap-summary-card > footer,
+  .airview-ap-actions { grid-template-columns: 1fr; }
+  .airview-ap-facts { padding: 14px; }
+  .airview-spectrum-x span:nth-child(even) { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wifi-management-shell *,
+  .wifi-management-shell *::before,
+  .wifi-management-shell *::after {
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+    animation-duration: .01ms !important;
+  }
+}

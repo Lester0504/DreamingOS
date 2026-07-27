@@ -108,7 +108,8 @@ define KernelPackage/fs-smbfs-common
 	CONFIG_SMBFS
   FILES:= \
 	$(LINUX_DIR)/fs/smb/common/cifs_arc4.ko@lt6.18 \
-	$(LINUX_DIR)/fs/smb/common/cifs_md4.ko
+	$(LINUX_DIR)/fs/smb/common/cifs_md4.ko \
+	$(LINUX_DIR)/fs/smb/common/smb_compress.ko@ge7.2
 endef
 
 define KernelPackage/fs-smbfs-common/description
@@ -444,7 +445,7 @@ $(eval $(call KernelPackage,fs-nilfs2))
 define KernelPackage/fs-nfs
   SUBMENU:=$(FS_MENU)
   TITLE:=NFS filesystem client support
-  DEPENDS:=+kmod-fs-nfs-common +kmod-dnsresolver
+  DEPENDS:=+kmod-fs-nfs +kmod-fs-nfs-common +kmod-dnsresolver
   KCONFIG:= \
 	CONFIG_NFS_FS \
 	CONFIG_NFS_USE_LEGACY_DNS=n \
@@ -504,9 +505,11 @@ define KernelPackage/fs-nfs-common-rpcsec
 	CONFIG_SUNRPC_GSS \
 	CONFIG_RPCSEC_GSS_KRB5
   FILES:= \
+	$(LINUX_DIR)/crypto/krb5enc.ko@ge7.2 \
+	$(LINUX_DIR)/crypto/krb5/krb5.ko@ge7.2 \
 	$(LINUX_DIR)/net/sunrpc/auth_gss/auth_rpcgss.ko \
 	$(LINUX_DIR)/net/sunrpc/auth_gss/rpcsec_gss_krb5.ko
-  AUTOLOAD:=$(call AutoLoad,31,auth_rpcgss rpcsec_gss_krb5)
+  AUTOLOAD:=$(call AutoLoad,31,krb5enc@ge7.2 krb5@ge7.2 auth_rpcgss rpcsec_gss_krb5)
 endef
 
 define KernelPackage/fs-nfs-common-rpcsec/description
@@ -519,7 +522,7 @@ $(eval $(call KernelPackage,fs-nfs-common-rpcsec))
 define KernelPackage/fs-nfs-v3
   SUBMENU:=$(FS_MENU)
   TITLE:=NFS3 filesystem client support
-  DEPENDS:=+kmod-fs-nfs
+  DEPENDS:=+kmod-fs-nfs +kmod-fs-nfs-common
   FILES:= \
 	$(LINUX_DIR)/fs/nfs/nfsv3.ko
   AUTOLOAD:=$(call AutoLoad,41,nfsv3)
@@ -535,7 +538,7 @@ $(eval $(call KernelPackage,fs-nfs-v3))
 define KernelPackage/fs-nfs-v4
   SUBMENU:=$(FS_MENU)
   TITLE:=NFS4 filesystem client support
-  DEPENDS:=+kmod-fs-nfs
+  DEPENDS:=+kmod-fs-nfs +kmod-fs-nfs-common
   KCONFIG:= \
 	CONFIG_NFS_V4=y
   FILES:= \
@@ -555,7 +558,7 @@ $(eval $(call KernelPackage,fs-nfs-v4))
 define KernelPackage/fs-nfsd
   SUBMENU:=$(FS_MENU)
   TITLE:=NFS kernel server support
-  DEPENDS:=+kmod-fs-nfs-common +kmod-fs-exportfs +kmod-fs-nfs-common-rpcsec
+  DEPENDS:=+kmod-fs-nfs +kmod-fs-nfs-common +kmod-fs-exportfs +kmod-fs-nfs-common-rpcsec
   KCONFIG:= \
 	CONFIG_NFSD \
 	CONFIG_NFSD_V4=y \
@@ -578,8 +581,12 @@ $(eval $(call KernelPackage,fs-nfsd))
 
 define KernelPackage/fs-ntfs3
   SUBMENU:=$(FS_MENU)
-  TITLE:=NTFS filesystem read & write (new driver) support
-  KCONFIG:= CONFIG_NTFS3_FS CONFIG_NTFS3_FS_POSIX_ACL=y
+  TITLE:=NTFS3 Read-Write file system support
+  DEPENDS:=+kmod-nls-base
+  KCONFIG:= \
+	CONFIG_NTFS3_FS \
+	CONFIG_NTFS3_LZX_XPRESS=y \
+	CONFIG_NTFS3_FS_POSIX_ACL=y
   FILES:=$(LINUX_DIR)/fs/ntfs3/ntfs3.ko
   $(call AddDepends/nls)
   AUTOLOAD:=$(call AutoLoad,80,ntfs3)

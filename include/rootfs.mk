@@ -121,6 +121,18 @@ define prepare_rootfs
 		$(1)/usr/lib/opkg/info/*.postinst* \
 		$(1)/usr/lib/opkg/lists/* \
 		$(1)/var/lock/*.lock
+	@if [ -f "$(TOPDIR)/upx_list.txt" ]; then \
+		while IFS= read -r file; do \
+			$(STAGING_DIR_HOST)/bin/upx --lzma --best "$(1)$$file" || true; \
+		done < "$(TOPDIR)/upx_list.txt"; \
+	fi
+	chmod 600 $(1)/etc/config/*
+	@( \
+		if [ "$(call qstrip,$(CONFIG_TARGET_ROOTFS_LOCAL_PACKAGES))" = y ]; then \
+			$(CP) $(TOPDIR)/bin/targets/$(BOARD)/$(SUBTARGET)/packages $(1)/usr/share/openwrt_core; \
+			$(SED) "/openwrt_core/c\src/gz openwrt_core file:///usr/share/openwrt_core" $(1)/etc/opkg/distfeeds.conf; \
+		fi; \
+	)
 	$(call clean_ipkg,$(1))
 	$(call mklibs,$(1))
 	$(if $(SOURCE_DATE_EPOCH),find $(1)/ -mindepth 1 -execdir touch -hcd "@$(SOURCE_DATE_EPOCH)" "{}" +)

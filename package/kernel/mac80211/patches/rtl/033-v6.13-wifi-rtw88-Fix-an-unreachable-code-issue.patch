@@ -1,0 +1,25 @@
+From fff1c8f7956ce46172d6a82097fe983a184531c8 Mon Sep 17 00:00:00 2001
+From: Dheeraj Reddy Jonnalagadda <dheeraj.linuxdev@gmail.com>
+Date: Fri, 22 Nov 2024 17:44:59 +0530
+Subject: [PATCH 3/3] wifi: rtw88: Fix an unreachable code issue
+
+The error handling in rtw8821a_iqk_tx_vdf_true() contained unreachable
+code due to tx_fail being explicitly set to false before the error check.
+This prevented proper handling of failures and resulted in dead code.
+
+Signed-off-by: Dheeraj Reddy Jonnalagadda <dheeraj.linuxdev@gmail.com>
+---
+ drivers/net/wireless/realtek/rtw88/rtw8821a.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+--- a/drivers/net/wireless/realtek/rtw88/rtw8821a.c
++++ b/drivers/net/wireless/realtek/rtw88/rtw8821a.c
+@@ -221,8 +221,6 @@ static void rtw8821a_iqk_tx_vdf_true(str
+ 				/* Originally: if (~tx_fail) {
+ 				 * It looks like a typo, so make it more explicit.
+ 				 */
+-				tx_fail = false;
+-
+ 				if (!tx_fail) {
+ 					rtw_write32(rtwdev, REG_RFECTL_A,
+ 						    0x02000000);

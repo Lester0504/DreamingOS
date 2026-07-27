@@ -495,8 +495,13 @@ define KernelPackage/usb-cdns
 	   +kmod-usb-roles
   KCONFIG:= \
 	CONFIG_USB_CDNS_SUPPORT
+ifeq ($(KERNEL_PATCHVER),7.2)
+  FILES:= $(LINUX_DIR)/drivers/usb/cdns3/cdns.ko
+  AUTOLOAD:=$(call AutoLoad,50,cdns,1)
+else
   FILES:= $(LINUX_DIR)/drivers/usb/cdns3/cdns-usb-common.ko
   AUTOLOAD:=$(call AutoLoad,50,cdns-usb-common,1)
+endif
 endef
 
 define KernelPackage/usb-cdns/description
@@ -515,8 +520,10 @@ define KernelPackage/usb-cdns3
 	CONFIG_USB_CDNS3 \
 	CONFIG_USB_CDNS3_GADGET=$(if $(CONFIG_USB_GADGET_SUPPORT),y,n) \
 	CONFIG_USB_CDNS3_HOST=$(if $(CONFIG_USB_SUPPORT),y,n)
+ifneq ($(KERNEL_PATCHVER),7.2)
   FILES:= $(LINUX_DIR)/drivers/usb/cdns3/cdns3.ko
   AUTOLOAD:=$(call AutoLoad,54,cdns3,1)
+endif
 endef
 
 define KernelPackage/usb-cdns3/description
@@ -2001,4 +2008,3 @@ define KernelPackage/chaoskey/description
 endef
 
 $(eval $(call KernelPackage,chaoskey))
-

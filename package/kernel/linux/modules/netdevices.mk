@@ -189,9 +189,14 @@ define KernelPackage/libphy
   KCONFIG:=CONFIG_PHYLIB \
 	   CONFIG_PHYLIB_LEDS=y \
 	   CONFIG_MDIO_BUS
-  FILES:=$(LINUX_DIR)/drivers/net/phy/libphy.ko \
-    $(LINUX_DIR)/drivers/net/phy/mdio-bus.ko@ge6.18
+  FILES:=$(LINUX_DIR)/drivers/net/phy/libphy.ko
+ifeq ($(KERNEL_PATCHVER),7.2)
+  FILES+=$(LINUX_DIR)/drivers/net/phy/mdio_bus.ko
+  AUTOLOAD:=$(call AutoLoad,15,libphy mdio_bus,1)
+else
+  FILES+=$(LINUX_DIR)/drivers/net/phy/mdio-bus.ko@ge6.18
   AUTOLOAD:=$(call AutoLoad,15,libphy mdio-bus@ge6.18,1)
+endif
 endef
 
 define KernelPackage/libphy/description
@@ -294,7 +299,7 @@ define KernelPackage/phy-maxlinear
    SUBMENU:=$(NETWORK_DEVICES_MENU)
    TITLE:=Maxlinear Ethernet PHY driver
    KCONFIG:=CONFIG_MAXLINEAR_GPHY
-   DEPENDS:=+kmod-libphy +kmod-hwmon-core +kmod-polynomial
+   DEPENDS:=+kmod-libphy +kmod-hwmon-core +kmod-phy-package +kmod-polynomial
    FILES:=$(LINUX_DIR)/drivers/net/phy/mxl-gpy.ko
    AUTOLOAD:=$(call AutoLoad,18,mxl-gpy,1)
 endef
@@ -563,7 +568,7 @@ define KernelPackage/phy-realtek
    TITLE:=Realtek Ethernet PHY driver
    KCONFIG:=CONFIG_REALTEK_PHY \
     CONFIG_REALTEK_PHY_HWMON=y
-   DEPENDS:=+kmod-libphy +kmod-hwmon-core
+   DEPENDS:=+kmod-libphy +kmod-hwmon-core +kmod-phy-package
    FILES:=$(LINUX_DIR)/drivers/net/phy/realtek/realtek.ko
    AUTOLOAD:=$(call AutoLoad,18,realtek,1)
 endef
@@ -646,8 +651,9 @@ define KernelPackage/phy-airoha-en8811h
   DEPENDS:=+airoha-en8811h-firmware +kmod-libphy
   KCONFIG:=CONFIG_AIR_EN8811H_PHY
   FILES:= \
-   $(LINUX_DIR)/drivers/net/phy/air_en8811h.ko
-  AUTOLOAD:=$(call AutoLoad,18,air_en8811h,1)
+	$(LINUX_DIR)/drivers/net/phy/air_phy_lib.ko@ge7.2 \
+	$(LINUX_DIR)/drivers/net/phy/air_en8811h.ko
+  AUTOLOAD:=$(call AutoLoad,18,air_phy_lib@ge7.2 air_en8811h,1)
 endef
 
 define KernelPackage/phy-airoha-en8811h/description
@@ -694,8 +700,9 @@ define KernelPackage/dwmac-motorcomm
   TITLE:=Motorcomm PCI DWMAC support
   DEPENDS:=@PCI_SUPPORT +kmod-phy-motorcomm +kmod-stmmac-core
   KCONFIG:=CONFIG_DWMAC_MOTORCOMM
-  FILES:=$(LINUX_DIR)/drivers/net/ethernet/stmicro/stmmac/dwmac-motorcomm.ko
-  AUTOLOAD:=$(call AutoProbe,dwmac-motorcomm,1)
+  FILES:=$(LINUX_DIR)/drivers/net/ethernet/stmicro/stmmac/stmmac_libpci.ko \
+    $(LINUX_DIR)/drivers/net/ethernet/stmicro/stmmac/dwmac-motorcomm.ko
+  AUTOLOAD:=$(call AutoProbe,stmmac_libpci dwmac-motorcomm,1)
 endef
 
 define KernelPackage/dwmac-motorcomm/description
@@ -875,14 +882,14 @@ define KernelPackage/dsa-mxl862xx
   SUBMENU:=Network Devices
   TITLE:=MaxLinear MXL862 switch support
   KCONFIG:= \
-    CONFIG_NET_DSA_TAG_MXL_862XX \
-    CONFIG_NET_DSA_TAG_MXL_862XX_8021Q \
-    CONFIG_NET_DSA_MXL862
+	CONFIG_NET_DSA_TAG_MXL_862XX \
+	CONFIG_NET_DSA_TAG_MXL_862XX_8021Q@lt7.2 \
+	CONFIG_NET_DSA_MXL862
   DEPENDS:=+kmod-dsa +kmod-lib-crc16 +kmod-phy-maxlinear
   FILES:= \
-    $(LINUX_DIR)/drivers/net/dsa/mxl862xx/mxl862xx_dsa.ko \
-    $(LINUX_DIR)/net/dsa/tag_mxl862xx.ko \
-    $(LINUX_DIR)/net/dsa/tag_mxl862xx_8021q.ko
+	$(LINUX_DIR)/drivers/net/dsa/mxl862xx/mxl862xx_dsa.ko \
+	$(LINUX_DIR)/net/dsa/tag_mxl862xx.ko \
+	$(LINUX_DIR)/net/dsa/tag_mxl862xx_8021q.ko@lt7.2
   AUTOLOAD:=$(call AutoProbe,mxl862xx_dsa)
 endef
 
@@ -1545,9 +1552,12 @@ define KernelPackage/ice
     CONFIG_ICE_HWMON=y \
     CONFIG_ICE_HWTS=n \
     CONFIG_ICE_SWITCHDEV=y
-  FILES:=$(LINUX_DIR)/drivers/net/ethernet/intel/ice/ice.ko
+  FILES:= \
+    $(LINUX_DIR)/drivers/net/ethernet/intel/libeth/libeth_xdp.ko \
+    $(LINUX_DIR)/drivers/net/ethernet/intel/ice/ice.ko
   AUTOLOAD:=$(call AutoProbe,ice)
 endef
+
 
 define KernelPackage/ice/description
   Kernel modules for Intel(R) Ethernet Controller E810 Series
@@ -1580,7 +1590,7 @@ $(eval $(call KernelPackage,iavf))
 define KernelPackage/b44
   TITLE:=Broadcom 44xx driver
   KCONFIG:=CONFIG_B44
-  DEPENDS:=@PCI_SUPPORT @!TARGET_bcm47xx_mips74k +!TARGET_bcm47xx:kmod-ssb +kmod-mii +kmod-libphy
+  DEPENDS:=@PCI_SUPPORT @!TARGET_bcm47xx_mips74k +!TARGET_bcm47xx:kmod-ssb +kmod-mii +kmod-libphy +kmod-fixed-phy
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   FILES:=$(LINUX_DIR)/drivers/net/ethernet/broadcom/b44.ko
   AUTOLOAD:=$(call AutoLoad,19,b44,1)
