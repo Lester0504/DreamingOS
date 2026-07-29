@@ -28,7 +28,8 @@ def require_all(text: str, needles: tuple[str, ...], scope: str) -> None:
 
 
 def test_schema_is_independent_config_db_override_and_version_bumped() -> None:
-    assert "#define AEGISXD_SCHEMA_VERSION 8" in INTERNAL
+    version = re.search(r"#define\s+AEGISXD_SCHEMA_VERSION\s+(\d+)", INTERNAL)
+    assert version and int(version.group(1)) >= 8
     require_all(DB, (
         "CREATE TABLE IF NOT EXISTS aegis_signature_policy_overrides",
         "PRIMARY KEY(gid,sid)",
@@ -104,6 +105,27 @@ def test_status_capabilities_and_counts() -> None:
         "aegisxd_signature_policy_counts_json",
         "ids_ips_signature_policy_counts",
     ), "status capabilities/counts")
+
+
+def test_effective_count_avoids_cross_database_n_plus_one() -> None:
+    fast_start = POLICY.index("int aegisxd_signature_policy_effective_enabled_count(void)")
+    fast_end = POLICY.index("static int aegisxd_suricata_action_token_len", fast_start)
+    fast = POLICY[fast_start:fast_end]
+
+    require_all(fast, (
+        "SELECT sid,target_rev,suppressed,enabled_override FROM",
+        'AEGISXD_SIGNATURE_POLICY_TABLE " WHERE gid=1 ORDER BY sid"',
+        "SELECT COUNT(*) FROM aegis_suricata_rules",
+        "WHERE rule_text<>'' AND enabled_default<>0",
+        "WHERE rule_text<>'' ORDER BY sid",
+        "rows[pos].sid < sid",
+        "rows[pos].target_rev == rev",
+        "aegisxd_signature_policy_effective_enabled_count_slow()",
+    ), "effective signature count optimized path")
+    assert "aegisxd_signature_override_load(" not in fast, \
+        "the normal count path must not query config.db once per Suricata rule"
+    assert "allocation_failed" in fast, \
+        "partial override snapshots must fail over instead of silently changing policy semantics"
 
 
 def test_no_runtime_dataplane_false_claim_on_policy_set() -> None:

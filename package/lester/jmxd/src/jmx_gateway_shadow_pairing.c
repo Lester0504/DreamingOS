@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -35,6 +36,10 @@
 
 #ifndef O_NOFOLLOW
 #define O_NOFOLLOW 0
+#endif
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
 #endif
 
 #define GS_PAIR_DB_DEFAULT "/etc/dreamingwrt/config.db"
@@ -964,6 +969,57 @@ done:
     sqlite3_finalize(statement);
     if (database) sqlite3_close(database);
     return status;
+}
+
+int jmx_gateway_shadow_pairing_available(void)
+{
+    EVP_PKEY_CTX *context = NULL;
+    const char *database = gs_pair_db_path();
+    const char *state_dir = gs_pair_dir();
+    char parent[PATH_MAX];
+    const char *separator;
+    size_t length;
+    int ok;
+
+    /* Ed25519 must be present in this libcrypto build. */
+    context = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+    if (!context) return 0;
+    ok = EVP_PKEY_keygen_init(context) > 0;
+    EVP_PKEY_CTX_free(context);
+    if (!ok) return 0;
+
+    /*
+     * Pairing state lives in the config database.  Require a writable database
+     * when it exists, otherwise a writable parent directory, so a read-only
+     * rootfs is reported honestly instead of failing only once the operator
+     * presses the pairing button.
+     */
+    if (access(database, F_OK) == 0) {
+        if (access(database, R_OK | W_OK) != 0) return 0;
+    } else {
+        separator = strrchr(database, '/');
+        if (!separator || separator == database) return 0;
+        length = (size_t)(separator - database);
+        if (length >= sizeof(parent)) return 0;
+        memcpy(parent, database, length);
+        parent[length] = '\0';
+        if (access(parent, W_OK | X_OK) != 0) return 0;
+    }
+
+    /*
+     * The private identity key and pending pairing codes need a private
+     * directory.  Accept an existing private directory, or a writable parent
+     * that lets gs_prepare_dir() create one later.
+     */
+    if (access(state_dir, F_OK) == 0)
+        return access(state_dir, R_OK | W_OK | X_OK) == 0;
+    separator = strrchr(state_dir, '/');
+    if (!separator || separator == state_dir) return 0;
+    length = (size_t)(separator - state_dir);
+    if (length >= sizeof(parent)) return 0;
+    memcpy(parent, state_dir, length);
+    parent[length] = '\0';
+    return access(parent, W_OK | X_OK) == 0;
 }
 
 struct json_object *jmx_gateway_shadow_pairing_identity(void)

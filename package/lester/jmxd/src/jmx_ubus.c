@@ -74,6 +74,7 @@ static u_int32_t last_traffic_time = 0;
 struct ubus_context *ubus_ctx = NULL;
 static struct blob_buf b;
 static struct uloop_timeout jmx_ubus_reconnect_timer;
+static struct uloop_timeout jmx_ubus_health_timer;
 static const char *jmx_ubus_path_primary = "/var/run/ubus/ubus.sock";
 static const char *jmx_ubus_path_fallback = "/var/run/ubus.sock";
 
@@ -4460,12 +4461,6 @@ static struct json_object *jmx_api_system_kernel_restore_wrap(struct json_object
     return jmx_system_kernel_restore_defaults(req_obj);
 }
 
-static struct json_object *jmx_api_system_backup_create_wrap(struct json_object *req_obj)
-{
-    return jmx_system_backup_create(req_obj);
-}
-
-
 static struct json_object *jmx_api_system_service_set_wrap(struct json_object *req_obj)
 {
     return jmx_system_service_set(req_obj);
@@ -4495,7 +4490,6 @@ static struct json_object *jmx_api_signature_resolve_app_wrap(struct json_object
 static struct json_object *jmx_api_signature_update_validate_wrap(struct json_object *req_obj){return jmx_signature_update_validate(req_obj);}
 static struct json_object *jmx_api_signature_update_apply_wrap(struct json_object *req_obj){return jmx_signature_update_apply(req_obj);}
 static struct json_object *jmx_api_signature_update_status_wrap(struct json_object *req_obj){return jmx_signature_update_status(req_obj);}
-static struct json_object *jmx_api_system_backup_history_wrap(struct json_object *req_obj){return jmx_system_backup_history(req_obj);}
 static struct json_object *jmx_api_system_disabled_functions_get_wrap(struct json_object *req_obj){(void)req_obj;return jmx_system_disabled_functions_get();}
 static struct json_object *jmx_api_system_disabled_functions_set_wrap(struct json_object *req_obj){return jmx_system_disabled_functions_set(req_obj);}
 static struct json_object *jmx_api_system_services_status_wrap(struct json_object *req_obj){return jmx_system_services_status(req_obj);}
@@ -4670,12 +4664,10 @@ static jmx_api_node_t jmx_api_node_list[] = {
     {"dreamingwrt_system_settings_get", jmx_api_system_settings_get_wrap},
     {"dreamingwrt_system_settings_set", jmx_api_system_settings_set_wrap},
     {"dreamingwrt_system_settings_apply", jmx_api_system_settings_apply_wrap},
-    {"dreamingwrt_system_backup_create", jmx_api_system_backup_create_wrap},
     {"dreamingwrt_system_kernel_restore_defaults", jmx_api_system_kernel_restore_wrap},
 
     {"dreamingwrt_service_set", jmx_api_system_service_set_wrap},
     {"dreamingwrt_cron_set", jmx_api_system_cron_set_wrap},
-    {"dreamingwrt_system_backup_history", jmx_api_system_backup_history_wrap},
     {"dreamingwrt_system_disabled_functions_get", jmx_api_system_disabled_functions_get_wrap},
     {"dreamingwrt_system_disabled_functions_set", jmx_api_system_disabled_functions_set_wrap},
     {"dreamingwrt_system_services_status", jmx_api_system_services_status_wrap},
@@ -4965,9 +4957,23 @@ static int jmx_ubus_reconnect_now(void)
         return rc;
     }
     ubus_ctx->connection_lost = jmx_ubus_connection_lost;
-    if (jmx_ubus_register_objects() != 0)
-        return -1;
+    /*
+     * Re-arm the freshly reconnected socket in uloop BEFORE object
+     * registration.  ubus_reconnect() opened a new socket fd but left it
+     * outside the epoll set; object registration below issues synchronous
+     * request/response round-trips on that fd.  If registration failed and we
+     * returned early (the previous behaviour), the live ubus fd was never
+     * added to uloop, so the main loop stayed idle in epoll_wait while every
+     * inbound method invoke hung forever (ubus list still worked from the
+     * cached registration).  Adding the socket first guarantees the control
+     * plane is serviceable and lets the reconnect timer retry registration on
+     * its own cadence instead of orphaning the connection.
+     */
     jmx_ubus_add_uloop();
+    if (jmx_ubus_register_objects() != 0) {
+        LOG_ERROR("ubus reconnected but object registration failed; will retry\n");
+        return -1;
+    }
     LOG_WARN("ubus reconnected and objects re-registered\n");
     return 0;
 }
@@ -4986,6 +4992,30 @@ static void jmx_ubus_connection_lost(struct ubus_context *ctx)
         uloop_fd_delete(&ctx->sock);
     if (!jmx_ubus_reconnect_timer.pending)
         uloop_timeout_set(&jmx_ubus_reconnect_timer, 2000);
+}
+
+/*
+ * Self-healing control-plane watchdog.  The observer-only core watchdog only
+ * detects a stalled/livelocked main loop; it cannot see the specific failure
+ * where the loop is healthy (heartbeat fires) but the ubus socket has fallen
+ * out of the epoll set after a reconnect edge case.  In that state the object
+ * stays registered on ubusd yet no inbound invoke is ever read, so every
+ * dreamingwrt method times out.  This lightweight timer re-arms the socket if
+ * it observes a live fd that is no longer registered in uloop, closing that
+ * gap without ever touching ubus from a foreign thread.
+ */
+#ifndef JMX_UBUS_HEALTH_INTERVAL_MS
+#define JMX_UBUS_HEALTH_INTERVAL_MS 5000
+#endif
+static void jmx_ubus_health_cb(struct uloop_timeout *t)
+{
+    if (ubus_ctx && ubus_ctx->sock.fd >= 0 && !ubus_ctx->sock.registered &&
+        !jmx_ubus_reconnect_timer.pending) {
+        LOG_ERROR("ubus socket fd=%d present but not registered in uloop; "
+                  "re-arming control plane\n", ubus_ctx->sock.fd);
+        jmx_ubus_add_uloop();
+    }
+    uloop_timeout_set(t, JMX_UBUS_HEALTH_INTERVAL_MS);
 }
 
 int jmx_ubus_init(void)
@@ -5008,6 +5038,8 @@ int jmx_ubus_init(void)
         return -EIO;
     }
     jmx_ubus_add_uloop();
+    jmx_ubus_health_timer.cb = jmx_ubus_health_cb;
+    uloop_timeout_set(&jmx_ubus_health_timer, JMX_UBUS_HEALTH_INTERVAL_MS);
     atexit(jmx_ubus_cleanup_at_exit);
     return 0;
 }

@@ -252,9 +252,10 @@ def test_apply_consumes_preflight_before_attempting_activation() -> None:
 def test_apply_is_fail_closed_while_pairing_or_dependencies_are_unready() -> None:
     source = module_source()
     apply = c_function(source, "jmx_gateway_shadow_apply")
+    preflight = c_function(source, "jmx_gateway_shadow_preflight")
 
-    assert "mutual_authenticated_peer_pairing_pending" in apply, (
-        "phase-one apply must report pairing pending"
+    assert "mutual_authenticated_peer_pairing_pending" in apply + preflight, (
+        "the apply preflight path must report pairing pending"
     )
     assert "capability_disabled" in apply or "preflight_failed" in apply, (
         "unready apply must return a fail-closed error"

@@ -60,6 +60,7 @@
 #include "storage/storage_overview.h"
 #include "storage/storage_files.h"
 #include "storage/file_services.h"
+#include "storage/storage_blockdev.h"
 #include "system/power.h"
 
 static const char *dw_vendor_for_mac(const char *mac);
@@ -23616,6 +23617,39 @@ static int dw_handle_file_services_get(struct ubus_context *ctx, struct ubus_obj
     return 0;
 }
 
+static int dw_handle_storage_partitions(struct ubus_context *ctx,
+                                        struct ubus_object *obj,
+                                        struct ubus_request_data *req,
+                                        const char *method,
+                                        struct blob_attr *msg)
+{
+    (void)obj; (void)method; (void)msg;
+    dw_send_owned_json(ctx, req, jmx_storage_partitions_get());
+    return 0;
+}
+
+static int dw_handle_storage_raid(struct ubus_context *ctx,
+                                  struct ubus_object *obj,
+                                  struct ubus_request_data *req,
+                                  const char *method,
+                                  struct blob_attr *msg)
+{
+    (void)obj; (void)method; (void)msg;
+    dw_send_owned_json(ctx, req, jmx_storage_raid_get());
+    return 0;
+}
+
+static int dw_handle_storage_raid_scan(struct ubus_context *ctx,
+                                       struct ubus_object *obj,
+                                       struct ubus_request_data *req,
+                                       const char *method,
+                                       struct blob_attr *msg)
+{
+    (void)obj; (void)method; (void)msg;
+    dw_send_owned_json(ctx, req, jmx_storage_raid_scan());
+    return 0;
+}
+
 static int dw_handle_file_service_get(struct ubus_context *ctx, struct ubus_object *obj,
                                       struct ubus_request_data *req, const char *method,
                                       struct blob_attr *msg)
@@ -24625,9 +24659,54 @@ static int dw_handle_upnp_mapping_set(struct ubus_context *ctx, struct ubus_obje
     char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
     struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
     struct json_object *data = json_object_new_object();
-    json_object_object_add(data, "ok", json_object_new_boolean(0));
-    json_object_object_add(data, "error", json_object_new_string("upnp_static_mapping_unsupported"));
-    struct json_object *resp = jmx_gen_api_response_data(API_CODE_ERROR, data);
+    char port_owner[96] = {0};
+    int rc = jmx_upnp_mapping_set_ex(in, port_owner, sizeof(port_owner));
+    const char *err = NULL;
+
+    switch (rc) {
+    case 0:  break;
+    case -1: err = "storage_error"; break;
+    case -2: err = "upnp_mapping_invalid"; break;
+    case -3: err = "upnp_static_mapping_unsupported"; break;
+    case -4: err = "upnp_mapping_dataplane_failed"; break;
+    case -5: err = "upnp_mapping_port_conflict"; break;
+    case -6: err = "upnp_mapping_management_port"; break;
+    case -7: err = "upnp_mapping_local_listener"; break;
+    default: err = "upnp_mapping_save_failed"; break;
+    }
+    json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
+    json_object_object_add(data, "saved", json_object_new_boolean(rc == 0));
+    json_object_object_add(data, "applied", json_object_new_boolean(rc == 0));
+    json_object_object_add(data, "apply_state",
+        json_object_new_string(rc == 0 ? "applied" :
+                               rc == -2 ? "validation_failed" :
+                               rc == -3 ? "unsupported" :
+                               rc == -4 ? "apply_failed_rolled_back" :
+                               (rc == -5 || rc == -6 || rc == -7) ? "validation_failed" : "save_failed"));
+    /* -4 means the DB row was rolled back, so nothing is left claiming a
+     * mapping the kernel does not actually have. */
+    json_object_object_add(data, "runtime_rolled_back", json_object_new_boolean(rc == -4));
+    if (err) json_object_object_add(data, "error", json_object_new_string(err));
+    if (rc == -6 || rc == -7) {
+        if (port_owner[0])
+            json_object_object_add(data, "port_listener", json_object_new_string(port_owner));
+    }
+    if (rc == -6)
+        json_object_object_add(data, "message",
+            json_object_new_string("external port belongs to the management plane; "
+                                   "redirecting it would lock you out of the router"));
+    else if (rc == -7)
+        json_object_object_add(data, "message",
+            json_object_new_string("external port is already served by a local process on this "
+                                   "router; redirecting it would steal that service's traffic"));
+    if (rc == 0) {
+        struct json_object *st = jmx_upnp_static_status();
+        struct json_object *sd = NULL;
+        if (st && json_object_object_get_ex(st, "data", &sd) && sd)
+            json_object_object_add(data, "dataplane", json_object_get(sd));
+        if (st) json_object_put(st);
+    }
+    struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp); if (in) json_object_put(in); if (msg_json) free(msg_json);
     return 0;
@@ -25018,11 +25097,75 @@ static int dw_handle_upnp_mapping_delete(struct ubus_context *ctx, struct ubus_o
     char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
     struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
     struct json_object *data = json_object_new_object();
-    json_object_object_add(data, "ok", json_object_new_boolean(0));
-    json_object_object_add(data, "error", json_object_new_string("upnp_static_mapping_unsupported"));
-    struct json_object *resp = jmx_gen_api_response_data(API_CODE_ERROR, data);
+    const char *id = dw_json_get_string(in, "id", "");
+    int rc = jmx_upnp_mapping_delete(id);
+    const char *err = NULL;
+
+    switch (rc) {
+    case 0:  break;
+    case 1:  err = "upnp_mapping_not_found"; break;
+    case -1: err = "storage_error"; break;
+    case -2: err = "upnp_mapping_invalid"; break;
+    case -3: err = "upnp_static_mapping_unsupported"; break;
+    case -4: err = "upnp_mapping_dataplane_failed"; break;
+    default: err = "upnp_mapping_delete_failed"; break;
+    }
+    json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
+    json_object_object_add(data, "deleted", json_object_new_boolean(rc == 0));
+    json_object_object_add(data, "apply_state",
+        json_object_new_string(rc == 0 ? "applied" :
+                               rc == 1 ? "not_found" :
+                               rc == -2 ? "validation_failed" :
+                               rc == -3 ? "unsupported" :
+                               rc == -4 ? "apply_failed" : "save_failed"));
+    if (err) json_object_object_add(data, "error", json_object_new_string(err));
+    if (rc == 0) {
+        struct json_object *st = jmx_upnp_static_status();
+        struct json_object *sd = NULL;
+        if (st && json_object_object_get_ex(st, "data", &sd) && sd)
+            json_object_object_add(data, "dataplane", json_object_get(sd));
+        if (st) json_object_put(st);
+    }
+    struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp); if (in) json_object_put(in); if (msg_json) free(msg_json);
+    return 0;
+}
+
+static int dw_handle_upnp_static_status(struct ubus_context *ctx, struct ubus_object *obj,
+                                        struct ubus_request_data *req, const char *method,
+                                        struct blob_attr *msg)
+{
+    (void)obj; (void)method; (void)msg;
+    struct json_object *resp = jmx_upnp_static_status();
+    dw_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return 0;
+}
+
+static int dw_handle_upnp_static_apply(struct ubus_context *ctx, struct ubus_object *obj,
+                                       struct ubus_request_data *req, const char *method,
+                                       struct blob_attr *msg)
+{
+    (void)obj; (void)method; (void)msg;
+    int rc = jmx_upnp_static_apply();
+    struct json_object *data = json_object_new_object();
+    json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
+    json_object_object_add(data, "applied", json_object_new_boolean(rc == 0));
+    if (rc == -3)
+        json_object_object_add(data, "error", json_object_new_string("upnp_static_mapping_unsupported"));
+    else if (rc != 0)
+        json_object_object_add(data, "error", json_object_new_string("upnp_mapping_dataplane_failed"));
+    if (rc == 0) {
+        struct json_object *st = jmx_upnp_static_status();
+        struct json_object *sd = NULL;
+        if (st && json_object_object_get_ex(st, "data", &sd) && sd)
+            json_object_object_add(data, "dataplane", json_object_get(sd));
+        if (st) json_object_put(st);
+    }
+    struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
+    dw_send_json(ctx, req, resp);
+    json_object_put(resp);
     return 0;
 }
 
@@ -25768,11 +25911,6 @@ static int dw_handle_system_settings_apply(struct ubus_context *ctx, struct ubus
                                           struct blob_attr *msg)
 { (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_system_settings_apply_result(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
-static int dw_handle_system_backup_create(struct ubus_context *ctx, struct ubus_object *obj,
-                                          struct ubus_request_data *req, const char *method,
-                                          struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_system_backup_create(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
-
 static int dw_handle_system_service_set(struct ubus_context *ctx, struct ubus_object *obj,
                                         struct ubus_request_data *req, const char *method,
                                         struct blob_attr *msg)
@@ -26051,74 +26189,6 @@ static int dw_handle_system_admin_password_set(struct ubus_context *ctx, struct 
     return 0;
 }
 
-static int dw_handle_system_flash_create_backup(struct ubus_context *ctx, struct ubus_object *obj,
-                                                struct ubus_request_data *req, const char *method,
-                                                struct blob_attr *msg)
-{
-    (void)obj; (void)method;
-    char *msg_json = NULL;
-    struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    struct json_object *resp = jmx_flash_create_backup(payload);
-
-    dw_send_json(ctx, req, resp);
-    json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
-    return 0;
-}
-
-static int dw_handle_system_flash_restore_backup(struct ubus_context *ctx, struct ubus_object *obj,
-                                                 struct ubus_request_data *req, const char *method,
-                                                 struct blob_attr *msg)
-{
-    (void)obj; (void)method;
-    char *msg_json = NULL;
-    struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    struct json_object *resp = jmx_flash_restore_backup(payload);
-
-    dw_send_json(ctx, req, resp);
-    json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
-    return 0;
-}
-
-static int dw_handle_system_flash_upload_firmware(struct ubus_context *ctx, struct ubus_object *obj,
-                                                  struct ubus_request_data *req, const char *method,
-                                                  struct blob_attr *msg)
-{
-    (void)obj; (void)method;
-    char *msg_json = NULL;
-    struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    struct json_object *resp = jmx_flash_upload_firmware(payload);
-
-    dw_send_json(ctx, req, resp);
-    json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
-    return 0;
-}
-
-static int dw_handle_system_flash_sysupgrade(struct ubus_context *ctx, struct ubus_object *obj,
-                                             struct ubus_request_data *req, const char *method,
-                                             struct blob_attr *msg)
-{
-    (void)obj; (void)method;
-    char *msg_json = NULL;
-    struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    struct json_object *resp = jmx_flash_sysupgrade(payload);
-
-    dw_send_json(ctx, req, resp);
-    json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
-    return 0;
-}
-
 static int dw_handle_system_flash_factory_reset(struct ubus_context *ctx, struct ubus_object *obj,
                                                 struct ubus_request_data *req, const char *method,
                                                 struct blob_attr *msg)
@@ -26237,8 +26307,6 @@ static int dw_handle_signature_db_carriers(struct ubus_context *ctx, struct ubus
 { (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_signature_db_carriers(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 static int dw_handle_signature_db_carrier_prefixes(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
 { (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_signature_db_carrier_prefixes(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
-static int dw_handle_system_backup_history(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_system_backup_history(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 static int dw_handle_system_disabled_functions_get(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
 { (void)obj; (void)method; (void)msg; struct json_object *resp = jmx_system_disabled_functions_get(); dw_send_json(ctx, req, resp); json_object_put(resp); return 0; }
 static int dw_handle_system_disabled_functions_set(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
@@ -28012,6 +28080,8 @@ static struct ubus_method dw_methods[] = {
     UBUS_METHOD("upnp_mappings_list", dw_handle_upnp_mappings_list, dw_empty_policy),
     UBUS_METHOD("upnp_mapping_delete", dw_handle_upnp_mapping_delete, dw_empty_policy),
     UBUS_METHOD("upnp_mapping_set", dw_handle_upnp_mapping_set, dw_empty_policy),
+    UBUS_METHOD("upnp_static_status", dw_handle_upnp_static_status, dw_empty_policy),
+    UBUS_METHOD("upnp_static_apply", dw_handle_upnp_static_apply, dw_empty_policy),
     /* Advanced Routing sub-resource ubus methods */
     UBUS_METHOD("routing_static_routes_get", dw_handle_routing_static_routes_get, dw_empty_policy),
     UBUS_METHOD("routing_static_route_set", dw_handle_routing_static_route_set, dw_empty_policy),
@@ -28109,7 +28179,6 @@ static struct ubus_method dw_methods[] = {
     UBUS_METHOD("dreamingwrt_system_settings_set", dw_handle_system_settings_set, dw_empty_policy),
     UBUS_METHOD("dreamingwrt_system_settings_apply", dw_handle_system_settings_apply, dw_empty_policy),
     UBUS_METHOD("dreamingwrt_system_settings_draft_apply", dw_handle_system_settings_draft_apply, dw_empty_policy),
-    UBUS_METHOD("dreamingwrt_system_backup_create", dw_handle_system_backup_create, dw_empty_policy),
     UBUS_METHOD("dreamingwrt_service_set", dw_handle_system_service_set, dw_empty_policy),
     UBUS_METHOD("dreamingwrt_cron_set", dw_handle_system_cron_set, dw_empty_policy),
     UBUS_METHOD("system_kernel_restore_defaults", dw_handle_system_kernel_restore_defaults, dw_empty_policy),
@@ -28124,10 +28193,6 @@ static struct ubus_method dw_methods[] = {
     UBUS_METHOD("system_admin_avatar_set", dw_handle_system_admin_avatar_set, dw_empty_policy),
     UBUS_METHOD("system_admin_rename", dw_handle_system_admin_rename, dw_empty_policy),
     UBUS_METHOD("system_admin_password_set", dw_handle_system_admin_password_set, dw_empty_policy),
-    UBUS_METHOD("system_flash_create_backup", dw_handle_system_flash_create_backup, dw_empty_policy),
-    UBUS_METHOD("system_flash_restore_backup", dw_handle_system_flash_restore_backup, dw_empty_policy),
-    UBUS_METHOD("system_flash_upload_firmware", dw_handle_system_flash_upload_firmware, dw_empty_policy),
-    UBUS_METHOD("system_flash_sysupgrade", dw_handle_system_flash_sysupgrade, dw_empty_policy),
     UBUS_METHOD("system_flash_factory_reset", dw_handle_system_flash_factory_reset, dw_empty_policy),
     UBUS_METHOD("system_flash_preserve_config_get", dw_handle_system_flash_preserve_config_get, dw_empty_policy),
     UBUS_METHOD("system_flash_preserve_config_set", dw_handle_system_flash_preserve_config_set, dw_empty_policy),
@@ -28163,7 +28228,6 @@ static struct ubus_method dw_methods[] = {
     UBUS_METHOD("setup_detect_wan_status", dw_handle_setup_detect_wan_status, dw_empty_policy),
     UBUS_METHOD("setup_assist_mode", dw_handle_setup_assist_mode, dw_empty_policy),
     UBUS_METHOD("setup_security_ssh_set", dw_handle_setup_security_ssh_set, dw_empty_policy),
-    UBUS_METHOD("system_backup_history", dw_handle_system_backup_history, dw_empty_policy),
     UBUS_METHOD("system_disabled_functions_get", dw_handle_system_disabled_functions_get, dw_empty_policy),
     UBUS_METHOD("system_disabled_functions_set", dw_handle_system_disabled_functions_set, dw_empty_policy),
     UBUS_METHOD("system_services_status", dw_handle_system_services_status, dw_empty_policy),
@@ -28220,6 +28284,9 @@ static struct ubus_method dw_methods[] = {
     /* Storage overview and file services */
     UBUS_METHOD("storage_overview", dw_handle_storage_overview, dw_empty_policy),
     UBUS_METHOD("storage_files", dw_handle_storage_files, dw_empty_policy),
+    UBUS_METHOD("storage_partitions", dw_handle_storage_partitions, dw_empty_policy),
+    UBUS_METHOD("storage_raid", dw_handle_storage_raid, dw_empty_policy),
+    UBUS_METHOD("storage_raid_scan", dw_handle_storage_raid_scan, dw_empty_policy),
     UBUS_METHOD("storage_file_content", dw_handle_storage_file_content,
                 dw_empty_policy),
     UBUS_METHOD("file_services_get", dw_handle_file_services_get, dw_empty_policy),

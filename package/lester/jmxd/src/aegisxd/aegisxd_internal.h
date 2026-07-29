@@ -97,10 +97,17 @@ int aegisxd_seed_builtin_feeds(void);
 struct json_object *aegisxd_status_json(void);
 struct json_object *aegisxd_feeds_json(void);
 struct json_object *aegisxd_feed_status_json(void);
+int aegisxd_job_result_ok(struct json_object *result);
+int aegisxd_job_running_count(void);
+int aegisxd_job_record_start(const char *job_id, const char *op,
+                             const char *feed_id, int dry_run);
+void aegisxd_job_record_pid(const char *job_id, pid_t pid);
+void aegisxd_job_record_finish(const char *job_id, struct json_object *result);
 struct json_object *aegisxd_feed_jobs_json(int *running_out);
 struct json_object *aegisxd_feed_update_start(struct json_object *body);
 int aegisxd_feed_update_worker_main(const char *job_id, const char *feed_id, int dry_run);
 struct json_object *aegisxd_feed_import_start(struct json_object *body);
+int aegisxd_feed_import_worker_main(const char *job_id, const char *feed_id);
 struct json_object *aegisxd_import_feed_id(const char *feed_id);
 struct json_object *aegisxd_feed_import_status_json(void);
 struct json_object *aegisxd_categories_json(void);

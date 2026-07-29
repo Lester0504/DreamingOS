@@ -22,6 +22,14 @@ extern "C" {
 /* Create the pairing-only schema in DREAMINGWRT_CONFIG_DB (idempotent). */
 int jmx_gateway_shadow_pairing_schema_ensure(void);
 
+/*
+ * Side-effect free capability probe.  Returns 1 when this build can actually
+ * run the pairing protocol: Ed25519 is available in libcrypto, the config
+ * database is writable, and the pairing state directory is usable.  No key is
+ * generated and no schema is created, so this is safe to call on read paths.
+ */
+int jmx_gateway_shadow_pairing_available(void);
+
 /* Return the public Ed25519 identity.  Private key material is never returned. */
 struct json_object *jmx_gateway_shadow_pairing_identity(void);
 

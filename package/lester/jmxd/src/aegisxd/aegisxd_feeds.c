@@ -83,7 +83,7 @@ static const char *aegisxd_job_result_error(struct json_object *result)
     return json_object_get_string(err) ? json_object_get_string(err) : "";
 }
 
-static int aegisxd_job_result_ok(struct json_object *result)
+int aegisxd_job_result_ok(struct json_object *result)
 {
     struct json_object *ok = NULL;
 
@@ -91,7 +91,7 @@ static int aegisxd_job_result_ok(struct json_object *result)
            json_object_get_boolean(ok);
 }
 
-static int aegisxd_job_running_count(void)
+int aegisxd_job_running_count(void)
 {
     sqlite3_stmt *st;
     sqlite3_stmt *up = NULL;
@@ -135,7 +135,7 @@ static int aegisxd_job_running_count(void)
     return running;
 }
 
-static int aegisxd_job_record_start(const char *job_id, const char *op,
+int aegisxd_job_record_start(const char *job_id, const char *op,
                                     const char *feed_id, int dry_run)
 {
     sqlite3_stmt *st;
@@ -159,7 +159,7 @@ static int aegisxd_job_record_start(const char *job_id, const char *op,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
-static void aegisxd_job_record_pid(const char *job_id, pid_t pid)
+void aegisxd_job_record_pid(const char *job_id, pid_t pid)
 {
     sqlite3_stmt *st;
 
@@ -174,7 +174,7 @@ static void aegisxd_job_record_pid(const char *job_id, pid_t pid)
     sqlite3_finalize(st);
 }
 
-static void aegisxd_job_record_finish(const char *job_id, struct json_object *result)
+void aegisxd_job_record_finish(const char *job_id, struct json_object *result)
 {
     sqlite3_stmt *st;
     const char *json_s = result ? json_object_to_json_string(result) : "{}";
@@ -734,8 +734,9 @@ struct json_object *aegisxd_feed_update_start(struct json_object *body)
 {
     const char *feed_id = aegisxd_json_str(body, "feed_id", "");
     int dry_run = aegisxd_json_bool(body, "dry_run", 1);
+    /* Keep the single-threaded ubus loop responsive during slow downloads. */
     int background = aegisxd_json_bool(body, "background",
-                       aegisxd_json_bool(body, "async", 0));
+                       aegisxd_json_bool(body, "async", 1));
     char job_id[128];
     pid_t pid;
 

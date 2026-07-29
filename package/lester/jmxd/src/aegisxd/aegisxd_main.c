@@ -16,6 +16,15 @@ int main(int argc, char **argv)
 
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
         return 1;
+    if (argc >= 2 && !strcmp(argv[1], "--feed-import-worker")) {
+        const char *job_id = argc >= 3 ? argv[2] : "";
+        const char *feed_id = argc >= 4 ? argv[3] : "";
+        int rc;
+
+        rc = aegisxd_feed_import_worker_main(job_id, feed_id);
+        curl_global_cleanup();
+        return rc;
+    }
     if (argc >= 2 && !strcmp(argv[1], "--feed-update-worker")) {
         const char *job_id = argc >= 3 ? argv[2] : "";
         const char *feed_id = argc >= 4 ? argv[3] : "";

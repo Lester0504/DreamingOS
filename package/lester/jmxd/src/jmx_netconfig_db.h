@@ -167,6 +167,9 @@ int  jmx_upnp_acl_set(struct json_object *acl);
 int  jmx_upnp_acl_delete(const char *id);
 int  jmx_upnp_mapping_delete(const char *id);
 int  jmx_upnp_service_apply(void);
+/* Static mapping dataplane (independent nft table, see jmx_netconfig_db.c) */
+struct json_object *jmx_upnp_static_status(void);
+int  jmx_upnp_static_apply(void);
 struct json_object *jmx_upnp_service_save_apply_result(struct json_object *cfg);
 struct json_object *jmx_upnp_acl_save_apply_result(struct json_object *acl);
 struct json_object *jmx_upnp_acl_delete_apply_result(const char *id);
@@ -225,6 +228,9 @@ int  jmx_vpn_certificate_set(struct json_object *cfg);
 struct json_object *jmx_bulk_ip_get(void);
 struct json_object *jmx_upnp_mappings_list(void);
 int  jmx_upnp_mapping_set(struct json_object *cfg);
+/* Same as jmx_upnp_mapping_set(), but reports the port's current listener so
+ * the caller can name the blocker. Return codes documented at the definition. */
+int  jmx_upnp_mapping_set_ex(struct json_object *cfg, char *owner, size_t owner_len);
 struct json_object *jmx_routing_static_routes_list(void);
 int  jmx_routing_static_route_set(struct json_object *cfg);
 int  jmx_routing_static_route_delete(const char *id);
@@ -357,17 +363,11 @@ int jmx_system_settings_apply(struct json_object *cfg);
 struct json_object *jmx_system_settings_save_apply_result(struct json_object *cfg);
 struct json_object *jmx_system_settings_apply_result(struct json_object *cfg);
 struct json_object *jmx_system_settings_draft_apply(struct json_object *cfg);
-struct json_object *jmx_system_backup_create(struct json_object *cfg);
-struct json_object *jmx_flash_create_backup(struct json_object *cfg);
-struct json_object *jmx_flash_restore_backup(struct json_object *cfg);
-struct json_object *jmx_flash_upload_firmware(struct json_object *cfg);
-struct json_object *jmx_flash_sysupgrade(struct json_object *cfg);
 struct json_object *jmx_flash_factory_reset(struct json_object *cfg);
 struct json_object *jmx_flash_preserve_config_get(struct json_object *cfg);
 struct json_object *jmx_flash_preserve_config_set(struct json_object *cfg);
 int jmx_system_cron_set(struct json_object *cfg);
 struct json_object *jmx_system_service_set(struct json_object *cfg);
-struct json_object *jmx_system_backup_history(struct json_object *cfg);
 struct json_object *jmx_system_disabled_functions_get(void);
 struct json_object *jmx_system_disabled_functions_set(struct json_object *cfg);
 struct json_object *jmx_system_services_status(struct json_object *cfg);

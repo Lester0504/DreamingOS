@@ -7,12 +7,15 @@
  * keepalived must never be started until a mutually authenticated peer exists.
  */
 #include "jmx_gateway_shadow.h"
+#include "jmx_gateway_shadow_pairing.h"
+#include "jmx_gateway_shadow_runtime.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <limits.h>
 #include <signal.h>
 #include <sqlite3.h>
 #include <stdint.h>
@@ -28,11 +31,22 @@
 extern struct json_object *jmx_gen_api_response_data(int code,
                                                      struct json_object *data_obj);
 
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
 #define GS_DB_PATH "/etc/dreamingwrt/config.db"
 #define GS_RUNTIME_DIR "/etc/dreamingwrt/gateway-shadow"
 #define GS_AUTH_KEY_PATH "/etc/dreamingwrt/gateway-shadow/auth.key"
-#define GS_KEEPALIVED_PID "/var/run/keepalived.pid"
-#define GS_CONNTRACKD_PID "/var/run/conntrackd.pid"
+/*
+ * These must match the Shadow-owned paths written by
+ * jmx_gateway_shadow_runtime.c, not the distribution-wide keepalived
+ * pidfile; otherwise status would report an unrelated instance.
+ */
+#define GS_KEEPALIVED_PID \
+    "/var/run/dreamingwrt-gateway-shadow-keepalived.pid"
+#define GS_CONNTRACKD_CTL \
+    "/var/run/dreamingwrt-gateway-shadow-conntrackd.ctl"
 
 static const char *gs_db_path(void)
 {
@@ -246,6 +260,39 @@ static int gs_ipv4(const char *text)
     return text && inet_pton(AF_INET, text, &address) == 1;
 }
 
+/*
+ * The runtime module requires heartbeat addresses inside the dedicated,
+ * non-routed 169.254/16 link-local range, excluding network and broadcast.
+ * Mirror that here so a draft that can never be applied is refused at save.
+ */
+static int gs_heartbeat_ipv4(const char *text)
+{
+    struct in_addr address;
+    uint32_t host;
+    if (!text || inet_pton(AF_INET, text, &address) != 1) return 0;
+    host = ntohl(address.s_addr);
+    return (host & 0xffff0000U) == 0xa9fe0000U &&
+           (host & 0x0000ffffU) != 0 && (host & 0x0000ffffU) != 0xffffU;
+}
+
+/* Mirror gs_virtual_ipv4(): reject 0.0.0.0, loopback, multicast, broadcast. */
+static int gs_usable_virtual_ipv4(const char *text)
+{
+    struct in_addr address;
+    char copy[64];
+    const char *slash;
+    size_t length;
+    uint32_t host;
+    if (!text || !(slash = strrchr(text, '/'))) return 0;
+    length = (size_t)(slash - text);
+    if (!length || length >= sizeof(copy)) return 0;
+    memcpy(copy, text, length); copy[length] = '\0';
+    if (inet_pton(AF_INET, copy, &address) != 1) return 0;
+    host = ntohl(address.s_addr);
+    return host != 0 && (host & 0xff000000U) != 0x7f000000U &&
+           (host & 0xf0000000U) != 0xe0000000U && host != 0xffffffffU;
+}
+
 static int gs_ipv4_cidr(const char *text)
 {
     char address[64];
@@ -291,16 +338,34 @@ static int gs_interface_exists(const char *name)
     return access(path, F_OK) == 0;
 }
 
-static int gs_binary_exists(const char *name)
+static int gs_binary_path(const char *name, char *out, size_t out_len)
 {
     static const char *dirs[] = { "/usr/sbin", "/usr/bin", "/sbin", "/bin" };
-    char path[128];
     size_t i;
+    if (!name || !name[0] || !out || out_len < 2) return 0;
     for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
-        snprintf(path, sizeof(path), "%s/%s", dirs[i], name);
-        if (access(path, X_OK) == 0) return 1;
+        int count = snprintf(out, out_len, "%s/%s", dirs[i], name);
+        if (count <= 0 || (size_t)count >= out_len) continue;
+        if (access(out, X_OK) == 0) return 1;
     }
+    out[0] = '\0';
     return 0;
+}
+
+static int gs_binary_exists(const char *name)
+{
+    char path[PATH_MAX];
+    return gs_binary_path(name, path, sizeof(path));
+}
+
+/*
+ * conntrackd has no pidfile.  The Shadow configuration pins a UNIX control
+ * socket, so its presence is the honest liveness signal for our instance.
+ */
+static int gs_conntrackd_running(void)
+{
+    struct stat status;
+    return lstat(GS_CONNTRACKD_CTL, &status) == 0 && S_ISSOCK(status.st_mode);
 }
 
 static const char *gs_json_string(struct json_object *obj, const char *key, const char *fallback)
@@ -349,6 +414,9 @@ static int gs_validate(struct json_object *cfg, struct json_object *errors)
     int priority = gs_json_int(cfg, "priority", 0);
     int advert = gs_json_int(cfg, "advert_interval_seconds", 0);
     char management_address[64] = "", vip_address[64] = "";
+    char vip_only[64] = "";
+
+    (void)gs_cidr_address(vip, vip_only, sizeof(vip_only));
 
 #define GS_ERR(code) json_object_array_add(errors, json_object_new_string(code))
     if (strcmp(role, "primary") && strcmp(role, "secondary")) GS_ERR("role_invalid");
@@ -356,13 +424,22 @@ static int gs_validate(struct json_object *cfg, struct json_object *errors)
     if (!gs_ipv4_cidr(management)) GS_ERR("management_ipv4_invalid");
     if (!gs_safe_ifname(heartbeat)) GS_ERR("heartbeat_interface_invalid");
     if (lan[0] && heartbeat[0] && !strcmp(lan, heartbeat)) GS_ERR("heartbeat_interface_must_be_dedicated");
-    if (!gs_ipv4(local)) GS_ERR("heartbeat_local_ip_invalid");
-    if (!gs_ipv4(peer)) GS_ERR("heartbeat_peer_ip_invalid");
+    if (!gs_heartbeat_ipv4(local)) GS_ERR("heartbeat_local_ip_invalid");
+    if (!gs_heartbeat_ipv4(peer)) GS_ERR("heartbeat_peer_ip_invalid");
     if (heartbeat_prefix < 1 || heartbeat_prefix > 32) GS_ERR("heartbeat_prefix_length_invalid");
     else if (gs_ipv4(local) && gs_ipv4(peer) &&
              !gs_same_ipv4_subnet(local, peer, heartbeat_prefix)) GS_ERR("heartbeat_addresses_not_same_subnet");
     if (local[0] && peer[0] && !strcmp(local, peer)) GS_ERR("heartbeat_addresses_must_differ");
-    if (!gs_ipv4_cidr(vip)) GS_ERR("virtual_ipv4_invalid");
+    if (!gs_ipv4_cidr(vip) || !gs_usable_virtual_ipv4(vip)) GS_ERR("virtual_ipv4_invalid");
+    if (gs_usable_virtual_ipv4(vip) &&
+        (!strcmp(vip_only, local) || !strcmp(vip_only, peer)))
+        GS_ERR("virtual_ipv4_conflicts_with_heartbeat");
+    /*
+     * Phase one renders "nopreempt" unconditionally and the runtime validator
+     * refuses preempt, so accepting it here would produce a draft that can be
+     * saved but never applied.
+     */
+    if (gs_json_bool(cfg, "preempt", 0)) GS_ERR("preempt_unsupported");
     if (gs_cidr_address(management, management_address, sizeof(management_address)) == 0 &&
         gs_cidr_address(vip, vip_address, sizeof(vip_address)) == 0 &&
         !strcmp(management_address, vip_address)) GS_ERR("management_ipv4_conflicts_with_virtual_ipv4");
@@ -380,21 +457,31 @@ static int gs_peer_paired(struct json_object *peer)
            gs_json_string(peer, "certificate_fingerprint", "")[0];
 }
 
+/*
+ * Every capability bit below is a runtime probe, never a literal.  Pairing is
+ * implemented in jmx_gateway_shadow_pairing.c and only needs libcrypto plus
+ * writable state, so it is advertised independently of keepalived.  Apply
+ * additionally needs a mutually authenticated peer and a real keepalived
+ * binary, because that is where VRRP is actually started.
+ */
 static struct json_object *gs_capabilities(int keepalived, int conntrackd, int paired)
 {
     struct json_object *cap = json_object_new_object();
+    int pairing = jmx_gateway_shadow_pairing_available();
     json_object_object_add(cap, "read", json_object_new_boolean(1));
     json_object_object_add(cap, "save", json_object_new_boolean(1));
     json_object_object_add(cap, "preflight", json_object_new_boolean(1));
     json_object_object_add(cap, "status", json_object_new_boolean(1));
-    json_object_object_add(cap, "pairing_supported", json_object_new_boolean(0));
-    json_object_object_add(cap, "apply_supported", json_object_new_boolean(0));
+    json_object_object_add(cap, "pairing_supported", json_object_new_boolean(pairing));
+    json_object_object_add(cap, "apply_supported",
+                           json_object_new_boolean(paired && keepalived));
     json_object_object_add(cap, "disable_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "vrrp_supported", json_object_new_boolean(keepalived));
     json_object_object_add(cap, "connection_sync_supported", json_object_new_boolean(conntrackd));
     json_object_object_add(cap, "secrets_write_only", json_object_new_boolean(1));
     json_object_object_add(cap, "session_continuity", json_object_new_string("best_effort"));
-    if (!paired) gs_add_string(cap, "reason", "mutual_authenticated_peer_pairing_pending");
+    if (!pairing) gs_add_string(cap, "reason", "pairing_runtime_unavailable");
+    else if (!paired) gs_add_string(cap, "reason", "mutual_authenticated_peer_pairing_pending");
     else if (!keepalived) gs_add_string(cap, "reason", "keepalived_not_installed");
     return cap;
 }
@@ -574,7 +661,8 @@ struct json_object *jmx_gateway_shadow_status(void)
     json_object_object_add(data, "keepalived_available", json_object_new_boolean(keepalived));
     json_object_object_add(data, "keepalived_running", json_object_new_boolean(gs_pid_alive(GS_KEEPALIVED_PID)));
     json_object_object_add(data, "conntrackd_available", json_object_new_boolean(conntrackd));
-    json_object_object_add(data, "conntrackd_running", json_object_new_boolean(gs_pid_alive(GS_CONNTRACKD_PID)));
+    json_object_object_add(data, "conntrackd_running",
+                           json_object_new_boolean(gs_conntrackd_running()));
     json_object_object_add(data, "virtual_ipv4_present", json_object_new_boolean(
         cfg ? gs_virtual_ip_present(gs_json_string(cfg, "lan_interface", ""),
                                     gs_json_string(cfg, "virtual_ipv4", "")) : 0));
@@ -622,12 +710,24 @@ struct json_object *jmx_gateway_shadow_preflight(struct json_object *payload)
     gs_check_add(checks, "keepalived", keepalived, "keepalived_not_installed");
     gs_check_add(checks, "conntrackd", !gs_json_bool(cfg, "connection_sync", 1) || conntrackd, "conntrackd_not_installed");
     gs_check_add(checks, "mutual_peer_trust", paired, "mutual_authenticated_peer_pairing_pending");
-    ready = 0; /* Pairing engine is not implemented in phase one. */
+    /*
+     * Real readiness.  Phase one still requires a mutually authenticated peer
+     * before keepalived may be started, so pairing is one term of the
+     * conjunction rather than a hard-coded blocker.
+     */
+    ready = valid && paired && keepalived &&
+            gs_interface_exists(gs_json_string(cfg, "lan_interface", "")) &&
+            gs_interface_exists(gs_json_string(cfg, "heartbeat_interface", "")) &&
+            (!gs_json_bool(cfg, "connection_sync", 1) || conntrackd);
     json_object_object_add(data, "ready", json_object_new_boolean(ready));
     json_object_object_add(data, "checks", checks);
     json_object_object_add(data, "errors", errors);
     json_object_object_add(data, "capabilities", gs_capabilities(keepalived, conntrackd, paired));
-    if (!ready) gs_add_string(data, "reason", !paired ? "mutual_authenticated_peer_pairing_pending" : "preflight_failed");
+    if (!ready)
+        gs_add_string(data, "reason",
+                      !paired ? "mutual_authenticated_peer_pairing_pending" :
+                      !keepalived ? "keepalived_not_installed" :
+                      !valid ? "configuration_invalid" : "preflight_failed");
     json_object_put(cfg); json_object_put(peer);
     return gs_response(1, data, NULL);
 }
@@ -730,37 +830,250 @@ save_failed:
                                              "gateway_shadow_save_failed");
 }
 
+/* Ensure the private runtime directory exists before rendering into it. */
+static int gs_runtime_dir_ensure(void)
+{
+    const char *runtime_dir = gs_runtime_dir();
+    struct stat status;
+    if (!getenv("DREAMINGWRT_GATEWAY_SHADOW_DIR") &&
+        mkdir("/etc/dreamingwrt", 0700) != 0 && errno != EEXIST)
+        return -1;
+    if (mkdir(runtime_dir, 0700) != 0 && errno != EEXIST) return -1;
+    if (lstat(runtime_dir, &status) != 0 || !S_ISDIR(status.st_mode)) return -1;
+    return chmod(runtime_dir, 0700) == 0 ? 0 : -1;
+}
+
+/* Persist the outcome of an apply attempt so status/ reflects reality. */
+static void gs_runtime_record(const char *state, const char *last_error,
+                              int managed_daemons, int touch_apply_time)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    if (gs_open(&db) != 0) return;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE gateway_shadow_runtime SET state=?1,last_error=?2,"
+            "managed_daemons=?3,last_transition_at=?4,"
+            "last_apply_at=CASE WHEN ?5 THEN ?4 ELSE last_apply_at END,"
+            "updated_at=?4 WHERE id=1", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, state ? state : "unknown", -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, last_error ? last_error : "", -1, SQLITE_STATIC);
+        sqlite3_bind_int(st, 3, managed_daemons ? 1 : 0);
+        sqlite3_bind_int64(st, 4, gs_now());
+        sqlite3_bind_int(st, 5, touch_apply_time ? 1 : 0);
+        (void)sqlite3_step(st);
+    }
+    if (st) sqlite3_finalize(st);
+    sqlite3_close(db);
+}
+
+static void gs_runtime_result_add(struct json_object *data, const char *key,
+                                  const struct jmx_gateway_shadow_runtime_result *result)
+{
+    struct json_object *node = json_object_new_object();
+    json_object_object_add(node, "code", json_object_new_int(result->code));
+    if (result->system_errno)
+        json_object_object_add(node, "errno", json_object_new_int(result->system_errno));
+    if (result->child_exit_status)
+        json_object_object_add(node, "child_exit_status",
+                               json_object_new_int(result->child_exit_status));
+    if (result->message[0]) gs_add_string(node, "message", result->message);
+    if (result->child_output[0]) gs_add_string(node, "output", result->child_output);
+    json_object_object_add(data, key, node);
+}
+
+/*
+ * Apply is the only entry point that starts VRRP.  It refuses to act unless
+ * preflight reports ready, which includes a mutually authenticated peer, a real
+ * keepalived binary, and existing interfaces.  Rendering, config-testing, and
+ * daemon control are delegated to jmx_gateway_shadow_runtime.c so that this
+ * control plane never writes daemon files or execs binaries itself.
+ */
 struct json_object *jmx_gateway_shadow_apply(struct json_object *payload)
 {
     sqlite3 *db = NULL;
     struct json_object *data = json_object_new_object();
     struct json_object *preflight = jmx_gateway_shadow_preflight(payload);
-    struct json_object *preflight_data = NULL;
-    struct json_object *ready_value = NULL;
-    int ready = 0;
+    struct json_object *preflight_data = NULL, *value = NULL, *cfg = NULL, *peer = NULL;
+    struct jmx_gateway_shadow_runtime_config runtime;
+    struct jmx_gateway_shadow_runtime_result result;
+    char keepalived_bin[PATH_MAX], conntrackd_bin[PATH_MAX];
+    const char *reason = NULL;
+    int ready = 0, keepalived, conntrackd, paired, sync_wanted, enabled;
+    int keepalived_was_running, managed = 0, rc;
+
     if (preflight && json_object_object_get_ex(preflight, "data", &preflight_data) &&
-        preflight_data && json_object_object_get_ex(preflight_data, "ready", &ready_value))
-        ready = json_object_get_boolean(ready_value);
-    if (jmx_gateway_shadow_schema_ensure() == 0 && gs_open(&db) == 0) {
-        sqlite3_stmt *st = NULL;
-        if (sqlite3_prepare_v2(db, "UPDATE gateway_shadow_runtime SET state='blocked',"
-                                  "last_error='mutual_authenticated_peer_pairing_pending',updated_at=?1 WHERE id=1",
-                               -1, &st, NULL) == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, gs_now()); (void)sqlite3_step(st);
-        }
-        if (st) sqlite3_finalize(st); sqlite3_close(db);
+        preflight_data && json_object_object_get_ex(preflight_data, "ready", &value))
+        ready = json_object_get_boolean(value);
+    if (preflight_data && json_object_object_get_ex(preflight_data, "reason", &value) &&
+        value && json_object_is_type(value, json_type_string))
+        reason = json_object_get_string(value);
+
+    keepalived = gs_binary_path("keepalived", keepalived_bin, sizeof(keepalived_bin));
+    conntrackd = gs_binary_path("conntrackd", conntrackd_bin, sizeof(conntrackd_bin));
+
+    if (jmx_gateway_shadow_schema_ensure() != 0 || gs_open(&db) != 0) {
+        if (preflight) json_object_put(preflight);
+        json_object_put(data);
+        return gs_response(0, NULL, "gateway_shadow_storage_unavailable");
     }
-    json_object_object_add(data, "persisted", json_object_new_boolean(0));
-    json_object_object_add(data, "applied", json_object_new_boolean(0));
-    json_object_object_add(data, "changed", json_object_new_boolean(0));
-    json_object_object_add(data, "rollback_available", json_object_new_boolean(0));
+    cfg = gs_config_read(db);
+    peer = gs_peer_read(db);
+    sqlite3_close(db);
+    if (!cfg || !peer) {
+        if (cfg) json_object_put(cfg);
+        if (peer) json_object_put(peer);
+        if (preflight) json_object_put(preflight);
+        json_object_put(data);
+        return gs_response(0, NULL, "gateway_shadow_read_failed");
+    }
+    paired = gs_peer_paired(peer);
+    enabled = gs_json_bool(cfg, "enabled", 0);
+    sync_wanted = gs_json_bool(cfg, "connection_sync", 1);
+
     json_object_object_add(data, "preflight_ready", json_object_new_boolean(ready));
-    if (preflight_data) json_object_object_add(data, "preflight", json_object_get(preflight_data));
-    gs_add_string(data, "reason", "mutual_authenticated_peer_pairing_pending");
-    json_object_object_add(data, "capabilities", gs_capabilities(gs_binary_exists("keepalived"),
-                                                                    gs_binary_exists("conntrackd"), 0));
+    if (preflight_data)
+        json_object_object_add(data, "preflight", json_object_get(preflight_data));
+    json_object_object_add(data, "capabilities",
+                           gs_capabilities(keepalived, conntrackd, paired));
+
+    /* Refuse before touching the filesystem when preflight is not ready. */
+    if (!ready || !enabled) {
+        const char *blocked = !enabled ? "gateway_shadow_disabled" :
+                              reason && reason[0] ? reason : "preflight_failed";
+        gs_runtime_record("blocked", blocked, 0, 0);
+        json_object_object_add(data, "persisted", json_object_new_boolean(0));
+        json_object_object_add(data, "applied", json_object_new_boolean(0));
+        json_object_object_add(data, "changed", json_object_new_boolean(0));
+        json_object_object_add(data, "rollback_available", json_object_new_boolean(0));
+        gs_add_string(data, "state", "blocked");
+        gs_add_string(data, "reason", blocked);
+        json_object_put(cfg); json_object_put(peer);
+        if (preflight) json_object_put(preflight);
+        return gs_response(0, data, !enabled ? "gateway_shadow_disabled" :
+                                     "gateway_shadow_preflight_not_ready");
+    }
+
+    if (gs_runtime_dir_ensure() != 0) {
+        gs_runtime_record("blocked", "runtime_directory_unavailable", 0, 0);
+        json_object_object_add(data, "persisted", json_object_new_boolean(0));
+        json_object_object_add(data, "applied", json_object_new_boolean(0));
+        json_object_object_add(data, "changed", json_object_new_boolean(0));
+        gs_add_string(data, "state", "blocked");
+        gs_add_string(data, "reason", "runtime_directory_unavailable");
+        json_object_put(cfg); json_object_put(peer);
+        if (preflight) json_object_put(preflight);
+        return gs_response(0, data, "gateway_shadow_runtime_directory_failed");
+    }
+
+    memset(&runtime, 0, sizeof(runtime));
+    runtime.role = gs_json_string(cfg, "role", "primary");
+    runtime.lan_interface = gs_json_string(cfg, "lan_interface", "");
+    runtime.heartbeat_interface = gs_json_string(cfg, "heartbeat_interface", "");
+    runtime.heartbeat_local_ip = gs_json_string(cfg, "heartbeat_local_ip", "");
+    runtime.heartbeat_peer_ip = gs_json_string(cfg, "heartbeat_peer_ip", "");
+    runtime.virtual_ipv4 = gs_json_string(cfg, "virtual_ipv4", "");
+    runtime.virtual_router_id = (unsigned int)gs_json_int(cfg, "virtual_router_id", 51);
+    runtime.priority = (unsigned int)gs_json_int(cfg, "priority", 150);
+    runtime.advert_interval_seconds =
+        (unsigned int)gs_json_int(cfg, "advert_interval_seconds", 1);
+    runtime.preempt = gs_json_bool(cfg, "preempt", 0);
+    runtime.connection_sync = sync_wanted && conntrackd ? 1 : 0;
+
+    rc = jmx_gateway_shadow_runtime_render(&runtime, gs_runtime_dir(), &result);
+    gs_runtime_result_add(data, "render", &result);
+    if (rc != JMX_GS_RUNTIME_OK) {
+        gs_runtime_record("blocked", "runtime_render_failed", 0, 0);
+        json_object_object_add(data, "persisted", json_object_new_boolean(0));
+        json_object_object_add(data, "applied", json_object_new_boolean(0));
+        json_object_object_add(data, "changed", json_object_new_boolean(0));
+        gs_add_string(data, "state", "blocked");
+        gs_add_string(data, "reason", "runtime_render_failed");
+        json_object_put(cfg); json_object_put(peer);
+        if (preflight) json_object_put(preflight);
+        return gs_response(0, data, "gateway_shadow_render_failed");
+    }
+    json_object_object_add(data, "persisted", json_object_new_boolean(1));
+    gs_add_string(data, "keepalived_config", result.keepalived_path);
+    gs_add_string(data, "conntrackd_config", result.conntrackd_path);
+
+    {
+        char keepalived_cfg[PATH_MAX], conntrackd_cfg[PATH_MAX];
+        snprintf(keepalived_cfg, sizeof(keepalived_cfg), "%s", result.keepalived_path);
+        snprintf(conntrackd_cfg, sizeof(conntrackd_cfg), "%s", result.conntrackd_path);
+
+        rc = jmx_gateway_shadow_runtime_config_test(JMX_GS_DAEMON_KEEPALIVED,
+                                                   keepalived_bin, keepalived_cfg,
+                                                   &result);
+        gs_runtime_result_add(data, "config_test", &result);
+        if (rc != JMX_GS_RUNTIME_OK) {
+            gs_runtime_record("blocked", "keepalived_config_test_failed", 0, 0);
+            json_object_object_add(data, "applied", json_object_new_boolean(0));
+            json_object_object_add(data, "changed", json_object_new_boolean(0));
+            gs_add_string(data, "state", "blocked");
+            gs_add_string(data, "reason", "keepalived_config_test_failed");
+            json_object_put(cfg); json_object_put(peer);
+            if (preflight) json_object_put(preflight);
+            return gs_response(0, data, "gateway_shadow_config_test_failed");
+        }
+
+        /*
+         * A live Shadow keepalived is reloaded in place so an established
+         * VRRP session is not dropped; otherwise it is started.
+         */
+        keepalived_was_running = gs_pid_alive(GS_KEEPALIVED_PID);
+        rc = jmx_gateway_shadow_runtime_daemon_control(
+            JMX_GS_DAEMON_KEEPALIVED,
+            keepalived_was_running ? JMX_GS_DAEMON_RELOAD : JMX_GS_DAEMON_START,
+            keepalived_bin, keepalived_cfg, &result);
+        gs_runtime_result_add(data, "keepalived", &result);
+        if (rc != JMX_GS_RUNTIME_OK) {
+            gs_runtime_record("blocked", "keepalived_control_failed",
+                              keepalived_was_running, 1);
+            json_object_object_add(data, "applied", json_object_new_boolean(0));
+            json_object_object_add(data, "changed", json_object_new_boolean(0));
+            gs_add_string(data, "state", "blocked");
+            gs_add_string(data, "reason", "keepalived_control_failed");
+            json_object_put(cfg); json_object_put(peer);
+            if (preflight) json_object_put(preflight);
+            return gs_response(0, data, "gateway_shadow_keepalived_failed");
+        }
+        managed = 1;
+
+        /*
+         * conntrackd has no atomic reload, so a controlled stop/start is the
+         * only correct sequence.  A sync failure degrades session continuity
+         * but must not tear down an already-running VRRP instance.
+         */
+        if (runtime.connection_sync) {
+            (void)jmx_gateway_shadow_runtime_daemon_control(
+                JMX_GS_DAEMON_CONNTRACKD, JMX_GS_DAEMON_STOP,
+                conntrackd_bin, conntrackd_cfg, &result);
+            rc = jmx_gateway_shadow_runtime_daemon_control(
+                JMX_GS_DAEMON_CONNTRACKD, JMX_GS_DAEMON_START,
+                conntrackd_bin, conntrackd_cfg, &result);
+            gs_runtime_result_add(data, "conntrackd", &result);
+            json_object_object_add(data, "connection_sync_active",
+                                   json_object_new_boolean(rc == JMX_GS_RUNTIME_OK));
+            if (rc != JMX_GS_RUNTIME_OK)
+                gs_add_string(data, "connection_sync_error", "conntrackd_control_failed");
+        } else {
+            json_object_object_add(data, "connection_sync_active",
+                                   json_object_new_boolean(0));
+            if (sync_wanted && !conntrackd)
+                gs_add_string(data, "connection_sync_error", "conntrackd_not_installed");
+        }
+    }
+
+    gs_runtime_record("active", "", managed, 1);
+    json_object_object_add(data, "applied", json_object_new_boolean(1));
+    json_object_object_add(data, "changed", json_object_new_boolean(1));
+    json_object_object_add(data, "rollback_available", json_object_new_boolean(1));
+    json_object_object_add(data, "managed_daemons", json_object_new_boolean(managed));
+    gs_add_string(data, "state", "active");
+    gs_add_string(data, "apply_state", "applied");
+    json_object_put(cfg); json_object_put(peer);
     if (preflight) json_object_put(preflight);
-    return gs_response(0, data, "capability_disabled");
+    return gs_response(1, data, NULL);
 }
 
 struct json_object *jmx_gateway_shadow_disable(struct json_object *payload)
@@ -780,6 +1093,36 @@ struct json_object *jmx_gateway_shadow_disable(struct json_object *payload)
         return gs_response(0, NULL, "gateway_shadow_disable_failed");
     }
     sqlite3_close(db);
+    /*
+     * Disabling must also stop the daemons this control plane started,
+     * otherwise a stale keepalived would keep announcing the virtual address
+     * after the operator turned the feature off.
+     */
+    {
+        struct jmx_gateway_shadow_runtime_result result;
+        char binary[PATH_MAX], config_path[PATH_MAX];
+        int stopped_keepalived = 0, stopped_conntrackd = 0;
+        snprintf(config_path, sizeof(config_path), "%s/keepalived.conf",
+                 gs_runtime_dir());
+        if (gs_pid_alive(GS_KEEPALIVED_PID) &&
+            gs_binary_path("keepalived", binary, sizeof(binary)) &&
+            jmx_gateway_shadow_runtime_daemon_control(
+                JMX_GS_DAEMON_KEEPALIVED, JMX_GS_DAEMON_STOP, binary,
+                config_path, &result) == JMX_GS_RUNTIME_OK)
+            stopped_keepalived = 1;
+        snprintf(config_path, sizeof(config_path), "%s/conntrackd.conf",
+                 gs_runtime_dir());
+        if (gs_conntrackd_running() &&
+            gs_binary_path("conntrackd", binary, sizeof(binary)) &&
+            jmx_gateway_shadow_runtime_daemon_control(
+                JMX_GS_DAEMON_CONNTRACKD, JMX_GS_DAEMON_STOP, binary,
+                config_path, &result) == JMX_GS_RUNTIME_OK)
+            stopped_conntrackd = 1;
+        json_object_object_add(data, "keepalived_stopped",
+                               json_object_new_boolean(stopped_keepalived));
+        json_object_object_add(data, "conntrackd_stopped",
+                               json_object_new_boolean(stopped_conntrackd));
+    }
     json_object_object_add(data, "persisted", json_object_new_boolean(1));
     json_object_object_add(data, "applied", json_object_new_boolean(1));
     json_object_object_add(data, "changed", json_object_new_boolean(1));
@@ -797,12 +1140,25 @@ static struct json_object *gs_pairing_disabled(void)
     return gs_response(0, data, "capability_disabled");
 }
 
+/*
+ * Authenticated peer pairing is implemented in jmx_gateway_shadow_pairing.c
+ * (Ed25519 offer/accept/confirm over config.db).  These entry points used to
+ * be hard stubs returning capability_disabled because that translation unit
+ * was never listed in the Makefile, so the implementation was compiled out
+ * entirely.  Now that it is linked in, forward to the real protocol and only
+ * fall back to the disabled response when the pairing schema cannot be
+ * initialised - that is a genuine storage fault, not a missing capability.
+ */
 struct json_object *jmx_gateway_shadow_pairing_start(struct json_object *payload)
 {
-    (void)payload; return gs_pairing_disabled();
+    if (jmx_gateway_shadow_pairing_schema_ensure() != 0)
+        return gs_pairing_disabled();
+    return jmx_gateway_shadow_pairing_protocol_start(payload);
 }
 
 struct json_object *jmx_gateway_shadow_pairing_approve(struct json_object *payload)
 {
-    (void)payload; return gs_pairing_disabled();
+    if (jmx_gateway_shadow_pairing_schema_ensure() != 0)
+        return gs_pairing_disabled();
+    return jmx_gateway_shadow_pairing_protocol_approve(payload);
 }

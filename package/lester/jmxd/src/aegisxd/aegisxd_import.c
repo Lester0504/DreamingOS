@@ -974,7 +974,87 @@ struct json_object *aegisxd_import_feed_id(const char *feed_id)
     return result;
 }
 
+static struct json_object *aegisxd_feed_import_run(struct json_object *body);
+
+int aegisxd_feed_import_worker_main(const char *job_id, const char *feed_id)
+{
+    struct json_object *body;
+    struct json_object *result;
+    int ok;
+
+    if (aegisxd_db_init() != 0) {
+        result = aegisxd_error("db_init_failed",
+                               "failed to initialize aegis database in import worker");
+    } else {
+        body = json_object_new_object();
+        if (feed_id && feed_id[0])
+            aegisxd_json_add_string(body, "feed_id", feed_id);
+        result = aegisxd_feed_import_run(body);
+        json_object_put(body);
+    }
+    ok = aegisxd_job_result_ok(result);
+    aegisxd_job_record_finish(job_id, result);
+    json_object_put(result);
+    aegisxd_db_close();
+    return ok ? 0 : 1;
+}
+
 struct json_object *aegisxd_feed_import_start(struct json_object *body)
+{
+    const char *req_feed_id = aegisxd_json_str(body, "feed_id", "");
+    int background = aegisxd_json_bool(body, "background",
+                       aegisxd_json_bool(body, "async", 1));
+    char job_id[128];
+    pid_t pid;
+
+    if (!background)
+        return aegisxd_feed_import_run(body);
+    if (aegisxd_job_running_count() > 0) {
+        struct json_object *busy = aegisxd_error("job_already_running",
+            "another aegis feed job is already running");
+
+        aegisxd_json_add_string(busy, "state", "running");
+        json_object_object_add(busy, "running", json_object_new_boolean(1));
+        json_object_object_add(busy, "jobs", aegisxd_feed_jobs_json(NULL));
+        return busy;
+    }
+    snprintf(job_id, sizeof(job_id), "feed-import-%lld-%ld",
+             (long long)aegisxd_now_s(), (long)getpid());
+    if (aegisxd_job_record_start(job_id, "feed_import", req_feed_id, 0) != 0)
+        return aegisxd_error("job_record_failed", "failed to record aegis feed job");
+    pid = fork();
+    if (pid < 0) {
+        struct json_object *err = aegisxd_error("fork_failed",
+                                                "failed to start feed import worker");
+
+        aegisxd_job_record_finish(job_id, err);
+        return err;
+    }
+    if (pid == 0) {
+        execl("/usr/bin/dreamingwrt-aegisxd", "dreamingwrt-aegisxd",
+              "--feed-import-worker", job_id, req_feed_id ? req_feed_id : "",
+              (char *)NULL);
+        _exit(127);
+    }
+    aegisxd_job_record_pid(job_id, pid);
+    {
+        struct json_object *resp = json_object_new_object();
+
+        json_object_object_add(resp, "ok", json_object_new_boolean(1));
+        aegisxd_json_add_string(resp, "service", "dreamingwrt-aegisxd");
+        aegisxd_json_add_string(resp, "state", "running");
+        json_object_object_add(resp, "running", json_object_new_boolean(1));
+        json_object_object_add(resp, "background", json_object_new_boolean(1));
+        aegisxd_json_add_string(resp, "job_id", job_id);
+        aegisxd_json_add_string(resp, "op", "feed_import");
+        aegisxd_json_add_string(resp, "feed_id", req_feed_id);
+        json_object_object_add(resp, "pid", json_object_new_int((int)pid));
+        json_object_object_add(resp, "dataplane_changed", json_object_new_boolean(0));
+        return resp;
+    }
+}
+
+static struct json_object *aegisxd_feed_import_run(struct json_object *body)
 {
     struct json_object *resp = json_object_new_object();
     struct json_object *results = json_object_new_array();

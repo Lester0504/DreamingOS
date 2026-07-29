@@ -12,6 +12,7 @@
 #include "jmx_route.h"
 #include "jmx_events.h"
 #include "jmx_network.h"
+#include "jmx_dhcp_sniff.h"
 #include "jmx_signature_db.h"
 #include "jmx_system.h"
 #include "jmx_system_data_path.h"
@@ -319,6 +320,34 @@ static void nc_add_json_object_from_text(struct json_object *o, const char *key,
         parsed = json_object_new_object();
     }
     json_object_object_add(o, key, parsed);
+}
+
+/*
+ * Emit a real JSON array parsed from a stored text column.  Historically the
+ * DHCP/IPv6 read path returned `dns_json`/`exclude_pool` as raw JSON *strings*
+ * (e.g. "[]"), forcing the frontend to double-decode.  This helper adds a
+ * proper array field so consumers can read it directly; the legacy string
+ * field is kept separately for backward compatibility.
+ */
+static void nc_add_json_array_from_text(struct json_object *o, const char *key,
+                                        const char *raw)
+{
+    struct json_object *parsed = NULL;
+    if (raw && raw[0])
+        parsed = json_tokener_parse(raw);
+    if (!parsed || !json_object_is_type(parsed, json_type_array)) {
+        if (parsed) json_object_put(parsed);
+        parsed = json_object_new_array();
+    }
+    json_object_object_add(o, key, parsed);
+}
+
+/* Add a parsed array field from a SQLite text column (never double-encoded). */
+static void nc_add_array_text(struct json_object *o, const char *key,
+                              sqlite3_stmt *st, int col)
+{
+    const char *v = (const char *)sqlite3_column_text(st, col);
+    nc_add_json_array_from_text(o, key, v);
 }
 
 /* Never serialize stored credentials through a read API or config snapshot. */
@@ -2833,6 +2862,8 @@ static struct json_object *nc_wan_row_to_json(sqlite3_stmt *st)
     nc_add_text(o, "access_mode", st, 7);
     nc_add_text(o, "gateway", st, 8);
     nc_add_text(o, "dns_json", st, 9);
+    /* Parsed DNS array alongside the legacy string field (no double-encode). */
+    nc_add_array_text(o, "dns", st, 9);
     nc_add_text(o, "ipv6_mode", st, 10);
     nc_add_text(o, "ipv6_addr", st, 11);
     nc_add_text(o, "delegated_prefix", st, 12);
@@ -3880,6 +3911,9 @@ static void nc_lan_load_dhcp(const char *lan_id, struct json_object *lan_obj)
             nc_add_text(dhcp, "exclude_pool", st, 4);
             nc_add_text(dhcp, "gateway", st, 5);
             nc_add_text(dhcp, "dns_json", st, 6);
+            /* Parsed arrays alongside the legacy string fields (no double-encode). */
+            nc_add_array_text(dhcp, "exclude_pool_list", st, 4);
+            nc_add_array_text(dhcp, "dns", st, 6);
             json_object_object_add(dhcp, "lease", json_object_new_int(sqlite3_column_int(st, 7)));
         }
         sqlite3_finalize(st);
@@ -3904,6 +3938,8 @@ static void nc_lan_load_ipv6(const char *lan_id, struct json_object *lan_obj)
             nc_add_text(ipv6, "addr", st, 4);
             json_object_object_add(ipv6, "use_dns6", json_object_new_boolean(sqlite3_column_int(st, 5)));
             nc_add_text(ipv6, "dns_json", st, 6);
+            /* Parsed IPv6 DNS array alongside the legacy string field. */
+            nc_add_array_text(ipv6, "dns6", st, 6);
             nc_add_text(ipv6, "prefix_len", st, 7);
             nc_add_text(ipv6, "ra_flags", st, 8);
             json_object_object_add(ipv6, "ra_static", json_object_new_boolean(sqlite3_column_int(st, 9)));
@@ -8140,6 +8176,13 @@ done:
  * capabilities: feature detection for UI
  * ══════════════════════════════════════════════════════════════════════ */
 
+/* Static-mapping dataplane, defined further down with the UPnP mapping CRUD. */
+#define NC_UPNP_NFT_TABLE "dreamingwrt_upnp"
+static int nc_upnp_nft_available(void);
+
+/* DNS engine discovery, defined further down with the DNS service code. */
+static int nc_dns_encrypted_capable_engine(const char **engine_id);
+
 struct json_object *jmx_netconfig_capabilities(void)
 {
     struct json_object *data = json_object_new_object();
@@ -8278,8 +8321,13 @@ struct json_object *jmx_netconfig_capabilities(void)
     json_object_object_add(data, "edns_client_subnet", json_object_new_boolean(1));
     json_object_object_add(data, "ipv6_dns", json_object_new_boolean(
         access("/usr/sbin/odhcpd", X_OK) == 0));
-    json_object_object_add(data, "doh", json_object_new_boolean(0));
-    json_object_object_add(data, "dot", json_object_new_boolean(0));
+    /* Encrypted upstreams are an engine property; probed at runtime. Writing
+     * one is still gated (see encrypted_upstream_write in the DNS service
+     * capability block) until the engine config renderer exists. */
+    json_object_object_add(data, "doh",
+                           json_object_new_boolean(nc_dns_encrypted_capable_engine(NULL)));
+    json_object_object_add(data, "dot",
+                           json_object_new_boolean(nc_dns_encrypted_capable_engine(NULL)));
     json_object_object_add(data, "domain_forward", json_object_new_boolean(1));
     json_object_object_add(data, "domain_block", json_object_new_boolean(1));
     json_object_object_add(data, "upstream_rule", json_object_new_boolean(1));
@@ -8298,7 +8346,7 @@ struct json_object *jmx_netconfig_capabilities(void)
     json_object_object_add(data, "use_stun", json_object_new_boolean(0));
     json_object_object_add(data, "stun", json_object_new_boolean(0));
     json_object_object_add(data, "pcp", json_object_new_boolean(0));
-    json_object_object_add(data, "mapping_delete", json_object_new_boolean(0));
+    json_object_object_add(data, "mapping_delete", json_object_new_boolean(nc_upnp_nft_available()));
     json_object_object_add(data, "live_packets", json_object_new_boolean(0));
     json_object_object_add(data, "acl", json_object_new_boolean(1));
 
@@ -8354,12 +8402,14 @@ struct json_object *jmx_netconfig_capabilities(void)
     json_object_object_add(data, "save_wan_dns_policy", json_object_new_boolean(1));
 
     /* ── UPnP mapping ── */
-    json_object_object_add(data, "stun_host", json_object_new_boolean(1));
-    json_object_object_add(data, "stun_port", json_object_new_boolean(1));
-    json_object_object_add(data, "mapping_create", json_object_new_boolean(0));
-    json_object_object_add(data, "mapping_update", json_object_new_boolean(0));
-    json_object_object_add(data, "save_upnp_mapping", json_object_new_boolean(0));
-    json_object_object_add(data, "delete_upnp_mapping", json_object_new_boolean(0));
+    /* STUN has no probe implementation and nc_upnp_disabled_field_changed()
+     * actively rejects writes to these fields - report false, not true. */
+    json_object_object_add(data, "stun_host", json_object_new_boolean(0));
+    json_object_object_add(data, "stun_port", json_object_new_boolean(0));
+    json_object_object_add(data, "mapping_create", json_object_new_boolean(nc_upnp_nft_available()));
+    json_object_object_add(data, "mapping_update", json_object_new_boolean(nc_upnp_nft_available()));
+    json_object_object_add(data, "save_upnp_mapping", json_object_new_boolean(nc_upnp_nft_available()));
+    json_object_object_add(data, "delete_upnp_mapping", json_object_new_boolean(nc_upnp_nft_available()));
 
     /* ── Flow Control extras ── */
     json_object_object_add(data, "save_rule", json_object_new_boolean(1));
@@ -9190,6 +9240,86 @@ static void nc_dhcp_sync_scope_from_lan(const char *lan_id)
     }
 }
 
+/* Read the persisted rogue-DHCP-detection preference from network_global. */
+static int nc_rogue_dhcp_pref(void)
+{
+    sqlite3_stmt *st = NULL;
+    int enabled = 0;
+
+    if (nc_prepare(&st, "SELECT rogue_dhcp_detection FROM network_global WHERE id=1") == 0) {
+        if (sqlite3_step(st) == SQLITE_ROW)
+            enabled = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    return enabled ? 1 : 0;
+}
+
+/*
+ * Build the passive rogue-DHCP observation report.
+ *
+ * The detector is a read-only LAN observer: every BOOTREPLY seen coming from
+ * UDP/67 is attributed to its L2 source, and any server IP that is not one of
+ * this router's own addresses is reported as unauthorized. No packet is ever
+ * injected and no client is disturbed, so this stays safe on a live gateway.
+ */
+static struct json_object *nc_rogue_dhcp_report(int *rogue_count_out)
+{
+    dhcp_server_obs_t obs[32];
+    struct json_object *report = json_object_new_object();
+    struct json_object *servers = json_object_new_array();
+    int n, i, rogue = 0, authorized = 0;
+    int active = dhcp_sniff_active();
+
+    n = active ? dhcp_sniff_servers_snapshot(obs, (int)(sizeof(obs) / sizeof(obs[0]))) : 0;
+    for (i = 0; i < n; i++) {
+        struct json_object *item = json_object_new_object();
+        char macbuf[18], ipbuf[INET_ADDRSTRLEN] = "", offbuf[INET_ADDRSTRLEN] = "";
+        struct in_addr a;
+
+        snprintf(macbuf, sizeof(macbuf), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 obs[i].mac[0], obs[i].mac[1], obs[i].mac[2],
+                 obs[i].mac[3], obs[i].mac[4], obs[i].mac[5]);
+        a.s_addr = obs[i].server_ip;
+        inet_ntop(AF_INET, &a, ipbuf, sizeof(ipbuf));
+        a.s_addr = obs[i].offered_ip;
+        inet_ntop(AF_INET, &a, offbuf, sizeof(offbuf));
+
+        json_object_object_add(item, "mac", json_object_new_string(macbuf));
+        json_object_object_add(item, "server_ip", json_object_new_string(ipbuf));
+        json_object_object_add(item, "offered_ip", json_object_new_string(offbuf));
+        json_object_object_add(item, "first_seen", json_object_new_int64((int64_t)obs[i].first_seen));
+        json_object_object_add(item, "last_seen", json_object_new_int64((int64_t)obs[i].last_seen));
+        json_object_object_add(item, "hits", json_object_new_int64((int64_t)obs[i].hits));
+        json_object_object_add(item, "authorized", json_object_new_boolean(obs[i].authorized));
+        json_object_object_add(item, "rogue", json_object_new_boolean(!obs[i].authorized));
+        json_object_object_add(item, "local_origin", json_object_new_boolean(obs[i].local_origin));
+        json_object_array_add(servers, item);
+        if (obs[i].authorized) authorized++; else rogue++;
+    }
+
+    json_object_object_add(report, "detector_active", json_object_new_boolean(active));
+    json_object_object_add(report, "servers", servers);
+    json_object_object_add(report, "server_count", json_object_new_int(n));
+    json_object_object_add(report, "rogue_count", json_object_new_int(rogue));
+    json_object_object_add(report, "authorized_count", json_object_new_int(authorized));
+    /*
+     * Scope note for the UI: the AF_PACKET/ETH_P_IP tap only receives frames
+     * the bridge delivers *inbound*, so replies this router emits itself are
+     * not part of the sample. An empty list therefore means "no foreign DHCP
+     * server answered on the LAN", not "our own DHCP server is down".
+     */
+    json_object_object_add(report, "observation_scope",
+                           json_object_new_string("br-lan_inbound_bootreply_udp67"));
+    json_object_object_add(report, "local_server_replies_observed", json_object_new_boolean(0));
+    json_object_object_add(report, "scope_note",
+                           json_object_new_string("inbound_only_local_dnsmasq_offers_not_sampled"));
+    if (!active)
+        json_object_object_add(report, "reason",
+                               json_object_new_string("dhcp_passive_observer_not_running"));
+    if (rogue_count_out) *rogue_count_out = rogue;
+    return report;
+}
+
 struct json_object *jmx_dhcp_service_get(void)
 {
     struct json_object *data = json_object_new_object();
@@ -9249,8 +9379,14 @@ done:
     { struct json_object *top_pfx=json_object_new_array(); sqlite3_stmt *stp=NULL; if(g_netconfig_db && nc_prepare(&stp,"SELECT id,name,duid,iaid,prefix,scope_id,lan_id,hostid,prefix_len,remark,enabled,lease_minutes,sort_order,apply_state,runtime_configured,runtime_bound,runtime_prefix,runtime_duid,last_apply_at FROM dhcpv6_prefix_reservation ORDER BY sort_order,id")==0){while(sqlite3_step(stp)==SQLITE_ROW){struct json_object *p=json_object_new_object(); nc_add_text(p,"id",stp,0); nc_add_text(p,"name",stp,1); nc_add_text(p,"duid",stp,2); nc_add_text(p,"iaid",stp,3); nc_add_text(p,"prefix",stp,4); nc_add_text(p,"scope",stp,5); nc_add_text(p,"scope_id",stp,5); nc_add_text(p,"lan_id",stp,6); nc_add_text(p,"hostid",stp,7); json_object_object_add(p,"prefix_len",json_object_new_int(sqlite3_column_int(stp,8))); nc_add_text(p,"remark",stp,9); json_object_object_add(p,"enabled",json_object_new_boolean(sqlite3_column_int(stp,10))); json_object_object_add(p,"lease_minutes",json_object_new_int(sqlite3_column_int(stp,11))); json_object_object_add(p,"sort_order",json_object_new_int(sqlite3_column_int(stp,12))); nc_add_text(p,"apply_state",stp,13); json_object_object_add(p,"runtime_configured",json_object_new_boolean(sqlite3_column_int(stp,14))); json_object_object_add(p,"runtime_bound",json_object_new_boolean(sqlite3_column_int(stp,15))); nc_add_text(p,"runtime_prefix",stp,16); nc_add_text(p,"runtime_duid",stp,17); json_object_object_add(p,"last_apply_at",json_object_new_int64(sqlite3_column_int64(stp,18))); json_object_array_add(top_pfx,p);} sqlite3_finalize(stp);} json_object_object_add(data,"prefix_reservations",top_pfx); json_object_object_add(data,"prefixes",json_object_get(top_pfx)); }
     json_object_object_add(data,"ts",json_object_new_int64(nc_now_s())); json_object_object_add(data,"selected",json_object_new_string(selected)); json_object_object_add(data,"scopes",scopes);
     json_object_object_add(data,"whitelist",whitelist); json_object_object_add(data,"blacklist",blacklist);
-    { struct json_object *g=json_object_new_object(); json_object_object_add(g,"rogue_dhcp_detection",json_object_new_boolean(0)); json_object_object_add(data,"global",g); }
-    { struct json_object *c=json_object_new_object(); json_object_object_add(c,"service_read",json_object_new_boolean(1)); json_object_object_add(c,"service_update",json_object_new_boolean(1)); json_object_object_add(c,"apply_readback",json_object_new_boolean(1)); json_object_object_add(c,"dhcp_options",json_object_new_boolean(1)); json_object_object_add(c,"static_reservations",json_object_new_boolean(1)); json_object_object_add(c,"reservation_delete",json_object_new_boolean(1)); json_object_object_add(c,"exclude_pool",json_object_new_boolean(1)); json_object_object_add(c,"access_list_replace",json_object_new_boolean(1)); json_object_object_add(c,"access_list_apply",json_object_new_boolean(1)); json_object_object_add(c,"pool_addresses_full_ipv4",json_object_new_boolean(1)); json_object_object_add(c,"lease_read",json_object_new_boolean(1)); json_object_object_add(c,"allow_deny_list",json_object_new_boolean(1)); json_object_object_add(c,"dhcpv6_static_prefix",json_object_new_boolean(1)); json_object_object_add(c,"prefix_reservations",json_object_new_boolean(1)); json_object_object_add(c,"prefix_reservation_apply",json_object_new_boolean(1)); json_object_object_add(c,"prefix_reservation_readback",json_object_new_boolean(1)); json_object_object_add(c,"rogue_dhcp_detection",json_object_new_boolean(0)); json_object_object_add(data,"capabilities",c); }
+    int nc_rogue_count = 0;
+    struct json_object *nc_rogue = nc_rogue_dhcp_report(&nc_rogue_count);
+    { struct json_object *g=json_object_new_object(); json_object_object_add(g,"rogue_dhcp_detection",json_object_new_boolean(nc_rogue_dhcp_pref())); json_object_object_add(data,"global",g); }
+    /* flat alias for the server list; refcount +1 because nc_rogue keeps its own */
+    json_object_object_add(data,"rogue_dhcp_servers",json_object_get(json_object_object_get(nc_rogue,"servers")));
+    json_object_object_add(data,"rogue_dhcp_count",json_object_new_int(nc_rogue_count));
+    json_object_object_add(data,"rogue_dhcp",nc_rogue); /* ownership transferred */
+    { struct json_object *c=json_object_new_object(); json_object_object_add(c,"service_read",json_object_new_boolean(1)); json_object_object_add(c,"service_update",json_object_new_boolean(1)); json_object_object_add(c,"apply_readback",json_object_new_boolean(1)); json_object_object_add(c,"dhcp_options",json_object_new_boolean(1)); json_object_object_add(c,"static_reservations",json_object_new_boolean(1)); json_object_object_add(c,"reservation_delete",json_object_new_boolean(1)); json_object_object_add(c,"exclude_pool",json_object_new_boolean(1)); json_object_object_add(c,"access_list_replace",json_object_new_boolean(1)); json_object_object_add(c,"access_list_apply",json_object_new_boolean(1)); json_object_object_add(c,"pool_addresses_full_ipv4",json_object_new_boolean(1)); json_object_object_add(c,"lease_read",json_object_new_boolean(1)); json_object_object_add(c,"allow_deny_list",json_object_new_boolean(1)); json_object_object_add(c,"dhcpv6_static_prefix",json_object_new_boolean(1)); json_object_object_add(c,"prefix_reservations",json_object_new_boolean(1)); json_object_object_add(c,"prefix_reservation_apply",json_object_new_boolean(1)); json_object_object_add(c,"prefix_reservation_readback",json_object_new_boolean(1)); json_object_object_add(c,"rogue_dhcp_detection",json_object_new_boolean(dhcp_sniff_active())); json_object_object_add(c,"rogue_dhcp_passive_only",json_object_new_boolean(1)); if(!dhcp_sniff_active()) json_object_object_add(c,"rogue_dhcp_detection_reason",json_object_new_string("dhcp_passive_observer_not_running")); json_object_object_add(data,"capabilities",c); }
     return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
 }
 
@@ -9920,6 +10056,9 @@ static void nc_upnp_add_caps(struct json_object *root)
 {
     struct json_object *caps = json_object_new_object();
     int has = nc_file_exists("/etc/init.d/miniupnpd") || nc_file_exists("/usr/sbin/miniupnpd") || nc_file_exists("/etc/config/upnpd");
+    /* Static mappings live in our own nft table, so they depend on nft being
+     * usable - NOT on miniupnpd, and NOT on the still-preview firewall path. */
+    int nft_ok = nc_upnp_nft_available();
     json_object_object_add(caps, "miniupnpd", json_object_new_boolean(has));
     json_object_object_add(caps, "natpmp", json_object_new_boolean(has));
     json_object_object_add(caps, "pcp", json_object_new_boolean(0));
@@ -9930,15 +10069,24 @@ static void nc_upnp_add_caps(struct json_object *root)
     json_object_object_add(caps, "acl_delete", json_object_new_boolean(has));
     json_object_object_add(caps, "dynamic_mapping_read", json_object_new_boolean(1));
     json_object_object_add(caps, "static_mapping_read", json_object_new_boolean(1));
-    json_object_object_add(caps, "mapping_delete", json_object_new_boolean(0));
+    json_object_object_add(caps, "mapping_delete", json_object_new_boolean(nft_ok));
     json_object_object_add(caps, "live_packets", json_object_new_boolean(0));
     json_object_object_add(caps, "acl", json_object_new_boolean(1));
-    json_object_object_add(caps, "mapping_create", json_object_new_boolean(0));
-    json_object_object_add(caps, "mapping_update", json_object_new_boolean(0));
-    json_object_object_add(caps, "save_upnp_mapping", json_object_new_boolean(0));
-    json_object_object_add(caps, "delete_upnp_mapping", json_object_new_boolean(0));
-    json_object_object_add(caps, "static_mapping_apply", json_object_new_boolean(0));
-    json_object_object_add(caps, "static_mapping_readback", json_object_new_boolean(0));
+    json_object_object_add(caps, "mapping_create", json_object_new_boolean(nft_ok));
+    json_object_object_add(caps, "mapping_update", json_object_new_boolean(nft_ok));
+    json_object_object_add(caps, "save_upnp_mapping", json_object_new_boolean(nft_ok));
+    json_object_object_add(caps, "delete_upnp_mapping", json_object_new_boolean(nft_ok));
+    json_object_object_add(caps, "static_mapping_apply", json_object_new_boolean(nft_ok));
+    json_object_object_add(caps, "static_mapping_readback", json_object_new_boolean(nft_ok));
+    json_object_object_add(caps, "static_mapping_dataplane",
+                           json_object_new_string(nft_ok ? "nft:inet " NC_UPNP_NFT_TABLE
+                                                         : "unavailable"));
+    if (!nft_ok)
+        json_object_object_add(caps, "static_mapping_reason",
+                               json_object_new_string("nft_unavailable"));
+    /* IPv6 static mappings need a family column and filter (not DNAT)
+     * semantics - separate contract, deliberately still false. */
+    json_object_object_add(caps, "static_mapping_ipv6", json_object_new_boolean(0));
     json_object_object_add(caps, "stun_host", json_object_new_boolean(0));
     json_object_object_add(caps, "stun_port", json_object_new_boolean(0));
     json_object_object_add(caps, "port_range", json_object_new_boolean(0));
@@ -10296,10 +10444,340 @@ int jmx_upnp_acl_delete(const char *id)
     return rc == 0 && changed == 1 ? 0 : (rc == 0 ? 1 : -1);
 }
 
+
+/* ══════════════════════════════════════════════════════════════════════
+ * UPnP static port mappings (admin intent, distinct from miniupnpd leases)
+ *
+ * Dataplane strategy: a DreamingWrt-owned nft table, deliberately NOT fw4
+ * and NOT miniupnpd's own chains.
+ *   - miniupnpd flushes upnp_prerouting/upnp_forward/upnp_postrouting on
+ *     restart, so anything we wrote there would silently vanish.
+ *   - `fw4 reload` rebuilds the whole inet fw4 table, same problem.
+ *   - the existing `inet dreamingwrt_ipv6_load` table proves an independent
+ *     table coexists fine with fw4.
+ * Keeping our own table also means static mappings do NOT depend on the
+ * still-preview-only /etc/config/dreamingwrt_firewall apply path.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+static void nc_upnp_db_init_mappings(void);
+
+/* nft present and usable? Static mapping capability hangs off this. */
+static int nc_upnp_nft_available(void)
+{
+    static int cached = -1;
+
+    if (cached >= 0)
+        return cached;
+    cached = nc_run_quiet("nft --check --file /dev/null >/dev/null 2>&1") == 0 ? 1 : 0;
+    if (!cached)
+        cached = nc_file_exists("/usr/sbin/nft") || nc_file_exists("/sbin/nft") ? 1 : 0;
+    return cached;
+}
+
+static int nc_upnp_proto_ok(const char *proto)
+{
+    return proto && (!strcmp(proto, "tcp") || !strcmp(proto, "udp"));
+}
+
+static int nc_upnp_port_ok(int port)
+{
+    return port >= 1 && port <= 65535;
+}
+
+/*
+ * Only RFC1918 targets. A static DNAT pointing at a public address would turn
+ * the router into an open relay for someone else's host.
+ */
+static int nc_upnp_private_ipv4(const char *ip)
+{
+    struct in_addr a;
+    uint32_t h;
+
+    if (!ip || !ip[0] || inet_pton(AF_INET, ip, &a) != 1)
+        return 0;
+    h = ntohl(a.s_addr);
+    if ((h >> 24) == 10) return 1;                        /* 10/8      */
+    if ((h >> 20) == ((172 << 4) | 1)) return 1;          /* 172.16/12 */
+    if ((h >> 16) == ((192 << 8) | 168)) return 1;        /* 192.168/16 */
+    return 0;
+}
+
+/*
+ * A prerouting DNAT on a port the router itself listens on steals that
+ * traffic from the local service. Two severities, and we must not conflate
+ * them:
+ *   NC_UPNP_PORT_MGMT  - ssh / webd / ttyd. Redirecting these locks the admin
+ *                        out and the only recovery is serial console.
+ *   NC_UPNP_PORT_LOCAL - any other local listener (samba, netdata, ac, ...).
+ *                        Still a real conflict, but not a lockout.
+ * Derived from what is actually listening rather than a hardcoded port list:
+ * this box runs ssh on 11504 and webd on 12517, not the defaults, so any
+ * static table would be wrong.
+ */
+#define NC_UPNP_PORT_FREE  0
+#define NC_UPNP_PORT_MGMT  1
+#define NC_UPNP_PORT_LOCAL 2
+
+static int nc_upnp_port_is_mgmt_owner(const char *prog)
+{
+    static const char *mgmt[] = {
+        "sshd", "dropbear", "dreamingwrt-w", "dreamingwrt-webd", "ttyd", "uhttpd", NULL
+    };
+    int i;
+
+    if (!prog || !prog[0])
+        return 0;
+    for (i = 0; mgmt[i]; i++)
+        if (strstr(prog, mgmt[i]))
+            return 1;
+    return 0;
+}
+
+/*
+ * Returns NC_UPNP_PORT_*; when non-free, owner is filled with the listening
+ * program name so the error message can name the actual blocker.
+ */
+static int nc_upnp_port_conflict(int port, char *owner, size_t owner_len)
+{
+    FILE *fp;
+    char line[320];
+    int result = NC_UPNP_PORT_FREE;
+
+    if (owner && owner_len)
+        owner[0] = '\0';
+    if (port < 1 || port > 65535)
+        return NC_UPNP_PORT_FREE;
+
+    /* -p gives us the owning program, which is what turns a bare refusal into
+     * an actionable one. Re-probed per call: listeners come and go. */
+    fp = popen("netstat -lntp 2>/dev/null", "r");
+    if (!fp)
+        return NC_UPNP_PORT_FREE;
+    while (fgets(line, sizeof(line), fp)) {
+        char local[128] = {0}, prog[96] = {0};
+        const char *colon;
+        int lport;
+
+        /* Proto Recv-Q Send-Q Local Foreign State PID/Program */
+        if (sscanf(line, "%*s %*s %*s %127s %*s %*s %95[^\n]", local, prog) < 1)
+            continue;
+        colon = strrchr(local, ':');
+        if (!colon)
+            continue;
+        lport = atoi(colon + 1);
+        if (lport != port)
+            continue;
+        /* trim leading spaces off the PID/Program column */
+        {
+            char *p = prog;
+            while (*p == ' ' || *p == '\t') p++;
+            if (owner && owner_len)
+                snprintf(owner, owner_len, "%s", p);
+            if (nc_upnp_port_is_mgmt_owner(p)) {
+                result = NC_UPNP_PORT_MGMT;
+                break;               /* management wins, stop looking */
+            }
+            result = NC_UPNP_PORT_LOCAL;
+        }
+    }
+    pclose(fp);
+    return result;
+}
+
+/*
+ * Render every enabled static mapping into one nft transaction and swap the
+ * table atomically. Full rebuild rather than incremental diffing: the DB is
+ * the single source of truth, so state drift is impossible by construction.
+ */
+static int nc_upnp_static_nft_apply(void)
+{
+    sqlite3_stmt *st = NULL;
+    FILE *fp;
+    char path[] = "/tmp/dw-upnp-static.nft";
+    int rows = 0;
+
+    if (!nc_upnp_nft_available())
+        return -3;
+    if (jmx_netconfig_db_init() != 0)
+        return -1;
+    nc_upnp_db_init_mappings();
+
+    /* No enabled mappings: drop the table entirely rather than leaving an
+     * empty chain with a registered nat hook doing nothing per packet. */
+    if (nc_prepare(&st, "SELECT COUNT(*) FROM upnp_mapping WHERE enabled=1") == 0) {
+        int enabled = 0;
+        if (sqlite3_step(st) == SQLITE_ROW)
+            enabled = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+        st = NULL;
+        if (enabled == 0) {
+            nc_run_quiet("nft delete table inet " NC_UPNP_NFT_TABLE " >/dev/null 2>&1");
+            return 0;
+        }
+    }
+
+    fp = fopen(path, "w");
+    if (!fp)
+        return -1;
+    /* delete is tolerated-if-missing via `nft -f` add-then-flush idiom */
+    fprintf(fp, "table inet " NC_UPNP_NFT_TABLE " {}\n");
+    fprintf(fp, "delete table inet " NC_UPNP_NFT_TABLE "\n");
+    fprintf(fp, "table inet " NC_UPNP_NFT_TABLE " {\n");
+    fprintf(fp, "  chain dw_upnp_prerouting {\n");
+    fprintf(fp, "    type nat hook prerouting priority dstnat + 5; policy accept;\n");
+
+    if (nc_prepare(&st,
+        "SELECT protocol,external_port,internal_ip,internal_port,description "
+        "FROM upnp_mapping WHERE enabled=1 ORDER BY external_port") == 0) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const char *proto = (const char *)sqlite3_column_text(st, 0);
+            int eport = sqlite3_column_int(st, 1);
+            const char *iip = (const char *)sqlite3_column_text(st, 2);
+            int iport = sqlite3_column_int(st, 3);
+
+            if (!nc_upnp_proto_ok(proto) || !nc_upnp_port_ok(eport) ||
+                !nc_upnp_port_ok(iport) || !nc_upnp_private_ipv4(iip))
+                continue;   /* never emit a row we would have rejected on write */
+            fprintf(fp, "    %s dport %d counter dnat ip to %s:%d\n",
+                    proto, eport, iip, iport);
+            rows++;
+        }
+        sqlite3_finalize(st);
+    }
+    fprintf(fp, "  }\n}\n");
+    fclose(fp);
+
+    if (nc_run_quiet("nft -f /tmp/dw-upnp-static.nft >/tmp/dw-upnp-static.log 2>&1") != 0) {
+        /* leave no half-applied table behind */
+        nc_run_quiet("nft delete table inet " NC_UPNP_NFT_TABLE " >/dev/null 2>&1");
+        return -1;
+    }
+    /* rows is the count we believe we installed; readback verifies it for real. */
+    (void)rows;
+    return 0;
+}
+
+/* Read back what the kernel actually holds, so the API never claims more
+ * than the dataplane really has. */
+static struct json_object *nc_upnp_static_nft_readback(void)
+{
+    struct json_object *out = json_object_new_object();
+    struct json_object *rules = json_object_new_array();
+    int installed = 0, count = 0;
+    int db_enabled = -1;
+    FILE *fp;
+    char line[512];
+
+    if (!nc_upnp_nft_available()) {
+        json_object_object_add(out, "supported", json_object_new_boolean(0));
+        json_object_object_add(out, "reason", json_object_new_string("nft_unavailable"));
+        json_object_object_add(out, "rules", rules);
+        return out;
+    }
+    fp = popen("nft list table inet " NC_UPNP_NFT_TABLE " 2>/dev/null", "r");
+    if (fp) {
+        while (fgets(line, sizeof(line), fp)) {
+            char *nl;
+            if (strstr(line, "table inet " NC_UPNP_NFT_TABLE))
+                installed = 1;
+            if (!strstr(line, "dnat"))
+                continue;
+            nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
+            while (*line == ' ' || *line == '\t') memmove(line, line + 1, strlen(line));
+            json_object_array_add(rules, json_object_new_string(line));
+            count++;
+        }
+        pclose(fp);
+    }
+    /* How many rows the DB *thinks* are live, so drift is visible instead of
+     * silently assumed away. */
+    if (jmx_netconfig_db_init() == 0) {
+        sqlite3_stmt *st = NULL;
+        nc_upnp_db_init_mappings();
+        if (nc_prepare(&st, "SELECT COUNT(*) FROM upnp_mapping WHERE enabled=1") == 0) {
+            if (sqlite3_step(st) == SQLITE_ROW)
+                db_enabled = sqlite3_column_int(st, 0);
+            sqlite3_finalize(st);
+        }
+    }
+    json_object_object_add(out, "supported", json_object_new_boolean(1));
+    json_object_object_add(out, "table", json_object_new_string("inet " NC_UPNP_NFT_TABLE));
+    json_object_object_add(out, "installed", json_object_new_boolean(installed));
+    json_object_object_add(out, "rule_count", json_object_new_int(count));
+    json_object_object_add(out, "db_enabled_count", json_object_new_int(db_enabled));
+    if (db_enabled >= 0)
+        json_object_object_add(out, "in_sync", json_object_new_boolean(db_enabled == count));
+    json_object_object_add(out, "rules", rules);
+    return out;
+}
+
+/*
+ * Our nft table lives in kernel memory only, so a reboot (or an external
+ * `nft flush ruleset`) wipes it while the DB still lists the mappings. Rather
+ * than adding yet another boot script, reconcile lazily on the first UPnP
+ * touch after core start: if the DB has enabled rows and the table is not
+ * installed, re-render it. Idempotent and cheap (one `nft list` probe).
+ */
+static void nc_upnp_static_reconcile_once(void)
+{
+    static int done = 0;
+    sqlite3_stmt *st = NULL;
+    int enabled = 0;
+
+    if (done)
+        return;
+    done = 1;
+    if (!nc_upnp_nft_available())
+        return;
+    if (jmx_netconfig_db_init() != 0)
+        return;
+    nc_upnp_db_init_mappings();
+    if (nc_prepare(&st, "SELECT COUNT(*) FROM upnp_mapping WHERE enabled=1") != 0)
+        return;
+    if (sqlite3_step(st) == SQLITE_ROW)
+        enabled = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    if (enabled <= 0)
+        return;
+    if (nc_run_quiet("nft list table inet " NC_UPNP_NFT_TABLE " >/dev/null 2>&1") == 0)
+        return;   /* already present, nothing to restore */
+    nc_upnp_static_nft_apply();
+}
+
+struct json_object *jmx_upnp_static_status(void)
+{
+    struct json_object *data;
+
+    nc_upnp_static_reconcile_once();
+    data = nc_upnp_static_nft_readback();
+    json_object_object_add(data, "ts", json_object_new_int64(nc_now_s()));
+    return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+}
+
+int jmx_upnp_static_apply(void)
+{
+    return nc_upnp_static_nft_apply();
+}
+
 int jmx_upnp_mapping_delete(const char *id)
 {
-    (void)id;
-    return -3;
+    sqlite3_stmt *st = NULL;
+    int rc, changed;
+
+    if (!id || !id[0] || !nc_valid_name(id)) return -2;
+    if (jmx_netconfig_db_init() != 0) return -1;
+    nc_upnp_db_init_mappings();
+    if (nc_prepare(&st, "DELETE FROM upnp_mapping WHERE id=?1") != 0) return -1;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    rc = nc_step_done(st);
+    changed = sqlite3_changes(g_netconfig_db);
+    sqlite3_finalize(st);
+    if (rc != 0) return -1;
+    if (changed != 1) return 1;          /* not found */
+    /* DB is source of truth; re-render the whole table from it. */
+    if (nc_upnp_static_nft_apply() != 0) return -4;
+    return 0;
 }
 
 static int nc_upnp_disabled_field_changed(struct json_object *cfg,
@@ -11075,14 +11553,190 @@ static void nc_dns_add_stats(struct json_object *root)
     json_object_object_add(root, "stats", stats);
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * DNS engine discovery (A-09 P1)
+ *
+ * Which resolvers exist is a runtime fact about the installed firmware, not a
+ * compile-time constant. Hardcoding smartdns/mosdns to false made the API lie
+ * on boxes that actually have them installed, and told the user "unsupported"
+ * when the truthful answer is "installed but not wired up yet".
+ *
+ * We report three orthogonal facts per engine and never conflate them:
+ *   installed - binary present
+ *   managed   - init script present (we could start/stop it)
+ *   active    - the process is actually running right now
+ * "Can DreamingWrt drive it" is a fourth, separate thing, and is still false
+ * until the renderer lands - see dns_engine_switch below.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    const char *id;
+    const char *binary;
+    const char *alt_binary;
+    const char *init_script;
+    const char *proc_name;
+    int encrypted_upstreams;   /* engine itself can speak DoT/DoH upstream */
+} nc_dns_engine_t;
+
+static const nc_dns_engine_t g_dns_engines[] = {
+    { "dnsmasq",     "/usr/sbin/dnsmasq",  NULL,
+      "/etc/init.d/dnsmasq",     "dnsmasq",     0 },
+    { "smartdns",    "/usr/sbin/smartdns", "/usr/bin/smartdns",
+      "/etc/init.d/smartdns",    "smartdns",    1 },
+    { "mosdns",      "/usr/bin/mosdns",    "/usr/sbin/mosdns",
+      "/etc/init.d/mosdns",      "mosdns",      1 },
+    { "adguardhome", "/usr/bin/AdGuardHome", "/usr/bin/adguardhome",
+      "/etc/init.d/AdGuardHome", "AdGuardHome", 1 },
+};
+#define NC_DNS_ENGINE_COUNT ((int)(sizeof(g_dns_engines) / sizeof(g_dns_engines[0])))
+
+static int nc_dns_engine_installed(const nc_dns_engine_t *e)
+{
+    if (!e) return 0;
+    if (e->binary && access(e->binary, X_OK) == 0) return 1;
+    if (e->alt_binary && access(e->alt_binary, X_OK) == 0) return 1;
+    return 0;
+}
+
+static const char *nc_dns_engine_path(const nc_dns_engine_t *e)
+{
+    if (!e) return "";
+    if (e->binary && access(e->binary, X_OK) == 0) return e->binary;
+    if (e->alt_binary && access(e->alt_binary, X_OK) == 0) return e->alt_binary;
+    return "";
+}
+
+/* Running or not - read from /proc, not from an init script exit code. */
+static int nc_dns_engine_active(const nc_dns_engine_t *e)
+{
+    DIR *d;
+    struct dirent *de;
+    int found = 0;
+
+    if (!e || !e->proc_name || !e->proc_name[0])
+        return 0;
+    d = opendir("/proc");
+    if (!d)
+        return 0;
+    while (!found && (de = readdir(d))) {
+        char path[64], comm[128];
+        FILE *fp;
+        if (de->d_name[0] < '0' || de->d_name[0] > '9')
+            continue;
+        snprintf(path, sizeof(path), "/proc/%s/comm", de->d_name);
+        fp = fopen(path, "r");
+        if (!fp)
+            continue;
+        if (fgets(comm, sizeof(comm), fp)) {
+            char *nl = strchr(comm, '\n');
+            if (nl) *nl = '\0';
+            if (!strcmp(comm, e->proc_name))
+                found = 1;
+        }
+        fclose(fp);
+    }
+    closedir(d);
+    return found;
+}
+
+static const nc_dns_engine_t *nc_dns_engine_find(const char *id)
+{
+    int i;
+    if (!id || !id[0]) return NULL;
+    for (i = 0; i < NC_DNS_ENGINE_COUNT; i++)
+        if (!strcmp(g_dns_engines[i].id, id))
+            return &g_dns_engines[i];
+    return NULL;
+}
+
+/*
+ * True when some installed engine could carry encrypted upstreams. This is the
+ * honest basis for the doh/dot capability: it is a property of the resolver in
+ * use, not a global constant. dnsmasq alone cannot do it, so on a dnsmasq-only
+ * box this stays false - which is why it used to be hardcoded 0.
+ */
+static int nc_dns_encrypted_capable_engine(const char **engine_id)
+{
+    int i;
+    if (engine_id) *engine_id = "";
+    for (i = 0; i < NC_DNS_ENGINE_COUNT; i++) {
+        if (!g_dns_engines[i].encrypted_upstreams)
+            continue;
+        if (nc_dns_engine_installed(&g_dns_engines[i])) {
+            if (engine_id) *engine_id = g_dns_engines[i].id;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Per-engine inventory for the UI, plus why a capability is off. */
+static void nc_dns_add_engines(struct json_object *root)
+{
+    struct json_object *arr = json_object_new_array();
+    int i;
+
+    for (i = 0; i < NC_DNS_ENGINE_COUNT; i++) {
+        const nc_dns_engine_t *e = &g_dns_engines[i];
+        struct json_object *o = json_object_new_object();
+        int installed = nc_dns_engine_installed(e);
+        int managed = e->init_script && nc_file_exists(e->init_script);
+
+        json_object_object_add(o, "id", json_object_new_string(e->id));
+        json_object_object_add(o, "installed", json_object_new_boolean(installed));
+        json_object_object_add(o, "path", json_object_new_string(nc_dns_engine_path(e)));
+        json_object_object_add(o, "managed", json_object_new_boolean(managed));
+        json_object_object_add(o, "active",
+                               json_object_new_boolean(installed ? nc_dns_engine_active(e) : 0));
+        json_object_object_add(o, "encrypted_upstreams",
+                               json_object_new_boolean(e->encrypted_upstreams));
+        /* DreamingWrt cannot yet render this engine's config; only dnsmasq is
+         * driven end-to-end today. Say so instead of implying we can switch. */
+        json_object_object_add(o, "dreamingwrt_managed_config",
+                               json_object_new_boolean(!strcmp(e->id, "dnsmasq")));
+        if (!installed)
+            json_object_object_add(o, "reason", json_object_new_string("engine_not_installed"));
+        else if (strcmp(e->id, "dnsmasq"))
+            json_object_object_add(o, "reason",
+                                   json_object_new_string("engine_config_renderer_missing"));
+        json_object_array_add(arr, o);
+    }
+    json_object_object_add(root, "engines", arr);
+}
+
 static void nc_dns_add_caps(struct json_object *root)
 {
     struct json_object *caps = json_object_new_object();
+    const char *enc_engine = "";
+    int enc_engine_present = nc_dns_encrypted_capable_engine(&enc_engine);
+    const nc_dns_engine_t *e_smart = nc_dns_engine_find("smartdns");
+    const nc_dns_engine_t *e_mos = nc_dns_engine_find("mosdns");
+
     json_object_object_add(caps, "dnsmasq", json_object_new_boolean(1));
-    json_object_object_add(caps, "smartdns", json_object_new_boolean(0));
-    json_object_object_add(caps, "mosdns", json_object_new_boolean(0));
-    json_object_object_add(caps, "doh", json_object_new_boolean(0));
-    json_object_object_add(caps, "dot", json_object_new_boolean(0));
+    /* Installed-and-detected, from the runtime probe above. */
+    json_object_object_add(caps, "smartdns",
+                           json_object_new_boolean(nc_dns_engine_installed(e_smart)));
+    json_object_object_add(caps, "mosdns",
+                           json_object_new_boolean(nc_dns_engine_installed(e_mos)));
+    /*
+     * doh/dot describe whether *this box could* carry encrypted upstreams.
+     * Writing one is still refused by nc_dns_request_capability_check() until
+     * the renderer lands, which is reported separately as
+     * encrypted_upstream_write so the UI cannot mistake one for the other.
+     */
+    json_object_object_add(caps, "doh", json_object_new_boolean(enc_engine_present));
+    json_object_object_add(caps, "dot", json_object_new_boolean(enc_engine_present));
+    json_object_object_add(caps, "encrypted_upstream_write", json_object_new_boolean(0));
+    json_object_object_add(caps, "encrypted_upstream_engine",
+                           json_object_new_string(enc_engine));
+    if (!enc_engine_present)
+        json_object_object_add(caps, "encrypted_upstream_reason",
+            json_object_new_string("no_installed_engine_supports_encrypted_upstreams"));
+    else
+        json_object_object_add(caps, "encrypted_upstream_reason",
+            json_object_new_string("engine_config_renderer_missing"));
+    /* Switching the active resolver is not implemented; only dnsmasq is driven. */
+    json_object_object_add(caps, "dns_engine_switch", json_object_new_boolean(0));
     json_object_object_add(caps, "domain_block", json_object_new_boolean(1));
     json_object_object_add(caps, "domain_forward", json_object_new_boolean(1));
     json_object_object_add(caps, "live_stats", json_object_new_boolean(0));
@@ -11222,6 +11876,7 @@ done:
     nc_dns_add_wan_dns(data);
     nc_dns_add_stats(data);
     nc_dns_add_caps(data);
+    nc_dns_add_engines(data);
     return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
 }
 
@@ -20062,7 +20717,6 @@ static void nc_sys_settings_db_init(void)
     nc_add_column_if_missing("system_settings", "ntp_use_dhcp", "INTEGER NOT NULL DEFAULT 0");
     nc_exec("CREATE TABLE IF NOT EXISTS system_ntp_server (id TEXT PRIMARY KEY,server TEXT NOT NULL,priority INTEGER NOT NULL DEFAULT 100,enabled INTEGER NOT NULL DEFAULT 1)");
     nc_exec("CREATE TABLE IF NOT EXISTS system_cron_job (id TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,schedule TEXT NOT NULL,command TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)");
-    nc_exec("CREATE TABLE IF NOT EXISTS system_backup_history (id TEXT PRIMARY KEY,path TEXT NOT NULL,size_bytes INTEGER NOT NULL DEFAULT 0,firmware_version TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,reason TEXT NOT NULL DEFAULT 'manual')");
     nc_exec("CREATE TABLE IF NOT EXISTS disabled_function (code TEXT PRIMARY KEY,reason TEXT NOT NULL DEFAULT '',source TEXT NOT NULL DEFAULT 'auto',updated_at INTEGER NOT NULL)");
     nc_exec("CREATE TABLE IF NOT EXISTS system_ui_settings (id INTEGER PRIMARY KEY CHECK (id = 1),ui_mode TEXT NOT NULL DEFAULT 'calm',sidebar_collapsed INTEGER NOT NULL DEFAULT 1,default_view TEXT NOT NULL DEFAULT 'overview',show_status_rail INTEGER NOT NULL DEFAULT 1,animation_level TEXT NOT NULL DEFAULT 'balanced',density TEXT NOT NULL DEFAULT 'comfortable',updated_at INTEGER NOT NULL DEFAULT 0)");
     nc_exec("CREATE TABLE IF NOT EXISTS appearance_settings (id INTEGER PRIMARY KEY CHECK (id = 1),accent_color TEXT NOT NULL DEFAULT 'violet',glass_opacity REAL NOT NULL DEFAULT 0.06,glass_highlight REAL NOT NULL DEFAULT 0.28,glass_blur REAL NOT NULL DEFAULT 3.2,glass_saturate INTEGER NOT NULL DEFAULT 140,glass_neutral_color TEXT NOT NULL DEFAULT '10 16 25',glass_border_width REAL NOT NULL DEFAULT 1.0,glass_border_color TEXT NOT NULL DEFAULT '#25FFFFFF',glass_preserve_center INTEGER NOT NULL DEFAULT 1,menu_glass_mode TEXT NOT NULL DEFAULT 'shader',menu_glass_displacement_scale REAL NOT NULL DEFAULT 80.0,menu_glass_blur_amount REAL NOT NULL DEFAULT 0.0,menu_glass_saturation INTEGER NOT NULL DEFAULT 140,menu_glass_aberration_intensity REAL NOT NULL DEFAULT 2.0,menu_glass_corner_radius REAL NOT NULL DEFAULT 0.0,menu_glass_over_light INTEGER NOT NULL DEFAULT 0,menu_glass_highlight_angle REAL NOT NULL DEFAULT 135.0,wallpaper_enabled INTEGER NOT NULL DEFAULT 0,wallpaper_directory TEXT NOT NULL DEFAULT '/www/dreamingwrt/static/background',wallpaper_image TEXT NOT NULL DEFAULT '',wallpaper_opacity REAL NOT NULL DEFAULT 0.16,wallpaper_mode TEXT NOT NULL DEFAULT 'argon',wallpaper_interval TEXT NOT NULL DEFAULT 'medium',login_enabled INTEGER NOT NULL DEFAULT 1,login_image TEXT NOT NULL DEFAULT '',login_opacity REAL NOT NULL DEFAULT 1.0,login_mode TEXT NOT NULL DEFAULT 'argon',login_interval TEXT NOT NULL DEFAULT 'medium',updated_at INTEGER NOT NULL DEFAULT 0)");
@@ -22650,10 +23304,7 @@ struct json_object *jmx_system_settings_get(void)
     json_object_object_add(cap,"mounts_unmount",json_object_new_boolean(1));
     json_object_object_add(cap,"mounts_generate_config",json_object_new_boolean(mounts_gen));
     json_object_object_add(cap,"flash_read",json_object_new_boolean(1));
-    json_object_object_add(cap,"flash_backup_create",json_object_new_boolean(0));
-    json_object_object_add(cap,"flash_backup_restore",json_object_new_boolean(0));
     json_object_object_add(cap,"flash_factory_reset",json_object_new_boolean(0));
-    json_object_object_add(cap,"flash_sysupgrade",json_object_new_boolean(0));
     struct json_object*flash=json_object_new_object();json_object_object_add(flash,"current_firmware",json_object_new_string(ver[0]?ver:"DreamingWrt"));json_object_object_add(flash,"build_time",json_object_new_string(""));json_object_object_add(flash,"backup_size",json_object_new_string(""));json_object_object_add(flash,"keep_settings",json_object_new_boolean(1));json_object_object_add(flash,"last_backup_at",json_object_new_int64(0));json_object_object_add(flash,"auto_backup",json_object_new_boolean(1));json_object_object_add(d,"flash",flash);
     {
         char kern[256]="";
@@ -23434,21 +24085,6 @@ struct json_object *jmx_system_settings_draft_apply(struct json_object *cfg)
 {
     return jmx_system_settings_apply_result(cfg);
 }
-struct json_object *jmx_system_backup_create(struct json_object *cfg)
-{
-    struct json_object *d = json_object_new_object();
-    (void)cfg;
-    json_object_object_add(d, "ok", json_object_new_boolean(0));
-    json_object_object_add(d, "error", json_object_new_string("deprecated_path_disabled"));
-    json_object_object_add(d, "persisted", json_object_new_boolean(0));
-    json_object_object_add(d, "artifact_created", json_object_new_boolean(0));
-    json_object_object_add(d, "replacement",
-                           json_object_new_string("/api/v1/system/config-backups"));
-    json_object_object_add(d, "reason",
-                           json_object_new_string("use_owner_scoped_sqlite_online_backup_pipeline"));
-    return jmx_gen_api_response_data(API_CODE_ERROR, d);
-}
-
 int jmx_system_cron_set(struct json_object *cfg)
 {if(!cfg||jmx_netconfig_db_init()!=0)return -1;nc_sys_settings_db_init();struct json_object*jobs=NULL;if(!json_object_object_get_ex(cfg,"jobs",&jobs)||!json_object_is_type(jobs,json_type_array))return -1;sqlite3_int64 now=(sqlite3_int64)nc_now_s();nc_exec("BEGIN IMMEDIATE");nc_exec("DELETE FROM system_cron_job");int n=json_object_array_length(jobs);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(jobs,i);const char*id=nc_json_str_def(o,"id","");const char*sch=nc_json_str_def(o,"schedule","");const char*cmd=nc_json_str_def(o,"command","");if(!nc_valid_name(id)||!sch[0]||strncmp(cmd,"/usr/libexec/dreamingwrt/",25)&&strncmp(cmd,"/etc/init.d/",12)){nc_exec("ROLLBACK");return -1;}sqlite3_stmt*st=NULL;if(nc_prepare(&st,"INSERT INTO system_cron_job(id,enabled,schedule,command,description,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,2,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,3,sch,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,cmd,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"desc",nc_json_str_def(o,"description","")),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,6,now);sqlite3_bind_int64(st,7,now);sqlite3_step(st);sqlite3_finalize(st);}}nc_exec("COMMIT");return 0;}
 
@@ -23484,9 +24120,6 @@ struct json_object *jmx_system_service_set(struct json_object *cfg)
 
 /* ── Small closure APIs: safe read-only / SQLite-only helpers ─────────── */
 static const char *nc_simple_status_name(int rc){return rc==0?"ok":"error";}
-
-struct json_object *jmx_system_backup_history(struct json_object *cfg)
-{if(jmx_netconfig_db_init()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);(void)cfg;nc_sys_settings_db_init();struct json_object*a=json_object_new_array();sqlite3_stmt*st=NULL;if(nc_prepare(&st,"SELECT id,path,size_bytes,firmware_version,created_at,reason FROM system_backup_history ORDER BY created_at DESC LIMIT 100")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();nc_add_text(o,"id",st,0);nc_add_text(o,"path",st,1);json_object_object_add(o,"size_bytes",json_object_new_int64(sqlite3_column_int64(st,2)));nc_add_text(o,"firmware_version",st,3);json_object_object_add(o,"created_at",json_object_new_int64(sqlite3_column_int64(st,4)));nc_add_text(o,"reason",st,5);json_object_array_add(a,o);}sqlite3_finalize(st);}struct json_object*d=json_object_new_object();json_object_object_add(d,"items",a);json_object_object_add(d,"runtime",json_object_new_string("history_from_sqlite"));return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
 
 struct json_object *jmx_system_disabled_functions_get(void)
 {if(jmx_netconfig_db_init()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);nc_sys_settings_db_init();nc_sys_sync_disabled_from_file();nc_sys_hwprobe_disabled();struct json_object*d=json_object_new_object();json_object_object_add(d,"path",json_object_new_string("/etc/disabled_func"));json_object_object_add(d,"items",nc_sys_disabled_json());json_object_object_add(d,"status",json_object_new_string("synced_from_file"));return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
@@ -24509,6 +25142,7 @@ struct json_object *jmx_upnp_mappings_list(void)
     sqlite3_stmt *st = NULL;
     if (jmx_netconfig_db_init() != 0) goto done;
     nc_upnp_db_init_mappings();
+    nc_upnp_static_reconcile_once();
     if (nc_prepare(&st, "SELECT id,enabled,protocol,external_port,internal_ip,internal_port,client,description,lease,packets FROM upnp_mapping ORDER BY external_port") == 0) {
         while (sqlite3_step(st) == SQLITE_ROW) {
             struct json_object *m = json_object_new_object();
@@ -24529,14 +25163,118 @@ struct json_object *jmx_upnp_mappings_list(void)
     }
 done:
     json_object_object_add(data, "mappings", arr);
+    /* Real kernel state next to the DB rows: the UI must be able to tell
+     * "stored" from "actually forwarding". */
+    json_object_object_add(data, "dataplane", nc_upnp_static_nft_readback());
     json_object_object_add(data, "ts", json_object_new_int64(nc_now_s()));
     return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
 }
 
+/*
+ * Create or update a static mapping.
+ * Return codes: 0 ok, -1 storage, -2 invalid input, -3 unsupported,
+ *               -4 dataplane apply failed (DB rolled back),
+ *               -5 external port conflicts with another mapping,
+ *               -6 external port belongs to the management plane (lockout),
+ *               -7 external port is already a local listener.
+ */
+int jmx_upnp_mapping_set_ex(struct json_object *cfg, char *owner, size_t owner_len)
+{
+    const char *id, *proto, *iip, *desc, *client;
+    int eport, iport, enabled, lease;
+    sqlite3_stmt *st = NULL;
+    char gen_id[64];
+    int rc, conflict;
+
+    if (owner && owner_len) owner[0] = '\0';
+    if (!cfg) return -2;
+    if (!nc_upnp_nft_available()) return -3;
+
+    id     = nc_json_str_def(cfg, "id", "");
+    proto  = nc_json_str_def(cfg, "protocol", "tcp");
+    iip    = nc_json_str_def(cfg, "internal_ip",
+             nc_json_str_def(cfg, "internal_client", ""));
+    desc   = nc_json_str_def(cfg, "description", nc_json_str_def(cfg, "remark", ""));
+    client = nc_json_str_def(cfg, "client", "");
+    eport  = nc_json_int_def(cfg, "external_port", 0);
+    iport  = nc_json_int_def(cfg, "internal_port", 0);
+    enabled = nc_json_bool_def(cfg, "enabled", 1);
+    lease  = nc_json_int_def(cfg, "lease", 0);
+
+    if (!nc_upnp_proto_ok(proto) || !nc_upnp_port_ok(eport) || !nc_upnp_port_ok(iport))
+        return -2;
+    if (!nc_upnp_private_ipv4(iip))
+        return -2;
+    if (strlen(desc) > 256 || strlen(client) > 128)
+        return -2;
+    /* Never hand a port the router itself is serving to a LAN host. */
+    conflict = nc_upnp_port_conflict(eport, owner, owner_len);
+    if (conflict == NC_UPNP_PORT_MGMT)
+        return -6;
+    if (conflict == NC_UPNP_PORT_LOCAL)
+        return -7;
+
+    if (jmx_netconfig_db_init() != 0) return -1;
+    nc_upnp_db_init_mappings();
+
+    if (!id[0]) {
+        snprintf(gen_id, sizeof(gen_id), "map_%s_%d", proto, eport);
+        id = gen_id;
+    }
+    if (!nc_valid_name(id)) return -2;
+
+    /* (protocol, external_port) must be unique across mappings. */
+    if (nc_prepare(&st,
+        "SELECT COUNT(*) FROM upnp_mapping WHERE protocol=?1 AND external_port=?2 AND id<>?3") == 0) {
+        int dup = 0;
+        sqlite3_bind_text(st, 1, proto, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, eport);
+        sqlite3_bind_text(st, 3, id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) dup = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+        st = NULL;
+        if (dup > 0) return -5;
+    }
+
+    if (nc_prepare(&st,
+        "INSERT INTO upnp_mapping(id,enabled,protocol,external_port,internal_ip,internal_port,"
+        "client,description,lease,packets,created_at,updated_at) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?10) "
+        "ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,protocol=excluded.protocol,"
+        "external_port=excluded.external_port,internal_ip=excluded.internal_ip,"
+        "internal_port=excluded.internal_port,client=excluded.client,"
+        "description=excluded.description,lease=excluded.lease,updated_at=excluded.updated_at") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, enabled ? 1 : 0);
+    sqlite3_bind_text(st, 3, proto, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 4, eport);
+    sqlite3_bind_text(st, 5, iip, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 6, iport);
+    sqlite3_bind_text(st, 7, client, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, desc, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 9, lease);
+    sqlite3_bind_int64(st, 10, nc_now_s());
+    rc = nc_step_done(st);
+    sqlite3_finalize(st);
+    if (rc != 0) return -1;
+
+    if (nc_upnp_static_nft_apply() != 0) {
+        /* Do not leave a DB row claiming a mapping the kernel does not have. */
+        if (nc_prepare(&st, "DELETE FROM upnp_mapping WHERE id=?1") == 0) {
+            sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+            nc_step_done(st);
+            sqlite3_finalize(st);
+        }
+        nc_upnp_static_nft_apply();
+        return -4;
+    }
+    return 0;
+}
+
 int jmx_upnp_mapping_set(struct json_object *cfg)
 {
-    (void)cfg;
-    return -3;
+    return jmx_upnp_mapping_set_ex(cfg, NULL, 0);
 }
 
 /* ── Advanced Routing CRUD ── */
@@ -28543,86 +29281,6 @@ int jmx_client_control_schedule_tick(void)
 }
 
 /* ═══ Flash / Firmware Operations ═══ */
-
-struct json_object *jmx_flash_create_backup(struct json_object *cfg) {
-    (void)cfg;
-    struct json_object *d = json_object_new_object();
-    char path[256];
-    snprintf(path, sizeof(path), "/tmp/dreamingwrt/flash_backup_%lld.tar.gz", (long long)nc_now_s());
-    mkdir("/tmp/dreamingwrt", 0755);
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "sysupgrade -b %s 2>&1", path);
-    int rc = nc_run_quiet(cmd);
-    struct stat stbuf;
-    long long sz = 0;
-    if (stat(path, &stbuf) == 0) sz = (long long)stbuf.st_size;
-    json_object_object_add(d, "ok", json_object_new_boolean(rc == 0));
-    json_object_object_add(d, "path", json_object_new_string(path));
-    json_object_object_add(d, "size_bytes", json_object_new_int64(sz));
-    json_object_object_add(d, "ts", json_object_new_int64(nc_now_s()));
-    return jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, d);
-}
-
-struct json_object *jmx_flash_restore_backup(struct json_object *cfg) {
-    struct json_object *d = json_object_new_object();
-    const char *path = nc_json_str_def(cfg, "path", "");
-    if (!path[0] || access(path, F_OK) != 0) {
-        json_object_object_add(d, "error", json_object_new_string("backup file not found"));
-        return jmx_gen_api_response_data(API_CODE_ERROR, d);
-    }
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "sysupgrade -r %s 2>&1", path);
-    int rc = nc_run_quiet(cmd);
-    json_object_object_add(d, "ok", json_object_new_boolean(rc == 0));
-    json_object_object_add(d, "path", json_object_new_string(path));
-    json_object_object_add(d, "ts", json_object_new_int64(nc_now_s()));
-    return jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, d);
-}
-
-struct json_object *jmx_flash_upload_firmware(struct json_object *cfg) {
-    struct json_object *d = json_object_new_object();
-    const char *path = nc_json_str_def(cfg, "path", "");
-    if (!path[0] || access(path, F_OK) != 0) {
-        json_object_object_add(d, "error", json_object_new_string("firmware file not found"));
-        return jmx_gen_api_response_data(API_CODE_ERROR, d);
-    }
-    struct stat stbuf;
-    if (stat(path, &stbuf) != 0 || stbuf.st_size < 1024) {
-        json_object_object_add(d, "error", json_object_new_string("firmware file too small or unreadable"));
-        return jmx_gen_api_response_data(API_CODE_ERROR, d);
-    }
-    char staged[256];
-    snprintf(staged, sizeof(staged), "/tmp/dreamingwrt/firmware_%lld.bin", (long long)nc_now_s());
-    mkdir("/tmp/dreamingwrt", 0755);
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "cp '%s' '%s' 2>&1", path, staged);
-    int rc = nc_run_quiet(cmd);
-    json_object_object_add(d, "ok", json_object_new_boolean(rc == 0));
-    json_object_object_add(d, "staged_path", json_object_new_string(staged));
-    json_object_object_add(d, "size_bytes", json_object_new_int64(stbuf.st_size));
-    json_object_object_add(d, "ts", json_object_new_int64(nc_now_s()));
-    return jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, d);
-}
-
-struct json_object *jmx_flash_sysupgrade(struct json_object *cfg) {
-    struct json_object *d = json_object_new_object();
-    const char *path = nc_json_str_def(cfg, "path", "");
-    int keep = nc_json_bool_def(cfg, "keep_settings", 1);
-    if (!path[0] || access(path, F_OK) != 0) {
-        json_object_object_add(d, "error", json_object_new_string("firmware file not found"));
-        return jmx_gen_api_response_data(API_CODE_ERROR, d);
-    }
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "sysupgrade %s'%s' &", keep ? "" : "-n ", path);
-    LOG_ERROR("flash_sysupgrade: initiating upgrade from %s (keep_settings=%d)\n", path, keep);
-    int rc = nc_run_quiet(cmd);
-    json_object_object_add(d, "ok", json_object_new_boolean(rc == 0));
-    json_object_object_add(d, "path", json_object_new_string(path));
-    json_object_object_add(d, "keep_settings", json_object_new_boolean(keep));
-    json_object_object_add(d, "message", json_object_new_string("sysupgrade initiated, device will reboot"));
-    json_object_object_add(d, "ts", json_object_new_int64(nc_now_s()));
-    return jmx_gen_api_response_data(API_CODE_SUCCESS, d);
-}
 
 struct json_object *jmx_flash_factory_reset(struct json_object *cfg) {
     (void)cfg;

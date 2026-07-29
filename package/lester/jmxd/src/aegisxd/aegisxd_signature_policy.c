@@ -674,7 +674,7 @@ struct json_object *aegisxd_signature_policy_counts_json(void)
     return o;
 }
 
-int aegisxd_signature_policy_effective_enabled_count(void)
+static int aegisxd_signature_policy_effective_enabled_count_slow(void)
 {
     sqlite3_stmt *st;
     int count = 0;
@@ -698,6 +698,94 @@ int aegisxd_signature_policy_effective_enabled_count(void)
             count++;
     }
     sqlite3_finalize(st);
+    return count;
+}
+
+struct aegisxd_sig_override_row {
+    int sid;
+    int target_rev;
+    int suppressed;
+    int enabled_override;
+};
+
+int aegisxd_signature_policy_effective_enabled_count(void)
+{
+    sqlite3_stmt *st;
+    struct aegisxd_sig_override_row *rows = NULL;
+    size_t used = 0;
+    size_t cap = 0;
+    size_t pos = 0;
+    int allocation_failed = 0;
+    int count = 0;
+
+    /* The rule and override tables live in separate SQLite databases. */
+    st = aegisxd_config_prepare(
+        "SELECT sid,target_rev,suppressed,enabled_override FROM "
+        AEGISXD_SIGNATURE_POLICY_TABLE " WHERE gid=1 ORDER BY sid");
+    if (st) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            if (used == cap) {
+                size_t next = cap ? cap * 2 : 64;
+                struct aegisxd_sig_override_row *grown =
+                    realloc(rows, next * sizeof(*rows));
+
+                if (!grown) {
+                    allocation_failed = 1;
+                    break;
+                }
+                rows = grown;
+                cap = next;
+            }
+            rows[used].sid = sqlite3_column_int(st, 0);
+            rows[used].target_rev = sqlite3_column_int(st, 1);
+            rows[used].suppressed = sqlite3_column_int(st, 2) ? 1 : 0;
+            rows[used].enabled_override = sqlite3_column_int(st, 3);
+            used++;
+        }
+        sqlite3_finalize(st);
+    }
+
+    if (allocation_failed) {
+        free(rows);
+        return aegisxd_signature_policy_effective_enabled_count_slow();
+    }
+
+    if (used == 0) {
+        free(rows);
+        st = aegisxd_prepare("SELECT COUNT(*) FROM aegis_suricata_rules "
+                             "WHERE rule_text<>'' AND enabled_default<>0");
+        if (!st)
+            return 0;
+        if (sqlite3_step(st) == SQLITE_ROW)
+            count = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+        return count;
+    }
+
+    st = aegisxd_prepare("SELECT sid,rev,enabled_default FROM aegis_suricata_rules "
+                         "WHERE rule_text<>'' ORDER BY sid");
+    if (!st) {
+        free(rows);
+        return 0;
+    }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        int sid = sqlite3_column_int(st, 0);
+        int rev = sqlite3_column_int(st, 1);
+        int enabled = sqlite3_column_int(st, 2) ? 1 : 0;
+
+        while (pos < used && rows[pos].sid < sid)
+            pos++;
+        if (pos < used && rows[pos].sid == sid && rows[pos].target_rev == rev) {
+            if (rows[pos].suppressed)
+                enabled = 0;
+            else if (rows[pos].enabled_override >= 0)
+                enabled = rows[pos].enabled_override ? 1 : 0;
+        }
+        if (enabled)
+            count++;
+    }
+    sqlite3_finalize(st);
+    free(rows);
     return count;
 }
 
