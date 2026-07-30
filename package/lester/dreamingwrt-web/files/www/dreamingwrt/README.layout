@@ -10,12 +10,8 @@ Layout:
 - `login/`: temporary standalone login entry while the new SPA grows.
 - `static/css`, `static/js`: shared hashed or versioned frontend assets.
 - `static/images/logo`: canonical public root for database-mapped application,
-  device, brand and carrier logos. The bulk of that catalog is installed by the
-  optional `jmxd` logo component, whose filename mapping lives in
-  `dreamingwrt_signatures.db`. That component and database are private and are
-  **not** part of the public source release, so in a stock public build this
-  directory only holds the assets checked into the tree. Frontend code must treat
-  a missing logo as normal and fall back to a generic icon.
+  device, brand and carrier logos installed by the required `jmxd` logo
+  component. Their filename mapping remains in `dreamingwrt_signatures.db`.
 - `static/images`: Dreaming OS shell identity assets such as
   `dreamingwrt.png` and `logo-64.png`, plus setup artwork and other Web-owned
   images. Shell identity must not depend on the database-mapped logo catalog.

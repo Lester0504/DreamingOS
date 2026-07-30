@@ -80,7 +80,7 @@ try:
           clients: [], apps: [], active_urls: [], ranks: []
         }};
         if (path === '/api/v1/system/status') return {{ hostname: 'DreamingWrt', model: 'Fixture Router', uptime: 7200, version: '7.2-RC3', build_date: 'Build202607180016', connections: 128 }};
-        if (path === '/api/v1/network/overview') return {{ wans: {{ wans }}, lans: {{ lans: [{{ id: 'lan', name: 'LAN', ifname: 'br-lan', ip: '192.168.1.1' }}] }} }};
+        if (path === '/api/v1/network/overview') return {{ wans: {{ wans }}, lans: {{ lans: [{{ id: 'lan', name: 'LAN', ifname: 'br-lan', ip: '192.168.30.1' }}] }} }};
         if (path === '/api/v1/network/wans') return {{ wans }};
         if (path === '/api/v1/network/ports') return {{ ports: [
           {{ id: 'eth0', label: 'eth0', ifname: 'eth0', role: 'lan', active: true, speed: '1 Gbps' }},

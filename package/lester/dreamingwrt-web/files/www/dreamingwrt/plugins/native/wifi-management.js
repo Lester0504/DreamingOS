@@ -50,7 +50,7 @@ export function mount(context = {}) {
     statusView: 'radios',
     filters: {
       ai: false, broadcast: 'all', aps: new Set(), bands: new Set(), mimo: new Set(), types: new Set(), status: new Set(),
-      connectivityRange: 48, environmentAp: 'all', environmentRange: '1d', environmentWidths: new Set(), signalMin: -90, signalMax: -30
+      connectivityRange: 48, environmentAp: 'all', environmentBand: '', environmentRange: '1d', environmentWidths: new Set(), signalMin: -90, signalMax: -30
     },
     columns: {
       connectivity: new Set(['client', 'event', 'ap', 'result', 'signal', 'band', 'broadcast', 'time']),
@@ -646,13 +646,13 @@ export function mount(context = {}) {
       ['5g', '5 GHz', [20, 40, 80, 160]],
       ['6g', '6 GHz', [20, 40, 80, 160, 320]]
     ];
-    return `<section class="wifi-panel-section wifi-global-defaults"><div class="wifi-radio-setting-grid"><div class="wifi-radio-label"><strong>默认 Wi-Fi 速度</strong><small>为全部 AP 设置默认信道宽度策略。</small></div><div class="wifi-speed-controls"><div class="wifi-radio-options">${[['maximum', '最高速度'], ['conservative', '保守'], ['custom', '自定义']].map(([value, label]) => `<label><input type="radio" name="wifi-speed-profile" value="${value}" data-wifi-setting="global.speed_profile" ${profile === value ? 'checked' : ''} ${canConfigWrite() ? '' : 'disabled'}><span>${label}</span></label>`).join('')}<button class="wifi-link-button is-inline" type="button" data-wifi-apply-all ${canConfigWrite() ? '' : 'disabled'}>应用于所有 AP</button></div><div class="wifi-width-picker"><strong>信道宽度 (MHz)</strong><div>${bands.map(([band, label, options]) => `<fieldset><legend>${label}</legend><span>${options.map((width) => `<button type="button" class="${Number(widths[band]) === width ? 'is-active' : ''}" data-wifi-width-band="${band}" data-wifi-width="${width}" ${canConfigWrite() ? '' : 'disabled'}>${width}</button>`).join('')}</span></fieldset>`).join('')}</div></div>${switchRow('global.dfs_enabled', '扩展 5 GHz 频谱 (DFS)', '允许自动信道使用 DFS 频段。', state.config.global.dfs_enabled, !canConfigWrite())}</div></div></section>`;
+    return `<section class="wifi-panel-section wifi-unifi-global"><div class="wifi-unifi-setting-grid"><div class="wifi-unifi-label"><strong>默认 Wi-Fi 速度</strong><small>为全部 AP 设置默认信道宽度策略。</small></div><div class="wifi-speed-controls"><div class="wifi-radio-options">${[['maximum', '最高速度'], ['conservative', '保守'], ['custom', '自定义']].map(([value, label]) => `<label><input type="radio" name="wifi-speed-profile" value="${value}" data-wifi-setting="global.speed_profile" ${profile === value ? 'checked' : ''} ${canConfigWrite() ? '' : 'disabled'}><span>${label}</span></label>`).join('')}<button class="wifi-link-button is-inline" type="button" data-wifi-apply-all ${canConfigWrite() ? '' : 'disabled'}>应用于所有 AP</button></div><div class="wifi-width-picker"><strong>信道宽度 (MHz)</strong><div>${bands.map(([band, label, options]) => `<fieldset><legend>${label}</legend><span>${options.map((width) => `<button type="button" class="${Number(widths[band]) === width ? 'is-active' : ''}" data-wifi-width-band="${band}" data-wifi-width="${width}" ${canConfigWrite() ? '' : 'disabled'}>${width}</button>`).join('')}</span></fieldset>`).join('')}</div></div>${switchRow('global.dfs_enabled', '扩展 5 GHz 频谱 (DFS)', '允许自动信道使用 DFS 频段。', state.config.global.dfs_enabled, !canConfigWrite())}</div></div></section>`;
   }
 
   function globalSettings() {
     const global = state.config.global;
     const disabled = !canConfigWrite();
-    return `<section class="wifi-panel-section"><header class="wifi-section-head"><div><strong>控制器能力</strong><small>按依赖关系管理 Mesh、设备发现与信道优化入口。</small></div></header><div class="wifi-settings-list">${switchRow('global.mesh', '无线 Mesh', '允许 AP 通过无线回程互联并扩展覆盖。', global.mesh, disabled)}<div class="wifi-dependency-panel ${global.mesh ? 'is-active' : ''}" data-dwrt-component="dependency-group"><div class="wifi-inline-setting" data-dwrt-dependency-panel><span><strong>Mesh 监视器</strong><small>仅在 Mesh 启用后用于检测无线回程上行连通性。</small></span><div class="wifi-radio-options compact">${[['gateway', 'Gateway'], ['custom', '自定义 IP']].map(([value, label]) => `<label><input type="radio" name="mesh-monitor" value="${value}" data-wifi-setting="global.mesh_monitor" ${global.mesh_monitor === value ? 'checked' : ''} ${disabled || !global.mesh ? 'disabled' : ''}><span>${label}</span></label>`).join('')}</div></div>${global.mesh && global.mesh_monitor === 'custom' ? `<div class="wifi-inline-setting" data-dwrt-dependency-panel><span><strong>监视器 IP</strong><small>AP 用于连通性探测的地址。</small></span><input type="text" data-wifi-setting="global.mesh_monitor_ip" value="${escapeHtml(global.mesh_monitor_ip || '')}" ${disabled ? 'disabled' : ''}></div>` : ''}</div>${switchRow('global.auto_link', '自动链接', '自动关联兼容的无线摄像机和 IoT 设备。', global.auto_link, disabled)}${switchRow('global.wifiman', 'WiFiman 支持', '允许移动端进行本地发现和信号测绘。', global.wifiman, disabled)}<div class="wifi-inline-setting"><span><strong>信道 AI</strong><small>根据相邻 AP 和干扰优化信道分配。</small></span><a href="#/monitor/wireless-status">前往无线状态</a></div></div></section>`;
+    return `<section class="wifi-panel-section"><header class="wifi-section-head"><div><strong>控制器能力</strong><small>按依赖关系管理 Mesh、设备发现与信道优化入口。</small></div></header><div class="wifi-settings-list">${switchRow('global.mesh', '无线 Mesh', '允许 AP 通过无线回程互联并扩展覆盖。', global.mesh, disabled)}<div class="wifi-dependency-panel ${global.mesh ? 'is-active' : ''}" data-dwrt-component="dependency-group"><div class="wifi-inline-setting" data-dwrt-dependency-panel><span><strong>Mesh 监视器</strong><small>仅在 Mesh 启用后用于检测无线回程上行连通性。</small></span><div class="wifi-radio-options compact">${[['gateway', 'Gateway'], ['custom', '自定义 IP']].map(([value, label]) => `<label><input type="radio" name="mesh-monitor" value="${value}" data-wifi-setting="global.mesh_monitor" ${global.mesh_monitor === value ? 'checked' : ''} ${disabled || !global.mesh ? 'disabled' : ''}><span>${label}</span></label>`).join('')}</div></div>${global.mesh && global.mesh_monitor === 'custom' ? `<div class="wifi-inline-setting" data-dwrt-dependency-panel><span><strong>监视器 IP</strong><small>AP 用于连通性探测的地址。</small></span><input type="text" data-wifi-setting="global.mesh_monitor_ip" value="${escapeHtml(global.mesh_monitor_ip || '')}" ${disabled ? 'disabled' : ''}></div>` : ''}</div>${switchRow('global.auto_link', 'UniFi 自动链接', '自动关联兼容的无线摄像机和 IoT 设备。', global.auto_link, disabled)}${switchRow('global.wifiman', 'WiFiman 支持', '允许移动端进行本地发现和信号测绘。', global.wifiman, disabled)}<div class="wifi-inline-setting"><span><strong>信道 AI</strong><small>根据相邻 AP 和干扰优化信道分配。</small></span><a href="#/monitor/wireless-status">前往无线状态</a></div></div></section>`;
   }
 
   function speedLimits() {
@@ -825,6 +825,23 @@ export function mount(context = {}) {
     return aps.find((ap) => ap.id === state.filters.environmentAp) || aps[0] || null;
   }
 
+  function environmentBands() {
+    const order = { '2g': 0, '5g': 1, '6g': 2 };
+    const bands = new Set();
+    const ap = selectedEnvironmentAp();
+    apRadios(ap ? ap.id : '').forEach((radio) => { if (radio.band) bands.add(radio.band); });
+    if (!bands.size) state.status.radios.forEach((radio) => { if (radio.band) bands.add(radio.band); });
+    state.status.interference.forEach((row) => { const band = normalizeBand(row.band); if (band) bands.add(band); });
+    return Array.from(bands).sort((left, right) => (order[left] ?? 9) - (order[right] ?? 9));
+  }
+
+  function selectedEnvironmentBand() {
+    const bands = environmentBands();
+    if (!bands.length) return '5g';
+    if (state.filters.environmentBand && bands.includes(state.filters.environmentBand)) return state.filters.environmentBand;
+    return bands.includes('5g') ? '5g' : bands[0];
+  }
+
   function scanStateLabel(value) {
     return ({ creating: '正在创建', queued: '排队中', leased: '等待 AP', running: '扫描中', completed: '已完成', failed: '失败', cancelled: '已取消', expired: '已超时' })[value] || firstText(value, '等待状态');
   }
@@ -866,7 +883,10 @@ export function mount(context = {}) {
       body = `<div class="airview-range-picker" role="group" aria-label="连接性时间范围">${[6, 12, 24, 48].map((hours) => `<button type="button" data-airview-connectivity-range="${hours}" aria-pressed="${state.filters.connectivityRange === hours}">${hours} 小时</button>`).join('')}</div><div class="airview-link-actions"><button type="button" class="wifi-link-button" data-airview-clear ${state.filters.connectivityRange === 48 ? 'disabled' : ''}>清除筛选条件</button>${columnEditor('connectivity')}</div>`;
     } else if (state.statusView === 'environment') {
       const scannerAvailable = bool(state.status.capabilities.scan_execution || state.status.capabilities.scan, false);
-      body = `${environmentApPicker(aps)}<button type="button" class="policy-primary compact airview-scan-button" data-airview-scan ${scannerAvailable && !state.scanning && aps.length ? '' : 'disabled'}>${icon('scan')}<span>${state.scanning ? '扫描任务执行中' : '扫描环境'}</span></button>${scanJobsPanel()}<details open><summary>时间范围</summary><div class="airview-range-picker compact">${[['30m','30 分钟'],['1h','1 小时'],['1d','1 天'],['1w','1 周'],['1m','1 月']].map(([value, label]) => `<button type="button" data-airview-environment-range="${value}" aria-pressed="${state.filters.environmentRange === value}">${label}</button>`).join('')}</div></details><details open><summary>信道宽度</summary><div class="airview-filter-list two-columns">${[20,40,80,160,240].map((width) => filterCheckbox('environmentWidths', width, String(width), state.filters.environmentWidths.has(String(width)))).join('')}</div></details><details open><summary>信号</summary>${signalRangeControl()}</details><div class="airview-link-actions">${columnEditor('environment')}<button type="button" class="wifi-link-button" data-airview-clear>清除筛选条件</button></div>`;
+      const envBands = environmentBands();
+      const activeEnvBand = selectedEnvironmentBand();
+      const bandSegment = envBands.length ? `<div class="airview-band-segment" role="group" aria-label="频段">${envBands.map((band) => `<button type="button" data-airview-environment-band="${band}" aria-pressed="${activeEnvBand === band}">${escapeHtml(bandLabel(band))}</button>`).join('')}</div>` : '';
+      body = `${environmentApPicker(aps)}${bandSegment}<button type="button" class="policy-primary compact airview-scan-button" data-airview-scan ${scannerAvailable && !state.scanning && aps.length ? '' : 'disabled'}>${icon('scan')}<span>${state.scanning ? '扫描任务执行中' : '扫描环境'}</span></button>${scanJobsPanel()}<details open><summary>时间范围</summary><div class="airview-range-picker compact">${[['30m','30 分钟'],['1h','1 小时'],['1d','1 天'],['1w','1 周'],['1m','1 月']].map(([value, label]) => `<button type="button" data-airview-environment-range="${value}" aria-pressed="${state.filters.environmentRange === value}">${label}</button>`).join('')}</div></details><details open><summary>信道宽度</summary><div class="airview-filter-list two-columns">${[20,40,80,160,240].map((width) => filterCheckbox('environmentWidths', width, String(width), state.filters.environmentWidths.has(String(width)))).join('')}</div></details><details open><summary>信号</summary>${signalRangeControl()}</details><div class="airview-link-actions">${columnEditor('environment')}<button type="button" class="wifi-link-button" data-airview-clear>清除筛选条件</button></div>`;
     } else {
       body = `<div class="airview-ai-row"><span>信道 AI 视图</span><label class="airview-switch"><input type="checkbox" data-airview-ai ${state.filters.ai ? 'checked' : ''} ${channelAiAvailable ? '' : 'disabled'} aria-label="信道 AI 视图"><i></i></label></div><div class="airview-ai-map ${channelAiAvailable ? '' : 'is-unavailable'}" aria-label="信道 AI 状态" data-dwrt-tooltip="${channelAiAvailable ? '显示信道 AI 建议' : '后端尚未提供信道 AI 建议'}">${airviewAiCells()}</div><label class="airview-broadcast-select">${icon('search')}<select data-airview-broadcast><option value="all">所有 WiFi 广播 (${broadcasts.length})</option>${broadcasts.map((broadcast) => `<option value="${escapeHtml(broadcast.id)}" ${state.filters.broadcast === broadcast.id ? 'selected' : ''}>${escapeHtml(broadcast.name)}</option>`).join('')}</select></label><details open><summary>Access Point</summary><div class="airview-filter-list">${aps.length ? aps.map((ap) => filterCheckbox('aps', ap.id, ap.name, state.filters.aps.has(ap.id), deviceImage(ap, 'airview-filter-device-image'))).join('') : '<small class="airview-filter-empty">未检测到 AP</small>'}</div></details><details open><summary>频段</summary><div class="airview-filter-list">${['2g', '5g', '6g'].map((band) => filterCheckbox('bands', band, bandLabel(band), state.filters.bands.has(band))).join('')}</div></details><details open><summary>信道计划</summary>${miniChannelPlan()}</details><details open><summary>MIMO</summary><div class="airview-filter-list">${['1x1', '2x2', '3x3', '4x4'].map((mimo) => filterCheckbox('mimo', mimo, mimo, state.filters.mimo.has(mimo))).join('')}</div></details><details open><summary>类型</summary><div class="airview-filter-list">${[['wired', '有线'], ['meshed', '已 Mesh']].map(([value, label]) => filterCheckbox('types', value, label, state.filters.types.has(value))).join('')}</div></details><details open><summary>状态</summary><div class="airview-filter-list">${[['online', '在线'], ['offline', '离线']].map(([value, label]) => filterCheckbox('status', value, label, state.filters.status.has(value))).join('')}</div></details><button type="button" class="wifi-link-button" data-airview-clear ${radioFiltersDefault() ? 'disabled' : ''}>清除筛选条件</button>`;
     }
@@ -930,8 +950,10 @@ export function mount(context = {}) {
   }
 
   function environmentRows() {
+    const band = selectedEnvironmentBand();
     return state.status.interference.filter((row) => {
       if (state.filters.environmentAp !== 'all' && firstText(row.ap_id, row.nearest_ap_id) !== state.filters.environmentAp) return false;
+      if (band && normalizeBand(row.band) !== band) return false;
       const width = String(firstNumber(row.width, row.channel_width));
       if (state.filters.environmentWidths.size && !state.filters.environmentWidths.has(width)) return false;
       const signal = firstNumber(row.signal, row.rssi, -100);
@@ -984,10 +1006,57 @@ export function mount(context = {}) {
     return `<svg class="airview-environment-history-line" viewBox="0 0 900 210" preserveAspectRatio="none" aria-label="信道利用率历史"><polyline points="${points}"></polyline></svg>`;
   }
 
+  function environmentBandRange(band) {
+    return ({
+      '2g': { min: 2400, max: 2496, ticks: [[2412, '1'], [2437, '6'], [2462, '11'], [2484, '14']] },
+      '5g': { min: 5150, max: 5895, ticks: [[5180, '36'], [5260, '52'], [5320, '64'], [5500, '100'], [5580, '116'], [5660, '132'], [5745, '149'], [5825, '165']] },
+      '6g': { min: 5925, max: 7125, ticks: [[5955, '1'], [6135, '37'], [6335, '77'], [6535, '117'], [6735, '157'], [6935, '197'], [7115, '233']] }
+    })[band] || { min: 2400, max: 2496, ticks: [] };
+  }
+
+  function channelToFrequency(band, channel) {
+    const ch = Number(channel);
+    if (!ch) return 0;
+    if (band === '2g') return ch === 14 ? 2484 : 2407 + ch * 5;
+    if (band === '5g') return 5000 + ch * 5;
+    if (band === '6g') return 5950 + ch * 5;
+    return 0;
+  }
+
+  // Neighbor spectrum: each AP is a bell centred on its channel, width by its
+  // bandwidth, peak at its RSSI. Mirrors UniFi's WiFi scanner spectrum chart.
+  function environmentSpectrumChart(rows, band) {
+    const W = 900, H = 232, padL = 4, padR = 4, padT = 6, padB = 4;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+    const range = environmentBandRange(band);
+    const span = Math.max(1, range.max - range.min);
+    const fx = (freq) => padL + Math.min(1, Math.max(0, (freq - range.min) / span)) * plotW;
+    const fy = (dbm) => padT + Math.min(1, Math.max(0, Math.abs(dbm) / 100)) * plotH;
+    const baseY = padT + plotH;
+    const bells = rows.map((row, index) => {
+      const freq = firstNumber(row.frequency_mhz) || channelToFrequency(band, firstNumber(row.channel));
+      if (!freq) return '';
+      const width = firstNumber(row.width_mhz, row.width, row.channel_width) || 20;
+      const signal = firstNumber(row.signal, row.rssi_dbm, row.rssi, -95);
+      const cx = fx(freq);
+      const half = Math.max(9, (width / span * plotW) / 2);
+      const peakY = fy(signal);
+      const left = cx - half;
+      const right = cx + half;
+      const path = `M ${left.toFixed(1)} ${baseY.toFixed(1)} C ${(left + half * 0.6).toFixed(1)} ${baseY.toFixed(1)} ${(cx - half * 0.4).toFixed(1)} ${peakY.toFixed(1)} ${cx.toFixed(1)} ${peakY.toFixed(1)} C ${(cx + half * 0.4).toFixed(1)} ${peakY.toFixed(1)} ${(right - half * 0.6).toFixed(1)} ${baseY.toFixed(1)} ${right.toFixed(1)} ${baseY.toFixed(1)} Z`;
+      const tone = index % 6;
+      const tip = `${firstText(row.ssid, row.name, '隐藏网络')} · 信道 ${firstText(row.channel, '--')} · ${width} MHz · ${signal} dBm`;
+      return `<path class="airview-bell tone-${tone}" d="${path}" data-dwrt-tooltip="${escapeHtml(tip)}"></path>`;
+    }).join('');
+    return `<svg class="airview-environment-spectrum" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-label="邻居广播频谱">${bells}</svg>`;
+  }
+
   function environmentResults() {
-    const channels = [30,36,42,48,54,60,66,72,78,84,90,96,112,118,124,130,136,142,148,154,160,165,171];
+    const band = selectedEnvironmentBand();
+    const range = environmentBandRange(band);
     const rows = environmentRows();
-    const titleBand = state.filters.bands.size === 1 ? bandLabel(Array.from(state.filters.bands)[0]) : '5 GHz';
+    const titleBand = bandLabel(band);
     const neighbor = state.status.environment.neighborScan;
     const columns = state.columns.environment;
     const cell = (row, key) => ({
@@ -1004,7 +1073,10 @@ export function mount(context = {}) {
     })[key];
     const visible = COLUMN_DEFS.environment.filter(([key]) => columns.has(key));
     const emptyText = bool(neighbor.execution_available, false) && neighbor.reason === 'scan_not_yet_run' ? '尚未执行邻居扫描，点击左侧“扫描环境”获取附近广播。' : environmentReason(neighbor.reason);
-    return `<section class="airview-spectrum-view"><header>环境 · ${escapeHtml(titleBand)}</header>${environmentCapabilitySummary()}<div class="airview-spectrum-chart" role="img" aria-label="${escapeHtml(`${titleBand} 信道利用率历史`)}"><div class="airview-spectrum-y">${[100,80,60,40,20,0].map((value) => `<span>${value}</span>`).join('')}</div><div class="airview-spectrum-grid"><i></i><i></i><i></i><i></i><i></i><i></i></div><span class="airview-spectrum-db">%</span>${surveyHistoryChart()}<div class="airview-spectrum-x">${channels.map((channel) => `<span>${channel}</span>`).join('')}</div><span class="airview-spectrum-channel">历史范围</span></div><div class="airview-spectrum-table wifi-table-scroll"><table><thead><tr>${visible.map(([, label]) => `<th>${label}</th>`).join('')}</tr></thead><tbody>${rows.map((row) => `<tr>${visible.map(([key]) => `<td>${cell(row, key)}</td>`).join('')}</tr>`).join('')}</tbody></table>${rows.length ? '' : `<div class="airview-spectrum-empty">${icon('info')}<span>${escapeHtml(emptyText)}</span></div>`}</div></section>`;
+    const chartBody = rows.length
+      ? environmentSpectrumChart(rows, band)
+      : `<div class="airview-environment-history-empty"><strong>暂无可绘制的邻居广播</strong><span>${escapeHtml(emptyText)}</span></div>`;
+    return `<section class="airview-spectrum-view"><header>环境 · ${escapeHtml(titleBand)}<small>${rows.length} 个邻居广播</small></header>${environmentCapabilitySummary()}<div class="airview-spectrum-chart" role="img" aria-label="${escapeHtml(`${titleBand} 邻居广播频谱`)}"><div class="airview-spectrum-y">${[-30,-45,-60,-75,-90].map((value) => `<span>${value}</span>`).join('')}</div><div class="airview-spectrum-grid"><i></i><i></i><i></i><i></i></div><span class="airview-spectrum-db">dBm</span>${chartBody}<div class="airview-spectrum-x">${range.ticks.map(([, label]) => `<span>${label}</span>`).join('')}</div><span class="airview-spectrum-channel">信道</span></div><div class="airview-spectrum-table wifi-table-scroll"><table><thead><tr>${visible.map(([, label]) => `<th>${label}</th>`).join('')}</tr></thead><tbody>${rows.map((row) => `<tr>${visible.map(([key]) => `<td>${cell(row, key)}</td>`).join('')}</tr>`).join('')}</tbody></table>${rows.length ? '' : `<div class="airview-spectrum-empty">${icon('info')}<span>${escapeHtml(emptyText)}</span></div>`}</div></section>`;
   }
 
   function selectedRadioEntries() {
@@ -1507,6 +1579,7 @@ export function mount(context = {}) {
     }
     if (target.matches('[data-airview-connectivity-range]')) { state.filters.connectivityRange = Number(target.dataset.airviewConnectivityRange); render(); loadConnectivityEvents(); return; }
     if (target.matches('[data-airview-environment-range]')) { state.filters.environmentRange = target.dataset.airviewEnvironmentRange; render(); loadEnvironmentHistory(); return; }
+    if (target.matches('[data-airview-environment-band]')) { state.filters.environmentBand = target.dataset.airviewEnvironmentBand; render(); return; }
     if (target.matches('[data-airview-columns]')) { state.columnEditor = target.dataset.airviewColumns; render(); return; }
     if (target.matches('[data-airview-columns-done]')) { state.columnEditor = ''; render(); return; }
     if (target.matches('[data-airview-columns-reset]')) {
@@ -1529,6 +1602,7 @@ export function mount(context = {}) {
       state.filters.status.clear();
       state.filters.environmentWidths.clear();
       state.filters.environmentAp = apInventory()[0]?.id || 'all';
+      state.filters.environmentBand = '';
       render();
       return;
     }

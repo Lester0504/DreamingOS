@@ -40,7 +40,6 @@ def test_status_reports_versions_datasets_and_explicit_degradation():
     ):
         assert field in API
     assert 'jmx_signature_db_status(NULL)' in API
-    assert 'dw_status_object_ok(status, 0)' in API
     assert 'dw_storage_status_json(0)' in API
     assert 'dw_json_get_bool(payload, "degraded", 0)' in API
     assert 'dw_json_get_string(status, "health", "unknown")' in API

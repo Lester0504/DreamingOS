@@ -55,6 +55,7 @@ static time_t g_next_lan_service_probe_at = 0;
 static identity_signal_dedupe_entry_t
     g_identity_signal_dedupe[IDENTITY_SIGNAL_DEDUPE_SLOTS];
 static unsigned int g_identity_signal_dedupe_cursor;
+static int g_collector_initialized;
 
 static uint64_t identity_signal_hash_part(uint64_t hash, const char *value)
 {
@@ -1634,6 +1635,7 @@ static int identity_register_listener(struct uloop_fd *u, uloop_fd_handler cb,
 
 int jmx_identity_collector_init(void)
 {
+    jmx_identity_collector_close();
     g_mdns_fd.fd = make_mcast_socket("224.0.0.251", 5353);
     if (g_mdns_fd.fd >= 0)
         identity_register_listener(&g_mdns_fd, mdns_cb, "mDNS");
@@ -1661,7 +1663,21 @@ int jmx_identity_collector_init(void)
     collect_dhcp_leases();
     send_ssdp_msearch(1);
     probe_lan_services(1);
-    return 0;
+    g_collector_initialized = 1;
+    return jmx_identity_collector_ready() ? 0 : -1;
+}
+
+int jmx_identity_collector_listener_count(void)
+{
+    return (g_mdns_fd.fd >= 0) + (g_ssdp_fd.fd >= 0) +
+           (g_ssdp_query_fd.fd >= 0) + (g_dhcp_fd.fd >= 0);
+}
+
+int jmx_identity_collector_ready(void)
+{
+    return g_collector_initialized &&
+           (jmx_identity_collector_listener_count() > 0 ||
+            access("/proc/net/arp", R_OK) == 0);
 }
 
 static void collect_arp_entries(void)
@@ -1716,4 +1732,5 @@ void jmx_identity_collector_close(void)
     if (g_ssdp_query_fd.fd >= 0) { uloop_fd_delete(&g_ssdp_query_fd); close(g_ssdp_query_fd.fd); g_ssdp_query_fd.fd = -1; }
     if (g_dhcp_fd.fd >= 0) { uloop_fd_delete(&g_dhcp_fd); close(g_dhcp_fd.fd); g_dhcp_fd.fd = -1; }
     identity_ubus_close();
+    g_collector_initialized = 0;
 }

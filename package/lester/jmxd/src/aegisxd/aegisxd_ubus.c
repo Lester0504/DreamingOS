@@ -523,6 +523,48 @@ static int aegisxd_handle_content_policy_delete(struct ubus_context *ctx, struct
     json_object_put(resp); json_object_put(body); return UBUS_STATUS_OK;
 }
 
+static int aegisxd_handle_pcdn_get(struct ubus_context *ctx, struct ubus_object *obj,
+                                   struct ubus_request_data *req, const char *method,
+                                   struct blob_attr *msg)
+{
+    struct json_object *resp = aegisxd_pcdn_get_json();
+    (void)obj; (void)method; (void)msg;
+    aegisxd_send_json(ctx, req, resp); json_object_put(resp); return UBUS_STATUS_OK;
+}
+
+static int aegisxd_handle_pcdn_validate(struct ubus_context *ctx, struct ubus_object *obj,
+                                        struct ubus_request_data *req, const char *method,
+                                        struct blob_attr *msg)
+{
+    struct json_object *body = aegisxd_json_from_blob(msg);
+    struct json_object *resp = aegisxd_pcdn_validate_json(aegisxd_payload_or_self(body));
+    (void)obj; (void)method;
+    aegisxd_send_json(ctx, req, resp); json_object_put(resp); json_object_put(body);
+    return UBUS_STATUS_OK;
+}
+
+static int aegisxd_handle_pcdn_set(struct ubus_context *ctx, struct ubus_object *obj,
+                                   struct ubus_request_data *req, const char *method,
+                                   struct blob_attr *msg)
+{
+    struct json_object *body = aegisxd_json_from_blob(msg);
+    struct json_object *resp = aegisxd_pcdn_set_json(aegisxd_payload_or_self(body));
+    (void)obj; (void)method;
+    aegisxd_send_json(ctx, req, resp); json_object_put(resp); json_object_put(body);
+    return UBUS_STATUS_OK;
+}
+
+static int aegisxd_handle_pcdn_sync(struct ubus_context *ctx, struct ubus_object *obj,
+                                    struct ubus_request_data *req, const char *method,
+                                    struct blob_attr *msg)
+{
+    struct json_object *body = aegisxd_json_from_blob(msg);
+    struct json_object *resp = aegisxd_pcdn_sync_json(aegisxd_payload_or_self(body));
+    (void)obj; (void)method;
+    aegisxd_send_json(ctx, req, resp); json_object_put(resp); json_object_put(body);
+    return UBUS_STATUS_OK;
+}
+
 static int aegisxd_handle_geo_get(struct ubus_context *ctx, struct ubus_object *obj,
                                   struct ubus_request_data *req, const char *method,
                                   struct blob_attr *msg)
@@ -577,6 +619,51 @@ static int aegisxd_handle_domain_override_delete(struct ubus_context *ctx, struc
     json_object_put(resp); json_object_put(body); return UBUS_STATUS_OK;
 }
 
+#define AEGISXD_CERTIFICATE_HANDLER(name, function)                                      \
+static int name(struct ubus_context *ctx, struct ubus_object *obj,                       \
+                struct ubus_request_data *req, const char *method,                       \
+                struct blob_attr *msg)                                                    \
+{                                                                                         \
+    struct json_object *body = aegisxd_json_from_blob(msg);                               \
+    struct json_object *resp = function(aegisxd_payload_or_self(body));                    \
+    (void)obj; (void)method;                                                               \
+    aegisxd_send_json(ctx, req, resp);                                                     \
+    json_object_put(resp);                                                                 \
+    json_object_put(body);                                                                 \
+    return UBUS_STATUS_OK;                                                                 \
+}
+
+AEGISXD_CERTIFICATE_HANDLER(aegisxd_handle_certificate_generate,
+                            aegisxd_certificate_generate_json)
+AEGISXD_CERTIFICATE_HANDLER(aegisxd_handle_certificate_rotate,
+                            aegisxd_certificate_rotate_json)
+AEGISXD_CERTIFICATE_HANDLER(aegisxd_handle_certificate_revoke,
+                            aegisxd_certificate_revoke_json)
+AEGISXD_CERTIFICATE_HANDLER(aegisxd_handle_certificate_download,
+                            aegisxd_certificate_download_json)
+AEGISXD_CERTIFICATE_HANDLER(aegisxd_handle_certificate_distribution_downloaded,
+                            aegisxd_certificate_distribution_downloaded_json)
+AEGISXD_CERTIFICATE_HANDLER(aegisxd_handle_certificate_distributions,
+                            aegisxd_certificate_distributions_json)
+AEGISXD_CERTIFICATE_HANDLER(aegisxd_handle_certificate_distribution_create,
+                            aegisxd_certificate_distribution_create_json)
+AEGISXD_CERTIFICATE_HANDLER(aegisxd_handle_certificate_distribution_get,
+                            aegisxd_certificate_distribution_get_json)
+
+static int aegisxd_handle_certificate_status(struct ubus_context *ctx,
+                                             struct ubus_object *obj,
+                                             struct ubus_request_data *req,
+                                             const char *method,
+                                             struct blob_attr *msg)
+{
+    struct json_object *resp = aegisxd_certificate_status_json();
+
+    (void)obj; (void)method; (void)msg;
+    aegisxd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return UBUS_STATUS_OK;
+}
+
 static const struct blobmsg_policy aegisxd_any_policy[] = {
     { .name = "payload", .type = BLOBMSG_TYPE_UNSPEC },
 };
@@ -618,6 +705,19 @@ static const struct ubus_method aegisxd_methods[] = {
     UBUS_METHOD("content_policy_validate", aegisxd_handle_content_policy_validate, aegisxd_any_policy),
     UBUS_METHOD("set_content_policy", aegisxd_handle_content_policy_set, aegisxd_any_policy),
     UBUS_METHOD("content_policy_delete", aegisxd_handle_content_policy_delete, aegisxd_any_policy),
+    UBUS_METHOD("content_pcdn_get", aegisxd_handle_pcdn_get, aegisxd_any_policy),
+    UBUS_METHOD("content_pcdn_validate", aegisxd_handle_pcdn_validate, aegisxd_any_policy),
+    UBUS_METHOD("content_pcdn_set", aegisxd_handle_pcdn_set, aegisxd_any_policy),
+    UBUS_METHOD("content_pcdn_sync", aegisxd_handle_pcdn_sync, aegisxd_any_policy),
+    UBUS_METHOD("certificate_status", aegisxd_handle_certificate_status, aegisxd_any_policy),
+    UBUS_METHOD("certificate_generate", aegisxd_handle_certificate_generate, aegisxd_any_policy),
+    UBUS_METHOD("certificate_rotate", aegisxd_handle_certificate_rotate, aegisxd_any_policy),
+    UBUS_METHOD("certificate_revoke", aegisxd_handle_certificate_revoke, aegisxd_any_policy),
+    UBUS_METHOD("certificate_download", aegisxd_handle_certificate_download, aegisxd_any_policy),
+    UBUS_METHOD("certificate_distribution_downloaded", aegisxd_handle_certificate_distribution_downloaded, aegisxd_any_policy),
+    UBUS_METHOD("certificate_distributions", aegisxd_handle_certificate_distributions, aegisxd_any_policy),
+    UBUS_METHOD("certificate_distribution_create", aegisxd_handle_certificate_distribution_create, aegisxd_any_policy),
+    UBUS_METHOD("certificate_distribution_get", aegisxd_handle_certificate_distribution_get, aegisxd_any_policy),
     UBUS_METHOD("domain_overrides", aegisxd_handle_domain_overrides, aegisxd_any_policy),
     UBUS_METHOD("add_domain_override", aegisxd_handle_domain_override_set, aegisxd_any_policy),
     UBUS_METHOD("remove_domain_override", aegisxd_handle_domain_override_delete, aegisxd_any_policy),

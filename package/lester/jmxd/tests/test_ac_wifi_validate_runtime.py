@@ -46,11 +46,11 @@ def static_contract() -> None:
         "ac_attr_get_s64(tb[AC_WIFI_VALIDATE_BASE_REVISION])",
     ):
         assert token in ubus, f"missing validate ubus contract: {token}"
-    assert "#define AC_SCHEMA_VERSION 11" in internal, (
+    assert "#define AC_SCHEMA_VERSION 12" in internal, (
         "production schema version must match the migrated DB "
         "(2026-07-26 v9 lesson: the standalone test define is not enough)"
     )
-    assert "#define AC_SCHEMA_VERSION 11" in db
+    assert "#define AC_SCHEMA_VERSION 12" in db
     # W1 flips no write capability; the 2026-07-20 gates stay fail-closed.
     protocol = (ROOT / "src/ac/ac_protocol.c").read_text(encoding="utf-8")
     for gate in ('"ssid_create", 0', '"ssid_update", 0', '"ssid_delete", 0',

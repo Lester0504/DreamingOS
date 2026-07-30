@@ -854,7 +854,7 @@ static int cmd_set_gateway_addr(struct jmctl_opts *opts, int argc, char **argv)
         lan = default_lan_config("lan", "");
     if (parse_cidr(argv[0], ip, sizeof(ip), &prefix) != 0) {
         json_object_put(lan);
-        return print_error(opts, "invalid_gateway_address", "expected IPv4 or IPv4/prefix, for example 192.168.1.1/24");
+        return print_error(opts, "invalid_gateway_address", "expected IPv4 or IPv4/prefix, for example 192.168.30.1/24");
     }
     addresses = json_object_new_array();
     addr = json_object_new_object();
@@ -1417,7 +1417,7 @@ static void console_help(struct console_ctx *ctx)
         printf("  eth0 | eth1 | eth2  Bind physical device\n");
         break;
     case CTX_SET_GATEWAY:
-        printf("set gateway.addr usage: <ipv4> or <ipv4/prefix>, for example 192.168.1.1/24\n");
+        printf("set gateway.addr usage: <ipv4> or <ipv4/prefix>, for example 192.168.30.1/24\n");
         break;
     case CTX_ADD:
         printf("add usage:\n");

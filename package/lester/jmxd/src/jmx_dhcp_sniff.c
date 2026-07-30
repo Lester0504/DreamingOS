@@ -21,6 +21,7 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 
 #include "jmx_dhcp_sniff.h"
 #include "jmx.h"
@@ -37,6 +38,138 @@ static int g_ring_count = 0;
 static pthread_mutex_t g_ring_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_sniff_thread;
 static int g_sniff_running = 0;
+/*
+ * 1 only after the AF_PACKET socket is bound and the capture loop is live.
+ * dhcp_sniff_active() must not claim observation while the socket failed to
+ * open (no br-lan, missing CAP_NET_RAW, ...), otherwise the DHCP capability
+ * would report a detector that never sees a packet.
+ */
+static int g_sniff_capture_ok = 0;
+
+/*
+ * Observed DHCP server table (rogue DHCP detection).
+ * Kept as a small retained set rather than a consume-once ring: a rogue
+ * server must stay visible across polls for as long as it keeps answering.
+ */
+#define DHCP_SERVER_MAX 32
+static dhcp_server_obs_t g_servers[DHCP_SERVER_MAX];
+static int g_server_count = 0;
+static pthread_mutex_t g_server_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Cache of this host's own IPv4 addresses, refreshed periodically. */
+#define DHCP_SELF_ADDR_MAX 32
+static uint32_t g_self_addrs[DHCP_SELF_ADDR_MAX];
+static int g_self_addr_count = 0;
+static time_t g_self_addr_ts = 0;
+static pthread_mutex_t g_self_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void dhcp_refresh_self_addrs(void)
+{
+    struct ifaddrs *ifa = NULL, *p;
+    int n = 0;
+
+    if (getifaddrs(&ifa) != 0 || !ifa)
+        return;
+    for (p = ifa; p && n < DHCP_SELF_ADDR_MAX; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET)
+            continue;
+        g_self_addrs[n++] =
+            ((struct sockaddr_in *)p->ifa_addr)->sin_addr.s_addr;
+    }
+    freeifaddrs(ifa);
+    g_self_addr_count = n;
+    g_self_addr_ts = time(NULL);
+}
+
+/* 1 if addr belongs to this router (i.e. an authorized DHCP server). */
+static int dhcp_addr_is_self(uint32_t addr)
+{
+    int i, self = 0;
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&g_self_lock);
+    if (g_self_addr_count == 0 || now - g_self_addr_ts > 30)
+        dhcp_refresh_self_addrs();
+    for (i = 0; i < g_self_addr_count; i++) {
+        if (g_self_addrs[i] == addr) {
+            self = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_self_lock);
+    return self;
+}
+
+/* Record a DHCP server seen answering on the LAN. */
+static void dhcp_note_server(const unsigned char *mac, uint32_t server_ip,
+                             uint32_t offered_ip, int local_origin)
+{
+    uint32_t now = (uint32_t)time(NULL);
+    int authorized = dhcp_addr_is_self(server_ip);
+    int i, oldest = 0;
+
+    /* A reply we emitted ourselves is authorized by definition. */
+    if (local_origin)
+        authorized = 1;
+
+    pthread_mutex_lock(&g_server_lock);
+    for (i = 0; i < g_server_count; i++) {
+        if (g_servers[i].server_ip == server_ip &&
+            !memcmp(g_servers[i].mac, mac, 6)) {
+            g_servers[i].last_seen = now;
+            g_servers[i].offered_ip = offered_ip;
+            g_servers[i].authorized = authorized;
+            g_servers[i].local_origin = local_origin;
+            if (g_servers[i].hits < 0xFFFFFFFFu)
+                g_servers[i].hits++;
+            pthread_mutex_unlock(&g_server_lock);
+            return;
+        }
+        if (g_servers[i].last_seen < g_servers[oldest].last_seen)
+            oldest = i;
+    }
+    if (g_server_count < DHCP_SERVER_MAX)
+        i = g_server_count++;
+    else
+        i = oldest; /* evict least recently seen */
+    memset(&g_servers[i], 0, sizeof(g_servers[i]));
+    memcpy(g_servers[i].mac, mac, 6);
+    g_servers[i].server_ip = server_ip;
+    g_servers[i].offered_ip = offered_ip;
+    g_servers[i].first_seen = now;
+    g_servers[i].last_seen = now;
+    g_servers[i].hits = 1;
+    g_servers[i].authorized = authorized;
+    g_servers[i].local_origin = local_origin;
+    pthread_mutex_unlock(&g_server_lock);
+    if (!authorized) {
+        char ipbuf[INET_ADDRSTRLEN] = "";
+        struct in_addr a; a.s_addr = server_ip;
+        inet_ntop(AF_INET, &a, ipbuf, sizeof(ipbuf));
+        LOG_WARN("dhcp_sniff: rogue DHCP server %s "
+                 "(%02x:%02x:%02x:%02x:%02x:%02x) answering on %s\n",
+                 ipbuf, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                 DHCP_IFACE);
+    }
+}
+
+int dhcp_sniff_servers_snapshot(dhcp_server_obs_t *out, int max_out)
+{
+    int count = 0, i;
+
+    if (!out || max_out < 1)
+        return 0;
+    pthread_mutex_lock(&g_server_lock);
+    for (i = 0; i < g_server_count && count < max_out; i++)
+        memcpy(&out[count++], &g_servers[i], sizeof(dhcp_server_obs_t));
+    pthread_mutex_unlock(&g_server_lock);
+    return count;
+}
+
+int dhcp_sniff_active(void)
+{
+    return (g_sniff_running && g_sniff_capture_ok) ? 1 : 0;
+}
 
 /* DHCP magic cookie: 0x63825363 */
 #define DHCP_MAGIC 0x63825363
@@ -122,9 +255,22 @@ static void *sniff_thread(void *arg)
     struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    g_sniff_capture_ok = 1;
+
     unsigned char buf[1500];
     while (g_sniff_running) {
-        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        struct sockaddr_ll from;
+        socklen_t fromlen = sizeof(from);
+        ssize_t n;
+
+        memset(&from, 0, sizeof(from));
+        /*
+         * recvfrom() so the true L2 source is available: with SOCK_DGRAM the
+         * ethernet header is stripped, and the DHCP chaddr field carries the
+         * *client* MAC, never the responding server's.
+         */
+        n = recvfrom(fd, buf, sizeof(buf), 0,
+                     (struct sockaddr *)&from, &fromlen);
         if (n <= 0) {
             if (!g_sniff_running) break;
             usleep(100000);  /* 100ms */
@@ -138,24 +284,53 @@ static void *sniff_thread(void *arg)
         int ip_hdr_len = iph->ihl * 4;
         struct udphdr *udph = (struct udphdr *)(buf + ip_hdr_len);
         uint16_t dport = ntohs(udph->uh_dport);
-        /* Only DHCP: client→server on port 67 */
-        if (dport != 67) continue;
+        uint16_t sport = ntohs(udph->uh_sport);
+        /*
+         * Two directions are interesting:
+         *   dport 67  client→server DISCOVER/REQUEST (fingerprint options)
+         *   sport 67  server→client OFFER/ACK        (rogue server detection)
+         */
+        if (dport != 67 && sport != 67) continue;
 
         int udp_payload_off = ip_hdr_len + sizeof(struct udphdr);
         int udp_payload_len = n - udp_payload_off;
         if (udp_payload_len < 236 + 4) continue;
 
         const unsigned char *dhcp = buf + udp_payload_off;
-        /* op=1 is BOOTREQUEST */
-        if (dhcp[0] != 1) continue;
+
+        /* Verify magic cookie before trusting any offsets. */
+        {
+            uint32_t cookie;
+            memcpy(&cookie, dhcp + 236, 4);
+            if (ntohl(cookie) != DHCP_MAGIC) continue;
+        }
+
+        /*
+         * op=2 (BOOTREPLY) arriving from UDP/67 means some host on the LAN is
+         * acting as a DHCP server. Record it; the caller decides whether the
+         * source is one of our own addresses or a rogue.
+         */
+        if (dhcp[0] == 2 && sport == 67) {
+            uint32_t yiaddr;
+            unsigned char smac[6] = {0};
+            /*
+             * PACKET_OUTGOING means this router emitted the reply, in which
+             * case sll_addr holds the *destination* (client) MAC, not a source.
+             * Do not attribute it as a peer server MAC.
+             */
+            int local_origin = (from.sll_pkttype == PACKET_OUTGOING);
+            memcpy(&yiaddr, dhcp + 16, 4);
+            if (!local_origin && from.sll_halen >= 6)
+                memcpy(smac, from.sll_addr, 6);
+            dhcp_note_server(smac, iph->saddr, yiaddr, local_origin);
+            continue;
+        }
+
+        /* op=1 is BOOTREQUEST (client fingerprint path) */
+        if (dhcp[0] != 1 || dport != 67) continue;
 
         /* Extract MAC from chaddr (offset 28, 16 bytes, we use 6) */
         const unsigned char *mac = dhcp + 28;
-
-        /* Check magic cookie */
-        uint32_t magic;
-        memcpy(&magic, dhcp + 236, 4);
-        if (ntohl(magic) != DHCP_MAGIC) continue;
 
         /* Parse options (offset 240 to end of UDP payload) */
         char opt55[DHCP_OPT55_MAX] = {0};
@@ -168,6 +343,7 @@ static void *sniff_thread(void *arg)
         }
     }
     close(fd);
+    g_sniff_capture_ok = 0;
     return NULL;
 }
 

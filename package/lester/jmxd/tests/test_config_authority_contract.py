@@ -20,9 +20,9 @@ def assert_source_contract() -> None:
     package_makefile = read(ROOT / "Makefile")
     web_package_makefile = read(PACKAGES / "dreamingwrt-web/Makefile")
     init_source = read(ROOT / "src/init/dreamingwrt_init.c")
-    # dreamingwrt-installer is not part of the 26.07.1 public tree.
-    persist_path = PACKAGES / "dreamingwrt-installer/files/dreamingwrt-persist.init"
-    persist_init = read(persist_path) if persist_path.is_file() else None
+    persist_init = read(
+        PACKAGES / "dreamingwrt-installer/files/dreamingwrt-persist.init"
+    )
 
     assert "CREATE TABLE IF NOT EXISTS appearance_settings" in netconfig
     assert "config.db:appearance_settings" in netconfig
@@ -62,9 +62,8 @@ def assert_source_contract() -> None:
     assert wan_delete.index('nc_reload_network_stack(0, 1, "/tmp/dw-wan-delete-reload.log")') < wan_delete.index(
         'nc_exec("COMMIT")'
     )
-    if persist_init is not None:
-        assert "START=08" in persist_init
-        assert "START=8\n" not in persist_init
+    assert "START=08" in persist_init
+    assert "START=8\n" not in persist_init
     assert "wait_for_persistent_store" in init_source
     assert "path_is_mountpoint(DWRT_PERSIST_MOUNT)" in init_source
     assert "refusing to start components" in init_source

@@ -56,6 +56,7 @@
 #include "jmx_isp.h"
 #include "jmx_signature_update.h"
 #include "jmx_storage_guard.h"
+#include "jmx_identification_runtime.h"
 #include "webd/webd_mmdb.h"
 #include "storage/storage_overview.h"
 #include "storage/storage_files.h"
@@ -933,28 +934,17 @@ static struct json_object *dw_identification_state_json(void)
     struct json_object *data = json_object_new_object();
     struct json_object *cap = json_object_new_object();
     struct json_object *runtime = dw_identity_runtime_read();
+    struct jmx_identification_runtime readback;
     char mode[32] = "unavailable";
-    char proc_value[32] = "";
     int configured_record = 0;
-    int kernel_record = -1;
     int config_ok = jmx_identification_mode_get(mode, sizeof(mode),
                                                  &configured_record) == 0;
-    int runtime_available = runtime != NULL;
-    int mode_applied = 0;
+    int probe_ok = config_ok &&
+        jmx_identification_runtime_probe(mode, configured_record, &readback) == 0;
+    int mode_applied = probe_ok && readback.applied;
 
-    if (dw_read_file_buf(DW_JMX_RECORD_ENABLE_PATH, proc_value,
-                         sizeof(proc_value)) > 0)
-        kernel_record = atoi(proc_value) ? 1 : 0;
-    if (config_ok && runtime_available) {
-        const char *runtime_mode = dw_json_get_string(runtime, "mode", "");
-        int expected_device = !strcmp(mode, "device_and_traffic");
-        int runtime_device = dw_json_get_bool(runtime,
-                                               "device_identification_active", 0);
-
-        mode_applied = !strcmp(runtime_mode, mode) &&
-                       runtime_device == expected_device &&
-                       kernel_record == configured_record;
-    }
+    if (!probe_ok)
+        memset(&readback, 0, sizeof(readback));
     json_object_object_add(data, "ok", json_object_new_boolean(config_ok));
     json_object_object_add(data, "mode", json_object_new_string(mode));
     json_object_object_add(data, "device_identification_enabled",
@@ -964,21 +954,36 @@ static struct json_object *dw_identification_state_json(void)
     json_object_object_add(data, "traffic_record_enabled",
                            json_object_new_boolean(configured_record));
     json_object_object_add(data, "kernel_record_readback_available",
-                           json_object_new_boolean(kernel_record >= 0));
-    if (kernel_record >= 0)
+                           json_object_new_boolean(readback.kernel_readback_available));
+    if (readback.kernel_readback_available)
         json_object_object_add(data, "kernel_record_enabled",
-                               json_object_new_boolean(kernel_record));
+                               json_object_new_boolean(readback.kernel_record_enabled));
     json_object_object_add(data, "runtime_available",
-                           json_object_new_boolean(runtime_available));
+                           json_object_new_boolean(readback.identityd_readback_available));
+    json_object_object_add(data, "identityd_process_running",
+                           json_object_new_boolean(readback.identityd_process_running));
+    json_object_object_add(data, "identityd_state_fresh",
+                           json_object_new_boolean(readback.identityd_state_fresh));
+    json_object_object_add(data, "traffic_dataplane_active",
+                           json_object_new_boolean(readback.traffic_dataplane_matches));
+    json_object_object_add(data, "device_dataplane_active",
+                           json_object_new_boolean(readback.device_dataplane_matches));
+    json_object_object_add(data, "collector_ready",
+                           json_object_new_boolean(readback.collector_ready));
+    json_object_object_add(data, "listeners_ready",
+                           json_object_new_int(readback.listeners_ready));
     json_object_object_add(data, "applied", json_object_new_boolean(mode_applied));
     json_object_object_add(data, "apply_state", json_object_new_string(
         mode_applied ? "active" : config_ok ? "pending_readback" : "unavailable"));
+    json_object_object_add(data, "reason", json_object_new_string(
+        mode_applied ? "" : config_ok ? readback.reason : "identification_config_unavailable"));
     if (runtime)
         json_object_object_add(data, "identityd", runtime);
     json_object_object_add(cap, "identification_mode", json_object_new_boolean(1));
     json_object_object_add(cap, "device_identification", json_object_new_boolean(1));
     json_object_object_add(cap, "traffic_identification", json_object_new_boolean(1));
     json_object_object_add(cap, "runtime_readback", json_object_new_boolean(1));
+    json_object_object_add(cap, "dataplane_verified_readback", json_object_new_boolean(1));
     json_object_object_add(cap, "policy_dpi_independent", json_object_new_boolean(1));
     json_object_object_add(cap, "supported_modes", json_object_new_string(
         "disabled,device_and_traffic,traffic_only"));

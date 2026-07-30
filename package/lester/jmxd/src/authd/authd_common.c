@@ -41,9 +41,30 @@ struct json_object *authd_json_from_blob(struct blob_attr *msg)
     return obj;
 }
 
+/*
+ * Is the account store actually writable right now?
+ *
+ * account_upsert / account_delete / accounts_bulk / accounts_import are all
+ * implemented, so the only thing that can make the write path fail is the DB
+ * itself being absent or read-only (open failed, or the filesystem holding
+ * config.db went read-only). Probe that instead of hardcoding the capability,
+ * so the flag cannot claim a write channel that would actually error out.
+ */
+static int authd_accounts_writable(void)
+{
+    int readonly;
+
+    if (!g_authd_db)
+        return 0;
+    readonly = sqlite3_db_readonly(g_authd_db, "main");
+    /* -1 = no such database; treat anything but an explicit 0 as not writable */
+    return readonly == 0 ? 1 : 0;
+}
+
 struct json_object *authd_capabilities_json(void)
 {
     struct json_object *cap = json_object_new_object();
+    int accounts_writable = authd_accounts_writable();
 
     json_object_object_add(cap, "read", json_object_new_boolean(1));
     json_object_object_add(cap, "update_web", json_object_new_boolean(1));
@@ -54,12 +75,21 @@ struct json_object *authd_capabilities_json(void)
     json_object_object_add(cap, "portal_asset_upload", json_object_new_boolean(0));
     json_object_object_add(cap, "extend_session", json_object_new_boolean(0));
     json_object_object_add(cap, "disconnect", json_object_new_boolean(0));
-    json_object_object_add(cap, "write_accounts", json_object_new_boolean(0));
-    json_object_object_add(cap, "account_crud", json_object_new_boolean(1));
-    json_object_object_add(cap, "package_crud", json_object_new_boolean(1));
-    json_object_object_add(cap, "voucher_crud", json_object_new_boolean(1));
-    json_object_object_add(cap, "account_bulk", json_object_new_boolean(1));
-    json_object_object_add(cap, "account_import", json_object_new_boolean(1));
+    /*
+     * write_accounts is the umbrella flag the UI uses to enable the whole
+     * account management surface. It was hardcoded 0 while every underlying
+     * write (upsert/delete/bulk/import) was already implemented and reachable,
+     * which made the frontend grey out a working feature.
+     */
+    json_object_object_add(cap, "write_accounts", json_object_new_boolean(accounts_writable));
+    json_object_object_add(cap, "account_crud", json_object_new_boolean(accounts_writable));
+    json_object_object_add(cap, "package_crud", json_object_new_boolean(accounts_writable));
+    json_object_object_add(cap, "voucher_crud", json_object_new_boolean(accounts_writable));
+    json_object_object_add(cap, "account_bulk", json_object_new_boolean(accounts_writable));
+    json_object_object_add(cap, "account_import", json_object_new_boolean(accounts_writable));
+    if (!accounts_writable)
+        json_object_object_add(cap, "write_accounts_reason",
+                               json_object_new_string("account_store_not_writable"));
     json_object_object_add(cap, "ledger_write", json_object_new_boolean(1));
     json_object_object_add(cap, "password_policy_write", json_object_new_boolean(1));
     json_object_object_add(cap, "voucher_one_time_reveal", json_object_new_boolean(1));

@@ -82,6 +82,10 @@
           loading: false,
           slowLoading: false,
           timer: null,
+          batchController: null,
+          pollDelayMs: 0,
+          resourceBackoffUntil: {},
+          resourceBackoffMs: {},
           lastRenderKey: '',
           resourceCache: {},
           probeResults: {},
@@ -297,26 +301,49 @@
     return payload;
   }
 
-  async function fetchDashboardResource(name, url, retry = true) {
+  async function fetchDashboardResource(name, url, retry = true, externalSignal = undefined) {
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timeoutMs = name && String(name).startsWith('history:')
       ? DASHBOARD_RESOURCE_TIMEOUT_MS.history
       : DASHBOARD_RESOURCE_TIMEOUT_MS[name] || DASHBOARD_RESOURCE_TIMEOUT_MS.default;
-    const timer = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : null;
+    let timedOut = false;
+    let timer = null;
+    const armTimeout = () => {
+      if (controller && timer === null) timer = window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs);
+    };
+    let unlinkExternal = () => {};
+    if (controller && externalSignal) {
+      if (externalSignal.aborted) controller.abort();
+      else {
+        const abort = () => controller.abort();
+        externalSignal.addEventListener('abort', abort, { once: true });
+        unlinkExternal = () => externalSignal.removeEventListener('abort', abort);
+      }
+    }
     try {
       const requestUrl = `${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`;
-      const response = session
-        ? await session.fetch(requestUrl, {
+      const doFetch = () => {
+        armTimeout();
+        return session
+        ? session.fetch(requestUrl, {
           credentials: 'same-origin',
           cache: 'no-store',
           signal: controller ? controller.signal : undefined
         }, retry)
-        : await fetch(requestUrl, {
+        : fetch(requestUrl, {
         credentials: 'same-origin',
         cache: 'no-store',
         headers: authHeaders(),
         signal: controller ? controller.signal : undefined
         });
+      };
+      const limiter = window.DWRT_API_LIMITER;
+      const response = limiter && typeof limiter.run === 'function'
+        ? await limiter.run(doFetch, controller ? controller.signal : undefined)
+        : await doFetch();
       const text = await response.text();
       let json = {};
       if (text) {
@@ -343,12 +370,14 @@
     } catch (error) {
       if (error && error.name === 'AbortError') {
         const timeoutError = new Error(`${name}: request timeout after ${timeoutMs}ms`);
-        timeoutError.timeout = true;
+        timeoutError.timeout = timedOut;
+        timeoutError.cancelled = !timedOut;
         timeoutError.status = 0;
         return { name, ok: false, error: timeoutError };
       }
       return { name, ok: false, error };
     } finally {
+      unlinkExternal();
       if (timer) window.clearTimeout(timer);
     }
   }
@@ -543,14 +572,6 @@
     return 'unknown';
   }
 
-  // Bundled carrier marks used when the backend does not carry an explicit logo.
-  const CARRIER_LOGOS = {
-    unicom: '/static/images/logo/china-unicom.svg',
-    mobile: '/static/images/logo/china-mobile.svg',
-    telecom: '/static/images/logo/china-telecom.svg',
-    cernet: '/static/images/logo/china-cernet.svg'
-  };
-
   function carrierMeta(wan) {
     const evidence = carrierEvidence(wan);
     const key = carrierKey(evidence);
@@ -561,9 +582,15 @@
       cernet: '教育网',
       unknown: firstText(wan.note, wan.carrier_name, wan.carrier, wan.isp, wan.provider, wan.operator, '运营商未配置')
     };
+    const logos = {
+      unicom: '/static/images/logo/china-unicom.svg',
+      mobile: '/static/images/logo/china-mobile.svg',
+      telecom: '/static/images/logo/china-telecom.svg',
+      cernet: '/static/images/logo/china-cernet.svg'
+    };
     const explicitLogoRaw = firstText(wan.carrier_logo, wan.carrier_svg, wan.logo, wan.image, wan.icon);
     const explicitLogo = window.DWRT_DEVICE_IMAGES?.normalizeUrl?.(explicitLogoRaw) || explicitLogoRaw;
-    return { key, label: labels[key] || labels.unknown, logo: explicitLogo || CARRIER_LOGOS[key] || '' };
+    return { key, label: labels[key] || labels.unknown, logo: explicitLogo || logos[key] || '' };
   }
 
   function carrierMarkup(wan) {
@@ -1167,12 +1194,50 @@
 
   function dashboardResourceEntriesDue(force = false) {
     const cache = state.dashboard.resourceCache || {};
+    const backoff = state.dashboard.resourceBackoffUntil || {};
     const now = Date.now();
     return Object.entries(DASHBOARD_ENDPOINTS).filter(([name]) => {
+      // 超时退避:刚超时/失败的端点先歇一会,别每个 tick 都重打一个已经卡住的后端。
+      if (backoff[name] && now < backoff[name] && cache[name]) return false;
       if (force || !cache[name]) return true;
       const ttl = DASHBOARD_RESOURCE_TTL_MS[name] || DASHBOARD_REFRESH_MS;
       return now - (cache[name].fetchedAt || 0) >= ttl;
     });
+  }
+
+  function noteDashboardResourceResult(resource, elapsedMs) {
+    if (!resource || !resource.name) return;
+    const backoff = state.dashboard.resourceBackoffUntil || (state.dashboard.resourceBackoffUntil = {});
+    if (resource.ok) {
+      delete backoff[resource.name];
+      return;
+    }
+    if (resource.error && resource.error.cancelled) return;
+    const slow = resource.error && resource.error.timeout;
+    const base = DASHBOARD_RESOURCE_TTL_MS[resource.name] || DASHBOARD_REFRESH_MS;
+    const previous = state.dashboard.resourceBackoffMs?.[resource.name] || 0;
+    const next = Math.min(60000, Math.max(slow ? base * 2 : base, previous * 2));
+    (state.dashboard.resourceBackoffMs || (state.dashboard.resourceBackoffMs = {}))[resource.name] = next;
+    backoff[resource.name] = Date.now() + next;
+    void elapsedMs;
+  }
+
+  // 顺序小并发地取数,避免每 5 秒向单线程后端同时轰 4-6 个请求造成排队拥塞。
+  async function fetchDashboardResourcesQueued(entries, signal, concurrency = 2) {
+    const queue = entries.slice();
+    const results = [];
+    const worker = async () => {
+      while (queue.length) {
+        if (signal && signal.aborted) return;
+        const [name, url] = queue.shift();
+        const startedAt = Date.now();
+        const resource = await fetchDashboardResource(name, url, true, signal);
+        noteDashboardResourceResult(resource, Date.now() - startedAt);
+        results.push(resource);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, entries.length)) }, worker));
+    return results;
   }
 
   function normalizeDashboardClients(snapshot, system, clientsData = {}) {
@@ -3860,8 +3925,18 @@
     }).join('');
   }
 
+  function scheduleNextDashboardRefresh(delayMs) {
+    if (!state.dashboard.active) return;
+    window.clearTimeout(state.dashboard.timer);
+    state.dashboard.timer = window.setTimeout(refreshDashboard, delayMs);
+  }
+
   async function refreshDashboard() {
-    if (!state.dashboard.active || state.dashboard.loading) return;
+    if (!state.dashboard.active) return;
+    if (state.dashboard.loading || state.dashboard.slowLoading) {
+      scheduleNextDashboardRefresh(1000);
+      return;
+    }
     const wsFresh = state.dashboard.lastWsAt && Date.now() - state.dashboard.lastWsAt < DASHBOARD_REFRESH_MS * 2;
     state.dashboard.loading = true;
     if (!state.dashboard.lastRenderKey) setDashboardStatus('正在读取真实状态');
@@ -3870,15 +3945,18 @@
       ? entries.filter(([name]) => DASHBOARD_CRITICAL_RESOURCES.has(name) && !['clients', 'overview'].includes(name))
       : entries.filter(([name]) => DASHBOARD_CRITICAL_RESOURCES.has(name));
     const optionalEntries = entries.filter(([name]) => !DASHBOARD_CRITICAL_RESOURCES.has(name));
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    state.dashboard.batchController = controller;
+    const batchStartedAt = Date.now();
     const resources = criticalEntries.length
-      ? await Promise.all(criticalEntries.map(([name, url]) => fetchDashboardResource(name, url)))
+      ? await fetchDashboardResourcesQueued(criticalEntries, controller ? controller.signal : undefined)
       : [];
     state.dashboard.loading = false;
     if (!state.dashboard.active) return;
     renderDashboardCard(stabilizeDashboardRates(normalizeDashboardData(mergeDashboardResources(resources))));
     if (optionalEntries.length && !state.dashboard.slowLoading) {
       state.dashboard.slowLoading = true;
-      Promise.all(optionalEntries.map(([name, url]) => fetchDashboardResource(name, url)))
+      fetchDashboardResourcesQueued(optionalEntries, controller ? controller.signal : undefined)
         .then((optionalResources) => {
           if (!state.dashboard.active) return;
           renderDashboardCard(stabilizeDashboardRates(normalizeDashboardData(mergeDashboardResources(optionalResources))));
@@ -3888,6 +3966,14 @@
           state.dashboard.slowLoading = false;
         });
     }
+    // 后端响应慢时自动拉长轮询,快时逐步恢复,避免把拥塞的后端越打越死。
+    const batchElapsed = Date.now() - batchStartedAt;
+    const previousDelay = state.dashboard.pollDelayMs || DASHBOARD_REFRESH_MS;
+    const nextDelay = batchElapsed > 1500
+      ? Math.min(30000, Math.max(previousDelay, DASHBOARD_REFRESH_MS) * 2)
+      : Math.max(DASHBOARD_REFRESH_MS, Math.round(previousDelay * 0.6));
+    state.dashboard.pollDelayMs = nextDelay;
+    scheduleNextDashboardRefresh(nextDelay);
 
     const selectedRange = dashboardRangeMeta(state.dashboard.trafficRange).id;
     if (selectedRange !== 'realtime') {
@@ -3918,15 +4004,22 @@
     consoleStage?.classList.add('is-dashboard');
     if (!state.dashboard.lastRenderKey) renderDashboardCard(dashboardBootModel());
     subscribeDashboardRealtime();
+    state.dashboard.pollDelayMs = DASHBOARD_REFRESH_MS;
+    window.clearTimeout(state.dashboard.timer);
     refreshDashboard();
-    window.clearInterval(state.dashboard.timer);
-    state.dashboard.timer = window.setInterval(refreshDashboard, DASHBOARD_REFRESH_MS);
   }
 
   function stopDashboard(options = {}) {
     state.dashboard.active = false;
     unsubscribeDashboardRealtime();
-    window.clearInterval(state.dashboard.timer);
+    window.clearTimeout(state.dashboard.timer);
+    // 离开仪表盘立即中止在途请求,把浏览器连接和后端队列让给要进入的页面。
+    if (state.dashboard.batchController) {
+      try { state.dashboard.batchController.abort(); } catch (_) {}
+      state.dashboard.batchController = null;
+    }
+    state.dashboard.loading = false;
+    state.dashboard.slowLoading = false;
     window.clearTimeout(state.dashboard.deferredRenderTimer);
     window.clearTimeout(state.dashboard.realtimeFrameTimer);
     window.clearTimeout(state.dashboard.throughputFrameTimer);

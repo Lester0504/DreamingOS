@@ -327,13 +327,13 @@
   -webkit-backdrop-filter: blur(var(--lg-material-blur, 1px)) saturate(132%) brightness(1.02);
 }
 
-.policy-table-card.dwrt-kit-datatable-wrap {
-  --dwrt-kit-datatable-border: rgba(255, 255, 255, 0.12);
-  --dwrt-kit-datatable-head: rgba(255, 255, 255, 0.043);
-  --dwrt-kit-datatable-row: transparent;
-  --dwrt-kit-datatable-hover: rgba(255, 255, 255, 0.070);
-  --dwrt-kit-datatable-text: var(--app-text, rgba(248, 251, 255, 0.94));
-  --dwrt-kit-datatable-muted: var(--app-text-muted, rgba(214, 225, 240, 0.74));
+.policy-table-card.dwrt-kit-ikuai-table-wrap {
+  --dwrt-kit-ikuai-border: rgba(255, 255, 255, 0.12);
+  --dwrt-kit-ikuai-head: rgba(255, 255, 255, 0.043);
+  --dwrt-kit-ikuai-row: transparent;
+  --dwrt-kit-ikuai-hover: rgba(255, 255, 255, 0.070);
+  --dwrt-kit-ikuai-text: var(--app-text, rgba(248, 251, 255, 0.94));
+  --dwrt-kit-ikuai-muted: var(--app-text-muted, rgba(214, 225, 240, 0.74));
   border: 0;
 }
 
@@ -357,7 +357,7 @@
   table-layout: fixed;
 }
 
-.policy-table-card .dwrt-kit-datatable thead th {
+.policy-table-card .dwrt-kit-ikuai-table thead th {
   position: sticky;
   top: 0;
   z-index: 2;
@@ -366,10 +366,10 @@
   text-align: left;
   white-space: nowrap;
   color: var(--app-text-muted);
-  background: var(--dwrt-kit-datatable-head);
+  background: var(--dwrt-kit-ikuai-head);
 }
 
-.policy-table-card .dwrt-kit-datatable tbody td {
+.policy-table-card .dwrt-kit-ikuai-table tbody td {
   height: 42px;
   padding: 0 12px;
   vertical-align: middle;
@@ -378,8 +378,8 @@
   white-space: nowrap;
 }
 
-.policy-table-card .dwrt-kit-datatable tbody tr.is-child td {
-  color: var(--dwrt-kit-datatable-muted);
+.policy-table-card .dwrt-kit-ikuai-table tbody tr.is-child td {
+  color: var(--dwrt-kit-ikuai-muted);
   background: rgba(255,255,255,0.026);
 }
 
@@ -1270,13 +1270,13 @@ html[data-theme-resolved="light"] .policy-table-route-host .policy-stable-glass 
   .policy-entry button { justify-self: start; padding-left: 0; }
 }
 
-html[data-theme-resolved="light"] .policy-table-card.dwrt-kit-datatable-wrap,
-html[data-theme-resolved="dark"] .policy-table-card.dwrt-kit-datatable-wrap {
-  --dwrt-kit-datatable-border: rgba(255, 255, 255, 0.12);
-  --dwrt-kit-datatable-head: rgba(255, 255, 255, 0.043);
-  --dwrt-kit-datatable-row: transparent;
-  --dwrt-kit-datatable-hover: rgba(255, 255, 255, 0.070);
-  --dwrt-kit-datatable-text: var(--app-text, rgba(248, 251, 255, 0.94));
-  --dwrt-kit-datatable-muted: var(--app-text-muted, rgba(214, 225, 240, 0.74));
+html[data-theme-resolved="light"] .policy-table-card.dwrt-kit-ikuai-table-wrap,
+html[data-theme-resolved="dark"] .policy-table-card.dwrt-kit-ikuai-table-wrap {
+  --dwrt-kit-ikuai-border: rgba(255, 255, 255, 0.12);
+  --dwrt-kit-ikuai-head: rgba(255, 255, 255, 0.043);
+  --dwrt-kit-ikuai-row: transparent;
+  --dwrt-kit-ikuai-hover: rgba(255, 255, 255, 0.070);
+  --dwrt-kit-ikuai-text: var(--app-text, rgba(248, 251, 255, 0.94));
+  --dwrt-kit-ikuai-muted: var(--app-text-muted, rgba(214, 225, 240, 0.74));
   border-color: transparent;
 }

@@ -158,28 +158,28 @@
 }
 
 .dwrt-app .dwrt-kit-table-wrap .dwrt-kit-table thead th,
-.dwrt-app .dwrt-kit-table-wrap .dwrt-kit-datatable thead th,
+.dwrt-app .dwrt-kit-table-wrap .dwrt-kit-ikuai-table thead th,
 .dwrt-app .dwrt-kit-table-wrap .dwrt-kit-table tbody td,
-.dwrt-app .dwrt-kit-table-wrap .dwrt-kit-datatable tbody td {
+.dwrt-app .dwrt-kit-table-wrap .dwrt-kit-ikuai-table tbody td {
   background: transparent !important;
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
 }
 
 .dwrt-app .dwrt-kit-table-wrap .dwrt-kit-table tbody tr:hover > td,
-.dwrt-app .dwrt-kit-table-wrap .dwrt-kit-datatable tbody tr:hover > td {
+.dwrt-app .dwrt-kit-table-wrap .dwrt-kit-ikuai-table tbody tr:hover > td {
   background: var(--dwrt-control-row-hover) !important;
 }
 
-.dwrt-app .dwrt-kit-datatable-wrap,
-html[data-theme-resolved="light"] .dwrt-app .dwrt-kit-datatable-wrap,
-html[data-theme-resolved="dark"] .dwrt-app .dwrt-kit-datatable-wrap {
-  --dwrt-kit-datatable-border: rgb(255 255 255 / 0.10) !important;
-  --dwrt-kit-datatable-head: transparent !important;
-  --dwrt-kit-datatable-row: transparent !important;
-  --dwrt-kit-datatable-hover: var(--dwrt-control-row-hover) !important;
-  --dwrt-kit-datatable-text: var(--app-text, var(--dwrt-kit-text)) !important;
-  --dwrt-kit-datatable-muted: var(--app-text-muted, var(--dwrt-kit-muted)) !important;
+.dwrt-app .dwrt-kit-ikuai-table-wrap,
+html[data-theme-resolved="light"] .dwrt-app .dwrt-kit-ikuai-table-wrap,
+html[data-theme-resolved="dark"] .dwrt-app .dwrt-kit-ikuai-table-wrap {
+  --dwrt-kit-ikuai-border: rgb(255 255 255 / 0.10) !important;
+  --dwrt-kit-ikuai-head: transparent !important;
+  --dwrt-kit-ikuai-row: transparent !important;
+  --dwrt-kit-ikuai-hover: var(--dwrt-control-row-hover) !important;
+  --dwrt-kit-ikuai-text: var(--app-text, var(--dwrt-kit-text)) !important;
+  --dwrt-kit-ikuai-muted: var(--app-text-muted, var(--dwrt-kit-muted)) !important;
   border-color: transparent !important;
 }
 

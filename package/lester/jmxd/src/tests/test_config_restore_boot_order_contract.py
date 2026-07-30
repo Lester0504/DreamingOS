@@ -17,12 +17,7 @@ def start_order(path: Path) -> int:
 
 def main() -> None:
     source = INIT.read_text(encoding="utf-8")
-    if PERSIST_SCRIPT.is_file():
-        assert start_order(PERSIST_SCRIPT) < start_order(INIT_SCRIPT)
-    else:
-        # dreamingwrt-installer is not part of the 26.07.1 public tree; the
-        # boot-order half of this contract is checked where that package exists.
-        print("skip: dreamingwrt-persist.init is not part of the public tree")
+    assert start_order(PERSIST_SCRIPT) < start_order(INIT_SCRIPT)
     assert 'maybe_apply_armed_config_restore("supervisor_start")' in source
     assert 'maybe_apply_armed_config_restore("persistent_store_ready")' in source
     assert "g_config_restore_attempted_operation" in source

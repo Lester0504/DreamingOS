@@ -13,6 +13,7 @@ int main(int argc, char **argv)
 {
     struct sigaction child_action;
     int interrupted_jobs = 0;
+    int recovered_config_jobs = 0;
 
     (void)argc;
     (void)argv;
@@ -48,9 +49,17 @@ int main(int argc, char **argv)
                 APD_SERVICE_NAME);
         goto fail_db;
     }
+    if (apd_config_restart_recover_default(&recovered_config_jobs) != 0) {
+        fprintf(stderr, "[%s] startup failed stage=config_job_recovery\n",
+                APD_SERVICE_NAME);
+        goto fail_db;
+    }
     if (interrupted_jobs > 0)
         fprintf(stderr, "[%s] radio jobs recovered interrupted=%d\n",
                 APD_SERVICE_NAME, interrupted_jobs);
+    if (recovered_config_jobs > 0)
+        fprintf(stderr, "[%s] config jobs recovered interrupted=%d\n",
+                APD_SERVICE_NAME, recovered_config_jobs);
     if (apd_protocol_init() != 0) {
         fprintf(stderr, "[%s] startup failed stage=protocol_init\n",
                 APD_SERVICE_NAME);

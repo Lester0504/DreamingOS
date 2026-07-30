@@ -587,9 +587,9 @@ static int apd_config_restore(const struct apd_config_paths *paths,
     return failed ? -1 : 0;
 }
 
-int apd_config_apply(const struct apd_config_paths *paths,
-                     struct json_object *candidate,
-                     struct json_object **out)
+int apd_config_capture_previous(const struct apd_config_paths *paths,
+                                struct json_object *candidate,
+                                struct json_object **out)
 {
     struct json_object *sections = NULL;
     const char *reason;
@@ -601,14 +601,14 @@ int apd_config_apply(const struct apd_config_paths *paths,
         json_object_put(previous);
         return -1;
     }
-    if (!paths || !paths->uci || !paths->wifi || !paths->config_dir) {
+    if (!paths || !paths->uci || !paths->config_dir) {
         json_object_put(previous);
-        return apd_config_fail(out, "apply", "paths_invalid", NULL);
+        return apd_config_fail(out, "capture", "paths_invalid", NULL);
     }
     reason = apd_config_candidate_check(candidate, &sections);
     if (reason) {
         json_object_put(previous);
-        return apd_config_fail(out, "apply", reason, NULL);
+        return apd_config_fail(out, "capture", reason, NULL);
     }
     /* Capture the previous values first: they are the rollback
      * reference the caller must journal before anything mutates. */
@@ -632,7 +632,7 @@ int apd_config_apply(const struct apd_config_paths *paths,
                 json_object_put(captured_options);
                 json_object_put(captured);
                 json_object_put(previous);
-                return apd_config_fail(out, "apply",
+                return apd_config_fail(out, "capture",
                                        "previous_capture_failed", NULL);
             }
             json_object_object_add(captured_options, option, current ?
@@ -642,6 +642,35 @@ int apd_config_apply(const struct apd_config_paths *paths,
         json_object_object_add(captured, "options", captured_options);
         json_object_array_add(previous, captured);
     }
+    result = apd_config_result_new("capture");
+    json_object_object_add(result, "previous", previous);
+    return apd_config_ok(out, result);
+}
+
+int apd_config_apply_prepared(const struct apd_config_paths *paths,
+                              struct json_object *candidate,
+                              struct json_object *previous,
+                              struct json_object **out)
+{
+    struct json_object *sections = NULL;
+    const char *reason;
+    struct json_object *result;
+    size_t i;
+
+    if (!out)
+        return -1;
+    if (!paths || !paths->uci || !paths->wifi || !paths->config_dir ||
+        !previous || !json_object_is_type(previous, json_type_array))
+        return apd_config_fail(out, "apply",
+                               "paths_or_previous_invalid", NULL);
+    reason = apd_config_candidate_check(candidate, &sections);
+    if (reason)
+        return apd_config_fail(out, "apply", reason, NULL);
+    if (json_object_array_length(previous) !=
+        json_object_array_length(sections))
+        return apd_config_fail(out, "apply", "previous_shape_invalid",
+                               NULL);
+
     for (i = 0; i < json_object_array_length(sections); i++) {
         struct json_object *section = json_object_array_get_idx(sections, i);
         struct json_object *name = NULL;
@@ -663,7 +692,6 @@ int apd_config_apply(const struct apd_config_paths *paths,
                 json_object_object_add(*out, "rolled_back",
                                        json_object_new_boolean(1));
                 apd_command_result_free(&command);
-                json_object_put(previous);
                 return rc;
             }
             apd_command_result_free(&command);
@@ -681,7 +709,6 @@ int apd_config_apply(const struct apd_config_paths *paths,
             json_object_object_add(*out, "rolled_back",
                                    json_object_new_boolean(1));
             apd_command_result_free(&command);
-            json_object_put(previous);
             return rc;
         }
         apd_command_result_free(&command);
@@ -702,15 +729,43 @@ int apd_config_apply(const struct apd_config_paths *paths,
             json_object_object_add(*out, "rolled_back",
                                    json_object_new_boolean(1));
             apd_command_result_free(&command);
-            json_object_put(previous);
             return rc;
         }
         apd_command_result_free(&command);
     }
     result = apd_config_result_new("apply");
     json_object_object_add(result, "applied", json_object_new_boolean(1));
-    json_object_object_add(result, "previous", previous);
     return apd_config_ok(out, result);
+}
+
+int apd_config_apply(const struct apd_config_paths *paths,
+                     struct json_object *candidate,
+                     struct json_object **out)
+{
+    struct json_object *capture = NULL;
+    struct json_object *previous = NULL;
+    struct json_object *apply = NULL;
+    int rc;
+
+    if (!out)
+        return -1;
+    if (apd_config_capture_previous(paths, candidate, &capture) != 0) {
+        *out = capture;
+        return -1;
+    }
+    if (!json_object_object_get_ex(capture, "previous", &previous)) {
+        json_object_put(capture);
+        return apd_config_fail(out, "apply", "previous_capture_failed",
+                               NULL);
+    }
+    json_object_get(previous);
+    json_object_put(capture);
+    rc = apd_config_apply_prepared(paths, candidate, previous, &apply);
+    if (rc == 0)
+        json_object_object_add(apply, "previous", json_object_get(previous));
+    json_object_put(previous);
+    *out = apply;
+    return rc;
 }
 
 int apd_config_rollback(const struct apd_config_paths *paths,

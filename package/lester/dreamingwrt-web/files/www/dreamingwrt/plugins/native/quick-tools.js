@@ -6,20 +6,21 @@ export function mount(context = {}) {
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
   const VERSION = '20260711-01';
   const MODULE_CLASS = 'quick-tools-route-host';
+  const ASSET_ROOT = '/static/toolkit';
 
   const TOOLS = [
-    { id: 'router-check', title: '路由体检', description: '集中检查路由器资源、上联与关键网络服务，快速定位影响联网体验的异常。', glyph: 'router-check' },
-    { id: 'health-check', title: '健康检测', description: '查看系统负载、温度、内存和存储状态，识别持续运行中的健康风险。', glyph: 'health-check' },
-    { id: 'packet-capture', title: '抓包工具', description: '按接口、主机和协议采集网关流量，生成可下载的 PCAP 文件用于进一步分析。', glyph: 'packet-capture' },
-    { id: 'flow-table', title: '流表查看', description: '检查当前连接的五元组、方向、状态与流量，追踪终端正在建立的网络会话。', glyph: 'flow-table' },
-    { id: 'ping', title: 'Ping 测试', description: '从指定出口探测目标的可达性、往返延迟与丢包情况。', glyph: 'ping' },
-    { id: 'traceroute', title: '路由追踪', description: '逐跳显示到目标地址的转发路径和响应时间，辅助定位链路故障位置。', glyph: 'traceroute' },
-    { id: 'port-mirror', title: '端口镜像', description: '将选定接口的流量复制到监测端口，供旁路分析设备持续观察。', glyph: 'port-mirror' },
-    { id: 'ddns', title: '动态域名', description: '维护公网地址与域名记录的同步状态，让动态线路拥有稳定访问入口。', glyph: 'ddns' },
-    { id: 'wake-on-lan', title: '网络唤醒', description: '向局域网设备发送 Magic Packet，远程唤醒支持 WOL 的主机。', glyph: 'wake-on-lan' },
-    { id: 'throughput', title: '吞吐测试', description: '在网关与测试端之间测量实际传输能力，评估局域网或指定链路性能。', glyph: 'throughput' },
-    { id: 'speedtest', title: '线路测速', description: '测试所选 WAN 的下载、上传和时延，核对运营商线路的实际表现。', glyph: 'speedtest' },
-    { id: 'subnet', title: '子网换算', description: '根据 IPv4 地址和前缀计算网络地址、广播地址、掩码与可用主机范围。', glyph: 'subnet' }
+    { id: 'router-check', title: '路由体检', description: '集中检查路由器资源、上联与关键网络服务，快速定位影响联网体验的异常。', image: 'router-check.svg' },
+    { id: 'health-check', title: '健康检测', description: '查看系统负载、温度、内存和存储状态，识别持续运行中的健康风险。', image: 'health-check.svg' },
+    { id: 'packet-capture', title: '抓包工具', description: '按接口、主机和协议采集网关流量，生成可下载的 PCAP 文件用于进一步分析。', image: 'packet-capture.svg' },
+    { id: 'flow-table', title: '流表查看', description: '检查当前连接的五元组、方向、状态与流量，追踪终端正在建立的网络会话。', image: 'flow-table.svg' },
+    { id: 'ping', title: 'Ping 测试', description: '从指定出口探测目标的可达性、往返延迟与丢包情况。', image: 'ping.svg' },
+    { id: 'traceroute', title: '路由追踪', description: '逐跳显示到目标地址的转发路径和响应时间，辅助定位链路故障位置。', image: 'traceroute.svg' },
+    { id: 'port-mirror', title: '端口镜像', description: '将选定接口的流量复制到监测端口，供旁路分析设备持续观察。', image: 'port-mirror.svg' },
+    { id: 'ddns', title: '动态域名', description: '维护公网地址与域名记录的同步状态，让动态线路拥有稳定访问入口。', image: 'ddns.svg' },
+    { id: 'wake-on-lan', title: '网络唤醒', description: '向局域网设备发送 Magic Packet，远程唤醒支持 WOL 的主机。', image: 'wake-on-lan.svg' },
+    { id: 'throughput', title: '吞吐测试', description: '在网关与测试端之间测量实际传输能力，评估局域网或指定链路性能。', image: 'throughput.svg' },
+    { id: 'speedtest', title: '线路测速', description: '测试所选 WAN 的下载、上传和时延，核对运营商线路的实际表现。', image: 'speedtest.svg' },
+    { id: 'subnet', title: '子网换算', description: '根据 IPv4 地址和前缀计算网络地址、广播地址、掩码与可用主机范围。', image: 'subnet-calculator.svg' }
   ];
 
   const state = { mounted: true, active: '', busy: false, notice: '', result: null, captures: [], flows: [], health: null, wans: [], seq: 0 };
@@ -76,27 +77,6 @@ export function mount(context = {}) {
     return unwrap(json);
   }
 
-  // Line-art glyphs drawn for DreamingOS; no third-party illustration assets.
-  const TOOL_ART = {
-    'router-check': '<rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 16.5h.01M11 16.5h.01"/><path d="M17 16.5 19 19l3-4.5"/><path d="M12 10V4"/><path d="M8.5 6.5 12 3l3.5 3.5"/>',
-    'health-check': '<path d="M3 12h4l2.5-6 4 12 2.5-6H21"/>',
-    'packet-capture': '<path d="M4 6h16"/><path d="M4 12h10"/><path d="M4 18h7"/><circle cx="17.5" cy="15.5" r="3.5"/><path d="m20.5 18.5 2 2"/>',
-    'flow-table': '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M3 14.5h18M9 4v16"/>',
-    'ping': '<circle cx="12" cy="12" r="2"/><path d="M8.5 8.5a5 5 0 0 0 0 7"/><path d="M15.5 15.5a5 5 0 0 0 0-7"/><path d="M5.5 5.5a9 9 0 0 0 0 13"/><path d="M18.5 18.5a9 9 0 0 0 0-13"/>',
-    'traceroute': '<circle cx="5" cy="6" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="18" r="2"/><path d="M6.6 7.4 10.4 10.6"/><path d="M13.6 13.4 17.4 16.6"/>',
-    'port-mirror': '<rect x="3" y="4" width="7" height="16" rx="1.5"/><rect x="14" y="4" width="7" height="16" rx="1.5"/><path d="M10.5 9.5h3M10.5 14.5h3"/>',
-    'ddns': '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18Z"/>',
-    'wake-on-lan': '<path d="M13 2 5 14h6l-1 8 8-12h-6l1-8Z"/>',
-    'throughput': '<path d="M4 18V9"/><path d="M9.5 18V5"/><path d="M15 18v-7"/><path d="M20.5 18v-11"/>',
-    'speedtest': '<path d="M4 17a9 9 0 1 1 16 0"/><path d="M12 14 16 9"/><circle cx="12" cy="14" r="1.4"/>',
-    'subnet': '<rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="8" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/>'
-  };
-
-  function toolArt(tool) {
-    const paths = TOOL_ART[tool.glyph] || TOOL_ART['router-check'];
-    return `<svg class="quick-tool-art" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`;
-  }
-
   function icon(name) {
     const paths = {
       back: '<path d="m15 18-6-6 6-6"></path>',
@@ -111,7 +91,7 @@ export function mount(context = {}) {
   function toolCards() {
     return `<section class="quick-tools-grid" aria-label="快捷工具">${TOOLS.map((tool) => `<button class="quick-tool-card policy-stable-glass" type="button" data-quick-tool="${tool.id}">
       <span class="quick-tool-copy"><strong>${escapeHtml(tool.title)}</strong><small>${escapeHtml(tool.description)}</small></span>
-      ${toolArt(tool)}
+      <img src="${ASSET_ROOT}/${tool.image}" alt="" loading="eager">
     </button>`).join('')}</section>`;
   }
 
@@ -166,11 +146,11 @@ export function mount(context = {}) {
   }
 
   function captureTable() {
-    return `<section class="quick-tool-table dwrt-kit-table-wrap dwrt-kit-datatable-wrap policy-stable-glass"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>抓包任务</strong><span>网关本地 PCAP</span></div><button class="quick-tool-icon-button" data-capture-refresh type="button" title="刷新">${icon('refresh')}</button></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-datatable"><thead><tr><th>任务</th><th>接口</th><th>状态</th><th>大小</th><th>操作</th></tr></thead><tbody>${state.captures.length ? state.captures.map((item) => `<tr><td>${escapeHtml(firstText(item.id, '--'))}</td><td>${escapeHtml(firstText(item.ifname, '--'))}</td><td>${escapeHtml(firstText(item.state, item.status, '--'))}</td><td>${escapeHtml(formatBytes(item.size_bytes))}</td><td><div class="quick-tool-row-actions">${item.running ? `<button data-capture-stop="${escapeHtml(item.id)}" type="button" title="停止">${icon('stop')}</button>` : ''}${item.download_available || item.download_url ? `<a href="${escapeHtml(item.download_url || `/api/v1/topology/capture/download?id=${encodeURIComponent(item.id)}`)}" title="下载">${icon('download')}</a>` : ''}</div></td></tr>`).join('') : '<tr><td colspan="5" class="dwrt-kit-table-empty">暂无抓包任务</td></tr>'}</tbody></table></div></section>`;
+    return `<section class="quick-tool-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap policy-stable-glass"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>抓包任务</strong><span>网关本地 PCAP</span></div><button class="quick-tool-icon-button" data-capture-refresh type="button" title="刷新">${icon('refresh')}</button></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr><th>任务</th><th>接口</th><th>状态</th><th>大小</th><th>操作</th></tr></thead><tbody>${state.captures.length ? state.captures.map((item) => `<tr><td>${escapeHtml(firstText(item.id, '--'))}</td><td>${escapeHtml(firstText(item.ifname, '--'))}</td><td>${escapeHtml(firstText(item.state, item.status, '--'))}</td><td>${escapeHtml(formatBytes(item.size_bytes))}</td><td><div class="quick-tool-row-actions">${item.running ? `<button data-capture-stop="${escapeHtml(item.id)}" type="button" title="停止">${icon('stop')}</button>` : ''}${item.download_available || item.download_url ? `<a href="${escapeHtml(item.download_url || `/api/v1/topology/capture/download?id=${encodeURIComponent(item.id)}`)}" title="下载">${icon('download')}</a>` : ''}</div></td></tr>`).join('') : '<tr><td colspan="5" class="dwrt-kit-table-empty">暂无抓包任务</td></tr>'}</tbody></table></div></section>`;
   }
 
   function flowPanel() {
-    return `<div class="quick-tool-flow-toolbar"><button class="policy-filter-button" type="button" data-flow-refresh>${icon('refresh')}<span>刷新流表</span></button></div><section class="quick-tool-table dwrt-kit-table-wrap dwrt-kit-datatable-wrap policy-stable-glass"><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-datatable"><thead><tr><th>协议</th><th>源</th><th>目标</th><th>状态</th><th>流量</th></tr></thead><tbody>${state.flows.length ? state.flows.slice(0, 500).map((item) => `<tr><td>${escapeHtml(firstText(item.protocol, item.proto, '--'))}</td><td>${escapeHtml(endpoint(item, 'source'))}</td><td>${escapeHtml(endpoint(item, 'destination'))}</td><td>${escapeHtml(firstText(item.state, item.status, item.direction, '--'))}</td><td>${escapeHtml(formatBytes(Number(item.bytes) || Number(item.total_bytes) || 0))}</td></tr>`).join('') : '<tr><td colspan="5" class="dwrt-kit-table-empty">点击刷新读取当前真实连接</td></tr>'}</tbody></table></div></section>`;
+    return `<div class="quick-tool-flow-toolbar"><button class="policy-filter-button" type="button" data-flow-refresh>${icon('refresh')}<span>刷新流表</span></button></div><section class="quick-tool-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap policy-stable-glass"><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr><th>协议</th><th>源</th><th>目标</th><th>状态</th><th>流量</th></tr></thead><tbody>${state.flows.length ? state.flows.slice(0, 500).map((item) => `<tr><td>${escapeHtml(firstText(item.protocol, item.proto, '--'))}</td><td>${escapeHtml(endpoint(item, 'source'))}</td><td>${escapeHtml(endpoint(item, 'destination'))}</td><td>${escapeHtml(firstText(item.state, item.status, item.direction, '--'))}</td><td>${escapeHtml(formatBytes(Number(item.bytes) || Number(item.total_bytes) || 0))}</td></tr>`).join('') : '<tr><td colspan="5" class="dwrt-kit-table-empty">点击刷新读取当前真实连接</td></tr>'}</tbody></table></div></section>`;
   }
 
   function contractPanel(tool) {
@@ -213,7 +193,7 @@ export function mount(context = {}) {
   }
 
   function detailMarkup(tool) {
-    return `<section class="quick-tool-workspace"><header class="quick-tool-header"><button class="quick-tool-back" type="button" data-tool-back aria-label="返回快捷工具">${icon('back')}</button><div><span>快捷工具</span><strong>${escapeHtml(tool.title)}</strong><p>${escapeHtml(tool.description)}</p></div>${toolArt(tool)}</header><main class="quick-tool-body">${panelMarkup(tool)}</main></section>`;
+    return `<section class="quick-tool-workspace"><header class="quick-tool-header"><button class="quick-tool-back" type="button" data-tool-back aria-label="返回快捷工具">${icon('back')}</button><div><span>快捷工具</span><strong>${escapeHtml(tool.title)}</strong><p>${escapeHtml(tool.description)}</p></div><img src="${ASSET_ROOT}/${tool.image}" alt=""></header><main class="quick-tool-body">${panelMarkup(tool)}</main></section>`;
   }
 
   function render() {

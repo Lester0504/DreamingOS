@@ -23,8 +23,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src/apd/apd_transport.c"
 FIXTURE = ROOT / "tests/apd_transport_fixture.c"
 WIRE = ROOT / "src/ap_control_wire.c"
-JSON_PREFIX = Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c/0.19")
-OPENSSL_PREFIX = Path("/opt/homebrew/var/homebrew/tmp/.cellar/openssl@3/3.6.3")
+_ENV_PREFIX = os.environ.get("APD_TEST_PREFIX", "")
+_ENV_OPENSSL = os.environ.get("APD_TEST_OPENSSL_PREFIX", "")
+JSON_PREFIX = (Path(_ENV_PREFIX) if _ENV_PREFIX else
+               Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c/0.19"))
+OPENSSL_PREFIX = (Path(_ENV_OPENSSL) if _ENV_OPENSSL else
+                  (JSON_PREFIX if _ENV_PREFIX else
+                   Path("/opt/homebrew/var/homebrew/tmp/.cellar/openssl@3/3.6.3")))
 TOKEN = "A" * 43
 PROTOCOL = "ap-control.v1"
 PROTOCOL_V2 = "ap-control.v2"
@@ -414,13 +419,18 @@ def static_contract() -> None:
     config_end = source.index("static int apd_config_wire_step(",
                               config_start)
     config_block = source[config_start:config_end]
-    # Executor ordering: stage -> apply(previous) -> durable applying ->
-    # readback -> finish; a mismatch rolls back, never applied.
+    # Executor ordering: stage -> capture rollback reference -> persist the
+    # applying state -> mutate live config -> persist applied -> readback.
+    # The rollback reference must be durable before the first live mutation.
     assert config_block.index("apd_config_stage(") < config_block.index(
-        "apd_config_apply(")
-    assert config_block.index("apd_config_apply(") < config_block.index(
-        "apd_config_job_mark_applying(")
+        "apd_config_capture_previous(")
+    assert config_block.index("apd_config_capture_previous(") < \
+        config_block.index("apd_config_job_mark_applying(")
     assert config_block.index("apd_config_job_mark_applying(") < \
+        config_block.index("apd_config_apply_prepared(")
+    assert config_block.index("apd_config_apply_prepared(") < \
+        config_block.index("apd_config_job_mark_applied(")
+    assert config_block.index("apd_config_job_mark_applied(") < \
         config_block.index("apd_config_readback(")
     assert config_block.index("apd_config_job_finish_store(") < \
         config_block.index("apd_config_finish_send(")

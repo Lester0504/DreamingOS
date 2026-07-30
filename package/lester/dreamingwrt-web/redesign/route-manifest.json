@@ -1,6 +1,7 @@
 {
   "schema": "dreamingwrt-route-manifest-v1",
   "version": "20260720-01",
+  "design_contract": "redesign-guide/design.md",
   "runtime_menu": "/dynamic/menu/1.json",
   "page_shells": [
     "status-overview",
@@ -73,6 +74,7 @@
     { "route": "#/policy-engine/regions", "label": "区域", "owner": "plugins/native/policy-regions.js", "page_shell": "master-detail", "capability": "policy_regions", "registry": ["policy.regions", "policy.zoneMatrix", "policy.table", "network.lans", "network.wans"], "availability": "available" },
     { "route": "#/policy-engine/objects", "label": "对象", "owner": "plugins/native/policy-objects.js", "page_shell": "data-workbench", "capability": "policy_objects", "registry": ["policy.objects"], "availability": "available" },
     { "route": "#/policy-engine/routes", "label": "路由表", "owner": "plugins/native/routing-table.js", "page_shell": "data-workbench", "capability": "routing_table", "registry": ["policy.routes", "policy.runtime"], "availability": "available" },
+    { "route": "#/policy-engine/flow-engine", "label": "流量引擎", "owner": "plugins/native/flow-engine.js", "page_shell": "master-detail", "capability": "policy_engine", "registry": ["flow.engineStatus", "flow.engineRuntime", "flow.engineSettings", "flow.qosSettings", "flow.qosClasses", "flow.applyJobs", "flow.wanCapacity", "flow.wanHealth", "flow.smartControl"], "availability": "available" },
 
     { "route": "#/logs", "label": "日志中心", "owner": "static/js/log-center.js", "page_shell": "master-detail", "capability": "logs", "registry": [], "availability": "available" },
 

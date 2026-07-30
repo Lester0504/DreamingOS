@@ -1126,7 +1126,7 @@ export function mount(context = {}) {
       <div class="system-startup-note">
         在此启用或禁用已安装的启动脚本，更改在设备重启后生效。警告：如果禁用了必要的启动脚本，比如 “network”，可能会导致无法访问设备！
       </div>
-      <section class="dwrt-kit-table-wrap dwrt-kit-datatable-wrap dwrt-kit-glass-surface system-table-card system-startup-table-card">
+      <section class="dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface system-table-card system-startup-table-card">
         <div class="dwrt-kit-table-toolbar">
           <div class="dwrt-kit-table-title">
             <strong>启动脚本</strong>
@@ -1135,7 +1135,7 @@ export function mount(context = {}) {
           <span class="dwrt-kit-table-count">${formatInteger(services.length)} 个脚本</span>
         </div>
         <div class="dwrt-kit-table-scroll system-table-scroll" data-system-scroll="startup-services">
-          <table class="dwrt-kit-table dwrt-kit-datatable system-startup-table-core" aria-label="启动脚本">
+          <table class="dwrt-kit-table dwrt-kit-ikuai-table system-startup-table-core" aria-label="启动脚本">
             <thead>
               <tr>
                 <th scope="col" class="num">启动优先级</th>

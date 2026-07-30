@@ -53,6 +53,7 @@ OBJS += storage/storage_overview.o storage/storage_files.o storage/file_services
 OBJS += system/power.o
 OBJS += jmx_storage_guard.o jmx_core_watchdog.o
 OBJS += jmx_path_provider.o jmx_system_data_path.o
+OBJS += jmx_identification_runtime.o
 
 WEBD_OBJS := webd/webd_main.o webd/apid_runtime.o webd/jmx_app_api.o webd/jmx_app_perms.o webd/jmx_app_cache.o webd/webd_http.o webd/webd_static.o webd/webd_mmdb.o webd/webd_upload_staging.o webd/webd_init_control.o webd/webd_wifi_aggregate.o webd/webd_vpn_aggregate.o webd/native_plugins.o webd/terminal_groups.o webd/system_ttyd.o webd/system_ttyd_proxy.o webd/webd_session_idle.o webd/webd_admin_transaction.o webd/ai_runtime.o webd/ai_oauth.o webd/ai_local_rpc.o jmx_path_provider.o jmx_system_data_path.o
 
@@ -68,7 +69,7 @@ AUTHD_OBJS := authd/authd_main.o authd/authd_common.o authd/authd_db.o authd/aut
 OTAD_OBJS := otad/otad_main.o otad/otad_common.o otad/otad_db.o otad/otad_inventory.o otad/otad_inventory_transaction.o otad/otad_persist_source.o otad/otad_manifest.o otad/otad_trust.o otad/otad_topology.o otad/otad_firmware.o otad/otad_hot.o otad/otad_status.o otad/otad_ubus.o jmx_path_provider.o
 AC_OBJS := ac/ac_main.o ac/ac_db.o ac/ac_enrollment.o ac/ac_pki.o ac/ac_secrets.o ac/ac_protocol.o ac/ac_transport.o ac/ac_ubus.o ap_control_wire.o
 APD_OBJS := apd/apd_main.o apd/apd_db.o apd/apd_enrollment.o apd/apd_credentials.o apd/apd_protocol.o apd/apd_transport.o apd/apd_backend.o apd/apd_backend_openwrt.o apd/apd_readonly_command.o apd/apd_radio_job_journal.o apd/apd_config_job_journal.o apd/apd_config_executor.o apd/apd_config_recovery.o apd/apd_ubus.o ap_control_wire.o
-AEGISXD_OBJS := aegisxd/aegisxd_main.o aegisxd/aegisxd_common.o aegisxd/aegisxd_db.o aegisxd/aegisxd_status.o aegisxd/aegisxd_feeds.o aegisxd/aegisxd_import.o aegisxd/aegisxd_dataplane.o aegisxd/aegisxd_hits.o aegisxd/aegisxd_honeypot.o aegisxd/aegisxd_content.o aegisxd/aegisxd_geo.o aegisxd/aegisxd_signature_policy.o geoip/mmdb_country_prefix.o aegisxd/aegisxd_ubus.o
+AEGISXD_OBJS := aegisxd/aegisxd_main.o aegisxd/aegisxd_common.o aegisxd/aegisxd_db.o aegisxd/aegisxd_status.o aegisxd/aegisxd_feeds.o aegisxd/aegisxd_import.o aegisxd/aegisxd_dataplane.o aegisxd/aegisxd_hits.o aegisxd/aegisxd_honeypot.o aegisxd/aegisxd_content.o aegisxd/aegisxd_certificate.o aegisxd/aegisxd_pcdn.o aegisxd/aegisxd_pcdn_parser.o aegisxd/aegisxd_geo.o aegisxd/aegisxd_signature_policy.o geoip/mmdb_country_prefix.o aegisxd/aegisxd_ubus.o jmx_identification_runtime.o
 HONEYPOTD_OBJS := honeypotd/main.o honeypotd/runtime.o honeypotd/protocols.o honeypotd/events.o honeypotd/sha256.o
 TOOLKIT_OBJS := toolkit/toolkit_main.o toolkit/toolkit_common.o toolkit/toolkit_db.o toolkit/toolkit_ops.o
 JMCTL_OBJS := ctl/jmctl.o
@@ -110,7 +111,7 @@ AUTHD_CFLAGS ?=
 OTAD_LIBS ?= -lubus -lubox -lblobmsg_json -ljson-c -lsqlite3 -lblkid -lssl -lcrypto -lz -lm
 AC_LIBS ?= -lubus -lubox -lblobmsg_json -ljson-c -lsqlite3 -lssl -lcrypto -lpthread
 APD_LIBS ?= -lubus -lubox -lblobmsg_json -ljson-c -lsqlite3 -luci -lssl -lcrypto -lm -lpthread
-AEGISXD_LIBS ?= -lmaxminddb
+AEGISXD_LIBS ?= -lssl -lcrypto -lmaxminddb
 HONEYPOTD_LIBS ?= -lubus -lubox -lblobmsg_json -ljson-c
 TOOLKIT_LIBS ?= -ljson-c -lsqlite3 -lcurl -lssl -lcrypto
 JMCTL_LIBS ?= -lubus -lubox -lblobmsg_json -ljson-c

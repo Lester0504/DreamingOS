@@ -420,23 +420,15 @@ export function mount(context = {}) {
     return raw;
   }
 
-  // Bundled carrier marks used when the backend does not carry an explicit logo.
-  const CARRIER_LOGOS = {
-    '中国联通': '/static/images/logo/china-unicom.svg',
-    '中国移动': '/static/images/logo/china-mobile.svg',
-    '中国电信': '/static/images/logo/china-telecom.svg',
-    '教育网': '/static/images/logo/china-cernet.svg'
-  };
-
   function carrierLogo(row) {
     const label = carrierLabel(row);
-    const explicitRaw = firstText(row.carrier_logo, row.carrier_svg, row.logo, row.image, row.icon);
-    const explicit = window.DWRT_DEVICE_IMAGES?.normalizeUrl?.(explicitRaw) || explicitRaw;
-    const logo = explicit || CARRIER_LOGOS[label] || '';
-    if (logo) {
-      return `<img class="network-interface-carrier-logo" src="${escapeHtml(logo)}" alt="${escapeHtml(label)}" data-dwrt-tooltip="${escapeHtml(label)}">`;
-    }
-    return `<span class="network-interface-carrier-fallback" data-dwrt-tooltip="${escapeHtml(label)}">${icon('globe')}</span>`;
+    const key = `${firstText(row.carrier, row.carrier_name)} ${label}`.toLowerCase();
+    const file = /unicom|cucc|联通/.test(key) ? 'china-unicom.svg'
+      : /mobile|cmcc|移动/.test(key) ? 'china-mobile.svg'
+        : /telecom|ctcc|电信/.test(key) ? 'china-telecom.svg'
+          : /cernet|edu|教育/.test(key) ? 'china-cernet.svg' : '';
+    if (!file) return `<span class="network-interface-carrier-fallback" data-dwrt-tooltip="${escapeHtml(label)}">${icon('globe')}</span>`;
+    return `<img class="network-interface-carrier-logo" src="/static/images/logo/${file}" alt="${escapeHtml(label)}" data-dwrt-tooltip="${escapeHtml(label)}">`;
   }
 
   function statusMarkup(row) {
@@ -544,10 +536,10 @@ export function mount(context = {}) {
     const headers = isWan
       ? ['状态', '名称', '物理接口', '运营商', '接入方式', 'IPv4', '网关', 'DNS', '连接时间', '操作']
       : ['状态', '名称', '设备 / 网桥', '模式', 'VLAN', 'IPv4 网关', 'DHCP', 'IPv6', '成员端口', '操作'];
-    return `<section class="network-interface-table-card dwrt-kit-table-wrap dwrt-kit-glass-surface dwrt-kit-datatable-wrap" style="--network-interface-row-count:${Math.max(1, rows.length)}">
+    return `<section class="network-interface-table-card dwrt-kit-table-wrap dwrt-kit-glass-surface dwrt-kit-ikuai-table-wrap" style="--network-interface-row-count:${Math.max(1, rows.length)}">
       <div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${isWan ? 'WAN 线路' : 'LAN / VLAN 网络'}</strong><span>读取当前真实配置与运行状态</span></div><span class="dwrt-kit-table-count">${rows.length} / ${state.rows.length}</span></div>
       <div class="dwrt-kit-table-scroll network-interface-table-scroll" data-interface-scroll>
-        <table class="dwrt-kit-table dwrt-kit-datatable network-interface-table is-${kind}"><thead><tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr></thead>
+        <table class="dwrt-kit-table dwrt-kit-ikuai-table network-interface-table is-${kind}"><thead><tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr></thead>
           <tbody>${rows.length ? rows.map((row) => isWan ? wanTableRow(row) : lanTableRow(row)).join('') : `<tr><td class="dwrt-kit-table-empty" colspan="10">${state.loading ? '正在读取配置' : state.query ? '没有匹配的配置' : `暂无 ${kind.toUpperCase()} 配置`}</td></tr>`}</tbody>
         </table>
       </div>
@@ -663,7 +655,7 @@ export function mount(context = {}) {
       <div class="network-interface-form-grid">${formField('网络名称', inputField('name', draft.name, { placeholder: '例如 IoT' }))}${formField('网络 ID', inputField('id', draft.id, { disabled: state.drawer === 'edit' }), '保存后的稳定标识')}${formField('备注', inputField('note', draft.note, { placeholder: '可选' }))}${formField('设备 / 网桥', inputField('device', draft.device, { placeholder: 'br-lan' }))}${formField('逻辑接口', inputField('ifname', draft.ifname, { placeholder: draft.id }))}</div>
       ${segmentedField('mode', draft.mode, [['bridge', '桥接', '普通本地网络'], ['access', 'VLAN 接入', '单个 VLAN'], ['trunk', 'VLAN Trunk', '承载多个 VLAN']], '网络模式')}
       ${draft.mode !== 'bridge' ? dependentMarkup(formField('VLAN ID', inputField('vlan_id', draft.vlan_id, { type: 'number', min: 1, max: 4094 }), '1-4094')) : ''}${inlinePortPicker(draft)}`;
-    const addressing = `<div class="network-interface-form-grid">${formField('网关地址', inputField('ipaddr', draft.ipaddr, { placeholder: '192.168.1.1' }))}${formField('子网前缀', inputField('cidr', draft.cidr, { type: 'number', min: 1, max: 30 }), 'CIDR 前缀')}${formField('扩展 IP', inputField('extra_ips_text', asArray(draft.extra_ips).join(', '), { placeholder: '192.168.50.1/24, 192.168.60.1/24' }), '多个地址使用逗号分隔')}</div>`;
+    const addressing = `<div class="network-interface-form-grid">${formField('网关地址', inputField('ipaddr', draft.ipaddr, { placeholder: '192.168.30.1' }))}${formField('子网前缀', inputField('cidr', draft.cidr, { type: 'number', min: 1, max: 30 }), 'CIDR 前缀')}${formField('扩展 IP', inputField('extra_ips_text', asArray(draft.extra_ips).join(', '), { placeholder: '192.168.50.1/24, 192.168.60.1/24' }), '多个地址使用逗号分隔')}</div>`;
     const dhcpBody = `${switchField('dhcp.enabled', dhcp.enabled, 'DHCP 服务器', '向该网络内终端自动分配地址')}${dhcp.enabled ? dependentMarkup(`${formField('地址池起始', inputField('dhcp.pool_start', dhcp.pool_start))}${formField('地址池结束', inputField('dhcp.pool_end', dhcp.pool_end))}${formField('租期（分钟）', inputField('dhcp.lease', dhcp.lease, { type: 'number', min: 1 }))}${formField('DHCP 网关', inputField('dhcp.gateway', dhcp.gateway))}${formField('DNS 服务器', inputField('dhcp.dns_text', dhcp.dns.join(', ')), '多个地址使用逗号分隔')}`) : ''}`;
     const ipv6Body = `${switchField('ipv6.enabled', ipv6.enabled, '启用 IPv6', '配置地址委派、RA 与 DHCPv6')}${ipv6.enabled ? dependentMarkup(`${formField('地址模式', selectField('ipv6.mode', ipv6.mode, [['dhcp', '自动 / 委派'], ['static', '静态']]))}${formField('上游 WAN', inputField('ipv6.parent_text', ipv6.parent_wans.join(', '), { placeholder: 'wan, wan2' }), '多个接口使用逗号分隔')}${formField('静态地址', inputField('ipv6.addr', ipv6.addr, { placeholder: '2001:db8::1/64' }))}${formField('前缀长度', inputField('ipv6.prefix_len', ipv6.prefix_len, { placeholder: 'auto' }))}${formField('IPv6 租期（分钟）', inputField('ipv6.leasetime', ipv6.leasetime, { type: 'number', min: 1 }))}${formField('RA 标志', selectField('ipv6.ra_flags', ipv6.ra_flags, [['1', 'Managed + Other'], ['2', 'Managed'], ['3', 'Other'], ['0', '无状态']]))}${switchField('ipv6.dhcpv6', ipv6.dhcpv6, 'DHCPv6 服务')}${switchField('ipv6.ra_static', ipv6.ra_static, '静态 RA', '使用固定前缀通告')}${switchField('ipv6.use_dns6', ipv6.use_dns6, '下发 IPv6 DNS')}${ipv6.use_dns6 ? formField('IPv6 DNS', inputField('ipv6.dns_text', ipv6.dns6.join(', ')), '多个地址使用逗号分隔') : ''}${switchField('ipv6.ra_mtu_set', ipv6.ra_mtu_set, '自定义 RA MTU')}${ipv6.ra_mtu_set ? formField('RA MTU', inputField('ipv6.ra_mtu', ipv6.ra_mtu, { type: 'number', min: 1280, max: 9000 })) : ''}`) : ''}`;
     const link = `<div class="network-interface-form-grid">${switchField('lan_visit', draft.lan_visit, '允许 LAN 互访', '关闭后阻止其他本地网络主动访问此网络')}${formField('MAC 克隆', inputField('mac_clone', draft.mac_clone, { placeholder: '留空使用设备地址' }))}${formField('端口速率', selectField('speed', draft.speed, [['0', '自动协商'], ['100', '100 Mbps'], ['1000', '1 Gbps'], ['2500', '2.5 Gbps'], ['10000', '10 Gbps']]))}${formField('双工模式', selectField('duplex', draft.duplex, [['0', '自动'], ['full', '全双工'], ['half', '半双工']]))}</div>`;

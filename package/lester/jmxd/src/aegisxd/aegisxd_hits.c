@@ -35,11 +35,6 @@ struct aegisxd_dns_query_seen {
     int64_t ts;
 };
 
-struct aegisxd_dns_hit_dedupe {
-    char key[384];
-    int64_t ts;
-};
-
 struct aegisxd_nft_counter_seen {
     char rule_id[96];
     char rule_name[160];
@@ -85,15 +80,20 @@ struct aegisxd_reputation_match {
 static struct uloop_timeout g_hit_timer;
 static int g_hit_started;
 static off_t g_hit_offset;
-static time_t g_hit_inode_mtime;
+static dev_t g_hit_device;
+static ino_t g_hit_inode;
+static int g_hit_file_initialized;
+static char g_hit_partial[AEGISXD_HIT_MAX_LINE];
+static int g_hit_partial_len;
+static int g_hit_partial_dropping;
 static struct aegisxd_dns_query_seen g_seen[128];
 static int g_seen_pos;
-static struct aegisxd_dns_hit_dedupe g_dedupe[128];
-static int g_dedupe_pos;
 static int64_t g_last_event_at;
 static int64_t g_last_prune_at;
 static int g_last_event_id;
 static int g_events_inserted;
+static int g_events_aggregated;
+static int g_events_unattributed;
 static int g_lines_scanned;
 static struct aegisxd_nft_counter_seen g_nft_seen[8];
 static int64_t g_nft_last_poll_at;
@@ -130,6 +130,24 @@ static int g_policy_last_event_id;
 static int g_policy_events_inserted;
 static int g_policy_samples_seen;
 static int g_policy_verified_samples_seen;
+
+static void aegisxd_hits_follow_from_eof(void)
+{
+    struct stat st;
+
+    g_hit_partial_len = 0;
+    g_hit_partial_dropping = 0;
+    if (stat(AEGISXD_DNSMASQ_LOG_PATH, &st) == 0 && S_ISREG(st.st_mode)) {
+        g_hit_offset = st.st_size;
+        g_hit_device = st.st_dev;
+        g_hit_inode = st.st_ino;
+    } else {
+        g_hit_offset = 0;
+        g_hit_device = 0;
+        g_hit_inode = 0;
+    }
+    g_hit_file_initialized = 1;
+}
 static int g_policy_rules_seen;
 static int g_policy_sources_seen;
 static int g_policy_baselined;
@@ -492,25 +510,6 @@ static const char *aegisxd_hits_risk_from_category(const char *category, int sev
     return "medium";
 }
 
-static int aegisxd_hits_recent_duplicate(const char *domain, const char *source_ip,
-                                         int64_t now)
-{
-    char key[384];
-
-    snprintf(key, sizeof(key), "%s|%s", source_ip ? source_ip : "", domain ? domain : "");
-    for (size_t i = 0; i < ARRAY_SIZE(g_dedupe); i++) {
-        if (g_dedupe[i].key[0] && !strcmp(g_dedupe[i].key, key) &&
-            now - g_dedupe[i].ts < AEGISXD_HIT_DEDUPE_S) {
-            g_dedupe[i].ts = now;
-            return 1;
-        }
-    }
-    snprintf(g_dedupe[g_dedupe_pos].key, sizeof(g_dedupe[g_dedupe_pos].key), "%s", key);
-    g_dedupe[g_dedupe_pos].ts = now;
-    g_dedupe_pos = (g_dedupe_pos + 1) % (int)ARRAY_SIZE(g_dedupe);
-    return 0;
-}
-
 static void aegisxd_hits_prune_if_needed(int64_t now)
 {
     sqlite3_stmt *st = NULL;
@@ -534,11 +533,11 @@ static void aegisxd_hits_prune_if_needed(int64_t now)
     }
 }
 
-static int aegisxd_hits_insert_dns_block(const char *domain, const char *source_ip,
+static int aegisxd_hits_insert_dns_event(const char *domain, const char *source_ip,
                                          const char *source_mac,
                                          const char *in_interface,
                                          const char *client_lookup_source,
-                                         const char *qtype)
+                                         const char *qtype, int monitor)
 {
     sqlite3_stmt *st = NULL;
     struct json_object *meta = NULL;
@@ -547,9 +546,20 @@ static int aegisxd_hits_insert_dns_block(const char *domain, const char *source_
     char lookup_mac[32] = "";
     char lookup_if[32] = "";
     char lookup_source[32] = "";
+    char rule_kind[32] = "";
+    char rule_source_id[64] = "";
+    char matched_rule[254] = "";
+    char artifact_sha256[65] = "";
     int severity = 0;
     int confidence = 50;
+    int is_pcdn = 0;
+    int aggregated = 0;
     const char *risk;
+    const char *event_type;
+    const char *policy_id;
+    const char *policy_name;
+    const char *event_source;
+    const char *reason;
     const char *meta_s;
     const char *event_source_mac = source_mac ? source_mac : "";
     const char *event_in_interface = in_interface ? in_interface : "";
@@ -559,6 +569,33 @@ static int aegisxd_hits_insert_dns_block(const char *domain, const char *source_
 
     if (!domain || !domain[0])
         return -1;
+    if (monitor) {
+        is_pcdn = aegisxd_pcdn_installed_monitor_match(domain, matched_rule,
+                                                        artifact_sha256);
+        if (!is_pcdn)
+            return 0;
+        snprintf(rule_kind, sizeof(rule_kind), "%s", "pcdn_monitor");
+        snprintf(rule_source_id, sizeof(rule_source_id), "%s", "openhosts-pcdn");
+    } else {
+        if (!aegisxd_content_installed_dns_rule_match(domain, rule_kind,
+                rule_source_id, matched_rule)) {
+            g_events_unattributed++;
+            return 0;
+        }
+        is_pcdn = !strcmp(rule_kind, "pcdn") &&
+            aegisxd_pcdn_installed_domain_match(domain, artifact_sha256);
+        if (!strcmp(rule_kind, "pcdn") && !is_pcdn) {
+            g_events_unattributed++;
+            return 0;
+        }
+    }
+    event_type = monitor ? "pcdn_dns_observed" :
+        (is_pcdn ? "pcdn_dns_block" : "dns_filter_block");
+    policy_id = is_pcdn ? "pcdn" : "dns_filter";
+    policy_name = is_pcdn ? "PCDN Filter" : "DNS Filter";
+    event_source = is_pcdn ? "aegisxd.pcdn" : "aegisxd.dns_filter";
+    reason = monitor ? "pcdn_dnsmasq_query_observed" :
+        (is_pcdn ? "pcdn_dnsmasq_sinkhole" : "dnsmasq_address_sinkhole");
     if ((!event_source_mac[0] || !event_in_interface[0]) && source_ip && source_ip[0]) {
         (void)aegisxd_hits_lookup_client_identity(source_ip,
             lookup_mac, sizeof(lookup_mac), lookup_if, sizeof(lookup_if),
@@ -570,8 +607,6 @@ static int aegisxd_hits_insert_dns_block(const char *domain, const char *source_
         if (!event_lookup_source[0])
             event_lookup_source = lookup_source;
     }
-    if (aegisxd_hits_recent_duplicate(domain, source_ip, now))
-        return 0;
     aegisxd_hits_domain_lookup(domain, category, sizeof(category),
                                source_feed, sizeof(source_feed),
                                &severity, &confidence);
@@ -581,7 +616,18 @@ static int aegisxd_hits_insert_dns_block(const char *domain, const char *source_
     meta = json_object_new_object();
     aegisxd_json_add_string(meta, "feed", source_feed);
     aegisxd_json_add_string(meta, "source_feed", source_feed);
-    aegisxd_json_add_string(meta, "rule_source", "dnsmasq_address_blocklist");
+    aegisxd_json_add_string(meta, "rule_source", monitor ?
+                            "dnsmasq_query_monitor" : "dnsmasq_address_blocklist");
+    aegisxd_json_add_string(meta, "dns_rule_kind", rule_kind);
+    aegisxd_json_add_string(meta, "source_id", rule_source_id);
+    aegisxd_json_add_string(meta, "matched_rule", matched_rule);
+    aegisxd_json_add_string(meta, "effective_source", is_pcdn ? "pcdn" : rule_kind);
+    aegisxd_json_add_string(meta, "artifact_sha256", artifact_sha256);
+    aegisxd_json_add_string(meta, "attribution_precision", monitor ?
+                            "verified_pcdn_artifact_longest_suffix" :
+                            "installed_dnsmasq_provenance_longest_suffix");
+    aegisxd_json_add_string(meta, "pcdn_mode", monitor ? "monitor" : "block");
+    json_object_object_add(meta, "pcdn_match", json_object_new_boolean(is_pcdn));
     aegisxd_json_add_string(meta, "qtype", qtype ? qtype : "");
     aegisxd_json_add_string(meta, "dnsmasq_query_source_ip", source_ip ? source_ip : "");
     aegisxd_json_add_string(meta, "client_lookup_source", event_lookup_source);
@@ -592,19 +638,67 @@ static int aegisxd_hits_insert_dns_block(const char *domain, const char *source_
     meta_s = json_object_to_json_string(meta);
 
     st = aegisxd_prepare(
-        "INSERT INTO aegis_events("
-        "ts,event_type,level,action,policy_id,policy_name,policy_type,rule_id,rule_name,"
-        "risk,risk_category,source_ip,source_mac,destination_host,destination_port,protocol,"
-        "in_interface,reason,source,meta_json"
-        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        "UPDATE aegis_events SET ts=?1,last_seen=?1,"
+        "occurrence_count=occurrence_count+1,"
+        "source_mac=CASE WHEN ?2<>'' THEN ?2 ELSE source_mac END,"
+        "in_interface=CASE WHEN ?3<>'' THEN ?3 ELSE in_interface END,meta_json=?4 "
+        "WHERE id=(SELECT id FROM aegis_events WHERE event_type=?5 AND policy_id=?6 "
+        "AND policy_type='dns_filter' AND source=?7 AND destination_host=?8 "
+        "AND source_ip=?9 AND last_seen>=?10 ORDER BY id DESC LIMIT 1)");
     if (!st)
         goto out;
     sqlite3_bind_int64(st, 1, now);
-    sqlite3_bind_text(st, 2, "dns_filter_block", -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 3, "warning", -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 4, "block", -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 5, "dns_filter", -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 6, "DNS Filter", -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, event_source_mac ? event_source_mac : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, event_in_interface ? event_in_interface : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, meta_s ? meta_s : "{}", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, event_type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, policy_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, event_source, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, domain, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 9, source_ip ? source_ip : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 10, now - AEGISXD_HIT_DEDUPE_S);
+    if (sqlite3_step(st) != SQLITE_DONE)
+        goto out;
+    aggregated = sqlite3_changes(g_aegisxd_db) > 0;
+    sqlite3_finalize(st);
+    st = NULL;
+    if (aggregated) {
+        st = aegisxd_prepare(
+            "SELECT id FROM aegis_events WHERE event_type=?1 AND policy_id=?2 "
+            "AND policy_type='dns_filter' AND source=?3 AND destination_host=?4 AND source_ip=?5 "
+            "ORDER BY last_seen DESC,id DESC LIMIT 1");
+        if (st) {
+            sqlite3_bind_text(st, 1, event_type, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 2, policy_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 3, event_source, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 4, domain, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 5, source_ip ? source_ip : "", -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(st) == SQLITE_ROW)
+                g_last_event_id = sqlite3_column_int(st, 0);
+            sqlite3_finalize(st);
+            st = NULL;
+        }
+        g_last_event_at = now;
+        g_events_aggregated++;
+        rc = 0;
+        goto out;
+    }
+
+    st = aegisxd_prepare(
+        "INSERT INTO aegis_events("
+        "ts,event_type,level,action,policy_id,policy_name,policy_type,rule_id,rule_name,"
+        "risk,risk_category,source_ip,source_mac,destination_host,destination_port,protocol,"
+        "in_interface,reason,source,occurrence_count,first_seen,last_seen,meta_json"
+        ") VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,"
+        "?16,?17,?18,?19,1,?20,?21,?22)");
+    if (!st)
+        goto out;
+    sqlite3_bind_int64(st, 1, now);
+    sqlite3_bind_text(st, 2, event_type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, monitor ? "info" : "warning", -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 4, monitor ? "monitor" : "block", -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 5, policy_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, policy_name, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 7, "dns_filter", -1, SQLITE_STATIC);
     sqlite3_bind_text(st, 8, domain, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 9, domain, -1, SQLITE_TRANSIENT);
@@ -616,9 +710,11 @@ static int aegisxd_hits_insert_dns_block(const char *domain, const char *source_
     sqlite3_bind_int(st, 15, 53);
     sqlite3_bind_text(st, 16, "dns", -1, SQLITE_STATIC);
     sqlite3_bind_text(st, 17, event_in_interface ? event_in_interface : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 18, "dnsmasq_address_sinkhole", -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 19, "aegisxd.dns_filter", -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 20, meta_s ? meta_s : "{}", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 18, reason, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 19, event_source, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 20, now);
+    sqlite3_bind_int64(st, 21, now);
+    sqlite3_bind_text(st, 22, meta_s ? meta_s : "{}", -1, SQLITE_TRANSIENT);
     if (sqlite3_step(st) == SQLITE_DONE) {
         rc = 0;
         g_last_event_id = (int)sqlite3_last_insert_rowid(g_aegisxd_db);
@@ -2312,6 +2408,7 @@ static void aegisxd_parse_dnsmasq_query_line(const char *line)
     if (!aegisxd_hits_domain_ok(domain))
         return;
     aegisxd_hits_seen_remember(serial, domain, source_ip, qtype);
+    (void)aegisxd_hits_insert_dns_event(domain, source_ip, "", "", "", qtype, 1);
 }
 
 static void aegisxd_parse_dnsmasq_config_line(const char *line)
@@ -2353,12 +2450,12 @@ static void aegisxd_parse_dnsmasq_config_line(const char *line)
         snprintf(domain, sizeof(domain), "%s", seen->domain);
     if (!aegisxd_hits_domain_ok(domain))
         return;
-    (void)aegisxd_hits_insert_dns_block(domain,
+    (void)aegisxd_hits_insert_dns_event(domain,
         seen ? seen->source_ip : "",
         seen ? seen->source_mac : "",
         seen ? seen->in_interface : "",
         seen ? seen->client_lookup_source : "",
-        seen ? seen->qtype : "");
+        seen ? seen->qtype : "", 0);
 }
 
 static void aegisxd_parse_dnsmasq_log_line(const char *line)
@@ -2374,14 +2471,13 @@ static void aegisxd_hits_read_log(void)
     struct stat st;
     off_t file_size = 0;
     char buf[8192];
-    char line[AEGISXD_HIT_MAX_LINE];
     ssize_t n;
-    int used = 0;
     int budget = 0;
     int eof = 0;
 
     if (!aegisxd_active_state_present()) {
-        g_hit_offset = 0;
+        aegisxd_hits_follow_from_eof();
+        memset(g_seen, 0, sizeof(g_seen));
         return;
     }
     fd = open(AEGISXD_DNSMASQ_LOG_PATH, O_RDONLY | O_CLOEXEC);
@@ -2389,10 +2485,20 @@ static void aegisxd_hits_read_log(void)
         return;
     if (fstat(fd, &st) == 0) {
         file_size = st.st_size;
-        if (g_hit_inode_mtime != st.st_mtime || g_hit_offset > st.st_size) {
-            if (g_hit_offset <= 0 || g_hit_offset > st.st_size)
-                g_hit_offset = 0;
-            g_hit_inode_mtime = st.st_mtime;
+        if (!g_hit_file_initialized) {
+            /* Existing bytes predate this producer process and must not be replayed. */
+            g_hit_offset = st.st_size;
+            g_hit_device = st.st_dev;
+            g_hit_inode = st.st_ino;
+            g_hit_file_initialized = 1;
+        } else if (g_hit_device != st.st_dev || g_hit_inode != st.st_ino ||
+                   g_hit_offset > st.st_size) {
+            g_hit_offset = 0;
+            g_hit_device = st.st_dev;
+            g_hit_inode = st.st_ino;
+            g_hit_partial_len = 0;
+            g_hit_partial_dropping = 0;
+            memset(g_seen, 0, sizeof(g_seen));
         }
     }
     if (lseek(fd, g_hit_offset, SEEK_SET) < 0) {
@@ -2402,14 +2508,18 @@ static void aegisxd_hits_read_log(void)
     while ((n = read(fd, buf, sizeof(buf))) > 0) {
         for (ssize_t i = 0; i < n; i++) {
             if (buf[i] == '\n') {
-                line[used] = 0;
-                if (used > 0)
-                    aegisxd_parse_dnsmasq_log_line(line);
-                used = 0;
-            } else if (used + 1 < (int)sizeof(line)) {
-                line[used++] = buf[i];
+                if (!g_hit_partial_dropping && g_hit_partial_len > 0) {
+                    g_hit_partial[g_hit_partial_len] = 0;
+                    aegisxd_parse_dnsmasq_log_line(g_hit_partial);
+                }
+                g_hit_partial_len = 0;
+                g_hit_partial_dropping = 0;
+            } else if (!g_hit_partial_dropping &&
+                       g_hit_partial_len + 1 < (int)sizeof(g_hit_partial)) {
+                g_hit_partial[g_hit_partial_len++] = buf[i];
             } else {
-                used = 0;
+                g_hit_partial_len = 0;
+                g_hit_partial_dropping = 1;
             }
         }
         budget += (int)n;
@@ -2426,7 +2536,8 @@ static void aegisxd_hits_read_log(void)
         if (wfd >= 0)
             close(wfd);
         g_hit_offset = 0;
-        g_hit_inode_mtime = 0;
+        g_hit_partial_len = 0;
+        g_hit_partial_dropping = 0;
     }
 }
 
@@ -2463,7 +2574,7 @@ void aegisxd_hit_producer_start(void)
     memset(&g_hit_timer, 0, sizeof(g_hit_timer));
     g_hit_timer.cb = aegisxd_hit_tick;
     g_hit_started = 1;
-    g_hit_offset = 0;
+    aegisxd_hits_follow_from_eof();
     uloop_timeout_set(&g_hit_timer, AEGISXD_HIT_TICK_MS);
 }
 
@@ -2489,8 +2600,14 @@ struct json_object *aegisxd_dns_hit_producer_status_json(void)
     json_object_object_add(o, "last_event_id",
                            g_last_event_id > 0 ? json_object_new_int(g_last_event_id) : json_object_new_null());
     json_object_object_add(o, "events_inserted", json_object_new_int(g_events_inserted));
+    json_object_object_add(o, "events_aggregated", json_object_new_int(g_events_aggregated));
+    json_object_object_add(o, "events_unattributed_ignored",
+                           json_object_new_int(g_events_unattributed));
     json_object_object_add(o, "lines_scanned", json_object_new_int(g_lines_scanned));
-    json_object_object_add(o, "dedupe_window_sec", json_object_new_int(AEGISXD_HIT_DEDUPE_S));
+    json_object_object_add(o, "aggregation_window_sec", json_object_new_int(AEGISXD_HIT_DEDUPE_S));
+    json_object_object_add(o, "restart_replay_prevented", json_object_new_boolean(1));
+    json_object_object_add(o, "inode_rotation_supported", json_object_new_boolean(1));
+    json_object_object_add(o, "partial_line_buffering_supported", json_object_new_boolean(1));
     json_object_object_add(o, "work_log_max_bytes", json_object_new_int(AEGISXD_HIT_LOG_MAX_BYTES));
     json_object_object_add(o, "retention_days", json_object_new_int(AEGISXD_HIT_EVENT_RETENTION_DAYS));
     json_object_object_add(o, "max_events", json_object_new_int(AEGISXD_HIT_EVENT_MAX_ROWS));

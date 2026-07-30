@@ -8,6 +8,7 @@
  * standalone-test builds so the config wire step compiles either way. */
 #include "apd_config_executor.h"
 #include "apd_config_job_journal.h"
+#include "apd_config_recovery.h"
 
 #ifndef APD_CONFIG_UCI_PATH
 #define APD_CONFIG_UCI_PATH "/sbin/uci"
@@ -2407,6 +2408,7 @@ static int apd_config_executor_enabled(void)
 static int apd_config_wire_step(
     SSL *ssl, const struct apd_enrollment_metadata *metadata,
     const char *session_epoch);
+static void apd_config_paths_default(struct apd_config_paths *paths);
 
 static int apd_v2_jobs_step(
     SSL *ssl, const struct apd_enrollment_metadata *metadata,
@@ -2671,6 +2673,15 @@ static void apd_config_paths_default(struct apd_config_paths *paths)
     paths->staging_dir = APD_CONFIG_STAGING_DIR;
 }
 
+int apd_config_restart_recover_default(int *recovered)
+{
+    struct apd_config_paths paths;
+
+    apd_config_paths_default(&paths);
+    return apd_config_jobs_restart_recover(&paths, apd_now_s(),
+                                           apd_v2_finish_id, recovered);
+}
+
 static int apd_config_assignment_parse(
     struct json_object *response,
     const struct apd_enrollment_metadata *metadata, const char *session_epoch,
@@ -2862,17 +2873,10 @@ static int apd_config_execute(
     }
     json_object_put(result);
     result = NULL;
-    /* apply captures the previous values; persist them BEFORE the live
-     * mutation so a crash rolls back deterministically. */
-    if (apd_config_apply(&paths, candidate, &result) != 0) {
-        struct json_object *rolled = NULL;
-
-        outcome = "rolled_back";
-        error_code = "apply_failed";
-        if (result &&
-            json_object_object_get_ex(result, "rolled_back", &rolled) &&
-            json_object_get_boolean(rolled))
-            error_code = "apply_failed_rolled_back";
+    /* Capture is read-only. Persist its rollback reference before the
+     * first live UCI mutation. */
+    if (apd_config_capture_previous(&paths, candidate, &result) != 0) {
+        error_code = "previous_capture_failed";
         json_object_put(result);
         result = NULL;
         goto finish;
@@ -2889,11 +2893,36 @@ static int apd_config_execute(
     if (!previous_json ||
         apd_config_job_mark_applying(job, previous_json, apd_now_s(),
                                      &entry) < 0) {
-        outcome = "rolled_back";
         error_code = "journal_applying_failed";
         goto finish;
     }
-    apd_config_job_mark_applied(job, apd_now_s(), &entry);
+    {
+        struct json_object *previous = json_tokener_parse(previous_json);
+        int apply_rc = previous ?
+            apd_config_apply_prepared(&paths, candidate, previous, &result) :
+            -1;
+
+        json_object_put(previous);
+        if (apply_rc != 0) {
+            struct json_object *rolled = NULL;
+
+            outcome = "rolled_back";
+            error_code = "apply_failed";
+            if (result &&
+                json_object_object_get_ex(result, "rolled_back", &rolled) &&
+                json_object_get_boolean(rolled))
+                error_code = "apply_failed_rolled_back";
+            json_object_put(result);
+            result = NULL;
+            goto finish;
+        }
+    }
+    json_object_put(result);
+    result = NULL;
+    if (apd_config_job_mark_applied(job, apd_now_s(), &entry) < 0) {
+        error_code = "journal_applied_failed";
+        goto rollback;
+    }
     /* readback: mismatch -> rollback -> rolled_back. */
     if (apd_config_readback(&paths, candidate, &result) != 0) {
         error_code = "readback_failed";

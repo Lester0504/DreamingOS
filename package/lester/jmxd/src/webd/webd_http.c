@@ -117,6 +117,42 @@ int http_send_raw(int fd, int status, const char *content_type,
     return 0;
 }
 
+int http_send_download(int fd, int status, const char *content_type,
+                       const char *filename, const void *body, size_t body_len)
+{
+    char header[1024];
+    const char *status_text = http_status_text(status);
+    const unsigned char *cursor;
+    int hlen;
+
+    if (!content_type || !content_type[0] || !filename || !filename[0])
+        return -1;
+    for (cursor = (const unsigned char *)filename; *cursor; cursor++)
+        if (*cursor < 0x20 || *cursor == 0x7f || *cursor == '"' ||
+            *cursor == '\\' || *cursor == '/' || *cursor == ';')
+            return -1;
+    hlen = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Disposition: attachment; filename=\"%s\"\r\n"
+        "Content-Length: %llu\r\n"
+        "Connection: close\r\n"
+        "Cache-Control: no-store\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Headers: Authorization,Content-Type,If-None-Match,Accept\r\n"
+        "Access-Control-Allow-Methods: GET,HEAD,OPTIONS\r\n"
+        "\r\n",
+        status, status_text, content_type, filename,
+        (unsigned long long)body_len);
+    if (hlen <= 0 || hlen >= (int)sizeof(header) ||
+        http_write_all(fd, header, (size_t)hlen) != 0)
+        return -1;
+    if (body && body_len && http_write_all(fd, body, body_len) != 0)
+        return -1;
+    return 0;
+}
+
 static const char *webd_mime_type(const char *path)
 {
     const char *ext = path ? strrchr(path, '.') : NULL;

@@ -50,7 +50,7 @@ for (const expected of [
 for (const forbidden of [
   '<section class="wifi-section policy-stable-glass"',
   '<section class="wifi-config-table policy-stable-glass"',
-  '<section class="wifi-section wifi-global-defaults policy-stable-glass"',
+  '<section class="wifi-section wifi-unifi-global policy-stable-glass"',
   '.wifi-config-table,\n.wifi-section,\n.airview-sidebar',
   '.wifi-setting-row > i,'
 ]) {

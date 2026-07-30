@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static contract for the VPN frontend and fail-closed API gate."""
+"""Static contract for the UniFi-shaped VPN frontend and fail-closed API gate."""
 
 import json
 from pathlib import Path
@@ -26,7 +26,7 @@ assert vpn["style"] == "/static/css/vpn-config.css"
 assert (WWW / "plugins/native/vpn-config.js").is_file()
 assert (WWW / "static/css/vpn-config.css").is_file()
 
-# The VPN home information architecture remains four sections, not a replacement tab set.
+# UniFi home information architecture remains four sections, not a replacement tab set.
 for label in ("Teleport", "VPN 服务器", "VPN 客户端", "站点到站点 VPN"):
     assert label in MODULE
 assert "vpn-section-stack" in MODULE

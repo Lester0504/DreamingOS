@@ -16,7 +16,7 @@
   </style>
 </head>
 <body>
-  <img id="appWallpaper" src="../../files/www/dreamingwrt/static/images/gateway-wide.svg" alt="" hidden>
+  <img id="appWallpaper" src="../../files/www/dreamingwrt/static/images/gateway-wide.png" alt="" hidden>
   <div class="console-stage"><main id="routePreview" class="route-preview"></main></div>
   <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
   <script type="module">
@@ -24,7 +24,7 @@
     const radio = (phy, band, channel, width, power) => ({
       id:`ap:${AP_ID}:radio:${phy}`, phy, ap_id:AP_ID, ap_name:'', model:'Xiaomi Router BE10000 (Wi-Fi 7)',
       source:'managed_ap', online:true, configured_enabled:true, band, channel, width,
-      image_url:'/files/www/dreamingwrt/static/images/gateway-wide.svg', image_available:true,
+      image_url:'/files/www/dreamingwrt/static/images/gateway-wide.png', image_available:true,
       image_source:'fingerprint_model_catalog', image_model_match:'Xiaomi Router BE10000',
       interfaces:[{ txpower_dbm:power }]
     });
@@ -40,8 +40,8 @@
       },
       managed_aps:{items:[{
         ap_id:AP_ID, name:'Xiaomi Router BE10000 (Wi-Fi 7)', model:'Xiaomi Router BE10000 (Wi-Fi 7)',
-        image_url:'/files/www/dreamingwrt/static/images/gateway-wide.svg', online:true,
-        ip_address:'192.168.1.2', mac_address:'02:11:22:33:44:55', firmware_version:'1.0.0', uptime_text:'3 天 2 小时'
+        image_url:'/files/www/dreamingwrt/static/images/gateway-wide.png', online:true,
+        ip_address:'192.168.30.2', mac_address:'02:11:22:33:44:55', firmware_version:'1.0.0', uptime_text:'3 天 2 小时'
       }]},
       summary:{ managed_ap_count:1, managed_ap_online:1, radio_count:3, ssid_count:4, station_count:0 },
       radios:[radio('phy3','6GHz',33,320,24), radio('phy2','5GHz',36,160,27), radio('phy1','2.4GHz',10,40,28)],

@@ -687,7 +687,7 @@ export function mount(context = {}) {
     const tableWidth = columns.reduce((total, column) => total + column.width, 0);
     const subtitle = state.error || `${state.ports.filter((port) => port.connected).length} 个使用中 · ${state.ports.length - state.ports.filter((port) => port.connected).length} 个未连接`;
     const allSelected = rows.length > 0 && rows.every((port) => state.selectedPorts.has(port.id));
-    return `<section class="global-port-table-card dwrt-kit-table-wrap dwrt-kit-datatable-wrap dwrt-kit-glass-surface" data-dwrt-component="data-table" data-global-table><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>所有端口</strong><span class="${state.error ? 'is-warning' : ''}">${escapeHtml(subtitle)}</span></div><div class="global-table-meta">${state.selectedPorts.size ? `<button class="global-bulk-button" type="button" data-global-bulk>${icon('batch')}批量配置 ${state.selectedPorts.size}</button>` : ''}<span class="dwrt-kit-table-count">${rows.length}/${state.ports.length} 个端口</span><button type="button" data-global-refresh aria-label="刷新端口" title="刷新">${icon('refresh')}</button></div></div><div class="dwrt-kit-table-scroll global-port-table-scroll" data-global-scroll><table class="dwrt-kit-table dwrt-kit-datatable global-port-table" style="--global-port-table-width:${tableWidth}px"><thead><tr>${columns.map((column) => `<th style="width:${column.width}px;min-width:${column.width}px">${column.key === 'select' ? `<label class="global-row-select" aria-label="选择当前结果"><input type="checkbox" data-global-select-all ${allSelected ? 'checked' : ''}><span></span></label>` : `<button type="button" data-global-sort="${column.key}" ${column.key === 'actions' ? 'disabled' : ''}>${escapeHtml(column.label)}${sortIndicator(column.key)}</button>`}</th>`).join('')}</tr></thead><tbody>${state.loading ? `<tr><td colspan="${columns.length}" class="dwrt-kit-table-empty">正在读取端口状态</td></tr>` : rows.length ? rows.map((port) => `<tr data-global-port-id="${escapeHtml(port.id)}" class="${port.connected ? 'is-connected' : 'is-disconnected'} ${state.selectedPorts.has(port.id) ? 'is-selected' : ''}">${columns.map((column) => `<td class="is-${column.key}">${cell(port, column.key)}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${columns.length}" class="dwrt-kit-table-empty">${escapeHtml(state.error || '没有匹配的端口')}</td></tr>`}</tbody></table></div></section>`;
+    return `<section class="global-port-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface" data-dwrt-component="data-table" data-global-table><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>所有端口</strong><span class="${state.error ? 'is-warning' : ''}">${escapeHtml(subtitle)}</span></div><div class="global-table-meta">${state.selectedPorts.size ? `<button class="global-bulk-button" type="button" data-global-bulk>${icon('batch')}批量配置 ${state.selectedPorts.size}</button>` : ''}<span class="dwrt-kit-table-count">${rows.length}/${state.ports.length} 个端口</span><button type="button" data-global-refresh aria-label="刷新端口" title="刷新">${icon('refresh')}</button></div></div><div class="dwrt-kit-table-scroll global-port-table-scroll" data-global-scroll><table class="dwrt-kit-table dwrt-kit-ikuai-table global-port-table" style="--global-port-table-width:${tableWidth}px"><thead><tr>${columns.map((column) => `<th style="width:${column.width}px;min-width:${column.width}px">${column.key === 'select' ? `<label class="global-row-select" aria-label="选择当前结果"><input type="checkbox" data-global-select-all ${allSelected ? 'checked' : ''}><span></span></label>` : `<button type="button" data-global-sort="${column.key}" ${column.key === 'actions' ? 'disabled' : ''}>${escapeHtml(column.label)}${sortIndicator(column.key)}</button>`}</th>`).join('')}</tr></thead><tbody>${state.loading ? `<tr><td colspan="${columns.length}" class="dwrt-kit-table-empty">正在读取端口状态</td></tr>` : rows.length ? rows.map((port) => `<tr data-global-port-id="${escapeHtml(port.id)}" class="${port.connected ? 'is-connected' : 'is-disconnected'} ${state.selectedPorts.has(port.id) ? 'is-selected' : ''}">${columns.map((column) => `<td class="is-${column.key}">${cell(port, column.key)}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${columns.length}" class="dwrt-kit-table-empty">${escapeHtml(state.error || '没有匹配的端口')}</td></tr>`}</tbody></table></div></section>`;
   }
   function gatewayPorts() {
     return [...state.ports].sort((a, b) => {
@@ -780,30 +780,15 @@ export function mount(context = {}) {
     }
     return firstText(port.connection, '--');
   }
-  // Bundled carrier marks used when the backend does not carry an explicit logo.
-  const CARRIER_LOGOS = {
-    unicom: '/static/images/logo/china-unicom.svg',
-    mobile: '/static/images/logo/china-mobile.svg',
-    telecom: '/static/images/logo/china-telecom.svg',
-    cernet: '/static/images/logo/china-cernet.svg'
-  };
-
-  function bundledCarrierLogo(wan = {}) {
-    const text = String(firstText(wan.carrierName, wan.carrier_name, wan.carrier, wan.carrier_key, wan.isp, wan.isp_name) || '').toLowerCase();
-    if (/unicom|联通|cucc/.test(text)) return CARRIER_LOGOS.unicom;
-    if (/mobile|移动|cmcc/.test(text)) return CARRIER_LOGOS.mobile;
-    if (/telecom|电信|ctcc/.test(text)) return CARRIER_LOGOS.telecom;
-    if (/cernet|教育网/.test(text)) return CARRIER_LOGOS.cernet;
-    return '';
-  }
-
   function carrierLogo(wan = {}) {
-    const explicitLogoRaw = firstText(wan.carrier_logo, wan.carrierLogo, wan.carrier_svg, wan.logo, wan.image, wan.icon);
-    const explicitLogo = window.DWRT_DEVICE_IMAGES?.normalizeUrl?.(explicitLogoRaw) || explicitLogoRaw;
-    const logo = explicitLogo || bundledCarrierLogo(wan);
-    if (!logo) return '';
+    const key = normalizeKey(firstText(wan.carrier, wan.carrier_key, wan.carrierName, wan.isp, wan.name));
+    const file = key.includes('unicom') || key.includes('联通') ? 'china-unicom.svg'
+      : key.includes('telecom') || key.includes('电信') ? 'china-telecom.svg'
+        : key.includes('mobile') || key.includes('移动') ? 'china-mobile.svg'
+          : key.includes('cernet') || key.includes('教育') ? 'china-cernet.svg' : '';
+    if (!file) return '';
     const label = firstText(wan.carrierName, wan.name, wan.id, '运营商');
-    return `<img class="gateway-carrier-logo" src="${escapeHtml(logo)}" alt="${escapeHtml(label)}" data-dwrt-tooltip="${escapeHtml(label)}">`;
+    return `<img class="gateway-carrier-logo" src="/static/images/logo/${file}" alt="${escapeHtml(label)}" data-dwrt-tooltip="${escapeHtml(label)}">`;
   }
   function gatewayConnectionMarkup(port) {
     const owner = assignedWan(port.id);

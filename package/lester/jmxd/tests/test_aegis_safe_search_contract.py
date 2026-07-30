@@ -139,7 +139,7 @@ def test_dnsmasq_artifact_uses_fixed_addresses_and_required_hosts() -> None:
         (
             "content_safe_search_hosts",
             "content_safe_search_provider_enabled",
-            'fprintf(fp,"address=/%s/%s\\n",host->host,host->ipv4)',
+            'fprintf(fp, "address=/%s/%s\\n", host->host, host->ipv4)',
             "host->ipv6[0]",
         ),
         "Safe Search dnsmasq renderer",
@@ -171,7 +171,7 @@ def test_safe_search_reuses_atomic_dns_writer_and_guarded_apply() -> None:
         "guarded apply/readback/rollback",
     )
     state = function_body(DATAPLANE, "aegisxd_apply_state_json")
-    assert 'scope && !strcmp(scope, "dns_filter")' in state
+    assert 'aegisxd_compile_scope_selected(scope, "dns_filter")' in state
     compile_plan = function_body(DATAPLANE, "aegisxd_compile_plan")
     assert "aegisxd_plan_write_dnsmasq" in compile_plan
     assert "/etc/init.d/dnsmasq" not in CONTENT

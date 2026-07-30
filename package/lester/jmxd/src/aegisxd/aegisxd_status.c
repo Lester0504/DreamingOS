@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "aegisxd_internal.h"
+#include "jmx_identification_runtime.h"
 
 #define WORKER_STATUS_VERSION "1.0"
 #define AEGISXD_IDENTITY_RUNTIME_PATH "/run/dreamingwrt/identityd-state.json"
@@ -37,36 +38,16 @@ out:
     return value;
 }
 
-static int aegisxd_read_int_file(const char *path, int *value)
-{
-    FILE *fp;
-    char buf[32];
-
-    if (value)
-        *value = -1;
-    fp = path ? fopen(path, "r") : NULL;
-    if (!fp)
-        return -1;
-    if (!fgets(buf, sizeof(buf), fp)) {
-        fclose(fp);
-        return -1;
-    }
-    fclose(fp);
-    if (value)
-        *value = atoi(buf) ? 1 : 0;
-    return 0;
-}
-
 static struct json_object *aegisxd_identification_json(void)
 {
     struct json_object *out = json_object_new_object();
     struct json_object *runtime = aegisxd_read_json_file(
         AEGISXD_IDENTITY_RUNTIME_PATH, 64U * 1024U);
+    struct jmx_identification_runtime readback;
     sqlite3_stmt *st = NULL;
     char mode[32] = "unavailable";
     int record_enabled = 0;
     int config_available = 0;
-    int kernel_record = -1;
     int applied = 0;
 
     st = aegisxd_config_prepare(
@@ -82,15 +63,10 @@ static struct json_object *aegisxd_identification_json(void)
     }
     if (st)
         sqlite3_finalize(st);
-    (void)aegisxd_read_int_file(AEGISXD_RECORD_ENABLE_PATH, &kernel_record);
-    if (runtime && config_available && kernel_record == record_enabled) {
-        const char *runtime_mode = aegisxd_json_str(runtime, "mode", "");
-        int runtime_device = aegisxd_json_bool(runtime,
-                                                "device_identification_active", 0);
-        int expected_device = !strcmp(mode, "device_and_traffic");
-
-        applied = !strcmp(runtime_mode, mode) && runtime_device == expected_device;
-    }
+    memset(&readback, 0, sizeof(readback));
+    if (config_available &&
+        jmx_identification_runtime_probe(mode, record_enabled, &readback) == 0)
+        applied = readback.applied;
     json_object_object_add(out, "available", json_object_new_boolean(config_available));
     aegisxd_json_add_string(out, "mode", mode);
     json_object_object_add(out, "device_identification_enabled",
@@ -98,16 +74,31 @@ static struct json_object *aegisxd_identification_json(void)
     json_object_object_add(out, "traffic_identification_enabled",
                            json_object_new_boolean(record_enabled));
     json_object_object_add(out, "kernel_readback_available",
-                           json_object_new_boolean(kernel_record >= 0));
-    if (kernel_record >= 0)
+                           json_object_new_boolean(readback.kernel_readback_available));
+    if (readback.kernel_readback_available)
         json_object_object_add(out, "kernel_record_enabled",
-                               json_object_new_boolean(kernel_record));
+                               json_object_new_boolean(readback.kernel_record_enabled));
     json_object_object_add(out, "identityd_readback_available",
-                           json_object_new_boolean(runtime != NULL));
+                           json_object_new_boolean(readback.identityd_readback_available));
+    json_object_object_add(out, "identityd_process_running",
+                           json_object_new_boolean(readback.identityd_process_running));
+    json_object_object_add(out, "identityd_state_fresh",
+                           json_object_new_boolean(readback.identityd_state_fresh));
+    json_object_object_add(out, "traffic_dataplane_active",
+                           json_object_new_boolean(readback.traffic_dataplane_matches));
+    json_object_object_add(out, "device_dataplane_active",
+                           json_object_new_boolean(readback.device_dataplane_matches));
+    json_object_object_add(out, "collector_ready",
+                           json_object_new_boolean(readback.collector_ready));
+    json_object_object_add(out, "listeners_ready",
+                           json_object_new_int(readback.listeners_ready));
     json_object_object_add(out, "applied", json_object_new_boolean(applied));
     aegisxd_json_add_string(out, "apply_state",
                             applied ? "active" : config_available ?
                             "pending_readback" : "unavailable");
+    aegisxd_json_add_string(out, "reason",
+                            applied ? "" : config_available ? readback.reason :
+                            "identification_config_unavailable");
     if (runtime)
         json_object_object_add(out, "identityd", runtime);
     return out;
@@ -269,6 +260,10 @@ static int aegisxd_suricata_pid_running(void)
 {
     FILE *fp;
     long pid = 0;
+    char path[64];
+    char exe[AEGISXD_MAX_PATH];
+    const char *base;
+    ssize_t n;
 
     fp = fopen(AEGISXD_SURICATA_PID_PATH, "r");
     if (!fp)
@@ -278,7 +273,16 @@ static int aegisxd_suricata_pid_running(void)
     fclose(fp);
     if (pid <= 1)
         return 0;
-    return kill((pid_t)pid, 0) == 0 || errno == EPERM;
+    if (kill((pid_t)pid, 0) != 0 && errno != EPERM)
+        return 0;
+    snprintf(path, sizeof(path), "/proc/%ld/exe", pid);
+    n = readlink(path, exe, sizeof(exe) - 1);
+    if (n <= 0 || (size_t)n >= sizeof(exe) - 1)
+        return 0;
+    exe[n] = '\0';
+    base = strrchr(exe, '/');
+    base = base ? base + 1 : exe;
+    return !strcmp(base, "suricata");
 }
 
 static int aegisxd_suricata_eve_available(void)
@@ -286,16 +290,112 @@ static int aegisxd_suricata_eve_available(void)
     return access(AEGISXD_SURICATA_EVE_PATH, R_OK) == 0;
 }
 
+static int aegisxd_suricata_process_matches(const struct aegisxd_settings *settings)
+{
+    FILE *fp;
+    long pid = 0;
+    char path[64];
+    char cmdline[AEGISXD_MAX_TEXT];
+    size_t n;
+    char expected[IFNAMSIZ + 32];
+
+    if (!settings)
+        return 0;
+    fp = fopen(AEGISXD_SURICATA_PID_PATH, "r");
+    if (!fp)
+        return 0;
+    if (fscanf(fp, "%ld", &pid) != 1)
+        pid = 0;
+    fclose(fp);
+    if (pid <= 1)
+        return 0;
+    snprintf(path, sizeof(path), "/proc/%ld/cmdline", pid);
+    fp = fopen(path, "rb");
+    if (!fp)
+        return 0;
+    n = fread(cmdline, 1, sizeof(cmdline) - 1, fp);
+    fclose(fp);
+    if (!n)
+        return 0;
+    cmdline[n] = '\0';
+    for (size_t i = 0; i + 1 < n; i++) {
+        if (cmdline[i] == '\0')
+            cmdline[i] = ' ';
+    }
+    if (!strcmp(settings->mode, "monitor")) {
+        snprintf(expected, sizeof(expected), "--af-packet=%s",
+                 settings->suricata_interface);
+        return strstr(cmdline, expected) != NULL;
+    }
+    if (!strcmp(settings->mode, "protect")) {
+        snprintf(expected, sizeof(expected), "-q %d", settings->suricata_queue_num);
+        return strstr(cmdline, expected) != NULL;
+    }
+    return 0;
+}
+
+static int aegisxd_ids_ips_settings_load(struct aegisxd_settings *settings)
+{
+    memset(settings, 0, sizeof(*settings));
+    return aegisxd_settings_load(settings) == 0;
+}
+
+static int aegisxd_ids_ips_capture_configured(const struct aegisxd_settings *settings)
+{
+    if (!settings)
+        return 0;
+    if (!strcmp(settings->mode, "monitor"))
+        return settings->suricata_interface[0] &&
+               if_nametoindex(settings->suricata_interface) != 0;
+    if (!strcmp(settings->mode, "protect"))
+        return settings->suricata_queue_num >= 0 &&
+               settings->suricata_queue_num <= 65535;
+    return 0;
+}
+
+static int aegisxd_ids_ips_nfqueue_required(const struct aegisxd_settings *settings)
+{
+    return settings && !strcmp(settings->mode, "protect");
+}
+
+static int aegisxd_ids_ips_nfqueue_active_cached(void)
+{
+    static time_t checked_at;
+    static int active;
+    time_t now = time(NULL);
+
+    if (!checked_at || now != checked_at) {
+        active = aegisxd_suricata_nfqueue_runtime_active();
+        checked_at = now;
+    }
+    return active;
+}
+
 static const char *aegisxd_ids_ips_runtime_reason(const char *suricata_bin)
 {
+    struct aegisxd_settings settings;
+
     if (!suricata_bin || !suricata_bin[0])
         return "suricata_runtime_missing";
+    if (!aegisxd_ids_ips_settings_load(&settings))
+        return "suricata_settings_unavailable";
+    if (strcmp(settings.mode, "monitor") && strcmp(settings.mode, "protect"))
+        return "suricata_capture_mode_not_configured";
+    if (!aegisxd_ids_ips_capture_configured(&settings))
+        return !strcmp(settings.mode, "monitor") && !settings.suricata_interface[0] ?
+            "suricata_capture_interface_missing" :
+            "suricata_capture_interface_unavailable";
     if (!aegisxd_suricata_config_available())
         return "suricata_config_missing";
     if (!aegisxd_suricata_active())
         return "suricata_ready_not_active";
     if (!aegisxd_suricata_pid_running())
         return "suricata_process_not_running";
+    if (!aegisxd_suricata_process_matches(&settings))
+        return "suricata_process_capture_mismatch";
+    if (aegisxd_ids_ips_nfqueue_required(&settings) &&
+        !aegisxd_ids_ips_nfqueue_active_cached())
+        return "suricata_nfqueue_not_active";
     if (!aegisxd_suricata_eve_available())
         return "suricata_eve_missing";
     return "";
@@ -318,25 +418,43 @@ static int aegisxd_ids_ips_runtime_binary_available(const char *suricata_bin)
 
 static int aegisxd_ids_ips_production_active(const char *suricata_bin)
 {
+    struct aegisxd_settings settings;
+
     return aegisxd_ids_ips_runtime_binary_available(suricata_bin) &&
+           aegisxd_ids_ips_settings_load(&settings) &&
+           aegisxd_ids_ips_capture_configured(&settings) &&
            aegisxd_suricata_active() && aegisxd_suricata_pid_running() &&
+           aegisxd_suricata_process_matches(&settings) &&
+           (!aegisxd_ids_ips_nfqueue_required(&settings) ||
+            aegisxd_ids_ips_nfqueue_active_cached()) &&
            aegisxd_suricata_eve_available();
 }
 
 static const char *aegisxd_ids_ips_runtime_state(const char *suricata_bin)
 {
+    struct aegisxd_settings settings;
     int rules_ready = aegisxd_suricata_rules_enabled() > 0;
 
     if (!rules_ready)
         return "rules_missing";
     if (!aegisxd_ids_ips_runtime_binary_available(suricata_bin))
         return "rules_ready_runtime_missing";
+    if (!aegisxd_ids_ips_settings_load(&settings) ||
+        (strcmp(settings.mode, "monitor") && strcmp(settings.mode, "protect")))
+        return "rules_ready_capture_mode_missing";
+    if (!aegisxd_ids_ips_capture_configured(&settings))
+        return "rules_ready_capture_source_missing";
     if (!aegisxd_suricata_config_available())
         return "rules_ready_config_missing";
     if (!aegisxd_suricata_active())
         return "rules_ready_not_active";
     if (!aegisxd_suricata_pid_running())
         return "active_state_without_process";
+    if (!aegisxd_suricata_process_matches(&settings))
+        return "active_state_capture_mismatch";
+    if (aegisxd_ids_ips_nfqueue_required(&settings) &&
+        !aegisxd_ids_ips_nfqueue_active_cached())
+        return "active_state_without_nfqueue";
     if (!aegisxd_suricata_eve_available())
         return "active_waiting_for_eve";
     return "active";
@@ -344,10 +462,15 @@ static const char *aegisxd_ids_ips_runtime_state(const char *suricata_bin)
 
 static const char *aegisxd_ids_ips_next_action(const char *suricata_bin)
 {
+    struct aegisxd_settings settings;
+
     if (aegisxd_suricata_rules_enabled() <= 0)
         return "import_suricata_rules";
     if (!aegisxd_ids_ips_runtime_binary_available(suricata_bin))
         return "install_suricata_runtime";
+    if (!aegisxd_ids_ips_settings_load(&settings) ||
+        !aegisxd_ids_ips_capture_configured(&settings))
+        return "configure_suricata_capture";
     if (!aegisxd_suricata_config_available() || !aegisxd_suricata_active())
         return "apply_suricata_with_confirm";
     if (!aegisxd_suricata_pid_running())
@@ -365,6 +488,8 @@ static void aegisxd_add_ids_ips_runtime_fields(struct json_object *o,
     int runtime_available = aegisxd_ids_ips_runtime_binary_available(suricata_bin);
     int production_active = aegisxd_ids_ips_production_active(suricata_bin);
     int manual_ingest_active = aegisxd_suricata_hit_producer_active();
+    struct aegisxd_settings settings;
+    int settings_ok = aegisxd_ids_ips_settings_load(&settings);
 
     if (!o)
         return;
@@ -379,6 +504,20 @@ static void aegisxd_add_ids_ips_runtime_fields(struct json_object *o,
     aegisxd_json_add_string(o, "ids_ips_runtime_state", aegisxd_ids_ips_runtime_state(suricata_bin));
     aegisxd_json_add_string(o, "ids_ips_next_action", aegisxd_ids_ips_next_action(suricata_bin));
     json_object_object_add(o, "ids_ips_production_active", json_object_new_boolean(production_active));
+    json_object_object_add(o, "ids_ips_capture_configured",
+                           json_object_new_boolean(settings_ok &&
+                                                   aegisxd_ids_ips_capture_configured(&settings)));
+    aegisxd_json_add_string(o, "ids_ips_capture_mode",
+                            settings_ok && !strcmp(settings.mode, "monitor") ? "af-packet" :
+                            (settings_ok && !strcmp(settings.mode, "protect") ? "nfqueue" : ""));
+    aegisxd_json_add_string(o, "ids_ips_capture_interface",
+                            settings_ok ? settings.suricata_interface : "");
+    json_object_object_add(o, "ids_ips_nfqueue_num",
+                           json_object_new_int(settings_ok ? settings.suricata_queue_num : 0));
+    json_object_object_add(o, "ids_ips_nfqueue_active",
+                           json_object_new_boolean(settings_ok &&
+                               aegisxd_ids_ips_nfqueue_required(&settings) &&
+                               aegisxd_ids_ips_nfqueue_active_cached()));
     json_object_object_add(o, "ids_ips_production_events_supported", json_object_new_boolean(production_active));
     json_object_object_add(o, "ids_ips_runtime_pid_running",
                            json_object_new_boolean(aegisxd_suricata_pid_running()));
@@ -576,6 +715,17 @@ static struct json_object *aegisxd_capabilities_json(void)
     json_object_object_add(cap, "content_filter_all_scope_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "content_filter_device_scope_supported", json_object_new_boolean(0));
     json_object_object_add(cap, "content_filter_network_scope_supported", json_object_new_boolean(0));
+    json_object_object_add(cap, "pcdn_filter_supported", json_object_new_boolean(1));
+    json_object_object_add(cap, "pcdn_feed_update", json_object_new_boolean(1));
+    json_object_object_add(cap, "pcdn_guarded_apply", json_object_new_boolean(1));
+    json_object_object_add(cap, "pcdn_rollback", json_object_new_boolean(1));
+    json_object_object_add(cap, "pcdn_monitor_supported", json_object_new_boolean(1));
+    json_object_object_add(cap, "pcdn_hit_monitoring_supported", json_object_new_boolean(1));
+    json_object_object_add(cap, "pcdn_hit_attribution_ready",
+                           json_object_new_boolean(aegisxd_pcdn_hit_attribution_ready()));
+    json_object_object_add(cap, "pcdn_hit_count_supported", json_object_new_boolean(1));
+    aegisxd_json_add_string(cap, "pcdn_modes", "block,monitor");
+    aegisxd_json_add_string(cap, "pcdn_dataplane", "dnsmasq_domain_block_or_query_monitor");
     json_object_object_add(cap, "geo_country", aegisxd_geo_status_json());
     json_object_object_add(cap, "identification_mode_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "identification_runtime_readback", json_object_new_boolean(1));
@@ -585,6 +735,14 @@ static struct json_object *aegisxd_capabilities_json(void)
     aegisxd_json_add_string(cap, "identification_modes",
                             "disabled,device_and_traffic,traffic_only");
     json_object_object_add(cap, "ssl_inspection", json_object_new_boolean(0));
+    json_object_object_add(cap, "inspection_ca_management", json_object_new_boolean(1));
+    json_object_object_add(cap, "inspection_ca_download", json_object_new_boolean(1));
+    json_object_object_add(cap, "inspection_ca_rotation", json_object_new_boolean(1));
+    json_object_object_add(cap, "inspection_ca_revocation", json_object_new_boolean(1));
+    json_object_object_add(cap, "inspection_ca_manual_distribution", json_object_new_boolean(1));
+    json_object_object_add(cap, "inspection_ca_automatic_distribution", json_object_new_boolean(0));
+    aegisxd_json_add_string(cap, "inspection_ca_automatic_distribution_reason",
+                            "trusted_terminal_certificate_agent_missing");
     return cap;
 }
 
@@ -728,6 +886,11 @@ struct json_object *aegisxd_status_json(void)
     aegisxd_json_add_string(resp, "suricata_version", settings.suricata_version);
     aegisxd_json_add_string(resp, "default_action", settings.default_action);
     json_object_object_add(resp, "logging_enabled", json_object_new_boolean(settings.logging_enabled));
+    aegisxd_json_add_string(resp, "suricata_interface", settings.suricata_interface);
+    json_object_object_add(resp, "suricata_queue_num",
+                           json_object_new_int(settings.suricata_queue_num));
+    json_object_object_add(resp, "suricata_fail_open",
+                           json_object_new_boolean(settings.suricata_fail_open));
     aegisxd_add_ids_ips_runtime_fields(resp, aegisxd_suricata_binary_path());
     json_object_object_add(resp, "apply_enabled", json_object_new_boolean(1));
     json_object_object_add(resp, "dataplane_enabled", json_object_new_boolean(access("/run/dreamingwrt/aegis/active.json", F_OK) == 0));
@@ -920,7 +1083,8 @@ struct json_object *aegisxd_events_recent_json(void)
         "SELECT id,ts,event_type,level,action,policy_id,policy_name,policy_type,"
         "rule_id,rule_name,risk,risk_category,source_ip,source_mac,source_port,"
         "destination_ip,destination_host,destination_port,protocol,app_id,app_name,"
-        "in_interface,out_interface,rx_bytes,tx_bytes,flow_id,reason,source,meta_json "
+        "in_interface,out_interface,rx_bytes,tx_bytes,flow_id,reason,source,meta_json,"
+        "occurrence_count,first_seen,last_seen "
         "FROM aegis_events ORDER BY ts DESC,id DESC LIMIT 100");
     if (st) {
         while (sqlite3_step(st) == SQLITE_ROW) {
@@ -959,6 +1123,12 @@ struct json_object *aegisxd_events_recent_json(void)
             aegisxd_json_add_string(o, "reason", reason);
             aegisxd_json_add_string(o, "source", source);
             aegisxd_json_add_string(o, "meta_json", meta_json);
+            json_object_object_add(o, "occurrence_count",
+                                   json_object_new_int64(sqlite3_column_int64(st, 29)));
+            json_object_object_add(o, "first_seen",
+                                   json_object_new_int64(sqlite3_column_int64(st, 30)));
+            json_object_object_add(o, "last_seen",
+                                   json_object_new_int64(sqlite3_column_int64(st, 31)));
             aegisxd_event_add_meta_fields(o, meta_json, reason, source);
             json_object_array_add(events, o);
         }

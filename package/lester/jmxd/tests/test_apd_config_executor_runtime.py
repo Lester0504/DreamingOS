@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import glob
 import subprocess
 import sys
 import tempfile
@@ -63,26 +62,13 @@ def static_contract() -> None:
 
 
 def compile_fixture(output: Path) -> None:
-    configured_json = os.environ.get("APD_JSON_C_PREFIX", "")
-    json_candidates = [Path(configured_json)] if configured_json else []
-    json_candidates.extend((Path("/opt/homebrew/opt/json-c"), Path("/usr/local")))
-    json_candidates.extend(Path(value) for value in glob.glob(
-        "/opt/homebrew/var/homebrew/tmp/.cellar/json-c/*"
-    ))
-    json_prefix = next((value for value in json_candidates
-                        if (value / "include/json-c/json.h").is_file() and
-                           ((value / "lib/libjson-c.a").is_file() or
-                            (value / "lib/libjson-c.dylib").is_file() or
-                            (value / "lib/libjson-c.so").is_file())), None)
-    assert json_prefix, "json-c headers and library are required"
-
-    configured_ssl = os.environ.get("APD_OPENSSL_PREFIX", "")
-    ssl_candidates = [Path(configured_ssl)] if configured_ssl else []
-    ssl_candidates.extend((Path("/opt/homebrew/opt/openssl@3"), Path("/usr/local"), Path("/usr")))
-    ssl_prefix = next((value for value in ssl_candidates
-                       if (value / "include/openssl/sha.h").is_file()), None)
-    assert ssl_prefix, "OpenSSL headers and library are required"
-
+    prefix = os.environ.get("APD_TEST_PREFIX", "")
+    json_prefix = Path(prefix) if prefix else Path(
+        "/opt/homebrew/var/homebrew/tmp/.cellar/json-c/0.19")
+    openssl_prefix_raw = os.environ.get("APD_TEST_OPENSSL_PREFIX", "")
+    openssl_prefix = (Path(openssl_prefix_raw) if openssl_prefix_raw else
+                      (json_prefix if prefix else
+                       Path("/opt/homebrew/opt/openssl@3")))
     static_lib = json_prefix / "lib/libjson-c.a"
     json_link = ([str(static_lib)] if static_lib.is_file() else
                  [f"-L{json_prefix / 'lib'}",
@@ -92,9 +78,9 @@ def compile_fixture(output: Path) -> None:
         "-D_DARWIN_C_SOURCE" if sys.platform == "darwin" else "-D_GNU_SOURCE",
         "-Wall", "-Wextra", "-Werror",
         f"-I{json_prefix / 'include'}",
-        f"-I{ssl_prefix / 'include'}",
+        f"-I{openssl_prefix / 'include'}",
         str(FIXTURE), str(EXECUTOR), str(COMMAND), *json_link,
-        f"-L{ssl_prefix / 'lib'}", "-lcrypto",
+        f"-L{openssl_prefix / 'lib'}", "-lcrypto",
         "-o", str(output),
     ]
     subprocess.run(command, check=True, capture_output=True, text=True)

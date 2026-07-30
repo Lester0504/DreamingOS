@@ -796,7 +796,8 @@ static int app_response_status(struct json_object *resp, int current_status)
                            !strcmp(code_s, "schedule_not_found") ||
                            !strcmp(code_s, "voucher_not_found") ||
                            !strcmp(code_s, "wan_dns_policy_not_found") ||
-                           !strcmp(code_s, "upnp_acl_not_found")))
+                           !strcmp(code_s, "upnp_acl_not_found") ||
+                           !strcmp(code_s, "upnp_mapping_not_found")))
                 return 404;
             if (code_s && !strcmp(code_s, "insufficient_role"))
                 return 403;
@@ -830,14 +831,20 @@ static int app_response_status(struct json_object *resp, int current_status)
             if (code_s && (!strcmp(code_s, "dns_snapshot_incomplete") ||
                            !strcmp(code_s, "dns_listen_interface_invalid") ||
                            !strcmp(code_s, "dns_validation_failed") ||
+                           !strcmp(code_s, "upnp_mapping_invalid") ||
                            !strcmp(code_s, "missing_expected_revision") ||
                            !strcmp(code_s, "invalid_expected_revision")))
                 return 422;
             if (code_s && !strcmp(code_s, "rate_limited"))
                 return 429;
             if (code_s && (!strcmp(code_s, "upnp_static_mapping_unsupported") ||
-                           !strcmp(code_s, "upnp_stun_unsupported")))
+                           !strcmp(code_s, "upnp_stun_unsupported") ||
+                           !strcmp(code_s, "upnp_mapping_port_conflict") ||
+                           !strcmp(code_s, "upnp_mapping_local_listener") ||
+                           !strcmp(code_s, "upnp_mapping_management_port")))
                 return 409;
+            if (code_s && !strcmp(code_s, "upnp_mapping_dataplane_failed"))
+                return 500;
             if (code_s && !strcmp(code_s, "storage_error"))
                 return 500;
             if (code_s && (strstr(code_s, "save_failed") ||
@@ -35859,8 +35866,27 @@ static struct json_object *webd_geo_runtime_response(int *http_status)
         if (http_status) *http_status = 502;
         return upstream;
     }
+    /*
+     * webd_envelope() hands `runtime` straight to json_object_object_add(),
+     * which *steals* the reference that webd_data_or_self_from_jmx_response()
+     * returned - it does not take one of its own.  So `runtime` must never be
+     * put here: the envelope owns it, and releasing it again drops a reference
+     * the response still needs.
+     *
+     * This mattered because aegisxd's geo_get reply carries neither "code" nor
+     * "data", so webd_data_or_self_from_jmx_response() returns *upstream
+     * itself* with an extra reference instead of a child object.  The original
+     * `put(runtime); put(upstream);` therefore dropped both remaining
+     * references and freed the object the envelope still pointed at, which
+     * segfaulted the request worker on every GET /api/v1/aegis/geo and
+     * /firewall/geo-block/runtime.
+     *
+     * Releasing only `upstream` is correct for both shapes: when runtime
+     * aliases upstream the envelope keeps the extra reference, and when
+     * runtime is a genuine child its parent still owns it.  Same idiom as
+     * webd_topology_node_detail_response().
+     */
     response = webd_envelope(runtime, "dreamingwrt.aegis.geo_get");
-    json_object_put(runtime);
     json_object_put(upstream);
     if (http_status) *http_status = 200;
     return response;
@@ -35974,6 +36000,15 @@ static struct json_object *webd_geo_block_response(int *http_status)
                                json_object_new_string("aegisxd_geo_runtime_unavailable"));
     }
     response = webd_envelope(data, "jmxd.geo_control+dreamingwrt.aegis.geo_get");
+    /*
+     * Unlike webd_geo_runtime_response(), `runtime` is NOT handed to the
+     * envelope here - webd_geo_merge_runtime() takes its own reference via
+     * json_object_get().  The reference returned by
+     * webd_data_or_self_from_jmx_response() is therefore ours to release,
+     * whether it aliases runtime_upstream or is a genuine child.  Skipping
+     * this put leaked the entire aegisxd reply on every GET
+     * /api/v1/firewall/geo-block.
+     */
     if (runtime) json_object_put(runtime);
     if (runtime_upstream) json_object_put(runtime_upstream);
     json_object_put(core);
@@ -50098,6 +50133,142 @@ static struct json_object *webd_upload_delete_response(const char *owner_id,
     return webd_envelope(data, "webd.upload_staging");
 }
 
+static int webd_aegis_certificate_http_status(struct json_object *response)
+{
+    const char *error = app_nc_json_str(response, "error", "");
+
+    if (app_nc_json_bool(response, "ok", 0))
+        return 200;
+    if (!strcmp(error, "inspection_ca_not_active") ||
+        !strcmp(error, "certificate_distribution_not_found") ||
+        !strcmp(error, "certificate_distribution_target_not_found"))
+        return 404;
+    if (!strcmp(error, "source_unavailable") ||
+        !strcmp(error, "aegis_certificate_backend_unavailable"))
+        return 503;
+    if (!strcmp(error, "certificate_generation_conflict") ||
+        !strcmp(error, "inspection_ca_already_active"))
+        return 409;
+    if (!strcmp(error, "certificate_distribution_superseded") ||
+        !strcmp(error, "certificate_distribution_ca_revoked") ||
+        !strcmp(error, "certificate_distribution_not_downloadable"))
+        return 410;
+    if (!strcmp(error, "certificate_state_unavailable") ||
+        !strcmp(error, "inspection_ca_material_invalid") ||
+        !strcmp(error, "inspection_ca_encode_failed"))
+        return 503;
+    return 400;
+}
+
+static int webd_base64_decode_strict(const char *encoded,
+                                     unsigned char **out, size_t *out_length)
+{
+    size_t length;
+    size_t padding = 0;
+    unsigned char *decoded;
+    int decoded_length;
+
+    if (!encoded || !out || !out_length || !(length = strlen(encoded)) ||
+        (length % 4) != 0 || length > 32768 || length > INT_MAX)
+        return -1;
+    if (encoded[length - 1] == '=')
+        padding++;
+    if (length > 1 && encoded[length - 2] == '=')
+        padding++;
+    if (!(decoded = malloc(length / 4 * 3 + 1)))
+        return -1;
+    decoded_length = EVP_DecodeBlock(decoded, (const unsigned char *)encoded,
+                                     (int)length);
+    if (decoded_length <= 0 || (size_t)decoded_length < padding) {
+        free(decoded);
+        return -1;
+    }
+    *out_length = (size_t)decoded_length - padding;
+    *out = decoded;
+    return 0;
+}
+
+static void webd_aegis_certificate_download_response(int fd,
+                                                      const struct http_req *req)
+{
+    struct json_object *params = json_object_new_object();
+    struct json_object *response;
+    unsigned char *content = NULL;
+    size_t content_length = 0;
+    char format[16] = "pem";
+    char distribution_id[64] = "";
+    int status;
+    int send_rc;
+
+    if (req && webd_query_get(req->query, "format", format, sizeof(format)) && !format[0])
+        snprintf(format, sizeof(format), "pem");
+    if (req)
+        (void)webd_query_get(req->query, "distribution_id", distribution_id,
+                             sizeof(distribution_id));
+    json_object_object_add(params, "format", json_object_new_string(format));
+    if (distribution_id[0])
+        json_object_object_add(params, "distribution_id",
+                               json_object_new_string(distribution_id));
+    response = app_ubus_invoke_object_timeout(
+        "dreamingwrt.aegis", "certificate_download", params, 5000);
+    json_object_put(params);
+    if (!response) {
+        response = webd_error("aegis_certificate_backend_unavailable",
+                              "AegisX certificate backend did not answer", "",
+                              "webd.aegis.certificate");
+        http_send_json(fd, 503, response);
+        json_object_put(response);
+        return;
+    }
+    status = webd_aegis_certificate_http_status(response);
+    if (status != 200 ||
+        webd_base64_decode_strict(app_nc_json_str(response, "content_base64", ""),
+                                  &content, &content_length) != 0 ||
+        content_length != (size_t)app_nc_json_int64(response, "content_length", -1)) {
+        if (status == 200) {
+            json_object_put(response);
+            response = webd_error("aegis_certificate_payload_invalid",
+                                  "AegisX certificate payload failed validation", "",
+                                  "webd.aegis.certificate");
+            status = 502;
+        }
+        http_send_json(fd, status, response);
+        free(content);
+        json_object_put(response);
+        return;
+    }
+    if (req && !strcmp(req->method, "HEAD"))
+        send_rc = http_send_download(fd, 200,
+                           app_nc_json_str(response, "content_type", "application/pkix-cert"),
+                           app_nc_json_str(response, "filename", "aegisx-inspection-ca.pem"),
+                           NULL, content_length);
+    else
+        send_rc = http_send_download(fd, 200,
+                           app_nc_json_str(response, "content_type", "application/pkix-cert"),
+                           app_nc_json_str(response, "filename", "aegisx-inspection-ca.pem"),
+                           content, content_length);
+    if (send_rc == 0 && distribution_id[0] &&
+        (!req || strcmp(req->method, "HEAD"))) {
+        struct json_object *mark = json_object_new_object();
+        struct json_object *marked;
+
+        json_object_object_add(mark, "distribution_id",
+                               json_object_new_string(distribution_id));
+        json_object_object_add(mark, "ca_generation", json_object_new_int(
+            app_nc_json_int(response, "generation", 0)));
+        marked = app_ubus_invoke_object_timeout(
+            "dreamingwrt.aegis", "certificate_distribution_downloaded", mark, 2000);
+        if (!marked || !app_nc_json_bool(marked, "ok", 0))
+            fprintf(stderr, "[dreamingwrt-webd] certificate distribution download readback failed id=%s\n",
+                    distribution_id);
+        if (marked)
+            json_object_put(marked);
+        json_object_put(mark);
+    }
+    free(content);
+    json_object_put(response);
+}
+
 /* Route dispatcher */
 static void handle_client(int fd)
 {
@@ -51063,6 +51234,15 @@ static void handle_client(int fd)
         return;
     }
 
+    if (!strcmp(req.path, "/api/v1/aegis/certificates/inspection-ca/download") &&
+        (!strcmp(req.method, "GET") || !strcmp(req.method, "HEAD"))) {
+        webd_aegis_certificate_download_response(fd, &req);
+        free(device_id);
+        close(fd);
+        json_object_put(body_json);
+        return;
+    }
+
     if (!strcmp(req.path, "/api/v1/logs/download")) {
         webd_logs_download_response(fd, &req);
         free(device_id);
@@ -51993,6 +52173,66 @@ static void handle_client(int fd)
         resp = app_ubus_object_or_error("dreamingwrt.aegis", "health", body_json);
         status = app_response_status(resp, status);
     }
+    else if (!strcmp(req.path, "/api/v1/aegis/certificates/inspection-ca") &&
+             !strcmp(req.method, "GET")) {
+        resp = app_ubus_object_or_error("dreamingwrt.aegis", "certificate_status", body_json);
+        status = webd_aegis_certificate_http_status(resp);
+    }
+    else if (!strcmp(req.path, "/api/v1/aegis/certificates/inspection-ca/generate") &&
+             !strcmp(req.method, "POST")) {
+        resp = app_ubus_object_or_error("dreamingwrt.aegis", "certificate_generate", body_json);
+        status = webd_aegis_certificate_http_status(resp);
+        jmx_app_audit_log(device_id, device_id, "aegis.certificate.generate", "high",
+                          "inspection-ca", "", status < 400 ? "success" : "failed");
+    }
+    else if (!strcmp(req.path, "/api/v1/aegis/certificates/inspection-ca/rotate") &&
+             !strcmp(req.method, "POST")) {
+        resp = app_ubus_object_or_error("dreamingwrt.aegis", "certificate_rotate", body_json);
+        status = webd_aegis_certificate_http_status(resp);
+        jmx_app_audit_log(device_id, device_id, "aegis.certificate.rotate", "high",
+                          "inspection-ca", "", status < 400 ? "success" : "failed");
+    }
+    else if (!strcmp(req.path, "/api/v1/aegis/certificates/inspection-ca/revoke") &&
+             !strcmp(req.method, "POST")) {
+        resp = app_ubus_object_or_error("dreamingwrt.aegis", "certificate_revoke", body_json);
+        status = webd_aegis_certificate_http_status(resp);
+        jmx_app_audit_log(device_id, device_id, "aegis.certificate.revoke", "high",
+                          "inspection-ca", "", status < 400 ? "success" : "failed");
+    }
+    else if (!strcmp(req.path, "/api/v1/aegis/certificates/inspection-ca/distributions") &&
+             !strcmp(req.method, "GET")) {
+        resp = app_ubus_object_or_error("dreamingwrt.aegis", "certificate_distributions", body_json);
+        status = webd_aegis_certificate_http_status(resp);
+    }
+    else if (!strcmp(req.path, "/api/v1/aegis/certificates/inspection-ca/distributions") &&
+             !strcmp(req.method, "POST")) {
+        resp = app_ubus_object_or_error("dreamingwrt.aegis", "certificate_distribution_create", body_json);
+        status = webd_aegis_certificate_http_status(resp);
+        jmx_app_audit_log(device_id, device_id, "aegis.certificate.distribution.create",
+                          "medium", app_nc_json_str(body_json, "target_id", ""), "",
+                          status < 400 ? "ready_for_download" : "failed");
+    }
+    else if (!strncmp(req.path,
+                      "/api/v1/aegis/certificates/inspection-ca/distributions/",
+                      sizeof("/api/v1/aegis/certificates/inspection-ca/distributions/") - 1) &&
+             !strcmp(req.method, "GET")) {
+        const char *distribution_id = req.path +
+            sizeof("/api/v1/aegis/certificates/inspection-ca/distributions/") - 1;
+        char safe_id[64];
+
+        if (strchr(distribution_id, '/') ||
+            app_copy_safe_path_segment(safe_id, sizeof(safe_id), distribution_id, NULL) <= 0) {
+            status = 400;
+            resp = app_unsafe_path_segment_error("distribution_id");
+        } else {
+            struct json_object *params = app_json_id_payload(safe_id, body_json);
+            json_object_object_del(params, "id");
+            json_object_object_add(params, "distribution_id", json_object_new_string(safe_id));
+            resp = app_ubus_object_or_error("dreamingwrt.aegis", "certificate_distribution_get", params);
+            json_object_put(params);
+            status = webd_aegis_certificate_http_status(resp);
+        }
+    }
     else if (!strcmp(req.path, "/api/v1/aegis/identification") &&
              !strcmp(req.method, "GET")) {
         resp = app_ubus_object_or_error("dreamingwrt", "aegis_identification_get", body_json);
@@ -52185,7 +52425,10 @@ static void handle_client(int fd)
 
         if (json_object_object_get_ex(body_json, "enabled", &tmp))
             method = "set_enabled";
-        else if (json_object_object_get_ex(body_json, "mode", &tmp))
+        else if (json_object_object_get_ex(body_json, "mode", &tmp) ||
+                 json_object_object_get_ex(body_json, "suricata_interface", &tmp) ||
+                 json_object_object_get_ex(body_json, "suricata_queue_num", &tmp) ||
+                 json_object_object_get_ex(body_json, "suricata_fail_open", &tmp))
             method = "set_mode";
         else if (json_object_object_get_ex(body_json, "profile", &tmp))
             method = "set_profile";
@@ -52269,6 +52512,36 @@ static void handle_client(int fd)
         jmx_app_audit_log(device_id[0] ? device_id : "http", device_id,
                           "aegis.signature_policy.set", "medium",
                           sid_target, "",
+                          status < 400 ? "success" : error);
+    }
+    else if (!strcmp(req.path, "/api/v1/aegis/content-policy/pcdn") && !strcmp(req.method, "GET")) {
+        resp = app_ubus_object_or_error("dreamingwrt.aegis", "content_pcdn_get", body_json);
+        status = app_response_status(resp, status);
+    }
+    else if (!strcmp(req.path, "/api/v1/aegis/content-policy/pcdn/validate") && !strcmp(req.method, "POST")) {
+        resp = app_ubus_object_or_error("dreamingwrt.aegis", "content_pcdn_validate", body_json);
+        status = app_response_status(resp, status);
+    }
+    else if (!strcmp(req.path, "/api/v1/aegis/content-policy/pcdn/sync") && !strcmp(req.method, "POST")) {
+        resp = app_ubus_object_or_error("dreamingwrt.aegis", "content_pcdn_sync", body_json);
+        status = app_response_status(resp, status);
+        jmx_app_audit_log(device_id[0] ? device_id : "http", device_id,
+                          "aegis.content.pcdn.sync", "medium", "openhosts-pcdn", "",
+                          status < 400 ? "success" : app_ubus_response_error_code(resp));
+    }
+    else if (!strcmp(req.path, "/api/v1/aegis/content-policy/pcdn") &&
+             (!strcmp(req.method, "PUT") || !strcmp(req.method, "PATCH"))) {
+        const char *error;
+        resp = app_ubus_object_or_error("dreamingwrt.aegis", "content_pcdn_set", body_json);
+        status = app_response_status(resp, status);
+        error = app_ubus_response_error_code(resp);
+        if (!strcmp(error, "pcdn_revision_conflict"))
+            status = 409;
+        else if (!strcmp(error, "pcdn_revision_required") ||
+                 !strcmp(error, "invalid_pcdn_revision"))
+            status = 422;
+        jmx_app_audit_log(device_id[0] ? device_id : "http", device_id,
+                          "aegis.content.pcdn.set", "medium", "pcdn", "",
                           status < 400 ? "success" : error);
     }
     else if (!strcmp(req.path, "/api/v1/aegis/content-policy") && !strcmp(req.method, "GET")) {
@@ -53536,6 +53809,22 @@ static void handle_client(int fd)
         json_object_put(params);
         status = app_response_status(resp, status);
     }
+    else if (!strcmp(req.path, "/api/v1/storage/partitions") &&
+             !strcmp(req.method, "GET")) {
+        resp = app_ubus_invoke_timeout("storage_partitions", NULL, 5000);
+        status = app_response_status(resp, status);
+    }
+    else if ((!strcmp(req.path, "/api/v1/storage/raid") ||
+              !strcmp(req.path, "/api/v1/storage/raids")) &&
+             !strcmp(req.method, "GET")) {
+        resp = app_ubus_invoke_timeout("storage_raid", NULL, 5000);
+        status = app_response_status(resp, status);
+    }
+    else if (!strcmp(req.path, "/api/v1/storage/raid/scan") &&
+             !strcmp(req.method, "POST")) {
+        resp = app_ubus_invoke_timeout("storage_raid_scan", NULL, 6000);
+        status = app_response_status(resp, status);
+    }
     else if (!strcmp(req.path, "/api/v1/storage/files") && !strcmp(req.method, "GET")) {
         char root_id[64] = "";
         char path[PATH_MAX] = "/";
@@ -54167,19 +54456,27 @@ static void handle_client(int fd)
         resp = app_ubus_invoke("upnp_mappings_list", NULL);
     }
     else if (!strcmp(req.path, "/api/v1/services/upnp/mappings") && (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
-        status = 409;
-        resp = webd_error("upnp_static_mapping_unsupported",
-                          "static UPnP mappings have no runtime consumer",
-                          "miniupnpd/firewall static mapping apply",
-                          "webd.upnp");
+        resp = app_ubus_invoke("upnp_mapping_set", body_json);
+        status = app_response_status(resp, status);
+        jmx_cache_invalidate("upnp_service");
     }
     else if (!strncmp(req.path, "/api/v1/services/upnp/mappings/", 31) && req.path[31] &&
              !strchr(req.path + 31, '/') && !strcmp(req.method, "DELETE")) {
-        status = 409;
-        resp = webd_error("upnp_static_mapping_unsupported",
-                          "static UPnP mappings are read-only until runtime apply exists",
-                          "miniupnpd/firewall static mapping apply",
-                          "webd.upnp");
+        struct json_object *args = json_object_new_object();
+        json_object_object_add(args, "id", json_object_new_string(req.path + 31));
+        resp = app_ubus_invoke("upnp_mapping_delete", args);
+        status = app_response_status(resp, status);
+        json_object_put(args);
+        jmx_cache_invalidate("upnp_service");
+    }
+    else if (!strcmp(req.path, "/api/v1/services/upnp/mappings/status") && !strcmp(req.method, "GET")) {
+        resp = app_ubus_invoke("upnp_static_status", NULL);
+        status = app_response_status(resp, status);
+    }
+    else if (!strcmp(req.path, "/api/v1/services/upnp/mappings/apply") && !strcmp(req.method, "POST")) {
+        resp = app_ubus_invoke("upnp_static_apply", NULL);
+        status = app_response_status(resp, status);
+        jmx_cache_invalidate("upnp_service");
     }
 
     /* ── Advanced Routing sub-resources ── */

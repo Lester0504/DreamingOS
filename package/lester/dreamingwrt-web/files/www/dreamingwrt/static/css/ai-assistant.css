@@ -711,6 +711,108 @@
 
 .ai-message-files svg { width: 13px; height: 13px; flex: 0 0 auto; }
 
+/* ── 流式回答光标 ── */
+.ai-stream-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  border-radius: 1px;
+  background: currentColor;
+  vertical-align: -0.14em;
+  animation: ai-stream-caret-blink 1s steps(2, start) infinite;
+}
+
+@keyframes ai-stream-caret-blink {
+  to { visibility: hidden; }
+}
+
+.ai-send-button.is-stop {
+  border-color: rgba(255,69,58,0.28);
+  background: rgba(255,69,58,0.72);
+  box-shadow: 0 5px 14px rgba(255,69,58,0.22);
+}
+
+/* ── 工具调用活动条 ── */
+.ai-tool-activity {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-self: stretch;
+}
+
+.ai-tool-chip {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--app-radius-compact, 8px);
+  background: rgba(5,12,23,0.22);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08);
+  padding: 5px 9px;
+  color: var(--ai-text);
+  font-size: 11px;
+}
+
+.ai-tool-chip svg { width: 13px; height: 13px; flex: 0 0 auto; }
+.ai-tool-chip b { font-weight: 760; }
+.ai-tool-chip small { color: var(--ai-muted); }
+.ai-tool-chip em { color: #ffb0aa; font-style: normal; }
+.ai-tool-chip.is-success { box-shadow: inset 0 0 0 1px rgba(50,215,75,0.20); }
+.ai-tool-chip.is-warning { box-shadow: inset 0 0 0 1px rgba(255,179,64,0.22); }
+.ai-tool-chip.is-danger { box-shadow: inset 0 0 0 1px rgba(255,69,58,0.22); }
+
+/* ── 工具授权卡片 ── */
+.ai-tool-auth {
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+  align-self: stretch;
+}
+
+.ai-tool-auth-card {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(255,179,64,0.26);
+  border-radius: var(--app-radius-control, 12px);
+  background: rgba(255,179,64,0.08);
+  padding: 12px 14px;
+}
+
+.ai-tool-auth-card header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ai-tool-auth-card header strong { color: var(--ai-ink); font-size: 13px; font-weight: 790; }
+.ai-tool-auth-card p { margin: 0; color: var(--ai-text); font-size: 12px; line-height: 1.55; }
+.ai-tool-auth-card small { color: var(--ai-muted); font-size: 11px; }
+
+.ai-tool-auth-params {
+  margin: 0;
+  max-height: 150px;
+  overflow: auto;
+  border-radius: var(--app-radius-compact, 8px);
+  background: rgba(5,12,23,0.28);
+  padding: 8px 10px;
+  color: var(--ai-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ai-tool-auth-card footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .ai-composer-wrap {
   min-width: 0;
   display: grid;

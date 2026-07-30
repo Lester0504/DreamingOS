@@ -1,7 +1,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '20260725-route-resource-version-02';
+  const VERSION = '20260729-session-recovery-04';
   const STORAGE = Object.freeze({
     menu: 'dreamingwrt.shellWarm.menu.v4',
     theme: 'dreamingwrt.shellWarm.theme.v2'
@@ -11,7 +11,7 @@
     '/app/index.html',
     '/static/ui-kit/dwrt-ui-kit.css?v=20260723-status-compact-01',
     '/static/ui-kit/dwrt-sampled-liquid-glass.css?v=20260713-17',
-    '/static/css/menu-shell.css?v=20260721-01',
+    '/static/css/menu-shell.css?v=20260729-session-recovery-04',
     '/static/css/dwrt-theme.css?v=20260722-03',
     '/static/ui-kit/dwrt-control-material.css?v=20260719-16',
     '/static/js/menu-icons.js?v=20260722-auth-control-01',
@@ -21,7 +21,7 @@
     '/static/ui-kit/dwrt-ui-kit.js?v=20260723-airview-radio-sheet-01',
     '/static/js/dwrt-session-gate.js?v=20260720-01',
     '/static/js/dwrt-data-registry.js?v=20260721-02',
-    '/static/js/menu-shell.js?v=20260725-route-resource-version-02'
+    '/static/js/menu-shell.js?v=20260729-session-recovery-04'
   ]);
 
   function write(key, value) {

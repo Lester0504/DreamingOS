@@ -11,6 +11,8 @@
 #define AEGISXD_NFT_ACTIVE_FILE AEGISXD_RUNTIME_DIR "/nft-active.json"
 #define AEGISXD_NFT_LOG "/tmp/dreamingwrt-aegis-nft.log"
 #define AEGISXD_SURICATA_LOG "/tmp/dreamingwrt-aegis-suricata.log"
+#define AEGISXD_SURICATA_START_WAIT_STEPS 50
+#define AEGISXD_SURICATA_START_WAIT_US 100000
 #define AEGISXD_DNSMASQ_RELOAD_CMD \
     "PATH=/usr/sbin:/usr/bin:/sbin:/bin /etc/init.d/dnsmasq restart >/tmp/dreamingwrt-aegis-dnsmasq-reload.log 2>&1"
 
@@ -163,14 +165,17 @@ static int aegisxd_settings_update(const char *field, const char *value_s,
         return -1;
     if (strcmp(field, "enabled") && strcmp(field, "mode") &&
         strcmp(field, "source_level") && strcmp(field, "suricata_version") &&
-        strcmp(field, "default_action") && strcmp(field, "logging_enabled"))
+        strcmp(field, "default_action") && strcmp(field, "logging_enabled") &&
+        strcmp(field, "suricata_interface") &&
+        strcmp(field, "suricata_queue_num") &&
+        strcmp(field, "suricata_fail_open"))
         return -1;
     snprintf(sql, sizeof(sql), "UPDATE aegis_settings SET %s=?1,updated_at=?2 WHERE id=1", field);
     st = aegisxd_config_prepare(sql);
     if (!st)
         return -1;
     if (use_bool)
-        sqlite3_bind_int(st, 1, value_b ? 1 : 0);
+        sqlite3_bind_int(st, 1, value_b);
     else
         sqlite3_bind_text(st, 1, value_s ? value_s : "", -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, aegisxd_now_s());
@@ -183,6 +188,25 @@ static int aegisxd_mode_ok(const char *mode)
 {
     return mode && (!strcmp(mode, "off") || !strcmp(mode, "monitor") ||
                     !strcmp(mode, "protect") || !strcmp(mode, "dns_filter"));
+}
+
+static int aegisxd_suricata_interface_syntax_ok(const char *ifname)
+{
+    const unsigned char *p = (const unsigned char *)ifname;
+
+    if (!ifname || !ifname[0] || strlen(ifname) >= IFNAMSIZ)
+        return 0;
+    for (; *p; p++) {
+        if (!isalnum(*p) && *p != '_' && *p != '-' && *p != '.')
+            return 0;
+    }
+    return 1;
+}
+
+static int aegisxd_suricata_interface_runtime_ok(const char *ifname)
+{
+    return aegisxd_suricata_interface_syntax_ok(ifname) &&
+           if_nametoindex(ifname) != 0;
 }
 
 struct json_object *aegisxd_set_enabled(struct json_object *body)
@@ -204,17 +228,78 @@ struct json_object *aegisxd_set_enabled(struct json_object *body)
 struct json_object *aegisxd_set_mode(struct json_object *body)
 {
     struct json_object *resp = json_object_new_object();
-    const char *mode = aegisxd_json_str(body, "mode", "off");
+    struct aegisxd_settings current;
+    const char *mode;
+    const char *ifname = NULL;
+    struct json_object *v = NULL;
+    int queue_num = 0;
+    int fail_open = 1;
+    int has_ifname = 0;
+    int has_queue = 0;
+    int has_fail_open = 0;
     int rc = -1;
 
-    if (aegisxd_mode_ok(mode))
-        rc = aegisxd_settings_update("mode", mode, 0, 0);
+    memset(&current, 0, sizeof(current));
+    if (aegisxd_settings_load(&current) != 0) {
+        aegisxd_json_add_string(resp, "error", "settings_unavailable");
+        mode = "off";
+        goto out;
+    }
+    mode = aegisxd_json_str(body, "mode", current.mode);
+    if (body && json_object_object_get_ex(body, "suricata_interface", &v)) {
+        has_ifname = 1;
+        if (!v || !json_object_is_type(v, json_type_string))
+            goto invalid;
+        ifname = json_object_get_string(v);
+        if (ifname[0] && !aegisxd_suricata_interface_syntax_ok(ifname))
+            goto invalid;
+    }
+    if (body && json_object_object_get_ex(body, "suricata_queue_num", &v)) {
+        has_queue = 1;
+        if (!v || !json_object_is_type(v, json_type_int))
+            goto invalid;
+        queue_num = json_object_get_int(v);
+        if (queue_num < 0 || queue_num > 65535)
+            goto invalid;
+    }
+    if (body && json_object_object_get_ex(body, "suricata_fail_open", &v)) {
+        has_fail_open = 1;
+        if (!v || !json_object_is_type(v, json_type_boolean))
+            goto invalid;
+        fail_open = json_object_get_boolean(v) ? 1 : 0;
+    }
+    if (!aegisxd_mode_ok(mode))
+        goto invalid;
+    if (sqlite3_exec(g_aegisxd_config_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK)
+        goto out;
+    if (aegisxd_settings_update("mode", mode, 0, 0) != 0 ||
+        (has_ifname && aegisxd_settings_update("suricata_interface", ifname, 0, 0) != 0) ||
+        (has_queue && aegisxd_settings_update("suricata_queue_num", NULL, queue_num, 1) != 0) ||
+        (has_fail_open && aegisxd_settings_update("suricata_fail_open", NULL, fail_open, 1) != 0)) {
+        sqlite3_exec(g_aegisxd_config_db, "ROLLBACK", NULL, NULL, NULL);
+        goto out;
+    }
+    if (sqlite3_exec(g_aegisxd_config_db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_exec(g_aegisxd_config_db, "ROLLBACK", NULL, NULL, NULL);
+        goto out;
+    }
+    rc = 0;
+    goto out;
+invalid:
+    aegisxd_json_add_string(resp, "error", "invalid_suricata_runtime_settings");
+out:
     json_object_object_add(resp, "ok", json_object_new_boolean(rc == 0));
     json_object_object_add(resp, "changed", json_object_new_boolean(rc == 0));
     json_object_object_add(resp, "dataplane_changed", json_object_new_boolean(0));
     aegisxd_json_add_string(resp, "operation", "set_mode");
     aegisxd_json_add_string(resp, "mode", mode);
-    if (rc != 0)
+    if (has_ifname)
+        aegisxd_json_add_string(resp, "suricata_interface", ifname ? ifname : "");
+    if (has_queue)
+        json_object_object_add(resp, "suricata_queue_num", json_object_new_int(queue_num));
+    if (has_fail_open)
+        json_object_object_add(resp, "suricata_fail_open", json_object_new_boolean(fail_open));
+    if (rc != 0 && !json_object_object_get(resp, "error"))
         aegisxd_json_add_string(resp, "error", aegisxd_mode_ok(mode) ? "settings_update_failed" : "invalid_mode");
     return resp;
 }
@@ -274,6 +359,7 @@ static int aegisxd_plan_domain_union_count(void)
     sqlite3_stmt *st = NULL;
     void *filter = aegisxd_content_filter_load();
     char last_counted[254] = "";
+    int explicit_count = 0;
     int count = 0;
 
     if (!filter)
@@ -299,9 +385,14 @@ static int aegisxd_plan_domain_union_count(void)
         sqlite3_finalize(st);
     {
         FILE *sink = tmpfile();
-        if (sink) {
-            count += aegisxd_content_filter_write_explicit_blocks(filter, sink);
-            fclose(sink);
+        if (!sink)
+            count = -1;
+        else {
+            explicit_count = aegisxd_content_filter_write_explicit_blocks(filter, sink);
+            if (fclose(sink) != 0 || explicit_count < 0)
+                count = -1;
+            else
+                count += explicit_count;
         }
     }
     aegisxd_content_filter_free(filter);
@@ -775,6 +866,7 @@ static int aegisxd_plan_write_dnsmasq(const char *path, const char *job_id)
     char tmp[AEGISXD_MAX_PATH + 8];
     struct aegisxd_settings settings;
     int written = 0;
+    int explicit_written = 0;
     int ok = 1;
     void *filter = NULL;
     char last_written[254] = "";
@@ -783,9 +875,11 @@ static int aegisxd_plan_write_dnsmasq(const char *path, const char *job_id)
         return -1;
     fprintf(fp, "# Generated by dreamingwrt-aegisxd compile plan\n");
     fprintf(fp, "# job_id=%s\n", job_id ? job_id : "");
+    fprintf(fp, "# aegis-provenance-version=1\n");
     fprintf(fp, "# This artifact is not active until guarded apply installs it.\n");
-    if (aegisxd_settings_load(&settings) == 0 && settings.logging_enabled) {
-        fprintf(fp, "# DNS hit producer work log; aegisxd stores only matched block events.\n");
+    if ((aegisxd_settings_load(&settings) == 0 && settings.logging_enabled) ||
+        aegisxd_pcdn_monitor_configured()) {
+        fprintf(fp, "# DNS event work log; aegisxd stores only matched block or monitor events.\n");
         fprintf(fp, "log-facility=%s\n", AEGISXD_DNSMASQ_LOG_PATH);
         fprintf(fp, "log-queries=extra\n");
         fprintf(fp, "log-async=25\n");
@@ -810,17 +904,29 @@ static int aegisxd_plan_write_dnsmasq(const char *path, const char *job_id)
         const char *category = aegisxd_sqlite_text(st, 1, "");
 
         if (!strcmp(domain, last_written) || !aegisxd_plan_value_domain_ok(domain) ||
+            aegisxd_content_filter_domain_explicitly_blocked(filter, domain) ||
             !aegisxd_content_filter_domain_blocked(filter, domain, category,
                                                     sqlite3_column_int(st, 2)))
             continue;
+        fprintf(fp, "# aegis provenance=category source=domain_reputation domain=%s\n",
+                domain);
         fprintf(fp, "address=/%s/0.0.0.0\n", domain);
         fprintf(fp, "address=/%s/::\n", domain);
+        if (aegisxd_content_filter_mark_category_emitted(filter, domain) != 0) {
+            ok = 0;
+            goto out;
+        }
         written++;
         snprintf(last_written, sizeof(last_written), "%s", domain);
     }
     sqlite3_finalize(st);
     st = NULL;
-    written += aegisxd_content_filter_write_explicit_blocks(filter, fp);
+    explicit_written = aegisxd_content_filter_write_explicit_blocks(filter, fp);
+    if (explicit_written < 0) {
+        ok = 0;
+        goto out;
+    }
+    written += explicit_written;
 out:
     if (st)
         sqlite3_finalize(st);
@@ -1371,6 +1477,12 @@ struct json_object *aegisxd_compile_plan(struct json_object *body)
     aegisxd_json_add_string(settings, "default_action", settings_ok ? s.default_action : "alert");
     aegisxd_json_add_string(settings, "source_level", settings_ok ? s.source_level : "open");
     json_object_object_add(settings, "logging_enabled", json_object_new_boolean(settings_ok ? s.logging_enabled : 0));
+    aegisxd_json_add_string(settings, "suricata_interface",
+                            settings_ok ? s.suricata_interface : "");
+    json_object_object_add(settings, "suricata_queue_num",
+                           json_object_new_int(settings_ok ? s.suricata_queue_num : 0));
+    json_object_object_add(settings, "suricata_fail_open",
+                           json_object_new_boolean(settings_ok ? s.suricata_fail_open : 1));
 
     json_object_object_add(counts, "domain_categories", json_object_new_int(domain_categories < 0 ? 0 : domain_categories));
     json_object_object_add(counts, "blocklist_domains", json_object_new_int(blocklist_domains < 0 ? 0 : blocklist_domains));
@@ -1537,7 +1649,9 @@ static struct json_object *aegisxd_apply_state_json(const char *state, const cha
     aegisxd_json_add_string(o, "nft_file", nft_file);
     aegisxd_json_add_string(o, "job_id", job_id);
     json_object_object_add(o, "rules", json_object_new_int(rules < 0 ? 0 : rules));
-    if (scope && !strcmp(scope, "dns_filter")) {
+    if (scope && aegisxd_compile_scope_selected(scope, "dns_filter")) {
+        json_object_object_add(o, "content_revision",
+                               json_object_new_int(aegisxd_content_revision_get()));
         safe_search = json_object_new_object();
         providers = json_object_new_object();
         enabled_providers = json_object_new_array();
@@ -1566,6 +1680,20 @@ static struct json_object *aegisxd_apply_state_json(const char *state, const cha
         aegisxd_json_add_string(safe_search, "merge", "logical_or");
         aegisxd_json_add_string(safe_search, "artifact", "dnsmasq_domain_blocklist");
         json_object_object_add(o, "safe_search", safe_search);
+        {
+            struct json_object *pcdn = aegisxd_pcdn_active_state_json();
+            const char *pcdn_mode = aegisxd_json_str(pcdn, "mode", "block");
+            int pcdn_effective = aegisxd_pcdn_effective_rule_count(dns_file);
+
+            json_object_object_add(pcdn, "effective_rule_count",
+                                   json_object_new_int(pcdn_effective));
+            json_object_object_add(pcdn, "blocking", json_object_new_boolean(
+                aegisxd_json_bool(pcdn, "enabled", 0) && !strcmp(pcdn_mode, "block") &&
+                pcdn_effective > 0));
+            json_object_object_add(pcdn, "monitoring", json_object_new_boolean(
+                aegisxd_json_bool(pcdn, "enabled", 0) && !strcmp(pcdn_mode, "monitor")));
+            json_object_object_add(o, "pcdn", pcdn);
+        }
     }
     json_object_object_add(o, "updated_at", json_object_new_int64(aegisxd_now_s()));
     return o;
@@ -1707,7 +1835,8 @@ static int aegisxd_suricata_count_rules(const char *path)
     return n;
 }
 
-static int aegisxd_suricata_write_config(const char *rules_path, const char *mode)
+static int aegisxd_suricata_write_config(const char *rules_path,
+                                         const struct aegisxd_settings *settings)
 {
     FILE *fp = NULL;
     char tmp[AEGISXD_MAX_PATH + 8];
@@ -1746,11 +1875,13 @@ static int aegisxd_suricata_write_config(const char *rules_path, const char *mod
     fprintf(fp, "        - flow\n");
     fprintf(fp, "logging:\n");
     fprintf(fp, "  default-log-level: notice\n");
-    fprintf(fp, "af-packet:\n");
-    fprintf(fp, "  - interface: any\n");
-    fprintf(fp, "    cluster-id: 99\n");
-    fprintf(fp, "    cluster-type: cluster_flow\n");
-    fprintf(fp, "    defrag: yes\n");
+    if (settings && !strcmp(settings->mode, "monitor")) {
+        fprintf(fp, "af-packet:\n");
+        fprintf(fp, "  - interface: %s\n", settings->suricata_interface);
+        fprintf(fp, "    cluster-id: 99\n");
+        fprintf(fp, "    cluster-type: cluster_flow\n");
+        fprintf(fp, "    defrag: yes\n");
+    }
     fprintf(fp, "app-layer:\n");
     fprintf(fp, "  protocols:\n");
     fprintf(fp, "    tls:\n");
@@ -1759,7 +1890,13 @@ static int aegisxd_suricata_write_config(const char *rules_path, const char *mod
     fprintf(fp, "      enabled: yes\n");
     fprintf(fp, "dreamingwrt:\n");
     fprintf(fp, "  generated_by: dreamingwrt-aegisxd\n");
-    fprintf(fp, "  mode: %s\n", mode && mode[0] ? mode : "monitor");
+    fprintf(fp, "  mode: %s\n", settings && settings->mode[0] ?
+            settings->mode : "monitor");
+    fprintf(fp, "  capture-interface: %s\n",
+            settings ? settings->suricata_interface : "");
+    fprintf(fp, "  nfqueue: %d\n", settings ? settings->suricata_queue_num : 0);
+    fprintf(fp, "  fail-open: %s\n",
+            !settings || settings->suricata_fail_open ? "yes" : "no");
     if (fflush(fp) != 0) {
         fclose(fp);
         unlink(tmp);
@@ -1784,31 +1921,237 @@ static int aegisxd_suricata_test_config(const char *bin)
     return aegisxd_dataplane_run_quiet_log(cmd, AEGISXD_SURICATA_LOG);
 }
 
+static pid_t aegisxd_suricata_pid(void)
+{
+    FILE *fp;
+    long value = 0;
+
+    fp = fopen(AEGISXD_SURICATA_PID_PATH, "r");
+    if (!fp)
+        return 0;
+    if (fscanf(fp, "%ld", &value) != 1)
+        value = 0;
+    fclose(fp);
+    if (value <= 1 || value > INT_MAX)
+        return 0;
+    return (pid_t)value;
+}
+
+static int aegisxd_suricata_pid_running(void)
+{
+    pid_t pid = aegisxd_suricata_pid();
+    char path[64];
+    char exe[AEGISXD_MAX_PATH];
+    const char *base;
+    ssize_t n;
+
+    if (pid <= 1 || (kill(pid, 0) != 0 && errno != EPERM))
+        return 0;
+    snprintf(path, sizeof(path), "/proc/%ld/exe", (long)pid);
+    n = readlink(path, exe, sizeof(exe) - 1);
+    if (n <= 0 || (size_t)n >= sizeof(exe) - 1)
+        return 0;
+    exe[n] = '\0';
+    base = strrchr(exe, '/');
+    base = base ? base + 1 : exe;
+    return !strcmp(base, "suricata");
+}
+
 static int aegisxd_suricata_stop(void)
 {
+    pid_t pid = aegisxd_suricata_pid();
+    int i;
+
+    if (pid <= 1) {
+        unlink(AEGISXD_SURICATA_PID_PATH);
+        return 0;
+    }
+    if (kill(pid, SIGTERM) != 0 && errno != ESRCH)
+        return -1;
+    for (i = 0; i < 20; i++) {
+        if (kill(pid, 0) != 0 && errno == ESRCH)
+            break;
+        usleep(100000);
+    }
+    if (i == 20 && kill(pid, SIGKILL) != 0 && errno != ESRCH)
+        return -1;
+    unlink(AEGISXD_SURICATA_PID_PATH);
+    return 0;
+}
+
+int aegisxd_suricata_nfqueue_runtime_active(void)
+{
     return aegisxd_dataplane_run_quiet_log(
-        "if [ -s " AEGISXD_SURICATA_PID_PATH " ]; then "
-        "kill $(cat " AEGISXD_SURICATA_PID_PATH ") 2>/dev/null || true; "
-        "sleep 1; "
-        "kill -9 $(cat " AEGISXD_SURICATA_PID_PATH ") 2>/dev/null || true; "
-        "rm -f " AEGISXD_SURICATA_PID_PATH "; "
-        "fi",
+        "nft list table inet " AEGISXD_SURICATA_NFQ_TABLE " >/dev/null 2>&1",
+        AEGISXD_SURICATA_LOG) == 0;
+}
+
+static int aegisxd_suricata_nfqueue_delete(void)
+{
+    if (!aegisxd_suricata_nfqueue_runtime_active())
+        return 0;
+    return aegisxd_dataplane_run_quiet_log(
+        "nft delete table inet " AEGISXD_SURICATA_NFQ_TABLE,
         AEGISXD_SURICATA_LOG);
 }
 
-static int aegisxd_suricata_start(const char *bin)
+static int aegisxd_suricata_nfqueue_write(const struct aegisxd_settings *settings)
 {
-    char cmd[AEGISXD_MAX_PATH + 512];
+    FILE *fp;
+    char tmp[AEGISXD_MAX_PATH + 8];
 
-    if (!bin || !bin[0] || access(bin, X_OK) != 0 ||
+    if (!settings || strcmp(settings->mode, "protect") ||
+        settings->suricata_queue_num < 0 || settings->suricata_queue_num > 65535)
+        return -1;
+    snprintf(tmp, sizeof(tmp), "%s.tmp", AEGISXD_SURICATA_NFQ_PATH);
+    fp = fopen(tmp, "w");
+    if (!fp)
+        return -1;
+    fprintf(fp, "# owned-by=dreamingwrt-aegisxd scope=suricata-nfqueue\n");
+    fprintf(fp, "table inet %s {\n", AEGISXD_SURICATA_NFQ_TABLE);
+    fprintf(fp, " chain forward {\n");
+    fprintf(fp, "  type filter hook forward priority -10; policy accept;\n");
+    fprintf(fp, "  counter queue num %d%s\n", settings->suricata_queue_num,
+            settings->suricata_fail_open ? " bypass" : "");
+    fprintf(fp, " }\n}\n");
+    if (fflush(fp) != 0 || fsync(fileno(fp)) != 0 || fclose(fp) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    if (rename(tmp, AEGISXD_SURICATA_NFQ_PATH) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static int aegisxd_suricata_nfqueue_check(void)
+{
+    char cmd[AEGISXD_MAX_PATH + 64];
+
+    snprintf(cmd, sizeof(cmd), "nft -c -f '%s'", AEGISXD_SURICATA_NFQ_PATH);
+    return aegisxd_dataplane_run_quiet_log(cmd, AEGISXD_SURICATA_LOG);
+}
+
+static int aegisxd_suricata_nfqueue_apply(void)
+{
+    char cmd[AEGISXD_MAX_PATH + 64];
+
+    snprintf(cmd, sizeof(cmd), "nft -f '%s'", AEGISXD_SURICATA_NFQ_PATH);
+    return aegisxd_dataplane_run_quiet_log(cmd, AEGISXD_SURICATA_LOG);
+}
+
+static int aegisxd_suricata_start(const char *bin,
+                                  const struct aegisxd_settings *settings)
+{
+    char cmd[AEGISXD_MAX_PATH + IFNAMSIZ + 512];
+    int rc;
+    int i;
+
+    if (!settings || !bin || !bin[0] || access(bin, X_OK) != 0 ||
         access(AEGISXD_SURICATA_CONFIG_PATH, R_OK) != 0)
         return -1;
+    if (!strcmp(settings->mode, "monitor")) {
+        if (!aegisxd_suricata_interface_runtime_ok(settings->suricata_interface))
+            return -1;
+    } else if (strcmp(settings->mode, "protect") ||
+               settings->suricata_queue_num < 0 || settings->suricata_queue_num > 65535) {
+        return -1;
+    }
     snprintf(cmd, sizeof(cmd),
              "mkdir -p '%s' && rm -f '%s' && "
-             "'%s' -D -c '%s' --pidfile '%s'",
+             "'%s' -D -c '%s' --pidfile '%s' %s%s",
              AEGISXD_SURICATA_LOG_DIR, AEGISXD_SURICATA_EVE_PATH,
-             bin, AEGISXD_SURICATA_CONFIG_PATH, AEGISXD_SURICATA_PID_PATH);
-    return aegisxd_dataplane_run_quiet_log(cmd, AEGISXD_SURICATA_LOG);
+             bin, AEGISXD_SURICATA_CONFIG_PATH, AEGISXD_SURICATA_PID_PATH,
+             !strcmp(settings->mode, "monitor") ? "--af-packet=" : "-q ",
+             !strcmp(settings->mode, "monitor") ? settings->suricata_interface : "0");
+    if (!strcmp(settings->mode, "protect"))
+        snprintf(cmd, sizeof(cmd),
+                 "mkdir -p '%s' && rm -f '%s' && "
+                 "'%s' -D -c '%s' --pidfile '%s' -q %d",
+                 AEGISXD_SURICATA_LOG_DIR, AEGISXD_SURICATA_EVE_PATH,
+                 bin, AEGISXD_SURICATA_CONFIG_PATH, AEGISXD_SURICATA_PID_PATH,
+                 settings->suricata_queue_num);
+    rc = aegisxd_dataplane_run_quiet_log(cmd, AEGISXD_SURICATA_LOG);
+    if (rc != 0)
+        return rc;
+    for (i = 0; i < AEGISXD_SURICATA_START_WAIT_STEPS; i++) {
+        if (aegisxd_suricata_pid_running() &&
+            access(AEGISXD_SURICATA_EVE_PATH, R_OK) == 0)
+            return 0;
+        usleep(AEGISXD_SURICATA_START_WAIT_US);
+    }
+    return -1;
+}
+
+static int aegisxd_suricata_settings_from_active(struct json_object *state,
+                                                  struct aegisxd_settings *settings)
+{
+    const char *mode;
+    struct json_object *value = NULL;
+
+    if (!state || !settings || !json_object_is_type(state, json_type_object))
+        return -1;
+    memset(settings, 0, sizeof(*settings));
+    mode = aegisxd_json_str(state, "mode", "");
+    if (strcmp(mode, "monitor") && strcmp(mode, "protect"))
+        return -1;
+    snprintf(settings->mode, sizeof(settings->mode), "%s", mode);
+    snprintf(settings->suricata_interface, sizeof(settings->suricata_interface), "%s",
+             aegisxd_json_str(state, "suricata_interface", ""));
+    settings->suricata_queue_num = 0;
+    settings->suricata_fail_open = 1;
+    if (json_object_object_get_ex(state, "suricata_queue_num", &value) && value &&
+        json_object_is_type(value, json_type_int))
+        settings->suricata_queue_num = json_object_get_int(value);
+    if (json_object_object_get_ex(state, "suricata_fail_open", &value) && value &&
+        json_object_is_type(value, json_type_boolean))
+        settings->suricata_fail_open = json_object_get_boolean(value) ? 1 : 0;
+    if (!strcmp(settings->mode, "monitor") &&
+        !aegisxd_suricata_interface_runtime_ok(settings->suricata_interface))
+        return -1;
+    if (!strcmp(settings->mode, "protect") &&
+        (settings->suricata_queue_num < 0 || settings->suricata_queue_num > 65535))
+        return -1;
+    return 0;
+}
+
+static int aegisxd_suricata_restore_previous(const char *bin,
+                                              struct json_object *previous_state)
+{
+    struct aegisxd_settings previous;
+    int rc;
+
+    if (aegisxd_suricata_settings_from_active(previous_state, &previous) != 0)
+        return -1;
+    rc = aegisxd_suricata_start(bin, &previous);
+    if (rc != 0)
+        return -1;
+    if (!strcmp(previous.mode, "protect")) {
+        if (aegisxd_suricata_nfqueue_write(&previous) != 0 ||
+            aegisxd_suricata_nfqueue_check() != 0 ||
+            aegisxd_suricata_nfqueue_apply() != 0 ||
+            !aegisxd_suricata_nfqueue_runtime_active()) {
+            (void)aegisxd_suricata_nfqueue_delete();
+            (void)aegisxd_suricata_stop();
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int aegisxd_suricata_restore_file(const char *backup_path,
+                                         const char *active_path,
+                                         int previous_saved)
+{
+    int rc = 0;
+
+    if (previous_saved)
+        rc = aegisxd_file_copy_atomic(backup_path, active_path);
+    else if (unlink(active_path) != 0 && errno != ENOENT)
+        rc = -1;
+    unlink(backup_path);
+    return rc;
 }
 
 static void aegisxd_apply_add_capabilities(struct json_object *resp)
@@ -1836,6 +2179,9 @@ static void aegisxd_apply_add_capabilities(struct json_object *resp)
     json_object_object_add(cap, "suricata_config_render", json_object_new_boolean(1));
     json_object_object_add(cap, "suricata_test_config", json_object_new_boolean(1));
     json_object_object_add(cap, "suricata_confirm_required", json_object_new_boolean(1));
+    json_object_object_add(cap, "suricata_af_packet_monitor", json_object_new_boolean(1));
+    json_object_object_add(cap, "suricata_nfqueue_protect", json_object_new_boolean(1));
+    json_object_object_add(cap, "suricata_runtime_readback", json_object_new_boolean(1));
     json_object_object_add(cap, "suricata_runtime_available",
                            json_object_new_boolean(aegisxd_suricata_binary_path()[0] != 0));
     aegisxd_json_add_string(cap, "suricata_binary", aegisxd_suricata_binary_path());
@@ -2198,13 +2544,32 @@ static struct json_object *aegisxd_apply_suricata(struct json_object *body,
     int test_rc = -1;
     int start_rc = -1;
     int stop_rc = 0;
+    int nfq_check_rc = -1;
+    int nfq_apply_rc = -1;
+    int nfq_active = 0;
     int write_ruleset = 0;
+    int previous_runtime_active = 0;
+    int previous_config_saved = 0;
+    int previous_nfq_saved = 0;
+    int config_changed = 0;
+    int nfq_changed = 0;
+    int restore_rc = -1;
+    char previous_config[AEGISXD_MAX_PATH];
+    char previous_nfq[AEGISXD_MAX_PATH];
+    struct json_object *previous_state = NULL;
+
+    memset(&s, 0, sizeof(s));
+    snprintf(previous_config, sizeof(previous_config), "%s.previous",
+             AEGISXD_SURICATA_CONFIG_PATH);
+    snprintf(previous_nfq, sizeof(previous_nfq), "%s.previous",
+             AEGISXD_SURICATA_NFQ_PATH);
 
     if (!operation || !operation[0])
         operation = "apply";
     if (!strcmp(operation, "rollback") || !strcmp(operation, "disable") ||
         !strcmp(operation, "clear")) {
         int active = aegisxd_suricata_active();
+        int queue_active = aegisxd_suricata_nfqueue_runtime_active();
 
         json_object_object_add(resp, "ok", json_object_new_boolean(1));
         aegisxd_json_add_string(resp, "operation", operation);
@@ -2213,6 +2578,7 @@ static struct json_object *aegisxd_apply_suricata(struct json_object *body,
         json_object_object_add(resp, "confirm_required", json_object_new_boolean(!confirm));
         json_object_object_add(resp, "would_stop", json_object_new_boolean(active));
         json_object_object_add(resp, "suricata_active", json_object_new_boolean(active));
+        json_object_object_add(resp, "nfqueue_active", json_object_new_boolean(queue_active));
         aegisxd_json_add_string(resp, "active_state_path", AEGISXD_SURICATA_ACTIVE_PATH);
         aegisxd_json_add_string(resp, "pid_path", AEGISXD_SURICATA_PID_PATH);
         aegisxd_json_add_string(resp, "suricata_log", AEGISXD_SURICATA_LOG);
@@ -2225,16 +2591,22 @@ static struct json_object *aegisxd_apply_suricata(struct json_object *body,
             return resp;
         }
         stop_rc = aegisxd_suricata_stop();
-        if (stop_rc == 0) {
+        nfq_apply_rc = aegisxd_suricata_nfqueue_delete();
+        if (stop_rc == 0 && nfq_apply_rc == 0) {
             unlink(AEGISXD_SURICATA_ACTIVE_PATH);
+            unlink(AEGISXD_SURICATA_NFQ_PATH);
         } else {
             ok = 0;
-            aegisxd_apply_add_blocker(blockers, "suricata_stop_failed");
+            if (stop_rc != 0)
+                aegisxd_apply_add_blocker(blockers, "suricata_stop_failed");
+            if (nfq_apply_rc != 0)
+                aegisxd_apply_add_blocker(blockers, "suricata_nfqueue_remove_failed");
         }
         json_object_object_add(resp, "ok", json_object_new_boolean(ok));
-        json_object_object_add(resp, "changed", json_object_new_boolean(ok && active));
-        json_object_object_add(resp, "dataplane_changed", json_object_new_boolean(ok && active));
+        json_object_object_add(resp, "changed", json_object_new_boolean(ok && (active || queue_active)));
+        json_object_object_add(resp, "dataplane_changed", json_object_new_boolean(ok && (active || queue_active)));
         json_object_object_add(resp, "suricata_stop_exit_status", json_object_new_int(stop_rc));
+        json_object_object_add(resp, "nfqueue_remove_exit_status", json_object_new_int(nfq_apply_rc));
         json_object_object_add(resp, "blockers", blockers);
         if (!ok)
             aegisxd_json_add_string(resp, "error", "suricata_rollback_failed");
@@ -2285,6 +2657,22 @@ static struct json_object *aegisxd_apply_suricata(struct json_object *body,
         ok = 0;
         aegisxd_apply_add_blocker(blockers, "suricata_runtime_missing");
     }
+    if (ok && strcmp(s.mode, "monitor") && strcmp(s.mode, "protect")) {
+        ok = 0;
+        aegisxd_apply_add_blocker(blockers, "suricata_capture_mode_not_configured");
+    }
+    if (ok && !strcmp(s.mode, "monitor") &&
+        !aegisxd_suricata_interface_runtime_ok(s.suricata_interface)) {
+        ok = 0;
+        aegisxd_apply_add_blocker(blockers,
+            s.suricata_interface[0] ? "suricata_capture_interface_unavailable" :
+                                      "suricata_capture_interface_missing");
+    }
+    if (ok && !strcmp(s.mode, "protect") &&
+        (s.suricata_queue_num < 0 || s.suricata_queue_num > 65535)) {
+        ok = 0;
+        aegisxd_apply_add_blocker(blockers, "suricata_nfqueue_invalid");
+    }
     if (ok && bin[0]) {
         json_object_put(compile_req);
         compile_req = json_object_new_object();
@@ -2334,18 +2722,53 @@ static struct json_object *aegisxd_apply_suricata(struct json_object *body,
             aegisxd_apply_add_blocker(blockers, "suricata_rules_empty");
         }
     }
-    if (ok && bin[0]) {
-        config_rc = aegisxd_suricata_write_config(suricata_src, s.mode);
+    if (ok && bin[0] && confirm) {
+        previous_runtime_active = aegisxd_suricata_active() &&
+                                  aegisxd_suricata_pid_running();
+        if (previous_runtime_active)
+            previous_state = json_object_from_file(AEGISXD_SURICATA_ACTIVE_PATH);
+        unlink(previous_config);
+        unlink(previous_nfq);
+        if (access(AEGISXD_SURICATA_CONFIG_PATH, R_OK) == 0) {
+            previous_config_saved =
+                aegisxd_file_copy_atomic(AEGISXD_SURICATA_CONFIG_PATH,
+                                          previous_config) == 0;
+            if (!previous_config_saved) {
+                ok = 0;
+                aegisxd_apply_add_blocker(blockers, "suricata_config_backup_failed");
+            }
+        }
+        if (ok && access(AEGISXD_SURICATA_NFQ_PATH, R_OK) == 0) {
+            previous_nfq_saved =
+                aegisxd_file_copy_atomic(AEGISXD_SURICATA_NFQ_PATH,
+                                          previous_nfq) == 0;
+            if (!previous_nfq_saved) {
+                ok = 0;
+                aegisxd_apply_add_blocker(blockers, "suricata_nfqueue_backup_failed");
+            }
+        }
+    }
+    if (ok && bin[0] && confirm) {
+        config_rc = aegisxd_suricata_write_config(suricata_src, &s);
         if (config_rc != 0) {
             ok = 0;
             aegisxd_apply_add_blocker(blockers, "suricata_config_render_failed");
-        }
+        } else
+            config_changed = 1;
     }
-    if (ok && bin[0]) {
+    if (ok && bin[0] && confirm) {
         test_rc = aegisxd_suricata_test_config(bin);
         if (test_rc != 0) {
             ok = 0;
             aegisxd_apply_add_blocker(blockers, "suricata_config_test_failed");
+        }
+    }
+    if (ok && confirm && !strcmp(s.mode, "protect")) {
+        if (aegisxd_suricata_nfqueue_write(&s) != 0) {
+            ok = 0;
+            aegisxd_apply_add_blocker(blockers, "suricata_nfqueue_render_failed");
+        } else {
+            nfq_changed = 1;
         }
     }
 
@@ -2366,16 +2789,39 @@ static struct json_object *aegisxd_apply_suricata(struct json_object *body,
     aegisxd_json_add_string(resp, "suricata_log", AEGISXD_SURICATA_LOG);
     aegisxd_json_add_string(resp, "active_state_path", AEGISXD_SURICATA_ACTIVE_PATH);
     aegisxd_json_add_string(resp, "pid_path", AEGISXD_SURICATA_PID_PATH);
+    aegisxd_json_add_string(resp, "capture_mode",
+                            !strcmp(s.mode, "monitor") ? "af-packet" :
+                            (!strcmp(s.mode, "protect") ? "nfqueue" : ""));
+    aegisxd_json_add_string(resp, "suricata_interface", s.suricata_interface);
+    json_object_object_add(resp, "suricata_queue_num",
+                           json_object_new_int(s.suricata_queue_num));
+    json_object_object_add(resp, "suricata_fail_open",
+                           json_object_new_boolean(s.suricata_fail_open));
+    aegisxd_json_add_string(resp, "nfqueue_table", AEGISXD_SURICATA_NFQ_TABLE);
+    aegisxd_json_add_string(resp, "nfqueue_path", AEGISXD_SURICATA_NFQ_PATH);
     aegisxd_json_add_string(resp, "job_id", job_id);
     json_object_object_add(resp, "runtime_available", json_object_new_boolean(bin[0] != 0));
     json_object_object_add(resp, "config_available",
                            json_object_new_boolean(aegisxd_suricata_config_available()));
     json_object_object_add(resp, "config_render_exit_status", json_object_new_int(config_rc));
     json_object_object_add(resp, "suricata_test_exit_status", json_object_new_int(test_rc));
+    json_object_object_add(resp, "nfqueue_check_exit_status", json_object_new_int(nfq_check_rc));
     json_object_object_add(resp, "blockers", blockers);
     aegisxd_apply_add_capabilities(resp);
 
     if (!ok) {
+        if (confirm && config_changed) {
+            (void)aegisxd_suricata_restore_file(previous_config,
+                                                AEGISXD_SURICATA_CONFIG_PATH,
+                                                previous_config_saved);
+        }
+        if (confirm && nfq_changed) {
+            (void)aegisxd_suricata_restore_file(previous_nfq,
+                                                AEGISXD_SURICATA_NFQ_PATH,
+                                                previous_nfq_saved);
+        }
+        if (previous_state)
+            json_object_put(previous_state);
         aegisxd_json_add_string(resp, "state", "blocked");
         aegisxd_json_add_string(resp, "error", "suricata_apply_blocked");
         json_object_put(compile_req);
@@ -2383,22 +2829,91 @@ static struct json_object *aegisxd_apply_suricata(struct json_object *body,
     }
     if (!confirm) {
         aegisxd_json_add_string(resp, "state", "preview");
+        if (previous_state)
+            json_object_put(previous_state);
         json_object_put(compile_req);
         return resp;
     }
 
     stop_rc = aegisxd_suricata_stop();
-    start_rc = aegisxd_suricata_start(bin);
+    if (stop_rc != 0) {
+        start_rc = -1;
+    } else {
+        (void)aegisxd_suricata_nfqueue_delete();
+        if (!strcmp(s.mode, "protect"))
+            nfq_check_rc = aegisxd_suricata_nfqueue_check();
+        if (nfq_check_rc != 0 && !strcmp(s.mode, "protect"))
+            start_rc = -1;
+        else
+            start_rc = aegisxd_suricata_start(bin, &s);
+    }
     json_object_object_add(resp, "suricata_stop_exit_status", json_object_new_int(stop_rc));
     json_object_object_add(resp, "suricata_start_exit_status", json_object_new_int(start_rc));
     if (start_rc != 0) {
-        (void)aegisxd_suricata_stop();
-        unlink(AEGISXD_SURICATA_ACTIVE_PATH);
-        aegisxd_json_add_string(resp, "state", "rolled_back");
-        aegisxd_json_add_string(resp, "error", "suricata_start_failed");
+        if (stop_rc == 0) {
+            (void)aegisxd_suricata_stop();
+            (void)aegisxd_suricata_nfqueue_delete();
+        }
+        (void)aegisxd_suricata_restore_file(previous_config,
+                                            AEGISXD_SURICATA_CONFIG_PATH,
+                                            previous_config_saved);
+        (void)aegisxd_suricata_restore_file(previous_nfq,
+                                            AEGISXD_SURICATA_NFQ_PATH,
+                                            previous_nfq_saved);
+        if (stop_rc != 0 && previous_runtime_active &&
+            aegisxd_suricata_pid_running())
+            restore_rc = 0;
+        else
+            restore_rc = previous_runtime_active ?
+                aegisxd_suricata_restore_previous(bin, previous_state) : -1;
+        if (restore_rc != 0)
+            unlink(AEGISXD_SURICATA_ACTIVE_PATH);
+        aegisxd_json_add_string(resp, "state",
+                                restore_rc == 0 ? "rolled_back" :
+                                                  "stopped_after_failed_apply");
+        aegisxd_json_add_string(resp, "error",
+                                nfq_check_rc != 0 && !strcmp(s.mode, "protect") ?
+                                    "suricata_nfqueue_check_failed" :
+                                    "suricata_start_failed");
+        json_object_object_add(resp, "rollback_ok",
+                               json_object_new_boolean(restore_rc == 0));
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        if (previous_state)
+            json_object_put(previous_state);
         json_object_put(compile_req);
         return resp;
+    }
+    if (!strcmp(s.mode, "protect")) {
+        nfq_apply_rc = aegisxd_suricata_nfqueue_apply();
+        nfq_active = nfq_apply_rc == 0 && aegisxd_suricata_nfqueue_runtime_active();
+        json_object_object_add(resp, "nfqueue_apply_exit_status",
+                               json_object_new_int(nfq_apply_rc));
+        json_object_object_add(resp, "nfqueue_active", json_object_new_boolean(nfq_active));
+        if (!nfq_active) {
+            (void)aegisxd_suricata_nfqueue_delete();
+            (void)aegisxd_suricata_stop();
+            (void)aegisxd_suricata_restore_file(previous_config,
+                                                AEGISXD_SURICATA_CONFIG_PATH,
+                                                previous_config_saved);
+            (void)aegisxd_suricata_restore_file(previous_nfq,
+                                                AEGISXD_SURICATA_NFQ_PATH,
+                                                previous_nfq_saved);
+            restore_rc = previous_runtime_active ?
+                aegisxd_suricata_restore_previous(bin, previous_state) : -1;
+            if (restore_rc != 0)
+                unlink(AEGISXD_SURICATA_ACTIVE_PATH);
+            aegisxd_json_add_string(resp, "state",
+                                    restore_rc == 0 ? "rolled_back" :
+                                                      "stopped_after_failed_apply");
+            aegisxd_json_add_string(resp, "error", "suricata_nfqueue_apply_failed");
+            json_object_object_add(resp, "rollback_ok",
+                                   json_object_new_boolean(restore_rc == 0));
+            json_object_object_add(resp, "ok", json_object_new_boolean(0));
+            if (previous_state)
+                json_object_put(previous_state);
+            json_object_put(compile_req);
+            return resp;
+        }
     }
     {
         struct json_object *state = aegisxd_apply_state_json("enabled", s.mode,
@@ -2411,7 +2926,40 @@ static struct json_object *aegisxd_apply_suricata(struct json_object *body,
         aegisxd_json_add_string(state, "suricata_config", AEGISXD_SURICATA_CONFIG_PATH);
         aegisxd_json_add_string(state, "suricata_eve", AEGISXD_SURICATA_EVE_PATH);
         aegisxd_json_add_string(state, "pid_path", AEGISXD_SURICATA_PID_PATH);
-        (void)aegisxd_apply_write_state_path(AEGISXD_SURICATA_ACTIVE_PATH, state);
+        aegisxd_json_add_string(state, "capture_mode",
+                                !strcmp(s.mode, "monitor") ? "af-packet" : "nfqueue");
+        aegisxd_json_add_string(state, "suricata_interface", s.suricata_interface);
+        json_object_object_add(state, "suricata_queue_num",
+                               json_object_new_int(s.suricata_queue_num));
+        json_object_object_add(state, "suricata_fail_open",
+                               json_object_new_boolean(s.suricata_fail_open));
+        aegisxd_json_add_string(state, "nfqueue_table", AEGISXD_SURICATA_NFQ_TABLE);
+        if (aegisxd_apply_write_state_path(AEGISXD_SURICATA_ACTIVE_PATH, state) != 0) {
+            (void)aegisxd_suricata_nfqueue_delete();
+            (void)aegisxd_suricata_stop();
+            json_object_put(state);
+            (void)aegisxd_suricata_restore_file(previous_config,
+                                                AEGISXD_SURICATA_CONFIG_PATH,
+                                                previous_config_saved);
+            (void)aegisxd_suricata_restore_file(previous_nfq,
+                                                AEGISXD_SURICATA_NFQ_PATH,
+                                                previous_nfq_saved);
+            restore_rc = previous_runtime_active ?
+                aegisxd_suricata_restore_previous(bin, previous_state) : -1;
+            if (restore_rc != 0)
+                unlink(AEGISXD_SURICATA_ACTIVE_PATH);
+            aegisxd_json_add_string(resp, "state",
+                                    restore_rc == 0 ? "rolled_back" :
+                                                      "stopped_after_failed_apply");
+            aegisxd_json_add_string(resp, "error", "suricata_active_state_write_failed");
+            json_object_object_add(resp, "rollback_ok",
+                                   json_object_new_boolean(restore_rc == 0));
+            json_object_object_add(resp, "ok", json_object_new_boolean(0));
+            if (previous_state)
+                json_object_put(previous_state);
+            json_object_put(compile_req);
+            return resp;
+        }
         json_object_put(state);
     }
     json_object_object_add(resp, "ok", json_object_new_boolean(1));
@@ -2419,6 +2967,12 @@ static struct json_object *aegisxd_apply_suricata(struct json_object *body,
     json_object_object_add(resp, "dataplane_changed", json_object_new_boolean(1));
     json_object_object_add(resp, "applied", json_object_new_boolean(1));
     aegisxd_json_add_string(resp, "state", "applied");
+    if (!strcmp(s.mode, "monitor"))
+        unlink(AEGISXD_SURICATA_NFQ_PATH);
+    unlink(previous_config);
+    unlink(previous_nfq);
+    if (previous_state)
+        json_object_put(previous_state);
     json_object_put(compile_req);
     return resp;
 }
@@ -2673,7 +3227,7 @@ struct json_object *aegisxd_apply(struct json_object *body)
         if (counted > 0)
             rules = counted;
     }
-    if (rules <= 0) {
+    if (rules <= 0 && !aegisxd_pcdn_configured()) {
         ok = 0;
         aegisxd_apply_add_blocker(blockers, "dnsmasq_rules_empty");
     }

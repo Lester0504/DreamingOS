@@ -158,14 +158,18 @@
       cache: 'no-store',
       headers: { Accept: 'application/json' }
     };
-    state.capabilityProbe = (window.DWRT_SESSION
-      ? window.DWRT_SESSION.fetch('/api/v1/bootstrap?realtime=1', request)
-      : fetch('/api/v1/bootstrap?realtime=1', request)).then(async (response) => {
-      if (!response.ok) return configure({});
-      let json = null;
-      try { json = await response.json(); } catch (_) {}
-      return configure(json || {});
-    }).catch(() => configure({})).finally(() => {
+    // menu-shell 提供共享的 bootstrap 拉取(启动时三方去重);不可用时退回独立请求。
+    const sharedFetch = typeof window.DWRT_BOOTSTRAP_FETCH === 'function'
+      ? window.DWRT_BOOTSTRAP_FETCH().then((json) => configure(json || {}))
+      : (window.DWRT_SESSION
+        ? window.DWRT_SESSION.fetch('/api/v1/bootstrap?realtime=1', request)
+        : fetch('/api/v1/bootstrap?realtime=1', request)).then(async (response) => {
+        if (!response.ok) return configure({});
+        let json = null;
+        try { json = await response.json(); } catch (_) {}
+        return configure(json || {});
+      });
+    state.capabilityProbe = sharedFetch.catch(() => configure({})).finally(() => {
       state.capabilityProbe = null;
     });
     return state.capabilityProbe;

@@ -267,14 +267,6 @@
   color: var(--app-text-muted);
 }
 .network-interface-carrier-fallback svg { width: 18px; height: 18px; }
-.network-interface-carrier-logo {
-  width: 34px;
-  height: 24px;
-  display: block;
-  margin: 0 auto;
-  object-fit: contain;
-  object-position: center;
-}
 
 .network-interface-status {
   min-width: 0;

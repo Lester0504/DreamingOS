@@ -44,6 +44,15 @@ int apd_config_stage(const struct apd_config_paths *paths,
 int apd_config_readback(const struct apd_config_paths *paths,
                         struct json_object *candidate,
                         struct json_object **out);
+/* Capture is read-only. The caller must durably journal the returned
+ * previous array before apply_prepared() may mutate live UCI. */
+int apd_config_capture_previous(const struct apd_config_paths *paths,
+                                struct json_object *candidate,
+                                struct json_object **out);
+int apd_config_apply_prepared(const struct apd_config_paths *paths,
+                              struct json_object *candidate,
+                              struct json_object *previous,
+                              struct json_object **out);
 int apd_config_apply(const struct apd_config_paths *paths,
                      struct json_object *candidate,
                      struct json_object **out);

@@ -19,10 +19,12 @@
 #include <sqlite3.h>
 #include <openssl/evp.h>
 #include <openssl/x509.h>
+#include "ac_secrets.h"
 
 #define AC_CONFIG_DB_PATH "/etc/dreamingwrt/config.db"
 #define AC_CONTRACT_VERSION "ap-control.v1"
-#define AC_SCHEMA_VERSION 11
+#define AC_SCHEMA_VERSION 12
+#define AC_SECRETS_KEY_PATH "/etc/dreamingwrt/ac-secrets.key"
 #define AC_SERVICE_NAME "dreamingwrt-ac"
 #define AC_NODE_TRANSPORT_ENABLED 1
 #define AC_PAIRING_TOKEN_ID_LEN 36

@@ -517,16 +517,16 @@
   align-items: start;
 }
 
-.wifi-radio-setting-grid {
+.wifi-unifi-setting-grid {
   display: grid;
   grid-template-columns: minmax(180px, .34fr) minmax(0, 1fr);
   gap: 28px;
   align-items: start;
 }
 
-.wifi-radio-label { display: grid; gap: 4px; padding-top: 8px; }
-.wifi-radio-label strong { font-size: 14px; font-weight: 650; }
-.wifi-radio-label small { color: var(--wifi-muted); font-size: 12px; line-height: 1.45; }
+.wifi-unifi-label { display: grid; gap: 4px; padding-top: 8px; }
+.wifi-unifi-label strong { font-size: 14px; font-weight: 650; }
+.wifi-unifi-label small { color: var(--wifi-muted); font-size: 12px; line-height: 1.45; }
 .wifi-speed-controls { min-width: 0; display: grid; gap: 16px; }
 .wifi-speed-controls .wifi-radio-options { display: flex; align-items: center; gap: 8px; }
 .wifi-link-button.is-inline { margin: 0 0 0 8px; }
@@ -1030,6 +1030,10 @@
 .airview-range-picker button[aria-pressed="true"] { color: var(--wifi-accent); background: color-mix(in srgb, var(--wifi-accent) 10%, transparent); }
 
 .airview-ap-picker { display: grid; grid-template-columns: minmax(0, 1fr) 38px; align-items: center; gap: 8px; margin-bottom: 8px; }
+.airview-band-segment { display: flex; min-height: 34px; margin-bottom: 12px; overflow: hidden; border: 1px solid var(--wifi-line); border-radius: 8px; }
+.airview-band-segment button { flex: 1 1 0; min-width: 0; border: 0; border-right: 1px solid var(--wifi-soft-line); color: var(--wifi-muted); background: transparent; cursor: pointer; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.airview-band-segment button:last-child { border-right: 0; }
+.airview-band-segment button[aria-pressed="true"] { color: var(--wifi-accent); background: color-mix(in srgb, var(--wifi-accent) 12%, transparent); }
 .airview-ap-select { position: relative; display: grid; grid-template-columns: 28px minmax(0, 1fr) 18px; align-items: center; min-width: 0; min-height: 40px; padding: 4px 6px; border: 1px solid var(--wifi-line); border-radius: var(--app-radius-control); background: color-mix(in srgb, currentColor 5%, transparent); }
 .airview-ap-select .airview-filter-device-image { grid-column: 1; grid-row: 1; }
 .airview-ap-select select { grid-column: 1 / -1; grid-row: 1; z-index: 1; width: 100%; min-width: 0; height: 32px; padding: 0 24px 0 34px; overflow: hidden; border: 0; color: inherit; background: transparent; font: inherit; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; appearance: none; cursor: pointer; }
@@ -1190,7 +1194,7 @@
 .airview-environment-status small { overflow: hidden; color: var(--wifi-muted); font-size: 9px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
 .airview-environment-status > .is-ready { border-color: color-mix(in srgb, var(--dwrt-status-success-text, #55d98b) 30%, transparent); }
 .airview-spectrum-chart { position: relative; min-height: 280px; padding: 12px 10px 34px 44px; }
-.airview-spectrum-grid { position: absolute; inset: 12px 10px 34px 44px; display: grid; grid-template-rows: repeat(5, 1fr); background: repeating-linear-gradient(90deg, var(--wifi-soft-line) 0 1px, transparent 1px calc(100% / 23)); border: 1px solid var(--wifi-soft-line); }
+.airview-spectrum-grid { position: absolute; inset: 12px 10px 34px 44px; display: grid; grid-template-rows: repeat(4, 1fr); border: 1px solid var(--wifi-soft-line); }
 .airview-spectrum-grid i { border-bottom: 1px solid var(--wifi-soft-line); }
 .airview-spectrum-grid i:last-child { border-bottom: 0; }
 .airview-spectrum-y { position: absolute; top: 8px; bottom: 30px; left: 0; display: flex; flex-direction: column; justify-content: space-between; width: 38px; color: var(--wifi-muted); font-size: 9px; text-align: right; }
@@ -1199,6 +1203,15 @@
 .airview-spectrum-channel { position: absolute; bottom: 10px; left: 8px; color: var(--wifi-muted); font-size: 9px; }
 .airview-environment-history-line { position: absolute; inset: 12px 10px 34px 44px; z-index: 1; width: calc(100% - 54px); height: calc(100% - 46px); overflow: visible; }
 .airview-environment-history-line polyline { fill: none; stroke: var(--wifi-accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.airview-environment-spectrum { position: absolute; inset: 12px 10px 34px 44px; z-index: 1; width: calc(100% - 54px); height: calc(100% - 46px); overflow: visible; }
+.airview-environment-spectrum .airview-bell { fill: color-mix(in srgb, var(--airview-bell-color, var(--wifi-accent)) 24%, transparent); stroke: var(--airview-bell-color, var(--wifi-accent)); stroke-width: 1.5; vector-effect: non-scaling-stroke; transition: fill .15s ease; }
+.airview-environment-spectrum .airview-bell:hover { fill: color-mix(in srgb, var(--airview-bell-color, var(--wifi-accent)) 42%, transparent); }
+.airview-environment-spectrum .tone-0 { --airview-bell-color: #4f8cff; }
+.airview-environment-spectrum .tone-1 { --airview-bell-color: #35c28a; }
+.airview-environment-spectrum .tone-2 { --airview-bell-color: #f2a33c; }
+.airview-environment-spectrum .tone-3 { --airview-bell-color: #b57bff; }
+.airview-environment-spectrum .tone-4 { --airview-bell-color: #ef6f8e; }
+.airview-environment-spectrum .tone-5 { --airview-bell-color: #35b8c2; }
 .airview-environment-history-empty { position: absolute; inset: 12px 10px 34px 44px; z-index: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: 20px; color: var(--wifi-muted); text-align: center; }
 .airview-environment-history-empty strong { color: var(--app-text); font-size: 11px; }
 .airview-environment-history-empty span { max-width: 460px; font-size: 10px; line-height: 1.45; }
@@ -1272,7 +1285,7 @@
 }
 
 .dwrt-kit-sheet.airview-ap-sheet {
-  --dwrt-kit-sheet-width: min(50vw, 720px);
+  --dwrt-kit-sheet-width: min(90vw, 560px);
   --dwrt-kit-sheet-max-width: calc(100vw - 28px);
   grid-template-rows: var(--dwrt-kit-sheet-head-height) 82px minmax(0, 1fr);
 }
@@ -1618,7 +1631,7 @@
 
 @media (max-width: 980px) {
   .wifi-speed-layout,
-  .wifi-radio-setting-grid,
+  .wifi-unifi-setting-grid,
   .airview-layout {
     grid-template-columns: 1fr;
   }

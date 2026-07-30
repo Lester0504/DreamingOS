@@ -305,14 +305,85 @@ static void logd_program_package_add(const char *program, const char *package)
     g_program_package_count++;
 }
 
-static void logd_program_packages_load(void)
+/* Returns 0 for non-executable folders, 1 for standard executable roots, and
+ * 2 for usr/lib (only extension-less helper binaries such as OpenSSH's
+ * sshd-session/sshd-auth/sftp-server, never the many shared objects). */
+static int logd_apk_exec_folder(const char *folder)
+{
+    static const char *roots[] = {
+        "usr/bin", "usr/sbin", "bin", "sbin", "etc/init.d",
+    };
+    size_t i;
+
+    if (!folder)
+        return 0;
+    for (i = 0; i < ARRAY_SIZE(roots); i++)
+        if (!strcmp(folder, roots[i]))
+            return 1;
+    if (!strcmp(folder, "usr/lib"))
+        return 2;
+    return 0;
+}
+
+static void logd_program_packages_load_apk(void)
+{
+    /* glibc builds ship apk instead of opkg; its installed database lists a
+     * package's files as an 'F:<dir>' folder context followed by 'R:<file>'
+     * entries. Reconstruct program -> package ownership from that layout so
+     * log events keep a 'package' field after the apk migration. */
+    FILE *fp;
+    char line[512];
+    char package[128];
+    char folder[256];
+    int folder_is_exec;
+
+    fp = fopen("/lib/apk/db/installed", "r");
+    if (!fp)
+        return;
+    package[0] = 0;
+    folder[0] = 0;
+    folder_is_exec = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char *nl = strpbrk(line, "\r\n");
+        char program[128];
+
+        if (nl)
+            *nl = 0;
+        if (line[0] == 0 || line[1] != ':')
+            continue;
+        switch (line[0]) {
+        case 'P':
+            logd_copy_trim(package, sizeof(package), line + 2, strlen(line + 2));
+            folder[0] = 0;
+            folder_is_exec = 0;
+            break;
+        case 'F':
+            logd_copy_trim(folder, sizeof(folder), line + 2, strlen(line + 2));
+            folder_is_exec = logd_apk_exec_folder(folder);
+            break;
+        case 'R':
+            if (!folder_is_exec || !package[0])
+                break;
+            /* usr/lib mostly holds shared objects; only register bare helper
+             * binaries (no filename extension) so libraries never crowd out
+             * real program tags in the fixed-size ownership table. */
+            if (folder_is_exec == 2 && strchr(line + 2, '.'))
+                break;
+            logd_program_normalize(line + 2, program, sizeof(program));
+            logd_program_package_add(program, package);
+            break;
+        default:
+            break;
+        }
+    }
+    fclose(fp);
+}
+
+static void logd_program_packages_load_opkg(void)
 {
     DIR *dir;
     struct dirent *de;
 
-    if (g_program_packages_loaded)
-        return;
-    g_program_packages_loaded = 1;
     dir = opendir("/usr/lib/opkg/info");
     if (!dir)
         return;
@@ -350,6 +421,19 @@ static void logd_program_packages_load(void)
         fclose(fp);
     }
     closedir(dir);
+}
+
+static void logd_program_packages_load(void)
+{
+    if (g_program_packages_loaded)
+        return;
+    g_program_packages_loaded = 1;
+    /* opkg (musl builds) and apk (glibc builds) never coexist in practice;
+     * probe both so a single logd binary keeps package ownership regardless of
+     * which package manager the running firmware shipped. logd_program_package_add
+     * keeps the first mapping per program, so opkg wins on the rare overlap. */
+    logd_program_packages_load_opkg();
+    logd_program_packages_load_apk();
 }
 
 static const char *logd_program_package(const char *program)

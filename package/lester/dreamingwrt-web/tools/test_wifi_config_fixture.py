@@ -7,8 +7,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-# Override with PLAYWRIGHT_RUNTIME to point at a local Node + Playwright install.
-RUNTIME = Path(os.environ.get("PLAYWRIGHT_RUNTIME", Path.home() / ".cache/dreamingwrt-playwright"))
+RUNTIME = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies"
 NODE = Path(shutil.which("node") or RUNTIME / "node/bin/node")
 NODE_MODULES = RUNTIME / "node/node_modules"
 

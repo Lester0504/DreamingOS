@@ -3612,7 +3612,7 @@
           </section>
           <section class="client-filter-section ${activeTab === 'filter' ? 'is-active' : ''}" data-client-filter-panel="filter">
             <strong>IP 地址</strong>
-            <input data-client-filter-ip value="${escapeHtml(page.filters.ip)}" placeholder="例如 192.168.1 或 2408">
+            <input data-client-filter-ip value="${escapeHtml(page.filters.ip)}" placeholder="例如 192.168.30 或 2408">
             <label class="client-filter-inline">
               <input type="checkbox" data-client-filter-ip-exclude ${page.filters.ipExclude ? 'checked' : ''}>
               <span>排除匹配 IP</span>

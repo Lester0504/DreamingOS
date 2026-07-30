@@ -153,7 +153,12 @@ def route_window(path: str, radius: int = 1500) -> str:
 
 
 def test_config_db_is_authoritative_for_policies_and_domain_overrides() -> None:
-    assert 'AEGISXD_CONFIG_DB_PATH "/etc/dreamingwrt/config.db"' in INTERNAL
+    require_all(
+        INTERNAL,
+        ('AEGISXD_CONFIG_DIR "/etc/dreamingwrt"',
+         'AEGISXD_CONFIG_DB_PATH AEGISXD_CONFIG_DIR "/config.db"'),
+        "config.db production path",
+    )
     policy_name, policy = create_table_body(("aegis_content_policies", "aegis_content_policy"))
     override_name, override = create_table_body(("aegis_domain_overrides",))
 

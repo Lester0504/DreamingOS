@@ -275,13 +275,13 @@ export function mount(context = {}) {
   function renderTable() {
     const groups = filteredGroups();
     const subtitle = state.loading ? '正在读取 config.db 分组' : state.error || (state.source ? `数据源：${state.source}` : '按终端身份维护策略对象');
-    return `<section class="terminal-group-table-card dwrt-kit-table-wrap dwrt-kit-datatable-wrap dwrt-kit-glass-surface">
+    return `<section class="terminal-group-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface">
       <div class="dwrt-kit-table-toolbar terminal-group-table-toolbar">
         <div class="dwrt-kit-table-title"><strong>终端分组</strong><span class="${state.error ? 'is-warning' : ''}">${escapeHtml(subtitle)}</span></div>
         <div class="terminal-group-table-meta"><span class="dwrt-kit-table-count">${escapeHtml(formatInteger(groups.length))} 个分组 · ${escapeHtml(formatInteger(groups.reduce((sum, item) => sum + item.member_count, 0)))} 个成员</span><button type="button" data-terminal-group-refresh title="刷新" aria-label="刷新终端分组">${icon('refresh')}</button></div>
       </div>
       <div class="dwrt-kit-table-scroll terminal-group-table-scroll">
-        <table class="dwrt-kit-table dwrt-kit-datatable terminal-group-table">
+        <table class="dwrt-kit-table dwrt-kit-ikuai-table terminal-group-table">
           <thead><tr><th>分组名称</th><th class="num">成员</th><th>终端摘要</th><th class="num">关联策略</th><th>更新时间</th><th>操作</th></tr></thead>
           <tbody>${state.loading ? '<tr><td colspan="6" class="dwrt-kit-table-empty">正在读取终端分组</td></tr>' : groups.length ? groups.map(groupRow).join('') : `<tr><td colspan="6" class="dwrt-kit-table-empty">${escapeHtml(state.query ? '没有匹配的终端分组' : state.error || '暂无终端分组')}</td></tr>`}</tbody>
         </table>

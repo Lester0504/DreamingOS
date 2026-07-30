@@ -1123,13 +1123,13 @@ html[data-theme-resolved="dark"] .dwrt-kit-tooltip,
   color: rgba(250, 252, 255, 0.98) !important;
 }
 
-.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-datatable-wrap {
-  --dwrt-kit-datatable-border: rgba(255,255,255,0.10);
-  --dwrt-kit-datatable-head: rgba(255,255,255,0.043);
-  --dwrt-kit-datatable-row: transparent;
-  --dwrt-kit-datatable-hover: var(--dwrt-interactive-hover-bg);
-  --dwrt-kit-datatable-text: var(--dwrt-kit-text);
-  --dwrt-kit-datatable-muted: var(--dwrt-kit-muted);
+.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-ikuai-table-wrap {
+  --dwrt-kit-ikuai-border: rgba(255,255,255,0.10);
+  --dwrt-kit-ikuai-head: rgba(255,255,255,0.043);
+  --dwrt-kit-ikuai-row: transparent;
+  --dwrt-kit-ikuai-hover: var(--dwrt-interactive-hover-bg);
+  --dwrt-kit-ikuai-text: var(--dwrt-kit-text);
+  --dwrt-kit-ikuai-muted: var(--dwrt-kit-muted);
   border: 0;
   background:
     radial-gradient(ellipse at 44% -20%, rgba(255,255,255,calc(var(--lg-highlight, 0.34) * 0.09)), transparent 46%),
@@ -1139,20 +1139,20 @@ html[data-theme-resolved="dark"] .dwrt-kit-tooltip,
       rgba(8,14,26,calc(var(--lg-effective-opacity, 0.42) * 0.020)) 100%);
 }
 
-.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-datatable-wrap .dwrt-kit-table-toolbar {
+.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-toolbar {
   color: var(--dwrt-kit-text);
   border-bottom-color: rgba(255,255,255,0.10);
   background: rgba(255,255,255,0.018);
 }
 
-.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-datatable-wrap .dwrt-kit-table-title strong,
-.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-datatable-wrap .dwrt-kit-datatable tbody td {
+.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-title strong,
+.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-ikuai-table-wrap .dwrt-kit-ikuai-table tbody td {
   color: var(--dwrt-kit-text);
 }
 
-.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-datatable-wrap .dwrt-kit-table-title span,
-.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-datatable-wrap .dwrt-kit-table-count,
-.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-datatable-wrap .dwrt-kit-datatable thead th {
+.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-title span,
+.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-count,
+.dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-ikuai-table-wrap .dwrt-kit-ikuai-table thead th {
   color: var(--dwrt-kit-muted);
 }
 
@@ -1275,14 +1275,14 @@ html[data-theme-resolved="dark"] .dwrt-kit-tooltip,
 
 /* Final specificity guard: light theme and legacy compact-table declarations
    must not replace wallpaper-backed surfaces with a pale table material. */
-html[data-theme-resolved="light"] .dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-datatable-wrap,
-html[data-theme-resolved="dark"] .dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-datatable-wrap {
-  --dwrt-kit-datatable-border: rgba(255,255,255,0.10);
-  --dwrt-kit-datatable-head: rgba(255,255,255,0.043);
-  --dwrt-kit-datatable-row: transparent;
-  --dwrt-kit-datatable-hover: var(--dwrt-interactive-hover-bg);
-  --dwrt-kit-datatable-text: var(--app-text, var(--dwrt-kit-text));
-  --dwrt-kit-datatable-muted: var(--app-text-muted, var(--dwrt-kit-muted));
+html[data-theme-resolved="light"] .dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-ikuai-table-wrap,
+html[data-theme-resolved="dark"] .dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-ikuai-table-wrap {
+  --dwrt-kit-ikuai-border: rgba(255,255,255,0.10);
+  --dwrt-kit-ikuai-head: rgba(255,255,255,0.043);
+  --dwrt-kit-ikuai-row: transparent;
+  --dwrt-kit-ikuai-hover: var(--dwrt-interactive-hover-bg);
+  --dwrt-kit-ikuai-text: var(--app-text, var(--dwrt-kit-text));
+  --dwrt-kit-ikuai-muted: var(--app-text-muted, var(--dwrt-kit-muted));
   border: 0;
 }
 
@@ -1788,87 +1788,87 @@ html[data-theme-resolved="light"] .dwrt-date-popover {
 
 /* iKuai / Ant Design inspired compact data surfaces.
    Shared kit primitives: use these for dense monitoring tables and load cards instead of page-local copies. */
-.dwrt-kit-datatable-wrap {
-  --dwrt-kit-datatable-border: rgba(224, 229, 236, 0.82);
-  --dwrt-kit-datatable-head: rgba(247, 248, 250, 0.86);
-  --dwrt-kit-datatable-row: rgba(255, 255, 255, 0.78);
-  --dwrt-kit-datatable-hover: rgba(236, 247, 255, 0.72);
-  --dwrt-kit-datatable-text: rgba(30, 37, 48, 0.92);
-  --dwrt-kit-datatable-muted: rgba(96, 110, 128, 0.76);
+.dwrt-kit-ikuai-table-wrap {
+  --dwrt-kit-ikuai-border: rgba(224, 229, 236, 0.82);
+  --dwrt-kit-ikuai-head: rgba(247, 248, 250, 0.86);
+  --dwrt-kit-ikuai-row: rgba(255, 255, 255, 0.78);
+  --dwrt-kit-ikuai-hover: rgba(236, 247, 255, 0.72);
+  --dwrt-kit-ikuai-text: rgba(30, 37, 48, 0.92);
+  --dwrt-kit-ikuai-muted: rgba(96, 110, 128, 0.76);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.72);
-  border: 1px solid var(--dwrt-kit-datatable-border);
+  border: 1px solid var(--dwrt-kit-ikuai-border);
   box-shadow: none;
   backdrop-filter: blur(10px) saturate(120%);
   -webkit-backdrop-filter: blur(10px) saturate(120%);
 }
 
-.dwrt-kit-datatable-wrap .dwrt-kit-table-toolbar {
+.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-toolbar {
   min-height: 44px;
   padding: 10px 14px;
-  border-bottom: 1px solid var(--dwrt-kit-datatable-border);
+  border-bottom: 1px solid var(--dwrt-kit-ikuai-border);
   background: rgba(255, 255, 255, 0.36);
 }
 
-.dwrt-kit-datatable-wrap .dwrt-kit-table-title {
+.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-title {
   display: flex;
   min-width: 0;
   align-items: baseline;
   gap: 10px;
 }
 
-.dwrt-kit-datatable-wrap .dwrt-kit-table-title strong {
-  color: var(--dwrt-kit-datatable-text);
+.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-title strong {
+  color: var(--dwrt-kit-ikuai-text);
   font-size: 14px;
   font-weight: 650;
 }
 
-.dwrt-kit-datatable-wrap .dwrt-kit-table-title span,
-.dwrt-kit-datatable-wrap .dwrt-kit-table-count {
-  color: var(--dwrt-kit-datatable-muted);
+.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-title span,
+.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-count {
+  color: var(--dwrt-kit-ikuai-muted);
   font-size: 12px;
   font-weight: 500;
 }
 
-.dwrt-kit-datatable {
+.dwrt-kit-ikuai-table {
   min-width: 560px;
-  color: var(--dwrt-kit-datatable-text);
+  color: var(--dwrt-kit-ikuai-text);
   font-size: 12px;
   line-height: 1.4;
   background: transparent;
 }
 
-.dwrt-kit-datatable thead th {
+.dwrt-kit-ikuai-table thead th {
   height: 38px;
   padding: 0 12px;
   color: rgba(72, 84, 102, 0.88);
-  background: var(--dwrt-kit-datatable-head);
-  border-bottom: 1px solid var(--dwrt-kit-datatable-border);
+  background: var(--dwrt-kit-ikuai-head);
+  border-bottom: 1px solid var(--dwrt-kit-ikuai-border);
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0;
   text-transform: none;
 }
 
-.dwrt-kit-datatable tbody td {
+.dwrt-kit-ikuai-table tbody td {
   height: 40px;
   padding: 0 12px;
-  color: var(--dwrt-kit-datatable-text);
-  background: var(--dwrt-kit-datatable-row);
+  color: var(--dwrt-kit-ikuai-text);
+  background: var(--dwrt-kit-ikuai-row);
   border-bottom: 1px solid rgba(224, 229, 236, 0.62);
   font-size: 12px;
 }
 
-.dwrt-kit-datatable tbody td strong {
+.dwrt-kit-ikuai-table tbody td strong {
   font-weight: 600;
 }
 
-.dwrt-kit-datatable tbody tr:hover td {
-  background: var(--dwrt-kit-datatable-hover);
+.dwrt-kit-ikuai-table tbody tr:hover td {
+  background: var(--dwrt-kit-ikuai-hover);
 }
 
-.dwrt-kit-datatable .num,
-.dwrt-kit-datatable [data-type="number"] {
+.dwrt-kit-ikuai-table .num,
+.dwrt-kit-ikuai-table [data-type="number"] {
   text-align: center;
   font-variant-numeric: tabular-nums;
 }
@@ -1876,7 +1876,7 @@ html[data-theme-resolved="light"] .dwrt-date-popover {
 .dwrt-kit-table-empty {
   height: 120px !important;
   text-align: center !important;
-  color: var(--dwrt-kit-datatable-muted) !important;
+  color: var(--dwrt-kit-ikuai-muted) !important;
 }
 
 .system-health-load-grid {
@@ -1968,16 +1968,16 @@ html[data-theme-resolved="light"] .dwrt-date-popover {
   text-align: center;
 }
 
-html[data-theme-resolved="dark"] .dwrt-kit-datatable-wrap,
+html[data-theme-resolved="dark"] .dwrt-kit-ikuai-table-wrap,
 html[data-theme-resolved="dark"] .dwrt-kit-load-card {
-  --dwrt-kit-datatable-border: rgba(255, 255, 255, 0.12);
-  --dwrt-kit-datatable-head: rgba(255, 255, 255, 0.07);
-  --dwrt-kit-datatable-row: rgba(255, 255, 255, 0.045);
-  --dwrt-kit-datatable-hover: rgba(255, 255, 255, 0.075);
-  --dwrt-kit-datatable-text: rgba(245, 248, 255, 0.92);
-  --dwrt-kit-datatable-muted: rgba(205, 216, 232, 0.70);
+  --dwrt-kit-ikuai-border: rgba(255, 255, 255, 0.12);
+  --dwrt-kit-ikuai-head: rgba(255, 255, 255, 0.07);
+  --dwrt-kit-ikuai-row: rgba(255, 255, 255, 0.045);
+  --dwrt-kit-ikuai-hover: rgba(255, 255, 255, 0.075);
+  --dwrt-kit-ikuai-text: rgba(245, 248, 255, 0.92);
+  --dwrt-kit-ikuai-muted: rgba(205, 216, 232, 0.70);
   background: rgba(12, 18, 30, 0.48);
-  border-color: var(--dwrt-kit-datatable-border);
+  border-color: var(--dwrt-kit-ikuai-border);
 }
 
 html[data-theme-resolved="dark"] .dwrt-kit-load-card-head h3,
@@ -2018,15 +2018,15 @@ html[data-theme-resolved="dark"] .dwrt-kit-load-note {
 
 /* Dreaming OS glass table variant. Kept the legacy class name for compatibility,
    but the visual language is ours: no Ant white block, no opaque table background. */
-.dwrt-kit-datatable-wrap {
-  --dwrt-kit-datatable-border: rgba(255, 255, 255, 0.14);
-  --dwrt-kit-datatable-head: rgba(255, 255, 255, 0.055);
-  --dwrt-kit-datatable-row: transparent;
-  --dwrt-kit-datatable-hover: rgba(255, 255, 255, 0.070);
-  --dwrt-kit-datatable-text: var(--dwrt-kit-text, rgba(248, 251, 255, 0.94));
-  --dwrt-kit-datatable-muted: var(--dwrt-kit-muted, rgba(214, 225, 240, 0.74));
+.dwrt-kit-ikuai-table-wrap {
+  --dwrt-kit-ikuai-border: rgba(255, 255, 255, 0.14);
+  --dwrt-kit-ikuai-head: rgba(255, 255, 255, 0.055);
+  --dwrt-kit-ikuai-row: transparent;
+  --dwrt-kit-ikuai-hover: rgba(255, 255, 255, 0.070);
+  --dwrt-kit-ikuai-text: var(--dwrt-kit-text, rgba(248, 251, 255, 0.94));
+  --dwrt-kit-ikuai-muted: var(--dwrt-kit-muted, rgba(214, 225, 240, 0.74));
   border-radius: var(--dwrt-kit-radius);
-  border: 1px solid var(--dwrt-kit-datatable-border);
+  border: 1px solid var(--dwrt-kit-ikuai-border);
   background:
     radial-gradient(ellipse at 45% -18%, rgba(255,255,255,calc(var(--lg-highlight, 0.34) * 0.10)), transparent 52%),
     linear-gradient(150deg,
@@ -2042,53 +2042,53 @@ html[data-theme-resolved="dark"] .dwrt-kit-load-note {
   -webkit-backdrop-filter: blur(var(--lg-material-blur, 1px)) saturate(132%) brightness(1.02);
 }
 
-.dwrt-kit-datatable-wrap .dwrt-kit-table-toolbar {
+.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-toolbar {
   min-height: 48px;
   padding: 12px 16px;
   border-bottom: 1px solid rgba(255,255,255,0.10);
   background: rgba(255,255,255,0.020);
 }
 
-.dwrt-kit-datatable-wrap .dwrt-kit-table-title strong {
-  color: var(--dwrt-kit-datatable-text);
+.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-title strong {
+  color: var(--dwrt-kit-ikuai-text);
   font-size: 13px;
   font-weight: 760;
 }
 
-.dwrt-kit-datatable-wrap .dwrt-kit-table-title span,
-.dwrt-kit-datatable-wrap .dwrt-kit-table-count {
-  color: var(--dwrt-kit-datatable-muted);
+.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-title span,
+.dwrt-kit-ikuai-table-wrap .dwrt-kit-table-count {
+  color: var(--dwrt-kit-ikuai-muted);
   font-size: 12px;
   font-weight: 650;
 }
 
-.dwrt-kit-datatable thead th {
+.dwrt-kit-ikuai-table thead th {
   height: 38px;
-  color: var(--dwrt-kit-datatable-muted);
-  background: var(--dwrt-kit-datatable-head);
+  color: var(--dwrt-kit-ikuai-muted);
+  background: var(--dwrt-kit-ikuai-head);
   border-bottom: 1px solid rgba(255,255,255,0.105);
   font-size: 11px;
   font-weight: 760;
 }
 
-.dwrt-kit-datatable tbody td {
+.dwrt-kit-ikuai-table tbody td {
   height: 42px;
-  color: var(--dwrt-kit-datatable-text);
+  color: var(--dwrt-kit-ikuai-text);
   background: transparent;
   border-bottom: 1px solid rgba(255,255,255,0.070);
   font-size: 12px;
 }
 
-.dwrt-kit-datatable tbody tr:hover td {
-  background: var(--dwrt-kit-datatable-hover);
+.dwrt-kit-ikuai-table tbody tr:hover td {
+  background: var(--dwrt-kit-ikuai-hover);
 }
 
-html[data-theme-resolved="light"] .dwrt-kit-datatable-wrap {
-  --dwrt-kit-datatable-border: rgba(255, 255, 255, 0.46);
-  --dwrt-kit-datatable-head: rgba(255, 255, 255, 0.20);
-  --dwrt-kit-datatable-hover: rgba(255, 255, 255, 0.24);
-  --dwrt-kit-datatable-text: rgba(26, 34, 48, 0.92);
-  --dwrt-kit-datatable-muted: rgba(74, 88, 108, 0.70);
+html[data-theme-resolved="light"] .dwrt-kit-ikuai-table-wrap {
+  --dwrt-kit-ikuai-border: rgba(255, 255, 255, 0.46);
+  --dwrt-kit-ikuai-head: rgba(255, 255, 255, 0.20);
+  --dwrt-kit-ikuai-hover: rgba(255, 255, 255, 0.24);
+  --dwrt-kit-ikuai-text: rgba(26, 34, 48, 0.92);
+  --dwrt-kit-ikuai-muted: rgba(74, 88, 108, 0.70);
 }
 
 /* System-health load cards: align chart plot optically and make toolbar actions real controls. */

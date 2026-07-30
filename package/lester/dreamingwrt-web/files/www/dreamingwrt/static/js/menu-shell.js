@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = '20260725-route-resource-version-02';
+  const VERSION = '20260726-poll-discipline-05';
   const STATIC_MENU_URL = '/static/menu/main.json';
   const RUNTIME_MENU_URL = '/dynamic/menu/1.json';
   const MENU_URLS = window.DWRT_RUNTIME_MENU === false || document.documentElement.dataset.runtimeMenu === 'false'
@@ -116,11 +116,11 @@
     dashboard: {
       url: '/static/js/dashboard.js',
       globalName: 'DWRTDashboard',
-      version: '20260725-dreaming-os-01'
+      version: '20260726-poll-discipline-05'
     },
     topology: {
-      url: '/static/js/dwrt-topology.js',
-      globalName: 'DWRT_TOPOLOGY',
+      url: '/static/js/unifi-topology.js',
+      globalName: 'DWRT_UNIFI_TOPOLOGY',
       version: '20260722-04'
     },
     lineStatus: {
@@ -151,8 +151,8 @@
     ],
   };
   const GLOBAL_AI_ASSETS = Object.freeze({
-    module: { url: '/plugins/native/ai-assistant.js', version: '20260722-overlay-01' },
-    style: { url: '/static/css/ai-assistant.css', version: '20260721-01' }
+    module: { url: '/plugins/native/ai-assistant.js', version: '20260727-ai-stream-01' },
+    style: { url: '/static/css/ai-assistant.css', version: '20260727-ai-stream-01' }
   });
 
   let topologyVisibilityTimer = 0;
@@ -322,6 +322,7 @@
       pageRouteToken: 0,
       pageRouteTimer: 0,
       pageRouteStartedAt: 0,
+      pendingTransitionRelease: null,
       materialVersion: 0,
       legacyCanvasesCleared: false,
       raf: 0,
@@ -607,7 +608,7 @@
 
   async function ensureTopologyRendererLoaded() {
     await loadClassicPageScript('topology');
-    return window.DWRT_TOPOLOGY;
+    return window.DWRT_UNIFI_TOPOLOGY;
   }
 
   function iconSvg(name) {
@@ -667,6 +668,22 @@
     if (!res.ok) throw new Error(`${url} ${res.status}`);
     return res.json();
   }
+
+  // /api/v1/bootstrap 在启动时会被菜单、主题、realtime 三方各拉一次;
+  // 共享同一个 promise,10 秒内只发一次请求。
+  let bootstrapSharedPromise = null;
+  let bootstrapSharedAt = 0;
+  function fetchBootstrapShared() {
+    const now = Date.now();
+    if (bootstrapSharedPromise && now - bootstrapSharedAt < 10000) return bootstrapSharedPromise;
+    bootstrapSharedAt = now;
+    bootstrapSharedPromise = readRuntimeJson('/api/v1/bootstrap').catch((error) => {
+      bootstrapSharedPromise = null;
+      throw error;
+    });
+    return bootstrapSharedPromise;
+  }
+  window.DWRT_BOOTSTRAP_FETCH = fetchBootstrapShared;
 
   function readWarmShellValue(key) {
     const prewarm = window.DWRTShellPrewarm;
@@ -730,7 +747,7 @@
   async function loadRuntimeMenuConfig() {
     const config = { hidePages: [], hideFuncs: [], disabledCapabilities: [], capabilities: {} };
     try {
-      const bootstrap = await readRuntimeJson('/api/v1/bootstrap');
+      const bootstrap = await fetchBootstrapShared();
       const data = bootstrap && bootstrap.data ? bootstrap.data : bootstrap;
       if (window.DWRTRealtime && typeof window.DWRTRealtime.configure === 'function') {
         window.DWRTRealtime.configure(data || {});
@@ -811,14 +828,20 @@
     return item.style || item.route_style || item.css || item.plugin_style || plugin.style || plugin.css || '';
   }
 
-  function loadRouteItemStyle(item) {
+  function routeItemStyleEntry(item) {
     const url = safeStaticStyleUrl(itemRouteStyleResource(item));
-    if (!url) return Promise.resolve();
+    if (!url) return null;
     const rawVersion = item && (item.style_version || item.module_version || item.resource_version || item.version);
     const shellVersioned = new Set(['/static/css/system-settings.css', '/static/css/global-config.css', '/static/css/network-interface-config.css', '/static/css/network-services.css', '/static/css/policy-status.css', '/static/css/user-authentication.css', '/static/css/vpn-config.css']);
     const requestedVersion = shellVersioned.has(url) ? VERSION : (rawVersion || VERSION);
     const version = String(requestedVersion).replace(/[^A-Za-z0-9._-]/g, '') || VERSION;
-    return loadPageStyle({ url, version });
+    return { url, version };
+  }
+
+  function loadRouteItemStyle(item) {
+    const entry = routeItemStyleEntry(item);
+    if (!entry) return Promise.resolve();
+    return loadPageStyle(entry);
   }
 
   function routeModuleCacheUrl(item, url) {
@@ -1544,12 +1567,75 @@
     routeToAfterMenuPaint(itemPath(item));
   }
 
+  const prefetchedRouteResources = new Set();
+  const CLASSIC_PAGE_PREFETCH = [
+    { match: '#/monitor/line-status', script: 'lineStatus', styles: 'lineStatus' },
+    { match: '#/monitor/client-details', script: 'clientDetails', styles: 'clientDetails' },
+    { match: '#/insights', script: 'insightsFlows', styles: 'insightsFlows' },
+    { match: '#/monitor/topology', script: 'topology', styles: '' },
+    { match: '#/dashboard', script: 'dashboard', styles: '' }
+  ];
+
+  function prefetchClassicPageAssets(path) {
+    const hash = routeHashFromPath(path || '');
+    const config = CLASSIC_PAGE_PREFETCH.find((candidate) => hash.startsWith(candidate.match));
+    if (!config) return;
+    const assets = [];
+    const script = PAGE_SCRIPTS[config.script];
+    if (script) assets.push({ href: pageScriptUrl(script), as: 'script' });
+    (PAGE_STYLES[config.styles] || []).forEach((style) => {
+      assets.push({ href: `${style.url}?v=${encodeURIComponent(style.version || VERSION)}`, as: 'style' });
+    });
+    assets.forEach((asset) => {
+      if (prefetchedRouteResources.has(asset.href)) return;
+      prefetchedRouteResources.add(asset.href);
+      const link = document.createElement('link');
+      link.rel = 'preload';
+      link.as = asset.as;
+      link.href = asset.href;
+      document.head.appendChild(link);
+    });
+  }
+
+  function prefetchRouteResourcesForItem(item) {
+    if (!item || item.disabled) return;
+    const targets = [item, ...(Array.isArray(item.children) ? item.children.slice(0, 1) : [])];
+    targets.forEach((target) => prefetchClassicPageAssets(itemPath(target)));
+    targets.forEach((target) => {
+      const entry = routeModuleForItem(target);
+      if (entry && entry.url && !prefetchedRouteResources.has(entry.url)) {
+        prefetchedRouteResources.add(entry.url);
+        const link = document.createElement('link');
+        link.rel = 'modulepreload';
+        link.href = entry.url;
+        document.head.appendChild(link);
+      }
+      const styleEntry = routeItemStyleEntry((entry && entry.item) || target);
+      if (styleEntry) {
+        const styleHref = `${styleEntry.url}?v=${encodeURIComponent(styleEntry.version)}`;
+        if (!prefetchedRouteResources.has(styleHref)) {
+          prefetchedRouteResources.add(styleHref);
+          const link = document.createElement('link');
+          link.rel = 'preload';
+          link.as = 'style';
+          link.href = styleHref;
+          document.head.appendChild(link);
+        }
+      }
+    });
+  }
+
   function createMenuButton(level) {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'menu-item';
     button.innerHTML = '<span class="menu-icon"></span><span class="menu-label"></span>';
     button._dwrtMenuLevel = level;
+    // 悬停即预取路由模块与样式(静态资源,不打扰 API 后端),点击时基本零等待。
+    button.addEventListener('pointerenter', () => {
+      const item = button._dwrtMenuItem;
+      if (item) prefetchRouteResourcesForItem(item);
+    });
     button.addEventListener('pointerdown', () => {
       const token = beginPageGlassRouteTransition(true);
       window.setTimeout(() => settlePageGlassRouteTransition(token), 0);
@@ -2713,9 +2799,11 @@
     state.routeAbortController = routeController;
     renderRouteModuleLoading(current, currentPath);
     try {
-      await loadRouteItemStyle(entry.item || current);
-      if (loadId !== state.routeLoadId) return;
-      const moduleRecord = await import(/* webpackIgnore: true */ entry.url);
+      // 样式与模块并行拉取,消除“先等 CSS 再拉 JS”的串行瀑布。
+      const [, moduleRecord] = await Promise.all([
+        loadRouteItemStyle(entry.item || current),
+        import(/* webpackIgnore: true */ entry.url)
+      ]);
       if (loadId !== state.routeLoadId) return;
       const instance = await mountRouteModule(moduleRecord, {
         root: routePreview,
@@ -2729,8 +2817,8 @@
           fetch: (name, url, retry = true) => fetchApiResource(name, url, retry, routeController.signal),
           request: async (name, url, init = {}) => {
             const hasBody = init.body !== undefined;
-            const response = window.DWRT_SESSION
-              ? await window.DWRT_SESSION.fetch(url, {
+            const response = await withApiSlot(() => window.DWRT_SESSION
+              ? window.DWRT_SESSION.fetch(url, {
                 ...init,
                 credentials: 'same-origin',
                 cache: 'no-store',
@@ -2738,14 +2826,14 @@
                 headers: authHeaders({ Accept: 'application/json', ...(hasBody ? { 'Content-Type': 'application/json' } : {}), ...(init.headers || {}) }),
                 body: hasBody && typeof init.body !== 'string' ? JSON.stringify(init.body) : init.body
               })
-              : await fetch(url, {
+              : fetch(url, {
                 ...init,
                 credentials: 'same-origin',
                 cache: 'no-store',
                 signal: routeController.signal,
                 headers: authHeaders({ Accept: 'application/json', ...(hasBody ? { 'Content-Type': 'application/json' } : {}), ...(init.headers || {}) }),
                 body: hasBody && typeof init.body !== 'string' ? JSON.stringify(init.body) : init.body
-              });
+              }), routeController.signal);
             const text = await response.text();
             let json = {};
             if (text) {
@@ -2922,18 +3010,66 @@
     const login = $('sessionRecoveryLogin');
     if (!recovery || !login || recovery.dataset.bound === 'true') return;
     recovery.dataset.bound = 'true';
+    const dialog = recovery.querySelector('.session-recovery-dialog');
+    let glassRenderer = null;
+    const mountGlass = () => {
+      if (glassRenderer || !dialog || !appWallpaper) return;
+      const factory = window.DWRTSampledLiquidGlass;
+      if (!factory || typeof factory.create !== 'function') return;
+      glassRenderer = factory.create({
+        root: dialog,
+        backgroundElement: appWallpaper,
+        backgroundSrc: appWallpaper.currentSrc || appWallpaper.getAttribute('src') || '',
+        options: {
+          mode: 'shader',
+          cornerRadius: 20,
+          displacementScale: 80,
+          baseBlur: 3.2,
+          blurAmount: 0,
+          saturation: 140,
+          aberrationIntensity: 2,
+          neutralDensity: 0.06,
+          neutralColor: '10 16 25',
+          preserveCenter: true,
+          borderWidth: 1,
+          opacity: 1,
+          highlight: 0.28,
+          borderColor: '#25FFFFFF',
+          mapResolution: 0.25,
+          trackMotion: false,
+          trackScroll: false
+        }
+      });
+    };
+    const unmountGlass = () => {
+      glassRenderer?.destroy?.();
+      glassRenderer = null;
+    };
     const show = (detail = {}) => {
-      login.href = detail.loginUrl || window.DWRT_SESSION?.loginUrl?.() || '/login/';
+      login.dataset.loginUrl = detail.loginUrl || window.DWRT_SESSION?.loginUrl?.() || '/login/';
+      if (!recovery.hidden && recovery.classList.contains('is-open')) return;
       window.DWRT_UI_KIT?.unmount(recovery);
       recovery.hidden = false;
       recovery.classList.add('is-open');
       window.DWRT_UI_KIT?.mount(recovery);
+      mountGlass();
     };
     const hide = () => {
+      unmountGlass();
       recovery.classList.remove('is-open');
       recovery.hidden = true;
+      login.disabled = false;
+      login.removeAttribute('aria-busy');
       window.DWRT_UI_KIT?.unmount(recovery);
     };
+    login.addEventListener('click', () => {
+      if (login.disabled) return;
+      const loginUrl = login.dataset.loginUrl || window.DWRT_SESSION?.loginUrl?.() || '/login/';
+      login.disabled = true;
+      login.setAttribute('aria-busy', 'true');
+      window.DWRT_SESSION?.clear?.();
+      location.href = loginUrl;
+    });
     window.addEventListener('dwrt-session-required', (event) => show(event.detail || {}));
     window.addEventListener('dwrt-session-restored', hide);
     if (window.DWRT_SESSION?.required) show({ loginUrl: window.DWRT_SESSION.loginUrl() });
@@ -2974,21 +3110,51 @@
     return payload;
   }
 
+  // 全局 API 并发闸门:后端 webd 串行处理请求,页面挂载时 6-8 个并发请求会
+  // 相互排队并触发超线性的拥塞惩罚(实测串行 20-130ms/个,8 并发时 2-5.7s/个)。
+  // 客户端限流后请求逐个快速返回,页面渐进渲染,整体反而更快。
+  const API_LIMITER_MAX = 2;
+  let apiLimiterActive = 0;
+  const apiLimiterWaiters = [];
+  async function withApiSlot(run, signal) {
+    if (apiLimiterActive >= API_LIMITER_MAX) {
+      await new Promise((resolve) => {
+        const waiter = () => resolve();
+        apiLimiterWaiters.push(waiter);
+        if (signal) signal.addEventListener('abort', () => {
+          const index = apiLimiterWaiters.indexOf(waiter);
+          if (index >= 0) apiLimiterWaiters.splice(index, 1);
+          resolve();
+        }, { once: true });
+      });
+    }
+    apiLimiterActive += 1;
+    try {
+      return await run();
+    } finally {
+      apiLimiterActive -= 1;
+      const next = apiLimiterWaiters.shift();
+      if (next) next();
+    }
+  }
+  window.DWRT_API_LIMITER = { run: withApiSlot };
+
   async function fetchDashboardResource(name, url, retry = true, signal = undefined) {
     try {
       const requestUrl = `${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`;
-      const response = window.DWRT_SESSION
-        ? await window.DWRT_SESSION.fetch(requestUrl, {
+      if (signal && signal.aborted) throw Object.assign(new Error(`${name}: aborted`), { name: 'AbortError' });
+      const response = await withApiSlot(() => window.DWRT_SESSION
+        ? window.DWRT_SESSION.fetch(requestUrl, {
           credentials: 'same-origin',
           cache: 'no-store',
           signal
         }, retry)
-        : await fetch(requestUrl, {
+        : fetch(requestUrl, {
         credentials: 'same-origin',
         cache: 'no-store',
         headers: authHeaders(),
         signal
-        });
+        }), signal);
       const text = await response.text();
       let json = {};
       if (text) {
@@ -3026,18 +3192,18 @@
     if (!registry || registry.__dwrtConfigured) return registry || null;
     registry.__dwrtConfigured = true;
     registry.fetcher = async (url, request = {}, retry = true) => {
-      const response = window.DWRT_SESSION
-        ? await window.DWRT_SESSION.fetch(url, {
+      const response = await withApiSlot(() => window.DWRT_SESSION
+        ? window.DWRT_SESSION.fetch(url, {
           ...request,
           credentials: 'same-origin',
           cache: request.cache || 'no-store'
         }, retry)
-        : await fetch(url, {
+        : fetch(url, {
         ...request,
         credentials: 'same-origin',
         cache: request.cache || 'no-store',
         headers: authHeaders(request.headers)
-        });
+        }), request.signal);
       if (!window.DWRT_SESSION && response.status === 401 && retry && await refreshAuthToken()) {
         return registry.fetcher(url, request, false);
       }
@@ -3060,7 +3226,16 @@
       ['policy.objects', '/api/v1/policy-engine/objects', 'webd.policy-engine', 5000, { total: 'count' }],
       ['policy.regions', '/api/v1/policy-engine/zones', 'webd.policy-engine', 5000, { total: 'count' }],
       ['policy.zoneMatrix', '/api/v1/policy-engine/zone-matrix', 'webd.policy-engine', 5000, { policy_count: 'count' }],
-      ['policy.table', '/api/v1/policy-engine/policy-table?include_default=1', 'webd.policy-engine', 3000, { total: 'count' }]
+      ['policy.table', '/api/v1/policy-engine/policy-table?include_default=1', 'webd.policy-engine', 3000, { total: 'count' }],
+      ['flow.engineStatus', '/api/v1/flowd/status', 'webd.flowd', 5000, { qos_classes: 'count', apply_jobs: 'count' }],
+      ['flow.engineRuntime', '/api/v1/flowd/runtime', 'webd.flowd', 5000, { uptime: 's', connections: 'count' }],
+      ['flow.engineSettings', '/api/v1/flowd/settings', 'webd.flowd', 10000, {}],
+      ['flow.qosSettings', '/api/v1/flowd/qos/settings', 'webd.flowd', 10000, { headroom_pct: 'percent' }],
+      ['flow.qosClasses', '/api/v1/flowd/qos/classes', 'webd.flowd', 10000, { guarantee_pct: 'percent', ceiling_pct: 'percent', latency_ms: 'ms' }],
+      ['flow.applyJobs', '/api/v1/flowd/apply-jobs', 'webd.flowd', 5000, { total: 'count' }],
+      ['flow.wanCapacity', '/api/v1/flowd/wan-capacity', 'webd.flowd', 10000, { total: 'count' }],
+      ['flow.wanHealth', '/api/v1/flowd/wan-health', 'webd.flowd', 3000, { latency_ms: 'ms', loss_pct: 'percent', down_rate: 'bytes/s', up_rate: 'bytes/s' }],
+      ['flow.smartControl', '/api/v1/flow-control', 'webd.flow-control', 5000, { total_download_mbps: 'Mbit/s', total_upload_mbps: 'Mbit/s', latency_target_ms: 'ms' }]
     ].forEach(([key, url, owner, ttlMs, units]) => registry.define(key, { url, owner, ttlMs, units }));
     registry.define('appearance.settings', {
       url: '/api/v1/system/basic',
@@ -3270,14 +3445,6 @@
     ].map((value) => firstText(value)).filter(Boolean).join(' ');
   }
 
-  // Bundled carrier marks used when the backend does not carry an explicit logo.
-  const CARRIER_LOGOS = {
-    unicom: '/static/images/logo/china-unicom.svg',
-    mobile: '/static/images/logo/china-mobile.svg',
-    telecom: '/static/images/logo/china-telecom.svg',
-    cernet: '/static/images/logo/china-cernet.svg'
-  };
-
   function carrierMeta(wan) {
     const key = carrierKey(carrierEvidence(wan));
     const labels = {
@@ -3287,9 +3454,15 @@
       cernet: '教育网',
       unknown: firstText(wan.note, wan.carrier_name, wan.carrier, wan.isp, wan.provider, wan.operator, '运营商未配置')
     };
+    const logos = {
+      unicom: '/static/images/logo/china-unicom.svg',
+      mobile: '/static/images/logo/china-mobile.svg',
+      telecom: '/static/images/logo/china-telecom.svg',
+      cernet: '/static/images/logo/china-cernet.svg'
+    };
     const explicitLogoRaw = firstText(wan.carrier_logo, wan.carrier_svg, wan.logo, wan.image, wan.icon);
     const explicitLogo = window.DWRT_DEVICE_IMAGES?.normalizeUrl?.(explicitLogoRaw) || explicitLogoRaw;
-    return { key, label: labels[key] || labels.unknown, logo: explicitLogo || CARRIER_LOGOS[key] || '' };
+    return { key, label: labels[key] || labels.unknown, logo: explicitLogo || logos[key] || '' };
   }
 
   function loadTopologyPreferences() {
@@ -3534,7 +3707,7 @@
     }).join('');
     return `<section class="topology-property-card topology-port-card">
       <div class="topology-port-device">
-        <span class="topology-port-device-image" aria-hidden="true"><img src="/static/images/gateway-wide.svg" alt=""></span>
+        <span class="topology-port-device-image" aria-hidden="true"><img src="/static/images/gateway-wide.png" alt=""></span>
         <strong>${escapeHtml(topologyNodeTitle(node))}</strong>
       </div>
       <div class="topology-port-grid" aria-label="端口状态">${portCells}</div>
@@ -3910,7 +4083,7 @@
   }
 
   function topologyInfraDeviceImage(gateway = {}) {
-    const image = firstText(gateway.image, gateway.icon, gateway.device_image, gateway.model_image, '/static/images/gateway-wide.svg');
+    const image = firstText(gateway.image, gateway.icon, gateway.device_image, gateway.model_image, '/static/images/gateway-wide.png');
     return `<img src="${escapeHtml(image)}" alt="${escapeHtml(firstText(gateway.name, 'Gateway'))}">`;
   }
 
@@ -3979,7 +4152,7 @@
   }
 
   function topologyInfraGatewayImage(gateway = {}) {
-    return firstText(gateway.image, gateway.icon, gateway.device_image, gateway.model_image, '/static/images/gateway-wide.svg');
+    return firstText(gateway.image, gateway.icon, gateway.device_image, gateway.model_image, '/static/images/gateway-wide.png');
   }
 
   function topologyInfraLinkSpeed(item = {}) {
@@ -4024,7 +4197,7 @@
       cpu: metrics.cpu ? topologyInfraPercent(metrics.cpu) : '',
       memory: metrics.mem ? topologyInfraPercent(metrics.mem) : '',
       image: topologyInfraGatewayImage(gateway),
-      managedDevice: true,
+      unifiDevice: true,
       infrastructure_kind: 'gateway'
     }];
     const edges = [];
@@ -4276,7 +4449,7 @@
       state.topology.infrastructureModel = null;
       clearTopologyCanvasLayers();
       if (topologyContentContainer) topologyContentContainer.hidden = true;
-      topologyInfrastructureEmpty.classList.remove('is-ready', 'is-topology-canvas');
+      topologyInfrastructureEmpty.classList.remove('is-ready', 'is-unifi-canvas');
       topologyInfrastructureEmpty.hidden = false;
       topologyInfrastructureEmpty.innerHTML = `<strong>正在读取基础设施</strong><span>${escapeHtml(state.topology.infrastructureError || '等待 /api/v1/topology/infrastructure 返回真实 infrastructure contract。')}</span>`;
       return false;
@@ -4286,14 +4459,14 @@
     if (!model.valid) {
       clearTopologyCanvasLayers();
       if (topologyContentContainer) topologyContentContainer.hidden = true;
-      topologyInfrastructureEmpty.classList.remove('is-ready', 'is-topology-canvas');
+      topologyInfrastructureEmpty.classList.remove('is-ready', 'is-unifi-canvas');
       topologyInfrastructureEmpty.hidden = false;
       topologyInfrastructureEmpty.innerHTML = `<strong>基础设施暂不可绘制</strong><span>${escapeHtml(model.reason || '后端返回的数据缺少 WAN / 网关 / 端口链路。')}</span>`;
       return false;
     }
     clearTopologyCanvasLayers();
     if (topologyContentContainer) topologyContentContainer.hidden = true;
-    topologyInfrastructureEmpty.classList.add('is-ready', 'is-topology-canvas');
+    topologyInfrastructureEmpty.classList.add('is-ready', 'is-unifi-canvas');
     topologyInfrastructureEmpty.hidden = false;
     topologyInfrastructureEmpty.innerHTML = topologyInfraCanvasHtml(contract, model);
     if (!state.topology.transformSet) state.topology.transform = { x: 0, y: 0, k: 1 };
@@ -4534,7 +4707,7 @@
   }
 
   function renderCurrentTopologyModel() {
-    const renderer = window.DWRT_TOPOLOGY;
+    const renderer = window.DWRT_UNIFI_TOPOLOGY;
     syncTopologyControls();
     if (state.topology.view === 'infrastructure') {
       if (topologyEmpty) topologyEmpty.hidden = true;
@@ -4820,7 +4993,7 @@
   }
 
   function renderTopologyFromData(topologyData, flowData = null) {
-    const renderer = window.DWRT_TOPOLOGY;
+    const renderer = window.DWRT_UNIFI_TOPOLOGY;
     if (!renderer || typeof renderer.normalize !== 'function' || typeof renderer.render !== 'function') {
       topologyShell?.classList.add('is-locked');
       if (topologyEmpty) topologyEmpty.hidden = false;
@@ -4947,7 +5120,7 @@
     if (!topologyCanvas || !zoomTarget) return;
     const rect = topologyCanvas.getBoundingClientRect();
     const current = state.topology.transform;
-    const zoomLimits = window.DWRT_TOPOLOGY?.C?.ku || { min: 0.3, max: 2.5 };
+    const zoomLimits = window.DWRT_UNIFI_TOPOLOGY?.C?.ku || { min: 0.3, max: 2.5 };
     const normalizedDelta = Math.max(-90, Math.min(90, Number(delta) || 0));
     const factor = Number.isFinite(multiplier) ? multiplier : Math.exp(-normalizedDelta * 0.0026);
     const nextK = Math.max(zoomLimits.min, Math.min(zoomLimits.max, current.k * factor));
@@ -5052,7 +5225,7 @@
     if (topologyToggleLayer) topologyToggleLayer.innerHTML = '';
     renderTopologyDetailDrawer();
     syncTopologyControls();
-    if (!window.DWRT_TOPOLOGY) {
+    if (!window.DWRT_UNIFI_TOPOLOGY) {
       if (topologyStatus) topologyStatus.textContent = '正在加载拓扑渲染器';
     }
     try {
@@ -5246,18 +5419,18 @@
         : dashboardRoute
           ? '设备详情卡片读取 webd/jmxd 真实状态；缺失的后端能力会显示为空态，不使用演示数据。'
           : topologyRoute
-            ? '拓扑图仅在真实拓扑合同可用时显示。'
+            ? '拓扑图仅在真实 UniFi 合同可用时显示。'
             : lineStatusRoute
               ? '线路状态页展示真实 WAN 负载、健康与 IPv6 状态。'
               : clientDetailsRoute
                 ? '终端详情按旧版信息架构展示在线/离线、IPv6、速率、连接与识别信息。'
                 : insightsRoute
-                  ? '洞察页展示真实流量、风险、地区与筛选条件。'
+                  ? '洞察页按 UniFi Insights / Flows 信息架构展示真实流量、风险、地区与筛选条件。'
               : monitorDataConfig
                 ? monitorDataConfig.description
                 : routeModuleEntry
                   ? currentKey === 'policy-table'
-                    ? '策略表展示真实策略；筛选在抽屉中打开，不展示假数据。'
+                    ? '策略表按 UniFi Policy Table 信息架构展示真实策略；筛选在抽屉中打开，不展示假数据。'
                     : currentKey === 'system-general'
                       ? '系统常规页按 luci-app-dreamingwrt 对应页面的信息架构迁移，只替换为当前玻璃材质。'
                     : currentKey === 'system-flash'
@@ -5637,7 +5810,7 @@
     '.user-auth-web-access > div',
     '.user-auth-web-savebar',
     '.wifi-channel-band',
-    '.wifi-radio-label',
+    '.wifi-unifi-label',
     '.wifi-width-picker',
     '.wifi-width-picker fieldset',
     '.wifi-setting-row',
@@ -6109,6 +6282,7 @@
       displacementMapLabel: '',
       mapRequestToken: 0,
       mapTimer: 0,
+      mapSettlePending: false,
       materialVersion: -1,
       reconcileCount: 0
     };
@@ -6352,11 +6526,15 @@
     scope.mapTimer = window.setTimeout(() => {
       scope.mapTimer = 0;
       if (scope.mapRequestToken !== mapRequestToken || scope.signature !== signature
-          || state.liquidGlass.pageRouteToken !== routeToken || !scope.sampler.isConnected) return;
+          || state.liquidGlass.pageRouteToken !== routeToken || !scope.sampler.isConnected) {
+        finishPageGlassMapSettle(scope);
+        return;
+      }
       pageGlassDisplacementMap(geometry).then((displacementMap) => {
         if (scope.mapRequestToken !== mapRequestToken || scope.signature !== signature
             || state.liquidGlass.pageRouteToken !== routeToken || !scope.sampler.isConnected) {
           trimPageGlassMapCache();
+          finishPageGlassMapSettle(scope);
           return;
         }
         if (displacementMap.url && typeof scope.renderer.setDisplacementMap === 'function') {
@@ -6364,8 +6542,36 @@
           scope.displacementMapLabel = displacementMap.label;
         }
         trimPageGlassMapCache();
+        finishPageGlassMapSettle(scope);
       });
     }, 0);
+  }
+
+  // 路由过渡收尾时,几何/遮罩已更新但位移图还在异步生成:若此刻就摘掉过渡类,
+  // 采样器会先按旧位移图光栅一次、图到后再光栅一次(两次 200-300ms 的主线程
+  // 渲染停顿)。将过渡类的移除推迟到所有 scope 的位移图应用完毕,合并为一次光栅。
+  function finishPageGlassMapSettle(scope) {
+    if (scope) scope.mapSettlePending = false;
+    releasePageGlassRouteTransition();
+  }
+
+  function releasePageGlassRouteTransition(force = false) {
+    const release = state.liquidGlass.pendingTransitionRelease;
+    if (!release) return;
+    if (release.token !== state.liquidGlass.pageRouteToken) {
+      state.liquidGlass.pendingTransitionRelease = null;
+      return;
+    }
+    if (!force) {
+      for (const scope of state.liquidGlass.pageScopes.values()) {
+        if (scope.mapSettlePending) return;
+      }
+    }
+    window.clearTimeout(release.timer);
+    state.liquidGlass.pendingTransitionRelease = null;
+    state.liquidGlass.pageRouteTransition = false;
+    appShell.classList.remove('page-glass-route-transition');
+    PAGE_GLASS_SCOPES.forEach((scopeKey) => setPageGlassScopeInteracting(scopeKey, false));
   }
 
   function cancelPageGlassIdleWork() {
@@ -6407,9 +6613,20 @@
       if (!state.liquidGlass.pageScrollTimers.has(scope)) setPageGlassScopeInteracting(scope, false);
     });
     if (routeToken && routeToken === state.liquidGlass.pageRouteToken) {
-      state.liquidGlass.pageRouteTransition = false;
-      appShell.classList.remove('page-glass-route-transition');
-      PAGE_GLASS_SCOPES.forEach((scope) => setPageGlassScopeInteracting(scope, false));
+      let mapPending = false;
+      for (const scope of state.liquidGlass.pageScopes.values()) {
+        if (scope.mapSettlePending) { mapPending = true; break; }
+      }
+      if (state.liquidGlass.pendingTransitionRelease?.timer) {
+        window.clearTimeout(state.liquidGlass.pendingTransitionRelease.timer);
+      }
+      const release = { token: routeToken, timer: 0 };
+      state.liquidGlass.pendingTransitionRelease = release;
+      if (mapPending) {
+        release.timer = window.setTimeout(() => releasePageGlassRouteTransition(true), 400);
+      } else {
+        releasePageGlassRouteTransition(true);
+      }
     }
   }
 
@@ -6546,6 +6763,7 @@
           scope.mapTimer = 0;
           scope.sampler.hidden = true;
           scope.signature = '';
+          scope.mapSettlePending = false;
           return;
         }
         if (scope.materialVersion !== state.liquidGlass.materialVersion) {
@@ -6568,6 +6786,7 @@
           scope.sampler.style.webkitMaskImage = mask;
           scope.renderer.measure?.();
           scope.signature = signature;
+          scope.mapSettlePending = state.liquidGlass.pageRouteTransition;
           schedulePageGlassDisplacementMap(scope, geometry, signature);
         }
         scope.sampler.hidden = false;
@@ -6613,7 +6832,12 @@
       scope.mapRequestToken += 1;
       window.clearTimeout(scope.mapTimer);
       scope.mapTimer = 0;
+      scope.mapSettlePending = false;
     });
+    if (state.liquidGlass.pendingTransitionRelease) {
+      window.clearTimeout(state.liquidGlass.pendingTransitionRelease.timer);
+      state.liquidGlass.pendingTransitionRelease = null;
+    }
     state.liquidGlass.pageRouteTransition = true;
     state.liquidGlass.pageRouteStartedAt = performance.now();
     appShell.classList.add('page-glass-route-transition');
@@ -6636,10 +6860,14 @@
       if (token !== state.liquidGlass.pageRouteToken) return;
       window.clearTimeout(state.liquidGlass.pageRouteTimer);
       const elapsed = performance.now() - state.liquidGlass.pageRouteStartedAt;
+      // 采样器 SVG filter 重光栅是一次 200-300ms 的主线程渲染停顿(实测 LoAF)。
+      // 把它推迟到菜单动画(520ms clip-path)结束之后:切换动画期间停留在
+      // backdrop-filter 回退材质上(流畅),连续快速切换时每次点击都会重置
+      // token,重光栅被一路顺延,直到用户停下来才发生一次。
       state.liquidGlass.pageRouteTimer = window.setTimeout(() => {
         state.liquidGlass.pageRouteTimer = 0;
         queuePageGlassIdleReconcile(PAGE_GLASS_SCOPES, token);
-      }, elapsed >= 700 ? 0 : 120);
+      }, Math.max(96, 560 - elapsed));
     }));
   }
 
@@ -7010,7 +7238,7 @@
     }
     const correct = async () => {
       try {
-        const response = await readRuntimeJson('/api/v1/bootstrap?appearance=1');
+        const response = await fetchBootstrapShared();
         const bootstrap = response && response.data ? response.data : response;
         const appearance = bootstrap && bootstrap.appearance && typeof bootstrap.appearance === 'object' ? bootstrap.appearance : {};
         const material = appearance.login && typeof appearance.login === 'object' ? appearance.login : appearance;
@@ -7435,11 +7663,100 @@
     }).catch(() => {}).finally(scheduleIdleRouteWarmup);
   }
 
+  // Chromium 将 svg 用作 <img> 源时(SVGImage)由主线程绘制,dashboard/洞察等页的
+  // logo 图标会在挂载后造成多帧 150-450ms 的不可归因渲染停顿(实测隐藏这些 <img>
+  // 后停顿归零)。这里把 svg <img> 离屏栅格化为等视觉的 PNG blob 并替换 src,
+  // 之后的绘制走合成器位图路径,不再阻塞主线程。
+  const svgImageBitmapCache = new Map();
+  const svgImageBitmapPending = new Map();
+
+  function isSvgImageSource(src) {
+    return /\.svg(?:\?|$)/i.test(src) || /^data:image\/svg/i.test(src);
+  }
+
+  function rasterizeSvgImageUrl(url) {
+    if (svgImageBitmapCache.has(url)) return Promise.resolve(svgImageBitmapCache.get(url));
+    const pending = svgImageBitmapPending.get(url);
+    if (pending) return pending;
+    const promise = new Promise((resolve) => {
+      const image = new Image();
+      image.decoding = 'async';
+      image.onload = () => {
+        try {
+          const sourceW = Math.max(1, image.naturalWidth || 64);
+          const sourceH = Math.max(1, image.naturalHeight || 64);
+          const targetMax = Math.min(512, 128 * Math.min(3, window.devicePixelRatio || 1));
+          const scale = Math.min(8, Math.max(1, targetMax / Math.max(sourceW, sourceH)));
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(sourceW * scale));
+          canvas.height = Math.max(1, Math.round(sourceH * scale));
+          const context = canvas.getContext('2d');
+          if (!context) {
+            resolve('');
+            return;
+          }
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          canvas.toBlob((blob) => {
+            const blobUrl = blob ? URL.createObjectURL(blob) : '';
+            svgImageBitmapCache.set(url, blobUrl);
+            resolve(blobUrl);
+          }, 'image/png');
+        } catch (_) {
+          resolve('');
+        }
+      };
+      image.onerror = () => {
+        svgImageBitmapCache.set(url, '');
+        resolve('');
+      };
+      image.src = url;
+    }).finally(() => svgImageBitmapPending.delete(url));
+    svgImageBitmapPending.set(url, promise);
+    return promise;
+  }
+
+  function upgradeSvgImageElement(img) {
+    if (!(img instanceof HTMLImageElement)) return;
+    const src = img.getAttribute('src') || '';
+    if (!src || !isSvgImageSource(src)) return;
+    const cached = svgImageBitmapCache.get(src);
+    if (cached !== undefined) {
+      if (cached) img.src = cached;
+      return;
+    }
+    rasterizeSvgImageUrl(src).then((blobUrl) => {
+      if (!blobUrl || !img.isConnected) return;
+      if ((img.getAttribute('src') || '') !== src) return;
+      img.src = blobUrl;
+    });
+  }
+
+  function upgradeSvgImagesWithin(node) {
+    if (!(node instanceof Element)) return;
+    if (node instanceof HTMLImageElement) {
+      upgradeSvgImageElement(node);
+      return;
+    }
+    node.querySelectorAll('img').forEach(upgradeSvgImageElement);
+  }
+
+  function initSvgImageBitmapObserver() {
+    if (typeof MutationObserver === 'undefined' || !appShell) return;
+    const observer = new MutationObserver((records) => {
+      records.forEach((record) => {
+        if (record.addedNodes) record.addedNodes.forEach(upgradeSvgImagesWithin);
+      });
+    });
+    observer.observe(appShell, { childList: true, subtree: true });
+    upgradeSvgImagesWithin(appShell);
+  }
+
   function main() {
     configureDataRegistry();
     initSessionRecovery();
     ensureMenuGlassRenderer();
     initPageGlassObserver();
+    initSvgImageBitmapObserver();
     setupActionIcons();
     initEvents();
     loadPageFooterRelease().catch(() => {});

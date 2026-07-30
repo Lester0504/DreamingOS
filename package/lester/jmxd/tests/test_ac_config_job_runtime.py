@@ -33,8 +33,8 @@ def static_contract() -> None:
         "ac_db_config_jobs_recover(ac_now_s())",
     ):
         assert token in db, f"missing config job contract: {token}"
-    assert "#define AC_SCHEMA_VERSION 11" in db
-    assert "#define AC_SCHEMA_VERSION 11" in internal
+    assert "#define AC_SCHEMA_VERSION 12" in db
+    assert "#define AC_SCHEMA_VERSION 12" in internal
     # No ubus/REST surface may reach the config job store before the W3
     # orchestration lands behind the capability gates.
     ubus = (ROOT / "src/ac/ac_ubus.c").read_text(encoding="utf-8")

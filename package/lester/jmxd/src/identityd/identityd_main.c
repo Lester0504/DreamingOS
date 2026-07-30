@@ -23,8 +23,11 @@ int current_log_level = LOG_LEVEL_WARN;
 
 static struct uloop_timeout identity_tick_timer;
 static int identity_collector_active;
+static int identity_collector_requested;
 static char identity_mode[32] = "unavailable";
 static time_t identity_next_collect_at;
+static time_t identity_last_tick_at;
+static uint64_t identity_tick_count;
 
 #define IDENTITY_CONFIG_DB "/etc/dreamingwrt/config.db"
 #define IDENTITY_RUNTIME_DIR "/run/dreamingwrt"
@@ -66,7 +69,7 @@ out:
 static void identity_runtime_write(void)
 {
     char tmp[256];
-    char payload[512];
+    char payload[1024];
     int fd;
     int len;
 
@@ -74,11 +77,19 @@ static void identity_runtime_write(void)
         return;
     snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", IDENTITY_RUNTIME_STATE, (long)getpid());
     len = snprintf(payload, sizeof(payload),
-        "{\"ok\":true,\"service\":\"dreamingwrt-identityd\","
-        "\"mode\":\"%s\",\"collector_active\":%s,"
-        "\"device_identification_active\":%s,\"updated_at\":%lld}\n",
-        identity_mode, identity_collector_active ? "true" : "false",
-        identity_collector_active ? "true" : "false", (long long)time(NULL));
+        "{\"ok\":true,\"service\":\"dreamingwrt-identityd\",\"pid\":%ld,"
+        "\"mode\":\"%s\",\"collector_requested\":%s,"
+        "\"collector_ready\":%s,\"collector_active\":%s,"
+        "\"device_identification_active\":%s,\"listeners_ready\":%d,"
+        "\"tick_count\":%llu,\"last_tick_at\":%lld,\"updated_at\":%lld}\n",
+        (long)getpid(), identity_mode,
+        identity_collector_requested ? "true" : "false",
+        jmx_identity_collector_ready() ? "true" : "false",
+        identity_collector_active ? "true" : "false",
+        identity_collector_active ? "true" : "false",
+        jmx_identity_collector_listener_count(),
+        (unsigned long long)identity_tick_count,
+        (long long)identity_last_tick_at, (long long)time(NULL));
     if (len <= 0 || (size_t)len >= sizeof(payload))
         return;
     fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -103,19 +114,19 @@ static void identity_mode_reconcile(void)
     if (identity_mode_load(mode, sizeof(mode)) != 0)
         snprintf(mode, sizeof(mode), "%s", "unavailable");
     should_collect = !strcmp(mode, "device_and_traffic");
+    identity_collector_requested = should_collect;
     if (should_collect && !identity_collector_active) {
-        jmx_identity_collector_init();
-        identity_collector_active = 1;
-        identity_next_collect_at = time(NULL) + 10;
+        identity_collector_active = jmx_identity_collector_init() == 0 &&
+                                    jmx_identity_collector_ready();
+        identity_next_collect_at = identity_collector_active ? time(NULL) + 10 : 0;
     } else if (!should_collect && identity_collector_active) {
         jmx_identity_collector_close();
         identity_collector_active = 0;
         identity_next_collect_at = 0;
     }
-    if (strcmp(identity_mode, mode) || old_active != identity_collector_active) {
+    if (strcmp(identity_mode, mode) || old_active != identity_collector_active)
         snprintf(identity_mode, sizeof(identity_mode), "%s", mode);
-        identity_runtime_write();
-    }
+    identity_runtime_write();
 }
 
 static void identity_handle_signal(int signo)
@@ -140,7 +151,10 @@ static void identity_tick_cb(struct uloop_timeout *t)
     identity_mode_reconcile();
     if (identity_collector_active && now >= identity_next_collect_at) {
         jmx_identity_collector_tick();
+        identity_tick_count++;
+        identity_last_tick_at = now;
         identity_next_collect_at = now + 10;
+        identity_runtime_write();
     }
     uloop_timeout_set(t, 2000);
 }

@@ -269,8 +269,8 @@ html[data-adaptive-foreground="light"] {
   --dashboard-shadow: var(--adaptive-text-shadow) !important;
   --dwrt-kit-text: var(--adaptive-ink) !important;
   --dwrt-kit-muted: var(--adaptive-muted) !important;
-  --dwrt-kit-datatable-text: var(--adaptive-ink) !important;
-  --dwrt-kit-datatable-muted: var(--adaptive-muted) !important;
+  --dwrt-kit-ikuai-text: var(--adaptive-ink) !important;
+  --dwrt-kit-ikuai-muted: var(--adaptive-muted) !important;
   --text-primary: var(--adaptive-ink) !important;
   --text-secondary: var(--adaptive-text) !important;
   --text-muted: var(--adaptive-muted) !important;

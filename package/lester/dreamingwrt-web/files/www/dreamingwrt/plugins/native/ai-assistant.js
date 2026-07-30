@@ -16,7 +16,7 @@ export function mount(context = {}) {
     return { name, ok, data: json?.data ?? json, raw: json, error: ok ? null : new Error(apiErrorText(json, response.statusText)) };
   });
 
-  const VERSION = '20260719-30';
+  const VERSION = '20260727-ai-stream-01';
   const INSTANCE_ID = `ai-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
   const MODULE_CLASS = 'ai-assistant-route-host';
   const ACTIVE_CONVERSATION_KEY = 'dreamingwrt.ai.activeConversation';
@@ -25,8 +25,16 @@ export function mount(context = {}) {
   const ENDPOINTS = {
     config: '/api/v1/ai/config',
     models: '/api/v1/ai/models',
+    modelsSync: '/api/v1/ai/models/sync',
+    providerTest: '/api/v1/ai/provider/test',
     history: '/api/v1/ai/history',
     chat: '/api/v1/ai/chat',
+    chatStream: '/api/v1/ai/chat/stream',
+    tools: '/api/v1/ai/tools',
+    toolAuthorize: '/api/v1/ai/tool-authorize',
+    toolResume: '/api/v1/ai/tool-resume',
+    toolResumeStream: '/api/v1/ai/tool-resume/stream',
+    responses: '/api/v1/ai/responses',
     attachments: '/api/v1/ai/attachments',
     oauthProviders: '/api/v1/ai/oauth/providers',
     oauthStatus: '/api/v1/ai/oauth/status',
@@ -128,6 +136,21 @@ export function mount(context = {}) {
     saving: false,
     sending: false,
     syncingModels: false,
+    testingProvider: false,
+    tools: [],
+    toolsError: '',
+    stream: {
+      active: false,
+      responseId: '',
+      messageId: '',
+      cancelling: false,
+      controller: null
+    },
+    toolActivity: [],
+    pendingAuthorizations: [],
+    resume: null,
+    authorizing: 0,
+    resuming: false,
     oauth: {
       available: false,
       catalog: [],
@@ -362,7 +385,24 @@ export function mount(context = {}) {
         reasoning_effort_supported: caps.reasoning_effort_supported !== false,
         reasoning_effort_values: asArray(caps.reasoning_effort_values).map(String),
         attachment_ids: caps.attachment_ids === true,
-        attachment_upload_endpoint: firstText(caps.attachment_upload_endpoint, '/api/v1/ai/attachments')
+        attachment_upload_endpoint: firstText(caps.attachment_upload_endpoint, '/api/v1/ai/attachments'),
+        chat_runtime: caps.chat_runtime === true,
+        streaming: caps.streaming === true,
+        streaming_ready: caps.streaming_ready === true,
+        streaming_endpoint: firstText(caps.streaming_endpoint, ENDPOINTS.chatStream),
+        response_cancel: caps.response_cancel === true,
+        response_cancel_endpoint_template: firstText(caps.response_cancel_endpoint_template, `${ENDPOINTS.responses}/{response_id}`),
+        tool_execution_loop: caps.tool_execution_loop === true,
+        tool_execution_loop_streaming: caps.tool_execution_loop_streaming === true,
+        tool_authorization: caps.tool_authorization === true,
+        tool_authorization_resume: caps.tool_authorization_resume === true,
+        tool_authorization_resume_streaming: caps.tool_authorization_resume_streaming === true,
+        tool_resume_endpoint: firstText(caps.tool_resume_endpoint, ENDPOINTS.toolResume),
+        tool_resume_stream_endpoint: firstText(caps.tool_resume_stream_endpoint, ENDPOINTS.toolResumeStream),
+        tool_result_feedback: caps.tool_result_feedback === true,
+        max_tool_rounds: Math.max(0, Math.round(firstNumber(caps.max_tool_rounds, 0))),
+        provider_models_sync: caps.provider_models_sync === true,
+        provider_test: caps.provider_test === true
       },
       oauth: {
         available: oauth.available === true,
@@ -556,6 +596,443 @@ export function mount(context = {}) {
     return firstText(state.current.tool_policy, state.config.tool_policy, 'confirm_medium');
   }
 
+  function streamingReady() {
+    const caps = state.config.capabilities;
+    return Boolean(caps.streaming && caps.streaming_ready && streamEndpoint());
+  }
+
+  function streamEndpoint() {
+    return firstText(state.config.capabilities.streaming_endpoint, ENDPOINTS.chatStream);
+  }
+
+  function resumeEndpoint(streaming) {
+    const caps = state.config.capabilities;
+    return streaming
+      ? firstText(caps.tool_resume_stream_endpoint, ENDPOINTS.toolResumeStream)
+      : firstText(caps.tool_resume_endpoint, ENDPOINTS.toolResume);
+  }
+
+  function cancelEndpoint(responseId) {
+    const id = firstText(responseId);
+    if (!id) return '';
+    const template = firstText(state.config.capabilities.response_cancel_endpoint_template);
+    if (template.includes('{response_id}')) return template.replace('{response_id}', encodeURIComponent(id));
+    return `${ENDPOINTS.responses}/${encodeURIComponent(id)}`;
+  }
+
+  function toolLabel(id) {
+    const tool = state.tools.find((item) => item.id === firstText(id));
+    return firstText(tool?.label, tool?.title, id, '未知工具');
+  }
+
+  function toolDefinition(id) {
+    return state.tools.find((item) => item.id === firstText(id)) || null;
+  }
+
+  function normalizeTool(value = {}) {
+    return {
+      id: firstText(value.id, value.tool, value.name),
+      label: firstText(value.label, value.title, value.display_name, value.id, value.tool, value.name),
+      description: firstText(value.description, value.summary),
+      risk_level: firstText(value.risk_level, value.risk, 'low'),
+      category: firstText(value.category, value.group),
+      enabled: value.enabled !== false
+    };
+  }
+
+  function riskLabel(value) {
+    return ({ low: '低风险', medium: '中风险', high: '高风险', blocked: '已禁止' })[firstText(value, 'low')] || firstText(value, 'low');
+  }
+
+  function riskTone(value) {
+    const risk = firstText(value, 'low');
+    if (risk === 'high' || risk === 'blocked') return 'danger';
+    if (risk === 'medium') return 'warning';
+    return 'info';
+  }
+
+  function normalizeToolExecution(value = {}, fallbackStatus = 'completed') {
+    const execution = unwrap(value.execution ?? value);
+    return {
+      tool_call_id: firstText(value.tool_call_id, execution.tool_call_id),
+      tool: firstText(value.tool, execution.tool),
+      parameters: value.parameters && typeof value.parameters === 'object' ? value.parameters : {},
+      status: firstText(execution.status, value.status, fallbackStatus),
+      auth_id: firstNumber(execution.auth_id, value.auth_id, 0),
+      risk_level: firstText(execution.risk_level, value.risk_level, 'low'),
+      required_role: firstText(execution.required_role, value.required_role),
+      error: firstText(execution.error?.message, execution.error?.code, execution.error, value.error)
+    };
+  }
+
+  function recordToolActivity(entry = {}, fallbackStatus = 'completed') {
+    const normalized = normalizeToolExecution(entry, fallbackStatus);
+    if (!normalized.tool && !normalized.tool_call_id) return;
+    const index = state.toolActivity.findIndex((item) => item.tool_call_id && item.tool_call_id === normalized.tool_call_id);
+    if (index >= 0) state.toolActivity[index] = { ...state.toolActivity[index], ...normalized };
+    else state.toolActivity.push(normalized);
+  }
+
+  function clearToolRuntime() {
+    state.toolActivity = [];
+    state.pendingAuthorizations = [];
+    state.resume = null;
+  }
+
+  async function loadTools(options = {}) {
+    if (!state.config.capabilities.tool_execution_loop) {
+      state.tools = [];
+      return;
+    }
+    const result = await fetchApi('ai-tools', ENDPOINTS.tools);
+    if (!state.mounted) return;
+    if (result?.ok) {
+      const data = unwrap(result.data);
+      state.tools = asArray(data.tools || data).map(normalizeTool).filter((item) => item.id);
+      state.toolsError = '';
+    } else {
+      state.tools = [];
+      state.toolsError = result?.error?.message || '无法读取工具注册表';
+    }
+    if (options.render !== false) render();
+  }
+
+  function streamingMessage() {
+    if (!state.stream.messageId) return null;
+    return state.current.messages.find((item) => item.id === state.stream.messageId) || null;
+  }
+
+  function ensureStreamingMessage() {
+    let message = streamingMessage();
+    if (message) return message;
+    message = { id: `assistant-${Date.now()}`, role: 'assistant', content: '', created_at: Date.now(), attachments: [], streaming: true };
+    state.stream.messageId = message.id;
+    state.current.messages.push(message);
+    render();
+    return message;
+  }
+
+  function appendStreamDelta(delta) {
+    const text = String(delta ?? '');
+    if (!text) return;
+    const message = ensureStreamingMessage();
+    message.content += text;
+    const node = root.querySelector(`[data-ai-message-body="${message.id}"]`);
+    if (node) {
+      node.innerHTML = `${escapeHtml(message.content).replace(/\n/g, '<br>')}<span class="ai-stream-caret" aria-hidden="true"></span>`;
+      const chat = root.querySelector('[data-ai-scroll="chat"]');
+      if (chat && chat.scrollHeight - chat.scrollTop - chat.clientHeight < 160) chat.scrollTop = chat.scrollHeight;
+    } else {
+      state.shouldStickChat = true;
+      render();
+    }
+  }
+
+  function finishStreamingMessage() {
+    const message = streamingMessage();
+    if (message) {
+      message.streaming = false;
+      if (!firstText(message.content)) {
+        const index = state.current.messages.indexOf(message);
+        if (index >= 0) state.current.messages.splice(index, 1);
+      }
+    }
+    state.stream.messageId = '';
+  }
+
+  async function streamRequest(url, body, handlers = {}) {
+    const controller = new AbortController();
+    state.stream.controller = controller;
+    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      signal: controller.signal,
+      headers: {
+        ...(api.authHeaders ? api.authHeaders() : {}),
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream'
+      },
+      body: JSON.stringify(body || {})
+    });
+    const contentType = firstText(response.headers.get('content-type'));
+    if (!response.ok || !contentType.includes('text/event-stream')) {
+      const text = await response.text().catch(() => '');
+      let json = {};
+      if (text) { try { json = JSON.parse(text); } catch (_) { json = {}; } }
+      const error = new Error(apiErrorText(json, `流式接口返回 ${response.status}`));
+      error.status = response.status;
+      error.payload = json;
+      error.notStream = !contentType.includes('text/event-stream');
+      throw error;
+    }
+    if (!response.body?.getReader) {
+      const error = new Error('当前浏览器不支持流式读取');
+      error.notStream = true;
+      throw error;
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf('\n\n');
+      while (boundary >= 0) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const event = parseStreamFrame(frame);
+        if (event) handlers.onEvent?.(event.name, event.payload);
+        boundary = buffer.indexOf('\n\n');
+      }
+    }
+    if (buffer.trim()) {
+      const event = parseStreamFrame(buffer);
+      if (event) handlers.onEvent?.(event.name, event.payload);
+    }
+  }
+
+  function parseStreamFrame(frame) {
+    const lines = String(frame || '').split('\n');
+    let name = 'message';
+    const dataLines = [];
+    lines.forEach((line) => {
+      if (line.startsWith('event:')) name = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+    });
+    if (!dataLines.length) return null;
+    try {
+      return { name, payload: JSON.parse(dataLines.join('\n')) };
+    } catch (_) {
+      return { name, payload: {} };
+    }
+  }
+
+  function handleStreamEvent(name, payload = {}) {
+    if (!state.mounted) return;
+    const conversation = firstText(payload.conversation_id);
+    if (conversation) {
+      state.current.id = conversation;
+      touchActiveConversation();
+    }
+    if (firstText(payload.response_id)) state.stream.responseId = firstText(payload.response_id);
+    switch (name) {
+      case 'response.started':
+        ensureStreamingMessage();
+        break;
+      case 'response.delta':
+        appendStreamDelta(payload.delta);
+        break;
+      case 'tool.call.started':
+        recordToolActivity(payload.tool_call || payload.tool_execution || payload, 'running');
+        render();
+        break;
+      case 'tool.call.completed':
+      case 'tool.call.result':
+      case 'tool.call.requires_action':
+        recordToolActivity(payload.tool_call || payload.tool_execution || payload);
+        render();
+        break;
+      case 'response.requires_action':
+        state.pendingAuthorizations = asArray(payload.pending_authorizations).map(normalizeToolExecution).filter((item) => item.auth_id > 0);
+        asArray(payload.tool_executions).forEach(recordToolActivity);
+        state.resume = {
+          token: firstText(payload.resume_token),
+          expires_at: firstNumber(payload.resume_expires_at, 0),
+          endpoint: firstText(payload.resume_endpoint, ENDPOINTS.toolResume),
+          stream_endpoint: firstText(payload.resume_stream_endpoint, ENDPOINTS.toolResumeStream)
+        };
+        finishStreamingMessage();
+        render();
+        break;
+      case 'response.completed':
+        applyCompletion(payload);
+        break;
+      case 'response.cancelled':
+        applyCancellation(payload);
+        break;
+      case 'response.failed':
+        throw new Error(apiErrorText(payload, '模型响应失败'));
+      default:
+        break;
+    }
+  }
+
+  function applyCompletion(payload = {}) {
+    const reply = extractAssistantReply(payload);
+    const message = streamingMessage();
+    if (message) {
+      if (reply && reply.length >= message.content.length) message.content = reply;
+      message.streaming = false;
+      state.stream.messageId = '';
+    } else if (reply) {
+      state.current.messages.push({ id: `assistant-${Date.now()}`, role: 'assistant', content: reply, created_at: Date.now(), attachments: [] });
+    }
+    state.current.title = firstText(payload.conversation_title, state.current.title);
+    if (payload.usage && typeof payload.usage === 'object') state.current.usage = payload.usage;
+    asArray(payload.tool_executions).forEach(recordToolActivity);
+    state.pendingAuthorizations = [];
+    state.resume = null;
+  }
+
+  function applyCancellation(payload = {}) {
+    const partial = firstText(payload.partial_reply);
+    const message = streamingMessage();
+    if (message) {
+      if (partial && partial.length > message.content.length) message.content = partial;
+      message.streaming = false;
+      state.stream.messageId = '';
+    }
+    state.notice = '已停止本次回答';
+  }
+
+  async function cancelStream() {
+    const responseId = firstText(state.stream.responseId);
+    if (!state.stream.active || state.stream.cancelling) return;
+    state.stream.cancelling = true;
+    render();
+    try {
+      if (state.config.capabilities.response_cancel && responseId) {
+        await requestJson(cancelEndpoint(responseId), { method: 'DELETE' });
+      } else {
+        state.stream.controller?.abort();
+      }
+    } catch (error) {
+      state.stream.controller?.abort();
+      state.chatError = error?.message || '无法停止当前回答';
+    } finally {
+      state.stream.cancelling = false;
+      if (state.mounted) render();
+    }
+  }
+
+  async function authorizeTool(authId, approve) {
+    const id = Number(authId) || 0;
+    if (!id || state.authorizing || state.resuming) return;
+    state.authorizing = id;
+    state.chatError = '';
+    render();
+    const streaming = streamingReady() && state.config.capabilities.tool_authorization_resume_streaming;
+    try {
+      const result = await postJson(ENDPOINTS.toolAuthorize, {
+        id,
+        approve: Boolean(approve),
+        defer_continuation: streaming
+      });
+      if (!state.mounted) return;
+      const data = unwrap(result);
+      const continuation = data.continuation && typeof data.continuation === 'object' ? data.continuation : {};
+      state.pendingAuthorizations = state.pendingAuthorizations.filter((item) => item.auth_id !== id);
+      recordToolActivity({
+        ...(state.toolActivity.find((item) => item.auth_id === id) || {}),
+        auth_id: id,
+        status: approve ? 'authorized' : 'denied'
+      });
+      const continuationStatus = firstText(continuation.status);
+      const token = firstText(continuation.resume_token, state.resume?.token);
+      if (state.pendingAuthorizations.length) {
+        state.authorizing = 0;
+        render();
+        return;
+      }
+      if (continuationStatus === 'ready_to_resume' && token) {
+        state.authorizing = 0;
+        await resumeToolLoop(token);
+        return;
+      }
+      if (continuationStatus === 'not_available') {
+        state.chatError = '工具续跑状态已过期，请重新发送消息';
+        state.resume = null;
+      } else if (continuationStatus === 'awaiting_original_actor') {
+        state.notice = '已提交授权，等待原发起会话继续';
+      } else if (continuation.reply || continuation.tool_executions || continuation.pending_authorizations) {
+        consumeResumeResult(continuation);
+      } else if (!approve) {
+        state.notice = '已拒绝该工具调用';
+        state.resume = null;
+      }
+      state.authorizing = 0;
+      finishStreamingMessage();
+      await persistCurrentConversation().catch(() => {});
+      render();
+    } catch (error) {
+      if (!state.mounted) return;
+      state.authorizing = 0;
+      state.chatError = error?.message || '工具授权失败';
+      render();
+    }
+  }
+
+  async function resumeToolLoop(token) {
+    const resumeToken = firstText(token, state.resume?.token);
+    if (!resumeToken || state.resuming) return;
+    state.resuming = true;
+    state.stream.active = true;
+    state.chatError = '';
+    render();
+    const streaming = streamingReady() && state.config.capabilities.tool_authorization_resume_streaming;
+    try {
+      if (streaming) {
+        await streamRequest(resumeEndpoint(true), { resume_token: resumeToken }, {
+          onEvent: (name, payload) => handleStreamEvent(name, payload)
+        });
+      } else {
+        const result = await postJson(resumeEndpoint(false), { resume_token: resumeToken });
+        if (!state.mounted) return;
+        consumeResumeResult(unwrap(result));
+      }
+      if (!state.mounted) return;
+      finishStreamingMessage();
+      if (!state.pendingAuthorizations.length) {
+        await persistCurrentConversation();
+        state.notice = '对话已保存';
+      }
+    } catch (error) {
+      if (!state.mounted) return;
+      if (error?.name !== 'AbortError') state.chatError = error?.message || '工具续跑失败';
+      finishStreamingMessage();
+    } finally {
+      if (!state.mounted) return;
+      state.resuming = false;
+      state.stream.active = false;
+      state.stream.controller = null;
+      state.shouldStickChat = true;
+      render();
+    }
+  }
+
+  function consumeResumeResult(data = {}) {
+    state.current.id = firstText(data.conversation_id, state.current.id);
+    state.current.title = firstText(data.conversation_title, data.title, state.current.title);
+    asArray(data.tool_executions).forEach(recordToolActivity);
+    const pending = asArray(data.pending_authorizations).map(normalizeToolExecution).filter((item) => item.auth_id > 0);
+    state.pendingAuthorizations = pending;
+    if (pending.length) {
+      state.resume = {
+        token: firstText(data.resume_token, state.resume?.token),
+        expires_at: firstNumber(data.resume_expires_at, state.resume?.expires_at, 0),
+        endpoint: firstText(data.resume_endpoint, ENDPOINTS.toolResume),
+        stream_endpoint: firstText(data.resume_stream_endpoint, ENDPOINTS.toolResumeStream)
+      };
+    } else {
+      state.resume = null;
+    }
+    const reply = extractAssistantReply(data);
+    if (reply) {
+      const message = streamingMessage();
+      if (message) {
+        message.content = reply;
+        message.streaming = false;
+        state.stream.messageId = '';
+      } else {
+        state.current.messages.push({ id: `assistant-${Date.now()}`, role: 'assistant', content: reply, created_at: Date.now(), attachments: [] });
+      }
+    }
+    if (data.usage && typeof data.usage === 'object') state.current.usage = data.usage;
+    touchActiveConversation();
+  }
+
   async function loadInitial() {
     const seq = ++state.seq;
     state.loading = true;
@@ -590,6 +1067,7 @@ export function mount(context = {}) {
     }
     state.loading = false;
     state.historyLoading = false;
+    if (state.config.capabilities.tool_execution_loop) loadTools({ render: false });
     if (state.oauth.available && state.config.provider) await loadOAuthStatus(state.config.provider, { quiet: true });
     await consumeOAuthCallback();
     const resumeId = firstText(state.activeConversation.id);
@@ -901,6 +1379,8 @@ export function mount(context = {}) {
       <section class="ai-chat-card ai-page-card ${isGlobal ? 'ai-drawer-chat' : 'dwrt-kit-page-surface dwrt-kit-glass-surface'}">
         <div class="ai-chat-scroll" data-ai-scroll="chat" role="log" aria-live="polite">
           ${state.loading ? loadingState('正在读取 AI 配置') : messages.length ? messages.map(messageMarkup).join('') : chatEmptyState()}
+          ${state.loading ? '' : toolActivityMarkup()}
+          ${state.loading ? '' : authorizationMarkup()}
         </div>
         <footer class="ai-composer-wrap">
           ${state.chatError ? `<div class="ai-inline-message error">${icon('alert')}<span>${escapeHtml(state.chatError)}</span></div>` : ''}
@@ -915,7 +1395,9 @@ export function mount(context = {}) {
               </div>
               <div class="ai-composer-options">
                 ${runtimeMenu()}
-                <button class="ai-send-button" type="button" data-ai-send title="发送" aria-label="发送" ${configured && !state.sending ? '' : 'disabled'}>${state.sending ? icon('loader') : icon('send')}</button>
+                ${state.stream.active && (state.config.capabilities.response_cancel || state.stream.controller)
+                  ? `<button class="ai-send-button is-stop" type="button" data-ai-stop title="停止生成" aria-label="停止生成" ${state.stream.cancelling ? 'disabled' : ''}>${state.stream.cancelling ? icon('loader') : icon('stop')}</button>`
+                  : `<button class="ai-send-button" type="button" data-ai-send title="发送" aria-label="发送" ${configured && !state.sending ? '' : 'disabled'}>${state.sending ? icon('loader') : icon('send')}</button>`}
               </div>
             </div>
           </div>
@@ -982,14 +1464,72 @@ export function mount(context = {}) {
   function messageMarkup(message) {
     const attachments = asArray(message.attachments);
     return `
-      <article class="ai-message ${message.role === 'user' ? 'is-user' : 'is-assistant'}">
+      <article class="ai-message ${message.role === 'user' ? 'is-user' : 'is-assistant'} ${message.streaming ? 'is-streaming' : ''}">
         <div class="ai-message-author">${message.role === 'user' ? '你' : 'AI'}</div>
         <div class="ai-message-bubble">
-          <div class="ai-message-content">${escapeHtml(message.content).replace(/\n/g, '<br>')}</div>
+          <div class="ai-message-content" data-ai-message-body="${escapeHtml(message.id)}">${escapeHtml(message.content).replace(/\n/g, '<br>')}${message.streaming ? '<span class="ai-stream-caret" aria-hidden="true"></span>' : ''}</div>
           ${attachments.length ? `<div class="ai-message-files">${attachments.map((file) => `<span>${icon('file')}${escapeHtml(file.name)}</span>`).join('')}</div>` : ''}
-          <time>${formatMessageTime(message.created_at)}</time>
+          ${message.streaming ? '' : `<time>${formatMessageTime(message.created_at)}</time>`}
         </div>
       </article>
+    `;
+  }
+
+  function toolActivityMarkup() {
+    if (!state.toolActivity.length) return '';
+    return `
+      <section class="ai-tool-activity" aria-label="工具调用">
+        ${state.toolActivity.map((item) => {
+          const status = firstText(item.status, 'completed');
+          const label = ({
+            running: '执行中',
+            pending_authorization: '等待授权',
+            authorized: '已授权',
+            denied: '已拒绝',
+            completed: '已完成',
+            execution_failed: '执行失败'
+          })[status] || status;
+          const tone = status === 'execution_failed' || status === 'denied'
+            ? 'danger'
+            : status === 'pending_authorization' || status === 'running'
+              ? 'warning'
+              : 'success';
+          return `<div class="ai-tool-chip is-${tone}">
+            ${icon('shield')}
+            <b>${escapeHtml(toolLabel(item.tool))}</b>
+            <small>${escapeHtml(label)}</small>
+            ${item.error ? `<em>${escapeHtml(item.error)}</em>` : ''}
+          </div>`;
+        }).join('')}
+      </section>
+    `;
+  }
+
+  function authorizationMarkup() {
+    if (!state.pendingAuthorizations.length) return '';
+    return `
+      <section class="ai-tool-auth" aria-label="工具授权请求">
+        ${state.pendingAuthorizations.map((item) => {
+          const definition = toolDefinition(item.tool);
+          const busy = state.authorizing === item.auth_id || state.resuming;
+          const parameters = Object.keys(item.parameters || {}).length
+            ? JSON.stringify(item.parameters, null, 2)
+            : '';
+          return `<article class="ai-tool-auth-card">
+            <header>
+              <strong>${escapeHtml(toolLabel(item.tool))}</strong>
+              ${ui.statusBadgeMarkup?.(riskLabel(item.risk_level), riskTone(item.risk_level)) || `<span>${escapeHtml(riskLabel(item.risk_level))}</span>`}
+            </header>
+            <p>${escapeHtml(firstText(definition?.description, '模型请求执行该工具，请确认后继续。'))}</p>
+            ${parameters ? `<pre class="ai-tool-auth-params">${escapeHtml(parameters)}</pre>` : ''}
+            ${item.required_role ? `<small>需要角色：${escapeHtml(item.required_role)}</small>` : ''}
+            <footer>
+              <button class="ai-secondary-button" type="button" data-ai-tool-deny="${item.auth_id}" ${busy ? 'disabled' : ''}>${icon('close')}拒绝</button>
+              <button class="ai-primary-button" type="button" data-ai-tool-approve="${item.auth_id}" ${busy ? 'disabled' : ''}>${busy ? icon('loader') : icon('check')}允许执行</button>
+            </footer>
+          </article>`;
+        }).join('')}
+      </section>
     `;
   }
 
@@ -1020,7 +1560,7 @@ export function mount(context = {}) {
       </section>`;
     }
     return `
-      <section class="ai-history-card ai-page-card dwrt-kit-page-surface dwrt-kit-table-wrap dwrt-kit-datatable-wrap dwrt-kit-glass-surface">
+      <section class="ai-history-card ai-page-card dwrt-kit-page-surface dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface">
         <div class="dwrt-kit-table-toolbar ai-history-toolbar">
           <div class="dwrt-kit-table-title">
             <strong>历史对话</strong>
@@ -1034,7 +1574,7 @@ export function mount(context = {}) {
           </div>
         </div>
         <div class="dwrt-kit-table-scroll ai-history-scroll" data-ai-scroll="history">
-          <table class="dwrt-kit-table dwrt-kit-datatable ai-history-table">
+          <table class="dwrt-kit-table dwrt-kit-ikuai-table ai-history-table">
             <thead><tr><th>对话</th><th>消息</th><th>模型</th><th>用量</th><th>更新时间</th><th class="ai-actions-column">操作</th></tr></thead>
             <tbody>
               ${state.historyLoading ? `<tr><td colspan="6" class="dwrt-kit-table-empty">正在读取历史对话</td></tr>` : rows.length ? rows.map(historyRow).join('') : `<tr><td colspan="6" class="dwrt-kit-table-empty">${state.historyQuery ? '没有匹配的对话' : '暂无历史对话'}</td></tr>`}
@@ -1229,7 +1769,8 @@ export function mount(context = {}) {
             <span>${state.notice ? escapeHtml(state.notice) : configDirty() ? '有未保存的修改' : '配置已同步'}</span>
           </div>
           <div class="ai-settings-actions">
-            <button class="ai-secondary-button" type="button" data-ai-sync-models ${state.syncingModels ? 'disabled' : ''}>${state.syncingModels ? icon('loader') : icon('refresh')}刷新模型列表</button>
+            ${state.config.capabilities.provider_test ? `<button class="ai-secondary-button" type="button" data-ai-test-provider ${state.testingProvider || !credentialReady() ? 'disabled' : ''} ${credentialReady() ? '' : 'title="需要先启用 AI 并配置凭据"'}>${state.testingProvider ? icon('loader') : icon('link')}测试连接</button>` : ''}
+            <button class="ai-secondary-button" type="button" data-ai-sync-models ${state.syncingModels ? 'disabled' : ''}>${state.syncingModels ? icon('loader') : icon('refresh')}${state.config.capabilities.provider_models_sync ? '同步模型' : '刷新模型列表'}</button>
             <button class="ai-primary-button" type="button" data-ai-save ${state.saving || !configDirty() ? 'disabled' : ''}>${state.saving ? icon('loader') : icon('save')}保存设置</button>
           </div>
         </div>
@@ -1341,6 +1882,9 @@ export function mount(context = {}) {
       });
     }
     root.querySelector('[data-ai-send]')?.addEventListener('click', sendMessage);
+    root.querySelector('[data-ai-stop]')?.addEventListener('click', cancelStream);
+    root.querySelectorAll('[data-ai-tool-approve]').forEach((button) => button.addEventListener('click', () => authorizeTool(button.dataset.aiToolApprove, true)));
+    root.querySelectorAll('[data-ai-tool-deny]').forEach((button) => button.addEventListener('click', () => authorizeTool(button.dataset.aiToolDeny, false)));
     root.querySelector('[data-ai-clear-key]')?.addEventListener('click', () => {
       state.config.clear_api_key = !state.config.clear_api_key;
       if (state.config.clear_api_key) state.config.api_key_input = '';
@@ -1417,6 +1961,7 @@ export function mount(context = {}) {
       field.addEventListener('change', onConfigInput);
     });
     root.querySelector('[data-ai-sync-models]')?.addEventListener('click', syncModels);
+    root.querySelector('[data-ai-test-provider]')?.addEventListener('click', testProvider);
     root.querySelector('[data-ai-save]')?.addEventListener('click', saveConfig);
   }
 
@@ -1562,6 +2107,9 @@ export function mount(context = {}) {
     state.runtimeMenuOpen = false;
     state.runtimePane = 'main';
     state.shouldStickChat = true;
+    clearToolRuntime();
+    state.stream.responseId = '';
+    state.stream.messageId = '';
     setTab('chat');
     render();
     requestAnimationFrame(() => root.querySelector('[data-ai-prompt]')?.focus());
@@ -1618,6 +2166,9 @@ export function mount(context = {}) {
     state.chatError = '';
     state.notice = '';
     state.shouldStickChat = true;
+    clearToolRuntime();
+    state.stream.responseId = '';
+    state.stream.messageId = '';
     render();
     try {
       let outboundAttachments = selectedAttachments;
@@ -1637,34 +2188,77 @@ export function mount(context = {}) {
         userMessage.attachments = uploaded;
         outboundAttachments = uploaded;
       }
-      const result = await postJson(ENDPOINTS.chat, {
+      const payload = {
         conversation_id: conversationId(),
         model: currentModel(),
         reasoning_effort: currentEffort(),
         tool_policy: currentToolPolicy(),
-        messages: state.current.messages.map(({ role, content: text }) => ({ role, content: text })),
+        messages: state.current.messages
+          .filter((item) => !item.streaming)
+          .map(({ role, content: text }) => ({ role, content: text })),
         attachments: outboundAttachments
-      });
-      if (!state.mounted) return;
-      const data = unwrap(result);
-      state.current.id = firstText(data.conversation_id, data.conversation?.id, state.current.id);
-      state.current.title = firstText(data.conversation_title, data.title, data.conversation?.title, state.current.title);
-      touchActiveConversation();
-      const reply = extractAssistantReply(data);
-      if (!reply) {
-        const pending = firstText(data.message).toLowerCase().includes('integration pending') || data.status === 'ready';
-        throw new Error(pending ? '模型运行时尚未接入，后端未生成回答' : firstText(data.error, '后端未返回 AI 回答'));
+      };
+      let streamed = false;
+      if (streamingReady()) {
+        state.stream.active = true;
+        render();
+        try {
+          await streamRequest(streamEndpoint(), payload, {
+            onEvent: (name, eventPayload) => handleStreamEvent(name, eventPayload)
+          });
+          streamed = true;
+        } catch (error) {
+          if (error?.name === 'AbortError') streamed = true;
+          else if (!error?.notStream) throw error;
+        } finally {
+          state.stream.active = false;
+          state.stream.controller = null;
+        }
       }
-      state.current.messages.push({ id: `assistant-${Date.now()}`, role: 'assistant', content: reply, created_at: Date.now(), attachments: [] });
-      state.current.usage = data.usage && typeof data.usage === 'object' ? data.usage : state.current.usage;
-      await persistCurrentConversation();
-      state.notice = '对话已保存';
+      if (!streamed) {
+        const result = await postJson(ENDPOINTS.chat, payload);
+        if (!state.mounted) return;
+        const data = unwrap(result);
+        state.current.id = firstText(data.conversation_id, data.conversation?.id, state.current.id);
+        state.current.title = firstText(data.conversation_title, data.title, data.conversation?.title, state.current.title);
+        touchActiveConversation();
+        asArray(data.tool_executions).forEach(recordToolActivity);
+        const pending = asArray(data.pending_authorizations).map(normalizeToolExecution).filter((item) => item.auth_id > 0);
+        state.pendingAuthorizations = pending;
+        if (pending.length) {
+          state.resume = {
+            token: firstText(data.resume_token),
+            expires_at: firstNumber(data.resume_expires_at, 0),
+            endpoint: firstText(data.resume_endpoint, ENDPOINTS.toolResume),
+            stream_endpoint: firstText(data.resume_stream_endpoint, ENDPOINTS.toolResumeStream)
+          };
+        }
+        const reply = extractAssistantReply(data);
+        if (!reply && !pending.length) {
+          const notReady = firstText(data.message).toLowerCase().includes('integration pending') || data.status === 'ready';
+          throw new Error(notReady ? '模型运行时尚未接入，后端未生成回答' : firstText(data.error, '后端未返回 AI 回答'));
+        }
+        if (reply) state.current.messages.push({ id: `assistant-${Date.now()}`, role: 'assistant', content: reply, created_at: Date.now(), attachments: [] });
+        state.current.usage = data.usage && typeof data.usage === 'object' ? data.usage : state.current.usage;
+      }
+      if (!state.mounted) return;
+      finishStreamingMessage();
+      if (state.pendingAuthorizations.length) {
+        state.notice = '模型请求执行工具，请确认授权';
+        await persistCurrentConversation().catch(() => {});
+      } else {
+        await persistCurrentConversation();
+        state.notice = '对话已保存';
+      }
     } catch (error) {
-      state.chatError = error?.message || 'AI 请求失败';
+      if (error?.name !== 'AbortError') state.chatError = error?.message || 'AI 请求失败';
+      finishStreamingMessage();
       await persistCurrentConversation().catch(() => {});
     } finally {
       if (!state.mounted) return;
       state.sending = false;
+      state.stream.active = false;
+      state.stream.controller = null;
       state.shouldStickChat = true;
       render();
       requestAnimationFrame(() => root.querySelector('[data-ai-prompt]')?.focus());
@@ -1679,7 +2273,8 @@ export function mount(context = {}) {
   }
 
   async function persistCurrentConversation() {
-    if (!state.current.messages.length) return;
+    const persistable = state.current.messages.filter((item) => !item.streaming && firstText(item.content));
+    if (!persistable.length) return;
     const result = await postJson(ENDPOINTS.history, {
       id: conversationId(),
       title: conversationTitle(),
@@ -1687,7 +2282,7 @@ export function mount(context = {}) {
       reasoning_effort: currentEffort(),
       tool_policy: currentToolPolicy(),
       usage: state.current.usage || {},
-      messages: state.current.messages.map(({ id: message_id, role, content, created_at, attachments }) => ({
+      messages: persistable.map(({ id: message_id, role, content, created_at, attachments }) => ({
         message_id,
         role,
         content,
@@ -1736,6 +2331,9 @@ export function mount(context = {}) {
     state.chatError = '';
     state.notice = '';
     state.shouldStickChat = true;
+    clearToolRuntime();
+    state.stream.responseId = '';
+    state.stream.messageId = '';
     setTab('chat');
     render();
   }
@@ -1835,15 +2433,58 @@ export function mount(context = {}) {
     state.syncingModels = true;
     state.settingsError = '';
     render();
-    const result = await fetchApi('ai-models', ENDPOINTS.models);
-    if (!state.mounted) return;
-    if (result?.ok) {
-      state.models = uniqueModels(asArray(unwrap(result.data).models || unwrap(result.data)));
-      state.notice = `已读取 ${state.models.length} 个模型`;
-    } else {
-      state.settingsError = result?.error?.message || '模型列表读取失败';
+    try {
+      if (state.config.capabilities.provider_models_sync) {
+        const synced = unwrap(await postJson(ENDPOINTS.modelsSync, { provider: state.config.provider }));
+        if (!state.mounted) return;
+        const models = uniqueModels(asArray(synced.models || synced));
+        if (models.length) {
+          state.models = models;
+          state.notice = `已从提供商同步 ${models.length} 个模型`;
+          state.syncingModels = false;
+          render();
+          return;
+        }
+      }
+      const result = await fetchApi('ai-models', ENDPOINTS.models);
+      if (!state.mounted) return;
+      if (result?.ok) {
+        state.models = uniqueModels(asArray(unwrap(result.data).models || unwrap(result.data)));
+        state.notice = state.config.capabilities.provider_models_sync
+          ? `已读取 ${state.models.length} 个模型`
+          : `已读取 ${state.models.length} 个模型（后端未开放提供商同步）`;
+      } else {
+        state.settingsError = result?.error?.message || '模型列表读取失败';
+      }
+    } catch (error) {
+      if (!state.mounted) return;
+      state.settingsError = error?.message || '模型同步失败';
     }
+    if (!state.mounted) return;
     state.syncingModels = false;
+    render();
+  }
+
+  async function testProvider() {
+    if (state.testingProvider || !state.config.capabilities.provider_test) return;
+    state.testingProvider = true;
+    state.settingsError = '';
+    state.notice = '';
+    render();
+    try {
+      const data = unwrap(await postJson(ENDPOINTS.providerTest, { provider: state.config.provider }));
+      if (!state.mounted) return;
+      const latency = firstNumber(data.latency_ms, data.latency, 0);
+      const model = firstText(data.model, currentModel());
+      state.notice = data.ok === false
+        ? `连接测试失败：${apiErrorText(data, '提供商未返回成功状态')}`
+        : `连接正常${model ? `（${model}）` : ''}${latency ? ` · ${Math.round(latency)} ms` : ''}`;
+    } catch (error) {
+      if (!state.mounted) return;
+      state.settingsError = error?.message || '连接测试失败';
+    }
+    if (!state.mounted) return;
+    state.testingProvider = false;
     render();
   }
 
@@ -1971,6 +2612,7 @@ export function mount(context = {}) {
       'page-add': '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M12 18v-6M9 15h6"/>',
       shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/>',
       send: '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
+      stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
       loader: '<path d="M21 12a9 9 0 1 1-6.2-8.6"/>',
       alert: '<path d="M10.3 2.9 1.8 17a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 2.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/>',
       check: '<path d="m20 6-11 11-5-5"/>',
@@ -2019,6 +2661,8 @@ export function mount(context = {}) {
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      try { state.stream.controller?.abort(); } catch (_) {}
+      state.stream.controller = null;
       clearOAuthPollTimer();
       window.removeEventListener('message', receiveOAuthCompletion);
       window.removeEventListener('dwrt:ai-config-updated', receiveConfigUpdated);

@@ -52,7 +52,7 @@ int main(int argc, char **argv) {
         assert(arm_rc == 0);
         assert(!strcmp(info.phase, "armed"));
         assert(info.pending == 1);
-        assert(!strcmp(info.expected_lan_ip, "192.168.1.1"));
+        assert(!strcmp(info.expected_lan_ip, "192.168.30.1"));
         assert(info.wan_count == 1);
         assert(info.lan_count == 1);
         return 0;
@@ -143,7 +143,7 @@ def create_db(path: Path, marker: str, lan_ip: str, *, include_work_mode: bool =
     db.execute("INSERT INTO appearance_settings VALUES(1)")
     db.execute(
         "INSERT INTO system_settings VALUES(1, ?)",
-        ("DreamingWrt" if lan_ip == "192.168.1.1" else "TargetBeforeRestore",),
+        ("DreamingWrt" if lan_ip == "192.168.30.1" else "TargetBeforeRestore",),
     )
     if include_work_mode:
         db.executescript(
@@ -225,16 +225,16 @@ def main() -> None:
         incomplete = root / "incomplete.db"
         staged = staging / "config.db"
         manifest = staging / "manifest.json"
-        create_db(current, "target-before-restore", "198.51.100.250")
-        create_db(source, "source-from-30.1", "192.168.1.1")
+        create_db(current, "target-before-restore", "192.168.31.250")
+        create_db(source, "source-from-30.1", "192.168.30.1")
         create_db(
             incomplete,
             "same-schema-missing-work-mode",
-            "192.168.1.1",
+            "192.168.30.1",
             include_work_mode=False,
         )
         for name, value in (
-            ("network", "config interface 'lan'\n\toption ipaddr '198.51.100.250'\n"),
+            ("network", "config interface 'lan'\n\toption ipaddr '192.168.31.250'\n"),
             ("dhcp", "config dhcp 'lan'\n"),
             ("firewall", "config defaults\n"),
             ("system", "config system\n\toption hostname 'TargetBeforeRestore'\n"),
@@ -301,7 +301,7 @@ def main() -> None:
         assert marker(backup / "config.db") == "target-before-restore"
         run(exe, "rollback")
         assert marker(current) == "target-before-restore"
-        assert "198.51.100.250" in (etc_config / "network").read_text(encoding="ascii")
+        assert "192.168.31.250" in (etc_config / "network").read_text(encoding="ascii")
         assert "TargetBeforeRestore" in (etc_config / "system").read_text(encoding="ascii")
 
         run(exe, "arm")

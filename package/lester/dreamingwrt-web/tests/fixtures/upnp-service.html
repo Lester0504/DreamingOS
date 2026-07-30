@@ -64,11 +64,11 @@
       stun_host: '',
       stun_port: 3478,
       acl: [
-        { id: 'allow-lan', action: 'allow', external: '1024-65535', internal: '192.168.1.0/24', internal_ports: '1024-65535', remark: 'LAN', enabled: true, sort_order: 0 },
+        { id: 'allow-lan', action: 'allow', external: '1024-65535', internal: '192.168.30.0/24', internal_ports: '1024-65535', remark: 'LAN', enabled: true, sort_order: 0 },
         { id: 'deny-all', action: 'deny', external: '0-65535', internal: '0.0.0.0/0', internal_ports: '0-65535', remark: '默认拒绝', enabled: true, sort_order: 100 }
       ],
       mappings: [
-        { id: 'dynamic-1', mapping_type: 'dynamic', protocol: 'tcp', external_port: 42000, internal_ip: '192.168.1.21', internal_port: 42000, client: 'LivingRoom', description: 'Game session', lease_seconds: 3600, packets: 0 }
+        { id: 'dynamic-1', mapping_type: 'dynamic', protocol: 'tcp', external_port: 42000, internal_ip: '192.168.30.21', internal_port: 42000, client: 'LivingRoom', description: 'Game session', lease_seconds: 3600, packets: 0 }
       ],
       stats: { active_mappings: 1, requests_today: 0, denied_today: 0 },
       capabilities: {
@@ -99,7 +99,7 @@
     };
     const staticMappings = {
       mappings: [
-        { id: 'static-1', mapping_type: 'static', enabled: true, protocol: 'udp', external_port: 51820, internal_ip: '192.168.1.2', internal_port: 51820, client: 'VPN', description: 'WireGuard', lease: 0, packets: 0 }
+        { id: 'static-1', mapping_type: 'static', enabled: true, protocol: 'udp', external_port: 51820, internal_ip: '192.168.30.2', internal_port: 51820, client: 'VPN', description: 'WireGuard', lease: 0, packets: 0 }
       ]
     };
 

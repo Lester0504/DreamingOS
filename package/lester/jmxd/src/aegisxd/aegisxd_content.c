@@ -4,6 +4,26 @@
 
 #define CONTENT_MAX_LIST 128
 #define CONTENT_MAX_DOMAIN 253
+#define CONTENT_PROVENANCE_MAX_RULES 60000
+
+struct content_provenance_rule {
+    char domain[254];
+    char kind[32];
+    char source_id[64];
+};
+
+struct content_provenance_cache {
+    struct content_provenance_rule *rules;
+    size_t count;
+    size_t capacity;
+    char path[AEGISXD_MAX_PATH];
+    int revision;
+    off_t size;
+    time_t mtime;
+    int schema_ready;
+};
+
+static struct content_provenance_cache g_content_provenance;
 
 struct content_string_list {
     char **items;
@@ -26,6 +46,7 @@ struct content_filter {
     struct content_string_list allows;
     struct content_string_list blocks;
     struct content_string_list emitted_blocks;
+    struct content_string_list emitted_categories;
 };
 
 struct content_safe_search_host {
@@ -170,6 +191,226 @@ static int content_domain_list_matches(const struct content_string_list *list,
     if (!list || !domain) return 0;
     for (size_t i = 0; i < list->count; i++)
         if (content_domain_matches(domain, list->items[i])) return 1;
+    return 0;
+}
+
+int aegisxd_content_revision_get(void)
+{
+    sqlite3_stmt *st = aegisxd_config_prepare(
+        "SELECT revision FROM aegis_content_meta WHERE id=1");
+    int revision = -1;
+
+    if (st && sqlite3_step(st) == SQLITE_ROW)
+        revision = sqlite3_column_int(st, 0);
+    if (st)
+        sqlite3_finalize(st);
+    return revision;
+}
+
+static void content_provenance_reset(void)
+{
+    free(g_content_provenance.rules);
+    memset(&g_content_provenance, 0, sizeof(g_content_provenance));
+    g_content_provenance.revision = -1;
+}
+
+static int content_provenance_cmp(const void *a, const void *b)
+{
+    const struct content_provenance_rule *ra = a, *rb = b;
+
+    return strcmp(ra->domain, rb->domain);
+}
+
+static int content_provenance_add(const char *domain, const char *kind,
+                                  const char *source_id)
+{
+    struct content_provenance_rule *next;
+    size_t capacity;
+
+    if (!content_domain_ok(domain) || !kind || !kind[0] || !source_id ||
+        !source_id[0] || g_content_provenance.count >= CONTENT_PROVENANCE_MAX_RULES)
+        return -1;
+    if (g_content_provenance.count == g_content_provenance.capacity) {
+        capacity = g_content_provenance.capacity ?
+            g_content_provenance.capacity * 2 : 256;
+        if (capacity > CONTENT_PROVENANCE_MAX_RULES)
+            capacity = CONTENT_PROVENANCE_MAX_RULES;
+        next = realloc(g_content_provenance.rules, capacity * sizeof(*next));
+        if (!next)
+            return -1;
+        g_content_provenance.rules = next;
+        g_content_provenance.capacity = capacity;
+    }
+    next = &g_content_provenance.rules[g_content_provenance.count++];
+    snprintf(next->domain, sizeof(next->domain), "%s", domain);
+    snprintf(next->kind, sizeof(next->kind), "%s", kind);
+    snprintf(next->source_id, sizeof(next->source_id), "%s", source_id);
+    return 0;
+}
+
+static int content_provenance_load_file(const char *path, int revision,
+                                        const struct stat *file_stat)
+{
+    FILE *fp;
+    char line[1024];
+    char pending_domain[254] = "";
+    char pending_kind[32] = "";
+    char pending_source[64] = "";
+    int saw_ipv4 = 0;
+    int schema_ready = 0;
+
+    content_provenance_reset();
+    fp = fopen(path, "r");
+    if (!fp)
+        return -1;
+    while (fgets(line, sizeof(line), fp)) {
+        char domain[254] = "", kind[32] = "", source[64] = "";
+        char expected[600];
+
+        if (!strcmp(line, "# aegis-provenance-version=1\n") ||
+            !strcmp(line, "# aegis-provenance-version=1")) {
+            schema_ready = 1;
+            continue;
+        }
+        if (sscanf(line, "# aegis provenance=%31s source=%63s domain=%253s",
+                   kind, source, domain) == 3) {
+            domain[strcspn(domain, " \t\r\n")] = '\0';
+            snprintf(pending_domain, sizeof(pending_domain), "%s", domain);
+            snprintf(pending_kind, sizeof(pending_kind), "%s", kind);
+            snprintf(pending_source, sizeof(pending_source), "%s", source);
+            saw_ipv4 = 0;
+            continue;
+        }
+        if (sscanf(line, "# aegis monitor=%31s source=%63s domain=%253s",
+                   kind, source, domain) == 3) {
+            domain[strcspn(domain, " \t\r\n")] = '\0';
+            if (strcmp(kind, "pcdn") ||
+                content_provenance_add(domain, "pcdn_monitor", source) != 0)
+                goto fail;
+            pending_domain[0] = '\0';
+            saw_ipv4 = 0;
+            continue;
+        }
+        if (!pending_domain[0])
+            continue;
+        snprintf(expected, sizeof(expected), "address=/%s/0.0.0.0\n", pending_domain);
+        if (!strcmp(line, expected)) {
+            saw_ipv4 = 1;
+            continue;
+        }
+        snprintf(expected, sizeof(expected), "address=/%s/::\n", pending_domain);
+        if (saw_ipv4 && !strcmp(line, expected)) {
+            if (content_provenance_add(pending_domain, pending_kind,
+                                       pending_source) != 0)
+                goto fail;
+        }
+        pending_domain[0] = '\0';
+        saw_ipv4 = 0;
+    }
+    if (ferror(fp) || !schema_ready)
+        goto fail;
+    fclose(fp);
+    qsort(g_content_provenance.rules, g_content_provenance.count,
+          sizeof(*g_content_provenance.rules), content_provenance_cmp);
+    snprintf(g_content_provenance.path, sizeof(g_content_provenance.path),
+             "%s", path);
+    g_content_provenance.revision = revision;
+    g_content_provenance.size = file_stat->st_size;
+    g_content_provenance.mtime = file_stat->st_mtime;
+    g_content_provenance.schema_ready = 1;
+    return 0;
+fail:
+    fclose(fp);
+    content_provenance_reset();
+    return -1;
+}
+
+static int content_provenance_ensure(void)
+{
+    struct json_object *root = NULL, *revision_json = NULL;
+    const char *path;
+    struct stat st;
+    int revision;
+    int ok = 0;
+
+    root = json_object_from_file(AEGISXD_RUNTIME_DIR "/active.json");
+    if (!root || !json_object_is_type(root, json_type_object) ||
+        (strcmp(aegisxd_json_str(root, "scope", ""), "dns_filter") &&
+         strcmp(aegisxd_json_str(root, "scope", ""), "all")) ||
+        !json_object_object_get_ex(root, "content_revision", &revision_json) ||
+        !revision_json || !json_object_is_type(revision_json, json_type_int))
+        goto out;
+    revision = json_object_get_int(revision_json);
+    path = aegisxd_json_str(root, "dnsmasq_conf_file", "");
+    if (!path[0] || lstat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
+        access(path, R_OK) != 0)
+        goto out;
+    if (g_content_provenance.schema_ready &&
+        g_content_provenance.revision == revision &&
+        !strcmp(g_content_provenance.path, path) &&
+        g_content_provenance.size == st.st_size &&
+        g_content_provenance.mtime == st.st_mtime)
+        ok = 1;
+    else
+        ok = content_provenance_load_file(path, revision, &st) == 0;
+out:
+    if (root)
+        json_object_put(root);
+    if (!ok)
+        content_provenance_reset();
+    return ok ? 0 : -1;
+}
+
+int aegisxd_content_dns_provenance_ready(void)
+{
+    return content_provenance_ensure() == 0;
+}
+
+int aegisxd_content_installed_dns_rule_match(const char *domain,
+                                             char kind[32], char source_id[64],
+                                             char matched_rule[254])
+{
+    char normalized[254];
+    char *candidate;
+
+    if (kind)
+        kind[0] = '\0';
+    if (source_id)
+        source_id[0] = '\0';
+    if (matched_rule)
+        matched_rule[0] = '\0';
+    if (!domain || strlen(domain) >= sizeof(normalized))
+        return 0;
+    snprintf(normalized, sizeof(normalized), "%s", domain);
+    for (char *p = normalized; *p; p++)
+        *p = (char)tolower((unsigned char)*p);
+    while (normalized[0] && normalized[strlen(normalized) - 1] == '.')
+        normalized[strlen(normalized) - 1] = '\0';
+    if (!content_domain_ok(normalized) || content_provenance_ensure() != 0)
+        return 0;
+    candidate = normalized;
+    while (candidate && candidate[0]) {
+        struct content_provenance_rule key = { 0 };
+        struct content_provenance_rule *match;
+
+        snprintf(key.domain, sizeof(key.domain), "%s", candidate);
+        match = bsearch(&key, g_content_provenance.rules,
+                        g_content_provenance.count,
+                        sizeof(*g_content_provenance.rules),
+                        content_provenance_cmp);
+        if (match) {
+            if (kind)
+                snprintf(kind, 32, "%s", match->kind);
+            if (source_id)
+                snprintf(source_id, 64, "%s", match->source_id);
+            if (matched_rule)
+                snprintf(matched_rule, 254, "%s", match->domain);
+            return 1;
+        }
+        candidate = strchr(candidate, '.');
+        if (candidate)
+            candidate++;
+    }
     return 0;
 }
 
@@ -448,6 +689,15 @@ static struct json_object *content_capabilities(void)
     json_object_object_add(cap, "dataplane_apply_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "rollback_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "confirm_required", json_object_new_boolean(1));
+    json_object_object_add(cap, "pcdn_filter_supported", json_object_new_boolean(1));
+    aegisxd_json_add_string(cap, "pcdn_default_mode", "block");
+    json_object_object_add(cap, "pcdn_feed_update", json_object_new_boolean(1));
+    json_object_object_add(cap, "pcdn_guarded_apply", json_object_new_boolean(1));
+    json_object_object_add(cap, "pcdn_monitor_supported", json_object_new_boolean(1));
+    json_object_object_add(cap, "pcdn_hit_monitoring_supported", json_object_new_boolean(1));
+    json_object_object_add(cap, "pcdn_hit_count_supported", json_object_new_boolean(1));
+    json_object_object_add(cap, "pcdn_hit_attribution_ready",
+                           json_object_new_boolean(aegisxd_pcdn_hit_attribution_ready()));
     return cap;
 }
 
@@ -525,6 +775,7 @@ struct json_object *aegisxd_content_runtime_json(void)
     aegisxd_json_add_string(safe, "readback_source",
                             AEGISXD_RUNTIME_DIR "/active.json");
     json_object_object_add(o, "safe_search", safe);
+    json_object_object_add(o, "pcdn", aegisxd_pcdn_get_json());
     aegisxd_json_add_string(o, "source", "config.db:aegis_content_meta+runtime_active_json");
     return o;
 }
@@ -610,7 +861,8 @@ static int content_resource_count(void)
 {
     sqlite3_stmt *st = aegisxd_config_prepare(
         "SELECT (SELECT COUNT(*) FROM aegis_content_policies)+"
-        "(SELECT COUNT(*) FROM aegis_domain_overrides)");
+        "(SELECT COUNT(*) FROM aegis_domain_overrides)+"
+        "(SELECT COUNT(*) FROM aegis_pcdn_settings WHERE enabled=1)");
     int count = -1;
 
     if (st && sqlite3_step(st) == SQLITE_ROW)
@@ -883,12 +1135,13 @@ void *aegisxd_content_filter_load(void)
 {
     struct content_filter *f=calloc(1,sizeof(*f));sqlite3_stmt *st;if(!f)return NULL;st=aegisxd_config_prepare("SELECT managed FROM aegis_content_meta WHERE id=1");if(st&&sqlite3_step(st)==SQLITE_ROW)f->managed=sqlite3_column_int(st,0);if(st)sqlite3_finalize(st);if(!f->managed)return f;
     st=aegisxd_config_prepare("SELECT mode,ad_block,categories_json,safe_search_json,scope_json,schedule_json FROM aegis_content_policies WHERE enabled=1 AND mode<>'off' ORDER BY id");if(!st){free(f);return NULL;}while(sqlite3_step(st)==SQLITE_ROW){const char *mode=aegisxd_sqlite_text(st,0,"");struct json_object *arr=json_tokener_parse(aegisxd_sqlite_text(st,2,"[]"));struct json_object *safe=json_tokener_parse(aegisxd_sqlite_text(st,3,"{}"));struct json_object *scope=json_tokener_parse(aegisxd_sqlite_text(st,4,"{}"));struct json_object *schedule=json_tokener_parse(aegisxd_sqlite_text(st,5,"{}"));struct content_safe_search parsed;int global=scope&&json_object_is_type(scope,json_type_object)&&!strcmp(aegisxd_json_str(scope,"type","all"),"all")&&content_json_empty_array(scope,"devices")&&content_json_empty_array(scope,"networks");int always=schedule&&json_object_is_type(schedule,json_type_object)&&!strcmp(aegisxd_json_str(schedule,"type","always"),"always");if(!safe||!global||!always||content_safe_search_parse(safe,&parsed,NULL)!=0){if(arr)json_object_put(arr);if(safe)json_object_put(safe);if(scope)json_object_put(scope);if(schedule)json_object_put(schedule);sqlite3_finalize(st);aegisxd_content_filter_free(f);return NULL;}f->policy_count++;f->safe_search.google|=parsed.google;f->safe_search.bing|=parsed.bing;f->safe_search.youtube|=parsed.youtube;if(!strcmp(mode,"enhanced"))f->enhanced=1;if(sqlite3_column_int(st,1))f->ad_block=1;if(arr&&json_object_is_type(arr,json_type_array))for(size_t i=0;i<json_object_array_length(arr);i++){struct json_object *v=json_object_array_get_idx(arr,i);if(v&&json_object_is_type(v,json_type_string))content_list_add(&f->categories,json_object_get_string(v));}if(arr)json_object_put(arr);json_object_put(safe);json_object_put(scope);json_object_put(schedule);}sqlite3_finalize(st);
-    st=aegisxd_config_prepare("SELECT domain,action FROM aegis_domain_overrides WHERE enabled=1 ORDER BY domain");while(st&&sqlite3_step(st)==SQLITE_ROW){const char *d=aegisxd_sqlite_text(st,0,"");const char *a=aegisxd_sqlite_text(st,1,"");if(!strcmp(a,"allow"))content_list_add(&f->allows,d);else if(!strcmp(a,"block"))content_list_add(&f->blocks,d);}if(st)sqlite3_finalize(st);return f;
+    st=aegisxd_config_prepare("SELECT domain,action FROM aegis_domain_overrides WHERE enabled=1 ORDER BY domain");while(st&&sqlite3_step(st)==SQLITE_ROW){const char *d=aegisxd_sqlite_text(st,0,"");const char *a=aegisxd_sqlite_text(st,1,"");if(!strcmp(a,"allow"))content_list_add(&f->allows,d);else if(!strcmp(a,"block"))content_list_add(&f->blocks,d);}if(st)sqlite3_finalize(st);
+    return f;
 }
 
 void aegisxd_content_filter_free(void *opaque)
 {
-    struct content_filter *f=opaque;if(!f)return;content_list_free(&f->categories);content_list_free(&f->allows);content_list_free(&f->blocks);content_list_free(&f->emitted_blocks);free(f);
+    struct content_filter *f=opaque;if(!f)return;content_list_free(&f->categories);content_list_free(&f->allows);content_list_free(&f->blocks);content_list_free(&f->emitted_blocks);content_list_free(&f->emitted_categories);free(f);
 }
 
 int aegisxd_content_filter_domain_blocked(void *opaque,const char *domain,const char *category,int reputation)
@@ -896,7 +1149,72 @@ int aegisxd_content_filter_domain_blocked(void *opaque,const char *domain,const 
     struct content_filter *f=opaque;int blocked=0;if(!f)return 0;if(!f->managed)blocked=1;else if(content_safe_search_domain_claimed(&f->safe_search,domain))blocked=0;else if(content_domain_list_matches(&f->allows,domain))blocked=0;else if(content_domain_list_matches(&f->blocks,domain))blocked=1;else if(!f->policy_count)blocked=0;else if(f->enhanced)blocked=1;else if(category&&content_list_has(&f->categories,category))blocked=1;else if(f->ad_block&&category&&(strstr(category,"ads")||strstr(category,"track")))blocked=1;(void)reputation;if(blocked&&content_list_has(&f->blocks,domain))(void)content_list_add(&f->emitted_blocks,domain);return blocked;
 }
 
-int aegisxd_content_filter_write_explicit_blocks(void *opaque,FILE *fp)
+int aegisxd_content_filter_domain_explicitly_blocked(void *opaque,
+                                                      const char *domain)
 {
-    struct content_filter *f=opaque;int written=0;if(!f||!fp||!f->managed)return 0;for(size_t i=0;i<f->blocks.count;i++){if(content_safe_search_domain_claimed(&f->safe_search,f->blocks.items[i])||content_domain_list_matches(&f->allows,f->blocks.items[i])||content_list_has(&f->emitted_blocks,f->blocks.items[i]))continue;fprintf(fp,"address=/%s/0.0.0.0\naddress=/%s/::\n",f->blocks.items[i],f->blocks.items[i]);written++;}for(size_t i=0;i<f->allows.count;i++){if(content_safe_search_domain_claimed(&f->safe_search,f->allows.items[i]))continue;fprintf(fp,"server=/%s/#\n",f->allows.items[i]);}for(size_t i=0;i<ARRAY_SIZE(content_safe_search_hosts);i++){const struct content_safe_search_host *host=&content_safe_search_hosts[i];if(!content_safe_search_provider_enabled(&f->safe_search,host->provider))continue;fprintf(fp,"# safe-search provider=%s host=%s\n",host->provider,host->host);fprintf(fp,"address=/%s/%s\n",host->host,host->ipv4);if(host->ipv6[0])fprintf(fp,"address=/%s/%s\n",host->host,host->ipv6);written++;}return written;
+    struct content_filter *f = opaque;
+
+    return f && content_domain_list_matches(&f->blocks, domain) &&
+        !content_domain_list_matches(&f->allows, domain) &&
+        !content_safe_search_domain_claimed(&f->safe_search, domain);
+}
+
+int aegisxd_content_filter_mark_category_emitted(void *opaque,
+                                                  const char *domain)
+{
+    struct content_filter *f = opaque;
+
+    return f ? content_list_add(&f->emitted_categories, domain) : -1;
+}
+
+static int content_pcdn_allow_cb(const char *domain, void *opaque)
+{
+    struct content_filter *f = opaque;
+
+    return f && (content_safe_search_domain_claimed(&f->safe_search, domain) ||
+                 content_domain_list_matches(&f->allows, domain) ||
+                 content_domain_list_matches(&f->blocks, domain) ||
+                 content_domain_list_matches(&f->emitted_categories, domain) ||
+                 content_domain_list_matches(&f->emitted_blocks, domain));
+}
+
+int aegisxd_content_filter_write_explicit_blocks(void *opaque, FILE *fp)
+{
+    struct content_filter *f = opaque;
+    int written = 0, pcdn_written;
+
+    if (!f || !fp || !f->managed)
+        return 0;
+    for (size_t i = 0; i < f->blocks.count; i++) {
+        if (content_safe_search_domain_claimed(&f->safe_search, f->blocks.items[i]) ||
+            content_domain_list_matches(&f->allows, f->blocks.items[i]) ||
+            content_list_has(&f->emitted_blocks, f->blocks.items[i]))
+            continue;
+        fprintf(fp, "# aegis provenance=explicit_block source=domain_override domain=%s\n",
+                f->blocks.items[i]);
+        fprintf(fp, "address=/%s/0.0.0.0\naddress=/%s/::\n",
+                f->blocks.items[i], f->blocks.items[i]);
+        written++;
+    }
+    pcdn_written = aegisxd_pcdn_write_dnsmasq(fp, content_pcdn_allow_cb, f);
+    if (pcdn_written < 0)
+        return -1;
+    written += pcdn_written;
+    for (size_t i = 0; i < f->allows.count; i++) {
+        if (content_safe_search_domain_claimed(&f->safe_search, f->allows.items[i]))
+            continue;
+        fprintf(fp, "server=/%s/#\n", f->allows.items[i]);
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(content_safe_search_hosts); i++) {
+        const struct content_safe_search_host *host = &content_safe_search_hosts[i];
+
+        if (!content_safe_search_provider_enabled(&f->safe_search, host->provider))
+            continue;
+        fprintf(fp, "# safe-search provider=%s host=%s\n", host->provider, host->host);
+        fprintf(fp, "address=/%s/%s\n", host->host, host->ipv4);
+        if (host->ipv6[0])
+            fprintf(fp, "address=/%s/%s\n", host->host, host->ipv6);
+        written++;
+    }
+    return written;
 }

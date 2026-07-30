@@ -299,7 +299,7 @@
   overflow: hidden;
 }
 
-.user-auth-table-card.dwrt-kit-datatable-wrap { border: 0; border-radius: var(--app-radius-card, 16px); }
+.user-auth-table-card.dwrt-kit-ikuai-table-wrap { border: 0; border-radius: var(--app-radius-card, 16px); }
 .user-auth-table-card .dwrt-kit-table-scroll { min-height: 0; overflow: auto; overscroll-behavior: auto; scrollbar-gutter: stable; }
 .user-auth-table { min-width: 1120px; table-layout: auto; }
 .user-auth-table th:first-child,

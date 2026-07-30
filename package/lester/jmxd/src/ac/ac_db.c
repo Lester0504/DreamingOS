@@ -32,7 +32,7 @@ struct ac_device_model_report {
 };
 #endif
 #define AC_CONFIG_DB_PATH "/etc/dreamingwrt/config.db"
-#define AC_SCHEMA_VERSION 11
+#define AC_SCHEMA_VERSION 12
 #ifndef AC_CONTRACT_VERSION
 #define AC_CONTRACT_VERSION "ac-controller.v1"
 #endif
@@ -1916,8 +1916,9 @@ static int ac_schema_migrate(void)
         " entity_id TEXT NOT NULL,payload_json TEXT NOT NULL DEFAULT '{}');"
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_ac_events_topic_seq ON ac_events(topic,seq);"
         "CREATE TABLE IF NOT EXISTS ac_secrets ("
-        " secret_id TEXT PRIMARY KEY,version INTEGER NOT NULL,cipher_text BLOB NOT NULL,nonce BLOB NOT NULL,"
-        " key_id TEXT NOT NULL,updated_at INTEGER NOT NULL);"
+        " secret_id TEXT PRIMARY KEY NOT NULL,version INTEGER NOT NULL CHECK(version > 0),"
+        " key_id TEXT NOT NULL,nonce BLOB NOT NULL CHECK(length(nonce)=12),"
+        " ciphertext BLOB NOT NULL,tag BLOB NOT NULL CHECK(length(tag)=16));"
         "CREATE TABLE IF NOT EXISTS ac_config_jobs ("
         " job_id TEXT PRIMARY KEY,ap_id TEXT NOT NULL,"
         " state TEXT NOT NULL DEFAULT 'queued' CHECK(state IN"
@@ -1940,6 +1941,9 @@ static int ac_schema_migrate(void)
     if (ac_exec("BEGIN IMMEDIATE") != 0)
         return -1;
     if (ac_exec(schema) != 0 ||
+#ifndef AC_DB_TEST_STANDALONE
+        ac_secrets_schema_init(g_ac_db) != AC_SECRETS_OK ||
+#endif
         ac_add_column("ac_pairing_tokens", "digest_version", "INTEGER NOT NULL DEFAULT 0") != 0 ||
         ac_add_column("ac_pairing_tokens", "created_at", "INTEGER NOT NULL DEFAULT 0") != 0 ||
         ac_add_column("ac_pairing_tokens", "revoked_at", "INTEGER NOT NULL DEFAULT 0") != 0 ||

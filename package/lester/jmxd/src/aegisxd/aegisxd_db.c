@@ -49,6 +49,61 @@ static int aegisxd_add_column_if_missing(sqlite3 *db, const char *table,
     return aegisxd_exec(db, sql);
 }
 
+static int aegisxd_pcdn_mode_constraint_migrate(sqlite3 *db)
+{
+    sqlite3_stmt *st = NULL;
+    int rc;
+
+    if (!db || sqlite3_exec(db, "SAVEPOINT aegis_pcdn_mode_probe", NULL, NULL, NULL) != SQLITE_OK)
+        return -1;
+    rc = sqlite3_prepare_v2(db,
+        "UPDATE aegis_pcdn_settings SET mode='monitor' WHERE id=1", -1, &st, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_step(st);
+    if (st)
+        sqlite3_finalize(st);
+    sqlite3_exec(db, "ROLLBACK TO aegis_pcdn_mode_probe", NULL, NULL, NULL);
+    sqlite3_exec(db, "RELEASE aegis_pcdn_mode_probe", NULL, NULL, NULL);
+    if (rc == SQLITE_DONE)
+        return 0;
+
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK)
+        return -1;
+    if (aegisxd_exec(db, "DROP TABLE IF EXISTS aegis_pcdn_settings_v2") != 0 ||
+        aegisxd_exec(db,
+        "CREATE TABLE aegis_pcdn_settings_v2 ("
+        " id INTEGER PRIMARY KEY CHECK(id=1),"
+        " enabled INTEGER NOT NULL DEFAULT 0,"
+        " mode TEXT NOT NULL DEFAULT 'block' CHECK(mode IN ('block','monitor')),"
+        " source_id TEXT NOT NULL DEFAULT 'openhosts-pcdn',"
+        " revision INTEGER NOT NULL DEFAULT 1,"
+        " apply_state TEXT NOT NULL DEFAULT 'disabled',"
+        " last_error TEXT NOT NULL DEFAULT '',"
+        " sync_state TEXT NOT NULL DEFAULT 'never',"
+        " sync_error TEXT NOT NULL DEFAULT '',"
+        " artifact_path TEXT NOT NULL DEFAULT '',"
+        " artifact_sha256 TEXT NOT NULL DEFAULT '',"
+        " rule_count INTEGER NOT NULL DEFAULT 0,"
+        " rejected_count INTEGER NOT NULL DEFAULT 0,"
+        " last_sync_at INTEGER NOT NULL DEFAULT 0,"
+        " created_at INTEGER NOT NULL DEFAULT 0,"
+        " updated_at INTEGER NOT NULL DEFAULT 0)") != 0 ||
+        aegisxd_exec(db,
+        "INSERT INTO aegis_pcdn_settings_v2("
+        "id,enabled,mode,source_id,revision,apply_state,last_error,sync_state,sync_error,"
+        "artifact_path,artifact_sha256,rule_count,rejected_count,last_sync_at,created_at,updated_at) "
+        "SELECT id,enabled,CASE WHEN mode='monitor' THEN 'monitor' ELSE 'block' END,source_id,"
+        "revision,apply_state,last_error,sync_state,sync_error,artifact_path,artifact_sha256,"
+        "rule_count,rejected_count,last_sync_at,created_at,updated_at FROM aegis_pcdn_settings") != 0 ||
+        aegisxd_exec(db, "DROP TABLE aegis_pcdn_settings") != 0 ||
+        aegisxd_exec(db, "ALTER TABLE aegis_pcdn_settings_v2 RENAME TO aegis_pcdn_settings") != 0 ||
+        sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return -1;
+    }
+    return 0;
+}
+
 sqlite3_stmt *aegisxd_config_prepare(const char *sql)
 {
     sqlite3_stmt *st = NULL;
@@ -214,8 +269,8 @@ int aegisxd_db_init(void)
 
     if (g_aegisxd_config_db && g_aegisxd_db)
         return 0;
-    if (aegisxd_mkdir_p("/etc/dreamingwrt", 0755) != 0) {
-        fprintf(stderr, "[dreamingwrt-aegisxd] create /etc/dreamingwrt failed\n");
+    if (aegisxd_mkdir_p(AEGISXD_CONFIG_DIR, 0755) != 0) {
+        fprintf(stderr, "[dreamingwrt-aegisxd] create %s failed\n", AEGISXD_CONFIG_DIR);
         return -1;
     }
     if (aegisxd_mkdir_p(AEGISXD_WORK_DIR, 0755) != 0) {
@@ -255,7 +310,20 @@ int aegisxd_db_init(void)
         " suricata_version TEXT NOT NULL DEFAULT 'auto',"
         " default_action TEXT NOT NULL DEFAULT 'alert',"
         " logging_enabled INTEGER NOT NULL DEFAULT 1,"
+        " suricata_interface TEXT NOT NULL DEFAULT '',"
+        " suricata_queue_num INTEGER NOT NULL DEFAULT 0,"
+        " suricata_fail_open INTEGER NOT NULL DEFAULT 1,"
         " updated_at INTEGER NOT NULL DEFAULT 0)") != 0)
+        return aegisxd_db_init_fail();
+    if (aegisxd_add_column_if_missing(g_aegisxd_config_db, "aegis_settings",
+        "suricata_interface",
+        "ALTER TABLE aegis_settings ADD COLUMN suricata_interface TEXT NOT NULL DEFAULT ''") != 0 ||
+        aegisxd_add_column_if_missing(g_aegisxd_config_db, "aegis_settings",
+        "suricata_queue_num",
+        "ALTER TABLE aegis_settings ADD COLUMN suricata_queue_num INTEGER NOT NULL DEFAULT 0") != 0 ||
+        aegisxd_add_column_if_missing(g_aegisxd_config_db, "aegis_settings",
+        "suricata_fail_open",
+        "ALTER TABLE aegis_settings ADD COLUMN suricata_fail_open INTEGER NOT NULL DEFAULT 1") != 0)
         return aegisxd_db_init_fail();
     if (aegisxd_exec(g_aegisxd_config_db,
         "CREATE TABLE IF NOT EXISTS aegis_honeypots ("
@@ -329,6 +397,36 @@ int aegisxd_db_init(void)
         "VALUES(1,0,0,'legacy','',0)") != 0)
         return aegisxd_db_init_fail();
     if (aegisxd_exec(g_aegisxd_config_db,
+        "CREATE TABLE IF NOT EXISTS aegis_pcdn_settings ("
+        " id INTEGER PRIMARY KEY CHECK(id=1),"
+        " enabled INTEGER NOT NULL DEFAULT 0,"
+        " mode TEXT NOT NULL DEFAULT 'block' CHECK(mode IN ('block','monitor')),"
+        " source_id TEXT NOT NULL DEFAULT 'openhosts-pcdn',"
+        " revision INTEGER NOT NULL DEFAULT 1,"
+        " apply_state TEXT NOT NULL DEFAULT 'disabled',"
+        " last_error TEXT NOT NULL DEFAULT '',"
+        " sync_state TEXT NOT NULL DEFAULT 'never',"
+        " sync_error TEXT NOT NULL DEFAULT '',"
+        " artifact_path TEXT NOT NULL DEFAULT '',"
+        " artifact_sha256 TEXT NOT NULL DEFAULT '',"
+        " rule_count INTEGER NOT NULL DEFAULT 0,"
+        " rejected_count INTEGER NOT NULL DEFAULT 0,"
+        " last_sync_at INTEGER NOT NULL DEFAULT 0,"
+        " created_at INTEGER NOT NULL DEFAULT 0,"
+        " updated_at INTEGER NOT NULL DEFAULT 0)") != 0 ||
+        aegisxd_exec(g_aegisxd_config_db,
+        "INSERT OR IGNORE INTO aegis_pcdn_settings"
+        "(id,enabled,mode,source_id,revision,apply_state,sync_state,created_at,updated_at) "
+        "VALUES(1,0,'block','openhosts-pcdn',1,'disabled','never',0,0)") != 0 ||
+        aegisxd_add_column_if_missing(g_aegisxd_config_db, "aegis_pcdn_settings",
+        "artifact_path", "ALTER TABLE aegis_pcdn_settings ADD COLUMN artifact_path TEXT NOT NULL DEFAULT ''") != 0 ||
+        aegisxd_add_column_if_missing(g_aegisxd_config_db, "aegis_pcdn_settings",
+        "artifact_sha256", "ALTER TABLE aegis_pcdn_settings ADD COLUMN artifact_sha256 TEXT NOT NULL DEFAULT ''") != 0 ||
+        aegisxd_pcdn_mode_constraint_migrate(g_aegisxd_config_db) != 0 ||
+        aegisxd_exec(g_aegisxd_config_db,
+        "DROP TABLE IF EXISTS aegis_pcdn_rules") != 0)
+        return aegisxd_db_init_fail();
+    if (aegisxd_exec(g_aegisxd_config_db,
         "CREATE TABLE IF NOT EXISTS aegis_signature_policy_overrides ("
         " gid INTEGER NOT NULL DEFAULT 1 CHECK(gid=1),"
         " sid INTEGER NOT NULL,"
@@ -355,6 +453,8 @@ int aegisxd_db_init(void)
         "INSERT OR IGNORE INTO aegis_settings"
         "(id,enabled,mode,source_level,suricata_version,default_action,logging_enabled,updated_at) "
         "VALUES(1,0,'off','open','auto','alert',1,0)") != 0)
+        return aegisxd_db_init_fail();
+    if (aegisxd_certificate_schema_init() != 0)
         return aegisxd_db_init_fail();
 
     if (aegisxd_exec(g_aegisxd_db,
@@ -466,6 +566,10 @@ int aegisxd_db_init(void)
     if (aegisxd_exec(g_aegisxd_db,
         "CREATE INDEX IF NOT EXISTS idx_aegis_events_honeypot "
         "ON aegis_events(policy_type,source_ip,ts DESC)") != 0)
+        return aegisxd_db_init_fail();
+    if (aegisxd_exec(g_aegisxd_db,
+        "CREATE INDEX IF NOT EXISTS idx_aegis_events_dns_aggregate "
+        "ON aegis_events(policy_type,policy_id,source,destination_host,source_ip,last_seen DESC)") != 0)
         return aegisxd_db_init_fail();
     if (aegisxd_exec(g_aegisxd_db,
         "CREATE TABLE IF NOT EXISTS aegis_suricata_rules ("
@@ -590,9 +694,13 @@ int aegisxd_settings_load(struct aegisxd_settings *out)
     snprintf(out->suricata_version, sizeof(out->suricata_version), "%s", "auto");
     snprintf(out->default_action, sizeof(out->default_action), "%s", "alert");
     out->logging_enabled = 1;
+    out->suricata_interface[0] = '\0';
+    out->suricata_queue_num = 0;
+    out->suricata_fail_open = 1;
 
     st = aegisxd_config_prepare(
-        "SELECT enabled,mode,source_level,suricata_version,default_action,logging_enabled "
+        "SELECT enabled,mode,source_level,suricata_version,default_action,logging_enabled,"
+        "suricata_interface,suricata_queue_num,suricata_fail_open "
         "FROM aegis_settings WHERE id=1");
     if (!st)
         return -1;
@@ -607,6 +715,10 @@ int aegisxd_settings_load(struct aegisxd_settings *out)
         snprintf(out->default_action, sizeof(out->default_action), "%s",
                  aegisxd_sqlite_text(st, 4, "alert"));
         out->logging_enabled = sqlite3_column_int(st, 5) ? 1 : 0;
+        snprintf(out->suricata_interface, sizeof(out->suricata_interface), "%s",
+                 aegisxd_sqlite_text(st, 6, ""));
+        out->suricata_queue_num = sqlite3_column_int(st, 7);
+        out->suricata_fail_open = sqlite3_column_int(st, 8) ? 1 : 0;
     }
     sqlite3_finalize(st);
     return rc == SQLITE_ROW || rc == SQLITE_DONE ? 0 : -1;

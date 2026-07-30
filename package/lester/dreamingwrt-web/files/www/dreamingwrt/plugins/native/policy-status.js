@@ -442,14 +442,14 @@ export function mount(context = {}) {
 
   function rulesTable() {
     const paths = [...new Set((state.data?.rules || []).map((rule) => rule.target).filter((value) => value && value !== '--'))];
-    return `<section class="policy-status-table dwrt-kit-table-wrap dwrt-kit-datatable-wrap policy-status-glass">
+    return `<section class="policy-status-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap policy-status-glass">
       <div class="dwrt-kit-table-toolbar policy-status-toolbar">
         <div class="dwrt-kit-table-title"><strong>分流规则</strong><span data-policy-rule-count>${filteredRules().length} / ${state.data?.rules.length || 0} 条</span></div>
         <label class="policy-status-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg><input type="search" data-policy-status-search value="${escapeHtml(state.query)}" placeholder="搜索规则、匹配对象、出口" aria-label="搜索分流规则"></label>
         <select data-policy-status-filter="action" aria-label="筛选动作"><option value="">全部动作</option>${['route', 'balance', 'vpn', 'direct', 'reject', 'fallback'].map((action) => `<option value="${action}" ${state.action === action ? 'selected' : ''}>${actionLabel(action)}</option>`).join('')}</select>
         <select data-policy-status-filter="path" aria-label="筛选出口"><option value="">全部出口</option>${paths.map((path) => `<option value="${escapeHtml(path)}" ${state.path === path ? 'selected' : ''}>${escapeHtml(path)}</option>`).join('')}</select>
       </div>
-      <div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-datatable"><thead><tr><th>${sortButton('prio', '优先级')}</th><th>${sortButton('name', '分流规则')}</th><th>匹配对象</th><th>出口通道</th><th>${sortButton('active_flows', '状态速率')}</th><th>${sortButton('hit_count', '命中样本')}</th></tr></thead><tbody>${ruleRows()}</tbody></table></div>
+      <div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr><th>${sortButton('prio', '优先级')}</th><th>${sortButton('name', '分流规则')}</th><th>匹配对象</th><th>出口通道</th><th>${sortButton('active_flows', '状态速率')}</th><th>${sortButton('hit_count', '命中样本')}</th></tr></thead><tbody>${ruleRows()}</tbody></table></div>
     </section>`;
   }
 

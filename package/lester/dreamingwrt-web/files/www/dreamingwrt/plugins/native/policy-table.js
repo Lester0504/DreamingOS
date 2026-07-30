@@ -692,12 +692,12 @@ export function mount(context = {}) {
       if(d.destination_type==='region') reasons.push('PBR 地区对象写入尚未实现');
     }
     if(d.policy_type==='qos') {
-      if(d.qos_behavior!=='limit') reasons.push('当前后端只有 SQM 限速，没有 DPI 优先级队列语义');
+      if(d.qos_behavior!=='limit') reasons.push('当前后端只有 SQM 限速，没有 UniFi DPI 优先级队列语义');
       if(d.source_type!=='any'||d.destination_type!=='any'||d.destination_port_mode!=='any') reasons.push('QoS 源、目标和端口对象匹配尚未实现');
       if(d.download_burst!=='off'||d.upload_burst!=='off'||d.schedule_mode!=='always') reasons.push('QoS 突发与计划尚未进入后端合同');
     }
     if(d.policy_type==='nat') {
-      if(d.target==='dnat') reasons.push('DNAT 请使用端口转发；config nat 执行器尚未承载目标 NAT 合同');
+      if(d.target==='dnat') reasons.push('DNAT 请使用端口转发；config nat 执行器尚未承载 UniFi 目标 NAT 合同');
       if(d.target==='snat'&&d.translated_ip_mode==='primary') reasons.push('后端尚未提供所选接口主要地址的稳定写入解析');
       if(!['any','ip'].includes(d.source_type)||!['any','ip'].includes(d.destination_type)) reasons.push('NAT 网络对象引用尚未实现');
       if(d.source_port_mode==='list'||d.destination_port_mode==='list'||d.syslog||d.exclude) reasons.push('NAT 对象端口、Syslog 或排除语义尚未实现');
@@ -881,9 +881,9 @@ export function mount(context = {}) {
   function renderTable() {
     const rows = visibleRows();
     const cols = DEFAULT_COLUMNS.filter((column) => columnVisible(column.key));
-    return `<section class="policy-table-card dwrt-kit-table-wrap dwrt-kit-datatable-wrap policy-stable-glass">
+    return `<section class="policy-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap policy-stable-glass">
       <div class="dwrt-kit-table-scroll policy-table-scroll" data-table-scroll>
-        <table class="dwrt-kit-table dwrt-kit-datatable policy-table">
+        <table class="dwrt-kit-table dwrt-kit-ikuai-table policy-table">
           <thead><tr>${cols.map((column) => `<th style="min-width:${column.min || 42}px">${escapeHtml(column.label)}</th>`).join('')}</tr></thead>
           <tbody>${state.loading ? '<tr><td colspan="20" class="dwrt-kit-table-empty policy-empty-cell">正在读取策略表…</td></tr>' : rows.length ? rows.map((row) => renderRow(row)).join('') : '<tr><td colspan="20" class="dwrt-kit-table-empty policy-empty-cell">没有匹配的策略</td></tr>'}</tbody>
         </table>

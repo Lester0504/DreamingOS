@@ -302,7 +302,7 @@ def test_sqlite_transaction_preserves_non_app_rules_and_locks_revision() -> None
         "id": "aegis-youtube",
         "enabled": 1,
         "name": "Block YouTube",
-        "source": "02:00:5e:10:00:01",
+        "source": "bc:24:11:90:f7:ca",
         "schedule": "always",
         "app_ids": [1001, 1002],
         "filter_quic": 1,

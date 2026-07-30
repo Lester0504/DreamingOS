@@ -327,6 +327,27 @@ int apd_config_readback(const struct apd_config_paths *paths,
     return -1;
 }
 
+int apd_config_capture_previous(const struct apd_config_paths *paths,
+                                struct json_object *candidate,
+                                struct json_object **out)
+{
+    (void)paths; (void)candidate;
+    if (out)
+        *out = NULL;
+    return -1;
+}
+
+int apd_config_apply_prepared(const struct apd_config_paths *paths,
+                              struct json_object *candidate,
+                              struct json_object *previous,
+                              struct json_object **out)
+{
+    (void)paths; (void)candidate; (void)previous;
+    if (out)
+        *out = NULL;
+    return -1;
+}
+
 int apd_config_apply(const struct apd_config_paths *paths,
                      struct json_object *candidate, struct json_object **out)
 {
@@ -399,6 +420,16 @@ int apd_config_job_finish_ack(
 {
     (void)assignment; (void)finish_id; (void)now; (void)out;
     return APD_CONFIG_JOB_JOURNAL_ERROR;
+}
+
+int apd_config_jobs_restart_recover(
+    const struct apd_config_paths *paths, int64_t now,
+    apd_config_finish_id_fn finish_id, int *recovered)
+{
+    (void)paths; (void)now; (void)finish_id;
+    if (recovered)
+        *recovered = 0;
+    return 0;
 }
 
 int apd_backend_device_model_collect(struct apd_device_model *out)
