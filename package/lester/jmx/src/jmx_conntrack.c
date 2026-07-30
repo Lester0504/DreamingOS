@@ -25,7 +25,7 @@
 #include "jmx_log.h"
 #include "jmx.h"
 
-struct hlist_head af_conn_table[AF_CONN_HASH_SIZE];
+static struct hlist_head af_conn_table[AF_CONN_HASH_SIZE];
 
 DEFINE_SPINLOCK(af_conn_lock);
 
@@ -39,7 +39,7 @@ static u32 af_conn_hash(u32 src_ip, u32 dst_ip,
 }
 
 
-void af_conn_cleanup(void)
+static void af_conn_cleanup(void)
 {
     int i;
     spin_lock(&af_conn_lock);
@@ -57,7 +57,8 @@ void af_conn_cleanup(void)
     spin_unlock(&af_conn_lock);
 }
 
-af_conn_t *af_conn_add(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port, u8 protocol)
+static af_conn_t *af_conn_add(u32 src_ip, u32 dst_ip, u16 src_port,
+			      u16 dst_port, u8 protocol)
 {
     u32 hash;
     af_conn_t *conn;
@@ -86,7 +87,8 @@ af_conn_t *af_conn_add(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port, u8 pr
 }
 
 
-af_conn_t* af_conn_find(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port, u8 protocol)
+static af_conn_t *af_conn_find(u32 src_ip, u32 dst_ip, u16 src_port,
+			       u16 dst_port, u8 protocol)
 {
     u32 hash;
     af_conn_t *conn;
@@ -115,15 +117,6 @@ af_conn_t* af_conn_find_and_add(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_po
     return conn;
 }
 
-
-void af_conn_update(af_conn_t *conn, u32 app_id, u8 drop)
-{
-    spin_lock(&af_conn_lock);
-    conn->app_id = app_id;
-    conn->drop = drop;
-    conn->last_jiffies = jiffies;
-    spin_unlock(&af_conn_lock);
-}
 
 void af_conn_record_match(u32 src_ip, u32 dst_ip, u16 src_port,
                           u16 dst_port, u8 protocol, u32 app_id, u8 drop)
@@ -241,7 +234,7 @@ static void *af_conn_seq_next(struct seq_file *s, void *v, loff_t *pos)
     return NULL;
 }
 
-static void af_conn_seq_stop(struct seq_file *s, void *v)
+static void af_conn_seq_stop(struct seq_file *, void *)
 {
     spin_unlock_bh(&af_conn_lock);
 }
@@ -276,7 +269,7 @@ static const struct seq_operations af_conn_seq_ops = {
 };
 
 
-static int af_conn_open(struct inode *inode, struct file *file)
+static int af_conn_open(struct inode *, struct file *file)
 {
     struct seq_file *seq;
     struct af_conn_iter_state *iter;
@@ -318,11 +311,10 @@ static const struct proc_ops af_conn_fops = {
 
 #define AF_CONN_PROC_STR "af_conn"
 
-int af_conn_init_procfs(void)
+static int af_conn_init_procfs(void)
 {
-    struct proc_dir_entry *pde;
-    struct net *net = &init_net;
-    pde = proc_create(AF_CONN_PROC_STR, 0644, jmx_proc_root, &af_conn_fops);
+	struct proc_dir_entry *pde;
+	pde = proc_create(AF_CONN_PROC_STR, 0644, jmx_proc_root, &af_conn_fops);
     if (!pde)
     {
         printk("af_conn seq file created error\n");
@@ -332,10 +324,9 @@ int af_conn_init_procfs(void)
     return 0;
 }
 
-void af_conn_remove_procfs(void)
+static void af_conn_remove_procfs(void)
 {
-    struct net *net = &init_net;
-    remove_proc_entry(AF_CONN_PROC_STR, jmx_proc_root);
+	remove_proc_entry(AF_CONN_PROC_STR, jmx_proc_root);
 }
 
 

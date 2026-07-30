@@ -7,6 +7,7 @@
 #define __AF_CLIENT_H__
 #include "jmx.h"
 #include "jmx_client_accounting.h"
+#include <linux/refcount.h>
 
 extern rwlock_t af_client_lock;
 
@@ -22,6 +23,8 @@ extern int g_min_http_match_count;
 #define MAX_AF_CLIENT_HASH_SIZE 64
 #define NF_CLIENT_TIMER_EXPIRE 1
 #define MAX_CLIENT_ACTIVE_TIME 90
+
+extern struct list_head af_client_list_table[MAX_AF_CLIENT_HASH_SIZE];
 
 #define AF_CLIENT_LOCK_R() read_lock_bh(&af_client_lock);
 #define AF_CLIENT_UNLOCK_R() read_unlock_bh(&af_client_lock);
@@ -83,6 +86,8 @@ typedef struct visiting_info{
 typedef struct af_client_info
 {
 	struct list_head hlist;
+	refcount_t refs;
+	bool dying;
 	unsigned char mac[MAC_ADDR_LEN];
 	unsigned int ip;
 	struct in6_addr ipv6;
@@ -103,6 +108,7 @@ typedef struct af_client_info
 	spinlock_t visit_info_lock;
 	struct hlist_head visit_info_hash[MAX_VISIT_INFO_HASH_SIZE];
 	struct proc_dir_entry *proc_dir;
+	bool proc_ref_held;
 } af_client_info_t;
 
 int af_client_init(void);
@@ -111,14 +117,16 @@ void af_client_exit(void);
 af_client_info_t *find_af_client_by_ip(unsigned int ip);
 af_client_info_t *find_af_client_by_ipv6(struct in6_addr *addr);
 
-af_client_info_t *find_af_client(unsigned char *mac);
+af_client_info_t *af_client_get_by_ip(unsigned int ip);
+af_client_info_t *af_client_get_by_ipv6(struct in6_addr *addr);
+bool af_client_get_if_live(af_client_info_t *client);
+void af_client_put(af_client_info_t *client);
 
 void check_client_expire(void);
 
 void af_visit_info_report(void);
 
 void af_client_list_reset_report_num(void);
-af_client_info_t *nf_client_add(unsigned char *mac);
 af_client_info_t *find_and_add_af_client(unsigned char *mac);
 app_visit_info_t *get_or_create_visit_info(af_client_info_t *node, unsigned int app_id);
 int af_update_client_app_info(af_client_info_t *node, int app_id, int drop, int from_conntrack, int is_http);
@@ -126,6 +134,4 @@ int af_account_client_app_packet(af_client_info_t *node, unsigned int app_id,
 				 enum jmx_client_packet_direction direction,
 				 unsigned int bytes, bool blocked);
 unsigned long long af_client_counter_generation(void);
-void check_expired_visit_info(af_client_info_t *node);
-
 #endif

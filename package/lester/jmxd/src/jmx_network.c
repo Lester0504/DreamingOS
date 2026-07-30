@@ -7,16 +7,25 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include <ctype.h>
+#include <limits.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#ifndef JMX_NETWORK_DEFENSIVE_ONLY
 #include <libubox/uloop.h>
 #include <libubox/utils.h>
 #include <libubus.h>
+#endif
 #include <time.h>
 #include <signal.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <json-c/json.h>
+#ifndef JMX_NETWORK_DEFENSIVE_ONLY
 #include <uci.h>
 #include "jmx.h"
 #include "jmx_user.h"
@@ -24,11 +33,302 @@
 #include "jmx_ubus.h"
 #include "jmx_config.h"
 #include "jmx_utils.h"
-#include "jmx_network.h"
 #include "jmx_uci.h"
 #include "jmx_netconfig_db.h"
+#endif
+#include "jmx_network.h"
 #define MAX_INET_ADDR_LEN 32
 #define MAX_MAC_ADDR_LEN 18
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+#ifndef JMX_IFSTATUS_PATH
+#define JMX_IFSTATUS_PATH "/sbin/ifstatus"
+#endif
+
+#define JMX_IFSTATUS_MAX_OUTPUT (256U * 1024U)
+
+int jmx_interface_name_valid(const char *ifname, int require_existing)
+{
+    size_t i, len;
+
+    if (!ifname || !(len = strlen(ifname)) || len >= IFNAMSIZ)
+        return 0;
+    for (i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)ifname[i];
+
+        if (!isalnum(ch) && ch != '_' && ch != '-' && ch != '.' && ch != ':')
+            return 0;
+    }
+    return !require_existing || if_nametoindex(ifname) != 0;
+}
+
+static int jmx_canonical_address(int family, const char *value,
+                                 char *output, size_t output_len)
+{
+    unsigned char address[sizeof(struct in6_addr)];
+    char canonical[INET6_ADDRSTRLEN];
+
+    if (!value || !value[0] || !output || output_len == 0 ||
+        inet_pton(family, value, address) != 1 ||
+        !inet_ntop(family, address, canonical, sizeof(canonical)) ||
+        strlen(canonical) >= output_len)
+        return -1;
+    memcpy(output, canonical, strlen(canonical) + 1);
+    return 0;
+}
+
+static int jmx_json_ipv4_string(struct json_object *obj,
+                                char *output, size_t output_len)
+{
+    if (!obj || !json_object_is_type(obj, json_type_string))
+        return -1;
+    if (jmx_canonical_address(AF_INET, json_object_get_string(obj),
+                              output, output_len) != 0)
+        return -1;
+    return strcmp(output, json_object_get_string(obj)) == 0 ? 0 : -1;
+}
+
+static int jmx_prefix_to_mask(int prefix, char *output, size_t output_len)
+{
+    struct in_addr address;
+
+    if (prefix < 0 || prefix > 32 || !output || output_len < INET_ADDRSTRLEN)
+        return -1;
+    address.s_addr = htonl(prefix == 0 ? 0U : 0xffffffffU << (32 - prefix));
+    return inet_ntop(AF_INET, &address, output, output_len) ? 0 : -1;
+}
+
+int jmx_iface_status_parse_json(const char *json, iface_status_t *status)
+{
+    iface_status_t parsed;
+    struct json_object *root = NULL;
+    struct json_tokener *tokener = NULL;
+    struct json_object *array = NULL;
+    struct json_object *entry = NULL;
+    struct json_object *value = NULL;
+    size_t json_len, parse_end;
+    int i;
+
+    if (!json || !status)
+        return -1;
+    json_len = strlen(json);
+    if (json_len > INT_MAX)
+        return -1;
+    memset(&parsed, 0, sizeof(parsed));
+    tokener = json_tokener_new();
+    if (!tokener)
+        return -1;
+    root = json_tokener_parse_ex(tokener, json, (int)json_len);
+    if (!root || json_tokener_get_error(tokener) != json_tokener_success ||
+        !json_object_is_type(root, json_type_object))
+        goto fail;
+    parse_end = json_tokener_get_parse_end(tokener);
+    while (parse_end < json_len && isspace((unsigned char)json[parse_end]))
+        parse_end++;
+    if (parse_end != json_len)
+        goto fail;
+    json_tokener_free(tokener);
+    tokener = NULL;
+
+    if (json_object_object_get_ex(root, "ipv4-address", &array)) {
+        if (!json_object_is_type(array, json_type_array))
+            goto fail;
+        if (json_object_array_length(array) > 0) {
+            entry = json_object_array_get_idx(array, 0);
+            if (!entry || !json_object_is_type(entry, json_type_object) ||
+                !json_object_object_get_ex(entry, "address", &value) ||
+                jmx_json_ipv4_string(value, parsed.ip, sizeof(parsed.ip)) != 0 ||
+                !json_object_object_get_ex(entry, "mask", &value) ||
+                !json_object_is_type(value, json_type_int) ||
+                jmx_prefix_to_mask(json_object_get_int(value), parsed.mask,
+                                   sizeof(parsed.mask)) != 0)
+                goto fail;
+        }
+    }
+
+    array = NULL;
+    if (json_object_object_get_ex(root, "route", &array)) {
+        if (!json_object_is_type(array, json_type_array))
+            goto fail;
+        if (json_object_array_length(array) > 0) {
+            entry = json_object_array_get_idx(array, 0);
+            if (!entry || !json_object_is_type(entry, json_type_object))
+                goto fail;
+            if (json_object_object_get_ex(entry, "nexthop", &value) &&
+                jmx_json_ipv4_string(value, parsed.gateway,
+                                     sizeof(parsed.gateway)) != 0)
+                goto fail;
+        }
+    }
+
+    array = NULL;
+    if (json_object_object_get_ex(root, "dns-server", &array)) {
+        size_t count;
+
+        if (!json_object_is_type(array, json_type_array))
+            goto fail;
+        count = json_object_array_length(array);
+        if (count > 0 &&
+            jmx_json_ipv4_string(json_object_array_get_idx(array, 0),
+                                 parsed.dns1, sizeof(parsed.dns1)) != 0)
+            goto fail;
+        if (count > 1 &&
+            jmx_json_ipv4_string(json_object_array_get_idx(array, 1),
+                                 parsed.dns2, sizeof(parsed.dns2)) != 0)
+            goto fail;
+    }
+
+    array = NULL;
+    if (json_object_object_get_ex(root, "ipv6-address", &array)) {
+        if (!json_object_is_type(array, json_type_array))
+            goto fail;
+        for (i = 0; i < (int)json_object_array_length(array); i++) {
+            char candidate[sizeof(parsed.ipv6)];
+
+            entry = json_object_array_get_idx(array, i);
+            if (!entry || !json_object_is_type(entry, json_type_object) ||
+                !json_object_object_get_ex(entry, "address", &value) ||
+                !json_object_is_type(value, json_type_string) ||
+                jmx_canonical_address(AF_INET6, json_object_get_string(value),
+                                      candidate, sizeof(candidate)) != 0)
+                goto fail;
+            if (strncmp(candidate, "fe80:", 5) != 0 && !parsed.ipv6[0])
+                memcpy(parsed.ipv6, candidate, strlen(candidate) + 1);
+        }
+    }
+
+    *status = parsed;
+    json_object_put(root);
+    return 0;
+
+fail:
+    if (tokener)
+        json_tokener_free(tokener);
+    if (root)
+        json_object_put(root);
+    return -1;
+}
+
+char *get_interface_status_buf(char *ifname)
+{
+    char *const argv[] = { (char *)JMX_IFSTATUS_PATH, ifname, NULL };
+    char *buffer = NULL;
+    size_t capacity = 4096, used = 0;
+    int descriptors[2] = { -1, -1 };
+    int status = 0;
+    pid_t child;
+
+    if (!jmx_interface_name_valid(ifname, 0) || pipe(descriptors) != 0)
+        return NULL;
+    child = fork();
+    if (child < 0) {
+        close(descriptors[0]);
+        close(descriptors[1]);
+        return NULL;
+    }
+    if (child == 0) {
+        int null_fd;
+
+        close(descriptors[0]);
+        if (dup2(descriptors[1], STDOUT_FILENO) < 0)
+            _exit(126);
+        close(descriptors[1]);
+        null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDERR_FILENO);
+            close(null_fd);
+        }
+        execv(JMX_IFSTATUS_PATH, argv);
+        _exit(127);
+    }
+    close(descriptors[1]);
+    descriptors[1] = -1;
+    buffer = malloc(capacity);
+    if (!buffer)
+        goto fail;
+    for (;;) {
+        ssize_t count;
+
+        if (used == capacity - 1) {
+            size_t next_capacity;
+            char *next;
+
+            if (capacity >= JMX_IFSTATUS_MAX_OUTPUT + 1U)
+                goto fail;
+            next_capacity = capacity * 2U;
+            if (next_capacity > JMX_IFSTATUS_MAX_OUTPUT + 1U)
+                next_capacity = JMX_IFSTATUS_MAX_OUTPUT + 1U;
+            next = realloc(buffer, next_capacity);
+            if (!next)
+                goto fail;
+            buffer = next;
+            capacity = next_capacity;
+        }
+        count = read(descriptors[0], buffer + used, capacity - used - 1U);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count < 0)
+            goto fail;
+        if (count == 0)
+            break;
+        used += (size_t)count;
+    }
+    close(descriptors[0]);
+    descriptors[0] = -1;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR)
+            goto fail_no_child;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        goto fail_no_child;
+    buffer[used] = '\0';
+    return buffer;
+
+fail:
+    if (descriptors[0] >= 0)
+        close(descriptors[0]);
+    kill(child, SIGKILL);
+    while (waitpid(child, NULL, 0) < 0 && errno == EINTR)
+        ;
+fail_no_child:
+    free(buffer);
+    return NULL;
+}
+
+#ifndef JMX_NETWORK_DEFENSIVE_ONLY
+#include "jmx_exec.h"
+
+#define JMX_SERVICE_ACTION_TIMEOUT_MS 30000
+
+static int jmx_network_service_action(const char *service, const char *action)
+{
+    const char *path;
+    struct jmx_exec_result result;
+    char *argv[3];
+    int ok;
+
+    if (!service || !action ||
+        (strcmp(action, "reload") != 0 && strcmp(action, "restart") != 0))
+        return -1;
+    if (strcmp(service, "network") == 0)
+        path = "/etc/init.d/network";
+    else if (strcmp(service, "dnsmasq") == 0)
+        path = "/etc/init.d/dnsmasq";
+    else
+        return -1;
+
+    argv[0] = (char *)path;
+    argv[1] = (char *)action;
+    argv[2] = NULL;
+    if (jmx_exec_wait(path, argv, JMX_SERVICE_ACTION_TIMEOUT_MS, &result) != 0)
+        return -1;
+    ok = !result.timed_out && result.term_signal == 0 && result.exit_code == 0;
+    jmx_exec_result_free(&result);
+    return ok ? 0 : -1;
+}
 
 static int jmx_ipv6_prefix_length(const struct sockaddr_in6 *mask)
 {
@@ -209,136 +509,19 @@ void jmx_iface_ipv6_contract_add_json(struct json_object *obj,
 }
 
 int get_iface_status(char *ifname, iface_status_t *status){
-    int ret = -1; 
     char *buf = NULL;
 
-    buf = get_interface_status_buf(ifname);
-    if (!buf){
-		
-    LOG_ERROR("get interface status buf error\n");
-        return -1; 
-    }   
-    struct json_object *resp_obj = json_tokener_parse(buf);
-    if (!resp_obj) {
-        LOG_ERROR("get_iface_status: failed to parse JSON\n");
+    if (!status || !(buf = get_interface_status_buf(ifname))) {
+        LOG_ERROR("get interface status buf error\n");
+        return -1;
+    }
+    if (jmx_iface_status_parse_json(buf, status) != 0) {
+        LOG_ERROR("get_iface_status: invalid netifd JSON contract\n");
         free(buf);
         return -1;
     }
-    
-    struct json_object *ipv4_addr_array = json_object_object_get(resp_obj, "ipv4-address");
-    struct json_object *route_array = json_object_object_get(resp_obj, "route");
-    struct json_object *dns_server_array = json_object_object_get(resp_obj, "dns-server");
-    
-    if (ipv4_addr_array && json_object_array_length(ipv4_addr_array) > 0){ 
-       struct json_object *ipv4_addr_obj = json_object_array_get_idx(ipv4_addr_array, 0); 
-       struct json_object *addr_obj = json_object_object_get(ipv4_addr_obj, "address");
-       struct json_object *mask_obj = json_object_object_get(ipv4_addr_obj, "mask");
-       if (addr_obj && mask_obj){
-           strcpy(status->ip, json_object_get_string(addr_obj));
-           char *mask_str = cidr2str(json_object_get_int(mask_obj));
-            if (mask_str) 
-           strcpy(status->mask, mask_str);
-
-       }
-    }  
-	else{
-		LOG_ERROR("parse json error\n");
-	}
-    
-    if (route_array && json_object_array_length(route_array) > 0){ 
-       struct json_object *route_obj = json_object_array_get_idx(route_array, 0); 
-       struct json_object *nexhop_obj = json_object_object_get(route_obj, "nexthop");
-       if (nexhop_obj){
-           strcpy(status->gateway, json_object_get_string(nexhop_obj));
-       }
-    }   
-
-    if (dns_server_array && json_object_array_length(dns_server_array) > 0){ 
-       struct json_object *dns1_obj = json_object_array_get_idx(dns_server_array, 0); 
-       if (dns1_obj){
-           strcpy(status->dns1, json_object_get_string(dns1_obj));
-       }
-    }   
-    if (dns_server_array && json_object_array_length(dns_server_array)  > 1){ 
-       struct json_object *dns2_obj = json_object_array_get_idx(dns_server_array, 1); 
-       if (dns2_obj){
-           strcpy(status->dns2, json_object_get_string(dns2_obj));
-       }
-    }
-
-    /* Extract first global IPv6 address from ipv6-address array */
-    struct json_object *ipv6_addr_array = json_object_object_get(resp_obj, "ipv6-address");
-    if (ipv6_addr_array && json_object_is_type(ipv6_addr_array, json_type_array)) {
-        int ipv6_len = json_object_array_length(ipv6_addr_array);
-        int i;
-        for (i = 0; i < ipv6_len; i++) {
-            struct json_object *ipv6_obj = json_object_array_get_idx(ipv6_addr_array, i);
-            struct json_object *addr6 = ipv6_obj ? json_object_object_get(ipv6_obj, "address") : NULL;
-            if (!addr6) continue;
-            const char *a6 = json_object_get_string(addr6);
-            if (!a6 || !a6[0]) continue;
-            /* skip link-local (fe80::) */
-            if (strncmp(a6, "fe80:", 5) == 0) continue;
-            snprintf(status->ipv6, sizeof(status->ipv6), "%s", a6);
-            break;
-        }
-    }
-
-    ret = 0;
-DONE:
-    if (buf) {
-        free(buf);
-    }
-    if (resp_obj) {
-        json_object_put(resp_obj);
-    }
-    return ret;
-}
-
-
-char *get_interface_status_buf(char *ifname) {
-    if (!ifname) {
-        return NULL;
-    }
-    
-
-    char cmd[256] = {0};
-    snprintf(cmd, sizeof(cmd), "ifstatus %s", ifname);
-    
-    FILE *fp = popen(cmd, "r");
-    if (!fp) {
-        return NULL;
-    }
-    
-
-    size_t buf_size = 4096;
-    char *buf = malloc(buf_size);
-    if (!buf) {
-        pclose(fp);
-        return NULL;
-    }
-    
-    size_t total_read = 0;
-    char line[256];
-    while (fgets(line, sizeof(line), fp)) {
-        size_t line_len = strlen(line);
-        if (total_read + line_len >= buf_size) {
-            buf_size *= 2;
-            char *new_buf = realloc(buf, buf_size);
-            if (!new_buf) {
-                free(buf);
-                pclose(fp);
-                return NULL;
-            }
-            buf = new_buf;
-        }
-        strncpy(buf + total_read, line, line_len);
-        total_read += line_len;
-        buf[total_read] = '\0';
-    }
-    
-    pclose(fp);
-    return buf;
+    free(buf);
+    return 0;
 }
 
 
@@ -348,7 +531,7 @@ char *cidr2str(int cidr) {
     }
     
     static char mask_str[16];
-    unsigned int mask = 0xFFFFFFFF << (32 - cidr);
+    unsigned int mask = cidr == 0 ? 0U : 0xFFFFFFFFU << (32 - cidr);
     
 
     snprintf(mask_str, sizeof(mask_str), "%d.%d.%d.%d",
@@ -362,8 +545,10 @@ char *cidr2str(int cidr) {
 
 
 static int interface_name_matches(const char *ifname, const char *prefix) {
+    size_t len;
+
     if (!ifname || !prefix) return 0;
-    int len = strlen(prefix);
+    len = strlen(prefix);
     if (strlen(ifname) < len) return 0;
     return strncasecmp(ifname, prefix, len) == 0;
 }
@@ -498,6 +683,7 @@ static struct json_object *get_interface_list_by_type(const char *iftype) {
 
 
 struct json_object *jmx_api_get_lan_list(struct json_object *req_obj) {
+    (void)req_obj;
     LOG_DEBUG("jmx_api_get_lan_list: called\n");
     struct json_object *result = get_interface_list_by_type("lan");
     LOG_DEBUG("jmx_api_get_lan_list: returning result\n");
@@ -506,6 +692,7 @@ struct json_object *jmx_api_get_lan_list(struct json_object *req_obj) {
 
 
 struct json_object *jmx_api_get_wan_list(struct json_object *req_obj) {
+    (void)req_obj;
     LOG_DEBUG("jmx_api_get_wan_list: called\n");
     struct json_object *result = get_interface_list_by_type("wan");
     LOG_DEBUG("jmx_api_get_wan_list: returning result\n");
@@ -778,6 +965,7 @@ struct json_object *jmx_api_del_wan(struct json_object *req_obj) {
 
 
 struct json_object *jmx_api_get_lan_info(struct json_object *req_obj) {
+    (void)req_obj;
     LOG_DEBUG("jmx_api_get_lan_info called\n");
     
     struct json_object *data_obj = json_object_new_object();
@@ -922,13 +1110,17 @@ struct json_object *jmx_api_set_lan_info(struct json_object *req_obj) {
     jmx_uci_commit(ctx, "network");
     uci_free_context(ctx);
     update_lan_dhcp_from_req(json_object_object_get(req_obj, "dhcp"));
-    system("/etc/init.d/network restart");
-    system("/etc/init.d/dnsmasq restart");
+    if (jmx_network_service_action("network", "restart") != 0 ||
+        jmx_network_service_action("dnsmasq", "restart") != 0) {
+        LOG_ERROR("Failed to restart LAN runtime services\n");
+        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
+    }
     return jmx_gen_api_response_data(API_CODE_SUCCESS, NULL);
 }
 
 
 struct json_object *jmx_api_get_wan_info(struct json_object *req_obj) {
+    (void)req_obj;
     LOG_DEBUG("jmx_api_get_wan_info called\n");
     
     struct json_object *data_obj = json_object_new_object();
@@ -1114,9 +1306,9 @@ struct json_object *jmx_api_set_wan_info(struct json_object *req_obj) {
     
 
     LOG_DEBUG("Reloading network configuration...\n");
-    int ret = system("/etc/init.d/network reload");
-    if (ret != 0) {
-        LOG_ERROR("Failed to reload network, return code: %d\n", ret);
+    if (jmx_network_service_action("network", "reload") != 0) {
+        LOG_ERROR("Failed to reload network\n");
+        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
     }
     
     LOG_DEBUG("WAN interface info updated successfully\n");
@@ -1126,6 +1318,7 @@ struct json_object *jmx_api_set_wan_info(struct json_object *req_obj) {
 
 struct json_object *jmx_api_get_work_mode(struct json_object *req_obj)
 {
+    (void)req_obj;
     LOG_DEBUG("jmx_api_get_work_mode called\n");
     int work_mode = 0;
     if (jmx_work_mode_config_get(&work_mode, NULL, 0, NULL, 0) != 0) {
@@ -1239,41 +1432,6 @@ static void fill_lan_dhcp_info(struct json_object *data_obj)
 }
 
 
-static int ensure_dhcp_lan_section(struct uci_context *ctx)
-{
-    struct uci_ptr ptr;
-    if (uci_lookup_ptr(ctx, &ptr, "dhcp.lan", true) == UCI_OK) {
-        return 0;
-    }
-    struct uci_package *pkg = NULL;
-    if (uci_load(ctx, "dhcp", &pkg) != UCI_OK) {
-        LOG_ERROR("ensure_dhcp_lan_section: load dhcp failed\n");
-        return -1;
-    }
-    char path[64];
-    snprintf(path, sizeof(path), "dhcp.lan=dhcp");
-    if (uci_lookup_ptr(ctx, &ptr, path, true) != UCI_OK) {
-        LOG_ERROR("ensure_dhcp_lan_section: lookup ptr failed\n");
-        uci_unload(ctx, pkg);
-        return -1;
-    }
-    if (uci_set(ctx, &ptr) != UCI_OK) {
-        LOG_ERROR("ensure_dhcp_lan_section: set failed\n");
-        if (ptr.p) uci_unload(ctx, ptr.p);
-        return -1;
-    }
-    if (uci_save(ctx, ptr.p) != UCI_OK) {
-        LOG_ERROR("ensure_dhcp_lan_section: save failed\n");
-        if (ptr.p) uci_unload(ctx, ptr.p);
-        return -1;
-    }
-    if (ptr.p) uci_unload(ctx, ptr.p);
-    
-    jmx_uci_set_value(ctx, "dhcp.lan.interface", "lan");
-    return 0;
-}
-
-
 static void append_lan_dhcp_to_response(struct json_object *data_obj)
 {
     if (!data_obj) return;
@@ -1328,3 +1486,4 @@ static int update_lan_dhcp_from_req(struct json_object *dhcp_obj)
     uci_free_context(ctx);
     return 0;
 }
+#endif

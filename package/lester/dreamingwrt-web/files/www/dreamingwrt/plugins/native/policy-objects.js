@@ -58,21 +58,33 @@ export function mount(context = {}) {
   }
 
   function rowsMarkup(rows, legacy = false) {
-    if (!rows.length) return statePanel('empty', legacy ? '没有兼容路由对象' : '尚未创建复合对象', legacy ? '旧路由对象目录为空。' : '写入能力开放后，可按目标和意图创建复合对象。');
-    return `<div data-dwrt-component="data-table" data-dwrt-surface="dense-surface" class="policy-entity-table"><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table"><thead><tr><th>名称</th><th>类型</th><th>地址族</th><th>状态</th><th><span class="policy-entity-visually-hidden">详情</span></th></tr></thead><tbody>${rows.map((item) => `<tr><td><strong>${escapeHtml(item.name)}</strong>${item.comment ? `<small>${escapeHtml(item.comment)}</small>` : ''}</td><td>${escapeHtml(legacy ? '路由对象' : item.type)}</td><td>${escapeHtml(item.family || '--')}</td><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><button type="button" data-dwrt-component="icon-button" data-object-detail="${escapeHtml(`${legacy ? 'legacy:' : 'object:'}${item.id}`)}" aria-label="查看 ${escapeHtml(item.name)}">${icon('chevron-right')}</button></td></tr>`).join('')}</tbody></table></div></div>`;
+    const title = legacy ? '兼容路由对象' : '复合对象';
+    const description = legacy ? '保留旧配置语义，不混入复合对象编辑流程' : '对象只出现一次，具体策略通过引用建立关系';
+    const empty = legacy ? '没有兼容路由对象' : '尚未创建复合对象';
+    return `<section data-dwrt-component="data-table" class="policy-entity-table policy-object-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${title}</strong><span>${description}</span></div><span class="dwrt-kit-table-count">${rows.length} 个</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr><th>名称</th><th>类型</th><th>地址族</th><th>状态</th><th><span class="policy-entity-visually-hidden">详情</span></th></tr></thead><tbody>${rows.length ? rows.map((item) => `<tr><td><strong>${escapeHtml(item.name)}</strong>${item.comment ? `<small>${escapeHtml(item.comment)}</small>` : ''}</td><td>${escapeHtml(legacy ? '路由对象' : item.type)}</td><td>${escapeHtml(item.family || '--')}</td><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><button type="button" data-dwrt-component="icon-button" data-object-detail="${escapeHtml(`${legacy ? 'legacy:' : 'object:'}${item.id}`)}" aria-label="查看 ${escapeHtml(item.name)}">${icon('chevron-right')}</button></td></tr>`).join('') : `<tr><td class="dwrt-kit-table-empty" colspan="5">${empty}</td></tr>`}</tbody></table></div></section>`;
+  }
+
+  function overviewMarkup(data) {
+    const cards = [
+      { key: 'composite', label: '复合对象', value: String(data.items.length), detail: '安全、路由与 QoS 的统一目标', tone: 'info', icon: icon('boxes') },
+      { key: 'legacy', label: '兼容对象', value: String(data.legacy.length), detail: '仅供现有路由规则引用', tone: 'neutral', icon: icon('route') },
+      { key: 'contract', label: '写入合同', value: data.readOnly ? '未开放' : '已开放', detail: data.source || '策略引擎', tone: data.readOnly ? 'warn' : 'ok', icon: icon(data.readOnly ? 'lock-keyhole' : 'badge-check') }
+    ];
+    const renderer = ui.overviewCardsMarkup || window.DWRT_UI_KIT?.overviewCardsMarkup;
+    return typeof renderer === 'function' ? renderer(cards, { className: 'policy-object-overview', label: '对象概览' }) : '';
   }
 
   function detailMarkup() {
     const item = state.detail;
     if (!item) return '';
-    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-object-detail-close aria-label="关闭对象详情"></button><aside data-dwrt-component="sheet" data-dwrt-surface="stable-glass" class="dwrt-kit-sheet policy-entity-sheet is-open"><header class="dwrt-kit-sheet-header"><div><span>${item.legacy ? '兼容路由对象' : '复合对象'}</span><strong>${escapeHtml(item.name)}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-object-detail-close aria-label="关闭">${icon('x')}</button></header><div class="dwrt-kit-sheet-body policy-entity-sheet-body"><dl class="policy-entity-detail-list"><div><dt>对象标识</dt><dd>${escapeHtml(item.id)}</dd></div><div><dt>类型</dt><dd>${escapeHtml(item.type)}</dd></div><div><dt>地址族</dt><dd>${escapeHtml(item.family || '--')}</dd></div><div><dt>值</dt><dd>${escapeHtml(item.value || '--')}</dd></div><div><dt>状态</dt><dd>${escapeHtml(item.enabled ? '启用' : '停用')}</dd></div></dl>${item.legacy ? statePanel('unavailable', '兼容对象保持只读', '它属于路由对象合同，不等同于可同时生成安全、路由和 QoS 策略的复合对象。') : ''}</div><footer class="dwrt-kit-sheet-footer"><span></span>${button('关闭', 'data-object-detail-close', 'primary')}</footer></aside>`;
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-object-detail-close aria-label="关闭对象详情"></button><aside data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" class="dwrt-kit-sheet policy-entity-sheet is-open"><header class="dwrt-kit-sheet-header"><div><span>${item.legacy ? '兼容路由对象' : '复合对象'}</span><strong>${escapeHtml(item.name)}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-object-detail-close aria-label="关闭">${icon('x')}</button></header><div class="dwrt-kit-sheet-body policy-entity-sheet-body"><dl class="policy-entity-detail-list"><div><dt>对象标识</dt><dd>${escapeHtml(item.id)}</dd></div><div><dt>类型</dt><dd>${escapeHtml(item.type)}</dd></div><div><dt>地址族</dt><dd>${escapeHtml(item.family || '--')}</dd></div><div><dt>值</dt><dd>${escapeHtml(item.value || '--')}</dd></div><div><dt>状态</dt><dd>${escapeHtml(item.enabled ? '启用' : '停用')}</dd></div></dl>${item.legacy ? statePanel('unavailable', '兼容对象保持只读', '它属于路由对象合同，不等同于可同时生成安全、路由和 QoS 策略的复合对象。') : ''}</div><footer class="dwrt-kit-sheet-footer"><span></span>${button('关闭', 'data-object-detail-close', 'primary')}</footer></aside>`;
   }
 
   function workbenchMarkup() {
     const data = state.data;
     const stale = state.snapshot?.stale ? `<div class="policy-entity-alert is-warning" role="status"><strong>正在显示上次可用快照</strong><span>刷新失败，当前对象列表已保留。</span></div>` : '';
     const readOnly = data.readOnly ? statePanel('unavailable', '复合对象暂为只读', `${blockReason()}。页面不会展示无法提交的名称、成员或模块开关。`) : '';
-    return `<section data-dwrt-component="page-shell" data-dwrt-page-shell="data-workbench" data-dwrt-surface="stable-glass" class="policy-entity-page policy-objects-page"><header class="policy-entity-header"><div><h1 data-dwrt-page-title>对象</h1><p>集中查看可被策略引用的复合对象与兼容路由对象。</p></div><div class="policy-entity-header-actions">${statusBadge(data.readOnly ? '只读' : '可编辑', data.readOnly ? 'warning' : 'success')}${button(state.refreshing ? '正在刷新' : '刷新', `data-object-refresh ${state.refreshing ? 'disabled' : ''}`, 'ghost', 'refresh-cw')}</div></header>${stale}<section class="policy-entity-summary" aria-label="对象概览"><div><span>复合对象</span><strong>${data.items.length}</strong><small>安全、路由与 QoS 的统一目标</small></div><div><span>兼容对象</span><strong>${data.legacy.length}</strong><small>仅供现有路由规则引用</small></div><div><span>写入合同</span><strong>${data.readOnly ? '未开放' : '已开放'}</strong><small>${escapeHtml(data.source || '策略引擎')}</small></div></section>${readOnly}<section class="policy-entity-section"><header><div><h2>复合对象</h2><p>对象只出现一次，具体策略通过引用建立关系。</p></div></header>${rowsMarkup(data.items)}</section>${data.legacy.length ? `<section class="policy-entity-section"><header><div><h2>兼容路由对象</h2><p>保留旧配置语义，不混入复合对象编辑流程。</p></div></header>${rowsMarkup(data.legacy, true)}</section>` : ''}</section>`;
+    return `<section class="policy-entity-page policy-objects-page"><header class="policy-object-toolbar" data-adaptive-sample><div class="dwrt-kit-table-title"><strong>对象</strong><span>集中查看可被策略引用的复合对象与兼容路由对象</span></div><div class="policy-entity-header-actions">${statusBadge(data.readOnly ? '只读' : '可编辑', data.readOnly ? 'warning' : 'success')}${button(state.refreshing ? '正在刷新' : '刷新', `data-object-refresh aria-label="刷新对象" data-dwrt-tooltip="刷新" ${state.refreshing ? 'disabled' : ''}`, 'ghost', 'refresh-cw')}</div></header><main class="policy-object-workbench">${stale}${overviewMarkup(data)}${readOnly}${rowsMarkup(data.items)}${data.legacy.length ? rowsMarkup(data.legacy, true) : ''}</main></section>`;
   }
 
   function replaceMarkup(host, markup) {
@@ -85,7 +97,7 @@ export function mount(context = {}) {
     if (!root || !state.mounted) return;
     const terminal = pageState();
     replaceMarkup(pageHost, terminal
-      ? `<section data-dwrt-component="page-shell" data-dwrt-page-shell="data-workbench" data-dwrt-surface="stable-glass" class="policy-entity-page policy-objects-page"><header class="policy-entity-header"><div><h1 data-dwrt-page-title>对象</h1><p>集中查看可被策略引用的复合对象与兼容路由对象。</p></div></header>${statePanel(terminal.name, terminal.title, terminal.detail)}</section>`
+      ? `<section class="policy-entity-page policy-objects-page is-terminal"><main class="policy-object-workbench">${statePanel(terminal.name, terminal.title, terminal.detail)}</main></section>`
       : workbenchMarkup());
   }
 

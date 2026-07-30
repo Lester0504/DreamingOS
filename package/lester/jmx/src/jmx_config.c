@@ -14,6 +14,7 @@
 #include <net/sock.h>
 #include <linux/etherdevice.h>
 #include <linux/cdev.h>
+#include <linux/capability.h>
 #include <linux/vmalloc.h>
 #include <linux/device.h>
 #include <linux/version.h>
@@ -30,7 +31,7 @@ struct jmx_config_dev
 	struct cdev char_dev;
 	struct class *c;
 };
-struct jmx_config_dev g_jmx_dev;
+static struct jmx_config_dev g_jmx_dev;
 
 struct jmx_cdev_file
 {
@@ -38,7 +39,7 @@ struct jmx_cdev_file
 	char buf[256 << 10];
 };
 
-k_request_item_t k_request_api_list[]={
+static const k_request_item_t k_request_api_list[]={
 	{"add_mac_filter_rule", jmx_api_add_mac_filter_rule},
 	{"del_mac_filter_rule", jmx_api_del_mac_filter_rule},
 	{"mod_mac_filter_rule", jmx_api_mod_mac_filter_rule},
@@ -56,7 +57,7 @@ k_request_item_t k_request_api_list[]={
 	{"flush_app_filter_whitelist", jmx_api_flush_app_filter_whitelist},
 };
 
-int jmx_config_handle(char *config, unsigned int len)
+static int jmx_config_handle(char *config, unsigned int len)
 {
 	int i;
 	cJSON *config_obj = NULL;
@@ -70,10 +71,15 @@ int jmx_config_handle(char *config, unsigned int len)
 		printk("parse json failed, value = %s\n", config);
 		return -1;
 	}
+	if (config_obj->type != cJSON_Object) {
+		printk("error, config must be an object\n");
+		cJSON_Delete(config_obj);
+		return -1;
+	}
 	api_obj = cJSON_GetObjectItem(config_obj, "api");
 	data_obj = cJSON_GetObjectItem(config_obj, "data");
-	if (!api_obj){
-		printk("error, api obj not set\n");
+	if (!api_obj || api_obj->type != cJSON_String || !api_obj->valuestring){
+		printk("error, api must be a string\n");
 		cJSON_Delete(config_obj);
 		return -1;
 	}
@@ -85,7 +91,7 @@ int jmx_config_handle(char *config, unsigned int len)
 	}
 
 	for (i = 0; i < ARRAY_SIZE(k_request_api_list); i++){
-		k_request_item_t *req_item = &k_request_api_list[i];
+		const k_request_item_t *req_item = &k_request_api_list[i];
 		if (0 == strcmp(req_item->api, api_obj->valuestring)){
 			req_item->handle(data_obj);
 			break;
@@ -103,11 +109,14 @@ int jmx_config_handle(char *config, unsigned int len)
 static int jmx_cdev_open(struct inode *inode, struct file *filp)
 {
 	struct jmx_cdev_file *file;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
 	file = vzalloc(sizeof(*file));
 	if (!file)
-		return -EINVAL;
+		return -ENOMEM;
 
-	mutex_lock(&jmx_cdev_mutex);
 	filp->private_data = file;
 	return 0;
 }
@@ -120,18 +129,33 @@ static ssize_t jmx_cdev_read(struct file *filp, char *buf, size_t count, loff_t 
 static int jmx_cdev_release(struct inode *inode, struct file *filp)
 {
 	struct jmx_cdev_file *file = filp->private_data;
-	jmx_config_handle(file->buf, file->size);
+	int ret = 0;
+
+	if (!file)
+		return 0;
+
+	if (!capable(CAP_NET_ADMIN)) {
+		ret = -EPERM;
+	} else {
+		mutex_lock(&jmx_cdev_mutex);
+		ret = jmx_config_handle(file->buf, file->size);
+		mutex_unlock(&jmx_cdev_mutex);
+	}
+
 	filp->private_data = NULL;
-	mutex_unlock(&jmx_cdev_mutex);
 	vfree(file);
-	return 0;
+	return ret;
 }
 
 static ssize_t jmx_cdev_write(struct file *filp, const char *buffer, size_t count, loff_t *off)
 {
 	struct jmx_cdev_file *file = filp->private_data;
 	int ret;
-	if (file->size + count > sizeof(file->buf))
+
+	if (!file)
+		return -EINVAL;
+	if (file->size >= sizeof(file->buf) ||
+	    count > sizeof(file->buf) - file->size - 1)
 		return -EINVAL;
 
 	ret = copy_from_user(file->buf + file->size, buffer, count);
@@ -139,6 +163,7 @@ static ssize_t jmx_cdev_write(struct file *filp, const char *buffer, size_t coun
 		return -EINVAL;
 
 	file->size += count;
+	file->buf[file->size] = '\0';
 	return count;
 }
 
@@ -195,4 +220,3 @@ void jmx_unregister_dev(void)
 	cdev_del(&g_jmx_dev.char_dev);
 	unregister_chrdev_region(g_jmx_dev.id, 1);
 }
-

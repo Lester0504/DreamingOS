@@ -17,7 +17,7 @@ assert ".liquid-card > .dwrt-sampled-glass-media" in css
 assert "transform: none" in css
 assert "will-change: auto" in css
 assert "20260725-corner-clip-01" in html
-assert "20260725-ui-kit-filter-edge-05" in html
+assert "20260730-safari-glass-lite-06" in html
 assert "loginGlassClipId" not in html
 assert "loginGlassFilteredLayer" not in html
 assert "loginGlassSourceLayer" not in html

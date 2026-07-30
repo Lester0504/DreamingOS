@@ -26,6 +26,8 @@ require(KIT_JS, "syncMountedGlassWallpapers();", "viewport changes must realign 
 require(KIT_JS, "dialog.addEventListener('transitionend', state.transitionend)", "centered Modal must realign its mirror after the entrance transform")
 require(KIT_CSS, '.dwrt-kit-sheet[data-dwrt-sheet-variant="copilot"]', "copilot Sheet needs a shared Kit selector")
 require(KIT_CSS, '.dwrt-kit-modal[data-dwrt-modal-variant="copilot"]', "centered Modal needs the same explicit copilot material")
+require(KIT_CSS, "--dwrt-kit-sheet-radius: 22px", "copilot Sheet must use the AI drawer's 22px radius")
+require(KIT_CSS, "border-radius: var(--dwrt-kit-sheet-radius) 0 0 var(--dwrt-kit-sheet-radius)", "copilot Sheet must retain the AI drawer's left-edge geometry")
 require(KIT_CSS, ".dwrt-kit-sheet-wallpaper", "wallpaper geometry must be shared")
 require(KIT_CSS, ".dwrt-kit-sheet-material", "the material layer must be shared")
 require(KIT_CSS, "backdrop-filter: blur(var(--dwrt-glass-base-blur, 3.2px))", "Sheet material must use the established liquid-glass parameter")

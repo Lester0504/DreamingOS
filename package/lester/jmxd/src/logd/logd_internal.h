@@ -4,6 +4,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdint.h>
@@ -37,7 +38,8 @@
 #define LOGD_MAX_PORTS 96
 #define LOGD_LOGREAD_FALLBACK_LINES 128
 #define LOGD_DHCP_LEASE_PATH "/tmp/dhcp.leases"
-#define LOGD_EXPORT_DIR "/tmp/dreamingwrt/log_exports"
+#define LOGD_RUNTIME_DIR "/run/dreamingwrt"
+#define LOGD_EXPORT_DIR LOGD_RUNTIME_DIR "/log_exports"
 #define LOGD_MAX_EXPORT_LIMIT 50000
 #define LOGD_MAX_DHCP_LEASES 512
 #define LOGD_NOTIFYD_TIMEOUT_MS 500
@@ -111,6 +113,11 @@ int logd_collector_state_delete(const char *name, const char *key);
 struct json_object *logd_status_json(void);
 struct json_object *logd_settings_json(void);
 struct json_object *logd_settings_update(struct json_object *body);
+const char *logd_log_level_group(const char *category);
+const char *logd_log_level(const char *level);
+int logd_log_level_min_rank(const char *level);
+int logd_log_level_for_group(const char *group, char *out, size_t out_len);
+void logd_log_level_cache_invalidate(void);
 struct json_object *logd_syslog_test(struct json_object *body);
 int logd_syslog_enqueue_event(struct json_object *body);
 int logd_syslog_process_queue(int limit);

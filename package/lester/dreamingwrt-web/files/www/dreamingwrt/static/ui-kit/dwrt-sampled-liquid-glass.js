@@ -35,6 +35,13 @@
   const MAP_WORKER_URL = '/static/js/page-glass-map-worker.js?v=20260722-ui-kit-perf-04';
   const MAP_WORKER_TIMEOUT_MS = 5000;
   const MAP_CANCELLED = Symbol('sampled-glass-map-cancelled');
+  const SAFARI_LIGHT_PROFILE = (() => {
+    const vendor = String(window.navigator?.vendor || '');
+    const userAgent = String(window.navigator?.userAgent || '');
+    return vendor === 'Apple Computer, Inc.' &&
+      /Safari/i.test(userAgent) &&
+      !/(CriOS|FxiOS|EdgiOS|OPiOS)/i.test(userAgent);
+  })();
   const mapCache = new Map();
   const mapWorkerRequests = new Map();
   const pendingScrollSettles = new Set();
@@ -447,8 +454,9 @@
       this.ready = false;
       this.destroyed = false;
       this.layerRepairQueued = false;
-      this.trackMotion = this.options.trackMotion !== false;
-      this.trackScroll = this.options.trackScroll !== false;
+      this.lightRenderer = SAFARI_LIGHT_PROFILE;
+      this.trackMotion = !this.lightRenderer && this.options.trackMotion !== false;
+      this.trackScroll = !this.lightRenderer && this.options.trackScroll !== false;
       this.id = `dwrt-sampled-glass-${Date.now().toString(36)}-${++instanceCount}`;
       this.scheduleMeasure = this.scheduleMeasure.bind(this);
       this.syncDuringMotion = this.syncDuringMotion.bind(this);
@@ -483,21 +491,27 @@
       this.saturationNode = svgNode('feColorMatrix', { in: 'BLURRED', type: 'saturate', values: 1.4, result: 'FROSTED' });
       this.mapNode = svgNode('feImage', { x: 0, y: 0, width: 1, height: 1, preserveAspectRatio: 'none', result: 'DISPLACEMENT_MAP' });
       this.redDisplacement = svgNode('feDisplacementMap', { in: 'FROSTED', in2: 'DISPLACEMENT_MAP', scale: 80, xChannelSelector: 'R', yChannelSelector: 'B', result: 'RED_DISPLACED' });
-      this.redChannel = svgNode('feColorMatrix', { in: 'RED_DISPLACED', type: 'matrix', values: '1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0', result: 'RED_CHANNEL' });
-      this.greenDisplacement = svgNode('feDisplacementMap', { in: 'FROSTED', in2: 'DISPLACEMENT_MAP', scale: 72, xChannelSelector: 'R', yChannelSelector: 'B', result: 'GREEN_DISPLACED' });
-      this.greenChannel = svgNode('feColorMatrix', { in: 'GREEN_DISPLACED', type: 'matrix', values: '0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0', result: 'GREEN_CHANNEL' });
-      this.blueDisplacement = svgNode('feDisplacementMap', { in: 'FROSTED', in2: 'DISPLACEMENT_MAP', scale: 64, xChannelSelector: 'R', yChannelSelector: 'B', result: 'BLUE_DISPLACED' });
-      this.blueChannel = svgNode('feColorMatrix', { in: 'BLUE_DISPLACED', type: 'matrix', values: '0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0', result: 'BLUE_CHANNEL' });
-      this.greenBlueBlend = svgNode('feBlend', { in: 'GREEN_CHANNEL', in2: 'BLUE_CHANNEL', mode: 'screen', result: 'GB_COMBINED' });
-      this.rgbBlend = svgNode('feBlend', { in: 'RED_CHANNEL', in2: 'GB_COMBINED', mode: 'screen', result: 'RGB_COMBINED' });
-      this.finalBlur = svgNode('feGaussianBlur', { in: 'RGB_COMBINED', stdDeviation: 0.3 });
-      [
-        this.blurNode, this.saturationNode, this.mapNode,
-        this.redDisplacement, this.redChannel,
-        this.greenDisplacement, this.greenChannel,
-        this.blueDisplacement, this.blueChannel,
-        this.greenBlueBlend, this.rgbBlend, this.finalBlur
-      ].forEach(node => filter.appendChild(node));
+      if (this.lightRenderer) {
+        this.finalBlur = svgNode('feGaussianBlur', { in: 'RED_DISPLACED', stdDeviation: 0.25 });
+        [this.blurNode, this.saturationNode, this.mapNode, this.redDisplacement, this.finalBlur]
+          .forEach(node => filter.appendChild(node));
+      } else {
+        this.redChannel = svgNode('feColorMatrix', { in: 'RED_DISPLACED', type: 'matrix', values: '1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0', result: 'RED_CHANNEL' });
+        this.greenDisplacement = svgNode('feDisplacementMap', { in: 'FROSTED', in2: 'DISPLACEMENT_MAP', scale: 72, xChannelSelector: 'R', yChannelSelector: 'B', result: 'GREEN_DISPLACED' });
+        this.greenChannel = svgNode('feColorMatrix', { in: 'GREEN_DISPLACED', type: 'matrix', values: '0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0', result: 'GREEN_CHANNEL' });
+        this.blueDisplacement = svgNode('feDisplacementMap', { in: 'FROSTED', in2: 'DISPLACEMENT_MAP', scale: 64, xChannelSelector: 'R', yChannelSelector: 'B', result: 'BLUE_DISPLACED' });
+        this.blueChannel = svgNode('feColorMatrix', { in: 'BLUE_DISPLACED', type: 'matrix', values: '0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0', result: 'BLUE_CHANNEL' });
+        this.greenBlueBlend = svgNode('feBlend', { in: 'GREEN_CHANNEL', in2: 'BLUE_CHANNEL', mode: 'screen', result: 'GB_COMBINED' });
+        this.rgbBlend = svgNode('feBlend', { in: 'RED_CHANNEL', in2: 'GB_COMBINED', mode: 'screen', result: 'RGB_COMBINED' });
+        this.finalBlur = svgNode('feGaussianBlur', { in: 'RGB_COMBINED', stdDeviation: 0.3 });
+        [
+          this.blurNode, this.saturationNode, this.mapNode,
+          this.redDisplacement, this.redChannel,
+          this.greenDisplacement, this.greenChannel,
+          this.blueDisplacement, this.blueChannel,
+          this.greenBlueBlend, this.rgbBlend, this.finalBlur
+        ].forEach(node => filter.appendChild(node));
+      }
       defs.appendChild(filter);
       this.currentNode = svgNode('image', { class: 'dwrt-sampled-glass-source is-current', preserveAspectRatio: 'none', filter: `url(#${this.id})` });
       this.incomingNode = svgNode('image', { class: 'dwrt-sampled-glass-source is-incoming', preserveAspectRatio: 'none', filter: `url(#${this.id})`, opacity: 0 });
@@ -522,8 +536,8 @@
       this.root.prepend(svg);
       this.root.prepend(this.scrollFallback);
       this.root.classList.add('dwrt-sampled-glass');
-      this.root.dataset.glassRenderer = 'svg-explicit-sampling';
-      this.root.dataset.glassScrollStrategy = 'material-fallback-idle-queue';
+      this.root.dataset.glassRenderer = this.lightRenderer ? 'safari-light-sampling' : 'svg-explicit-sampling';
+      this.root.dataset.glassScrollStrategy = this.lightRenderer ? 'static-measure' : 'material-fallback-idle-queue';
       this.root.dataset.glassScrollState = 'idle';
       this.syncContentLayers();
     }
@@ -591,16 +605,19 @@
       // SVG displacement can pull pixels from half the configured scale beyond
       // the card bounds. Keep that source area inside the filter region so
       // Chromium never substitutes transparent pixels at rounded edges.
+      const activeDisplacement = this.lightRenderer
+        ? Math.abs(redScale)
+        : Math.max(Math.abs(redScale), Math.abs(greenScale), Math.abs(blueScale));
       this.filterPadding = Math.ceil(
-        Math.max(Math.abs(redScale), Math.abs(greenScale), Math.abs(blueScale)) * 0.5 +
+        activeDisplacement * 0.5 +
         blur * 2 +
         2
       );
       this.blurNode.setAttribute('stdDeviation', String(roundMetric(blur)));
       this.saturationNode.setAttribute('values', String(clamp(this.options.saturation, 70, 220) / 100));
       this.redDisplacement.setAttribute('scale', String(roundMetric(redScale)));
-      this.greenDisplacement.setAttribute('scale', String(roundMetric(greenScale)));
-      this.blueDisplacement.setAttribute('scale', String(roundMetric(blueScale)));
+      this.greenDisplacement?.setAttribute('scale', String(roundMetric(greenScale)));
+      this.blueDisplacement?.setAttribute('scale', String(roundMetric(blueScale)));
       this.finalBlur.setAttribute('stdDeviation', String(Math.max(0.1, 0.5 - aberration * 0.1)));
       this.root.style.setProperty('--sampled-glass-radius', `${clamp(this.options.cornerRadius, 0, 80)}px`);
       this.root.style.setProperty('--sampled-glass-neutral-density', String(roundMetric(neutralDensity)));
@@ -613,7 +630,9 @@
       const highlightAngle = Number(this.options.highlightAngle);
       this.root.style.setProperty('--sampled-glass-highlight-angle', `${Number.isFinite(highlightAngle) ? highlightAngle : 135}deg`);
       this.root.classList.toggle('is-over-light', Boolean(this.options.overLight));
-      this.root.dataset.glassScales = `${roundMetric(redScale)}/${roundMetric(greenScale)}/${roundMetric(blueScale)}`;
+      this.root.dataset.glassScales = this.lightRenderer
+        ? String(roundMetric(redScale))
+        : `${roundMetric(redScale)}/${roundMetric(greenScale)}/${roundMetric(blueScale)}`;
       this.root.dataset.glassFilterPadding = String(this.filterPadding);
       this.root.dataset.glassBaseBlur = String(roundMetric(baseBlur));
       this.root.dataset.glassNeutralDensity = String(roundMetric(neutralDensity));

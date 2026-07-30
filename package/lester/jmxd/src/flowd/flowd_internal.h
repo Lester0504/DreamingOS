@@ -140,6 +140,8 @@ struct json_object *flowd_app_rule_update(struct json_object *body);
 struct json_object *flowd_app_rule_delete(struct json_object *body);
 struct json_object *flowd_runtime_json(struct json_object *body);
 struct json_object *flowd_compile(struct json_object *body);
+struct json_object *flowd_nft_revision_status(void);
+struct json_object *flowd_nft_revision_apply(struct json_object *body);
 struct json_object *flowd_apply_jobs_json(struct json_object *body);
 
 int flowd_ubus_start(void);

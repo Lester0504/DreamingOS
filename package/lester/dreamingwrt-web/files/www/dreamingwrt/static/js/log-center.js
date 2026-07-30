@@ -5,6 +5,8 @@
   const REFRESH_MS = 30000;
   const SEARCH_DEBOUNCE_MS = 650;
   const DEFAULT_PAGE_SIZE = 25;
+  // 表格描述列的截断长度，超出后折叠为「…」，点击展开。
+  const MESSAGE_CLAMP_CHARS = 120;
   const ENDPOINTS = {
     settings: '/api/v1/logs/settings',
     filters: '/api/v1/logs/filter-data',
@@ -75,6 +77,18 @@
     { id: 'alarm', label: '告警信息', sections: ['warning'], modes: ['GENERAL'], severities: ['MEDIUM', 'HIGH', 'VERY_HIGH'] },
     { id: 'syslog', label: '原始 Syslog', sections: ['syslog'], modes: ['GENERAL'], categories: ['HOST'] }
   ];
+  // 每个 tab 只允许勾选属于自己的来源，避免勾选来源反过来改写 tab。
+  const SOURCES_BY_MODE = {
+    GENERAL: LOG_SOURCE_FILTERS.filter((item) => item.modes.includes('GENERAL')).map((item) => item.id),
+    AUDIT: LOG_SOURCE_FILTERS.filter((item) => item.modes.includes('AUDIT')).map((item) => item.id)
+  };
+  const DEFAULT_SOURCE_BY_MODE = { GENERAL: 'general', AUDIT: 'audit' };
+  // 30.1 实测：后端 logs/search 只认 severities / categories / events，
+  // 完全忽略 type 与 sources。审计日志实际落在 ADMIN 分类与
+  // ADMIN_AUTH_EVENT 事件里，因此「审计」tab 必须靠分类维度取数，
+  // 否则两个 tab 会拿回同一批系统日志。
+  const AUDIT_CATEGORY_IDS = ['ADMIN', 'AUDIT'];
+  const AUDIT_EVENT_IDS = ['ADMIN_AUTH_EVENT'];
   const SOURCE_BY_SECTION = {
     user: 'audit',
     audit: 'audit',
@@ -220,6 +234,8 @@
       programs: new Set(),
       selectedRows: new Set(),
       collapsed: new Set(['events', 'devices', 'clients', 'admins']),
+      expandedMessages: new Set(),
+      filterLocallyEnforced: false,
       rows: [],
       allRows: [],
       total: 0,
@@ -261,9 +277,20 @@
 
     function unwrapApiData(payload) {
       if (!payload || typeof payload !== 'object') return {};
-      if (payload.data && typeof payload.data === 'object') return payload.data;
-      if (payload.body && typeof payload.body === 'object') return payload.body;
-      return payload;
+      // webd 对该组接口返回 { ok, data: { ok, data: [...] } } 双层包裹，
+      // 只剥一层会拿不到 total/分页字段，这里剥到真正的载荷为止。
+      let current = payload;
+      for (let depth = 0; depth < 4; depth += 1) {
+        if (!current || typeof current !== 'object' || Array.isArray(current)) break;
+        const next = current.data && typeof current.data === 'object'
+          ? current.data
+          : (current.body && typeof current.body === 'object' ? current.body : null);
+        if (!next) break;
+        // 内层若已是数组或不再是 {ok,data} 包裹，则本层即为载荷宿主。
+        current = next;
+        if (Array.isArray(current)) break;
+      }
+      return current || {};
     }
 
     async function requestJson(name, url, init = {}) {
@@ -344,6 +371,46 @@
     }
 
     function nowRange() {
+      return currentRange();
+    }
+
+    function defaultSourceForMode(mode = state.mode) {
+      return DEFAULT_SOURCE_BY_MODE[mode] || 'general';
+    }
+
+    function sourcesForMode(mode = state.mode) {
+      return SOURCES_BY_MODE[mode] || SOURCES_BY_MODE.GENERAL;
+    }
+
+    function modeSourceFilters(mode = state.mode) {
+      return LOG_SOURCE_FILTERS.filter((item) => item.modes.includes(mode));
+    }
+
+    // 「常规」是路由器自身日志，「审计」是 Web/用户操作日志。
+    // 两者必须是互斥的行集合，否则两个 tab 会显示一模一样的内容。
+    function modeAllowsSource(sourceId, mode = state.mode) {
+      if (!sourceId) return true;
+      return sourcesForMode(mode).includes(sourceId);
+    }
+
+    // 判定一行是否属于「审计」语义：后端 source_id 恒为 general，
+    // 只能靠分类/事件识别管理员与用户操作。
+    function isAuditRow(row) {
+      const category = String(row.category || '').toUpperCase();
+      const event = String(row.event || '').toUpperCase();
+      if (AUDIT_CATEGORY_IDS.includes(category)) return true;
+      if (AUDIT_EVENT_IDS.includes(event)) return true;
+      if (row.sourceId === 'audit') return true;
+      if (AUDIT_EVENTS.some(([id]) => id === event)) return true;
+      return Boolean(row.admin && (row.admin.id || row.admin.name));
+    }
+
+    // tab 归属判定：审计 tab 只显示审计行，常规 tab 排除审计行。
+    function modeAllowsRow(row, mode = state.mode) {
+      return mode === 'AUDIT' ? isAuditRow(row) : !isAuditRow(row);
+    }
+
+    function currentRange() {
       if (state.period === 'custom' && state.customRange) {
         return {
           timestampFrom: state.customRange.start,
@@ -356,21 +423,29 @@
     }
 
     function requestBody() {
-      const range = nowRange();
-      const sourceIds = Array.from(state.sources);
+      const range = currentRange();
+      // 只提交属于当前 tab 的来源，避免后端把两个 tab 当成同一次查询。
+      const sourceIds = Array.from(state.sources).filter((id) => modeAllowsSource(id));
+      const effectiveSources = sourceIds.length ? sourceIds : [defaultSourceForMode()];
       const sourceSections = sourceIds.flatMap((id) => sourceMeta(id)?.sections || []);
+      // 审计模式下若用户没有手选分类，则用后端真正认的 ADMIN 分类兜底，
+      // 让「审计」tab 拿到的是用户/管理员操作日志而不是系统日志。
+      const categories = Array.from(state.categories);
+      const effectiveCategories = categories.length
+        ? categories
+        : (state.mode === 'AUDIT' ? AUDIT_CATEGORY_IDS.slice() : []);
       return {
         type: state.mode,
         searchText: state.search,
         severities: Array.from(state.severities),
-        sources: sourceIds,
-        sections: sourceSections,
-        logSources: sourceIds,
+        sources: effectiveSources,
+        sections: sourceSections.length ? sourceSections : (sourceMeta(defaultSourceForMode())?.sections || []),
+        logSources: effectiveSources,
         timestampFrom: range.timestampFrom,
         timestampTo: range.timestampTo,
         pageNumber: state.pageNumber,
         pageSize: state.pageSize,
-        categories: Array.from(state.categories),
+        categories: effectiveCategories,
         events: Array.from(state.events),
         deviceMacs: Array.from(state.deviceMacs),
         clientDeviceMacs: Array.from(state.clientDeviceMacs),
@@ -669,13 +744,14 @@
 
     function normalizeSearchPayload(payload) {
       const list = listFrom(payload);
+      const meta = Array.isArray(payload) ? {} : (payload || {});
       const rows = list.map((item, index) => normalizeLogItem(item, index, 'logs/search'));
-      const total = firstNumber(payload && payload.total_element_count, payload && payload.total_count, payload && payload.total, payload && payload.count, rows.length);
+      const total = firstNumber(meta.total_element_count, meta.total_count, meta.total, meta.count, rows.length);
       return {
         rows,
         total,
-        pageNumber: firstNumber(payload && payload.page_number, payload && payload.pageNumber, state.pageNumber),
-        pageSize: firstNumber(payload && payload.page_size, payload && payload.pageSize, state.pageSize)
+        pageNumber: firstNumber(meta.page_number, meta.pageNumber, state.pageNumber),
+        pageSize: firstNumber(meta.page_size, meta.pageSize, state.pageSize)
       };
     }
 
@@ -725,7 +801,12 @@
     function applyLocalFilters(rows) {
       const search = state.search.trim().toLowerCase();
       return rows.filter((row) => {
-        if (state.sources.size && row.sourceId && !state.sources.has(row.sourceId)) return false;
+        // 先按 tab 归属裁剪：常规=设备/系统侧，审计=用户操作侧。
+        // 后端忽略 type/sources，这一层是「两个 tab 不能一样」的真实保障。
+        if (!modeAllowsRow(row)) return false;
+        // 来源勾选只在后端真的给出可区分 source_id 时生效，
+        // 否则（全部为 general）不参与裁剪，避免把列表清空。
+        if (state.sources.size && row.sourceId && sourceFilteringMeaningful() && !state.sources.has(row.sourceId)) return false;
         if (state.severities.size && !state.severities.has(row.severity)) return false;
         if (state.categories.size && !state.categories.has(row.category)) return false;
         if (state.events.size && !state.events.has(row.event)) return false;
@@ -735,6 +816,16 @@
         if (state.programs.size && !state.programs.has(row.programId)) return false;
         return !search || rowSearchText(row).includes(search);
       });
+    }
+
+    // 当整批数据的 source_id 只有一种取值时，来源勾选没有区分能力。
+    function sourceFilteringMeaningful() {
+      const seen = new Set();
+      for (const row of state.allRows) {
+        if (row.sourceId) seen.add(row.sourceId);
+        if (seen.size > 1) return true;
+      }
+      return false;
     }
 
     function pruneSelectedRow() {
@@ -865,9 +956,16 @@
       ]);
       if (seq !== state.refreshSeq) return false;
       const search = normalizeSearchPayload(searchPayload);
-      state.rows = search.rows;
       state.allRows = search.rows;
-      state.total = firstNumber(countPayload && countPayload.total, countPayload && countPayload.total_count, search.total, search.rows.length);
+      // 30.1 实测后端只认 severities/categories/events，忽略 type 与 sources，
+      // 所以这里必须本地再裁一层，保证「风险」按钮和两个 tab 都有真实效果。
+      const constrained = applyLocalFilters(search.rows);
+      const locallyReduced = constrained.length !== search.rows.length;
+      state.rows = locallyReduced ? paginate(constrained) : search.rows;
+      state.total = locallyReduced
+        ? constrained.length
+        : firstNumber(countPayload && countPayload.total, countPayload && countPayload.total_count, search.total, search.rows.length);
+      state.filterLocallyEnforced = locallyReduced;
       state.filterData = filterPayload ? normalizeFilterData(filterPayload) : filterDataFromRows(search.rows);
       if (settingsPayload) state.settings = settingsPayload;
       pruneSelectedRow();
@@ -1039,7 +1137,7 @@
       state.search = '';
       state.eventSearch = '';
       state.severities = new Set(SEVERITIES.map((item) => item.id));
-      state.sources = new Set(['general']);
+      state.sources = new Set([defaultSourceForMode()]);
       state.categories.clear();
       state.events.clear();
       state.deviceMacs.clear();
@@ -1053,7 +1151,7 @@
 
     function activeFilterCount() {
       const severityChanged = state.severities.size !== SEVERITIES.length;
-      const sourceChanged = state.sources.size !== 1 || !state.sources.has('general');
+      const sourceChanged = state.sources.size !== 1 || !state.sources.has(defaultSourceForMode());
       return [
         sourceChanged,
         severityChanged,
@@ -1198,7 +1296,7 @@
           ${searchMarkup()}
           ${severityMarkup()}
           ${periodMarkup()}
-          ${filterGroup('sources', '日志来源', LOG_SOURCE_FILTERS.map((item) => sourceRow(item, sourceCounts)).join(''), { count: LOG_SOURCE_FILTERS.length })}
+          ${filterGroup('sources', '日志来源', modeSourceFilters().map((item) => sourceRow(item, sourceCounts)).join(''), { count: modeSourceFilters().length })}
           ${filterGroup('admins', '管理员', admins.map((item) => identityRow('adminIds', item, state.adminIds, 'id')).join('') || '<p class="log-filter-empty">暂无管理员筛选项</p>', { count: admins.length })}
           ${filterGroup('events', '事件', `
             <label class="log-filter-local-search">
@@ -1212,7 +1310,7 @@
         ${searchMarkup()}
         ${severityMarkup()}
         ${periodMarkup()}
-        ${filterGroup('sources', '日志来源', LOG_SOURCE_FILTERS.map((item) => sourceRow(item, sourceCounts)).join(''), { count: LOG_SOURCE_FILTERS.length })}
+        ${filterGroup('sources', '日志来源', modeSourceFilters().map((item) => sourceRow(item, sourceCounts)).join(''), { count: modeSourceFilters().length })}
         ${programs.length ? filterGroup('programs', '程序 / 插件', programs.map((item) => checkboxRow('programs', item, state.programs)).join(''), { count: programs.length }) : ''}
         ${filterGroup('categories', '日志分类', categories.map((item) => checkboxRow('categories', item, state.categories)).join(''), { count: categories.length })}
         ${filterGroup('events', '事件', `
@@ -1327,11 +1425,17 @@
     function rowMarkup(row) {
       const selected = state.selectedId && row.id === state.selectedId;
       const checked = state.selectedRows.has(row.id);
+      const message = row.message || '--';
+      const expanded = state.expandedMessages.has(row.id);
+      const truncatable = message.length > MESSAGE_CLAMP_CHARS;
       return `<tr class="${selected ? 'is-selected' : ''} ${checked ? 'is-ai-selected' : ''}" data-log-row="${html(row.id)}">
         <td class="log-table-select-cell"><label class="log-table-select" title="选择此日志"><input type="checkbox" data-log-row-select="${html(row.id)}" ${checked ? 'checked' : ''}><span aria-hidden="true"></span></label></td>
         <td><span class="log-table-category">${html(row.sourceLabel || row.categoryLabel)}</span></td>
         <td><strong>${html(row.eventLabel)}</strong></td>
-        <td><span class="log-table-desc">${html(row.message || '--')}</span></td>
+        <td class="log-table-desc-cell">
+          <span class="log-table-desc ${expanded ? 'is-expanded' : ''}" title="${html(message)}">${html(expanded || !truncatable ? message : `${message.slice(0, MESSAGE_CLAMP_CHARS).trimEnd()}…`)}</span>
+          ${truncatable ? `<button type="button" class="log-table-desc-toggle" data-log-desc-toggle="${html(row.id)}" aria-expanded="${expanded}" title="${expanded ? '收起完整描述' : '展开完整描述'}">${expanded ? '收起' : '…'}</button>` : ''}
+        </td>
         <td><span class="log-table-severity">${severityBarsMarkup(row.severity)}<em>${html(row.severityLabel)}</em></span></td>
         <td class="num">${html(formatTime(row.timestamp))}</td>
       </tr>`;
@@ -1386,24 +1490,14 @@
     }
 
     function renderRefreshState() {
-      if (!document.activeElement?.matches('[data-log-search]')) {
+      // 刷新只影响表格与筛选计数，不重建整页，否则每次操作都会整页抖动。
+      if (!root || !root.querySelector('[data-log-center-shell]')) {
         render();
         return;
       }
-      const card = root.querySelector('.log-center-table-card');
-      if (!card) {
-        render();
-        return;
-      }
-      const scroll = card.querySelector('.log-center-table-scroll');
-      const scrollTop = scroll?.scrollTop || 0;
-      const scrollLeft = scroll?.scrollLeft || 0;
-      card.outerHTML = tableMarkup();
-      const nextScroll = root.querySelector('.log-center-table-scroll');
-      if (nextScroll) {
-        nextScroll.scrollTop = scrollTop;
-        nextScroll.scrollLeft = scrollLeft;
-      }
+      renderTableRegion();
+      renderFilterRegion();
+      syncDrawer();
     }
 
     function detailRow(label, value) {
@@ -1420,19 +1514,18 @@
 
     function drawerMarkup() {
       const row = state.selectedRow;
-      if (!row) return '<aside class="log-center-drawer dwrt-glass-card insights-stable-glass" hidden></aside>';
+      if (!row) return '';
       const raw = rawLogText(row);
-      return `<aside class="log-center-drawer dwrt-glass-card insights-stable-glass is-open" aria-label="日志详情">
-        <header class="log-drawer-head">
+      // 与 AI 抽屉同一套 kit 组件（copilot 变体），不再手搓玻璃层。
+      return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-log-close-drawer aria-label="关闭日志详情"></button><aside class="log-center-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" aria-label="日志详情">
+        <header class="dwrt-kit-sheet-header log-drawer-head">
           <div>
             <span>${html(formatTime(row.timestamp))}</span>
-            <h2>${html(row.eventLabel)}</h2>
+            <strong>${html(row.eventLabel)}</strong>
           </div>
-          <button type="button" class="log-center-icon-button" data-log-close-drawer aria-label="关闭日志详情">
-            <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M5.65 5.65a.5.5 0 0 1 .7 0L10 9.29l3.65-3.64a.5.5 0 0 1 .7.7L10.71 10l3.64 3.65a.5.5 0 0 1-.7.7L10 10.71l-3.65 3.64a.5.5 0 0 1-.7-.7L9.29 10 5.65 6.35a.5.5 0 0 1 0-.7Z"></path></svg>
-          </button>
+          <button type="button" class="dwrt-kit-sheet-close" data-log-close-drawer aria-label="关闭日志详情">×</button>
         </header>
-        <div class="log-drawer-scroll">
+        <div class="dwrt-kit-sheet-body log-drawer-scroll">
           <section class="log-detail-section">
             <h3>事件</h3>
             <dl>
@@ -1472,6 +1565,7 @@
     }
 
     function captureInteractionState() {
+      if (!root) return null;
       const active = document.activeElement && root.contains(document.activeElement) ? document.activeElement : null;
       const focusKey = active?.matches('[data-log-search]') ? 'search'
         : active?.matches('[data-log-event-search]') ? 'event-search'
@@ -1530,14 +1624,39 @@
         <main class="log-center-main">
           ${state.view === 'settings' ? settingsMarkup() : tableMarkup()}
         </main>
-        ${state.view === 'settings' ? '' : drawerMarkup()}
+        <div class="log-center-drawer-host" data-log-drawer-host>${state.view === 'settings' ? '' : drawerMarkup()}</div>
       </section>`;
       mountUiKit(root);
       scheduleGlassCardsRender(160);
       restoreInteractionState(interaction);
     }
 
+    // 抽屉独立挂载：开关抽屉不再改变表格所在的 grid 结构。
+    function syncDrawer() {
+      const host = root && root.querySelector('[data-log-drawer-host]');
+      if (!host) {
+        render();
+        return;
+      }
+      const shell = root.querySelector('[data-log-center-shell]');
+      const shouldOpen = Boolean(state.selectedRow) && state.view !== 'settings';
+      if (shell) shell.classList.toggle('is-drawer-open', shouldOpen);
+      const openId = host.getAttribute('data-log-drawer-id') || '';
+      const nextId = shouldOpen ? String(state.selectedRow.id) : '';
+      if (openId === nextId) return;
+      host.setAttribute('data-log-drawer-id', nextId);
+      host.innerHTML = shouldOpen ? drawerMarkup() : '';
+      if (shouldOpen) {
+        mountUiKit(host);
+        scheduleGlassCardsRender(120);
+      }
+    }
+
     function selectedSetFor(kind) {
+      return setForKind(kind);
+    }
+
+    function setForKind(kind) {
       return {
         categories: state.categories,
         sources: state.sources,
@@ -1547,6 +1666,75 @@
         clientDeviceMacs: state.clientDeviceMacs,
         adminIds: state.adminIds
       }[kind] || null;
+    }
+
+    // 只重绘单行，避免为了一个「…」把整页 innerHTML 重建。
+    function patchRow(id) {
+      const row = state.rows.find((item) => item.id === id);
+      const node = root && root.querySelector(`[data-log-row="${cssEscape(id)}"]`);
+      if (!row || !node) {
+        renderTableRegion();
+        return;
+      }
+      node.outerHTML = rowMarkup(row);
+    }
+
+    // 局部重绘：表格区域。筛选栏与抽屉保持原节点，不参与重排。
+    function renderTableRegion() {
+      const main = root && root.querySelector('.log-center-main');
+      if (!main) {
+        render();
+        return;
+      }
+      const scroll = main.querySelector('.log-center-table-scroll');
+      const scrollTop = scroll ? scroll.scrollTop : 0;
+      const scrollLeft = scroll ? scroll.scrollLeft : 0;
+      main.innerHTML = state.view === 'settings' ? settingsMarkup() : tableMarkup();
+      const nextScroll = main.querySelector('.log-center-table-scroll');
+      if (nextScroll) {
+        nextScroll.scrollTop = scrollTop;
+        nextScroll.scrollLeft = scrollLeft;
+      }
+      mountUiKit(main);
+    }
+
+    // 局部重绘：筛选栏。表格与抽屉保持原节点。
+    function renderFilterRegion() {
+      const aside = root && root.querySelector('.log-center-filter');
+      if (!aside) {
+        render();
+        return;
+      }
+      const interaction = captureInteractionState();
+      const scroll = aside.querySelector('.log-filter-scroll');
+      const scrollTop = scroll ? scroll.scrollTop : 0;
+      aside.innerHTML = `<div class="log-filter-head">${modeTabsMarkup()}</div>${filtersMarkup()}${filterFooterMarkup()}`;
+      const nextScroll = aside.querySelector('.log-filter-scroll');
+      if (nextScroll) nextScroll.scrollTop = scrollTop;
+      mountUiKit(aside);
+      restoreInteractionState(interaction);
+    }
+
+    // 最轻量更新：只刷工具栏（选中计数、提示、AI 按钮可用性）。
+    function syncToolbar() {
+      const toolbar = root && root.querySelector('.log-center-toolbar');
+      if (!toolbar) {
+        renderTableRegion();
+        return;
+      }
+      const askButton = toolbar.querySelector('[data-log-ask-ai]');
+      if (askButton) {
+        askButton.disabled = !(state.selectedRows.size && !state.aiLoading);
+        const label = askButton.querySelector('span, em');
+        const text = state.aiLoading ? '分析中' : `问 AI${state.selectedRows.size ? ` (${state.selectedRows.size})` : ''}`;
+        if (label) label.textContent = text;
+        else askButton.setAttribute('aria-label', text);
+      }
+      const selectPage = root.querySelector('[data-log-select-page]');
+      if (selectPage) {
+        const visibleIds = state.rows.map((row) => row.id);
+        selectPage.checked = visibleIds.length > 0 && visibleIds.every((id) => state.selectedRows.has(id));
+      }
     }
 
     function toggleSetValue(set, value, checked) {
@@ -1559,9 +1747,13 @@
 
     function selectRow(id) {
       const row = state.rows.find((item) => item.id === id) || state.allRows.find((item) => item.id === id);
+      const previousId = state.selectedId;
       state.selectedId = row ? row.id : '';
       state.selectedRow = row || null;
-      render();
+      // 只切换选中高亮 + 抽屉，不整页重绘。
+      if (previousId) patchRow(previousId);
+      if (state.selectedId) patchRow(state.selectedId);
+      syncDrawer();
     }
 
     async function openCalendar(event) {
@@ -1606,13 +1798,13 @@
       const capabilities = state.settings && state.settings.capabilities || {};
       if (capabilities.ai_analysis !== true && capabilities.log_ai_analysis !== true) {
         state.notice = '后端尚未提供日志 AI 分析能力。';
-        render();
+        syncToolbar();
         return;
       }
       state.aiLoading = true;
       state.aiResult = null;
       state.notice = '';
-      render();
+      renderTableRegion();
       try {
         const payload = await postEndpoint('logs.ai.analyze', ENDPOINTS.aiAnalyze, {
           log_ids: rows.map((row) => row.id),
@@ -1637,25 +1829,38 @@
         state.notice = unavailable ? '后端尚未提供日志 AI 分析接口。' : (error && error.message || '日志 AI 分析失败');
       } finally {
         state.aiLoading = false;
-        render();
+        renderTableRegion();
       }
     }
 
     function onClick(event) {
       if (event.target.closest('[data-log-row-select], [data-log-select-page]')) return;
+      const descToggle = event.target.closest('[data-log-desc-toggle]');
+      if (descToggle) {
+        // 展开/收起描述属于行内显示，不应打开详情抽屉，也不应重排整页。
+        event.preventDefault();
+        event.stopPropagation();
+        const id = descToggle.dataset.logDescToggle;
+        if (state.expandedMessages.has(id)) state.expandedMessages.delete(id);
+        else state.expandedMessages.add(id);
+        patchRow(id);
+        return;
+      }
       if (event.target.closest('[data-log-ask-ai]')) {
         askAiAboutSelection();
         return;
       }
       if (event.target.closest('[data-log-ai-dismiss]')) {
         state.aiResult = null;
-        render();
+        renderTableRegion();
         return;
       }
       const modeButton = event.target.closest('[data-log-mode]');
       if (modeButton) {
-        state.mode = modeButton.dataset.logMode === 'AUDIT' ? 'AUDIT' : 'GENERAL';
-        state.sources = new Set([state.mode === 'AUDIT' ? 'audit' : 'general']);
+        const nextMode = modeButton.dataset.logMode === 'AUDIT' ? 'AUDIT' : 'GENERAL';
+        if (nextMode === state.mode) return;
+        state.mode = nextMode;
+        state.sources = new Set([defaultSourceForMode(nextMode)]);
         state.view = 'logs';
         state.pageNumber = 0;
         state.selectedId = '';
@@ -1722,9 +1927,11 @@
         return;
       }
       if (event.target.closest('[data-log-close-drawer]')) {
+        const previousId = state.selectedId;
         state.selectedId = '';
         state.selectedRow = null;
-        render();
+        if (previousId) patchRow(previousId);
+        syncDrawer();
         return;
       }
       const copyButton = event.target.closest('[data-log-copy]');
@@ -1743,7 +1950,8 @@
           state.view = 'settings';
           state.selectedId = '';
           state.selectedRow = null;
-          render();
+          renderTableRegion();
+          syncDrawer();
           return;
         }
         if (action === 'notifications') {
@@ -1761,7 +1969,7 @@
       }
       if (event.target.matches('[data-log-event-search]')) {
         state.eventSearch = event.target.value || '';
-        render();
+        renderFilterRegion();
       }
     }
 
@@ -1771,7 +1979,8 @@
         const id = rowSelect.dataset.logRowSelect;
         if (rowSelect.checked) state.selectedRows.add(id);
         else state.selectedRows.delete(id);
-        render();
+        patchRow(id);
+        syncToolbar();
         return;
       }
       if (event.target.matches('[data-log-select-page]')) {
@@ -1779,18 +1988,17 @@
           if (event.target.checked) state.selectedRows.add(row.id);
           else state.selectedRows.delete(row.id);
         });
-        render();
+        renderTableRegion();
         return;
       }
       const check = event.target.closest('[data-log-filter-check]');
       if (check) {
         if (check.dataset.logFilterCheck === 'sources') {
-          const meta = sourceMeta(check.value);
+          // 勾选来源只影响来源集合；tab（mode）由 tab 自己决定，
+          // 否则在「审计」下勾任何 GENERAL 来源都会把用户弹回「常规」。
           if (check.checked) state.sources.add(check.value);
           else state.sources.delete(check.value);
-          if (!state.sources.size) state.sources.add(state.mode === 'AUDIT' ? 'audit' : 'general');
-          if (check.checked && meta && meta.modes && meta.modes.includes('AUDIT')) state.mode = 'AUDIT';
-          if (check.checked && meta && meta.modes && meta.modes.includes('GENERAL')) state.mode = 'GENERAL';
+          if (!state.sources.size) state.sources.add(defaultSourceForMode());
           state.view = 'logs';
           state.pageNumber = 0;
           refresh({ resetPage: true });

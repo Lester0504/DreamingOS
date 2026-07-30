@@ -214,6 +214,59 @@ const char *logd_severity(const char *s)
     return "info";
 }
 
+/* Log level groups.
+ *
+ * Groups are derived from the `category` values the collectors and event
+ * producers already write, so a level actually filters real events instead of
+ * depending on a field nobody sets. Any category that is not explicitly mapped
+ * falls back to the system group, which keeps unknown/new producers visible
+ * rather than silently dropped.
+ */
+const char *logd_log_level_group(const char *category)
+{
+    if (!category || !category[0])
+        return "system";
+    if (!strcmp(category, "client") || !strcmp(category, "dhcp") ||
+        !strcmp(category, "port") || !strcmp(category, "link_up"))
+        return "device";
+    if (!strcmp(category, "audit") || !strcmp(category, "auth"))
+        return "management";
+    if (!strcmp(category, "vpn") || !strcmp(category, "wan") ||
+        !strcmp(category, "pppoe"))
+        return "remote_access";
+    return "system";
+}
+
+const char *logd_log_level(const char *level)
+{
+    if (!level || !level[0])
+        return "auto";
+    if (!strcmp(level, "auto") || !strcmp(level, "normal") ||
+        !strcmp(level, "verbose") || !strcmp(level, "debug"))
+        return level;
+    return "auto";
+}
+
+/* Minimum retained severity rank for a level.
+ *
+ * Ranks match logd_event_severity_rank(): debug 0, info 1, notice 2,
+ * warning 3, error 4, critical 5.
+ *
+ * - auto/verbose keep the historical behavior: everything from info up, and
+ *   debug is dropped.
+ * - normal is quieter: notice and above.
+ * - debug keeps everything including debug.
+ */
+int logd_log_level_min_rank(const char *level)
+{
+    level = logd_log_level(level);
+    if (!strcmp(level, "debug"))
+        return 0;
+    if (!strcmp(level, "normal"))
+        return 2;
+    return 1;
+}
+
 int logd_contains_ci(const char *s, const char *needle)
 {
     size_t nlen;

@@ -307,34 +307,46 @@ void jmx_netlink_handler(struct uloop_fd *u, unsigned int ev)
 #define MAX_NL_MSG_LEN 1024
 int jmx_nl_send_msg_to_kernel(int fd, void *msg, int len)
 {
-    struct sockaddr_nl saddr, daddr;
+    struct sockaddr_nl daddr;
+    struct nlmsghdr *nlh = NULL;
+    struct jmx_nl_msg_hdr *hdr;
+    size_t payload_len;
+    size_t frame_len;
+    ssize_t sent;
+
+    if (fd < 0 || !msg || len <= 0 ||
+        len > MAX_NL_MSG_LEN - (int)sizeof(*hdr)) {
+        errno = EINVAL;
+        return -1;
+    }
+    payload_len = sizeof(*hdr) + (size_t)len;
+    frame_len = NLMSG_SPACE(payload_len);
+    nlh = calloc(1, frame_len);
+    if (!nlh) {
+        errno = ENOMEM;
+        return -1;
+    }
     memset(&daddr, 0, sizeof(daddr));
     daddr.nl_family = AF_NETLINK;
     daddr.nl_pid = 0; // to kernel
     daddr.nl_groups = 0;
-    int ret = 0;
-    struct nlmsghdr *nlh = NULL;
-    nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_NL_MSG_LEN));
-    nlh->nlmsg_len = NLMSG_SPACE(MAX_NL_MSG_LEN);
+    nlh->nlmsg_len = NLMSG_LENGTH(payload_len);
     nlh->nlmsg_flags = 0;
     nlh->nlmsg_type = 0;
     nlh->nlmsg_seq = 0;
     nlh->nlmsg_pid = DEFAULT_JMX_NL_PID;
-
-    char msg_buf[MAX_NL_MSG_LEN] = {0};
-    struct jmx_nl_msg_hdr *hdr = (struct jmx_nl_msg_hdr *)msg_buf;
+    hdr = (struct jmx_nl_msg_hdr *)NLMSG_DATA(nlh);
     hdr->magic = 0xa0b0c0d0;
     hdr->len = len;
-    char *p_data = msg_buf + sizeof(struct jmx_nl_msg_hdr);
-    memcpy(p_data, msg, len);
+    memcpy(hdr + 1, msg, (size_t)len);
 
-    memcpy(NLMSG_DATA(nlh), msg_buf, len + sizeof(struct jmx_nl_msg_hdr));
-
-    ret = sendto(fd, nlh, nlh->nlmsg_len, 0, (struct sockaddr *)&daddr, sizeof(struct sockaddr_nl));
-	free(nlh);
-    if (!ret)
-    {
-        perror("sendto error\n");
+    sent = sendto(fd, nlh, nlh->nlmsg_len, 0,
+                  (struct sockaddr *)&daddr, sizeof(daddr));
+    free(nlh);
+    if (sent < 0)
+        return -1;
+    if ((size_t)sent != NLMSG_LENGTH(payload_len)) {
+        errno = EIO;
         return -1;
     }
 
@@ -345,6 +357,7 @@ int jmx_netlink_init(void)
 {
     int fd;
     struct sockaddr_nl nls;
+    jmx_nl_msg_t init = { .action = JMX_NL_MSG_INIT };
     fd = socket(AF_NETLINK, SOCK_RAW, JMX_NETLINK_ID);
     if (fd < 0)
     {
@@ -359,6 +372,13 @@ int jmx_netlink_init(void)
     if (bind(fd, (void *)&nls, sizeof(struct sockaddr_nl)))
     {
         LOG_DEBUG("Bind failed %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    if (jmx_nl_send_msg_to_kernel(fd, &init, sizeof(init)) != 0) {
+        LOG_DEBUG("Register legacy netlink owner failed: %s\n", strerror(errno));
+        close(fd);
         return -1;
     }
 

@@ -147,9 +147,9 @@ typedef struct jmx_regex_result {
 /* ── API ── */
 int jmx_v2_rules_init(void);
 void jmx_v2_rules_exit(void);
-int jmx_v2_rule_add(const jmx_v2_rule_t *rule);
-void jmx_v2_rules_flush(void);
-int jmx_v2_rules_commit(uint32_t version);
+int jmx_v2_rules_begin(uint32_t owner_portid);
+int jmx_v2_rule_add(uint32_t owner_portid, const jmx_v2_rule_t *rule);
+int jmx_v2_rules_commit(uint32_t owner_portid, uint32_t version);
 uint32_t jmx_v2_rules_count(void);
 void jmx_v2_rules_get_status(uint32_t *version, uint32_t *count);
 uint32_t jmx_v2_match_payload(const uint8_t *payload, uint16_t len,

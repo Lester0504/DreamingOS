@@ -77,8 +77,8 @@ def test_save_apply_readback_contract_is_core_owned() -> None:
         '"rollback"',
     ):
         assert required in result
-    assert 'jmx_netconfig_wan_save_apply_result(in)' in API
-    assert 'jmx_netconfig_lan_save_apply_result(in)' in API
+    assert 'jmx_netconfig_wan_save_apply_result(payload)' in API
+    assert 'jmx_netconfig_lan_save_apply_result(payload)' in API
     assert 'status = app_response_status(resp, status);' in WEBD
 
 

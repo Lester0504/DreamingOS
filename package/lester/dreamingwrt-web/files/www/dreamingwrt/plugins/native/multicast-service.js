@@ -6,7 +6,7 @@ export function mount(context = {}) {
   if (!root) return () => {};
   const stage = root.closest('.console-stage');
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260725-multicast-workbench-04';
+  const VERSION = '20260730-multicast-layout-02';
   const TABS = [
     ['overview', '总览'],
     ['igmp', 'IGMP / MLD 代理'],
@@ -404,11 +404,11 @@ export function mount(context = {}) {
   }
 
   function tabsMarkup() {
-    return `<nav class="dwrt-kit-tabs dwrt-kit-page-tabs multicast-tabs" role="tablist" data-dwrt-tabs-key="multicast-service" aria-label="组播服务视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${TABS.map(([id, label]) => `<button class="dwrt-kit-tab ${state.tab === id ? 'is-active' : ''}" type="button" role="tab" data-multicast-tab="${id}" data-value="${id}" aria-selected="${state.tab === id ? 'true' : 'false'}">${escapeHtml(label)}</button>`).join('')}</nav>`;
+    return `<nav class="dwrt-kit-tabs dwrt-kit-page-tabs multicast-tabs" data-dwrt-component="tabs" role="tablist" data-dwrt-tabs-key="multicast-service" aria-label="组播服务视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${TABS.map(([id, label]) => `<button class="dwrt-kit-tab ${state.tab === id ? 'is-active' : ''}" type="button" role="tab" data-multicast-tab="${id}" data-value="${id}" aria-selected="${state.tab === id ? 'true' : 'false'}">${escapeHtml(label)}</button>`).join('')}</nav>`;
   }
 
   function pageToolbar() {
-    return `<header class="multicast-page-header">${tabsMarkup()}<button class="dwrt-kit-button multicast-refresh" type="button" data-multicast-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '正在刷新' : '刷新'}</span></button></header>`;
+    return `<header class="multicast-page-header">${tabsMarkup()}<div class="multicast-page-actions"><button class="dwrt-kit-button multicast-refresh" data-dwrt-component="button" data-variant="ghost" type="button" data-multicast-refresh aria-label="刷新组播服务" data-dwrt-tooltip="刷新" ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '正在刷新' : '刷新'}</span></button></div></header>`;
   }
 
   function noticeMarkup() {
@@ -426,7 +426,7 @@ export function mount(context = {}) {
   }
 
   function tableShell(title, detail, headings, rows, empty, className = '') {
-    return `<section class="multicast-table dwrt-kit-table-wrap dwrt-kit-datatable-wrap ${className}"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(detail)}</span></div><span class="dwrt-kit-table-count">${rows.length} 条</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-datatable"><thead><tr>${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody>${state.loading ? `<tr><td class="dwrt-kit-table-empty" colspan="${headings.length}">正在读取运行状态</td></tr>` : rows.length ? rows.join('') : `<tr><td class="dwrt-kit-table-empty" colspan="${headings.length}">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
+    return `<section class="multicast-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap ${className}" data-dwrt-component="data-table" data-dwrt-surface="dense-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(detail)}</span></div><span class="dwrt-kit-table-count">${rows.length} 条</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr>${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody>${state.loading ? `<tr><td class="dwrt-kit-table-empty" colspan="${headings.length}">正在读取运行状态</td></tr>` : rows.length ? rows.join('') : `<tr><td class="dwrt-kit-table-empty" colspan="${headings.length}">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
   }
 
   function runtimeTable() {
@@ -473,7 +473,7 @@ export function mount(context = {}) {
   }
 
   function settingsSurface(title, detail, content) {
-    return `<section class="multicast-settings-surface dwrt-kit-glass-surface" data-dwrt-surface="stable-glass"><header class="multicast-surface-header"><span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(detail)}</small></span>${statusBadge(canWrite() ? '可配置' : '只读', canWrite() ? 'success' : 'warning')}</header>${capabilityPanel()}<div class="multicast-surface-body">${content}</div></section>`;
+    return `<section class="multicast-settings-surface"><header class="multicast-surface-header"><span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(detail)}</small></span>${statusBadge(canWrite() ? '可配置' : '只读', canWrite() ? 'success' : 'warning')}</header>${capabilityPanel()}<div class="multicast-surface-body">${content}</div></section>`;
   }
 
   function igmpPanel() {
@@ -577,7 +577,7 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'multicast-service-route-host');
-    root.innerHTML = `<section class="multicast-service-shell" data-multicast-version="${VERSION}" data-dwrt-component="page-shell" data-dwrt-page-shell="settings-workbench">${pageToolbar()}${noticeMarkup()}<main class="multicast-service-main">${panelMarkup()}</main>${savebarMarkup()}${confirmationMarkup()}</section>`;
+    root.innerHTML = `<section class="multicast-service-shell" data-multicast-version="${VERSION}">${pageToolbar()}<main class="multicast-service-main">${noticeMarkup()}${panelMarkup()}</main>${savebarMarkup()}${confirmationMarkup()}</section>`;
     ui.mountAll?.(root);
     ui.scheduleAdaptiveForegroundSample?.(20, root);
   }

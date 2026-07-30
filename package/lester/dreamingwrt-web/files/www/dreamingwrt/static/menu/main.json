@@ -1,5 +1,5 @@
 {
-  "version": "20260725-dreaming-os-01",
+  "version": "20260727-flow-engine-01",
   "generated_at": "2026-07-25T15:00:00+08:00",
   "meta": {
     "name": "Dreaming OS standalone console menu",
@@ -12,8 +12,14 @@
     ],
     "notes": "Static fallback belongs to the standalone Web. Installed native or advanced plugin entries are merged by webd/jmxd into /dynamic/menu/1.json."
   },
-  "hidePages": ["/app/#/network/network-control"],
-  "hideFuncs": ["advanced_plugins", "advanced_plugins_index", "container_service"],
+  "hidePages": [
+    "/app/#/network/network-control"
+  ],
+  "hideFuncs": [
+    "advanced_plugins",
+    "advanced_plugins_index",
+    "container_service"
+  ],
   "addFuncs": [],
   "items": [
     {
@@ -51,9 +57,9 @@
           "icon": "wireless_status",
           "path": "/app/#/monitor/wireless-status",
           "module": "native/wifi-management.js",
-          "module_version": "20260726-wifi-scan-reasons-01",
+          "module_version": "20260727-wifi-environment-spectrum-01",
           "style": "/static/css/wifi-management.css",
-          "style_version": "20260726-wifi-scan-reasons-01"
+          "style_version": "20260727-wifi-environment-spectrum-01"
         },
         {
           "label": "终端详情",
@@ -129,9 +135,9 @@
           "icon": "upnp",
           "path": "/app/#/network/upnp-service",
           "module": "native/upnp-service.js",
-          "module_version": "20260724-upnp-service-02",
+          "module_version": "20260730-upnp-dhcp-unify-05",
           "style": "/static/css/upnp-service.css",
-          "style_version": "20260724-upnp-service-02",
+          "style_version": "20260730-upnp-dhcp-unify-05",
           "frontend_owned": true
         },
         {
@@ -161,9 +167,9 @@
           "icon": "wifi",
           "path": "/app/#/network/wifi-config",
           "module": "native/wifi-management.js",
-          "module_version": "20260726-wifi-scan-reasons-01",
+          "module_version": "20260727-wifi-environment-spectrum-01",
           "style": "/static/css/wifi-management.css",
-          "style_version": "20260726-wifi-scan-reasons-01"
+          "style_version": "20260727-wifi-environment-spectrum-01"
         },
         {
           "label": "高级路由",
@@ -192,9 +198,9 @@
           "icon": "multicast",
           "path": "/app/#/network/multicast-service",
           "module": "native/multicast-service.js",
-          "module_version": "20260725-multicast-workbench-04",
+          "module_version": "20260730-multicast-layout-02",
           "style": "/static/css/multicast-service.css",
-          "style_version": "20260725-multicast-workbench-04",
+          "style_version": "20260730-multicast-layout-02",
           "availability": "available",
           "frontend_owned": true
         },
@@ -249,9 +255,9 @@
           "icon": "authentication_web",
           "path": "/app/#/authentication/web",
           "module": "native/user-authentication.js",
-          "module_version": "20260725-dreaming-os-01",
+          "module_version": "20260730-user-auth-online-layout-11",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260719-10"
+          "style_version": "20260730-user-auth-online-layout-11"
         },
         {
           "label": "在线用户",
@@ -260,9 +266,9 @@
           "icon": "authentication_online_users",
           "path": "/app/#/authentication/online-users",
           "module": "native/user-authentication.js",
-          "module_version": "20260725-dreaming-os-01",
+          "module_version": "20260730-user-auth-online-layout-11",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260719-10"
+          "style_version": "20260730-user-auth-online-layout-11"
         },
         {
           "label": "账号管理",
@@ -271,9 +277,9 @@
           "icon": "authentication_accounts",
           "path": "/app/#/authentication/accounts",
           "module": "native/user-authentication.js",
-          "module_version": "20260725-dreaming-os-01",
+          "module_version": "20260730-user-auth-online-layout-11",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260719-10"
+          "style_version": "20260730-user-auth-online-layout-11"
         },
         {
           "label": "代拨服务",
@@ -282,9 +288,9 @@
           "icon": "authentication_delegated",
           "path": "/app/#/authentication/delegated",
           "module": "native/user-authentication.js",
-          "module_version": "20260725-dreaming-os-01",
+          "module_version": "20260730-user-auth-online-layout-11",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260719-10"
+          "style_version": "20260730-user-auth-online-layout-11"
         },
         {
           "label": "终端限速",
@@ -333,9 +339,9 @@
           "icon": "authentication_notifications",
           "path": "/app/#/authentication/notifications",
           "module": "native/user-authentication.js",
-          "module_version": "20260725-dreaming-os-01",
+          "module_version": "20260730-user-auth-online-layout-11",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260719-10"
+          "style_version": "20260730-user-auth-online-layout-11"
         }
       ]
     },
@@ -546,9 +552,9 @@
           "icon": "policy_aegisx",
           "path": "/app/#/policy-engine/aegisx",
           "module": "native/aegisx.js",
-          "module_version": "20260722-overlay-01",
+          "module_version": "20260730-aegisx-ux-08",
           "style": "/static/css/aegisx.css",
-          "style_version": "20260719-13"
+          "style_version": "20260730-aegisx-ux-08"
         },
         {
           "label": "策略表",
@@ -579,9 +585,9 @@
           "icon": "policy_region",
           "path": "/app/#/policy-engine/regions",
           "module": "native/policy-regions.js",
-          "module_version": "20260721-02",
+          "module_version": "20260730-policy-regions-unify-10",
           "style": "/static/css/policy-entities.css",
-          "style_version": "20260721-02"
+          "style_version": "20260730-policy-workbench-unify-14"
         },
         {
           "label": "对象",
@@ -590,9 +596,9 @@
           "icon": "policy_object",
           "path": "/app/#/policy-engine/objects",
           "module": "native/policy-objects.js",
-          "module_version": "20260721-02",
+          "module_version": "20260730-policy-objects-unify-03",
           "style": "/static/css/policy-entities.css",
-          "style_version": "20260721-02"
+          "style_version": "20260730-policy-workbench-unify-14"
         },
         {
           "label": "路由表",
@@ -604,6 +610,17 @@
           "module_version": "20260722-overlay-01",
           "style": "/static/css/routing-table.css",
           "style_version": "20260722-overlay-01"
+        },
+        {
+          "label": "流量引擎",
+          "func_name": "flow_engine",
+          "id": "flow-engine",
+          "icon": "flow",
+          "path": "/app/#/policy-engine/flow-engine",
+          "module": "native/flow-engine.js",
+          "module_version": "20260730-flow-engine-unify-04",
+          "style": "/static/css/flow-engine.css",
+          "style_version": "20260730-flow-engine-unify-08"
         }
       ]
     },
@@ -614,9 +631,9 @@
       "icon": "log_center",
       "path": "/app/#/logs",
       "module": "native/log-center.js",
-      "module_version": "20260722-legacy-restore-01",
+      "module_version": "20260730-log-center-interaction-01",
       "style": "/static/css/log-center.css",
-      "style_version": "20260722-legacy-restore-01",
+      "style_version": "20260730-log-center-interaction-01",
       "frontend_owned": true,
       "capability": "logs",
       "bottom": true
@@ -636,9 +653,9 @@
           "icon": "general",
           "path": "/app/#/system/general",
           "module": "native/system-settings.js",
-      "module_version": "20260727-pair-approve-01",
-      "style": "/static/css/system-settings.css",
-      "style_version": "20260720-03"
+          "module_version": "20260727-pair-approve-01",
+          "style": "/static/css/system-settings.css",
+          "style_version": "20260720-03"
         },
         {
           "label": "管理员",
@@ -647,9 +664,9 @@
           "icon": "system",
           "path": "/app/#/system/admin",
           "module": "native/system-settings.js",
-      "module_version": "20260727-pair-approve-01",
-      "style": "/static/css/system-settings.css",
-      "style_version": "20260720-03"
+          "module_version": "20260727-pair-approve-01",
+          "style": "/static/css/system-settings.css",
+          "style_version": "20260720-03"
         },
         {
           "label": "通知推送",
@@ -669,9 +686,9 @@
           "icon": "ai",
           "path": "/app/#/system/llm-settings",
           "module": "native/ai-assistant.js",
-          "module_version": "20260725-dreaming-os-01",
+          "module_version": "20260727-ai-stream-01",
           "style": "/static/css/ai-assistant.css",
-          "style_version": "20260721-01",
+          "style_version": "20260727-ai-stream-01",
           "frontend_owned": true
         },
         {
@@ -681,9 +698,9 @@
           "icon": "qwrt_modules",
           "path": "/app/#/system/startup",
           "module": "native/system-settings.js",
-      "module_version": "20260727-pair-approve-01",
-      "style": "/static/css/system-settings.css",
-      "style_version": "20260720-03"
+          "module_version": "20260727-pair-approve-01",
+          "style": "/static/css/system-settings.css",
+          "style_version": "20260720-03"
         },
         {
           "label": "计划任务",
@@ -692,9 +709,9 @@
           "icon": "log_center",
           "path": "/app/#/system/crontab",
           "module": "native/system-settings.js",
-      "module_version": "20260727-pair-approve-01",
-      "style": "/static/css/system-settings.css",
-      "style_version": "20260720-03"
+          "module_version": "20260727-pair-approve-01",
+          "style": "/static/css/system-settings.css",
+          "style_version": "20260720-03"
         },
         {
           "label": "终端",
@@ -764,9 +781,9 @@
       "icon": "system_users",
       "path": "/app/#/system/users",
       "module": "native/system-users.js",
-      "module_version": "20260722-overlay-01",
+      "module_version": "20260729-user-avatar-01",
       "style": "/static/css/system-users.css",
-      "style_version": "20260710-02",
+      "style_version": "20260729-user-avatar-01",
       "bottom": true
     }
   ]

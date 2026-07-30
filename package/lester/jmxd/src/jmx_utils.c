@@ -12,8 +12,23 @@
 #include <string.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <net/if.h>
 
 #include "jmx_utils.h"
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
+
+#ifndef JMX_PROC_SYS_ROOT
+#define JMX_PROC_SYS_ROOT "/proc/sys/dreamingwrt/jmx"
+#endif
 
 char *str_trim(char *s) {
     if (!s) return s;
@@ -199,17 +214,135 @@ int jmx_parse_time_str(const char *time_str, jmx_time_period_t *periods, int max
 }
 
 
-void update_jmx_proc_value(char *key, char *value){
-    char cmd_buf[128] = {0};
-    char file_path[128] = {0};
-    char old_value[128] = {0};
-    sprintf(file_path, "/proc/sys/dreamingwrt/jmx/%s", key);
+enum jmx_proc_value_kind {
+    JMX_PROC_VALUE_U32,
+    JMX_PROC_VALUE_IFNAME,
+};
 
-    af_read_file_value(file_path, old_value, sizeof(old_value));    
-    if (strcmp(old_value, value) != 0){
-        sprintf(cmd_buf, "echo %s >/proc/sys/dreamingwrt/jmx/%s", value, key);
-        system(cmd_buf);
+struct jmx_proc_value_target {
+    const char *key;
+    const char *path;
+    enum jmx_proc_value_kind kind;
+};
+
+static const struct jmx_proc_value_target jmx_proc_value_targets[] = {
+    { "lan_ifname", JMX_PROC_SYS_ROOT "/lan_ifname", JMX_PROC_VALUE_IFNAME },
+    { "lan_ip", JMX_PROC_SYS_ROOT "/lan_ip", JMX_PROC_VALUE_U32 },
+    { "lan_mask", JMX_PROC_SYS_ROOT "/lan_mask", JMX_PROC_VALUE_U32 },
+    { "record_enable", JMX_PROC_SYS_ROOT "/record_enable", JMX_PROC_VALUE_U32 },
+    { "work_mode", JMX_PROC_SYS_ROOT "/work_mode", JMX_PROC_VALUE_U32 },
+};
+
+static const struct jmx_proc_value_target *jmx_proc_value_target(const char *key)
+{
+    size_t i;
+
+    if (!key)
+        return NULL;
+    for (i = 0; i < sizeof(jmx_proc_value_targets) / sizeof(jmx_proc_value_targets[0]); i++) {
+        if (strcmp(jmx_proc_value_targets[i].key, key) == 0)
+            return &jmx_proc_value_targets[i];
     }
+    return NULL;
+}
+
+static int jmx_proc_ifname_value_valid(const char *value)
+{
+    size_t i, len;
+
+    if (!value || !(len = strlen(value)) || len >= IFNAMSIZ)
+        return 0;
+    for (i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)value[i];
+
+        if (!isalnum(ch) && ch != '_' && ch != '-' && ch != '.' && ch != ':')
+            return 0;
+    }
+    return if_nametoindex(value) != 0;
+}
+
+static int jmx_proc_u32_value_valid(const char *value)
+{
+    unsigned long long number = 0;
+    size_t i;
+
+    if (!value || !value[0])
+        return 0;
+    for (i = 0; value[i]; i++) {
+        unsigned int digit;
+
+        if (!isdigit((unsigned char)value[i]))
+            return 0;
+        digit = (unsigned int)(value[i] - '0');
+        if (number > (0xffffffffULL - digit) / 10ULL)
+            return 0;
+        number = number * 10ULL + digit;
+    }
+    return 1;
+}
+
+static int jmx_proc_readback(const char *path, char *value, size_t value_len)
+{
+    ssize_t count;
+    int fd;
+
+    if (!path || !value || value_len < 2)
+        return -1;
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    do {
+        count = read(fd, value, value_len - 1);
+    } while (count < 0 && errno == EINTR);
+    close(fd);
+    if (count < 0 || (size_t)count >= value_len - 1)
+        return -1;
+    value[count] = '\0';
+    while (count > 0 && isspace((unsigned char)value[count - 1]))
+        value[--count] = '\0';
+    return 0;
+}
+
+int jmx_update_proc_value(const char *key, const char *value)
+{
+    const struct jmx_proc_value_target *target = jmx_proc_value_target(key);
+    char readback[128] = {0};
+    size_t offset = 0, value_len;
+    int fd;
+
+    if (!target || !value || !(value_len = strlen(value)) ||
+        value_len >= sizeof(readback))
+        return -1;
+    if ((target->kind == JMX_PROC_VALUE_IFNAME && !jmx_proc_ifname_value_valid(value)) ||
+        (target->kind == JMX_PROC_VALUE_U32 && !jmx_proc_u32_value_valid(value)))
+        return -1;
+    if (jmx_proc_readback(target->path, readback, sizeof(readback)) == 0 &&
+        strcmp(readback, value) == 0)
+        return 0;
+
+    fd = open(target->path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    while (offset < value_len) {
+        ssize_t count = write(fd, value + offset, value_len - offset);
+
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0) {
+            close(fd);
+            return -1;
+        }
+        offset += (size_t)count;
+    }
+    if (close(fd) != 0)
+        return -1;
+    if (jmx_proc_readback(target->path, readback, sizeof(readback)) != 0)
+        return -1;
+    return strcmp(readback, value) == 0 ? 0 : -1;
+}
+
+void update_jmx_proc_value(char *key, char *value){
+    (void)jmx_update_proc_value(key, value);
 }
 
 void update_jmx_proc_u32_value(char *key, u_int32_t value){

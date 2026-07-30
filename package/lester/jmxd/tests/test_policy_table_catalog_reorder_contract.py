@@ -24,6 +24,10 @@ assert '"reorder_scope_conflict"' in reorder
 assert 'app_routed_call("policy_rules_reorder", params)' in reorder
 assert '"apply_requires_explicit_apply_true"' in reorder
 assert 'app_routed_http_status(upstream, 200)' in reorder
+assert 'webd_policy_uci_reorder_response' in reorder
+assert 'uci_reorder_section(ctx, desired[i], i)' in reorder
+assert '"reorder_full_scope_required"' in capabilities
+assert '"reorder_uci_foreign_sections_preserved"' in capabilities
 
 catalog = between(API, "static struct json_object *webd_policy_catalog_response", "static struct json_object *webd_policy_table_response")
 for source in (
@@ -43,4 +47,4 @@ assert '"sources"' in catalog
 assert '"/api/v1/policy-engine/policy-table/"' in PERMS
 assert 'JMX_RISK_MEDIUM' in PERMS
 
-print("ok: policy catalog uses real sources and Policy Table reorder is scoped to transactional PBR")
+print("ok: policy catalog uses real sources and Policy Table reorder supports transactional PBR plus same-source UCI scopes")

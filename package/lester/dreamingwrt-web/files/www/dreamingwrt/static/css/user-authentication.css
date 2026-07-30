@@ -70,6 +70,22 @@
 .user-auth-page-header > .user-auth-toolbar .user-auth-toolbar-leading { flex: 0 1 min(430px, 34vw); }
 .user-auth-page-header > .user-auth-toolbar .policy-search-main { width: min(430px, 34vw); }
 
+/* 无二级 tab 的页面（如「在线用户」）：header 只承载工具栏，
+   高度收敛到工具栏本身，避免与 52px 最小高度叠加出多余空白。 */
+.user-auth-page-header.is-toolbar-only {
+  min-height: 0;
+}
+
+.user-auth-page-header.is-toolbar-only > .user-auth-toolbar {
+  height: 52px;
+  min-height: 52px;
+  justify-content: space-between;
+}
+
+.user-auth-page-header.is-toolbar-only > .user-auth-toolbar .user-auth-toolbar-leading {
+  flex: 0 1 min(430px, 34vw);
+}
+
 .user-auth-notice {
   min-height: 38px;
   display: flex;

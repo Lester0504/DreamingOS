@@ -241,20 +241,28 @@ typedef struct active_host_node {
 	u_int32_t update_time;         
 } active_host_node_t;
 
+char *ipv6_to_str(const struct in6_addr *addr, char *str);
+int af_send_msg_to_user(char *pbuf, uint16_t len);
+void jmx_v2_update_active_app(uint32_t appid, uint32_t src_ip,
+			      uint32_t dst_ip, uint16_t src_port,
+			      uint16_t dst_port, uint8_t proto);
+void jmx_v2_update_active_app_ex(uint32_t appid, uint32_t src_ip,
+				 uint32_t dst_ip, uint16_t src_port,
+				 uint16_t dst_port, uint8_t proto,
+				 uint8_t app_proto, const char *host,
+				 uint8_t host_len);
+void jmx_v2_update_active_app6_ex(uint32_t appid, const uint8_t *src_ip6,
+				  const uint8_t *dst_ip6, uint16_t src_port,
+				  uint16_t dst_port, uint8_t proto,
+				  uint8_t app_proto, const char *host,
+				  uint8_t host_len);
+
 int regexp_match(char *reg, char *text);
 int is_user_match_enable(void);
 
 
 struct af_client_info;
 typedef struct af_client_info af_client_info_t;
-
-void af_update_active_app_list(af_client_info_t *client, flow_info_t *flow);
-void af_clear_active_app_list(void);
-
-void af_update_active_host_list(af_client_info_t *client, flow_info_t *flow);
-active_host_node_t *af_find_active_host(const char *host);
-void af_clear_active_host_list(void);
-
 
 enum JMX_PKT_DIR
 {

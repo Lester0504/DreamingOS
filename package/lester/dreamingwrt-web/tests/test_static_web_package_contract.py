@@ -98,9 +98,9 @@ assert (WWW / "plugins/native/system-terminal.js").is_file()
 assert (WWW / "static/css/system-terminal.css").is_file()
 logs = next(item for item in menu["items"] if item.get("id") == "log-center")
 assert logs["module"] == "native/log-center.js"
-assert logs["module_version"] == "20260722-legacy-restore-01"
+assert logs["module_version"] == "20260730-log-center-interaction-01"
 assert logs["style"] == "/static/css/log-center.css"
-assert logs["style_version"] == "20260722-legacy-restore-01"
+assert logs["style_version"] == "20260730-log-center-interaction-01"
 assert logs["frontend_owned"] is True
 assert (WWW / "plugins/native/log-center.js").is_file()
 assert (WWW / "static/js/log-center.js").is_file()
@@ -176,8 +176,8 @@ assert ".ai-copilot-drawer" in ai_style
 assert ".ai-floating-orb" in ai_style
 assert ".ai-settings-section + .ai-settings-section" in ai_style
 assert ".ai-settings-card" in ai_style and "overflow: visible" in ai_style
-assert "dwrt-kit-datatable-wrap dwrt-kit-glass-surface system-table-card" in system_module
-assert "dwrt-kit-table dwrt-kit-datatable system-startup-table-core" in system_module
+assert "dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface system-table-card" in system_module
+assert "dwrt-kit-table dwrt-kit-ikuai-table system-startup-table-core" in system_module
 assert "systemStatusBadge(running ? '运行中' : '已停止'" in system_module
 assert "running\n              ? `${systemActionButton('重启'" in system_module
 assert ": systemActionButton('启动'" in system_module
@@ -251,14 +251,14 @@ assert "/plugins/native/ai-assistant.js" not in prewarm
 assert "/static/css/ai-assistant.css" not in prewarm
 assert "/static/js/dwrt-session-gate.js?v=20260720-01" in prewarm
 assert "/static/js/dwrt-data-registry.js?v=20260721-02" in prewarm
-assert "/static/js/menu-shell.js?v=20260725-route-resource-version-02" in prewarm
+assert "/static/js/menu-shell.js?v=20260730-session-recovery-clip-06" in prewarm
 assert "/static/ui-kit/dwrt-ui-kit.js?v=20260723-airview-radio-sheet-01" in prewarm
 assert "/static/js/device-images.js?v=20260723-airview-radio-sheet-01" in prewarm
-assert "const VERSION = '20260725-route-resource-version-02'" in prewarm
-assert "/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260725-ui-kit-filter-edge-05" in prewarm
-assert '/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260725-ui-kit-filter-edge-05' in app_html
-assert '/static/js/menu-shell.js?v=20260725-route-resource-version-02' in app_html
-assert '/static/js/shell-prewarm.js?v=20260725-route-resource-version-02' in app_html
+assert "const VERSION = '20260730-session-recovery-clip-06'" in prewarm
+assert "/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260730-safari-glass-lite-06" in prewarm
+assert '/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260730-safari-glass-lite-06' in app_html
+assert '/static/js/menu-shell.js?v=20260730-session-recovery-clip-06' in app_html
+assert '/static/js/shell-prewarm.js?v=20260730-session-recovery-clip-06' in app_html
 assert '/static/js/device-images.js?v=20260723-airview-radio-sheet-01' in app_html
 assert "/static/js/menu-icons.js?v=20260722-auth-control-01" in prewarm
 assert "/static/css/dwrt-theme.css?v=20260722-03" in prewarm

@@ -38,20 +38,10 @@ typedef struct {
 
 int af_conn_init(void);
 
-void af_conn_cleanup(void);
-af_conn_t* af_conn_add(u32 src_ip, u32 dst_ip, 
-                       u16 src_port, u16 dst_port, 
-                       u8 protocol);
-
-af_conn_t* af_conn_find(u32 src_ip, u32 dst_ip, 
-                       u16 src_port, u16 dst_port, 
-                       u8 protocol);
-
 af_conn_t* af_conn_find_and_add(u32 src_ip, u32 dst_ip, 
                        u16 src_port, u16 dst_port, 
                        u8 protocol);
 
-void af_conn_update(af_conn_t *conn, u32 app_id, u8 drop);
 void af_conn_record_match(u32 src_ip, u32 dst_ip, u16 src_port,
                           u16 dst_port, u8 protocol, u32 app_id, u8 drop);
 

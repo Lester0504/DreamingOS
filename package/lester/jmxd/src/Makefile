@@ -35,7 +35,7 @@
 #   zlib.h
 # ──────────────────────────────────────────────────────────────────────
 
-OBJS := jmx_user.o jmx_netlink.o jmx_ubus.o jmx_config.o jmx_utils.o main.o
+OBJS := jmx_user.o jmx_netlink.o jmx_ubus.o jmx_config.o jmx_utils.o jmx_exec.o main.o
 OBJS += jmx_app_filter.o jmx_mac_filter.o jmx_common.o jmx_db.o jmx_huginn.o jmx_dhcp_sniff.o
 OBJS += jmx_system.o jmx_network.o
 OBJS += jmx_dreamingwrt_api.o jmx_netconfig_db.o jmx_setup.o jmx_dreamingwrt_work_mode.o jmx_gateway_shadow.o

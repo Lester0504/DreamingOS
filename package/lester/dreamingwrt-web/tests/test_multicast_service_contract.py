@@ -28,8 +28,8 @@ assert route["availability"] == "available"
 assert route["frontend_owned"] is True
 assert route["module"] == "native/multicast-service.js"
 assert route["style"] == "/static/css/multicast-service.css"
-assert route["module_version"] == "20260725-multicast-workbench-04"
-assert route["style_version"] == "20260725-multicast-workbench-04"
+assert route["module_version"] == "20260730-multicast-layout-02"
+assert route["style_version"] == "20260730-multicast-layout-02"
 
 for label in ("总览", "IGMP / MLD 代理", "IPTV 透传", "UDPXY", "局域发现"):
     assert label in MODULE
@@ -83,14 +83,15 @@ for runtime_field in (
     assert runtime_field in MODULE, runtime_field
 
 for kit_contract in (
-    "dwrt-kit-page-tabs", "dwrt-kit-table-wrap", "dwrt-kit-glass-surface",
+    "dwrt-kit-page-tabs", "dwrt-kit-table-wrap", 'data-dwrt-surface="dense-surface"',
     "floatingSavebarMarkup", "statusBadgeMarkup", "confirmationMarkup",
-    'data-dwrt-component="dependency-group"', 'data-dwrt-page-shell="settings-workbench"',
+    'data-dwrt-component="tabs"', 'data-dwrt-component="button"',
+    'data-dwrt-component="dependency-group"', 'data-dwrt-component="data-table"',
 ):
     assert kit_contract in MODULE, kit_contract
 
 for workbench_contract in (
-    "20260725-multicast-workbench-04",
+    "20260730-multicast-layout-02",
     'role="tablist"',
     'role="tab"',
     "overviewSummaryMarkup",
@@ -102,7 +103,11 @@ for workbench_contract in (
 
 assert "overviewCardsMarkup" not in MODULE
 assert "multicast-overview-grid" not in MODULE
-assert "dwrt-kit-datatable-wrap dwrt-kit-glass-surface" not in MODULE
+assert "dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface" not in MODULE
+assert 'data-dwrt-component="page-shell"' not in MODULE
+assert 'data-dwrt-page-shell="settings-workbench"' not in MODULE
+assert 'data-dwrt-surface="stable-glass"' not in MODULE
+assert 'multicast-settings-surface dwrt-kit-glass-surface' not in MODULE
 
 assert "border-radius: 8px" in STYLE
 assert "border-radius: 6px" in STYLE
@@ -111,6 +116,7 @@ assert ".multicast-settings-surface" in STYLE
 assert ".multicast-surface-header" in STYLE
 assert ".multicast-surface-body" in STYLE
 assert ".multicast-runtime-summary" in STYLE
+assert ".multicast-page-actions" in STYLE
 assert ".multicast-table .dwrt-kit-table-scroll" in STYLE
 assert "overflow-x: auto" in STYLE
 assert "@media (max-width: 900px)" in STYLE
@@ -119,6 +125,13 @@ assert "font-size: 16px" in STYLE
 assert not re.search(r"font-size:\s*(?:[2-9]\d|1\d{2,})px", STYLE), "page CSS must not introduce Hero-sized text"
 assert "backdrop-filter:" not in STYLE
 assert "!important" not in STYLE
+assert "background: transparent" in STYLE
+assert "grid-template-rows: auto minmax(0, 1fr)" in STYLE
+assert ".console-stage.is-multicast-service" in STYLE
+assert "height: 100dvh" in STYLE
+assert ".multicast-service-main" in STYLE
+assert "overflow: auto" in STYLE
+assert '<main class="multicast-service-main">${noticeMarkup()}${panelMarkup()}</main>' in MODULE
 
 for source in (MODULE_PATH, STYLE_PATH):
     compressed = source.with_name(source.name + ".gz")

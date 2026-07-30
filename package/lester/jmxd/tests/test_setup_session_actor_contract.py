@@ -76,16 +76,12 @@ class SetupSessionActorContract(unittest.TestCase):
         self.assertIn("setup_active < 0 || setup_verify < 0", dispatch)
 
     def test_setup_writes_run_in_bounded_workers(self):
-        child_safe = function("static int app_api_child_safe_route")
-        self.assertIn('!strncmp(path, "/api/setup/", 11)', child_safe)
-        for route in (
-            "/api/v1/auth/pair/cancel",
-            "/api/system/dhcp",
-            "/api/system/static",
-            "/api/system/pppoe",
-            "/api/v1/device/config/lan",
-        ):
-            self.assertIn(f'!strcmp(path, "{route}")', child_safe)
+        dispatch = function(
+            "static void client_fd_cb(struct uloop_fd *ufd, unsigned int events)\n{")
+        self.assertIn('!strcmp(path, "/api/v1/events/stream")', dispatch)
+        self.assertIn("pid_t pid = fork();", dispatch)
+        self.assertNotIn("app_api_parent_fast_route", dispatch)
+        self.assertNotIn("app_api_child_safe_route", dispatch)
 
     def test_forwarded_ip_is_accepted_only_from_loopback_proxy(self):
         parser = function("static int parse_http_request")

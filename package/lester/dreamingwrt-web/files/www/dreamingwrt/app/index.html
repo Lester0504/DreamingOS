@@ -7,9 +7,9 @@
     <meta name="theme-color" content="#070a12">
     <title>Dreaming OS 控制台</title>
     <link rel="icon" href="/static/images/logo-64.png">
-    <link rel="stylesheet" href="/static/ui-kit/dwrt-ui-kit.css?v=20260723-status-compact-01">
-    <link rel="stylesheet" href="/static/ui-kit/dwrt-sampled-liquid-glass.css?v=20260713-17">
-    <link rel="stylesheet" href="/static/css/menu-shell.css?v=20260729-session-recovery-04">
+    <link rel="stylesheet" href="/static/ui-kit/dwrt-ui-kit.css?v=20260730-copilot-sheet-radius-02">
+    <link rel="stylesheet" href="/static/ui-kit/dwrt-sampled-liquid-glass.css?v=20260730-safari-glass-lite-06">
+    <link rel="stylesheet" href="/static/css/menu-shell.css?v=20260730-session-recovery-clip-06">
     <link rel="stylesheet" href="/static/css/notifications.css?v=20260712-10">
     <link rel="stylesheet" href="/static/css/dwrt-theme.css?v=20260722-03">
     <link id="dwrtControlMaterial" rel="stylesheet" href="/static/ui-kit/dwrt-control-material.css?v=20260719-16">
@@ -351,24 +351,26 @@
 
       <div class="dwrt-kit-modal-layer session-recovery-layer" id="sessionRecovery" data-dwrt-component="modal" hidden>
         <div class="dwrt-kit-modal-backdrop" aria-hidden="true"></div>
-        <section class="dwrt-kit-modal session-recovery-dialog" role="alertdialog" aria-modal="true" aria-labelledby="sessionRecoveryTitle" aria-describedby="sessionRecoveryDescription sessionRecoveryHint">
-          <header class="dwrt-kit-modal-header session-recovery-header">
-            <div class="session-recovery-heading">
-              <span class="session-recovery-icon" aria-hidden="true">
-                <i data-lucide="key-round" width="24" height="24"></i>
-              </span>
-              <h2 id="sessionRecoveryTitle">登录状态已失效</h2>
-              <p id="sessionRecoveryDescription">为了确保您的网络安全，系统需要重新验证您的身份。重新登录后，您将返回当前路径。</p>
-            </div>
-          </header>
-          <footer class="dwrt-kit-modal-footer session-recovery-footer">
-            <button class="session-recovery-login" id="sessionRecoveryLogin" data-dwrt-component="button" data-variant="primary" type="button" autofocus>
-              <i data-lucide="log-in" width="18" height="18" aria-hidden="true"></i>
-              <span>重新验证并登录</span>
-            </button>
-            <p class="session-recovery-hint" id="sessionRecoveryHint">Token expired / Re-authentication required</p>
-          </footer>
-        </section>
+        <div class="session-recovery-clip">
+          <section class="dwrt-kit-modal session-recovery-dialog" role="alertdialog" aria-modal="true" aria-labelledby="sessionRecoveryTitle" aria-describedby="sessionRecoveryDescription sessionRecoveryHint">
+            <header class="dwrt-kit-modal-header session-recovery-header">
+              <div class="session-recovery-heading">
+                <span class="session-recovery-icon" aria-hidden="true">
+                  <i data-lucide="key-round" width="24" height="24"></i>
+                </span>
+                <h2 id="sessionRecoveryTitle">登录状态已失效</h2>
+                <p id="sessionRecoveryDescription">为了确保您的网络安全，系统需要重新验证您的身份。重新登录后，您将返回当前路径。</p>
+              </div>
+            </header>
+            <footer class="dwrt-kit-modal-footer session-recovery-footer">
+              <button class="session-recovery-login" id="sessionRecoveryLogin" data-dwrt-component="button" data-variant="primary" type="button" autofocus>
+                <i data-lucide="log-in" width="18" height="18" aria-hidden="true"></i>
+                <span>重新验证并登录</span>
+              </button>
+              <p class="session-recovery-hint" id="sessionRecoveryHint">Token expired / Re-authentication required</p>
+            </footer>
+          </section>
+        </div>
       </div>
     </div>
 
@@ -376,13 +378,13 @@
     <script src="/static/ui-kit/dwrt-ui-kit.js?v=20260723-airview-radio-sheet-01" defer></script>
     <script src="/static/js/menu-icons.js?v=20260722-auth-control-01" defer></script>
     <script src="/static/js/device-images.js?v=20260723-airview-radio-sheet-01" defer></script>
-    <script src="/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260725-ui-kit-filter-edge-05" defer></script>
-    <script src="/static/js/shell-prewarm.js?v=20260729-session-recovery-04" defer></script>
+    <script src="/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260730-safari-glass-lite-06" defer></script>
+    <script src="/static/js/shell-prewarm.js?v=20260730-session-recovery-clip-06" defer></script>
     <script src="/static/js/dwrt-session-gate.js?v=20260720-01" defer></script>
     <script src="/static/js/dwrt-data-registry.js?v=20260721-02" defer></script>
     <script src="/static/js/dwrt-realtime.js?v=20260726-poll-discipline-05" defer></script>
     <script src="/static/js/notifications.js?v=20260704-1" defer></script>
     <script src="/static/js/notify-realtime.js?v=20260704-1" defer></script>
-    <script src="/static/js/menu-shell.js?v=20260729-session-recovery-04" defer></script>
+    <script src="/static/js/menu-shell.js?v=20260730-session-recovery-clip-06" defer></script>
   </body>
 </html>

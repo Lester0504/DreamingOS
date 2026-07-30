@@ -32,6 +32,8 @@ typedef struct jmx_iface_ipv6_contract {
 } jmx_iface_ipv6_contract_t;
 
 int get_iface_status(char *ifname, iface_status_t *status);
+int jmx_interface_name_valid(const char *ifname, int require_existing);
+int jmx_iface_status_parse_json(const char *json, iface_status_t *status);
 int jmx_iface_ipv6_contract_collect(const char *ifname,
                                     jmx_iface_ipv6_contract_t *contract);
 void jmx_iface_ipv6_contract_add_json(struct json_object *obj,

@@ -23,6 +23,7 @@
 #ifndef cJSON__h
 #define cJSON__h
 #include <linux/slab.h>
+#include <linux/types.h>
 
 
 #define cJSON_False 0
@@ -32,6 +33,12 @@
 #define cJSON_String 4
 #define cJSON_Array 5
 #define cJSON_Object 6
+
+/* Hard parser limits for the kernel control-plane JSON compatibility layer. */
+#define CJSON_PARSE_MAX_DEPTH 32U
+#define CJSON_PARSE_MAX_NODES 4096U
+#define CJSON_PARSE_MAX_STRING (64U * 1024U)
+#define CJSON_PARSE_MAX_TOTAL_ALLOC (512U * 1024U)
 
 
 typedef struct cJSON {
@@ -80,6 +87,7 @@ extern cJSON *cJSON_CreateObject(void);
 extern void cJSON_Minify(char *json);
 
 extern cJSON *cJSON_CreateIntArray(int *numbers,int count);
+extern cJSON *cJSON_CreateStringArray(const char **strings,int count);
 
 
 extern void   cJSON_AddItemToArray(cJSON *array, cJSON *item);

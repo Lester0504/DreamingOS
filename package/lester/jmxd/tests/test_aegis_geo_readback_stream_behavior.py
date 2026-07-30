@@ -229,10 +229,31 @@ def main() -> None:
         #define GEO_READBACK_MAX_ELEMENTS 1000000LL
         #define GEO_READBACK_MAX_SETS 498
         #define GEO_READBACK_MAX_RULES 63744
+        #define GEO_MAX_RULES 64
+        #define GEO_MAX_COUNTRIES 249
 
         struct geo_runtime_set {{
             char name[16];
             int64_t element_count;
+        }};
+
+        struct geo_counter_totals {{
+            uint64_t inbound_packets;
+            uint64_t inbound_bytes;
+            uint64_t outbound_packets;
+            uint64_t outbound_bytes;
+            int rule_lines;
+            int counter_lines;
+        }};
+
+        struct geo_rule_counter {{
+            char rule_id[65];
+            struct geo_counter_totals totals;
+        }};
+
+        struct geo_country_counter {{
+            char country[3];
+            struct geo_counter_totals totals;
         }};
 
         struct geo_runtime_counts {{
@@ -241,6 +262,15 @@ def main() -> None:
             int rule_count;
             int64_t element_count;
             struct geo_runtime_set sets[GEO_READBACK_MAX_SETS];
+            struct geo_counter_totals counter_totals;
+            struct geo_rule_counter rule_counters[GEO_MAX_RULES];
+            int rule_counter_count;
+            struct geo_country_counter country_counters[GEO_MAX_COUNTRIES];
+            int country_counter_count;
+            int owned_rule_lines;
+            int foreign_rule_lines;
+            int rule_lines_without_counter;
+            int rule_counter_bucket_overflow;
         }};
 
         {production_parser()}

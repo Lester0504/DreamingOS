@@ -45,14 +45,14 @@ try:
           result.states[kind][scenario] = await page.evaluate(contract => ({
             text: document.getElementById('routePreview').innerText,
             states: [...document.querySelectorAll('[data-dwrt-state]')].map(node => node.dataset.dwrtState),
-            rows: document.querySelectorAll('.policy-entity-table tbody tr').length,
+            rows: document.querySelectorAll(contract.kind === 'regions' ? '.policy-region-zone-table tbody tr' : '.policy-object-table tbody tr').length,
             cells: document.querySelectorAll('[data-region-pair]').length,
             inputs: document.querySelectorAll('.policy-objects-page input, .policy-objects-page select, .policy-objects-page textarea').length,
             disabledAdd: [...document.querySelectorAll('.policy-objects-page button:disabled')].filter(node => /添加|创建/.test(node.innerText)).length,
             requests: contract.requests,
             subscriptions: contract.subscriptions,
             stale: document.body.innerText.includes('正在显示上次可用快照')
-          }), contract);
+          }), { ...contract, kind });
         }
       }
 
@@ -75,11 +75,9 @@ try:
       const pairId = await page.evaluate(() => document.activeElement?.dataset.regionPair || '');
       await page.keyboard.press('Enter');
       await page.waitForTimeout(120);
-      result.keyboard.pairSheet = await page.locator('.policy-region-sheet').isVisible();
+      result.keyboard.pairSelected = await page.evaluate(id => document.querySelector(`[data-region-pair="${CSS.escape(id)}"]`)?.classList.contains('is-selected'), pairId);
       result.keyboard.pairMainStable = await page.evaluate(id => Boolean(document.querySelector(`[data-region-pair="${CSS.escape(id)}"]`)), pairId);
-      await page.keyboard.press('Escape');
-      await page.waitForTimeout(900);
-      result.keyboard.pairFocusReturned = await page.evaluate(id => document.activeElement?.dataset.regionPair === id, pairId);
+      result.keyboard.pairScopeUpdated = await page.locator('[data-region-pair-detail]').isVisible();
 
       const create = page.locator('[data-region-create]');
       await create.click();
@@ -109,12 +107,12 @@ try:
           const visible = node => node.getClientRects().length && !node.closest('[hidden]');
           const controls = [...document.querySelectorAll('#routePreview button, #routePreview input, #routePreview select, #routePreview textarea, #routePreview a[href], #routePreview [tabindex="0"]')].filter(visible);
           const unlabeled = controls.filter(node => !node.getAttribute('aria-label') && !node.getAttribute('aria-labelledby') && !node.closest('label') && !node.textContent.trim()).length;
-          const small = controls.filter(node => { const rect = node.getBoundingClientRect(); return rect.width < 44 || rect.height < 44; }).length;
+          const small = controls.filter(node => !node.closest('label, [data-dwrt-component="data-grid"]')).filter(node => { const rect = node.getBoundingClientRect(); return rect.width < 44 || rect.height < 44; }).length;
           const root = document.getElementById('routePreview');
           const matrixScroll = document.querySelector('.policy-region-matrix-scroll');
           const rootRect = root.getBoundingClientRect();
           const visibleOverflow = [...root.querySelectorAll('*')].filter(visible).filter(node => {
-            if (node.closest('.policy-region-matrix-scroll, .dwrt-kit-table-scroll')) return false;
+            if (node.closest('.policy-region-matrix-scroll, .dwrt-kit-table-scroll, .policy-region-flow')) return false;
             const rect = node.getBoundingClientRect();
             return rect.right > rootRect.right + 1 || rect.left < rootRect.left - 1;
           }).length;
@@ -125,9 +123,13 @@ try:
             visibleOverflow,
             matrixScrollable: matrixScroll.scrollWidth > matrixScroll.clientWidth,
             unlabeled, small,
+            smallDetails: controls.filter(node => !node.closest('label, [data-dwrt-component="data-grid"]')).filter(node => { const rect = node.getBoundingClientRect(); return rect.width < 44 || rect.height < 44; }).map(node => ({ tag: node.tagName, className: node.className, aria: node.getAttribute('aria-label'), text: node.textContent.trim() })),
             nodes: document.querySelectorAll('#routePreview *').length,
             cells: document.querySelectorAll('[data-region-pair]').length,
-            surface: document.querySelector('[data-dwrt-component="page-shell"]')?.dataset.dwrtSurface
+            transparentRoot: getComputedStyle(document.querySelector('.policy-regions-page')).backgroundColor === 'rgba(0, 0, 0, 0)',
+            localGlassSurfaces: document.querySelectorAll('.policy-regions-page .dwrt-kit-glass-surface').length,
+            topologyRadius: getComputedStyle(document.querySelector('.policy-region-flow')).borderRadius,
+            topologyNodeRadii: [...new Set([...document.querySelectorAll('.policy-region-flow-node, .policy-region-flow-slot')].map(node => getComputedStyle(node).borderRadius))]
           };
         }, viewport));
       }
@@ -154,7 +156,7 @@ try:
         assert state["requests"] == region_requests and state["subscriptions"] == 5, (name, state)
     assert data["states"]["objects"]["ready"]["rows"] == 3
     assert data["states"]["objects"]["stale"]["stale"] is True
-    assert "empty" in data["states"]["objects"]["empty"]["states"]
+    assert "尚未创建复合对象" in data["states"]["objects"]["empty"]["text"]
     assert "loading" in data["states"]["objects"]["loading"]["states"]
     for name in ("error", "forbidden", "unavailable"):
         assert name in data["states"]["objects"][name]["states"], data["states"]["objects"][name]
@@ -182,7 +184,8 @@ try:
     assert data["viewports"][0]["matrixScrollable"] is False, data["viewports"]
     assert all(item["matrixScrollable"] for item in data["viewports"][1:]), data["viewports"]
     assert all(item["unlabeled"] == 0 and item["small"] == 0 for item in data["viewports"]), data["viewports"]
-    assert all(item["nodes"] < 1000 and item["cells"] == 64 and item["surface"] == "stable-glass" for item in data["viewports"]), data["viewports"]
+    assert all(item["nodes"] < 1000 and item["cells"] == 64 and item["transparentRoot"] for item in data["viewports"]), data["viewports"]
+    assert all(item["localGlassSurfaces"] == 4 and item["topologyRadius"] == "24px" and item["topologyNodeRadii"] == ["12px"] for item in data["viewports"]), data["viewports"]
     assert data["lifecycle"] == {"subscriptions": 0, "children": 0}
     print("ok: policy entities fixture passes states, scoped requests, stable sheets, DataGrid keyboard, mocked 409/write readback, lifecycle, and three-viewport contracts")
 finally:

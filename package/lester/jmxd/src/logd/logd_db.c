@@ -1069,7 +1069,15 @@ int logd_config_db_init(void)
     if (logd_config_add_column_if_missing("logd_settings", "kernel_retention_days", "INTEGER NOT NULL DEFAULT 7") != 0 ||
         logd_config_add_column_if_missing("logd_settings", "max_size_mb", "INTEGER NOT NULL DEFAULT 128") != 0 ||
         logd_config_add_column_if_missing("logd_settings", "auto_cleanup", "INTEGER NOT NULL DEFAULT 1") != 0 ||
-        logd_config_add_column_if_missing("logd_settings", "archive_compress", "INTEGER NOT NULL DEFAULT 1") != 0)
+        logd_config_add_column_if_missing("logd_settings", "archive_compress", "INTEGER NOT NULL DEFAULT 1") != 0 ||
+        /* Independent log levels for the device / management / remote access /
+         * system groups. 'auto' keeps the existing behavior, so upgrading an
+         * existing database does not silently start dropping events.
+         */
+        logd_config_add_column_if_missing("logd_settings", "log_level_device", "TEXT NOT NULL DEFAULT 'auto'") != 0 ||
+        logd_config_add_column_if_missing("logd_settings", "log_level_management", "TEXT NOT NULL DEFAULT 'auto'") != 0 ||
+        logd_config_add_column_if_missing("logd_settings", "log_level_remote_access", "TEXT NOT NULL DEFAULT 'auto'") != 0 ||
+        logd_config_add_column_if_missing("logd_settings", "log_level_system", "TEXT NOT NULL DEFAULT 'auto'") != 0)
         goto fail;
     if (logd_config_exec(
         "CREATE TABLE IF NOT EXISTS logd_syslog_config ("
@@ -1488,6 +1496,67 @@ struct json_object *logd_status_json(void)
     return resp;
 }
 
+/* Configured level for one group.
+ *
+ * The ingest path calls this for every event, so the four values are cached for
+ * a short window. The cache is invalidated on write in logd_settings_update(),
+ * so a settings change takes effect immediately rather than after the TTL.
+ */
+static struct {
+    char device[16];
+    char management[16];
+    char remote_access[16];
+    char system[16];
+    int64_t loaded_at;
+    int valid;
+} g_logd_level_cache;
+
+void logd_log_level_cache_invalidate(void)
+{
+    g_logd_level_cache.valid = 0;
+}
+
+int logd_log_level_for_group(const char *group, char *out, size_t out_len)
+{
+    int64_t now = logd_now_s();
+
+    if (!out || !out_len)
+        return -1;
+    if (!g_logd_level_cache.valid ||
+        now - g_logd_level_cache.loaded_at > 5 || now < g_logd_level_cache.loaded_at) {
+        sqlite3_stmt *st = logd_config_prepare(
+            "SELECT log_level_device,log_level_management,log_level_remote_access,"
+            "log_level_system FROM logd_settings WHERE id=1");
+
+        if (!st)
+            return -1;
+        if (sqlite3_step(st) != SQLITE_ROW) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+        snprintf(g_logd_level_cache.device, sizeof(g_logd_level_cache.device), "%s",
+                 logd_log_level(logd_sqlite_text(st, 0, "auto")));
+        snprintf(g_logd_level_cache.management, sizeof(g_logd_level_cache.management), "%s",
+                 logd_log_level(logd_sqlite_text(st, 1, "auto")));
+        snprintf(g_logd_level_cache.remote_access, sizeof(g_logd_level_cache.remote_access), "%s",
+                 logd_log_level(logd_sqlite_text(st, 2, "auto")));
+        snprintf(g_logd_level_cache.system, sizeof(g_logd_level_cache.system), "%s",
+                 logd_log_level(logd_sqlite_text(st, 3, "auto")));
+        sqlite3_finalize(st);
+        g_logd_level_cache.loaded_at = now;
+        g_logd_level_cache.valid = 1;
+    }
+    if (!strcmp(group, "device"))
+        snprintf(out, out_len, "%s", g_logd_level_cache.device);
+    else if (!strcmp(group, "management"))
+        snprintf(out, out_len, "%s", g_logd_level_cache.management);
+    else if (!strcmp(group, "remote_access"))
+        snprintf(out, out_len, "%s", g_logd_level_cache.remote_access);
+    else
+        snprintf(out, out_len, "%s", g_logd_level_cache.system);
+    return 0;
+}
+
 struct json_object *logd_settings_json(void)
 {
     sqlite3_stmt *st;
@@ -1500,7 +1569,7 @@ struct json_object *logd_settings_json(void)
 
     json_object_object_add(resp, "db_path", json_object_new_string(LOGD_DB_PATH));
     json_object_object_add(resp, "config_db_path", json_object_new_string(LOGD_CONFIG_DB_PATH));
-    st = logd_config_prepare("SELECT retention_days,kernel_retention_days,max_size_mb,max_events,auto_cleanup,archive_compress,updated_at FROM logd_settings WHERE id=1");
+    st = logd_config_prepare("SELECT retention_days,kernel_retention_days,max_size_mb,max_events,auto_cleanup,archive_compress,updated_at,log_level_device,log_level_management,log_level_remote_access,log_level_system FROM logd_settings WHERE id=1");
     if (st) {
         rc = sqlite3_step(st);
         if (rc == SQLITE_ROW) {
@@ -1511,6 +1580,26 @@ struct json_object *logd_settings_json(void)
             json_object_object_add(resp, "auto_cleanup", json_object_new_boolean(sqlite3_column_int(st, 4)));
             json_object_object_add(resp, "archive_compress", json_object_new_boolean(sqlite3_column_int(st, 5)));
             json_object_object_add(resp, "updated_at", json_object_new_int64(sqlite3_column_int64(st, 6)));
+            {
+                struct json_object *levels = json_object_new_object();
+                static const char *const group_keys[4] = {
+                    "device", "management", "remote_access", "system"
+                };
+                int col;
+
+                for (col = 0; col < 4; col++) {
+                    const char *level = logd_log_level(logd_sqlite_text(st, 7 + col, "auto"));
+                    struct json_object *entry = json_object_new_object();
+
+                    json_object_object_add(entry, "level", json_object_new_string(level));
+                    json_object_object_add(entry, "min_severity_rank",
+                                           json_object_new_int(logd_log_level_min_rank(level)));
+                    json_object_object_add(entry, "keeps_debug",
+                                           json_object_new_boolean(!strcmp(level, "debug")));
+                    json_object_object_add(levels, group_keys[col], entry);
+                }
+                json_object_object_add(resp, "log_levels", levels);
+            }
         } else {
             ok = 0;
             logd_response_set_first_error(resp, rc == SQLITE_DONE ? "settings_missing" : "settings_query_failed");
@@ -1715,6 +1804,11 @@ struct json_object *logd_settings_update(struct json_object *body)
     int syslog_enabled = 0;
     int syslog_port = 514;
     char server_buf[256] = "";
+    char level_device[16] = "auto";
+    char level_management[16] = "auto";
+    char level_remote_access[16] = "auto";
+    char level_system[16] = "auto";
+    int levels_changed = 0;
     char protocol_buf[16] = "udp";
     char facility_buf[32] = "local7";
     char min_level_buf[32] = "notice";
@@ -1729,7 +1823,7 @@ struct json_object *logd_settings_update(struct json_object *body)
     int replace_profiles = 0;
 
     logd_syslog_tls_config_init(&tls_cfg);
-    st = logd_config_prepare("SELECT retention_days,kernel_retention_days,max_size_mb,max_events,auto_cleanup,archive_compress FROM logd_settings WHERE id=1");
+    st = logd_config_prepare("SELECT retention_days,kernel_retention_days,max_size_mb,max_events,auto_cleanup,archive_compress,log_level_device,log_level_management,log_level_remote_access,log_level_system FROM logd_settings WHERE id=1");
     if (!st) {
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("settings_query_failed"));
@@ -1743,6 +1837,14 @@ struct json_object *logd_settings_update(struct json_object *body)
         max_events = sqlite3_column_int(st, 3);
         auto_cleanup = sqlite3_column_int(st, 4);
         archive_compress = sqlite3_column_int(st, 5);
+        snprintf(level_device, sizeof(level_device), "%s",
+                 logd_log_level(logd_sqlite_text(st, 6, "auto")));
+        snprintf(level_management, sizeof(level_management), "%s",
+                 logd_log_level(logd_sqlite_text(st, 7, "auto")));
+        snprintf(level_remote_access, sizeof(level_remote_access), "%s",
+                 logd_log_level(logd_sqlite_text(st, 8, "auto")));
+        snprintf(level_system, sizeof(level_system), "%s",
+                 logd_log_level(logd_sqlite_text(st, 9, "auto")));
     } else {
         sqlite3_finalize(st);
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
@@ -1765,6 +1867,67 @@ struct json_object *logd_settings_update(struct json_object *body)
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("invalid_logd_settings"));
         return resp;
+    }
+    /* Independent per-group log levels.
+     *
+     * Unknown group keys and unknown level values are rejected instead of being
+     * silently dropped, so the caller never believes a level was applied when it
+     * was not.
+     */
+    {
+        struct json_object *levels = NULL;
+
+        if (json_object_object_get_ex(body, "log_levels", &levels) && levels) {
+            struct { const char *key; char *slot; size_t size; } groups[4] = {
+                { "device", level_device, sizeof(level_device) },
+                { "management", level_management, sizeof(level_management) },
+                { "remote_access", level_remote_access, sizeof(level_remote_access) },
+                { "system", level_system, sizeof(level_system) },
+            };
+
+            if (!json_object_is_type(levels, json_type_object)) {
+                json_object_object_add(resp, "ok", json_object_new_boolean(0));
+                json_object_object_add(resp, "error",
+                                       json_object_new_string("invalid_log_levels"));
+                return resp;
+            }
+            json_object_object_foreach(levels, key, value) {
+                const char *requested;
+                int index = -1;
+                int i;
+
+                for (i = 0; i < 4; i++)
+                    if (!strcmp(key, groups[i].key)) {
+                        index = i;
+                        break;
+                    }
+                if (index < 0) {
+                    json_object_object_add(resp, "ok", json_object_new_boolean(0));
+                    json_object_object_add(resp, "error",
+                                           json_object_new_string("unknown_log_level_group"));
+                    json_object_object_add(resp, "reason", json_object_new_string(key));
+                    return resp;
+                }
+                if (!value || !json_object_is_type(value, json_type_string)) {
+                    json_object_object_add(resp, "ok", json_object_new_boolean(0));
+                    json_object_object_add(resp, "error",
+                                           json_object_new_string("invalid_log_level"));
+                    json_object_object_add(resp, "reason", json_object_new_string(key));
+                    return resp;
+                }
+                requested = json_object_get_string(value);
+                if (!requested || strcmp(requested, logd_log_level(requested))) {
+                    json_object_object_add(resp, "ok", json_object_new_boolean(0));
+                    json_object_object_add(resp, "error",
+                                           json_object_new_string("invalid_log_level"));
+                    json_object_object_add(resp, "reason",
+                                           json_object_new_string(requested ? requested : ""));
+                    return resp;
+                }
+                snprintf(groups[index].slot, groups[index].size, "%s", requested);
+                levels_changed = 1;
+            }
+        }
     }
     if (json_object_object_get_ex(body, "syslog", &syslog) && syslog &&
         json_object_is_type(syslog, json_type_object)) {
@@ -1876,7 +2039,7 @@ struct json_object *logd_settings_update(struct json_object *body)
             replace_profiles = 1;
         }
     }
-    st = logd_config_prepare("UPDATE logd_settings SET retention_days=?1,kernel_retention_days=?2,max_size_mb=?3,max_events=?4,auto_cleanup=?5,archive_compress=?6,updated_at=?7 WHERE id=1");
+    st = logd_config_prepare("UPDATE logd_settings SET retention_days=?1,kernel_retention_days=?2,max_size_mb=?3,max_events=?4,auto_cleanup=?5,archive_compress=?6,updated_at=?7,log_level_device=?8,log_level_management=?9,log_level_remote_access=?10,log_level_system=?11 WHERE id=1");
     if (!st) {
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("settings_prepare_failed"));
@@ -1889,6 +2052,10 @@ struct json_object *logd_settings_update(struct json_object *body)
     sqlite3_bind_int(st, 5, auto_cleanup);
     sqlite3_bind_int(st, 6, archive_compress);
     sqlite3_bind_int64(st, 7, logd_now_s());
+    sqlite3_bind_text(st, 8, level_device, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 9, level_management, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 10, level_remote_access, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 11, level_system, -1, SQLITE_TRANSIENT);
     if (sqlite3_step(st) != SQLITE_DONE) {
         sqlite3_finalize(st);
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
@@ -1896,6 +2063,8 @@ struct json_object *logd_settings_update(struct json_object *body)
         return resp;
     }
     sqlite3_finalize(st);
+    if (levels_changed)
+        logd_log_level_cache_invalidate();
     if (syslog) {
         st = logd_config_prepare("UPDATE logd_syslog_config SET enabled=?1,server=?2,port=?3,protocol=?4,facility=?5,min_level=?6,categories=?7,tls_ca_path=?8,tls_client_cert_path=?9,tls_client_key_path=?10,tls_verify_peer=?11,tls_verify_host=?12,tls_sni=?13,updated_at=?14 WHERE id=1");
         if (!st) {

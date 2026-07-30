@@ -907,6 +907,38 @@ static int flowd_handle_apply_jobs(struct ubus_context *ctx, struct ubus_object 
     return UBUS_STATUS_OK;
 }
 
+static int flowd_handle_nft_revision_apply(struct ubus_context *ctx,
+                                           struct ubus_object *obj,
+                                           struct ubus_request_data *req,
+                                           const char *method,
+                                           struct blob_attr *msg)
+{
+    struct json_object *body = flowd_json_from_blob(msg);
+    struct json_object *resp;
+    (void)obj; (void)method;
+
+    resp = flowd_nft_revision_apply(flowd_payload_or_self(body));
+    flowd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    json_object_put(body);
+    return UBUS_STATUS_OK;
+}
+
+static int flowd_handle_nft_revision_status(struct ubus_context *ctx,
+                                            struct ubus_object *obj,
+                                            struct ubus_request_data *req,
+                                            const char *method,
+                                            struct blob_attr *msg)
+{
+    struct json_object *resp;
+    (void)obj; (void)method; (void)msg;
+
+    resp = flowd_nft_revision_status();
+    flowd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return UBUS_STATUS_OK;
+}
+
 static int flowd_handle_runtime(struct ubus_context *ctx, struct ubus_object *obj,
                                 struct ubus_request_data *req, const char *method,
                                 struct blob_attr *msg)
@@ -1020,6 +1052,8 @@ static const struct ubus_method flowd_methods[] = {
     UBUS_METHOD("app_rule_set", flowd_handle_app_rule_set, flowd_any_policy),
     UBUS_METHOD("app_rule_delete", flowd_handle_app_rule_delete, flowd_any_policy),
     UBUS_METHOD("compile", flowd_handle_compile, flowd_any_policy),
+    UBUS_METHOD("nft_revision_status", flowd_handle_nft_revision_status, flowd_any_policy),
+    UBUS_METHOD("nft_revision_apply", flowd_handle_nft_revision_apply, flowd_any_policy),
     UBUS_METHOD("apply_jobs", flowd_handle_apply_jobs, flowd_any_policy),
     UBUS_METHOD("runtime", flowd_handle_runtime, flowd_any_policy),
     UBUS_METHOD("flow_ingest", flowd_handle_flow_ingest, flowd_any_policy),

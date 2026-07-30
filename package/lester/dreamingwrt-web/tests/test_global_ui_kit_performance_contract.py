@@ -66,9 +66,23 @@ assert "requestToken !== this.mapRequestToken" in glass
 assert "this.pendingMapKey === key" in glass
 assert "window.addEventListener('pagehide', stopMapWorker)" in glass
 assert "this.filterPadding = Math.ceil(" in glass
-assert "Math.max(Math.abs(redScale), Math.abs(greenScale), Math.abs(blueScale)) * 0.5" in glass
+assert "const activeDisplacement = this.lightRenderer" in glass
+assert "Math.max(Math.abs(redScale), Math.abs(greenScale), Math.abs(blueScale))" in glass
+assert "activeDisplacement * 0.5" in glass
 assert "this.filter.setAttribute('x', String(-filterPadding))" in glass
 assert "this.filter.setAttribute('width', String(width + filterPadding * 2))" in glass
+assert "const SAFARI_LIGHT_PROFILE" in glass
+assert "vendor === 'Apple Computer, Inc.'" in glass
+assert "this.trackMotion = !this.lightRenderer" in glass
+assert "this.trackScroll = !this.lightRenderer" in glass
+assert "this.root.dataset.glassRenderer = this.lightRenderer ? 'safari-light-sampling'" in glass
+light_filter_start = glass.index("if (this.lightRenderer) {", glass.index("buildSvg()"))
+light_filter_end = glass.index("} else {", light_filter_start)
+light_filter = glass[light_filter_start:light_filter_end]
+assert light_filter.count("svgNode('feDisplacementMap'") == 0
+assert "this.redDisplacement" in light_filter
+assert "this.greenDisplacement" not in light_filter
+assert "this.blueDisplacement" not in light_filter
 
 trim_start = shell.index("  function trimPageGlassMapCache() {")
 trim_source = shell[trim_start:map_start]

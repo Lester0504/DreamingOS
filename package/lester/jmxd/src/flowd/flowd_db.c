@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "flowd_internal.h"
+#include "flowd_nft_apply.h"
+#include "flowd_runtime_contract.h"
 #include "jmx_system_data_path.h"
 
 #define WORKER_STATUS_VERSION "1.0"
@@ -112,6 +114,9 @@ int flowd_db_init(void)
     if (flowd_exec(g_flowd_config_db,
         "INSERT OR IGNORE INTO flowd_settings(id,enabled,geoip_dir,runtime_dir,apply_mode,updated_at) "
         "VALUES(1,1,'/etc/dreamingwrt/geoip','/etc/dreamingwrt/geoip/runtime','plan-only',0)") != 0)
+        return flowd_db_init_fail();
+    if (flowd_exec(g_flowd_config_db,
+        "UPDATE flowd_settings SET apply_mode='plan-only' WHERE apply_mode<>'plan-only'") != 0)
         return flowd_db_init_fail();
 
     if (flowd_exec(g_flowd_config_db,
@@ -691,6 +696,49 @@ static void flowd_status_field_copy(struct json_object *dst, struct json_object 
         json_object_object_add(dst, field, json_object_get(value));
 }
 
+static void flowd_status_configured_count_aliases(struct json_object *resp)
+{
+    static const char *const fields[] = {
+        "enabled_sources",
+        "enabled_country_policies",
+        "enabled_objects",
+        "enabled_custom_protocols",
+        "enabled_route_groups",
+        "enabled_wan_capacity",
+        "enabled_wan_health",
+        "enabled_split_rules",
+        "enabled_domain_rules",
+        "enabled_qos_classes",
+        "enabled_qos_rules",
+        "enabled_smart_qos_categories",
+        "enabled_quota_rules",
+        "enabled_conn_limit_rules",
+        "enabled_app_rules",
+    };
+    struct json_object *semantics = json_object_new_object();
+    size_t i;
+
+    for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        struct json_object *value = NULL;
+        char configured_field[96];
+
+        if (!json_object_object_get_ex(resp, fields[i], &value) || !value)
+            continue;
+        snprintf(configured_field, sizeof(configured_field), "configured_%s",
+                 fields[i]);
+        json_object_object_add(resp, configured_field, json_object_get(value));
+    }
+    json_object_object_add(semantics, "configured_enabled_prefix",
+                           json_object_new_string(
+                               "configuration rows with enabled=1; not kernel-applied rules"));
+    json_object_object_add(semantics, "legacy_enabled_prefix",
+                           json_object_new_string(
+                               "compatibility alias of configured_enabled_*"));
+    json_object_object_add(semantics, "runtime_truth_field",
+                           json_object_new_string("runtime_applied"));
+    json_object_object_add(resp, "count_semantics", semantics);
+}
+
 static void flowd_status_metadata_load(struct json_object *errors, int *ok,
                                        char *last_error, size_t last_error_len,
                                        int64_t *updated_at)
@@ -744,6 +792,7 @@ static void flowd_status_metadata_load(struct json_object *errors, int *ok,
 struct json_object *flowd_status_json(void)
 {
     struct flowd_settings s;
+    struct flowd_runtime_contract_input runtime_contract;
     struct json_object *resp = json_object_new_object();
     struct json_object *geoip = json_object_new_object();
     struct json_object *signature_datasets = NULL;
@@ -753,9 +802,11 @@ struct json_object *flowd_status_json(void)
     char last_error[FLOWD_MAX_TEXT] = "";
     int64_t updated_at = 0;
     int ok = 1;
+    int settings_available;
     int degraded;
 
-    if (flowd_settings_load(&s) != 0) {
+    settings_available = flowd_settings_load(&s) == 0;
+    if (!settings_available) {
         ok = 0;
         flowd_status_error_add(errors, "settings", "settings_unavailable");
     }
@@ -766,7 +817,8 @@ struct json_object *flowd_status_json(void)
     json_object_object_add(resp, "schema_source",
                            json_object_new_string("compiled:FLOWD_SCHEMA_VERSION"));
     json_object_object_add(resp, "migration_state", json_object_new_string("not_tracked"));
-    json_object_object_add(resp, "settings_available", json_object_new_boolean(ok));
+    json_object_object_add(resp, "settings_available",
+                           json_object_new_boolean(settings_available));
     json_object_object_add(resp, "enabled", json_object_new_boolean(s.enabled));
     json_object_object_add(resp, "apply_mode", json_object_new_string(s.apply_mode));
     json_object_object_add(resp, "geoip_dir", json_object_new_string(s.geoip_dir));
@@ -802,6 +854,7 @@ struct json_object *flowd_status_json(void)
     flowd_status_count_add(resp, errors, &ok, "app_rules", "SELECT COUNT(*) FROM flowd_app_rules");
     flowd_status_count_add(resp, errors, &ok, "enabled_app_rules", "SELECT COUNT(*) FROM flowd_app_rules WHERE enabled=1");
     flowd_status_count_add(resp, errors, &ok, "apply_jobs", "SELECT COUNT(*) FROM flowd_apply_jobs");
+    flowd_status_configured_count_aliases(resp);
     json_object_object_add(geoip, "configured_mmdb_present", json_object_new_boolean(flowd_file_exists(FLOWD_DEFAULT_MMDB)));
     json_object_object_add(geoip, "configured_mmdb_valid", json_object_new_boolean(flowd_geoip_configured_mmdb_valid()));
     json_object_object_add(geoip, "auto_import_needed", json_object_new_boolean(flowd_geoip_auto_import_enabled()));
@@ -845,6 +898,15 @@ struct json_object *flowd_status_json(void)
     else
         json_object_put(errors);
     flowd_response_set_ok(resp, ok);
+    runtime_contract.configured_enabled = s.enabled;
+    runtime_contract.configured_apply_mode = s.apply_mode;
+    runtime_contract.config_store_available = settings_available;
+    runtime_contract.runtime_snapshot_available = flowd_file_exists(FLOWD_DEFAULT_FLOW_DB_PATH);
+    runtime_contract.nft_binary_available = access(FLOWD_NFT_BINARY, X_OK) == 0;
+    runtime_contract.runtime_dir_available = flowd_dir_exists(s.runtime_dir);
+    flowd_runtime_contract_add(resp, &runtime_contract);
+    json_object_object_add(resp, "state", json_object_new_string(
+        !ok ? "degraded" : (s.enabled ? "running-plan-only" : "disabled")));
     json_object_object_add(resp, "ts", json_object_new_int64(flowd_now_s()));
     return resp;
 }
@@ -852,6 +914,7 @@ struct json_object *flowd_status_json(void)
 struct json_object *flowd_settings_json(void)
 {
     struct flowd_settings s;
+    struct flowd_runtime_contract_input runtime_contract;
     struct json_object *resp = json_object_new_object();
     int ok;
 
@@ -864,6 +927,13 @@ struct json_object *flowd_settings_json(void)
     json_object_object_add(resp, "apply_mode", json_object_new_string(s.apply_mode));
     if (!ok)
         json_object_object_add(resp, "error", json_object_new_string("settings_unavailable"));
+    runtime_contract.configured_enabled = s.enabled;
+    runtime_contract.configured_apply_mode = s.apply_mode;
+    runtime_contract.config_store_available = ok;
+    runtime_contract.runtime_snapshot_available = flowd_file_exists(FLOWD_DEFAULT_FLOW_DB_PATH);
+    runtime_contract.nft_binary_available = access(FLOWD_NFT_BINARY, X_OK) == 0;
+    runtime_contract.runtime_dir_available = flowd_dir_exists(s.runtime_dir);
+    flowd_runtime_contract_add(resp, &runtime_contract);
     return resp;
 }
 
@@ -887,7 +957,7 @@ struct json_object *flowd_settings_update(struct json_object *body)
     apply_mode = flowd_json_str(body, "apply_mode", s.apply_mode);
     if (!geoip_dir || !geoip_dir[0] || !runtime_dir || !runtime_dir[0] ||
         !flowd_path_ok(geoip_dir) || !flowd_path_ok(runtime_dir) ||
-        !(apply_mode && (!strcmp(apply_mode, "plan-only") || !strcmp(apply_mode, "managed"))))
+        !(apply_mode && !strcmp(apply_mode, FLOWD_EFFECTIVE_APPLY_MODE)))
         return flowd_error("invalid_settings", "invalid flowd settings");
     snprintf(s.geoip_dir, sizeof(s.geoip_dir), "%s", geoip_dir);
     snprintf(s.runtime_dir, sizeof(s.runtime_dir), "%s", runtime_dir);
@@ -7892,7 +7962,8 @@ static void flowd_build_dataplane_artifacts(struct json_object *out,
     json_object_object_add(out, "runtime_state", runtime_state);
 }
 
-static int flowd_apply_job_save(const char *id, const char *requested_by, int dry_run,
+static int flowd_apply_job_save(const char *id, const char *kind,
+                                const char *requested_by, int dry_run,
                                 const char *plan_path, struct json_object *plan,
                                 const char *state, const char *error)
 {
@@ -7901,7 +7972,8 @@ static int flowd_apply_job_save(const char *id, const char *requested_by, int dr
     int64_t now = flowd_now_s();
     int ok = 0;
 
-    if (!flowd_id_ok(id) || !flowd_text_ok(requested_by, 128) ||
+    if (!flowd_id_ok(id) || !flowd_token_ok(kind, 48) ||
+        !flowd_text_ok(requested_by, 128) ||
         !flowd_path_ok(plan_path ? plan_path : "") || !plan)
         return -1;
     plan_s = json_object_to_json_string_ext(plan, JSON_C_TO_STRING_PLAIN);
@@ -7910,19 +7982,22 @@ static int flowd_apply_job_save(const char *id, const char *requested_by, int dr
     st = flowd_config_prepare(
         "INSERT INTO flowd_apply_jobs"
         "(id,kind,requested_by,state,dry_run,plan_path,plan_json,error,created_at,updated_at,completed_at) "
-        "VALUES(?1,'compile',?2,?3,?4,?5,?6,?7,?8,?8,?8) "
-        "ON CONFLICT(id) DO UPDATE SET requested_by=excluded.requested_by,state=excluded.state,"
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10) "
+        "ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,requested_by=excluded.requested_by,state=excluded.state,"
         "dry_run=excluded.dry_run,plan_path=excluded.plan_path,plan_json=excluded.plan_json,"
         "error=excluded.error,updated_at=excluded.updated_at,completed_at=excluded.completed_at");
     if (st) {
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, requested_by ? requested_by : "", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 3, state ? state : "compiled", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 4, dry_run ? 1 : 0);
-        sqlite3_bind_text(st, 5, plan_path ? plan_path : "", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 6, plan_s, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 7, error ? error : "", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 8, now);
+        sqlite3_bind_text(st, 2, kind, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, requested_by ? requested_by : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, state ? state : "compiled", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 5, dry_run ? 1 : 0);
+        sqlite3_bind_text(st, 6, plan_path ? plan_path : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 7, plan_s, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 8, error ? error : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 9, now);
+        sqlite3_bind_int64(st, 10,
+                           state && !strcmp(state, "applying") ? 0 : now);
         ok = sqlite3_step(st) == SQLITE_DONE;
         sqlite3_finalize(st);
     }
@@ -7948,6 +8023,206 @@ static void flowd_apply_job_row_json(struct json_object *arr, sqlite3_stmt *st,
     if (include_plan)
         json_object_object_add(o, "plan", flowd_json_parse_or_object(plan_s));
     json_object_array_add(arr, o);
+}
+
+static void flowd_nft_result_add(struct json_object *plan,
+                                 const struct flowd_nft_apply_result *result)
+{
+    struct json_object *evidence = json_object_new_object();
+
+    json_object_object_add(evidence, "validation_ok",
+                           json_object_new_boolean(result->validated));
+    json_object_object_add(evidence, "apply_command_ok",
+                           json_object_new_boolean(result->applied));
+    json_object_object_add(evidence, "revision_readback_ok",
+                           json_object_new_boolean(result->readback_ok));
+    json_object_object_add(evidence, "rollback_attempted",
+                           json_object_new_boolean(result->rolled_back));
+    json_object_object_add(evidence, "rollback_readback_ok",
+                           json_object_new_boolean(result->rollback_ok));
+    json_object_object_add(evidence, "previous_present",
+                           json_object_new_boolean(result->previous_present));
+    json_object_object_add(evidence, "previous_revision",
+                           json_object_new_string(result->previous_revision));
+    json_object_object_add(evidence, "apply_path",
+                           json_object_new_string(result->apply_path));
+    json_object_object_add(evidence, "rollback_path",
+                           json_object_new_string(result->rollback_path));
+    json_object_object_add(evidence, "error",
+                           json_object_new_string(result->error));
+    json_object_object_add(plan, "evidence", evidence);
+}
+
+struct json_object *flowd_nft_revision_status(void)
+{
+    struct flowd_settings settings;
+    struct flowd_nft_readback readback;
+    struct json_object *resp = json_object_new_object();
+    const char *error = "";
+    int available = 0;
+
+    memset(&readback, 0, sizeof(readback));
+    if (flowd_settings_load(&settings) != 0) {
+        error = "settings_unavailable";
+    } else if (access(FLOWD_NFT_BINARY, X_OK) != 0) {
+        error = "nft_binary_unavailable";
+    } else if (!flowd_dir_exists(settings.runtime_dir)) {
+        error = "runtime_dir_unavailable";
+    } else if (flowd_nft_readback(FLOWD_NFT_BINARY, settings.runtime_dir,
+                                  "status", &readback) != 0) {
+        error = readback.error[0] ? readback.error : "nft_revision_readback_failed";
+    } else {
+        available = 1;
+    }
+
+    json_object_object_add(resp, "ok", json_object_new_boolean(available));
+    json_object_object_add(resp, "available", json_object_new_boolean(available));
+    json_object_object_add(resp, "source", json_object_new_string("nft-json-readback"));
+    json_object_object_add(resp, "table_family", json_object_new_string("inet"));
+    json_object_object_add(resp, "table_name", json_object_new_string(FLOWD_NFT_TABLE));
+    json_object_object_add(resp, "present",
+                           json_object_new_boolean(available && readback.present));
+    json_object_object_add(resp, "ownership_verified",
+                           json_object_new_boolean(available && readback.present &&
+                                                   readback.sentinel_only));
+    json_object_object_add(resp, "sentinel_only",
+                           json_object_new_boolean(available && readback.present &&
+                                                   readback.sentinel_only));
+    json_object_object_add(resp, "revision",
+                           json_object_new_string(available ? readback.revision : ""));
+    json_object_object_add(resp, "contains_policy_rules", json_object_new_boolean(0));
+    json_object_object_add(resp, "runtime_applied", json_object_new_boolean(0));
+    json_object_object_add(resp, "runtime_reason",
+                           json_object_new_string(FLOWD_APPLY_UNAVAILABLE_REASON));
+    json_object_object_add(resp, "observed_at", json_object_new_int64(flowd_now_s()));
+    if (error[0])
+        json_object_object_add(resp, "error", json_object_new_string(error));
+    return resp;
+}
+
+struct json_object *flowd_nft_revision_apply(struct json_object *body)
+{
+    struct flowd_settings settings;
+    struct flowd_nft_apply_result result;
+    struct json_object *resp = NULL;
+    struct json_object *plan = NULL;
+    const char *requested_by;
+    const char *requested_revision;
+    const char *state;
+    const char *error = "";
+    char job_id[FLOWD_MAX_ID];
+    char revision[128];
+    int dry_run;
+    int saved;
+    int rc = -1;
+
+    if (flowd_settings_load(&settings) != 0)
+        return flowd_error("settings_unavailable", "flowd settings are unavailable");
+    if (!body || !json_object_is_type(body, json_type_object))
+        body = NULL;
+    requested_by = flowd_json_str(body, "requested_by", "api");
+    requested_revision = flowd_json_str(body, "revision", "");
+    dry_run = flowd_json_bool(body, "dry_run", 1);
+    if (!flowd_text_ok(requested_by, 128))
+        return flowd_error("invalid_requested_by", "invalid flowd apply actor");
+    if (requested_revision[0]) {
+        if (!flowd_nft_safe_token(requested_revision, 120))
+            return flowd_error("invalid_revision", "invalid nft revision token");
+        snprintf(revision, sizeof(revision), "%s", requested_revision);
+    } else {
+        flowd_make_id("nft-revision", revision, sizeof(revision));
+    }
+    flowd_make_id("nft-apply", job_id, sizeof(job_id));
+
+    plan = json_object_new_object();
+    json_object_object_add(plan, "version", json_object_new_int(1));
+    json_object_object_add(plan, "kind", json_object_new_string("nft_revision_apply"));
+    json_object_object_add(plan, "job_id", json_object_new_string(job_id));
+    json_object_object_add(plan, "revision", json_object_new_string(revision));
+    json_object_object_add(plan, "generated_at", json_object_new_int64(flowd_now_s()));
+    json_object_object_add(plan, "dry_run", json_object_new_boolean(dry_run));
+    json_object_object_add(plan, "sentinel_only", json_object_new_boolean(1));
+    json_object_object_add(plan, "contains_policy_rules", json_object_new_boolean(0));
+    json_object_object_add(plan, "applies_dataplane", json_object_new_boolean(0));
+    json_object_object_add(plan, "mutates_nft_sentinel", json_object_new_boolean(!dry_run));
+    json_object_object_add(plan, "nft_table", json_object_new_string(FLOWD_NFT_TABLE));
+    json_object_object_add(plan, "note", json_object_new_string(
+        "bounded ownership/revision sentinel only; no flow, qos, route, quota, or policy rule is applied"));
+
+    if (dry_run) {
+        struct json_object *evidence = json_object_new_object();
+
+        state = "planned";
+        json_object_object_add(evidence, "validation_ok", json_object_new_boolean(0));
+        json_object_object_add(evidence, "apply_command_ok", json_object_new_boolean(0));
+        json_object_object_add(evidence, "revision_readback_ok", json_object_new_boolean(0));
+        json_object_object_add(evidence, "not_run_reason",
+                               json_object_new_string("dry_run"));
+        json_object_object_add(plan, "evidence", evidence);
+        saved = flowd_apply_job_save(job_id, "nft_revision_apply", requested_by,
+                                     1, "", plan, state, "") == 0;
+        if (!saved) {
+            error = "job_save_failed";
+            state = "failed";
+        }
+    } else {
+        if (flowd_mkdir_p(settings.runtime_dir, 0755) != 0) {
+            error = "runtime_dir_unavailable";
+            state = "failed";
+            saved = flowd_apply_job_save(job_id, "nft_revision_apply", requested_by,
+                                         0, "", plan, state, error) == 0;
+        } else {
+            state = "applying";
+            saved = flowd_apply_job_save(job_id, "nft_revision_apply", requested_by,
+                                         0, "", plan, state, "") == 0;
+            if (!saved) {
+                error = "job_save_failed";
+                state = "failed";
+            } else {
+                rc = flowd_nft_apply_revision(FLOWD_NFT_BINARY,
+                                              settings.runtime_dir,
+                                              revision, &result);
+                flowd_nft_result_add(plan, &result);
+                if (rc == 0) {
+                    state = "applied";
+                } else {
+                    error = result.error[0] ? result.error : "nft_revision_apply_failed";
+                    if (result.rolled_back && result.rollback_ok)
+                        state = "rolled_back";
+                    else
+                        state = "failed";
+                }
+                saved = flowd_apply_job_save(job_id, "nft_revision_apply",
+                                             requested_by, 0,
+                                             result.apply_path, plan,
+                                             state, error) == 0;
+                if (!saved) {
+                    error = "job_terminal_save_failed";
+                    state = "failed";
+                }
+            }
+        }
+    }
+
+    resp = json_object_new_object();
+    json_object_object_add(resp, "ok",
+                           json_object_new_boolean(saved && (dry_run || rc == 0)));
+    json_object_object_add(resp, "job_id", json_object_new_string(job_id));
+    json_object_object_add(resp, "revision", json_object_new_string(revision));
+    json_object_object_add(resp, "state", json_object_new_string(state));
+    json_object_object_add(resp, "dry_run", json_object_new_boolean(dry_run));
+    json_object_object_add(resp, "recorded", json_object_new_boolean(saved));
+    json_object_object_add(resp, "sentinel_only", json_object_new_boolean(1));
+    json_object_object_add(resp, "sentinel_applied",
+                           json_object_new_boolean(!dry_run && rc == 0));
+    json_object_object_add(resp, "applied", json_object_new_boolean(0));
+    json_object_object_add(resp, "runtime_applied", json_object_new_boolean(0));
+    json_object_object_add(resp, "runtime_reason",
+                           json_object_new_string(FLOWD_APPLY_UNAVAILABLE_REASON));
+    json_object_object_add(resp, "plan", plan);
+    if (error[0])
+        json_object_object_add(resp, "error", json_object_new_string(error));
+    return resp;
 }
 
 struct json_object *flowd_apply_jobs_json(struct json_object *body)
@@ -8455,6 +8730,8 @@ static void flowd_runtime_risk_cache_row(struct json_object *arr, sqlite3_stmt *
 
 struct json_object *flowd_runtime_json(struct json_object *body)
 {
+    struct flowd_settings settings;
+    struct flowd_runtime_contract_input runtime_contract;
     sqlite3 *db;
     const char *runtime_error = NULL;
     struct json_object *resp = json_object_new_object();
@@ -8474,10 +8751,21 @@ struct json_object *flowd_runtime_json(struct json_object *body)
     struct json_object *risk_cache = json_object_new_array();
     int limit = flowd_json_int(body, "limit", 100);
     int ok = 1;
+    int settings_available;
+
+    settings_available = flowd_settings_load(&settings) == 0;
+    runtime_contract.configured_enabled = settings.enabled;
+    runtime_contract.configured_apply_mode = settings.apply_mode;
+    runtime_contract.config_store_available = settings_available;
+    runtime_contract.runtime_snapshot_available = 0;
+    runtime_contract.nft_binary_available = access(FLOWD_NFT_BINARY, X_OK) == 0;
+    runtime_contract.runtime_dir_available = flowd_dir_exists(settings.runtime_dir);
 
     if (limit < 1 || limit > 500)
         limit = 100;
     json_object_object_add(resp, "ok", json_object_new_boolean(1));
+    json_object_object_add(resp, "settings_available",
+                           json_object_new_boolean(settings_available));
     json_object_object_add(resp, "runtime_db_path", json_object_new_string(FLOWD_DEFAULT_FLOW_DB_PATH));
     db = flowd_runtime_open_existing(&runtime_error);
     if (!db) {
@@ -8503,6 +8791,7 @@ struct json_object *flowd_runtime_json(struct json_object *body)
         json_object_object_add(resp, "dpi_cache", dpi_cache);
         json_object_object_add(resp, "quota_state", quota_state);
         json_object_object_add(resp, "risk_cache", risk_cache);
+        flowd_runtime_contract_add(resp, &runtime_contract);
         json_object_put(errors);
         return resp;
     }
@@ -8622,6 +8911,8 @@ struct json_object *flowd_runtime_json(struct json_object *body)
     else
         json_object_put(errors);
     json_object_object_add(resp, "note", json_object_new_string("read-only runtime snapshot; empty or missing tables mean the sampler/executor has not populated flow.db yet"));
+    runtime_contract.runtime_snapshot_available = 1;
+    flowd_runtime_contract_add(resp, &runtime_contract);
     return resp;
 }
 
@@ -8963,7 +9254,7 @@ struct json_object *flowd_compile(struct json_object *body)
         }
     }
     if (record_job)
-        saved = flowd_apply_job_save(job_id, requested_by, dry_run,
+        saved = flowd_apply_job_save(job_id, "compile", requested_by, dry_run,
                                      write_plan ? plan_path : "", plan,
                                      state, error) == 0;
     if (record_job && !saved) {

@@ -1,3 +1,35 @@
+.console-stage:has(.policy-regions-route-host),
+.console-stage:has(.policy-objects-route-host) {
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
+  height: 100dvh;
+  min-height: 0;
+  padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
+  overflow: hidden;
+}
+
+.console-stage:has(.policy-regions-route-host) .stage-header,
+.console-stage:has(.policy-objects-route-host) .stage-header {
+  display: none;
+}
+
+.console-stage .route-preview.policy-regions-route-host,
+.console-stage .route-preview.policy-objects-route-host {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: hidden;
+}
+
 .policy-objects-route-host,
 .policy-regions-route-host {
   min-width: 0;
@@ -9,6 +41,12 @@
   min-height: 100%;
 }
 
+.policy-regions-route-host .policy-entity-page-host,
+.policy-objects-route-host .policy-entity-page-host {
+  height: 100%;
+  min-height: 0;
+}
+
 .policy-entity-overlay-host:empty {
   display: none;
 }
@@ -16,13 +54,12 @@
 .policy-entity-page {
   width: 100%;
   min-width: 0;
-  min-height: 100%;
+  min-height: 0;
   display: grid;
   align-content: start;
-  gap: var(--app-page-gap, 14px);
-  padding: clamp(18px, 2.2vw, 28px);
-  padding-bottom: max(48px, env(safe-area-inset-bottom));
-  border-radius: var(--app-radius-card, 18px);
+  gap: 12px;
+  padding: 0;
+  border-radius: 0;
 }
 
 .policy-entity-header {
@@ -70,6 +107,250 @@
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+/* --- 区域：与 DHCP/组播/UPnP 同族的固定页头 + 唯一滚动工作区 --- */
+.policy-regions-page {
+  height: 100%;
+  min-height: 0;
+  grid-template-rows: minmax(0, 1fr);
+  gap: 0;
+  overflow: hidden;
+}
+
+.policy-region-workbench {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-auto-rows: max-content;
+  align-content: start;
+  gap: 12px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding-bottom: var(--app-page-gap, 14px);
+}
+
+.policy-region-zone-table .dwrt-kit-table-toolbar-actions {
+  flex: 0 0 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.policy-region-zone-table .dwrt-kit-table-title strong,
+.policy-region-zone-table .dwrt-kit-table-count {
+  white-space: nowrap;
+}
+
+.policy-region-zone-table [data-region-refresh] {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.policy-region-zone-table [data-region-refresh]:disabled {
+  opacity: .62;
+  cursor: wait;
+}
+
+.policy-region-flow {
+  min-width: 0;
+  min-height: 216px;
+  display: grid;
+  grid-template-columns: minmax(580px, 1.45fr) minmax(220px, .55fr);
+  align-items: center;
+  gap: 24px;
+  padding: 18px 20px;
+  border: 0;
+  border-radius: var(--app-radius-card, 24px);
+  color: var(--app-text, var(--dwrt-kit-text));
+  overflow: auto hidden;
+}
+
+.policy-region-flow-map {
+  min-width: 580px;
+  display: grid;
+  gap: 14px;
+}
+
+.policy-region-flow-upper,
+.policy-region-flow-main,
+.policy-region-flow-custom {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.policy-region-flow-upper {
+  justify-content: center;
+  gap: 12px;
+}
+
+.policy-region-flow-main {
+  justify-content: center;
+  gap: 8px;
+}
+
+.policy-region-flow-custom {
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.policy-region-flow-node,
+.policy-region-flow-slot {
+  min-width: 0;
+  min-height: 54px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border-subtle, var(--dwrt-glass-edge));
+  border-radius: var(--app-radius-control, 10px);
+  color: var(--app-text, var(--dwrt-kit-text));
+  background: color-mix(in srgb, var(--app-text, currentColor) 4%, transparent);
+}
+
+.policy-region-flow-node > span {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  color: var(--app-text-muted, var(--dwrt-kit-muted));
+}
+
+.policy-region-flow-node > div,
+.policy-region-flow-slot {
+  display: grid;
+  gap: 2px;
+}
+
+.policy-region-flow-node strong,
+.policy-region-flow-node small,
+.policy-region-flow-slot span,
+.policy-region-flow-slot small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.policy-region-flow-node strong,
+.policy-region-flow-slot span {
+  color: var(--app-text, var(--dwrt-kit-text));
+  font-size: 11px;
+  font-weight: 720;
+}
+
+.policy-region-flow-node small,
+.policy-region-flow-slot small {
+  color: var(--app-text-muted, var(--dwrt-kit-muted));
+  font-size: 9px;
+}
+
+.policy-region-flow-node.is-external,
+.policy-region-flow-node.is-gateway,
+.policy-region-flow-node.is-internal,
+.policy-region-flow-node.is-hotspot {
+  flex: 1 1 0;
+}
+
+.policy-region-flow-node.is-vpn,
+.policy-region-flow-node.is-dmz,
+.policy-region-flow-slot {
+  width: 148px;
+}
+
+.policy-region-flow-node.is-custom {
+  max-width: 150px;
+}
+
+.policy-region-flow-link {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  color: var(--app-text-muted, var(--dwrt-kit-muted));
+}
+
+.policy-region-flow-link svg {
+  width: 16px;
+  height: 16px;
+}
+
+.policy-region-flow > p {
+  margin: 0;
+  color: var(--app-text-secondary, var(--dwrt-kit-muted));
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+/* --- 对象：透明路由根 + DHCP 同族固定工具行和滚动工作区 --- */
+.policy-objects-page {
+  height: 100%;
+  min-height: 0;
+  grid-template-rows: 52px minmax(0, 1fr);
+  gap: 10px;
+  overflow: hidden;
+}
+
+.policy-objects-page.is-terminal {
+  grid-template-rows: minmax(0, 1fr);
+  gap: 0;
+}
+
+.policy-object-toolbar {
+  min-width: 0;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.policy-object-toolbar .dwrt-kit-table-title {
+  min-width: 0;
+}
+
+.policy-object-workbench {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-auto-rows: max-content;
+  align-content: start;
+  gap: 12px;
+  padding-bottom: max(36px, env(safe-area-inset-bottom));
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.policy-object-overview,
+.policy-object-table .dwrt-kit-table-scroll {
+  min-width: 0;
+}
+
+.policy-object-overview .dwrt-kit-overview-card {
+  min-height: 118px;
+}
+
+.policy-region-zone-row {
+  cursor: pointer;
+}
+
+.policy-region-zone-row:hover td {
+  background: var(--dwrt-interactive-hover-bg);
+}
+
+.policy-region-zone-footer,
+.policy-region-policy-footer {
+  min-height: 46px;
+  display: flex;
+  align-items: center;
+  border-top: 1px solid var(--color-border-subtle, var(--dwrt-glass-edge));
+  padding: 6px 12px;
+}
+
+.policy-region-zone-footer {
+  justify-content: flex-start;
 }
 
 .policy-entity-section > header {
@@ -171,8 +452,9 @@
   gap: 8px;
 }
 
-.policy-entity-table {
+.policy-entity-table.dwrt-kit-table-wrap {
   min-width: 0;
+  border-radius: var(--app-radius-card, 24px);
 }
 
 .policy-entity-table .dwrt-kit-table {
@@ -214,7 +496,7 @@
 }
 
 .policy-entity-sheet {
-  --dwrt-kit-sheet-width: min(520px, 92vw);
+  --dwrt-kit-sheet-width: min(460px, calc(100vw - 28px));
 }
 
 .policy-entity-sheet-body {
@@ -281,13 +563,22 @@
   scrollbar-gutter: stable;
 }
 
-.policy-region-matrix {
-  min-width: calc(132px + var(--policy-region-count) * 126px);
+.policy-region-matrix-axis {
+  min-height: 26px;
   display: grid;
-  grid-template-columns: 132px repeat(var(--policy-region-count), minmax(126px, 1fr));
-  gap: 1px;
-  border: 1px solid var(--color-border-subtle, var(--dwrt-glass-edge));
-  background: var(--color-border-subtle, var(--dwrt-glass-edge));
+  place-items: end center;
+  color: var(--app-text-muted, var(--dwrt-kit-muted));
+  font-size: 10px;
+  font-weight: 680;
+}
+
+.policy-region-matrix {
+  min-width: calc(116px + var(--policy-region-count) * 116px);
+  display: grid;
+  grid-template-columns: 116px repeat(var(--policy-region-count), minmax(116px, 1fr));
+  gap: 0;
+  border: 0;
+  background: transparent;
 }
 
 .policy-region-matrix-corner,
@@ -295,13 +586,14 @@
 .policy-region-matrix-row,
 .policy-region-matrix-cell {
   min-width: 0;
-  min-height: 58px;
-  display: grid;
-  place-content: center;
-  gap: 3px;
-  padding: 8px 10px;
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 4px;
   color: var(--app-text-secondary, var(--dwrt-kit-muted));
-  background: var(--color-surface-dense, var(--dwrt-kit-liquid-surface));
+  background: transparent;
   font-size: 11px;
   text-align: center;
 }
@@ -314,22 +606,55 @@
 }
 
 .policy-region-matrix-row {
-  place-content: center start;
+  justify-content: flex-start;
+  padding-inline: 10px;
   text-align: start;
 }
 
 .policy-region-matrix-cell {
+  position: relative;
+  min-height: 32px;
+  border: 1px solid var(--color-border-control, var(--color-border-subtle));
+  border-radius: 4px;
+  color: var(--app-text-secondary, var(--dwrt-kit-muted));
+  background: var(--color-surface-control, transparent);
+  font: inherit;
   cursor: pointer;
   user-select: none;
 }
 
 .policy-region-matrix-cell:hover {
-  background: var(--dwrt-interactive-hover-bg);
+  border-color: var(--color-border-strong, var(--color-border-control));
+  background: var(--dwrt-interactive-hover-bg, var(--color-surface-control));
 }
 
 .policy-region-matrix-cell strong {
-  color: var(--app-text, var(--dwrt-kit-text));
-  font-size: 12px;
+  color: inherit;
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.policy-region-matrix-corner {
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.policy-region-matrix-corner strong,
+.policy-region-matrix-corner small {
+  color: inherit;
+}
+
+.policy-region-matrix-corner.is-selected,
+.policy-region-matrix-cell.is-selected {
+  border-color: var(--color-info, var(--color-accent));
+  box-shadow: inset 0 0 0 1px var(--color-info, var(--color-accent));
+}
+
+.policy-region-matrix-corner.is-selected {
+  background: color-mix(in srgb, var(--color-info, var(--color-accent)) 9%, transparent);
 }
 
 .policy-region-matrix-cell small {
@@ -338,11 +663,109 @@
 }
 
 .policy-region-matrix-cell.is-success strong {
-  color: var(--color-success, var(--app-text));
+  color: inherit;
 }
 
 .policy-region-matrix-cell.is-danger strong {
-  color: var(--color-danger, var(--app-text));
+  color: inherit;
+}
+
+.policy-region-matrix-cell.is-return strong {
+  color: inherit;
+}
+
+.policy-region-matrix-cell.is-success {
+  border-color: color-mix(in srgb, var(--color-success, currentColor) 34%, transparent);
+  background: color-mix(in srgb, var(--color-success, currentColor) 10%, var(--color-surface-control, transparent));
+}
+
+.policy-region-matrix-cell.is-danger {
+  border-color: color-mix(in srgb, var(--color-danger, currentColor) 34%, transparent);
+  background: color-mix(in srgb, var(--color-danger, currentColor) 10%, var(--color-surface-control, transparent));
+}
+
+.policy-region-matrix-cell.is-return {
+  border-color: color-mix(in srgb, var(--color-info, currentColor) 34%, transparent);
+  background: color-mix(in srgb, var(--color-info, currentColor) 10%, var(--color-surface-control, transparent));
+}
+
+.policy-region-policy-toolbar {
+  gap: 12px;
+}
+
+.policy-region-policy-controls {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.policy-region-policy-controls > label:not(.policy-region-policy-search) {
+  min-height: 34px;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--app-text-secondary, var(--dwrt-kit-muted));
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.policy-region-policy-controls > label:not(.policy-region-policy-search) input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--color-accent, currentColor);
+}
+
+.policy-region-policy-search {
+  width: min(220px, 30vw);
+  min-width: 150px;
+  min-height: 36px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  border: 1px solid var(--color-border-control, var(--dwrt-glass-edge));
+  border-radius: var(--app-radius-control, 8px);
+  color: var(--app-text-muted, var(--dwrt-kit-muted));
+  background: var(--color-surface-control, transparent);
+}
+
+.policy-region-policy-search svg {
+  width: 15px;
+  height: 15px;
+  margin: auto;
+}
+
+.policy-region-policy-search input {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: var(--app-text, var(--dwrt-kit-text));
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  padding: 0 10px 0 0;
+}
+
+.policy-region-policy-scroll {
+  max-height: 430px;
+}
+
+.policy-region-policy-section .dwrt-kit-table {
+  min-width: 1120px;
+}
+
+.policy-region-policy-footer {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.policy-region-policy-footer > span {
+  color: var(--app-text-muted, var(--dwrt-kit-muted));
+  font-size: 10px;
 }
 
 .policy-region-form,
@@ -422,9 +845,25 @@
   font-size: 10px;
 }
 
+@media (max-width: 1100px) {
+  .policy-region-flow {
+    grid-template-columns: minmax(580px, 1fr);
+    gap: 14px;
+  }
+
+  .policy-region-flow > p {
+    max-width: 720px;
+  }
+}
+
 @media (max-width: 760px) {
+  .console-stage:has(.policy-regions-route-host),
+  .console-stage:has(.policy-objects-route-host) {
+    padding: 10px;
+  }
+
   .policy-entity-page {
-    padding: 16px 14px max(44px, env(safe-area-inset-bottom));
+    padding: 0;
   }
 
   .policy-entity-header {
@@ -435,6 +874,15 @@
   .policy-entity-header-actions {
     justify-content: space-between;
   }
+
+  .policy-object-toolbar .dwrt-kit-table-title span { display: none; }
+
+  .policy-object-toolbar [data-object-refresh] {
+    width: 40px;
+    padding: 0;
+  }
+
+  .policy-object-toolbar [data-object-refresh] span { display: none; }
 
   .policy-entity-summary {
     grid-template-columns: minmax(0, 1fr);
@@ -468,5 +916,27 @@
   .policy-entity-detail-list > div,
   .policy-region-pair-summary dl > div {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .policy-region-flow {
+    min-height: 0;
+    grid-template-columns: minmax(580px, 1fr);
+    gap: 14px;
+    padding: 14px;
+  }
+
+  .policy-region-flow > p {
+    width: calc(100vw - 78px);
+    max-width: 340px;
+  }
+
+  .policy-region-policy-toolbar,
+  .policy-region-policy-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .policy-region-policy-search {
+    width: 100%;
   }
 }

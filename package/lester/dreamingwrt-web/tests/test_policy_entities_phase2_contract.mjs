@@ -64,11 +64,14 @@ assert.doesNotMatch(objectsSource + regionsSource, /\.innerHTML\s*=/);
 const policy = menu.items.find((item) => item.id === 'policy-engine');
 const objectMenu = policy.children.find((item) => item.id === 'policy-object');
 const regionMenu = policy.children.find((item) => item.id === 'policy-region');
+const SHARED_STYLE_VERSION = '20260730-policy-workbench-unify-14';
 for (const item of [objectMenu, regionMenu]) {
   assert.equal(item.style, '/static/css/policy-entities.css');
-  assert.equal(item.module_version, '20260721-02');
-  assert.equal(item.style_version, '20260721-02');
+  // the two pages share one stylesheet, so the style version must stay in lockstep
+  assert.equal(item.style_version, SHARED_STYLE_VERSION);
 }
+assert.equal(objectMenu.module_version, '20260730-policy-objects-unify-03');
+assert.equal(regionMenu.module_version, '20260730-policy-regions-unify-10');
 assert.equal(objectMenu.module, 'native/policy-objects.js');
 assert.equal(regionMenu.module, 'native/policy-regions.js');
 
@@ -83,5 +86,66 @@ assert.deepEqual(regionRoute.registry, ['policy.regions', 'policy.zoneMatrix', '
 assert.doesNotMatch(css, /!important|backdrop-filter|#[0-9a-fA-F]{3,8}|rgba?\(/);
 assert.match(css, /overscroll-behavior:\s*contain/);
 assert.match(css, /policy-entity-overlay-host:empty/);
+
+// --- 区域 must follow the shared page grammar, not invent its own surface ---
+// no page-level frosted panel: the material comes from Kit table/sheet surfaces
+assert.doesNotMatch(regionsSource, /stable-glass/);
+assert.doesNotMatch(regionsSource, /data-dwrt-component="page-shell"|data-dwrt-page-shell=/);
+// no separate page header; status and refresh remain in the zone table toolbar
+assert.doesNotMatch(regionsSource, /policy-region-page-header|policy-region-header-heading/);
+assert.match(regionsSource, /class="policy-region-workbench"/);
+assert.match(css, /\.policy-region-workbench\s*\{[^}]*overflow:\s*auto/);
+assert.match(css, /\.policy-region-zone-table \[data-region-refresh\][^}]*min-width:\s*44px[^}]*min-height:\s*44px/);
+assert.match(regionsSource, /dwrt-kit-table-toolbar-actions[^]*data-region-refresh/);
+assert.match(regionsSource, /事务写入可用/);
+// relationship diagram, zone table, matrix and policy table ride shared stable glass
+assert.match(regionsSource, /function topologyMarkup\(\)/);
+assert.match(regionsSource, /class="policy-region-flow dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"/);
+for (const marker of [
+  'class="policy-entity-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface policy-region-zone-table"',
+  'class="policy-entity-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface policy-region-matrix-section"',
+  'class="policy-entity-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface policy-region-policy-section"'
+]) {
+  assert.ok(regionsSource.includes(marker), marker);
+}
+assert.equal((regionsSource.match(/dwrt-kit-glass-surface/g) || []).length, 4);
+assert.doesNotMatch(regionsSource, /data-dwrt-surface="dense-surface"/);
+assert.doesNotMatch(css, /policy-region-flow-node[^}]*border:\s*1px dashed/);
+assert.doesNotMatch(css, /policy-region-flow-node[^}]*background:[^;}]*color-accent/);
+assert.doesNotMatch(css, /policy-region-flow-(?:node\s*>\s*span|link)[^}]*color:[^;}]*color-accent/);
+assert.match(css, /policy-region-flow-node\s*>\s*span[^}]*color:\s*var\(--app-text-muted/);
+assert.match(css, /policy-region-flow-link[^}]*color:\s*var\(--app-text-muted/);
+assert.match(regionsSource, /data-region-family="ipv4"/);
+assert.match(regionsSource, /data-region-family="ipv6"/);
+assert.match(regionsSource, /data-region-policy-search/);
+assert.match(regionsSource, /data-region-manage-policies/);
+assert.match(regionsSource, /<button type="button" role="gridcell"/);
+assert.match(regionsSource, /state\.selectedPair = pair/);
+assert.match(regionsSource, /function visiblePolicies\(\)/);
+assert.match(css, /.console-stage:has\(\.policy-regions-route-host\)[^{]*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\)/);
+assert.match(css, /\.policy-region-matrix\s*\{[^}]*background:\s*transparent/);
+assert.match(css, /\.policy-region-matrix-cell\s*\{[^}]*min-height:\s*32px/);
+assert.doesNotMatch(css, /\.policy-region-matrix-cell\.is-(?:success|danger|return) strong\s*\{[^}]*color:\s*var\(--color-(?:success|danger|info)/);
+assert.match(regionsSource, /state\.sheetReturnFocus = trigger instanceof HTMLElement \? trigger : null/);
+assert.match(regionsSource, /focusTarget instanceof HTMLElement\) focusTarget\.focus\(\{ preventScroll: true \}\)/);
+assert.match(regionsSource, /returnFocus\?\.isConnected\) returnFocus\.focus\(\{ preventScroll: true \}\)/);
+// drawers reuse the shared copilot sheet instead of a hand-rolled panel
+assert.equal((regionsSource.match(/data-dwrt-sheet-variant="copilot"/g) || []).length, 2);
+assert.match(css, /\.policy-entity-sheet\s*\{[^}]*--dwrt-kit-sheet-width:\s*min\(460px,/);
+// UniFi zone semantics stay intact: 6 zone rows/columns driven by real pair data
+assert.match(regionsSource, /source_zone_id/);
+assert.match(regionsSource, /destination_zone_id/);
+assert.match(regionsSource, /policy_count/);
+
+// Objects use the same transparent route grammar and shared Kit surfaces.
+assert.doesNotMatch(objectsSource, /data-dwrt-component="page-shell"|data-dwrt-page-shell=|data-dwrt-surface="stable-glass"|data-dwrt-surface="dense-surface"/);
+assert.match(objectsSource, /class="policy-object-toolbar"/);
+assert.match(objectsSource, /class="policy-object-workbench"/);
+assert.match(objectsSource, /overviewCardsMarkup/);
+assert.match(objectsSource, /policy-object-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface/);
+assert.equal((objectsSource.match(/data-dwrt-sheet-variant="copilot"/g) || []).length, 1);
+assert.match(css, /.console-stage:has\(\.policy-objects-route-host\)[^{]*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\)/);
+assert.match(css, /\.policy-object-workbench\s*\{[^}]*gap:\s*12px[^}]*overflow:\s*auto/);
+assert.match(css, /\.policy-entity-table\.dwrt-kit-table-wrap\s*\{[^}]*border-radius:\s*var\(--app-radius-card/);
 
 console.log('ok: policy entity contracts enforce read-only object capabilities, real zone CRUD/matrix data, scoped Registry use, stable overlays, and shared Kit ownership');

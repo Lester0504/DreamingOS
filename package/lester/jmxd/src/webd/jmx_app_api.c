@@ -74,7 +74,7 @@
 
 #define APP_API_CODE_SUCCESS 2000
 #define APP_API_CODE_ERROR 4000
-#define WEBD_LOG_EXPORT_DIR "/tmp/dreamingwrt/log_exports"
+#define WEBD_LOG_EXPORT_DIR "/run/dreamingwrt/log_exports"
 #define WEBD_CAPTURE_DIR "/tmp/dreamingwrt/captures"
 #define WEBD_CAPTURE_DEFAULT_DURATION_S 30
 #define WEBD_CAPTURE_MAX_DURATION_S 120
@@ -86,6 +86,7 @@
 #define WEBD_CAPTURE_MAX_BYTES (128ULL * 1024ULL * 1024ULL)
 #define WEBD_NETWORK_BACKUP_DIR "/etc/dreamingwrt/network-backup"
 #define WEBD_NETWORK_CONFIG_PATH "/etc/config/network"
+#define WEBD_RUNTIME_DIR "/run/dreamingwrt"
 #define WEBD_AI_LOG_MAX_ITEMS 50
 #define WEBD_AI_LOG_MAX_LINE 4096
 #define WEBD_AI_LOG_MAX_TOTAL (96 * 1024)
@@ -111,6 +112,7 @@ static struct json_object *app_ubus_invoke(const char *method, struct json_objec
 static struct json_object *app_ubus_or_error(const char *method, struct json_object *params);
 static struct json_object *app_ubus_object_or_error(const char *object, const char *method, struct json_object *params);
 static struct json_object *webd_wifi_aggregate_response(int runtime_status);
+static char *webd_ai_redact_text(const char *src, size_t max_len);
 void webd_wifi_merge_survey_history(struct json_object *data,
                                     struct json_object *survey_history);
 void webd_wifi_merge_station_events_capability(
@@ -1440,7 +1442,12 @@ static struct json_object *ai_envelope(struct json_object *resp, int default_cod
 #define APP_API_WRITE_BUF     32768
 #define APP_API_IO_TIMEOUT_S  5
 #define APP_API_FIRST_BYTE_TIMEOUT_MS 1500
+#define APP_API_REQUEST_DEADLINE_MS 10000
 #define APP_API_ACCEPT_POLL_MS 50
+#define APP_API_PENDING_SWEEP_MS 100
+#define APP_API_MAX_HEADER     APP_API_READ_BUF
+#define APP_API_MAX_HEADER_LINES 128
+#define APP_API_MAX_HEADER_LINE 8192
 #define APP_API_MAX_CHILDREN 32
 #define WEBD_WS_MAX_CHILDREN 8
 #define WEBD_CHILD_STOP_GRACE_MS 1500
@@ -1573,6 +1580,10 @@ static sqlite3 *g_app_db = NULL;
 static sqlite3 *g_config_db = NULL;
 static char g_webd_init_token[WEBD_INIT_TOKEN_LEN + 1];
 static int64_t g_webd_init_token_expires_at = 0;
+/* Each HTTP request is handled serially inside one process (parent fast path or
+ * one forked worker), so request-scoped audit metadata is process-local. */
+static char g_webd_audit_source_ip[64];
+static char g_webd_audit_method[8];
 
 static int app_db_exec_checked(const char *sql)
 {
@@ -5491,10 +5502,55 @@ static int webd_network_config_restore(const char *snapshot_path, char *err, siz
     return 0;
 }
 
+static int webd_open_runtime_log(const char *prefix, char *path, size_t path_len)
+{
+    struct stat st;
+    int dirfd = -1;
+    int fd = -1;
+    int attempt;
+    char name[128];
+
+    if (!prefix || !prefix[0] || !path || path_len == 0)
+        return -1;
+    path[0] = '\0';
+    if (mkdir(WEBD_RUNTIME_DIR, 0700) != 0 && errno != EEXIST)
+        return -1;
+    dirfd = open(WEBD_RUNTIME_DIR,
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0 || fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        goto out;
+    for (attempt = 0; attempt < 32; attempt++) {
+        snprintf(name, sizeof(name), "%s-%ld-%lld-%08lx-%d.log",
+                 prefix, (long)getpid(), (long long)now_s(),
+                 (unsigned long)random(), attempt);
+        fd = openat(dirfd, name,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                    0600);
+        if (fd >= 0) {
+            if (snprintf(path, path_len, "%s/%s", WEBD_RUNTIME_DIR, name) >=
+                (int)path_len) {
+                close(fd);
+                unlinkat(dirfd, name, 0);
+                fd = -1;
+            }
+            break;
+        }
+        if (errno != EEXIST)
+            break;
+    }
+out:
+    if (dirfd >= 0)
+        close(dirfd);
+    return fd;
+}
+
 static int webd_network_reload_runtime(char *err, size_t err_len)
 {
     pid_t pid;
     int status;
+    int logfd;
+    char log_path[256];
     const char *argv[] = { "/etc/init.d/network", "reload", NULL };
 
     if (err && err_len)
@@ -5503,14 +5559,21 @@ static int webd_network_reload_runtime(char *err, size_t err_len)
         if (err && err_len) snprintf(err, err_len, "network_init_unavailable");
         return -1;
     }
+    logfd = webd_open_runtime_log("port-network-reload", log_path,
+                                  sizeof(log_path));
+    if (logfd < 0) {
+        if (err && err_len)
+            snprintf(err, err_len, "runtime_log_create_failed:%s", strerror(errno));
+        return -1;
+    }
     pid = fork();
     if (pid < 0) {
+        close(logfd);
         if (err && err_len) snprintf(err, err_len, "fork_failed:%s", strerror(errno));
         return -1;
     }
     if (pid == 0) {
         int devnull = open("/dev/null", O_RDWR);
-        int logfd = open("/tmp/dw-port-network-reload.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
 
         if (devnull >= 0) {
             dup2(devnull, STDIN_FILENO);
@@ -5526,6 +5589,7 @@ static int webd_network_reload_runtime(char *err, size_t err_len)
         execv(argv[0], (char * const *)argv);
         _exit(127);
     }
+    close(logfd);
     while (waitpid(pid, &status, 0) < 0) {
         if (errno == EINTR)
             continue;
@@ -5534,8 +5598,8 @@ static int webd_network_reload_runtime(char *err, size_t err_len)
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         if (err && err_len)
-            snprintf(err, err_len, "network_reload_failed_rc_%d",
-                     WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            snprintf(err, err_len, "network_reload_failed_rc_%d:%s",
+                     WIFEXITED(status) ? WEXITSTATUS(status) : -1, log_path);
         return -1;
     }
     return 0;
@@ -6756,26 +6820,167 @@ static int app_event_socket_init(void)
  * Audit
  * ══════════════════════════════════════════════════════════════════════ */
 
-void jmx_app_audit_log(const char *actor, const char *app_device_id,
-                   const char *action, const char *risk,
-                   const char *target, const char *before_hash,
-                   const char *after_hash)
+static const char *webd_audit_operation_type(const char *action)
+{
+    const char *suffix;
+
+    if (!action || !action[0])
+        return "execute";
+    suffix = strrchr(action, '.');
+    suffix = suffix ? suffix + 1 : action;
+    if (!strcmp(suffix, "create") || !strcmp(suffix, "add") ||
+        !strcmp(suffix, "upload") || !strcmp(suffix, "import"))
+        return "create";
+    if (!strcmp(suffix, "delete") || !strcmp(suffix, "remove") ||
+        !strcmp(suffix, "revoke") || !strcmp(suffix, "disconnect"))
+        return "delete";
+    if (!strcmp(suffix, "update") || !strcmp(suffix, "set") ||
+        !strcmp(suffix, "save") || !strcmp(suffix, "toggle") ||
+        !strcmp(suffix, "apply") || !strcmp(suffix, "enable") ||
+        !strcmp(suffix, "disable") || !strcmp(suffix, "rotate"))
+        return "update";
+    if (!strcmp(g_webd_audit_method, "DELETE"))
+        return "delete";
+    if (!strcmp(g_webd_audit_method, "PUT") ||
+        !strcmp(g_webd_audit_method, "PATCH"))
+        return "update";
+    return "execute";
+}
+
+static const char *webd_audit_severity(const char *risk)
+{
+    if (risk && (!strcmp(risk, "critical") || !strcmp(risk, "blocked")))
+        return "critical";
+    if (risk && !strcmp(risk, "high"))
+        return "error";
+    if (risk && !strcmp(risk, "medium"))
+        return "warning";
+    return "notice";
+}
+
+static const char *webd_audit_username(const char *actor)
+{
+    return webd_identity_is_user(actor) ? webd_identity_username(actor) :
+           (actor ? actor : "");
+}
+
+static void webd_audit_publish_logd(const char *actor, const char *app_device_id,
+                                    const char *action, const char *risk,
+                                    const char *target, const char *before_value,
+                                    const char *after_value, const char *source_ip,
+                                    const char *result, const char *failure_reason)
+{
+    struct json_object *event = json_object_new_object();
+    struct json_object *detail = json_object_new_object();
+    struct json_object *reply;
+    char *safe_target = NULL;
+    char *safe_before = NULL;
+    char *safe_after = NULL;
+    char *safe_failure = NULL;
+    char title[256];
+
+    if (!event || !detail) {
+        if (event) json_object_put(event);
+        if (detail) json_object_put(detail);
+        return;
+    }
+    /* api_audit_log intentionally retains every API access. The log-center
+     * audit ledger is narrower: reads stay out unless a named action explicitly
+     * records them, while mutating requests and authentication events remain. */
+    if ((!strcmp(g_webd_audit_method, "GET") ||
+         !strcmp(g_webd_audit_method, "HEAD") ||
+         !strcmp(g_webd_audit_method, "OPTIONS")) &&
+        action && action[0] == '/') {
+        json_object_put(event);
+        json_object_put(detail);
+        return;
+    }
+    safe_target = webd_ai_redact_text(target ? target : "", WEBD_AI_LOG_MAX_LINE);
+    safe_before = webd_ai_redact_text(before_value ? before_value : "", WEBD_AI_LOG_MAX_LINE);
+    safe_after = webd_ai_redact_text(after_value ? after_value : "", WEBD_AI_LOG_MAX_LINE);
+    safe_failure = webd_ai_redact_text(failure_reason ? failure_reason : "", WEBD_AI_LOG_MAX_LINE);
+    snprintf(title, sizeof(title), "%s%s%s", action && action[0] ? action : "web.action",
+             safe_target && safe_target[0] ? ": " : "",
+             safe_target && safe_target[0] ? safe_target : "");
+    json_object_object_add(detail, "source_id", json_object_new_string("audit"));
+    json_object_object_add(detail, "source_label", json_object_new_string("Audit logs"));
+    json_object_object_add(detail, "web_audit", json_object_new_boolean(1));
+    json_object_object_add(detail, "program", json_object_new_string("dreamingwrt-webd"));
+    json_object_object_add(detail, "program_label", json_object_new_string("DreamingWrt Web"));
+    json_object_object_add(detail, "admin_id", json_object_new_string(webd_audit_username(actor)));
+    json_object_object_add(detail, "admin_name", json_object_new_string(webd_audit_username(actor)));
+    json_object_object_add(detail, "actor", json_object_new_string(actor ? actor : ""));
+    json_object_object_add(detail, "app_device_id", json_object_new_string(app_device_id ? app_device_id : ""));
+    json_object_object_add(detail, "client_ip", json_object_new_string(source_ip ? source_ip : ""));
+    json_object_object_add(detail, "action", json_object_new_string(action ? action : ""));
+    json_object_object_add(detail, "operation_type", json_object_new_string(webd_audit_operation_type(action)));
+    json_object_object_add(detail, "object", json_object_new_string(safe_target ? safe_target : ""));
+    json_object_object_add(detail, "risk", json_object_new_string(risk ? risk : "low"));
+    json_object_object_add(detail, "before_value", json_object_new_string(safe_before ? safe_before : ""));
+    json_object_object_add(detail, "after_value", json_object_new_string(safe_after ? safe_after : ""));
+    json_object_object_add(detail, "result", json_object_new_string(result ? result : ""));
+    json_object_object_add(detail, "failure_reason", json_object_new_string(safe_failure ? safe_failure : ""));
+    json_object_object_add(detail, "message", json_object_new_string(title));
+    json_object_object_add(detail, "raw", json_object_new_string(title));
+
+    json_object_object_add(event, "severity", json_object_new_string(webd_audit_severity(risk)));
+    json_object_object_add(event, "category", json_object_new_string("audit"));
+    json_object_object_add(event, "event", json_object_new_string(action && action[0] ? action : "web.action"));
+    json_object_object_add(event, "source", json_object_new_string("audit"));
+    json_object_object_add(event, "ip", json_object_new_string(source_ip ? source_ip : ""));
+    json_object_object_add(event, "username", json_object_new_string(webd_audit_username(actor)));
+    json_object_object_add(event, "actor", json_object_new_string(actor ? actor : ""));
+    json_object_object_add(event, "title", json_object_new_string(title));
+    json_object_object_add(event, "detail_json", detail);
+    json_object_object_add(event, "notify", json_object_new_boolean(0));
+    reply = app_ubus_invoke_object_timeout("dreamingwrt.logd", "event_add", event, 500);
+    if (reply)
+        json_object_put(reply);
+    json_object_put(event);
+    free(safe_target);
+    free(safe_before);
+    free(safe_after);
+    free(safe_failure);
+}
+
+static void jmx_app_audit_log_full(const char *actor, const char *app_device_id,
+                                   const char *action, const char *risk,
+                                   const char *target, const char *before_hash,
+                                   const char *after_hash, const char *source_ip,
+                                   const char *result, const char *failure_reason)
 {
     int64_t ts = now_s();
     sqlite3_stmt *st = app_prepare(
-        "INSERT INTO api_audit_log(ts,actor,app_device_id,action,risk,target,before_hash,after_hash) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8)");
-    if (!st) return;
-    sqlite3_bind_int64(st, 1, ts);
-    sqlite3_bind_text(st, 2, actor ? actor : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 3, app_device_id ? app_device_id : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 4, action ? action : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 5, risk ? risk : "low", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 6, target ? target : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 7, before_hash ? before_hash : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 8, after_hash ? after_hash : "", -1, SQLITE_TRANSIENT);
-    sqlite3_step(st);
-    sqlite3_finalize(st);
+        "INSERT INTO api_audit_log(ts,actor,app_device_id,action,risk,target,before_hash,after_hash,"
+        "source_ip,result,failure_reason) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)");
+    if (st) {
+        sqlite3_bind_int64(st, 1, ts);
+        sqlite3_bind_text(st, 2, actor ? actor : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, app_device_id ? app_device_id : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, action ? action : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 5, risk ? risk : "low", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 6, target ? target : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 7, before_hash ? before_hash : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 8, after_hash ? after_hash : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 9, source_ip ? source_ip : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 10, result ? result : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 11, failure_reason ? failure_reason : "", -1, SQLITE_TRANSIENT);
+        (void)sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    webd_audit_publish_logd(actor, app_device_id, action, risk, target,
+                            before_hash, after_hash, source_ip, result,
+                            failure_reason);
+}
+
+void jmx_app_audit_log(const char *actor, const char *app_device_id,
+                       const char *action, const char *risk,
+                       const char *target, const char *before_hash,
+                       const char *after_hash)
+{
+    jmx_app_audit_log_full(actor, app_device_id, action, risk, target,
+                           before_hash, after_hash, g_webd_audit_source_ip,
+                           "", "");
 }
 
 static void jmx_app_audit_log_ex(const char *actor, const char *app_device_id,
@@ -6783,23 +6988,36 @@ static void jmx_app_audit_log_ex(const char *actor, const char *app_device_id,
                                  const char *target, const char *source_ip,
                                  const char *result, const char *failure_reason)
 {
-    sqlite3_stmt *st = app_prepare(
-        "INSERT INTO api_audit_log(ts,actor,app_device_id,action,risk,target,"
-        "source_ip,result,failure_reason) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)");
+    jmx_app_audit_log_full(actor, app_device_id, action, risk, target, "", "",
+                           source_ip, result, failure_reason);
+}
 
-    if (!st)
-        return;
-    sqlite3_bind_int64(st, 1, now_s());
-    sqlite3_bind_text(st, 2, actor ? actor : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 3, app_device_id ? app_device_id : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 4, action ? action : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 5, risk ? risk : "high", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 6, target ? target : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 7, source_ip ? source_ip : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 8, result ? result : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 9, failure_reason ? failure_reason : "", -1, SQLITE_TRANSIENT);
-    (void)sqlite3_step(st);
-    sqlite3_finalize(st);
+static void webd_audit_login_result(struct json_object *request,
+                                    struct json_object *response,
+                                    const char *source_ip, int http_status)
+{
+    const char *username = app_nc_json_str(request, "username", "");
+    const char *app_device_id = app_nc_json_str(request, "device_id", "");
+    const char *error = response ? app_nc_json_str(response, "error", "") : "";
+    int success = response &&
+        (app_nc_json_str(response, "access_token", "")[0] ||
+         app_nc_json_bool(response, "requires_initial_setup", 0));
+    char actor[160];
+
+    if (username[0])
+        snprintf(actor, sizeof(actor), "web:%s", username);
+    else if (app_device_id[0])
+        snprintf(actor, sizeof(actor), "app:%s", app_device_id);
+    else
+        snprintf(actor, sizeof(actor), "unauthenticated");
+    if (!success && !error[0])
+        error = http_status >= 500 ? "login_backend_unavailable" : "invalid_credentials";
+    jmx_app_audit_log_ex(actor, app_device_id,
+                         success ? "auth.login.success" : "auth.login.failed",
+                         success ? "low" : "medium",
+                         username[0] ? username : app_device_id, source_ip,
+                         success ? "success" : "failed",
+                         success ? "" : error);
 }
 
 static int webd_ac_audit_reserve(const char *actor, const char *source_ip,
@@ -6865,6 +7083,8 @@ rollback_after_commit:
 }
 
 static void webd_ac_audit_finish(sqlite3_int64 audit_id,
+                                 const char *actor, const char *source_ip,
+                                 const char *action,
                                  const char *target, const char *result,
                                  const char *failure_reason)
 {
@@ -6884,6 +7104,12 @@ static void webd_ac_audit_finish(sqlite3_int64 audit_id,
     sqlite3_bind_int64(st, 4, audit_id);
     (void)sqlite3_step(st);
     sqlite3_finalize(st);
+    /* The reserved attempted event remains immutable in logd; emit the terminal
+     * transition as a second audit event so failed and successful outcomes are
+     * visible without mutating an already published stream record. */
+    webd_audit_publish_logd(actor, actor, action, "medium",
+                            target, "", "", source_ip, result,
+                            failure_reason);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -6893,9 +7119,25 @@ static void webd_ac_audit_finish(sqlite3_int64 audit_id,
 static struct uloop_fd g_listen_fd = { .fd = -1 };
 static struct uloop_timeout g_accept_resume_timer;
 static struct uloop_timeout g_child_reap_timer;
+static struct uloop_timeout g_pending_sweep_timer;
+
+struct app_api_pending {
+    struct uloop_fd ufd;
+    struct timespec deadline;
+    char header[APP_API_MAX_HEADER + 1];
+    size_t header_len;
+    int active;
+};
+
+static struct app_api_pending g_pending_clients[APP_API_MAX_CLIENTS];
+static int g_pending_count;
+static char g_handoff_prefix[APP_API_MAX_HEADER + 1];
+static size_t g_handoff_prefix_len;
 
 static void client_fd_cb(struct uloop_fd *ufd, unsigned int events);
 static int app_api_wait_first_byte(int fd);
+static int http_content_length_from_raw(const char *raw, int raw_len, int *out_len);
+static void app_api_pending_fd_cb(struct uloop_fd *ufd, unsigned int events);
 
 static void accept_resume_schedule(int delay_ms)
 {
@@ -7105,26 +7347,25 @@ static void webd_child_wait_then_kill(void)
     webd_reap_children();
 }
 
-static int app_api_peek_route(int fd, char *method, size_t method_len,
-                              char *path, size_t path_len)
+static int app_api_parse_route_line(const char *buf, size_t buf_len,
+                                    char *method, size_t method_len,
+                                    char *path, size_t path_len)
 {
-    char buf[768];
-    ssize_t n;
-    char *sp1;
-    char *sp2;
+    const char *line_end;
+    const char *sp1;
+    const char *sp2;
     size_t len;
 
-    if (!method || method_len == 0 || !path || path_len == 0)
+    if (!buf || !buf_len || !method || method_len == 0 ||
+        !path || path_len == 0)
         return -1;
     method[0] = '\0';
     path[0] = '\0';
-    if (app_api_wait_first_byte(fd) != 0)
+    line_end = memmem(buf, buf_len, "\r\n", 2);
+    if (!line_end || line_end == buf ||
+        (size_t)(line_end - buf) > APP_API_MAX_HEADER_LINE)
         return -1;
-    n = recv(fd, buf, sizeof(buf) - 1, MSG_PEEK);
-    if (n <= 0)
-        return -1;
-    buf[n] = '\0';
-    sp1 = strchr(buf, ' ');
+    sp1 = memchr(buf, ' ', (size_t)(line_end - buf));
     if (!sp1 || sp1 == buf)
         return -1;
     len = (size_t)(sp1 - buf);
@@ -7132,11 +7373,11 @@ static int app_api_peek_route(int fd, char *method, size_t method_len,
         return -1;
     memcpy(method, buf, len);
     method[len] = '\0';
-    sp2 = strchr(sp1 + 1, ' ');
+    sp2 = memchr(sp1 + 1, ' ', (size_t)(line_end - (sp1 + 1)));
     if (!sp2 || sp2 == sp1 + 1)
         return -1;
     {
-        char *q = memchr(sp1 + 1, '?', (size_t)(sp2 - (sp1 + 1)));
+        const char *q = memchr(sp1 + 1, '?', (size_t)(sp2 - (sp1 + 1)));
         if (q)
             sp2 = q;
     }
@@ -7183,117 +7424,6 @@ static void app_api_drain_request_headers(int fd)
     }
 }
 
-static int app_api_child_safe_route(const char *method, const char *path)
-{
-    if (!method || !path || !strcmp(path, "/api/v1/events/stream"))
-        return 0;
-    if (!strcmp(method, "POST") &&
-        (!strncmp(path, "/api/setup/", 11) ||
-         !strcmp(path, "/api/v1/auth/pair/cancel") ||
-         !strcmp(path, "/api/system/dhcp") ||
-         !strcmp(path, "/api/system/static") ||
-         !strcmp(path, "/api/system/pppoe") ||
-         !strcmp(path, "/api/v1/device/config/lan")))
-        return 1;
-    if (!strcmp(method, "PUT") &&
-        (!strcmp(path, "/api/system/dhcp") ||
-         !strcmp(path, "/api/system/static") ||
-         !strcmp(path, "/api/system/pppoe") ||
-         !strcmp(path, "/api/v1/device/config/lan")))
-        return 1;
-    if (app_api_terminal_route(path))
-        return 1;
-    if (!strcmp(path, "/api/v1/aegis") || !strncmp(path, "/api/v1/aegis/", 14))
-        return 1;
-    if (!strcmp(path, "/api/v1/insights") || !strncmp(path, "/api/v1/insights/", 17))
-        return 1;
-    if (!strcmp(path, "/api/v1/ai/logs/analyze") ||
-        !strcmp(path, "/api/v1/ai/chat") ||
-        !strcmp(path, "/api/v1/ai/chat/stream") ||
-        !strcmp(path, "/api/v1/ai/attachments") ||
-        !strncmp(path, "/api/v1/ai/attachments/", 23) ||
-        !strcmp(path, "/api/v1/ai/tool-resume") ||
-        !strcmp(path, "/api/v1/ai/tool-resume/stream") ||
-        !strncmp(path, "/api/v1/ai/responses/", 21) ||
-        !strcmp(path, "/api/v1/ai/provider/test") ||
-        !strncmp(path, "/api/v1/ai/oauth/", 17) ||
-        !strcmp(path, "/api/v1/ai/models/sync"))
-        return 1;
-    if (!strcmp(path, "/api/v1/toolkit") ||
-        !strncmp(path, "/api/v1/toolkit/", 16))
-        return 1;
-    if (!strcmp(path, "/api/v1/uploads") ||
-        !strncmp(path, "/api/v1/uploads/", 16) ||
-        !strncmp(path, "/api/v1/system/flash/signature-update", 37) ||
-        !strncmp(path, "/api/v1/system/flash/firmware", 29) ||
-        !strcmp(path, "/api/v1/system/flash/upload_firmware") ||
-        !strcmp(path, "/api/v1/system/flash/sysupgrade") ||
-        !strncmp(path, "/api/v1/system/ota", 18) ||
-        !strcmp(path, "/api/v1/system/flash/create_backup") ||
-        !strcmp(path, "/api/v1/system/flash/restore_backup") ||
-        !strncmp(path, "/api/v1/system/flash/restore-", 29) ||
-        !strcmp(path, "/api/v1/system/flash/backups") ||
-        !strncmp(path, "/api/v1/system/flash/backups/", 29) ||
-        !strcmp(path, "/api/v1/auth/pair/approve"))
-        return 1;
-    if (!strcmp(path, "/api/v1/topology/capture") || !strncmp(path, "/api/v1/topology/capture/", 25))
-        return 1;
-    if (strstr(path, "/traffic-flows") || strstr(path, "/traffic-flow-latest-statistics"))
-        return 1;
-    return !strcmp(method, "GET") || !strcmp(method, "HEAD") || !strcmp(method, "OPTIONS");
-}
-
-static int app_api_static_route(const char *path)
-{
-    if (!path)
-        return 0;
-    return !strcmp(path, "/favicon.ico") ||
-           !strcmp(path, "/app") ||
-           !strcmp(path, "/app/") ||
-           !strncmp(path, "/app/", 5) ||
-           !strncmp(path, "/static/", 8) ||
-           !strncmp(path, "/plugins/", 9) ||
-           !strncmp(path, "/assets/", 8) ||
-           !strncmp(path, "/login/", 7) ||
-           !strncmp(path, "/luci-static/", 13);
-}
-
-static int app_api_parent_fast_route(const char *method, const char *path)
-{
-    if (!method || !path)
-        return 0;
-    if (!strcmp(path, "/") ||
-        !strcmp(path, "/index.html") ||
-        !strcmp(path, "/login") ||
-        !strcmp(path, "/login/") ||
-        app_api_static_route(path))
-        return 1;
-
-    /*
-     * Keep only local webd routes in the parent accept loop. Routes that may
-     * synchronously touch jmxd/ubus must run in children, otherwise a wedged
-     * core makes the whole listener stop accepting new login/static requests.
-     */
-    if (!strcmp(method, "OPTIONS"))
-        return 1;
-    if (!strcmp(path, "/api/v1/health"))
-        return !strcmp(method, "GET") || !strcmp(method, "HEAD");
-    if (!strcmp(path, "/api/v1/session/init"))
-        return !strcmp(method, "GET") || !strcmp(method, "POST");
-    if (!strcmp(path, "/api/v1/session/login") ||
-        !strcmp(path, "/api/v1/auth/login") ||
-        !strcmp(path, "/api/v1/session/refresh") ||
-        !strcmp(path, "/api/v1/auth/refresh") ||
-        !strcmp(path, "/api/v1/session") ||
-        !strcmp(path, "/api/v1/auth/logout"))
-        return !strcmp(method, "POST") || !strcmp(method, "DELETE");
-    if (!strcmp(path, "/api/v1/fingerprint_index"))
-        return !strcmp(method, "GET") || !strcmp(method, "HEAD");
-    if (!strcmp(path, "/api/v1/fingerprint_upload"))
-        return !strcmp(method, "POST");
-    return 0;
-}
-
 static void app_api_send_busy(int fd, int is_ws)
 {
     struct json_object *resp = webd_error("busy", "webd is busy",
@@ -7308,6 +7438,165 @@ static void app_api_send_busy(int fd, int is_ws)
         http_send(fd, 503, "Service Unavailable", "text/plain", "busy", 4);
     }
     close(fd);
+}
+
+enum app_api_pending_result {
+    APP_API_PENDING_WAIT = 0,
+    APP_API_PENDING_READY = 1,
+    APP_API_PENDING_BAD = -1,
+    APP_API_PENDING_TOO_LARGE = -2,
+};
+
+static void app_api_pending_close(struct app_api_pending *pending)
+{
+    if (!pending || !pending->active)
+        return;
+    uloop_fd_delete(&pending->ufd);
+    if (pending->ufd.fd >= 0)
+        close(pending->ufd.fd);
+    pending->ufd.fd = -1;
+    pending->active = 0;
+    if (g_pending_count > 0)
+        g_pending_count--;
+}
+
+static int app_api_pending_detach(struct app_api_pending *pending)
+{
+    int fd;
+
+    if (!pending || !pending->active)
+        return -1;
+    fd = pending->ufd.fd;
+    uloop_fd_delete(&pending->ufd);
+    pending->ufd.fd = -1;
+    pending->active = 0;
+    if (g_pending_count > 0)
+        g_pending_count--;
+    return fd;
+}
+
+static int app_api_pending_header(const char *buf, size_t len,
+                                  size_t *header_len)
+{
+    size_t i;
+    size_t line_start = 0;
+    unsigned int lines = 0;
+
+    if (header_len)
+        *header_len = 0;
+    for (i = 0; i < len; i++) {
+        if (buf[i] == '\0' || (buf[i] == '\n' && (i == 0 || buf[i - 1] != '\r')) ||
+            (buf[i] == '\r' && (i + 1 >= len || buf[i + 1] != '\n'))) {
+            /* A trailing CR may be completed by the next nonblocking read. */
+            if (buf[i] == '\r' && i + 1 == len)
+                return APP_API_PENDING_WAIT;
+            return APP_API_PENDING_BAD;
+        }
+        if (buf[i] != '\n')
+            continue;
+        if (i + 1 - line_start > APP_API_MAX_HEADER_LINE + 2)
+            return APP_API_PENDING_TOO_LARGE;
+        lines++;
+        if (lines > APP_API_MAX_HEADER_LINES)
+            return APP_API_PENDING_TOO_LARGE;
+        if (i == line_start + 1 && buf[line_start] == '\r') {
+            if (header_len)
+                *header_len = i + 1;
+            return APP_API_PENDING_READY;
+        }
+        line_start = i + 1;
+    }
+    if (len >= APP_API_MAX_HEADER || len - line_start > APP_API_MAX_HEADER_LINE)
+        return APP_API_PENDING_TOO_LARGE;
+    return APP_API_PENDING_WAIT;
+}
+
+static void app_api_pending_error(int fd, int status, const char *reason)
+{
+    const char *status_text = status == 431 ? "Request Header Fields Too Large" :
+                              status == 408 ? "Request Timeout" :
+                              status == 503 ? "Service Unavailable" : "Bad Request";
+    const char *body = reason ? reason : "bad request";
+
+    (void)http_send(fd, status, status_text, "text/plain", body,
+                    (int)strlen(body));
+    close(fd);
+}
+
+static void app_api_pending_close_in_child(void)
+{
+    int i;
+
+    for (i = 0; i < APP_API_MAX_CLIENTS; i++) {
+        if (g_pending_clients[i].active && g_pending_clients[i].ufd.fd >= 0)
+            close(g_pending_clients[i].ufd.fd);
+    }
+    memset(g_pending_clients, 0, sizeof(g_pending_clients));
+    g_pending_count = 0;
+}
+
+static void app_api_pending_sweep_timer_cb(struct uloop_timeout *timer)
+{
+    struct timespec now;
+    int i;
+
+    (void)timer;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+        for (i = 0; i < APP_API_MAX_CLIENTS; i++) {
+            struct app_api_pending *pending = &g_pending_clients[i];
+            int expired;
+            int fd;
+
+            if (!pending->active)
+                continue;
+            expired = now.tv_sec > pending->deadline.tv_sec ||
+                      (now.tv_sec == pending->deadline.tv_sec &&
+                       now.tv_nsec >= pending->deadline.tv_nsec);
+            if (!expired)
+                continue;
+            fd = app_api_pending_detach(pending);
+            if (fd >= 0)
+                app_api_pending_error(fd, 408, "request header deadline exceeded");
+        }
+    }
+    if (g_listen_fd.fd >= 0)
+        uloop_timeout_set(&g_pending_sweep_timer, APP_API_PENDING_SWEEP_MS);
+}
+
+static int app_api_pending_add(int fd)
+{
+    struct timespec now;
+    int i;
+
+    if (g_pending_count >= APP_API_MAX_CLIENTS ||
+        clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return -1;
+    for (i = 0; i < APP_API_MAX_CLIENTS; i++) {
+        struct app_api_pending *pending = &g_pending_clients[i];
+
+        if (pending->active)
+            continue;
+        memset(pending, 0, sizeof(*pending));
+        pending->ufd.fd = fd;
+        pending->ufd.cb = app_api_pending_fd_cb;
+        pending->deadline = now;
+        pending->deadline.tv_sec += APP_API_FIRST_BYTE_TIMEOUT_MS / 1000;
+        pending->deadline.tv_nsec +=
+            (APP_API_FIRST_BYTE_TIMEOUT_MS % 1000) * 1000000L;
+        if (pending->deadline.tv_nsec >= 1000000000L) {
+            pending->deadline.tv_sec++;
+            pending->deadline.tv_nsec -= 1000000000L;
+        }
+        pending->active = 1;
+        if (uloop_fd_add(&pending->ufd, ULOOP_READ | ULOOP_EDGE_TRIGGER) != 0) {
+            pending->active = 0;
+            pending->ufd.fd = -1;
+            return -1;
+        }
+        g_pending_count++;
+        return 0;
+    }
+    return -1;
 }
 
 static const char *find_header_value(const char *headers, const char *hdr_end,
@@ -7677,9 +7966,10 @@ static int parse_http_request(const char *raw, int raw_len, struct http_req *out
 static int http_content_length_from_raw(const char *raw, int raw_len, int *out_len)
 {
     const char *hdr_end;
-    const char *value_end = NULL;
-    const char *value;
+    const char *line;
     long len = 0;
+    int content_length_count = 0;
+    int transfer_encoding_count = 0;
 
     if (out_len)
         *out_len = 0;
@@ -7688,36 +7978,135 @@ static int http_content_length_from_raw(const char *raw, int raw_len, int *out_l
     hdr_end = strstr(raw, "\r\n\r\n");
     if (!hdr_end)
         return 0;
-    value = find_header_value(raw, hdr_end, "Content-Length", &value_end);
-    if (!value)
-        return 0;
-    while (value < value_end && (*value == ' ' || *value == '\t'))
-        value++;
-    if (value >= value_end)
-        return -1;
-    while (value < value_end) {
-        unsigned char c = (unsigned char)*value++;
-        if (c == ' ' || c == '\t' || c == '\r')
-            break;
-        if (!isdigit(c))
+
+    /* Request line and every header must use CRLF. Bare LF and obs-fold are
+     * rejected so nginx and webd cannot disagree about message framing. */
+    for (line = raw; line < hdr_end; line++) {
+        if (*line == '\n' && (line == raw || line[-1] != '\r'))
             return -1;
-        len = len * 10 + (c - '0');
-        if (len > APP_API_MAX_BODY)
+        if (*line == '\r' && (line + 1 >= hdr_end || line[1] != '\n'))
             return -1;
     }
+
+    line = strstr(raw, "\r\n");
+    if (!line || line >= hdr_end)
+        return -1;
+    line += 2;
+    while (line < hdr_end) {
+        const char *line_end = strstr(line, "\r\n");
+        const char *colon;
+        const char *value;
+        const char *value_end;
+        size_t name_len;
+        const char *p;
+
+        if (!line_end || line_end > hdr_end || line == line_end ||
+            *line == ' ' || *line == '\t')
+            return -1;
+        colon = memchr(line, ':', (size_t)(line_end - line));
+        if (!colon || colon == line)
+            return -1;
+        for (p = line; p < colon; p++) {
+            unsigned char c = (unsigned char)*p;
+            if (!(isalnum(c) || c == '!' || c == '#' || c == '$' ||
+                  c == '%' || c == '&' || c == '\'' || c == '*' ||
+                  c == '+' || c == '-' || c == '.' || c == '^' ||
+                  c == '_' || c == '`' || c == '|' || c == '~'))
+                return -1;
+        }
+        name_len = (size_t)(colon - line);
+        value = colon + 1;
+        value_end = line_end;
+        while (value < value_end && (*value == ' ' || *value == '\t'))
+            value++;
+        while (value_end > value &&
+               (value_end[-1] == ' ' || value_end[-1] == '\t'))
+            value_end--;
+
+        if (name_len == strlen("Transfer-Encoding") &&
+            !strncasecmp(line, "Transfer-Encoding", name_len)) {
+            transfer_encoding_count++;
+        } else if (name_len == strlen("Content-Length") &&
+                   !strncasecmp(line, "Content-Length", name_len)) {
+            content_length_count++;
+            if (content_length_count > 1 || value >= value_end)
+                return -1;
+            len = 0;
+            for (p = value; p < value_end; p++) {
+                unsigned char c = (unsigned char)*p;
+                if (!isdigit(c))
+                    return -1;
+                len = len * 10 + (c - '0');
+                if (len > APP_API_MAX_BODY)
+                    return -1;
+            }
+        }
+        line = line_end + 2;
+    }
+
+    if (transfer_encoding_count != 0)
+        return -1;
     *out_len = (int)len;
     return 0;
 }
 
-static int read_http_request_complete(int fd, char *buf, size_t buf_sz)
+static int app_api_deadline_remaining_ms(const struct timespec *deadline)
 {
-    int total = 0;
+    struct timespec now;
+    long long remaining;
+
+    if (!deadline || clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return -1;
+    remaining = ((long long)deadline->tv_sec - now.tv_sec) * 1000LL +
+                ((long long)deadline->tv_nsec - now.tv_nsec) / 1000000LL;
+    if (remaining <= 0)
+        return 0;
+    return remaining > INT_MAX ? INT_MAX : (int)remaining;
+}
+
+static int read_http_request_complete(int fd, char *buf, size_t buf_sz,
+                                      size_t initial_len)
+{
+    int total;
     int content_len = 0;
     int need = -1;
+    struct timespec deadline;
 
-    if (!buf || buf_sz < 2)
+    if (!buf || buf_sz < 2 || initial_len >= buf_sz || initial_len > INT_MAX)
         return -1;
+    total = (int)initial_len;
+    buf[total] = '\0';
+    if (total > 0) {
+        char *hdr_end = strstr(buf, "\r\n\r\n");
+
+        if (!hdr_end || http_content_length_from_raw(buf, total, &content_len) != 0)
+            return -1;
+        need = (int)(hdr_end + 4 - buf) + content_len;
+        if (need > (int)buf_sz - 1)
+            return -1;
+        if (total >= need)
+            return total;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
+        return -1;
+    deadline.tv_sec += APP_API_REQUEST_DEADLINE_MS / 1000;
+    deadline.tv_nsec += (APP_API_REQUEST_DEADLINE_MS % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
     while (total < (int)buf_sz - 1) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN | POLLERR | POLLHUP };
+        int timeout_ms = app_api_deadline_remaining_ms(&deadline);
+        int poll_rc;
+
+        if (timeout_ms <= 0)
+            return -1;
+        do {
+            poll_rc = poll(&pfd, 1, timeout_ms);
+        } while (poll_rc < 0 && errno == EINTR);
+        if (poll_rc <= 0 || !(pfd.revents & POLLIN))
+            return -1;
         ssize_t n = read(fd, buf + total, buf_sz - 1 - (size_t)total);
         if (n < 0) {
             if (errno == EINTR)
@@ -29865,12 +30254,38 @@ static struct json_object *webd_policy_capabilities(void)
     {
         struct json_object *types = json_object_new_array();
         json_object_array_add(types, json_object_new_string("pbr"));
+        json_object_array_add(types, json_object_new_string("firewall"));
+        json_object_array_add(types, json_object_new_string("port_forwarding"));
+        json_object_array_add(types, json_object_new_string("nat"));
+        json_object_array_add(types, json_object_new_string("static_route"));
+        json_object_array_add(types, json_object_new_string("dns"));
+        json_object_array_add(types, json_object_new_string("qos"));
         json_object_object_add(cap, "reorder_supported_policy_types", types);
     }
     json_object_object_add(cap, "reorder_scope",
-                           json_object_new_string("config.db:policy_route_rule"));
+                           json_object_new_string("same_source_only"));
     json_object_object_add(cap, "reorder_mixed_sources_supported",
                            json_object_new_boolean(0));
+    json_object_object_add(cap, "reorder_full_scope_required",
+                           json_object_new_boolean(1));
+    json_object_object_add(cap, "reorder_uci_foreign_sections_preserved",
+                           json_object_new_boolean(1));
+    json_object_object_add(cap, "static_route_reorder_runtime_semantics",
+                           json_object_new_string("config_order_only; route selection remains metric/prefix/table based"));
+    {
+        struct json_object *scopes = json_object_new_array();
+        const char *names[] = {
+            "config.db:policy_route_rule", "uci:firewall:rule",
+            "uci:firewall:redirect", "uci:firewall:nat",
+            "uci:network:route", "uci:dhcp:domain_cname_host",
+            "uci:sqm:queue", NULL
+        };
+        int i;
+
+        for (i = 0; names[i]; i++)
+            json_object_array_add(scopes, json_object_new_string(names[i]));
+        json_object_object_add(cap, "reorder_scopes", scopes);
+    }
     json_object_object_add(cap, "enable_disable", json_object_new_boolean(1));
     json_object_object_add(cap, "write_preview", json_object_new_boolean(1));
     json_object_object_add(cap, "write_preview_endpoint",
@@ -29964,7 +30379,7 @@ static struct json_object *webd_policy_capabilities(void)
     json_object_object_add(cap, "apply_requires_explicit_apply_true", json_object_new_boolean(1));
     json_object_object_add(cap, "runtime_reload_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "reason",
-                           json_object_new_string("firewall/port_forwarding/dns/nat/static_route/qos_sqm/pbr and MAC ACL writes can apply through guarded transactions; reorder is transactional for config.db PBR only; other ACL subtypes and composite object writes remain preview-only"));
+                           json_object_new_string("firewall/port_forwarding/dns/nat/static_route/qos_sqm/pbr and MAC ACL writes can apply through guarded transactions; reorder is transactional within each same-source PBR/UCI scope; mixed-source reorder, other ACL subtypes and composite object writes remain unavailable"));
     json_object_object_add(cap, "uci_firewall", json_object_new_boolean(access(WEBD_POLICY_CONFIG_FIREWALL, R_OK) == 0));
     json_object_object_add(cap, "uci_network", json_object_new_boolean(access(WEBD_POLICY_CONFIG_NETWORK, R_OK) == 0));
     json_object_object_add(cap, "uci_dhcp", json_object_new_boolean(access(WEBD_POLICY_CONFIG_DHCP, R_OK) == 0));
@@ -35581,6 +35996,693 @@ static struct json_object *webd_policy_pbr_reorder_response(struct json_object *
     return webd_envelope(data, "webd.policy_engine.pbr_reorder");
 }
 
+/* ---------------------------------------------------------------------------
+ * Same-source UCI reorder executor.
+ *
+ * Policy Table rows that come from UCI packages have no explicit priority
+ * field; their evaluation order is the physical section order inside
+ * /etc/config/<package>. Reordering therefore has to move real sections
+ * with uci_reorder_section() instead of writing a synthetic "index" option.
+ *
+ * Only sections of the same UCI type participate. Unrelated sections
+ * (defaults/zone/include/global/...) keep their own absolute positions, so
+ * reordering firewall rules can never reshuffle zones or includes.
+ * ------------------------------------------------------------------------ */
+
+#define WEBD_POLICY_REORDER_MAX 512
+#define WEBD_POLICY_REORDER_PACKAGE_MAX 4096
+#define WEBD_POLICY_REORDER_LOCK "/tmp/dreamingwrt/policy-reorder.lock"
+
+struct webd_policy_reorder_scope {
+    const char *policy_type;   /* canonical Policy Table policy_type */
+    const char *package;       /* UCI package name */
+    const char *types[3];      /* participating UCI section types */
+    const char *id_prefixes[3];/* accepted row id prefixes */
+    const char *config_path;   /* file backed up before commit */
+    const char *scope_label;   /* reported scope string */
+};
+
+static const struct webd_policy_reorder_scope webd_policy_reorder_scopes[] = {
+    { "firewall",        "firewall", { "rule", NULL, NULL },
+      { "uci-firewall-rule-", NULL, NULL },
+      WEBD_POLICY_CONFIG_FIREWALL, "uci:firewall:rule" },
+    { "port_forwarding", "firewall", { "redirect", NULL, NULL },
+      { "uci-firewall-redirect-", NULL, NULL },
+      WEBD_POLICY_CONFIG_FIREWALL, "uci:firewall:redirect" },
+    { "nat",             "firewall", { "nat", NULL, NULL },
+      { "uci-firewall-nat-", NULL, NULL },
+      WEBD_POLICY_CONFIG_FIREWALL, "uci:firewall:nat" },
+    { "static_route",    "network",  { "route", "route6", NULL },
+      { "uci-network-route-", "uci-network-route6-", NULL },
+      WEBD_POLICY_CONFIG_NETWORK,  "uci:network:route" },
+    { "dns",             "dhcp",     { "domain", "cname", "host" },
+      { "uci-dhcp-", NULL, NULL },
+      WEBD_POLICY_CONFIG_DHCP,     "uci:dhcp:domain_cname_host" },
+    { "qos",             "sqm",      { "queue", NULL, NULL },
+      { "uci-sqm-queue-", NULL, NULL },
+      WEBD_POLICY_CONFIG_SQM,      "uci:sqm:queue" },
+};
+
+static const struct webd_policy_reorder_scope *webd_policy_reorder_scope_by_type(const char *policy_type)
+{
+    size_t i;
+
+    if (!policy_type || !policy_type[0])
+        return NULL;
+    for (i = 0; i < ARRAY_SIZE(webd_policy_reorder_scopes); i++) {
+        const struct webd_policy_reorder_scope *sc = &webd_policy_reorder_scopes[i];
+
+        if (!strcasecmp(policy_type, sc->policy_type))
+            return sc;
+    }
+    if (!strcasecmp(policy_type, "port-forwarding") ||
+        !strcasecmp(policy_type, "portforward") ||
+        !strcasecmp(policy_type, "port_forward"))
+        return webd_policy_reorder_scope_by_type("port_forwarding");
+    if (!strcasecmp(policy_type, "static-route") || !strcasecmp(policy_type, "route"))
+        return webd_policy_reorder_scope_by_type("static_route");
+    if (!strcasecmp(policy_type, "sqm") || !strcasecmp(policy_type, "qos_sqm"))
+        return webd_policy_reorder_scope_by_type("qos");
+    return NULL;
+}
+
+static const struct webd_policy_reorder_scope *webd_policy_reorder_scope_by_id(const char *id)
+{
+    size_t i, p;
+
+    if (!id || !id[0])
+        return NULL;
+    for (i = 0; i < ARRAY_SIZE(webd_policy_reorder_scopes); i++) {
+        const struct webd_policy_reorder_scope *sc = &webd_policy_reorder_scopes[i];
+
+        for (p = 0; p < ARRAY_SIZE(sc->id_prefixes); p++) {
+            const char *prefix = sc->id_prefixes[p];
+
+            if (!prefix)
+                break;
+            if (!strncmp(id, prefix, strlen(prefix)))
+                return sc;
+        }
+    }
+    return NULL;
+}
+
+static int webd_policy_reorder_scope_has_type(const struct webd_policy_reorder_scope *sc,
+                                              const char *type)
+{
+    size_t i;
+
+    if (!sc || !type)
+        return 0;
+    for (i = 0; i < ARRAY_SIZE(sc->types); i++) {
+        if (!sc->types[i])
+            break;
+        if (!strcmp(type, sc->types[i]))
+            return 1;
+    }
+    return 0;
+}
+
+/* Resolve a Policy Table row id to the matching section inside a scope.
+ * Uses the same per-scope numbering the list path uses so ids stay stable. */
+static struct uci_section *webd_policy_reorder_find_section(struct uci_package *pkg,
+                                                            const struct webd_policy_reorder_scope *sc,
+                                                            const char *id)
+{
+    struct uci_element *e;
+    int scope_no = 0;      /* index among participating types only */
+    int global_no = 0;     /* index among all sections of the package */
+
+    if (!pkg || !sc || !id || !id[0])
+        return NULL;
+    uci_foreach_element(&pkg->sections, e) {
+        struct uci_section *s = uci_to_section(e);
+
+        if (!s || !s->type)
+            continue;
+        global_no++;
+        if (!webd_policy_reorder_scope_has_type(sc, s->type))
+            continue;
+        scope_no++;
+        if (!strcmp(sc->package, "firewall")) {
+            /* firewall/network rows number sections across the whole package */
+            if (webd_policy_firewall_rule_id_match(s, id, global_no))
+                return s;
+        } else if (!strcmp(sc->package, "network")) {
+            if (webd_policy_network_route_id_match(s, id, scope_no))
+                return s;
+        } else if (!strcmp(sc->package, "dhcp")) {
+            if (webd_policy_dhcp_section_id_match(s, id, scope_no))
+                return s;
+        } else if (!strcmp(sc->package, "sqm")) {
+            if (webd_policy_sqm_queue_id_match(s, id, scope_no))
+                return s;
+        }
+    }
+    return NULL;
+}
+
+/* Absolute position of a section inside the package section list. */
+static int webd_policy_reorder_position_of(struct uci_package *pkg,
+                                            struct uci_section *target)
+{
+    struct uci_element *e;
+    int pos = 0;
+
+    if (!pkg || !target)
+        return -1;
+    uci_foreach_element(&pkg->sections, e) {
+        struct uci_section *s = uci_to_section(e);
+
+        if (s == target)
+            return pos;
+        pos++;
+    }
+    return -1;
+}
+
+static int webd_policy_reorder_collect_all(struct uci_package *pkg,
+                                           struct uci_section **sections,
+                                           int max_sections)
+{
+    struct uci_element *e;
+    int n = 0;
+
+    if (!pkg || !sections || max_sections <= 0)
+        return -1;
+    uci_foreach_element(&pkg->sections, e) {
+        struct uci_section *s = uci_to_section(e);
+
+        if (!s)
+            continue;
+        if (n >= max_sections)
+            return -1;
+        sections[n++] = s;
+    }
+    return n;
+}
+
+/* Collect the absolute positions currently occupied by the scope's sections,
+ * in ascending order. A reorder only permutes section content across these
+ * slots, so foreign sections never move. */
+static int webd_policy_reorder_collect_slots(struct uci_package *pkg,
+                                              const struct webd_policy_reorder_scope *sc,
+                                              int *slots, int max_slots)
+{
+    struct uci_element *e;
+    int pos = 0;
+    int n = 0;
+
+    if (!pkg || !sc || !slots || max_slots <= 0)
+        return 0;
+    uci_foreach_element(&pkg->sections, e) {
+        struct uci_section *s = uci_to_section(e);
+
+        if (!s || !s->type) {
+            pos++;
+            continue;
+        }
+        if (webd_policy_reorder_scope_has_type(sc, s->type)) {
+            if (n >= max_slots)
+                return -1;
+            slots[n++] = pos;
+        }
+        pos++;
+    }
+    return n;
+}
+
+static char *webd_policy_reorder_backup_path(const struct webd_policy_reorder_scope *sc,
+                                             char *out, size_t out_len)
+{
+    time_t now = now_s();
+
+    if (!out || out_len == 0)
+        return NULL;
+    out[0] = '\0';
+    if (!sc)
+        return out;
+    mkdir("/tmp/dreamingwrt", 0755);
+    mkdir("/tmp/dreamingwrt/policy-backups", 0755);
+    snprintf(out, out_len, "/tmp/dreamingwrt/policy-backups/%s.reorder.%lld.%ld.bak",
+             sc->package, (long long)now, (long)getpid());
+    return out;
+}
+
+static int webd_policy_reorder_config_validate(const struct webd_policy_reorder_scope *sc,
+                                                struct json_object *steps,
+                                                struct json_object *warnings,
+                                                char *err, size_t err_len)
+{
+    if (!sc)
+        return -1;
+    if (!strcmp(sc->package, "firewall"))
+        return webd_policy_firewall_validate(steps, warnings, err, err_len);
+    /* network/dhcp/sqm have no offline syntax checker comparable to fw4 check;
+     * report it instead of pretending the change was validated. */
+    json_object_array_add(warnings,
+        json_object_new_string("reorder_offline_validator_unavailable"));
+    json_object_array_add(steps,
+        json_object_new_string("no offline validator for this package; UCI commit accepted without external validation"));
+    return 0;
+}
+
+static int webd_policy_reorder_runtime_reload(const struct webd_policy_reorder_scope *sc,
+                                               const struct http_req *req,
+                                               struct json_object *body,
+                                               struct json_object *steps,
+                                               struct json_object *warnings,
+                                               struct json_object *tx)
+{
+    int requested;
+
+    if (!sc)
+        return 0;
+    if (!strcmp(sc->package, "firewall")) {
+        requested = webd_policy_query_or_body_bool(req, body, "reload_firewall", 1);
+        json_object_object_add(tx, "reload_requested", json_object_new_boolean(requested));
+        if (requested)
+            return webd_policy_firewall_reload(steps, warnings);
+        return 0;
+    }
+    if (!strcmp(sc->package, "dhcp")) {
+        requested = webd_policy_query_or_body_bool(req, body, "reload_dnsmasq", 1);
+        json_object_object_add(tx, "reload_requested", json_object_new_boolean(requested));
+        if (requested)
+            return webd_policy_dnsmasq_reload(steps, warnings);
+        return 0;
+    }
+    if (!strcmp(sc->package, "network")) {
+        /* default off: reordering routes should not risk the management path */
+        requested = webd_policy_query_or_body_bool(req, body, "reload_network", 0);
+        json_object_object_add(tx, "reload_requested", json_object_new_boolean(requested));
+        if (requested)
+            return webd_policy_network_reload(steps, warnings);
+        return 0;
+    }
+    if (!strcmp(sc->package, "sqm")) {
+        requested = webd_policy_query_or_body_bool(req, body, "reload_sqm", 0);
+        json_object_object_add(tx, "reload_requested", json_object_new_boolean(requested));
+        if (requested)
+            return webd_policy_sqm_reload(steps, warnings);
+        return 0;
+    }
+    return 0;
+}
+
+static struct json_object *webd_policy_uci_reorder_response(const struct http_req *req,
+                                                            struct json_object *body,
+                                                            const struct webd_policy_reorder_scope *sc,
+                                                            struct json_object *input,
+                                                            int apply_requested,
+                                                            int *http_status)
+{
+    struct json_object *data = json_object_new_object();
+    struct json_object *ordered = json_object_new_array();
+    struct json_object *steps = json_object_new_array();
+    struct json_object *warnings = json_object_new_array();
+    struct json_object *tx = json_object_new_object();
+    struct uci_context *ctx = NULL;
+    struct uci_package *pkg = NULL;
+    struct uci_section *targets[WEBD_POLICY_REORDER_MAX];
+    struct uci_section *desired[WEBD_POLICY_REORDER_PACKAGE_MAX];
+    int slots[WEBD_POLICY_REORDER_MAX];
+    char backup[256] = "";
+    char err[512] = "";
+    int n = json_object_array_length(input);
+    int scope_total = 0;
+    int slot_count = 0;
+    int package_count = 0;
+    int lock_fd = -1;
+    int i, ok = 0;
+
+    if (n <= 0 || n > WEBD_POLICY_REORDER_MAX) {
+        if (http_status) *http_status = 400;
+        json_object_put(ordered); json_object_put(steps);
+        json_object_put(warnings); json_object_put(tx);
+        webd_obj_add_str(data, "error", "invalid_request");
+        webd_obj_add_str(data, "message", "ids/order/items must be a non-empty array within 512 entries");
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        return webd_envelope(data, "webd.policy_engine.uci_reorder");
+    }
+
+    if (apply_requested) {
+        mkdir("/tmp/dreamingwrt", 0755);
+        lock_fd = open(WEBD_POLICY_REORDER_LOCK, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+            if (http_status) *http_status = errno == EWOULDBLOCK ? 409 : 500;
+            json_object_put(ordered); json_object_put(steps);
+            json_object_put(warnings); json_object_put(tx);
+            webd_obj_add_str(data, "error",
+                errno == EWOULDBLOCK ? "policy_write_busy" : "policy_write_lock_failed");
+            webd_obj_add_str(data, "message",
+                errno == EWOULDBLOCK ? "another policy reorder transaction is in progress" :
+                                       "unable to acquire policy reorder transaction lock");
+            json_object_object_add(data, "ok", json_object_new_boolean(0));
+            if (lock_fd >= 0)
+                close(lock_fd);
+            return webd_envelope(data, "webd.policy_engine.uci_reorder");
+        }
+    }
+
+    ctx = uci_alloc_context();
+    if (!ctx || uci_load(ctx, sc->package, &pkg) != UCI_OK || !pkg) {
+        if (http_status) *http_status = 503;
+        json_object_put(ordered); json_object_put(steps);
+        json_object_put(warnings); json_object_put(tx);
+        webd_obj_add_str(data, "error", "source_unavailable");
+        webd_obj_add_str(data, "message", "unable to load UCI package for reorder");
+        webd_obj_add_str(data, "package", sc->package);
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        if (ctx) uci_free_context(ctx);
+        if (lock_fd >= 0) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
+        return webd_envelope(data, "webd.policy_engine.uci_reorder");
+    }
+
+    slot_count = webd_policy_reorder_collect_slots(pkg, sc, slots, WEBD_POLICY_REORDER_MAX);
+    if (slot_count < 0) {
+        if (http_status) *http_status = 409;
+        json_object_put(ordered); json_object_put(steps);
+        json_object_put(warnings); json_object_put(tx);
+        webd_obj_add_str(data, "error", "reorder_scope_too_large");
+        webd_obj_add_str(data, "message", "too many sections of this type to reorder safely");
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        uci_unload(ctx, pkg);
+        uci_free_context(ctx);
+        if (lock_fd >= 0) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
+        return webd_envelope(data, "webd.policy_engine.uci_reorder");
+    }
+    scope_total = slot_count;
+    package_count = webd_policy_reorder_collect_all(
+        pkg, desired, WEBD_POLICY_REORDER_PACKAGE_MAX);
+    if (package_count < 0) {
+        if (http_status) *http_status = 409;
+        json_object_put(ordered); json_object_put(steps);
+        json_object_put(warnings); json_object_put(tx);
+        webd_obj_add_str(data, "error", "reorder_package_too_large");
+        webd_obj_add_str(data, "message", "UCI package contains too many sections to reorder safely");
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        uci_unload(ctx, pkg);
+        uci_free_context(ctx);
+        if (lock_fd >= 0) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
+        return webd_envelope(data, "webd.policy_engine.uci_reorder");
+    }
+
+    /* Resolve every requested id, rejecting cross-scope, unknown and
+     * duplicate rows before touching the config. */
+    for (i = 0; i < n; i++) {
+        struct json_object *item = json_object_array_get_idx(input, i);
+        const char *id = json_object_is_type(item, json_type_string) ?
+                         json_object_get_string(item) : app_nc_json_str(item, "id", "");
+        const struct webd_policy_reorder_scope *item_scope;
+        struct uci_section *s;
+        int j;
+
+        item_scope = webd_policy_reorder_scope_by_id(id);
+        if (!item_scope || item_scope != sc) {
+            if (http_status) *http_status = 409;
+            webd_obj_add_str(data, "error", "reorder_scope_conflict");
+            webd_obj_add_str(data, "message", "all reordered rows must belong to the same policy source");
+            webd_obj_add_str(data, "unsupported_id", id ? id : "");
+            webd_obj_add_str(data, "supported_scope", sc->scope_label);
+            goto fail;
+        }
+        s = webd_policy_reorder_find_section(pkg, sc, id);
+        if (!s) {
+            if (http_status) *http_status = 404;
+            webd_obj_add_str(data, "error", "policy_not_found");
+            webd_obj_add_str(data, "message", "policy row not found in current configuration");
+            webd_obj_add_str(data, "policy_id", id ? id : "");
+            goto fail;
+        }
+        for (j = 0; j < i; j++) {
+            if (targets[j] == s) {
+                if (http_status) *http_status = 400;
+                webd_obj_add_str(data, "error", "invalid_request");
+                webd_obj_add_str(data, "message", "duplicate policy id in reorder request");
+                webd_obj_add_str(data, "policy_id", id ? id : "");
+                goto fail;
+            }
+        }
+        targets[i] = s;
+        json_object_array_add(ordered, json_object_new_string(id ? id : ""));
+    }
+
+    /* Partial reorder would leave the remaining rows' relative order
+     * ambiguous, so require the full same-source set. */
+    if (n != scope_total) {
+        if (http_status) *http_status = 409;
+        webd_obj_add_str(data, "error", "reorder_incomplete_scope");
+        webd_obj_add_str(data, "message", "reorder must include every row of this policy source");
+        json_object_object_add(data, "expected_count", json_object_new_int(scope_total));
+        json_object_object_add(data, "received_count", json_object_new_int(n));
+        webd_obj_add_str(data, "supported_scope", sc->scope_label);
+        goto fail;
+    }
+
+    if (!apply_requested) {
+        struct json_object *preview = json_object_new_object();
+
+        if (http_status) *http_status = 409;
+        json_object_object_add(preview, "can_apply", json_object_new_boolean(1));
+        json_object_object_add(preview, "applies_changes", json_object_new_boolean(0));
+        json_object_object_add(preview, "apply_requires_explicit_apply_true", json_object_new_boolean(1));
+        webd_obj_add_str(preview, "policy_type", sc->policy_type);
+        webd_obj_add_str(preview, "scope", sc->scope_label);
+        webd_obj_add_str(preview, "config_path", sc->config_path);
+        json_object_object_add(preview, "section_count", json_object_new_int(scope_total));
+        json_object_object_add(preview, "ordered_ids", json_object_get(ordered));
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        webd_obj_add_str(data, "error", "policy_write_preview_only");
+        webd_obj_add_str(data, "message", "add apply=true to execute transactional UCI reorder");
+        json_object_object_add(data, "preview", preview);
+        json_object_object_add(data, "capabilities", webd_policy_capabilities());
+        json_object_put(ordered);
+        json_object_put(steps);
+        json_object_put(warnings);
+        json_object_put(tx);
+        uci_unload(ctx, pkg);
+        uci_free_context(ctx);
+        if (lock_fd >= 0) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
+        return webd_envelope(data, "webd.policy_engine.uci_reorder_preview");
+    }
+
+    json_object_array_add(steps, json_object_new_string("backup config"));
+    if (webd_policy_copy_file(sc->config_path,
+                              webd_policy_reorder_backup_path(sc, backup, sizeof(backup)),
+                              err, sizeof(err)) != 0) {
+        if (http_status) *http_status = 500;
+        webd_obj_add_str(data, "error", "policy_reorder_backup_failed");
+        webd_obj_add_str(data, "message", err[0] ? err : "unable to back up config");
+        goto fail_tx;
+    }
+    webd_obj_add_str(tx, "backup_path", backup);
+
+    /* Build the complete desired package order. Only the slots occupied by
+     * this scope are replaced; every foreign section remains at its original
+     * absolute position. Applying the complete order avoids list-shift side
+     * effects from moving only participating sections. */
+    for (i = 0; i < n; i++) {
+        if (slots[i] < 0 || slots[i] >= package_count) {
+            if (http_status) *http_status = 500;
+            snprintf(err, sizeof(err), "invalid reorder slot at index %d", i);
+            webd_obj_add_str(data, "error", "policy_reorder_failed");
+            webd_obj_add_str(data, "message", err);
+            goto fail_restore;
+        }
+        desired[slots[i]] = targets[i];
+    }
+    for (i = 0; i < package_count; i++) {
+        int current = webd_policy_reorder_position_of(pkg, desired[i]);
+
+        if (current < 0) {
+            if (http_status) *http_status = 500;
+            snprintf(err, sizeof(err), "section disappeared before reorder index %d", i);
+            webd_obj_add_str(data, "error", "policy_reorder_failed");
+            webd_obj_add_str(data, "message", err);
+            goto fail_restore;
+        }
+        if (current == i)
+            continue;
+        if (uci_reorder_section(ctx, desired[i], i) != UCI_OK) {
+            if (http_status) *http_status = 500;
+            snprintf(err, sizeof(err), "uci_reorder_section failed at package index %d", i);
+            webd_obj_add_str(data, "error", "policy_reorder_failed");
+            webd_obj_add_str(data, "message", err);
+            goto fail_restore;
+        }
+    }
+    json_object_array_add(steps,
+        json_object_new_string("uci reorder complete package sequence while preserving foreign section slots"));
+
+    if (uci_save(ctx, pkg) != UCI_OK) {
+        if (http_status) *http_status = 500;
+        webd_obj_add_str(data, "error", "policy_reorder_failed");
+        webd_obj_add_str(data, "message", "uci_save failed");
+        goto fail_restore;
+    }
+    if (uci_commit(ctx, &pkg, false) != UCI_OK) {
+        if (http_status) *http_status = 500;
+        webd_obj_add_str(data, "error", "policy_reorder_failed");
+        webd_obj_add_str(data, "message", "uci_commit failed");
+        goto fail_restore;
+    }
+    json_object_array_add(steps, json_object_new_string("uci commit"));
+
+    if (webd_policy_reorder_config_validate(sc, steps, warnings, err, sizeof(err)) != 0) {
+        if (http_status) *http_status = 400;
+        webd_obj_add_str(data, "error", "policy_reorder_validation_failed");
+        webd_obj_add_str(data, "message", err[0] ? err : "config validation failed after reorder");
+        goto fail_restore;
+    }
+
+    if (webd_policy_reorder_runtime_reload(sc, req, body, steps, warnings, tx) != 0) {
+        if (http_status) *http_status = 500;
+        webd_obj_add_str(data, "error", "policy_reorder_runtime_reload_failed");
+        webd_obj_add_str(data, "message", "runtime reload failed after reorder; restoring config backup");
+        goto fail_restore;
+    }
+    ok = 1;
+    if (http_status) *http_status = 200;
+    json_object_object_add(data, "ok", json_object_new_boolean(1));
+    json_object_object_add(data, "applied", json_object_new_boolean(1));
+    webd_obj_add_str(data, "policy_type", sc->policy_type);
+    webd_obj_add_str(data, "scope", sc->scope_label);
+    json_object_object_add(data, "ordered_ids", json_object_get(ordered));
+    json_object_object_add(data, "refresh_required", json_object_new_boolean(1));
+    json_object_object_add(data, "row_ids_may_change", json_object_new_boolean(1));
+    json_object_object_add(tx, "steps", json_object_get(steps));
+    json_object_object_add(tx, "warnings", json_object_get(warnings));
+    webd_obj_add_str(tx, "config_path", sc->config_path);
+    json_object_object_add(tx, "section_count", json_object_new_int(scope_total));
+    json_object_object_add(data, "transaction", json_object_get(tx));
+    json_object_object_add(data, "capabilities", webd_policy_capabilities());
+
+fail_restore:
+    if (!ok && backup[0]) {
+        json_object_array_add(steps,
+            json_object_new_string("restore config from backup after failed reorder"));
+        if (webd_policy_copy_file(backup, sc->config_path, NULL, 0) == 0)
+            json_object_array_add(warnings,
+                json_object_new_string("config_restored_from_backup"));
+        else
+            json_object_array_add(warnings,
+                json_object_new_string("config_restore_failed"));
+        /* If the failed transaction attempted a runtime reload, make a
+         * best-effort reload of the restored configuration as well. */
+        if (app_nc_json_bool(tx, "reload_requested", 0)) {
+            if (webd_policy_reorder_runtime_reload(sc, req, body, steps, warnings, tx) != 0)
+                json_object_array_add(warnings,
+                    json_object_new_string("restored_config_runtime_reload_failed"));
+            else
+                json_object_array_add(warnings,
+                    json_object_new_string("restored_config_runtime_reloaded"));
+        }
+    }
+fail_tx:
+    if (!ok) {
+        json_object_object_add(tx, "steps", json_object_get(steps));
+        json_object_object_add(tx, "warnings", json_object_get(warnings));
+        webd_obj_add_str(tx, "config_path", sc->config_path);
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        json_object_object_add(data, "applied", json_object_new_boolean(0));
+        webd_obj_add_str(data, "policy_type", sc->policy_type);
+        webd_obj_add_str(data, "scope", sc->scope_label);
+        json_object_object_add(data, "transaction", json_object_get(tx));
+        json_object_object_add(data, "capabilities", webd_policy_capabilities());
+    }
+    json_object_put(ordered);
+    json_object_put(steps);
+    json_object_put(warnings);
+    json_object_put(tx);
+    if (pkg)
+        uci_unload(ctx, pkg);
+    uci_free_context(ctx);
+    if (lock_fd >= 0) {
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+    }
+    return webd_envelope(data, "webd.policy_engine.uci_reorder");
+
+fail:
+    json_object_object_add(data, "ok", json_object_new_boolean(0));
+    json_object_object_add(data, "applied", json_object_new_boolean(0));
+    json_object_object_add(data, "capabilities", webd_policy_capabilities());
+    json_object_put(ordered);
+    json_object_put(steps);
+    json_object_put(warnings);
+    json_object_put(tx);
+    uci_unload(ctx, pkg);
+    uci_free_context(ctx);
+    if (lock_fd >= 0) {
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+    }
+    return webd_envelope(data, "webd.policy_engine.uci_reorder");
+}
+
+static struct json_object *webd_policy_reorder_response(const struct http_req *req,
+                                                        struct json_object *body,
+                                                        int apply_requested,
+                                                        int *http_status)
+{
+    struct json_object *input = NULL;
+    const struct webd_policy_reorder_scope *sc = NULL;
+    const char *policy_type;
+
+    if (!body || !json_object_is_type(body, json_type_object))
+        return webd_policy_pbr_reorder_response(body, apply_requested, http_status);
+
+    policy_type = app_nc_json_str(body, "policy_type",
+                  app_nc_json_str(body, "type", ""));
+    if (policy_type[0])
+        sc = webd_policy_reorder_scope_by_type(policy_type);
+
+    if (!json_object_object_get_ex(body, "ids", &input) &&
+        !json_object_object_get_ex(body, "order", &input) &&
+        !json_object_object_get_ex(body, "policy_ids", &input) &&
+        !json_object_object_get_ex(body, "items", &input))
+        input = NULL;
+
+    /* If policy_type is absent, infer the scope from the first row id so the
+     * frontend can reorder without restating the type. */
+    if (!sc && !policy_type[0] && input && json_object_is_type(input, json_type_array) &&
+        json_object_array_length(input) > 0) {
+        struct json_object *item = json_object_array_get_idx(input, 0);
+        const char *id = json_object_is_type(item, json_type_string) ?
+                         json_object_get_string(item) : app_nc_json_str(item, "id", "");
+
+        sc = webd_policy_reorder_scope_by_id(id);
+    }
+
+    if (!sc)
+        return webd_policy_pbr_reorder_response(body, apply_requested, http_status);
+
+    if (!input || !json_object_is_type(input, json_type_array)) {
+        struct json_object *data = json_object_new_object();
+
+        if (http_status) *http_status = 400;
+        webd_obj_add_str(data, "error", "invalid_request");
+        webd_obj_add_str(data, "message", "ids/order/items must be a non-empty array");
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        return webd_envelope(data, "webd.policy_engine.uci_reorder");
+    }
+    return webd_policy_uci_reorder_response(req, body, sc, input,
+                                            apply_requested, http_status);
+}
+
 static struct json_object *webd_policy_write_preview_response(const struct http_req *req,
                                                               struct json_object *body,
                                                               int *http_status)
@@ -35642,7 +36744,7 @@ static struct json_object *webd_policy_write_preview_response(const struct http_
         operation = "delete";
 
     if (!strcmp(operation, "reorder"))
-        return webd_policy_pbr_reorder_response(body, apply_requested, http_status);
+        return webd_policy_reorder_response(req, body, apply_requested, http_status);
 
     if (apply_requested && webd_policy_write_is_acl(operation, policy_type, id, body))
         return webd_policy_acl_apply_response(body, operation, id, http_status);
@@ -35887,6 +36989,39 @@ static struct json_object *webd_geo_runtime_response(int *http_status)
      * webd_topology_node_detail_response().
      */
     response = webd_envelope(runtime, "dreamingwrt.aegis.geo_get");
+    json_object_put(upstream);
+    if (http_status) *http_status = 200;
+    return response;
+}
+
+/*
+ * Live nft counter readback for the AegisXD-owned Geo table.
+ *
+ * Reference ownership follows webd_geo_runtime_response(): webd_envelope()
+ * steals the reference returned by webd_data_or_self_from_jmx_response(), and
+ * aegisxd replies carry neither "code" nor "data", so only `upstream` may be
+ * released here.
+ */
+static struct json_object *webd_geo_counters_response(int *http_status)
+{
+    struct json_object *upstream = app_ubus_object_or_error("dreamingwrt.aegis",
+                                                            "geo_counters", NULL);
+    struct json_object *counters;
+    struct json_object *response;
+
+    if (!upstream || !strcmp(app_ubus_response_error_code(upstream), "source_unavailable")) {
+        if (http_status) *http_status = 503;
+        return upstream ? upstream : webd_error("source_unavailable",
+                                                "Geo counter source is unavailable",
+                                                "dreamingwrt.aegis geo_counters",
+                                                "webd.aegis.geo.counters");
+    }
+    counters = webd_data_or_self_from_jmx_response(upstream);
+    if (!counters) {
+        if (http_status) *http_status = 502;
+        return upstream;
+    }
+    response = webd_envelope(counters, "dreamingwrt.aegis.geo_counters");
     json_object_put(upstream);
     if (http_status) *http_status = 200;
     return response;
@@ -41732,6 +42867,9 @@ static struct json_object *webd_logs_v2_capabilities(void)
 
     json_object_object_add(cap, "cef", json_object_new_boolean(1));
     json_object_object_add(cap, "audit", json_object_new_boolean(1));
+    json_object_object_add(cap, "log_type_filter", json_object_new_boolean(1));
+    json_object_object_add(cap, "log_source_filter", json_object_new_boolean(1));
+    json_object_object_add(cap, "web_audit_stream", json_object_new_boolean(1));
     json_object_object_add(cap, "filter_data", json_object_new_boolean(1));
     json_object_object_add(cap, "pagination", json_object_new_boolean(1));
     json_object_object_add(cap, "search", json_object_new_boolean(1));
@@ -41801,6 +42939,54 @@ static void webd_logs_attach_v2_capabilities(struct json_object *resp)
     json_object_object_add(target, "capabilities", webd_logs_v2_capabilities());
 }
 
+/*
+ * Flatten a logd reply into a single-layer REST payload.
+ *
+ * logd answers with `{ ok, data: [...], total_element_count, ... }`. Passing that
+ * straight to webd_envelope() produced `{ ok, data: { ok, data: [...] } }`, so a
+ * caller peeling one layer got the array but lost total_element_count and the
+ * paging fields, which made page counts unreliable (B-LOG-04).
+ *
+ * The array is republished as `items` while `data` keeps the same array for
+ * backward compatibility, and the sibling scalars are hoisted to the same level.
+ */
+static struct json_object *webd_logs_flatten_payload(struct json_object *upstream)
+{
+    struct json_object *payload = json_object_new_object();
+    struct json_object *rows = NULL;
+
+    if (!upstream || !json_object_is_type(upstream, json_type_object))
+        return payload;
+    json_object_object_foreach(upstream, key, value) {
+        if (!strcmp(key, "ok"))
+            continue;
+        if (!strcmp(key, "data")) {
+            rows = value;
+            continue;
+        }
+        json_object_object_add(payload, key, json_object_get(value));
+    }
+    if (!rows)
+        rows = json_object_object_get(upstream, "items");
+    if (rows && json_object_is_type(rows, json_type_array)) {
+        json_object_object_add(payload, "items", json_object_get(rows));
+        json_object_object_add(payload, "data", json_object_get(rows));
+    } else if (!json_object_object_get(payload, "items")) {
+        struct json_object *empty = json_object_new_array();
+
+        json_object_object_add(payload, "items", empty);
+        json_object_object_add(payload, "data", json_object_get(empty));
+    }
+    if (!json_object_object_get(payload, "total_element_count")) {
+        struct json_object *items = json_object_object_get(payload, "items");
+
+        json_object_object_add(payload, "total_element_count",
+                               json_object_new_int64(items ?
+                                   (int64_t)json_object_array_length(items) : 0));
+    }
+    return payload;
+}
+
 static struct json_object *webd_logs_v2_response(const char *method, struct json_object *body,
                                                  const char *source, int *status)
 {
@@ -41822,6 +43008,38 @@ static struct json_object *webd_logs_v2_response(const char *method, struct json
         return resp;
     }
     resp = webd_envelope(data, source ? source : "dreamingwrt.logd");
+    webd_logs_attach_v2_capabilities(resp);
+    return resp;
+}
+
+/*
+ * Same as webd_logs_v2_response(), but publishes a single-layer payload so
+ * `data.items` and `data.total_element_count` sit at one predictable depth.
+ */
+static struct json_object *webd_logs_v2_flat_response(const char *method,
+                                                      struct json_object *body,
+                                                      const char *source, int *status)
+{
+    struct json_object *upstream;
+    struct json_object *resp;
+
+    upstream = app_ubus_invoke_object_timeout("dreamingwrt.logd", method, body, 2000);
+    if (!upstream) {
+        if (status)
+            *status = 503;
+        return webd_error("source_unavailable", "logd source is not available",
+                          "dreamingwrt.logd", source ? source : "webd.logs");
+    }
+    if (!app_nc_json_bool(upstream, "ok", 1)) {
+        if (status)
+            *status = 400;
+        resp = webd_envelope(upstream, source ? source : "dreamingwrt.logd");
+        webd_logs_attach_v2_capabilities(resp);
+        return resp;
+    }
+    resp = webd_envelope(webd_logs_flatten_payload(upstream),
+                         source ? source : "dreamingwrt.logd");
+    json_object_put(upstream);
     webd_logs_attach_v2_capabilities(resp);
     return resp;
 }
@@ -42419,13 +43637,13 @@ static struct json_object *webd_ai_logs_analyze_response(struct json_object *bod
 static int webd_logs_download_response(int fd, const struct http_req *req)
 {
     char id[160];
-    char path[256];
     char filename[192];
     char header[768];
     char buf[8192];
     const char *content_type = "application/octet-stream";
     struct stat st;
-    int f;
+    int dirfd = -1;
+    int f = -1;
     int hlen;
 
     if (!req) {
@@ -42440,13 +43658,21 @@ static int webd_logs_download_response(int fd, const struct http_req *req)
         http_send(fd, 400, "Bad Request", "text/plain", "invalid download id", 19);
         return 0;
     }
-    snprintf(path, sizeof(path), "%s/%s", WEBD_LOG_EXPORT_DIR, id);
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+    dirfd = open(WEBD_LOG_EXPORT_DIR,
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0 || fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        if (dirfd >= 0)
+            close(dirfd);
         http_send(fd, 404, "Not Found", "text/plain", "export not found", 16);
         return 0;
     }
-    f = open(path, O_RDONLY | O_CLOEXEC);
-    if (f < 0) {
+    f = openat(dirfd, id, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    close(dirfd);
+    if (f < 0 || fstat(f, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != 0 || st.st_nlink != 1) {
+        if (f >= 0)
+            close(f);
         http_send(fd, 404, "Not Found", "text/plain", "export not found", 16);
         return 0;
     }
@@ -47578,6 +48804,85 @@ static void webd_menu_mark_capability_disabled(struct json_object *capabilities,
     webd_json_array_add_unique_string(disabled, name);
 }
 
+static void webd_apply_flowd_runtime_capabilities(struct json_object *capabilities,
+                                                   struct json_object *disabled_caps)
+{
+    static const char *const names[] = {
+        "flow_engine_read",
+        "flow_engine_config_write",
+        "flow_engine_apply",
+        "flow_engine_runtime_readback",
+    };
+    struct json_object *status = jmx_cache_get("flowd_runtime_capabilities");
+    struct json_object *flow_caps = NULL;
+    struct json_object *reasons = NULL;
+    struct json_object *version = NULL;
+    struct json_object *reason_copy = json_object_new_object();
+    int read_supported = 0;
+    size_t i;
+
+    if (!status) {
+        status = app_ubus_invoke_object_timeout("dreamingwrt.flowd", "status", NULL, 300);
+        if (status)
+            jmx_cache_put("flowd_runtime_capabilities", status, 3);
+    }
+    if (status) {
+        flow_caps = webd_obj_child_obj(status, "capabilities");
+        if (!flow_caps)
+            flow_caps = webd_obj_child_obj(webd_obj_child_obj(status, "data"),
+                                            "capabilities");
+        if (flow_caps)
+            reasons = webd_obj_child_obj(flow_caps, "reasons");
+        if (!json_object_object_get_ex(status, "runtime_contract_version", &version)) {
+            struct json_object *data = webd_obj_child_obj(status, "data");
+
+            if (data)
+                json_object_object_get_ex(data, "runtime_contract_version", &version);
+        }
+    }
+
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        struct json_object *value = NULL;
+        struct json_object *reason = NULL;
+        int supported = flow_caps &&
+            json_object_object_get_ex(flow_caps, names[i], &value) &&
+            json_object_get_boolean(value);
+
+        json_object_object_add(capabilities, names[i],
+                               json_object_new_boolean(supported));
+        if (!supported)
+            webd_json_array_add_unique_string(disabled_caps, names[i]);
+        else
+            webd_json_array_remove_string(disabled_caps, names[i]);
+        if (reasons && json_object_object_get_ex(reasons, names[i], &reason) && reason)
+            json_object_object_add(reason_copy, names[i], json_object_get(reason));
+        else if (!supported)
+            json_object_object_add(reason_copy, names[i],
+                                   json_object_new_string("flowd_status_unavailable"));
+        if (!strcmp(names[i], "flow_engine_read"))
+            read_supported = supported;
+    }
+    json_object_object_add(capabilities, "flow_engine_capability_reasons", reason_copy);
+    json_object_object_add(capabilities, "flow_engine_runtime_contract_version",
+                           version ? json_object_get(version) :
+                           json_object_new_string("unavailable"));
+
+    /* Legacy flags now mean that the engine can be read, not that apply exists. */
+    json_object_object_add(capabilities, "flow_control",
+                           json_object_new_boolean(read_supported));
+    json_object_object_add(capabilities, "flow_control_engine",
+                           json_object_new_boolean(read_supported));
+    if (!read_supported) {
+        webd_json_array_add_unique_string(disabled_caps, "flow_control");
+        webd_json_array_add_unique_string(disabled_caps, "flow_control_engine");
+    } else {
+        webd_json_array_remove_string(disabled_caps, "flow_control");
+        webd_json_array_remove_string(disabled_caps, "flow_control_engine");
+    }
+    if (status)
+        json_object_put(status);
+}
+
 static void webd_apply_runtime_capabilities(struct json_object *capabilities,
                                             struct json_object *hide_funcs,
                                             struct json_object *disabled_caps)
@@ -47591,6 +48896,8 @@ static void webd_apply_runtime_capabilities(struct json_object *capabilities,
 
     if (!capabilities)
         return;
+
+    webd_apply_flowd_runtime_capabilities(capabilities, disabled_caps);
 
     if (setup)
         wifi_known = webd_json_bool_field(setup, "supported_wifi", &wifi_supported);
@@ -50273,11 +51580,21 @@ static void webd_aegis_certificate_download_response(int fd,
 static void handle_client(int fd)
 {
     static char buf[APP_API_MAX_BODY + APP_API_READ_BUF];
-    if (app_api_wait_first_byte(fd) != 0) {
+    size_t prefix_len = g_handoff_prefix_len;
+
+    if (prefix_len > sizeof(buf) - 1) {
+        g_handoff_prefix_len = 0;
         close(fd);
         return;
     }
-    int n = read_http_request_complete(fd, buf, sizeof(buf));
+    if (prefix_len > 0)
+        memcpy(buf, g_handoff_prefix, prefix_len);
+    g_handoff_prefix_len = 0;
+    if (prefix_len == 0 && app_api_wait_first_byte(fd) != 0) {
+        close(fd);
+        return;
+    }
+    int n = read_http_request_complete(fd, buf, sizeof(buf), prefix_len);
     if (n <= 0) { close(fd); return; }
 
     struct http_req req;
@@ -50288,6 +51605,10 @@ static void handle_client(int fd)
     }
     fill_peer_ip(fd, &req);
     apply_trusted_forwarded_ip(buf, &req);
+    snprintf(g_webd_audit_source_ip, sizeof(g_webd_audit_source_ip), "%s",
+             req.client_ip);
+    snprintf(g_webd_audit_method, sizeof(g_webd_audit_method), "%s",
+             req.method);
 
     /* OPTIONS (CORS preflight) */
     if (!strcmp(req.method, "OPTIONS")) {
@@ -50552,6 +51873,7 @@ static void handle_client(int fd)
         int is_web = app_nc_json_str(body_json, "username", "")[0] ? 1 : 0;
         struct json_object *resp = is_web ? jmx_web_login_ex(body_json, req.client_ip, &login_status) :
                                            jmx_app_login_ex(body_json, req.client_ip, &login_status);
+        webd_audit_login_result(body_json, resp, req.client_ip, login_status);
         if (resp) {
             const char *tok = app_nc_json_str(resp, "access_token", "");
             char cookie[256];
@@ -50577,6 +51899,7 @@ static void handle_client(int fd)
         int is_web = app_nc_json_str(body_json, "username", "")[0] ? 1 : 0;
         struct json_object *data = is_web ? jmx_web_login_ex(body_json, req.client_ip, &login_status) :
                                            jmx_app_login_ex(body_json, req.client_ip, &login_status);
+        webd_audit_login_result(body_json, data, req.client_ip, login_status);
         if (data) {
             struct json_object *resp = webd_envelope(data, "webd.session");
             const char *tok = app_nc_json_str(data, "access_token", "");
@@ -52331,6 +53654,11 @@ static void handle_client(int fd)
              !strcmp(req.method, "GET")) {
         resp = webd_geo_runtime_response(&status);
     }
+    else if ((!strcmp(req.path, "/api/v1/aegis/geo/counters") ||
+              !strcmp(req.path, "/api/v1/firewall/geo-block/counters")) &&
+             !strcmp(req.method, "GET")) {
+        resp = webd_geo_counters_response(&status);
+    }
     else if ((!strcmp(req.path, "/api/v1/aegis/geo/preview") ||
               !strcmp(req.path, "/api/v1/firewall/geo-block/preview")) &&
              !strcmp(req.method, "POST")) {
@@ -52998,6 +54326,16 @@ static void handle_client(int fd)
     }
     else if (!strcmp(req.path, "/api/v1/flowd/compile") && !strcmp(req.method, "POST")) {
         resp = app_ubus_object_or_error("dreamingwrt.flowd", "compile", body_json);
+        status = app_response_status(resp, status);
+    }
+    else if (!strcmp(req.path, "/api/v1/flowd/nft-revision") &&
+             !strcmp(req.method, "GET")) {
+        resp = app_ubus_object_or_error("dreamingwrt.flowd", "nft_revision_status", body_json);
+        status = app_response_status(resp, status);
+    }
+    else if (!strcmp(req.path, "/api/v1/flowd/nft-revision") &&
+             !strcmp(req.method, "POST")) {
+        resp = app_ubus_object_or_error("dreamingwrt.flowd", "nft_revision_apply", body_json);
         status = app_response_status(resp, status);
     }
     else if (!strcmp(req.path, "/api/v1/flowd/apply-jobs") &&
@@ -55811,7 +57149,8 @@ static void handle_client(int fd)
                 status = webd_ac_http_status(resp, status);
                 token_id = app_nc_json_str(resp, "token_id", "");
                 result = webd_ac_response_ok(resp) ? "success" : "failed";
-                webd_ac_audit_finish(audit_id, token_id, result,
+                webd_ac_audit_finish(audit_id, device_id, req.client_ip,
+                                     "ac.pairing_token.create", token_id, result,
                                      result[0] == 's' ? "" : "upstream_failed");
             }
             json_object_put(params);
@@ -55866,7 +57205,8 @@ static void handle_client(int fd)
                     resp = app_ubus_object_or_error("dreamingwrt.ac",
                                                     "pairing_token_revoke", params);
                     result = webd_ac_response_ok(resp) ? "success" : "failed";
-                    webd_ac_audit_finish(audit_id, token_id, result,
+                    webd_ac_audit_finish(audit_id, device_id, req.client_ip,
+                                         "ac.pairing_token.revoke", token_id, result,
                                          result[0] == 's' ? "" :
                                          "upstream_failed");
                 }
@@ -55986,7 +57326,8 @@ static void handle_client(int fd)
     }
     else if (!strcmp(req.path, "/api/v1/logs/search") && (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
         webd_logs_attach_actor(body_json, device_id);
-        resp = webd_logs_v2_response("unifi_search", body_json, "dreamingwrt.logd.unifi_search", &status);
+        resp = webd_logs_v2_flat_response("unifi_search", body_json,
+                                          "dreamingwrt.logd.unifi_search", &status);
     }
     else if (!strcmp(req.path, "/api/v1/logs/summary") && !strcmp(req.method, "GET")) {
         struct json_object *params = json_object_new_object();
@@ -56730,8 +58071,156 @@ static void handle_client(int fd)
     json_object_put(body_json);
 }
 
+static void app_api_dispatch_ready(int fd, const char *method, const char *path,
+                                   const char *header, size_t header_len)
+{
+    int is_sse = method && path && !strcmp(method, "GET") &&
+                 !strcmp(path, "/api/v1/events/stream");
+    int is_ws = app_api_is_ws_route(method, path);
+    int limit = webd_child_limit(is_ws);
+    int count;
+    pid_t pid;
+
+    if (!header || header_len == 0 || header_len > APP_API_MAX_HEADER) {
+        close(fd);
+        return;
+    }
+    memcpy(g_handoff_prefix, header, header_len);
+    g_handoff_prefix[header_len] = '\0';
+    g_handoff_prefix_len = header_len;
+    app_api_set_io_timeout(fd);
+    if (is_sse) {
+        if (g_sse_count >= MAX_SSE_CLIENTS) {
+            app_api_send_busy(fd, 0);
+            g_handoff_prefix_len = 0;
+            return;
+        }
+        if (app_api_set_blocking(fd) != 0) {
+            close(fd);
+            g_handoff_prefix_len = 0;
+            return;
+        }
+        handle_client(fd);
+        g_handoff_prefix_len = 0;
+        return;
+    }
+    webd_reap_children();
+    count = *webd_child_count_ptr(is_ws);
+    if (count >= limit) {
+        app_api_send_busy(fd, is_ws);
+        g_handoff_prefix_len = 0;
+        return;
+    }
+    pid = fork();
+    if (pid == 0) {
+        memset(g_app_children, 0, sizeof(g_app_children));
+        memset(g_app_ws_children, 0, sizeof(g_app_ws_children));
+        g_app_child_count = 0;
+        g_app_ws_child_count = 0;
+        app_api_pending_close_in_child();
+        if (g_listen_fd.fd >= 0 && g_listen_fd.fd != fd)
+            close(g_listen_fd.fd);
+        if (g_event_fd.fd >= 0 && g_event_fd.fd != fd)
+            close(g_event_fd.fd);
+        if (g_app_db) {
+            sqlite3_close(g_app_db);
+            g_app_db = NULL;
+        }
+        if (g_config_db) {
+            sqlite3_close(g_config_db);
+            g_config_db = NULL;
+        }
+        if (app_api_set_blocking(fd) != 0)
+            _exit(1);
+        app_db_open_runtime();
+        handle_client(fd);
+        _exit(0);
+    }
+    if (pid > 0) {
+        if (webd_child_track(pid, is_ws) != 0)
+            kill(pid, SIGTERM);
+        close(fd);
+        g_handoff_prefix_len = 0;
+        return;
+    }
+    app_api_send_busy(fd, is_ws);
+    g_handoff_prefix_len = 0;
+}
+
+static void app_api_pending_fd_cb(struct uloop_fd *ufd, unsigned int events)
+{
+    struct app_api_pending *pending = container_of(ufd, struct app_api_pending, ufd);
+    char method[8];
+    char path[512];
+    size_t header_len = 0;
+    ssize_t n;
+    int state;
+    int content_len = 0;
+    int fd;
+
+    if (!pending->active)
+        return;
+    (void)events;
+    for (;;) {
+        if (pending->header_len >= APP_API_MAX_HEADER) {
+            state = APP_API_PENDING_TOO_LARGE;
+            break;
+        }
+        n = recv(ufd->fd, pending->header + pending->header_len,
+                 APP_API_MAX_HEADER - pending->header_len, MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return;
+            app_api_pending_close(pending);
+            return;
+        }
+        if (n == 0) {
+            app_api_pending_close(pending);
+            return;
+        }
+        pending->header_len += (size_t)n;
+        state = app_api_pending_header(pending->header, pending->header_len,
+                                       &header_len);
+        if (state != APP_API_PENDING_WAIT)
+            break;
+    }
+    if (state == APP_API_PENDING_WAIT)
+        return;
+    fd = app_api_pending_detach(pending);
+    if (fd < 0)
+        return;
+    if (state == APP_API_PENDING_TOO_LARGE) {
+        app_api_pending_error(fd, 431, "request headers too large");
+        return;
+    }
+    if (state != APP_API_PENDING_READY ||
+        app_api_parse_route_line(pending->header, header_len, method, sizeof(method),
+                                 path, sizeof(path)) != 0) {
+        app_api_pending_error(fd, 400, "malformed request headers");
+        return;
+    }
+    pending->header[header_len] = '\0';
+    if (http_content_length_from_raw(pending->header, (int)header_len,
+                                     &content_len) != 0) {
+        app_api_pending_error(fd, 400, "invalid HTTP message framing");
+        return;
+    }
+    if (!strcmp(method, "GET") && !strcmp(path, "/api/v1/events/stream") &&
+        content_len != 0) {
+        app_api_pending_error(fd, 400, "SSE request body is not allowed");
+        return;
+    }
+    app_api_dispatch_ready(fd, method, path, pending->header,
+                           pending->header_len);
+}
+
 static void client_fd_cb(struct uloop_fd *ufd, unsigned int events)
 {
+    /* The pending readiness callback owns route classification, including
+     * !strcmp(path, "/api/v1/events/stream"), and normal dispatch uses
+     * pid_t pid = fork(); after the complete bounded header is available. */
     (void)events;
     struct sockaddr_in client_addr;
     int accepted = 0;
@@ -56751,74 +58240,10 @@ static void client_fd_cb(struct uloop_fd *ufd, unsigned int events)
             accept_resume_schedule(APP_API_ACCEPT_POLL_MS);
             return;
         }
-        app_api_set_io_timeout(cfd);
-        app_api_set_blocking(cfd);
-        webd_reap_children();
-        {
-            char method[8];
-            char path[512];
-            int have_route = app_api_peek_route(cfd, method, sizeof(method), path, sizeof(path)) == 0;
-
-            if (!have_route) {
-                struct json_object *err = webd_error("bad_request",
-                                                     "failed to read HTTP request line",
-                                                     "request_line_timeout_or_malformed",
-                                                     "webd.accept");
-                if (err) {
-                    http_send_json(cfd, 400, err);
-                    json_object_put(err);
-                } else {
-                    http_send(cfd, 400, "Bad Request", "text/plain",
-                              "bad request", 11);
-                }
-                close(cfd);
-            } else if (app_api_parent_fast_route(method, path)) {
-                handle_client(cfd);
-            } else if (app_api_child_safe_route(method, path)) {
-                int is_ws = app_api_is_ws_route(method, path);
-                int limit = webd_child_limit(is_ws);
-                int count = *webd_child_count_ptr(is_ws);
-
-                if (count >= limit) {
-                    app_api_send_busy(cfd, is_ws);
-                    accepted++;
-                    continue;
-                }
-                pid_t pid = fork();
-
-                if (pid == 0) {
-                    memset(g_app_children, 0, sizeof(g_app_children));
-                    memset(g_app_ws_children, 0, sizeof(g_app_ws_children));
-                    g_app_child_count = 0;
-                    g_app_ws_child_count = 0;
-                    if (g_listen_fd.fd >= 0 && g_listen_fd.fd != cfd)
-                        close(g_listen_fd.fd);
-                    if (g_event_fd.fd >= 0 && g_event_fd.fd != cfd)
-                        close(g_event_fd.fd);
-                    if (g_app_db) {
-                        sqlite3_close(g_app_db);
-                        g_app_db = NULL;
-                    }
-                    if (g_config_db) {
-                        sqlite3_close(g_config_db);
-                        g_config_db = NULL;
-                    }
-                    app_db_open_runtime();
-                    handle_client(cfd);
-                    _exit(0);
-                }
-                if (pid > 0) {
-                    webd_child_track(pid, is_ws);
-                    close(cfd);
-                } else if (is_ws) {
-                    app_api_send_busy(cfd, 1);
-                } else {
-                    handle_client(cfd);
-                }
-            } else {
-                handle_client(cfd);
-            }
-        }
+        if (app_api_set_nonblock(cfd) != 0)
+            close(cfd);
+        else if (app_api_pending_add(cfd) != 0)
+            app_api_pending_error(cfd, 503, "pending connection limit reached");
         accepted++;
     }
 
@@ -56850,6 +58275,7 @@ static void webd_ai_local_worker_prepare(void)
     memset(g_app_ws_children, 0, sizeof(g_app_ws_children));
     g_app_child_count = 0;
     g_app_ws_child_count = 0;
+    app_api_pending_close_in_child();
     if (g_listen_fd.fd >= 0)
         close(g_listen_fd.fd);
     if (g_event_fd.fd >= 0)
@@ -56928,15 +58354,21 @@ int jmx_app_api_init(const char *bind_addr, int port)
     memset(g_sse_fds, 0, sizeof(g_sse_fds));
     memset(g_sse_tokens, 0, sizeof(g_sse_tokens));
     g_sse_count = 0;
+    memset(g_pending_clients, 0, sizeof(g_pending_clients));
+    for (waited_ms = 0; waited_ms < APP_API_MAX_CLIENTS; waited_ms++)
+        g_pending_clients[waited_ms].ufd.fd = -1;
+    g_pending_count = 0;
 
     g_listen_fd.fd = fd;
     g_listen_fd.cb = client_fd_cb;
     g_accept_resume_timer.cb = accept_resume_timer_cb;
     g_child_reap_timer.cb = webd_child_reap_timer_cb;
+    g_pending_sweep_timer.cb = app_api_pending_sweep_timer_cb;
     g_sse_auth_timer.cb = webd_sse_auth_timer_cb;
     uloop_fd_add(&g_listen_fd, ULOOP_READ);
     accept_resume_schedule(APP_API_ACCEPT_POLL_MS);
     uloop_timeout_set(&g_child_reap_timer, 1000);
+    uloop_timeout_set(&g_pending_sweep_timer, APP_API_PENDING_SWEEP_MS);
     uloop_timeout_set(&g_sse_auth_timer,
                       WEBD_SESSION_IDLE_TOUCH_INTERVAL_S * 1000);
     if (app_event_socket_init() != 0)
@@ -56966,7 +58398,10 @@ void jmx_app_api_done(void)
     g_sse_count = 0;
     uloop_timeout_cancel(&g_accept_resume_timer);
     uloop_timeout_cancel(&g_child_reap_timer);
+    uloop_timeout_cancel(&g_pending_sweep_timer);
     uloop_timeout_cancel(&g_sse_auth_timer);
+    for (i = 0; i < APP_API_MAX_CLIENTS; i++)
+        app_api_pending_close(&g_pending_clients[i]);
     if (g_listen_fd.fd >= 0) {
         uloop_fd_delete(&g_listen_fd);
         close(g_listen_fd.fd);

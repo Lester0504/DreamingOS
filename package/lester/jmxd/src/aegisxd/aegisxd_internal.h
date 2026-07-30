@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <net/if.h>
 
 #include <curl/curl.h>
 #include <json-c/json.h>
@@ -29,23 +30,48 @@
 #include <libubox/utils.h>
 #include <libubus.h>
 
-#define AEGISXD_CONFIG_DB_PATH "/etc/dreamingwrt/config.db"
-#define AEGISXD_DB_PATH "/etc/dreamingwrt/aegis.db"
+#ifndef AEGISXD_CONFIG_DIR
+#define AEGISXD_CONFIG_DIR "/etc/dreamingwrt"
+#endif
+#ifndef AEGISXD_CONFIG_DB_PATH
+#define AEGISXD_CONFIG_DB_PATH AEGISXD_CONFIG_DIR "/config.db"
+#endif
+#ifndef AEGISXD_DB_PATH
+#define AEGISXD_DB_PATH AEGISXD_CONFIG_DIR "/aegis.db"
+#endif
+#ifndef AEGISXD_CLIENT_DB_PATH
+#define AEGISXD_CLIENT_DB_PATH AEGISXD_CONFIG_DIR "/dreamingwrt.db"
+#endif
+#ifndef AEGISXD_RUNTIME_DIR
 #define AEGISXD_RUNTIME_DIR "/run/dreamingwrt/aegis"
+#endif
+#ifndef AEGISXD_WORK_DIR
 #define AEGISXD_WORK_DIR "/opt/dreamingwrt/aegis"
-#define AEGISXD_FEED_DIR "/opt/dreamingwrt/aegis/feeds"
+#endif
+#ifndef AEGISXD_PKI_DIR
+#define AEGISXD_PKI_DIR AEGISXD_CONFIG_DIR "/aegis-pki"
+#endif
+#ifndef AEGISXD_FEED_DIR
+#define AEGISXD_FEED_DIR AEGISXD_WORK_DIR "/feeds"
+#endif
+#ifndef AEGISXD_LEGACY_FEED_DIR
 #define AEGISXD_LEGACY_FEED_DIR "/tmp/dreamingwrt-aegisxd/feeds"
+#endif
+#ifndef AEGISXD_DNSMASQ_LOG_PATH
 #define AEGISXD_DNSMASQ_LOG_PATH "/var/run/dnsmasq/dreamingwrt-aegis.log"
+#endif
 #define AEGISXD_SURICATA_ACTIVE_PATH AEGISXD_RUNTIME_DIR "/suricata-active.json"
 #define AEGISXD_SURICATA_EVE_PATH AEGISXD_WORK_DIR "/suricata/eve.json"
 #define AEGISXD_SURICATA_LOG_DIR AEGISXD_WORK_DIR "/suricata"
 #define AEGISXD_SURICATA_CONFIG_PATH AEGISXD_RUNTIME_DIR "/suricata.yaml"
 #define AEGISXD_SURICATA_PID_PATH AEGISXD_RUNTIME_DIR "/suricata.pid"
+#define AEGISXD_SURICATA_NFQ_TABLE "dreamingwrt_aegis_ids"
+#define AEGISXD_SURICATA_NFQ_PATH AEGISXD_RUNTIME_DIR "/suricata-nfqueue.nft"
 #define AEGISXD_HONEYPOT_RUNTIME_PATH AEGISXD_RUNTIME_DIR "/honeypot-runtime.json"
 #define AEGISXD_HONEYPOT_NFT_PATH AEGISXD_RUNTIME_DIR "/honeypot.nft"
 #define AEGISXD_HONEYPOT_ACTIVE_PATH AEGISXD_RUNTIME_DIR "/honeypot-active.json"
 #define AEGISXD_HONEYPOT_BINARY "/usr/bin/dreamingwrt-honeypotd"
-#define AEGISXD_SCHEMA_VERSION 8
+#define AEGISXD_SCHEMA_VERSION 11
 #define AEGISXD_MAX_PATH 512
 #define AEGISXD_MAX_TEXT 1024
 #define AEGISXD_MAX_FEED_BYTES (64U * 1024U * 1024U)
@@ -57,6 +83,9 @@ struct aegisxd_settings {
     char suricata_version[32];
     char default_action[32];
     int logging_enabled;
+    char suricata_interface[IFNAMSIZ];
+    int suricata_queue_num;
+    int suricata_fail_open;
 };
 
 struct aegisxd_feed_manifest {
@@ -93,6 +122,7 @@ int aegisxd_db_init(void);
 void aegisxd_db_close(void);
 int aegisxd_settings_load(struct aegisxd_settings *out);
 int aegisxd_seed_builtin_feeds(void);
+int aegisxd_certificate_schema_init(void);
 
 struct json_object *aegisxd_status_json(void);
 struct json_object *aegisxd_feeds_json(void);
@@ -122,6 +152,16 @@ struct json_object *aegisxd_set_enabled(struct json_object *body);
 struct json_object *aegisxd_set_mode(struct json_object *body);
 struct json_object *aegisxd_set_profile(struct json_object *body);
 
+struct json_object *aegisxd_certificate_status_json(void);
+struct json_object *aegisxd_certificate_generate_json(struct json_object *body);
+struct json_object *aegisxd_certificate_rotate_json(struct json_object *body);
+struct json_object *aegisxd_certificate_revoke_json(struct json_object *body);
+struct json_object *aegisxd_certificate_download_json(struct json_object *body);
+struct json_object *aegisxd_certificate_distribution_downloaded_json(struct json_object *body);
+struct json_object *aegisxd_certificate_distributions_json(struct json_object *body);
+struct json_object *aegisxd_certificate_distribution_create_json(struct json_object *body);
+struct json_object *aegisxd_certificate_distribution_get_json(struct json_object *body);
+
 struct json_object *aegisxd_content_policies_json(struct json_object *body);
 struct json_object *aegisxd_content_policy_validate_json(struct json_object *body);
 struct json_object *aegisxd_content_policy_set_json(struct json_object *body);
@@ -134,7 +174,34 @@ void *aegisxd_content_filter_load(void);
 void aegisxd_content_filter_free(void *filter);
 int aegisxd_content_filter_domain_blocked(void *filter, const char *domain,
                                           const char *category, int reputation);
+int aegisxd_content_filter_domain_explicitly_blocked(void *filter,
+                                                      const char *domain);
+int aegisxd_content_filter_mark_category_emitted(void *filter,
+                                                  const char *domain);
 int aegisxd_content_filter_write_explicit_blocks(void *filter, FILE *fp);
+int aegisxd_content_revision_get(void);
+int aegisxd_content_installed_dns_rule_match(const char *domain,
+                                             char kind[32], char source_id[64],
+                                             char matched_rule[254]);
+int aegisxd_content_dns_provenance_ready(void);
+struct json_object *aegisxd_pcdn_get_json(void);
+struct json_object *aegisxd_pcdn_validate_json(struct json_object *body);
+struct json_object *aegisxd_pcdn_set_json(struct json_object *body);
+struct json_object *aegisxd_pcdn_sync_json(struct json_object *body);
+struct json_object *aegisxd_pcdn_active_state_json(void);
+int aegisxd_pcdn_sync_worker_main(const char *job_id);
+int aegisxd_pcdn_write_dnsmasq(FILE *fp,
+                               int (*allow_cb)(const char *domain, void *opaque),
+                               void *opaque);
+int aegisxd_pcdn_configured(void);
+int aegisxd_pcdn_monitor_configured(void);
+int aegisxd_pcdn_effective_rule_count(const char *path);
+int aegisxd_pcdn_installed_domain_match(const char *domain,
+                                        char artifact_sha256[65]);
+int aegisxd_pcdn_installed_monitor_match(const char *domain,
+                                         char matched_rule[254],
+                                         char artifact_sha256[65]);
+int aegisxd_pcdn_hit_attribution_ready(void);
 
 struct json_object *aegisxd_ingest_suricata_eve(struct json_object *body);
 struct json_object *aegisxd_honeypot_get_json(void);
@@ -152,6 +219,7 @@ int aegisxd_honeypot_reconcile(void);
 struct json_object *aegisxd_geo_get_json(void);
 struct json_object *aegisxd_geo_apply_json(struct json_object *body);
 struct json_object *aegisxd_geo_status_json(void);
+struct json_object *aegisxd_geo_counters_json(void);
 struct json_object *aegisxd_signature_policies_json(struct json_object *body);
 struct json_object *aegisxd_set_signature_policy_json(struct json_object *body);
 struct json_object *aegisxd_suppress_signature_json(struct json_object *body);
@@ -160,6 +228,7 @@ struct json_object *aegisxd_signature_policy_counts_json(void);
 int aegisxd_signature_policy_problem_count(void);
 int aegisxd_signature_policy_effective_enabled_count(void);
 int aegisxd_suricata_runtime_available(void);
+int aegisxd_suricata_nfqueue_runtime_active(void);
 int aegisxd_signature_policy_effective_rule_text(int gid, int sid, int rev,
                                                  int enabled_default,
                                                  const char *default_action,

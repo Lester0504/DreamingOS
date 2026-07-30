@@ -42,9 +42,7 @@ static inline char *jmx_client_fs_compat_strncpy(char *dst, const char *src, siz
 #define strncpy jmx_client_fs_compat_strncpy
 #endif
 #include "jmx_client.h"
-extern char *ipv6_to_str(const struct in6_addr *addr, char *str);
-
-extern struct list_head af_client_list_table[MAX_AF_CLIENT_HASH_SIZE];
+#include "jmx_client_fs.h"
 struct af_client_iter_state
 {
     unsigned int bucket;
@@ -122,7 +120,7 @@ static void *af_client_seq_next(struct seq_file *s, void *v, loff_t *pos)
     return af_client_get_next(s, v);
 }
 
-static void af_client_seq_stop(struct seq_file *s, void *v)
+static void af_client_seq_stop(struct seq_file *, void *)
 {
     AF_CLIENT_UNLOCK_R();
 }
@@ -156,7 +154,7 @@ static const struct seq_operations nf_client_seq_ops = {
     .stop = af_client_seq_stop,
     .show = af_client_seq_show};
 
-static int af_client_open(struct inode *inode, struct file *file)
+static int af_client_open(struct inode *, struct file *file)
 {
     struct seq_file *seq;
     struct af_client_iter_state *iter;
@@ -203,18 +201,13 @@ static const struct proc_ops af_client_fops = {
 
 static int af_visiting_seq_show(struct seq_file *s, void *v)
 {
-    unsigned char mac_str[32] = {0};
-    unsigned char ip_str[32] = {0};
-    static int index = 0;
-	int i;
-    af_client_info_t *node = (af_client_info_t *)v;
-    if (v == SEQ_START_TOKEN)
-    {
-        index = 0;
-        seq_printf(s, "%-20s %-12s %-32s\n", "Mac", "Appid", "Url");
-        return 0;
-    }
-	index++;
+	unsigned char mac_str[32] = {0};
+	af_client_info_t *node = (af_client_info_t *)v;
+	if (v == SEQ_START_TOKEN)
+	{
+		seq_printf(s, "%-20s %-12s %-32s\n", "Mac", "Appid", "Url");
+		return 0;
+	}
 	
 	sprintf(mac_str, MAC_FMT, MAC_ARRAY(node->mac));
 	int visiting_app = 0;
@@ -241,7 +234,7 @@ static const struct seq_operations nf_visiting_seq_ops = {
 };
 
 
-static int af_visiting_open(struct inode *inode, struct file *file)
+static int af_visiting_open(struct inode *, struct file *file)
 {
     struct seq_file *seq;
     struct af_client_iter_state *iter;
@@ -295,8 +288,6 @@ static DEFINE_MUTEX(af_client_base_dir_mutex);
 
 
 
-
-void remove_client_proc_dir(af_client_info_t *client);
 
 struct af_client_visit_iter_state
 {
@@ -449,7 +440,6 @@ static void *af_client_visit_seq_start(struct seq_file *s, loff_t *pos)
 
 static void *af_client_visit_seq_next(struct seq_file *s, void *v, loff_t *pos)
 {
-	struct af_client_visit_iter_state *st = s->private;
 	void *next;
 	
 	(*pos)++;
@@ -472,7 +462,7 @@ static void *af_client_visit_seq_next(struct seq_file *s, void *v, loff_t *pos)
 	return next;
 }
 
-static void af_client_visit_seq_stop(struct seq_file *s, void *v)
+static void af_client_visit_seq_stop(struct seq_file *, void *)
 {
 	AF_CLIENT_UNLOCK_R();
 }
@@ -488,7 +478,6 @@ static void print_client_visit_header(struct seq_file *s)
 static int af_client_visit_seq_show(struct seq_file *s, void *v)
 {
 	unsigned char mac_str[32] = {0};
-	unsigned char ip_str[32] = {0};
 	app_visit_info_t *info = (app_visit_info_t *)v;
 	struct af_client_visit_iter_state *st = s->private;
 	
@@ -581,9 +570,8 @@ static const struct proc_ops af_client_visit_fops = {
 
 int init_af_client_procfs(void)
 {
-    struct proc_dir_entry *pde;
-    struct net *net = &init_net;
-    pde = proc_create(AF_CLIENT_PROC_STR, 0440, jmx_proc_root, &af_client_fops);
+	struct proc_dir_entry *pde;
+	pde = proc_create(AF_CLIENT_PROC_STR, 0440, jmx_proc_root, &af_client_fops);
 
     if (!pde)
     {
@@ -609,8 +597,7 @@ int init_af_client_procfs(void)
 
 void finit_af_client_procfs(void)
 {
-    struct net *net = &init_net;
-    int i;
+	int i;
     af_client_info_t *client;
     
     mutex_lock(&af_client_base_dir_mutex);
@@ -647,147 +634,107 @@ static void print_single_client_visit_header(struct seq_file *s)
 
 struct single_client_visit_iter_state
 {
-	unsigned int visit_bucket;
-	struct hlist_node *current_visit_node;
 	af_client_info_t *client;
+	struct single_client_visit_snapshot *snapshots;
+	unsigned int snapshot_count;
+	bool snapshot_truncated;
 };
+
+struct single_client_visit_snapshot
+{
+	unsigned int app_id;
+	unsigned int total_num;
+	unsigned int drop_num;
+	unsigned int conn_count;
+	unsigned int is_http;
+	unsigned long latest_time;
+	unsigned int latest_action;
+};
+
+static void single_client_visit_take_snapshot(struct single_client_visit_iter_state *st)
+{
+	app_visit_info_t *info;
+	unsigned int bucket;
+
+	spin_lock_bh(&st->client->visit_info_lock);
+	for (bucket = 0; bucket < MAX_VISIT_INFO_HASH_SIZE; bucket++) {
+		hlist_for_each_entry(info, &st->client->visit_info_hash[bucket], hlist) {
+			struct single_client_visit_snapshot *snapshot;
+
+			if (st->snapshot_count >= MAX_RECORD_APP_NUM) {
+				st->snapshot_truncated = true;
+				goto out_unlock;
+			}
+
+			snapshot = &st->snapshots[st->snapshot_count++];
+			snapshot->app_id = info->app_id;
+			snapshot->total_num = info->total_num;
+			snapshot->drop_num = info->drop_num;
+			snapshot->conn_count = info->conn_count;
+			snapshot->is_http = info->is_http;
+			snapshot->latest_time = info->latest_time;
+			snapshot->latest_action = info->latest_action;
+		}
+	}
+
+out_unlock:
+	spin_unlock_bh(&st->client->visit_info_lock);
+}
 
 static void *single_client_visit_seq_start(struct seq_file *s, loff_t *pos)
 {
 	struct single_client_visit_iter_state *st = s->private;
-	struct hlist_head *head;
-	app_visit_info_t *info;
-	
-	if (!st->client)
+	loff_t index;
+
+	if (!st || !st->snapshots || !st->client || *pos < 0)
 		return NULL;
-	
-	spin_lock_bh(&st->client->visit_info_lock);
-	
-	if (*pos == 0) {
+
+	if (*pos == 0)
 		return SEQ_START_TOKEN;
-	}
-	
-	st->visit_bucket = 0;
-	st->current_visit_node = NULL;
-	
-	for (; st->visit_bucket < MAX_VISIT_INFO_HASH_SIZE; st->visit_bucket++) {
-		head = &st->client->visit_info_hash[st->visit_bucket];
-		if (!hlist_empty(head)) {
-			st->current_visit_node = head->first;
-			info = hlist_entry(head->first, app_visit_info_t, hlist);
-			(*pos)--;
-			if (*pos == 0) {
-				return info;
-			}
-			break;
-		}
-	}
-	
-	while (*pos > 0 && st->visit_bucket < MAX_VISIT_INFO_HASH_SIZE) {
-		if (st->current_visit_node) {
-			struct hlist_node *next = st->current_visit_node->next;
-			if (next) {
-				st->current_visit_node = next;
-				info = hlist_entry(next, app_visit_info_t, hlist);
-				(*pos)--;
-				if (*pos == 0) {
-					return info;
-				}
-				continue;
-			}
-			st->visit_bucket++;
-			st->current_visit_node = NULL;
-		}
-		
-		for (; st->visit_bucket < MAX_VISIT_INFO_HASH_SIZE; st->visit_bucket++) {
-			head = &st->client->visit_info_hash[st->visit_bucket];
-			if (!hlist_empty(head)) {
-				st->current_visit_node = head->first;
-				info = hlist_entry(head->first, app_visit_info_t, hlist);
-				(*pos)--;
-				if (*pos == 0) {
-					return info;
-				}
-				break;
-			}
-		}
-	}
-	
-	return NULL;
+
+	index = *pos - 1;
+	return index < st->snapshot_count ? &st->snapshots[index] : NULL;
 }
 
-static void *single_client_visit_seq_next(struct seq_file *s, void *v, loff_t *pos)
+static void *single_client_visit_seq_next(struct seq_file *s, void *, loff_t *pos)
 {
 	struct single_client_visit_iter_state *st = s->private;
-	struct hlist_head *head;
-	app_visit_info_t *info;
-	
+	loff_t index;
+
 	(*pos)++;
-	
-	if (v == SEQ_START_TOKEN) {
-		st->visit_bucket = 0;
-		st->current_visit_node = NULL;
-		for (; st->visit_bucket < MAX_VISIT_INFO_HASH_SIZE; st->visit_bucket++) {
-			head = &st->client->visit_info_hash[st->visit_bucket];
-			if (!hlist_empty(head)) {
-				st->current_visit_node = head->first;
-				return hlist_entry(head->first, app_visit_info_t, hlist);
-			}
-		}
-		return NULL;
-	}
-	
-	if (st->current_visit_node) {
-		struct hlist_node *next = st->current_visit_node->next;
-		if (next) {
-			st->current_visit_node = next;
-			return hlist_entry(next, app_visit_info_t, hlist);
-		}
-		st->visit_bucket++;
-		st->current_visit_node = NULL;
-	}
-	
-	for (; st->visit_bucket < MAX_VISIT_INFO_HASH_SIZE; st->visit_bucket++) {
-		head = &st->client->visit_info_hash[st->visit_bucket];
-		if (!hlist_empty(head)) {
-			st->current_visit_node = head->first;
-			return hlist_entry(head->first, app_visit_info_t, hlist);
-		}
-	}
-	
-	return NULL;
+	index = *pos - 1;
+	return index < st->snapshot_count ? &st->snapshots[index] : NULL;
 }
 
-static void single_client_visit_seq_stop(struct seq_file *s, void *v)
+static void single_client_visit_seq_stop(struct seq_file *, void *)
 {
-	struct single_client_visit_iter_state *st = s->private;
-	if (st->client) {
-		spin_unlock_bh(&st->client->visit_info_lock);
-	}
 }
 
 static int single_client_visit_seq_show(struct seq_file *s, void *v)
 {
-	app_visit_info_t *info = (app_visit_info_t *)v;
+	struct single_client_visit_snapshot *snapshot = v;
+	u_int32_t cur_time;
+	u_int32_t offline_time;
 	
 	if (v == SEQ_START_TOKEN) {
 		print_single_client_visit_header(s);
 		return 0;
 	}
 	
-	if (!info)
+	if (!snapshot)
 		return 0;
 	
-	u_int32_t cur_time = af_get_timestamp_sec();
-	u_int32_t offline_time = (cur_time > info->latest_time) ? (cur_time - info->latest_time) : 0;
+	cur_time = af_get_timestamp_sec();
+	offline_time = (cur_time > snapshot->latest_time) ?
+		(cur_time - snapshot->latest_time) : 0;
 	seq_printf(s, "%-8u %-8u %-8u %-8u %-8u %-12lu %-12u %-10u\n",
-	           info->app_id,
-	           info->total_num,
-	           info->drop_num,
-	           info->conn_count,
-	           info->is_http,
-	           info->latest_time,
-	           info->latest_action,
+	           snapshot->app_id,
+	           snapshot->total_num,
+	           snapshot->drop_num,
+	           snapshot->conn_count,
+	           snapshot->is_http,
+	           snapshot->latest_time,
+	           snapshot->latest_action,
 	           offline_time);
 	
 	return 0;
@@ -815,16 +762,30 @@ static int single_client_visit_open(struct inode *inode, struct file *file)
 	
 	if (!client)
 		return -ENOENT;
+	if (!af_client_get_if_live(client))
+		return -ENOENT;
 	
 	iter = kzalloc(sizeof(*iter), GFP_KERNEL);
-	if (!iter)
+	if (!iter) {
+		af_client_put(client);
 		return -ENOMEM;
-	
+	}
+
 	iter->client = client;
-	
+	iter->snapshots = kcalloc(MAX_RECORD_APP_NUM,
+	                           sizeof(*iter->snapshots), GFP_KERNEL);
+	if (!iter->snapshots) {
+		kfree(iter);
+		af_client_put(client);
+		return -ENOMEM;
+	}
+	single_client_visit_take_snapshot(iter);
+
 	err = seq_open(file, &single_client_visit_seq_ops);
 	if (err) {
+		kfree(iter->snapshots);
 		kfree(iter);
+		af_client_put(client);
 		return err;
 	}
 	
@@ -833,13 +794,29 @@ static int single_client_visit_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static int single_client_visit_release(struct inode *inode, struct file *file)
+{
+	struct seq_file *seq = file->private_data;
+	struct single_client_visit_iter_state *iter = seq ? seq->private : NULL;
+	af_client_info_t *client = iter ? iter->client : NULL;
+	struct single_client_visit_snapshot *snapshots =
+		iter ? iter->snapshots : NULL;
+	int ret;
+
+	kfree(snapshots);
+	ret = seq_release_private(inode, file);
+
+	af_client_put(client);
+	return ret;
+}
+
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(5, 5, 0)
 static const struct file_operations single_client_visit_fops = {
 	.owner = THIS_MODULE,
 	.open = single_client_visit_open,
 	.read = seq_read,
 	.llseek = seq_lseek,
-	.release = seq_release_private,
+		.release = single_client_visit_release,
 };
 #else
 static const struct proc_ops single_client_visit_fops = {
@@ -847,7 +824,7 @@ static const struct proc_ops single_client_visit_fops = {
 	.proc_read = seq_read,
 	.proc_open = single_client_visit_open,
 	.proc_lseek = seq_lseek,
-	.proc_release = seq_release_private,
+	.proc_release = single_client_visit_release,
 };
 #endif
 
@@ -856,7 +833,6 @@ int create_client_proc_dir(af_client_info_t *client)
 	struct proc_dir_entry *client_dir;
 	struct proc_dir_entry *visit_file;
 	char mac_str[32] = {0};
-	struct net *net = &init_net;
 	
 	if (!client)
 		return -1;
@@ -882,12 +858,16 @@ int create_client_proc_dir(af_client_info_t *client)
 	}
 	
 	client->proc_dir = client_dir;
+	refcount_inc(&client->refs);
+	client->proc_ref_held = true;
 	
 	visit_file = proc_create_data("visit_list", 0444, client_dir, &single_client_visit_fops, client);
 	if (!visit_file) {
 		AF_ERROR("create visit_list file failed for client: %s\n", mac_str);
 		proc_remove(client_dir);
 		client->proc_dir = NULL;
+		client->proc_ref_held = false;
+		af_client_put(client);
 		return -1;
 	}
 	
@@ -896,9 +876,14 @@ int create_client_proc_dir(af_client_info_t *client)
 
 void remove_client_proc_dir(af_client_info_t *client)
 {
+	bool put_ref;
+
 	if (!client || !client->proc_dir)
 		return;
-	
+	put_ref = client->proc_ref_held;
 	proc_remove(client->proc_dir);
 	client->proc_dir = NULL;
+	client->proc_ref_held = false;
+	if (put_ref)
+		af_client_put(client);
 }

@@ -23,6 +23,7 @@ int af_read_file_value(const char *file_path, char *value, int value_len);
 int af_read_file_int_value(const char *file_path, int *value);
 int jmx_send_msg_to_kernel(char *buf);
 int jmx_parse_time_str(const char *time_str, jmx_time_period_t *periods, int max_periods);
+int jmx_update_proc_value(const char *key, const char *value);
 void update_jmx_proc_value(char *key, char *value);
 void update_jmx_proc_u32_value(char *key, u_int32_t value);
 #endif

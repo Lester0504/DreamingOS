@@ -23,6 +23,7 @@
 #include <sys/sysmacros.h>
 #endif
 #include <sys/wait.h>
+#include <net/if.h>
 #include "jmx_system.h"
 
 #ifndef JMX_SYSTEM_MOUNT_CONTRACT_ONLY
@@ -41,6 +42,7 @@
 #include "jmx_ubus.h"
 #include "jmx_config.h"
 #include "jmx_utils.h"
+#include "jmx_network.h"
 #include "jmx_uci.h"
 #include "jmx_netconfig_db.h"
 #endif
@@ -2861,30 +2863,26 @@ struct json_object *get_system_status(void)
 }
 
 struct json_object *jmx_api_set_system_info(struct json_object *req_obj) {
+    jmx_legacy_settings_t old_settings;
     if (!req_obj) {
         return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
     }
     
     struct json_object *jmx_obj = json_object_object_get(req_obj, "jmx");
-    if (!jmx_obj) {
+    if (!jmx_obj || !json_object_is_type(jmx_obj, json_type_object)) {
         LOG_ERROR("Missing jmx parameter\n");
         return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
     }
     
     struct json_object *lan_ifname_obj = json_object_object_get(jmx_obj, "lan_ifname");
-    if (!lan_ifname_obj) {
+    if (!lan_ifname_obj || !json_object_is_type(lan_ifname_obj, json_type_string)) {
         LOG_ERROR("Missing lan_ifname parameter\n");
         return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
     }
     
     const char *lan_ifname = json_object_get_string(lan_ifname_obj);
-    if (!lan_ifname || strlen(lan_ifname) == 0) {
+    if (!lan_ifname || !jmx_interface_name_valid(lan_ifname, 1)) {
         LOG_ERROR("Invalid lan_ifname value\n");
-        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
-    }
-    
-    if (strlen(lan_ifname) < 2 || strlen(lan_ifname) > 16) {
-        LOG_ERROR("lan_ifname length invalid\n");
         return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
     }
     
@@ -2903,12 +2901,20 @@ struct json_object *jmx_api_set_system_info(struct json_object *req_obj) {
         }
     }
     
-    if (jmx_legacy_settings_set_system(lan_ifname, theme_mode) != 0) {
-        LOG_ERROR("Failed to commit system settings to config.db\n");
+    if (jmx_legacy_settings_get(&old_settings) != 0) {
+        LOG_ERROR("Failed to read current system settings from config.db\n");
         return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
     }
-	
-	update_jmx_proc_value("lan_ifname", lan_ifname);
+    if (jmx_update_proc_value("lan_ifname", lan_ifname) != 0) {
+        LOG_ERROR("Failed to update and verify lan_ifname runtime state\n");
+        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
+    }
+    if (jmx_legacy_settings_set_system(lan_ifname, theme_mode) != 0) {
+        LOG_ERROR("Failed to commit system settings to config.db\n");
+        if (jmx_update_proc_value("lan_ifname", old_settings.lan_ifname) != 0)
+            LOG_ERROR("Failed to roll back lan_ifname runtime state\n");
+        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
+    }
     LOG_DEBUG("Set system config: lan_ifname=%s, theme_mode=%d\n", lan_ifname, theme_mode);
     return jmx_gen_api_response_data(API_CODE_SUCCESS, NULL);
 }

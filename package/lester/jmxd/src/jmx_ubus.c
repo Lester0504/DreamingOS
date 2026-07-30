@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "proc_path.h"
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* 
@@ -7,6 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <stdint.h>
+#include <errno.h>
+#include <dirent.h>
 #include <libubox/uloop.h>
 #include <libubox/utils.h>
 #include <libubus.h>
@@ -46,6 +53,19 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <libubox/list.h>
+#ifdef __linux__
+#include <linux/openat2.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#endif
+
+#ifndef JMX_HISTORY_MOUNTINFO
+#define JMX_HISTORY_MOUNTINFO "/proc/self/mountinfo"
+#endif
+
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1U << 0)
+#endif
 
 extern jmx_status_t g_jmx_status;
 extern void reload_oaf_rule(void);
@@ -3606,9 +3626,842 @@ struct json_object *jmx_api_get_online_offline_records(struct json_object *req_o
 }
 
 
+#define JMX_HISTORY_MAX_DEPTH 64
+
+struct jmx_history_location {
+    int root_fd;
+    int parent_fd;
+    int data_fd;
+    dev_t device;
+    char root_path[PATH_MAX];
+    char relative[PATH_MAX];
+    char canonical[PATH_MAX];
+};
+
+static void jmx_history_location_close(struct jmx_history_location *location)
+{
+    if (!location)
+        return;
+    if (location->data_fd >= 0)
+        close(location->data_fd);
+    if (location->parent_fd >= 0)
+        close(location->parent_fd);
+    if (location->root_fd >= 0)
+        close(location->root_fd);
+    location->data_fd = location->parent_fd = location->root_fd = -1;
+}
+
+static struct json_object *jmx_history_error(const char *error,
+                                             const char *reason)
+{
+    struct json_object *data = json_object_new_object();
+
+    if (!data)
+        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
+    json_object_object_add(data, "ok", json_object_new_boolean(0));
+    json_object_object_add(data, "error",
+                           json_object_new_string(error ? error : "history_storage_error"));
+    json_object_object_add(data, "reason",
+                           json_object_new_string(reason ? reason : "history_storage_error"));
+    return jmx_gen_api_response_data(API_CODE_ERROR, data);
+}
+
+static int jmx_history_path_prefix(const char *path, const char *prefix)
+{
+    size_t length;
+
+    if (!path || !prefix)
+        return 0;
+    length = strlen(prefix);
+    return !strncmp(path, prefix, length) &&
+           (path[length] == '\0' || path[length] == '/');
+}
+
+static int jmx_history_path_syntax(const char *path)
+{
+    const char *cursor;
+    size_t depth = 0;
+
+    if (!path || path[0] != '/' || strlen(path) > 64 ||
+        path[1] == '\0' || path[strlen(path) - 1] == '/')
+        return 0;
+    cursor = path + 1;
+    while (*cursor) {
+        const char *end = strchr(cursor, '/');
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        size_t i;
+
+        if (!length || (length == 1 && cursor[0] == '.') ||
+            (length == 2 && cursor[0] == '.' && cursor[1] == '.') ||
+            ++depth > JMX_HISTORY_MAX_DEPTH)
+            return 0;
+        for (i = 0; i < length; i++)
+            if ((unsigned char)cursor[i] < 0x20 || cursor[i] == '\\')
+                return 0;
+        if (!end)
+            break;
+        cursor = end + 1;
+    }
+    return 1;
+}
+
+static int jmx_history_unescape_mount(const char *source, char *destination,
+                                      size_t destination_length)
+{
+    size_t input = 0, output = 0;
+
+    if (!source || !destination || destination_length < 2)
+        return -1;
+    while (source[input]) {
+        if (source[input] == '\\' && source[input + 1] >= '0' &&
+            source[input + 1] <= '7' && source[input + 2] >= '0' &&
+            source[input + 2] <= '7' && source[input + 3] >= '0' &&
+            source[input + 3] <= '7') {
+            unsigned int value = (unsigned int)(source[input + 1] - '0') * 64U +
+                                 (unsigned int)(source[input + 2] - '0') * 8U +
+                                 (unsigned int)(source[input + 3] - '0');
+
+            if (!value || value == '/' || output + 1 >= destination_length)
+                return -1;
+            destination[output++] = (char)value;
+            input += 4;
+            continue;
+        }
+        if (output + 1 >= destination_length)
+            return -1;
+        destination[output++] = source[input++];
+    }
+    destination[output] = '\0';
+    return 0;
+}
+
+static int jmx_history_mount_fs_allowed(const char *filesystem)
+{
+    static const char *const denied[] = {
+        "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "overlay",
+        "squashfs", "debugfs", "tracefs", "securityfs", "cgroup",
+        "cgroup2", "pstore", "efivarfs", "fusectl", "configfs", NULL
+    };
+    size_t i;
+
+    if (!filesystem || !filesystem[0])
+        return 0;
+    for (i = 0; denied[i]; i++)
+        if (!strcmp(filesystem, denied[i]))
+            return 0;
+    return 1;
+}
+
+static int jmx_history_device_protected(dev_t device)
+{
+    static const char *const protected_paths[] = {
+        "/", "/data", "/etc/dreamingwrt", "/boot", NULL
+    };
+    struct stat status;
+    size_t i;
+
+    for (i = 0; protected_paths[i]; i++)
+        if (stat(protected_paths[i], &status) == 0 && status.st_dev == device)
+            return 1;
+    return 0;
+}
+
+static int jmx_history_find_root(const char *path, char *root_path,
+                                 size_t root_length, dev_t *device)
+{
+    FILE *mounts;
+    char *line = NULL;
+    size_t capacity = 0, best_length = 0;
+    int result = -1, saved_errno = EACCES;
+
+    if (!strcmp(path, "/tmp/jmx")) {
+        struct stat status;
+        int fd = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+
+        if (fd < 0 || fstat(fd, &status) != 0 || !S_ISDIR(status.st_mode)) {
+            if (fd >= 0)
+                close(fd);
+            return -1;
+        }
+        close(fd);
+        if (snprintf(root_path, root_length, "%s", "/tmp") >= (int)root_length) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        *device = status.st_dev;
+        return 0;
+    }
+    mounts = fopen(JMX_HISTORY_MOUNTINFO, "re");
+    if (!mounts)
+        return -1;
+    errno = 0;
+    while (getline(&line, &capacity, mounts) >= 0) {
+        char *fields[192], *save = NULL, *token;
+        char mount_path[PATH_MAX], filesystem[64];
+        int count = 0, dash = -1;
+        unsigned int major_id, minor_id;
+        struct stat status;
+        int fd;
+
+        for (token = strtok_r(line, " ", &save); token && count < 192;
+             token = strtok_r(NULL, " ", &save)) {
+            token[strcspn(token, "\r\n")] = '\0';
+            fields[count] = token;
+            if (!strcmp(token, "-"))
+                dash = count;
+            count++;
+        }
+        if (count < 10 || dash < 6 || dash + 2 >= count ||
+            sscanf(fields[2], "%u:%u", &major_id, &minor_id) != 2 ||
+            jmx_history_unescape_mount(fields[4], mount_path,
+                                       sizeof(mount_path)) != 0 ||
+            snprintf(filesystem, sizeof(filesystem), "%s", fields[dash + 1]) >=
+                (int)sizeof(filesystem) ||
+#ifndef JMX_HISTORY_TEST_ALLOW_ANY_MOUNT_ROOT
+            !(jmx_history_path_prefix(mount_path, "/mnt") ||
+              jmx_history_path_prefix(mount_path, "/media")) ||
+#endif
+            !jmx_history_mount_fs_allowed(filesystem) ||
+            !jmx_history_path_prefix(path, mount_path) ||
+            strlen(mount_path) <= best_length)
+            continue;
+        fd = open(mount_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0)
+            continue;
+        if (fstat(fd, &status) != 0 || !S_ISDIR(status.st_mode) ||
+#ifdef __linux__
+            (unsigned int)major(status.st_dev) != major_id ||
+            (unsigned int)minor(status.st_dev) != minor_id ||
+#endif
+#ifndef JMX_HISTORY_TEST_ALLOW_PROTECTED_DEVICE
+            jmx_history_device_protected(status.st_dev)) {
+#else
+            0) {
+#endif
+            close(fd);
+            continue;
+        }
+        close(fd);
+        if (snprintf(root_path, root_length, "%s", mount_path) >=
+            (int)root_length) {
+            saved_errno = ENAMETOOLONG;
+            continue;
+        }
+        best_length = strlen(mount_path);
+        *device = status.st_dev;
+        result = 0;
+    }
+    if (ferror(mounts)) {
+        result = -1;
+        saved_errno = EIO;
+    }
+    free(line);
+    if (fclose(mounts) != 0 && result == 0) {
+        result = -1;
+        saved_errno = EIO;
+    }
+    if (result != 0)
+        errno = saved_errno;
+    return result;
+}
+
+static int jmx_history_open_relative(int root_fd, dev_t device,
+                                     const char *relative, int create)
+{
+    int current = dup(root_fd);
+    char copy[PATH_MAX], *save = NULL, *part;
+
+    if (current < 0)
+        return -1;
+    if (!relative || !relative[0])
+        return current;
+    if (snprintf(copy, sizeof(copy), "%s", relative) >= (int)sizeof(copy)) {
+        close(current);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    for (part = strtok_r(copy, "/", &save); part;
+         part = strtok_r(NULL, "/", &save)) {
+        struct stat status;
+        int next = openat(current, part,
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+
+        if (next < 0 && errno == ENOENT && create) {
+            if (mkdirat(current, part, 0700) != 0 && errno != EEXIST) {
+                close(current);
+                return -1;
+            }
+            next = openat(current, part,
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        }
+        if (next < 0 || fstat(next, &status) != 0 ||
+            !S_ISDIR(status.st_mode) || status.st_dev != device) {
+            int saved = next < 0 ? errno : EXDEV;
+            if (next >= 0)
+                close(next);
+            close(current);
+            errno = saved;
+            return -1;
+        }
+        close(current);
+        current = next;
+    }
+    return current;
+}
+
+static int jmx_history_location_open(const char *path, int create_parent,
+                                     int create_data,
+                                     struct jmx_history_location *location)
+{
+    struct stat status;
+    const char *relative;
+
+    memset(location, 0, sizeof(*location));
+    location->root_fd = location->parent_fd = location->data_fd = -1;
+    if (!jmx_history_path_syntax(path) ||
+        jmx_history_find_root(path, location->root_path,
+                              sizeof(location->root_path), &location->device) != 0)
+        return -1;
+    relative = path + strlen(location->root_path);
+    while (*relative == '/')
+        relative++;
+    if (!relative[0] || snprintf(location->relative,
+                                 sizeof(location->relative), "%s", relative) >=
+                                (int)sizeof(location->relative) ||
+        snprintf(location->canonical, sizeof(location->canonical), "%s", path) >=
+                                (int)sizeof(location->canonical)) {
+        errno = EACCES;
+        return -1;
+    }
+    location->root_fd = open(location->root_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (location->root_fd < 0 || fstat(location->root_fd, &status) != 0 ||
+        !S_ISDIR(status.st_mode) || status.st_dev != location->device) {
+        int saved = location->root_fd < 0 ? errno : EXDEV;
+        jmx_history_location_close(location);
+        errno = saved;
+        return -1;
+    }
+    location->parent_fd = jmx_history_open_relative(
+        location->root_fd, location->device, location->relative, create_parent);
+    if (location->parent_fd < 0) {
+        jmx_history_location_close(location);
+        return -1;
+    }
+    location->data_fd = openat(location->parent_fd, "client_data",
+                               O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (location->data_fd < 0 && errno == ENOENT && create_data) {
+        if (mkdirat(location->parent_fd, "client_data", 0700) != 0 &&
+            errno != EEXIST) {
+            jmx_history_location_close(location);
+            return -1;
+        }
+        location->data_fd = openat(location->parent_fd, "client_data",
+                                   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    }
+    if (location->data_fd < 0) {
+        if (errno == ENOENT && !create_data)
+            return 0;
+        jmx_history_location_close(location);
+        return -1;
+    }
+    if (fstat(location->data_fd, &status) != 0 || !S_ISDIR(status.st_mode) ||
+        status.st_dev != location->device) {
+        jmx_history_location_close(location);
+        errno = EXDEV;
+        return -1;
+    }
+    return 0;
+}
+
+static int jmx_history_reopen_directory(int directory_fd)
+{
+    struct stat original, reopened;
+    int fd = openat(directory_fd, ".",
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+
+    if (fd < 0 || fstat(directory_fd, &original) != 0 ||
+        fstat(fd, &reopened) != 0 || !S_ISDIR(reopened.st_mode) ||
+        original.st_dev != reopened.st_dev || original.st_ino != reopened.st_ino) {
+        int saved = fd < 0 ? errno : ESTALE;
+        if (fd >= 0)
+            close(fd);
+        errno = saved;
+        return -1;
+    }
+    return fd;
+}
+
+static int jmx_history_directory_empty(int directory_fd, int *empty)
+{
+    DIR *directory;
+    struct dirent *entry;
+    int duplicate = jmx_history_reopen_directory(directory_fd), result = 0;
+
+    *empty = 1;
+    if (duplicate < 0)
+        return -1;
+    directory = fdopendir(duplicate);
+    if (!directory) {
+        close(duplicate);
+        return -1;
+    }
+    for (;;) {
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) {
+            if (errno)
+                result = -1;
+            break;
+        }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+        *empty = 0;
+        break;
+    }
+    if (closedir(directory) != 0)
+        result = -1;
+    return result;
+}
+
+static int jmx_history_fsync_directory(int directory_fd)
+{
+    if (fsync(directory_fd) == 0)
+        return 0;
+#ifndef __linux__
+    if (errno == EINVAL || errno == ENOTSUP)
+        return 0;
+#endif
+    return -1;
+}
+
+static int jmx_history_tree_size(int directory_fd, uint64_t *bytes)
+{
+    DIR *directory;
+    struct dirent *entry;
+    struct stat directory_status;
+    int duplicate = jmx_history_reopen_directory(directory_fd), result = 0;
+
+    if (duplicate < 0 || fstat(directory_fd, &directory_status) != 0 ||
+        !S_ISDIR(directory_status.st_mode)) {
+        if (duplicate >= 0)
+            close(duplicate);
+        return -1;
+    }
+    directory = fdopendir(duplicate);
+    if (!directory) {
+        close(duplicate);
+        return -1;
+    }
+    for (;;) {
+        struct stat status;
+
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) {
+            if (errno)
+                result = -1;
+            break;
+        }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+        if (fstatat(directory_fd, entry->d_name, &status,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            result = -1;
+            break;
+        }
+        if (status.st_dev != directory_status.st_dev) {
+            errno = EXDEV;
+            result = -1;
+            break;
+        }
+        if (S_ISDIR(status.st_mode)) {
+            int child = openat(directory_fd, entry->d_name,
+                               O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (child < 0 || jmx_history_tree_size(child, bytes) != 0) {
+                if (child >= 0)
+                    close(child);
+                result = -1;
+                break;
+            }
+            close(child);
+        } else if (S_ISREG(status.st_mode)) {
+            if (status.st_size < 0 || UINT64_MAX - *bytes < (uint64_t)status.st_size) {
+                errno = EOVERFLOW;
+                result = -1;
+                break;
+            }
+            *bytes += (uint64_t)status.st_size;
+        }
+    }
+    if (closedir(directory) != 0)
+        result = -1;
+    return result;
+}
+
+static int jmx_history_clear_fd(int directory_fd)
+{
+    DIR *directory;
+    struct dirent *entry;
+    struct stat directory_status;
+    int duplicate = jmx_history_reopen_directory(directory_fd), result = 0;
+
+    if (duplicate < 0 || fstat(directory_fd, &directory_status) != 0 ||
+        !S_ISDIR(directory_status.st_mode)) {
+        if (duplicate >= 0)
+            close(duplicate);
+        return -1;
+    }
+    directory = fdopendir(duplicate);
+    if (!directory) {
+        close(duplicate);
+        return -1;
+    }
+    for (;;) {
+        struct stat status;
+
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) {
+            if (errno)
+                result = -1;
+            break;
+        }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+        if (fstatat(directory_fd, entry->d_name, &status,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            result = -1;
+            break;
+        }
+        if (status.st_dev != directory_status.st_dev) {
+            errno = EXDEV;
+            result = -1;
+            break;
+        }
+        if (S_ISDIR(status.st_mode)) {
+            int child = openat(directory_fd, entry->d_name,
+                               O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (child < 0) {
+                result = -1;
+                break;
+            }
+            if (jmx_history_clear_fd(child) != 0) {
+                close(child);
+                result = -1;
+                break;
+            }
+            if (close(child) != 0 ||
+                unlinkat(directory_fd, entry->d_name, AT_REMOVEDIR) != 0) {
+                result = -1;
+                break;
+            }
+        } else if (unlinkat(directory_fd, entry->d_name, 0) != 0) {
+            result = -1;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        result = -1;
+    if (result == 0 && jmx_history_fsync_directory(directory_fd) != 0)
+        result = -1;
+    return result;
+}
+
+static int jmx_history_write_all(int fd, const void *data, size_t length)
+{
+    const unsigned char *cursor = data;
+
+    while (length) {
+        ssize_t written = write(fd, cursor, length);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return -1;
+        cursor += (size_t)written;
+        length -= (size_t)written;
+    }
+    return 0;
+}
+
+static int jmx_history_copy_tree(int source_fd, int destination_fd)
+{
+    DIR *directory;
+    struct dirent *entry;
+    struct stat source_status, destination_status;
+    int duplicate = jmx_history_reopen_directory(source_fd), result = 0;
+
+    if (duplicate < 0 || fstat(source_fd, &source_status) != 0 ||
+        fstat(destination_fd, &destination_status) != 0 ||
+        !S_ISDIR(source_status.st_mode) || !S_ISDIR(destination_status.st_mode)) {
+        if (duplicate >= 0)
+            close(duplicate);
+        return -1;
+    }
+    directory = fdopendir(duplicate);
+    if (!directory) {
+        close(duplicate);
+        return -1;
+    }
+    for (;;) {
+        struct stat status;
+
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) {
+            if (errno)
+                result = -1;
+            break;
+        }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+        if (fstatat(source_fd, entry->d_name, &status, AT_SYMLINK_NOFOLLOW) != 0) {
+            result = -1;
+            break;
+        }
+        if (status.st_dev != source_status.st_dev) {
+            errno = EXDEV;
+            result = -1;
+            break;
+        }
+        if (S_ISDIR(status.st_mode)) {
+            int source_child = -1, destination_child = -1;
+            if (mkdirat(destination_fd, entry->d_name, status.st_mode & 0777) != 0 ||
+                (source_child = openat(source_fd, entry->d_name,
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)) < 0 ||
+                (destination_child = openat(destination_fd, entry->d_name,
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)) < 0 ||
+                jmx_history_copy_tree(source_child, destination_child) != 0 ||
+                jmx_history_fsync_directory(destination_child) != 0) {
+                if (source_child >= 0)
+                    close(source_child);
+                if (destination_child >= 0)
+                    close(destination_child);
+                result = -1;
+                break;
+            }
+            if (close(source_child) != 0 || close(destination_child) != 0) {
+                result = -1;
+                break;
+            }
+        } else if (S_ISREG(status.st_mode)) {
+            char buffer[65536];
+            int source_file = openat(source_fd, entry->d_name,
+                                     O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            int destination_file = -1;
+            if (source_file >= 0)
+                destination_file = openat(destination_fd, entry->d_name,
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                    status.st_mode & 0777);
+            if (source_file < 0 || destination_file < 0) {
+                if (source_file >= 0)
+                    close(source_file);
+                if (destination_file >= 0)
+                    close(destination_file);
+                result = -1;
+                break;
+            }
+            for (;;) {
+                ssize_t count = read(source_file, buffer, sizeof(buffer));
+                if (count < 0 && errno == EINTR)
+                    continue;
+                if (count < 0 || (count > 0 && jmx_history_write_all(
+                                     destination_file, buffer, (size_t)count) != 0)) {
+                    result = -1;
+                    break;
+                }
+                if (!count)
+                    break;
+            }
+            if (result == 0 && fsync(destination_file) != 0)
+                result = -1;
+            if (close(source_file) != 0 || close(destination_file) != 0)
+                result = -1;
+            if (result != 0)
+                break;
+        } else {
+            errno = ENOTSUP;
+            result = -1;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        result = -1;
+    if (result == 0 && jmx_history_fsync_directory(destination_fd) != 0)
+        result = -1;
+    return result;
+}
+
+enum jmx_history_move_kind {
+    JMX_HISTORY_MOVE_NONE = 0,
+    JMX_HISTORY_MOVE_RENAME,
+    JMX_HISTORY_MOVE_COPY,
+};
+
+static int jmx_history_rename_noreplace(int old_fd, const char *old_name,
+                                        int new_fd, const char *new_name)
+{
+#ifdef SYS_renameat2
+    return (int)syscall(SYS_renameat2, old_fd, old_name, new_fd, new_name,
+                        RENAME_NOREPLACE);
+#else
+    (void)old_fd;
+    (void)old_name;
+    (void)new_fd;
+    (void)new_name;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static int jmx_history_migrate(struct jmx_history_location *source,
+                               struct jmx_history_location *destination,
+                               enum jmx_history_move_kind *kind)
+{
+    int empty = 0;
+    uint64_t source_bytes = 0, destination_bytes = 0;
+
+    *kind = JMX_HISTORY_MOVE_NONE;
+    if (source->data_fd < 0)
+        return 0;
+    if (destination->data_fd >= 0) {
+        if (jmx_history_directory_empty(destination->data_fd, &empty) != 0) {
+            close(destination->data_fd);
+            destination->data_fd = -1;
+            errno = EIO;
+            return -1;
+        }
+        if (!empty || close(destination->data_fd) != 0) {
+            destination->data_fd = -1;
+            errno = EEXIST;
+            return -1;
+        }
+        destination->data_fd = -1;
+        if (unlinkat(destination->parent_fd, "client_data", AT_REMOVEDIR) != 0)
+            return -1;
+    }
+    if (jmx_history_rename_noreplace(source->parent_fd, "client_data",
+                                     destination->parent_fd, "client_data") == 0) {
+        close(source->data_fd);
+        source->data_fd = -1;
+        destination->data_fd = openat(destination->parent_fd, "client_data",
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        *kind = JMX_HISTORY_MOVE_RENAME;
+        if (destination->data_fd < 0 ||
+            jmx_history_fsync_directory(source->parent_fd) != 0 ||
+            jmx_history_fsync_directory(destination->parent_fd) != 0)
+            return -1;
+        return 0;
+    }
+    if (errno != EXDEV && errno != ENOSYS)
+        return -1;
+    if (mkdirat(destination->parent_fd, "client_data", 0700) != 0)
+        return -1;
+    destination->data_fd = openat(destination->parent_fd, "client_data",
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (destination->data_fd < 0 ||
+        jmx_history_copy_tree(source->data_fd, destination->data_fd) != 0 ||
+        jmx_history_tree_size(source->data_fd, &source_bytes) != 0 ||
+        jmx_history_tree_size(destination->data_fd, &destination_bytes) != 0 ||
+        source_bytes != destination_bytes) {
+        if (destination->data_fd >= 0) {
+            (void)jmx_history_clear_fd(destination->data_fd);
+            close(destination->data_fd);
+            destination->data_fd = -1;
+            (void)unlinkat(destination->parent_fd, "client_data", AT_REMOVEDIR);
+        }
+        return -1;
+    }
+    if (jmx_history_fsync_directory(destination->parent_fd) != 0)
+        return -1;
+    *kind = JMX_HISTORY_MOVE_COPY;
+    return 0;
+}
+
+static int jmx_history_locations_overlap(
+    const struct jmx_history_location *source,
+    const struct jmx_history_location *destination)
+{
+    char source_data[PATH_MAX], destination_data[PATH_MAX];
+
+    if (snprintf(source_data, sizeof(source_data), "%s/client_data",
+                 source->canonical) >= (int)sizeof(source_data) ||
+        snprintf(destination_data, sizeof(destination_data), "%s/client_data",
+                 destination->canonical) >= (int)sizeof(destination_data))
+        return 1;
+    return jmx_history_path_prefix(source_data, destination_data) ||
+           jmx_history_path_prefix(destination_data, source_data);
+}
+
+static int jmx_history_migration_rollback(struct jmx_history_location *source,
+                                          struct jmx_history_location *destination,
+                                          enum jmx_history_move_kind kind)
+{
+    uint64_t source_bytes = 0, destination_bytes = 0;
+
+    if (kind == JMX_HISTORY_MOVE_NONE)
+        return 0;
+    if (destination->data_fd >= 0) {
+        if (close(destination->data_fd) != 0)
+            return -1;
+        destination->data_fd = -1;
+    }
+    if (kind == JMX_HISTORY_MOVE_RENAME)
+        return jmx_history_rename_noreplace(destination->parent_fd, "client_data",
+                                             source->parent_fd, "client_data");
+    if (source->data_fd < 0) {
+        if (mkdirat(source->parent_fd, "client_data", 0700) != 0 &&
+            errno != EEXIST)
+            return -1;
+        source->data_fd = openat(source->parent_fd, "client_data",
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    }
+    destination->data_fd = openat(destination->parent_fd, "client_data",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (source->data_fd < 0 || destination->data_fd < 0 ||
+        jmx_history_clear_fd(source->data_fd) != 0 ||
+        jmx_history_copy_tree(destination->data_fd, source->data_fd) != 0 ||
+        jmx_history_tree_size(source->data_fd, &source_bytes) != 0 ||
+        jmx_history_tree_size(destination->data_fd, &destination_bytes) != 0 ||
+        source_bytes != destination_bytes ||
+        jmx_history_fsync_directory(source->parent_fd) != 0 ||
+        jmx_history_clear_fd(destination->data_fd) != 0) {
+        return -1;
+    }
+    if (close(destination->data_fd) != 0) {
+        destination->data_fd = -1;
+        return -1;
+    }
+    destination->data_fd = -1;
+    return unlinkat(destination->parent_fd, "client_data", AT_REMOVEDIR);
+}
+
+static int jmx_history_migration_finish(struct jmx_history_location *source,
+                                        enum jmx_history_move_kind kind)
+{
+    if (kind != JMX_HISTORY_MOVE_COPY)
+        return 0;
+    if (source->data_fd < 0 || jmx_history_clear_fd(source->data_fd) != 0 ||
+        close(source->data_fd) != 0) {
+        source->data_fd = -1;
+        return -1;
+    }
+    source->data_fd = -1;
+    if (unlinkat(source->parent_fd, "client_data", AT_REMOVEDIR) != 0 ||
+        jmx_history_fsync_directory(source->parent_fd) != 0)
+        return -1;
+    return 0;
+}
+
+
 struct json_object *jmx_api_get_record_base(struct json_object *req_obj) {
     struct json_object *data_obj = json_object_new_object();
+    struct jmx_history_location location;
     jmx_legacy_settings_t settings;
+    uint64_t data_size_bytes = 0;
+    int size_available = 0;
+
+    (void)req_obj;
     if (jmx_legacy_settings_get(&settings) != 0) {
         json_object_put(data_obj);
         return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
@@ -3620,31 +4473,48 @@ struct json_object *jmx_api_get_record_base(struct json_object *req_obj) {
     json_object_object_add(data_obj, "history_data_path", json_object_new_string(settings.history_data_path));
 
     struct json_object *status_obj = json_object_new_object();
-    char data_dir[512] = {0};
-    if (settings.history_data_path[0]) {
-        snprintf(data_dir, sizeof(data_dir), "%s/client_data", settings.history_data_path);
-    } else {
-        strncpy(data_dir, CLIENT_DATA_BASE_DIR_DEFAULT, sizeof(data_dir) - 1);
+    if (jmx_history_location_open(settings.history_data_path, 0, 0,
+                                  &location) == 0) {
+        if (location.data_fd < 0) {
+            size_available = 1;
+        } else if (jmx_history_tree_size(location.data_fd,
+                                         &data_size_bytes) == 0) {
+            size_available = 1;
+        }
+        jmx_history_location_close(&location);
     }
-    
-    char cmd[1024] = {0};
-    char result[256] = {0};
-    snprintf(cmd, sizeof(cmd), "du -sk %s 2>/dev/null | awk '{print $1}'", data_dir);
-    if (exec_with_result_line(cmd, result, sizeof(result)) == 0 && strlen(result) > 0) {
-        unsigned long long data_size_kb = strtoull(result, NULL, 10);
-        json_object_object_add(status_obj, "data_size", json_object_new_int64(data_size_kb));
-        json_object_object_add(status_obj, "data_size_unit", json_object_new_string("KB"));
-    } else {
-        json_object_object_add(status_obj, "data_size", json_object_new_int64(0));
-        json_object_object_add(status_obj, "data_size_unit", json_object_new_string("KB"));
-    }
+    json_object_object_add(status_obj, "data_size",
+                           json_object_new_int64((int64_t)((data_size_bytes + 1023U) / 1024U)));
+    json_object_object_add(status_obj, "data_size_unit", json_object_new_string("KB"));
+    json_object_object_add(status_obj, "data_size_available",
+                           json_object_new_boolean(size_available));
+    if (!size_available)
+        json_object_object_add(status_obj, "reason",
+                               json_object_new_string("history_path_unavailable"));
     json_object_object_add(data_obj, "status", status_obj);
 
     return jmx_gen_api_response_data(API_CODE_SUCCESS, data_obj);
 }
 
+static int jmx_record_enable_runtime_set(int enabled)
+{
+    char value[2];
+
+    value[0] = enabled ? '1' : '0';
+    value[1] = '\0';
+    return jmx_update_proc_value("record_enable", value);
+}
+
 struct json_object *jmx_api_set_record_base(struct json_object *req_obj) {
     jmx_legacy_settings_t old_settings;
+    struct jmx_history_location old_location, new_location;
+    enum jmx_history_move_kind move_kind = JMX_HISTORY_MOVE_NONE;
+    int path_changed;
+
+    memset(&old_location, 0, sizeof(old_location));
+    memset(&new_location, 0, sizeof(new_location));
+    old_location.root_fd = old_location.parent_fd = old_location.data_fd = -1;
+    new_location.root_fd = new_location.parent_fd = new_location.data_fd = -1;
     if (jmx_legacy_settings_get(&old_settings) != 0) {
         return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
     }
@@ -3665,6 +4535,7 @@ struct json_object *jmx_api_set_record_base(struct json_object *req_obj) {
         history_data_path = json_object_get_string(v);
 
     if (enable < 0) enable = 0;
+    enable = enable ? 1 : 0;
     if (record_time < 0) record_time = 0;
     if (app_valid_time < 0) app_valid_time = 0;
 
@@ -3676,48 +4547,86 @@ struct json_object *jmx_api_set_record_base(struct json_object *req_obj) {
         }
     }
 
-    if (!history_data_path || strlen(history_data_path) == 0) {
-        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
-    }
-
-    if (strcmp(history_data_path, "/") == 0) {
-        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
-    }
-
-    if (strlen(history_data_path) > 64) {
-        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
-    }
+    if (!history_data_path || !jmx_history_path_syntax(history_data_path))
+        return jmx_history_error("invalid_history_data_path",
+                                 "history_path_must_be_a_controlled_storage_path");
     if (!history_data_size || !history_data_size[0])
         history_data_size = old_settings.history_data_size;
-    if (jmx_legacy_settings_set_record(enable ? 1 : 0, record_time,
-                                       app_valid_time, history_data_size,
-                                       history_data_path) != 0)
-        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
-    
-    if (history_data_path && strlen(history_data_path) > 0) {
-        char old_data_dir[512] = {0};
-        char new_data_dir[512] = {0};
-        
-        if (old_settings.history_data_path[0] &&
-            strcmp(old_settings.history_data_path, history_data_path) != 0) {
-            snprintf(old_data_dir, sizeof(old_data_dir), "%s/client_data", old_settings.history_data_path);
-            snprintf(new_data_dir, sizeof(new_data_dir), "%s/client_data", history_data_path);
-            
-            char cmd[2048] = {0};
-            snprintf(cmd, sizeof(cmd), "mkdir -p %s && mv %s/* %s/ 2>/dev/null; true", 
-                     new_data_dir, old_data_dir, new_data_dir);
-            
-            system(cmd);
-            LOG_WARN("22cmd: %s\n", cmd);
-            LOG_WARN("move old data to new path: %s -> %s\n",
-                     old_settings.history_data_path, history_data_path);
+    path_changed = strcmp(old_settings.history_data_path,
+                          history_data_path) != 0;
+    if (jmx_history_location_open(history_data_path, 1, path_changed,
+                                  &new_location) != 0)
+        return jmx_history_error("history_path_unavailable",
+                                 "history_path_is_outside_controlled_storage_or_not_safe");
+    if (path_changed) {
+        if (jmx_history_location_open(old_settings.history_data_path, 0, 0,
+                                      &old_location) != 0) {
+            jmx_history_location_close(&new_location);
+            return jmx_history_error("history_source_unavailable",
+                                     "current_history_path_cannot_be_opened_safely");
         }
-        
-        reset_client_data_base_dir_cache();
+        if (jmx_history_locations_overlap(&old_location, &new_location)) {
+            jmx_history_location_close(&old_location);
+            jmx_history_location_close(&new_location);
+            return jmx_history_error("history_path_overlap",
+                                     "history_source_and_destination_must_not_overlap");
+        }
+        if (jmx_history_migrate(&old_location, &new_location, &move_kind) != 0) {
+            (void)jmx_history_migration_rollback(&old_location, &new_location,
+                                                 move_kind);
+            jmx_history_location_close(&old_location);
+            jmx_history_location_close(&new_location);
+            return jmx_history_error("history_migration_failed",
+                                     "history_data_was_not_committed");
+        }
     }
-    
-    update_jmx_proc_u32_value("record_enable", enable);
-    
+    if (jmx_record_enable_runtime_set(enable) != 0) {
+        int proc_rollback_failed =
+            jmx_record_enable_runtime_set(old_settings.record_enabled) != 0;
+        int migration_rollback_failed = path_changed &&
+            jmx_history_migration_rollback(&old_location, &new_location,
+                                           move_kind) != 0;
+
+        jmx_history_location_close(&old_location);
+        jmx_history_location_close(&new_location);
+        return jmx_history_error("record_enable_runtime_apply_failed",
+            migration_rollback_failed ? "history_migration_rollback_failed" :
+            proc_rollback_failed ? "record_enable_compensation_failed" :
+                                   "record_enable_runtime_write_or_readback_failed");
+    }
+    if (path_changed &&
+        jmx_history_migration_finish(&old_location, move_kind) != 0) {
+        int migration_rollback_failed = jmx_history_migration_rollback(
+            &old_location, &new_location, move_kind) != 0;
+        int proc_rollback_failed =
+            jmx_record_enable_runtime_set(old_settings.record_enabled) != 0;
+
+        jmx_history_location_close(&old_location);
+        jmx_history_location_close(&new_location);
+        return jmx_history_error("history_migration_finalize_failed",
+            migration_rollback_failed ? "history_migration_rollback_failed" :
+            proc_rollback_failed ? "record_enable_compensation_failed" :
+                                   "history_settings_not_changed");
+    }
+    if (jmx_legacy_settings_set_record(enable, record_time,
+                                       app_valid_time, history_data_size,
+                                       history_data_path) != 0) {
+        int migration_rollback_failed = path_changed &&
+            jmx_history_migration_rollback(&old_location, &new_location,
+                                           move_kind) != 0;
+        int proc_rollback_failed =
+            jmx_record_enable_runtime_set(old_settings.record_enabled) != 0;
+
+        jmx_history_location_close(&old_location);
+        jmx_history_location_close(&new_location);
+        return jmx_history_error("history_settings_commit_failed",
+            migration_rollback_failed ? "history_migration_rollback_failed" :
+            proc_rollback_failed ? "record_enable_compensation_failed" :
+                                   "history_settings_database_write_failed");
+    }
+    jmx_history_location_close(&old_location);
+    jmx_history_location_close(&new_location);
+    reset_client_data_base_dir_cache();
 
     load_app_valid_time_config();
 
@@ -3741,21 +4650,20 @@ struct json_object *jmx_api_record_action(struct json_object *req_obj) {
     
     if (strcmp(action, "clean_all_data") == 0) {
         jmx_legacy_settings_t settings;
+        struct jmx_history_location location;
         if (jmx_legacy_settings_get(&settings) != 0) {
             return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
         }
-        
-        char data_dir[512] = {0};
-        if (settings.history_data_path[0]) {
-            snprintf(data_dir, sizeof(data_dir), "%s/client_data", settings.history_data_path);
-        } else {
-            strncpy(data_dir, CLIENT_DATA_BASE_DIR_DEFAULT, sizeof(data_dir) - 1);
+        if (jmx_history_location_open(settings.history_data_path, 0, 0,
+                                      &location) != 0)
+            return jmx_history_error("history_path_unavailable",
+                                     "configured_history_path_cannot_be_opened_safely");
+        if (location.data_fd >= 0 && jmx_history_clear_fd(location.data_fd) != 0) {
+            jmx_history_location_close(&location);
+            return jmx_history_error("history_clear_failed",
+                                     "history_data_was_not_fully_cleared");
         }
-        
-        char cmd[1024] = {0};
-        snprintf(cmd, sizeof(cmd), "rm -rf %s/* 2>/dev/null; true", data_dir);
-        system(cmd);
-        
+        jmx_history_location_close(&location);
         reset_client_data_base_dir_cache();
         
         return jmx_gen_api_response_data(API_CODE_SUCCESS, NULL);

@@ -128,7 +128,7 @@ def test_every_write_path_is_capability_gated() -> None:
     assert "if (!(cap('mapping_delete') || cap('delete_upnp_mapping')) || state.saving) return;" in MODULE
 
 
-def test_design_system_and_dense_settings_contract() -> None:
+def test_design_system_and_dhcp_aligned_settings_contract() -> None:
     for component in (
         'data-dwrt-component="surface"',
         'data-dwrt-component="data-table"',
@@ -141,7 +141,7 @@ def test_design_system_and_dense_settings_contract() -> None:
     assert "floatingSavebarMarkup" in MODULE
     assert "statusBadgeMarkup" in MODULE
     assert "dwrt-kit-table-wrap" in MODULE
-    assert "dwrt-kit-glass-surface" in MODULE
+    assert "dwrt-kit-glass-surface" in MODULE  # Copilot editors remain glass Sheets.
     assert "aria-expanded" in MODULE
     assert "可用性说明" in MODULE
     assert 'data-dwrt-component="tabs"' in MODULE
@@ -151,6 +151,29 @@ def test_design_system_and_dense_settings_contract() -> None:
     assert "@media (prefers-reduced-motion: reduce)" in STYLE
     assert "backdrop-filter" not in STYLE
     assert "letter-spacing: 0" in STYLE
+    assert 'class="upnp-settings-surface dwrt-kit-glass-surface"' in MODULE
+    assert 'data-dwrt-surface="dense-surface"' not in MODULE
+    assert 'class="upnp-service-primary"' in MODULE
+    assert "switchControl('enabled', state.draft.enabled" in MODULE
+    protocol = MODULE[MODULE.index('const protocolBody') : MODULE.index('const boundaryBody')]
+    assert "switchRow('enabled'" not in protocol
+    assert '.upnp-setting-group-body::before' not in STYLE
+    assert ':has(' not in STYLE
+
+
+def test_dhcp_aligned_fixed_header_and_workbench_scroll_contract() -> None:
+    assert "20260730-upnp-dhcp-unify-05" in MODULE
+    assert ".console-stage.is-upnp-service" in STYLE
+    assert "grid-template-rows: auto minmax(0, 1fr)" in STYLE
+    assert ".upnp-page-toolbar" in STYLE and "min-height: 52px" in STYLE
+    assert ".upnp-service-workbench" in STYLE
+    assert "overscroll-behavior: contain" in STYLE
+    assert "scrollbar-gutter: stable" in STYLE
+    assert 'data-upnp-version="${VERSION}"' in MODULE
+    assert "border-radius: var(--upnp-radius-card)" in STYLE
+    assert "height: max-content" in STYLE
+    assert "align-self: start" in STYLE
+    assert "width: min(460px" in STYLE
 
 
 def test_no_fake_runtime_values_or_browser_persistence() -> None:

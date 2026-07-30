@@ -1,4 +1,4 @@
-const LEGACY_CONTROLLER_URL = '/static/js/log-center.js?v=20260722-legacy-restore-01';
+const LEGACY_CONTROLLER_URL = '/static/js/log-center.js?v=20260730-log-center-interaction-01';
 
 let controllerPromise = null;
 

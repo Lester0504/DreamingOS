@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260719-10';
+  const VERSION = '20260730-user-auth-online-layout-11';
   const MODULE_CLASS = 'user-authentication-route-host';
   const stage = root?.closest('.console-stage');
   const PAGE_BY_ID = {
@@ -586,7 +586,11 @@ export function mount(context = {}) {
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', MODULE_CLASS);
     const tabs = tabsMarkup();
-    root.innerHTML = `<section class="user-auth-shell is-${state.page}">${tabs ? `<header class="user-auth-page-header">${tabs}</header>` : ''}${noticeMarkup()}<main class="user-auth-workbench">${mainMarkup()}</main>${drawerMarkup()}${previewMarkup()}<input type="file" data-user-auth-import-file accept=".json,.csv,application/json,text/csv" hidden></section>`;
+    // 「在线用户」等页面没有二级 tab，此前 header 直接不渲染，
+    // 导致 alignPageToolbar() 找不到宿主、工具栏留在 workbench 内，
+    // 页面顶部出现一整条空白带。只要该页有工具栏就必须建出 header。
+    const needsHeader = Boolean(tabs) || state.page !== 'web';
+    root.innerHTML = `<section class="user-auth-shell is-${state.page}">${needsHeader ? `<header class="user-auth-page-header${tabs ? '' : ' is-toolbar-only'}">${tabs}</header>` : ''}${noticeMarkup()}<main class="user-auth-workbench">${mainMarkup()}</main>${drawerMarkup()}${previewMarkup()}<input type="file" data-user-auth-import-file accept=".json,.csv,application/json,text/csv" hidden></section>`;
     alignPageToolbar();
     ui.mountAll?.(root);
   }
@@ -597,6 +601,8 @@ export function mount(context = {}) {
     if (!header) return;
     header.querySelectorAll(':scope > .user-auth-toolbar').forEach((node) => node.remove());
     if (toolbar) header.appendChild(toolbar);
+    // 没有 tab 也没有工具栏时不要留下一个空的 header 占位。
+    if (!header.children.length) header.remove();
   }
 
   function patchWorkbench() {

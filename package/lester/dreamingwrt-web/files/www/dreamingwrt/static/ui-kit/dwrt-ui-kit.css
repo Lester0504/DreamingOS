@@ -2905,7 +2905,9 @@ body:has(.dwrt-kit-modal-layer.is-open) {
 }
 
 .dwrt-kit-sheet[data-dwrt-sheet-variant="copilot"] {
+  --dwrt-kit-sheet-radius: 22px;
   border-right: 0;
+  border-radius: var(--dwrt-kit-sheet-radius) 0 0 var(--dwrt-kit-sheet-radius);
 }
 
 .dwrt-kit-modal[data-dwrt-modal-variant="copilot"] {

@@ -37,8 +37,10 @@
   color: var(--dwrt-ink, var(--app-text));
 }
 
-.log-center-shell.is-drawer-open {
-  grid-template-columns: var(--log-filter-width) minmax(0, 1fr) clamp(316px, 22vw, 392px);
+/* 抽屉改为 kit 的 copilot 悬浮 sheet，不再挤占表格所在的 grid 轨道，
+   因此打开/关闭抽屉不会让表格重新排版。 */
+.log-center-drawer-host:empty {
+  display: none;
 }
 
 .log-center-filter {
@@ -770,6 +772,49 @@
   white-space: nowrap;
 }
 
+/* 描述列：默认单行截断，「…」按钮展开为多行，避免一眼望不到头。 */
+.log-table-desc-cell {
+  min-width: 0;
+  max-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.log-table-desc.is-expanded {
+  overflow: visible;
+  white-space: normal;
+  word-break: break-word;
+  text-overflow: clip;
+  line-height: 1.5;
+}
+
+.log-table-desc-toggle {
+  flex: none;
+  min-width: 24px;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid rgba(255,255,255,0.16);
+  border-radius: 7px;
+  background: rgba(255,255,255,0.06);
+  color: var(--dwrt-muted, rgba(218,229,244,0.78));
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.log-table-desc-toggle:hover {
+  border-color: rgba(94,199,255,0.52);
+  color: var(--dwrt-ink, var(--app-text));
+}
+
+html[data-theme-resolved="light"] .log-table-desc-toggle {
+  border-color: rgba(46,61,84,0.16);
+  background: rgba(255,255,255,0.58);
+}
+
 .log-table-severity {
   display: inline-flex;
   align-items: center;
@@ -859,15 +904,9 @@
   cursor: default;
 }
 
+/* 与 AI 抽屉同宽同材质：宽度交给 kit 的 copilot sheet 变量。 */
 .log-center-drawer {
-  height: calc(100% - (2 * var(--app-page-gutter-block, 14px)));
-  min-width: 0;
-  min-height: 0;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  overflow: hidden;
-  border-radius: var(--app-radius-card, 24px);
-  margin-block: var(--app-page-gutter-block, 14px);
+  --dwrt-kit-sheet-width: min(100vw, 460px);
   color: var(--dwrt-ink, var(--app-text));
 }
 
@@ -892,7 +931,9 @@
   font-weight: 680;
 }
 
-.log-drawer-head h2 {
+.log-drawer-head h2,
+.log-drawer-head strong {
+  display: block;
   margin: 3px 0 0;
   color: var(--dwrt-ink, var(--app-text));
   font-size: 16px;
@@ -1034,23 +1075,6 @@ html[data-theme-resolved="light"] .log-detail-raw pre {
   background: rgba(241,246,252,0.76);
 }
 
-@media (max-width: 1360px) {
-  .log-center-shell.is-drawer-open {
-    grid-template-columns: var(--log-filter-width) minmax(0, 1fr);
-  }
-
-  .log-center-shell.is-drawer-open .log-center-drawer {
-    position: fixed;
-    z-index: 64;
-    top: var(--app-page-gutter-block, 14px);
-    right: var(--app-page-gutter-inline, 16px);
-    bottom: var(--app-page-gutter-block, 14px);
-    width: min(420px, calc(100vw - 48px));
-    height: auto;
-    margin-block: 0;
-  }
-}
-
 @media (max-width: 980px) {
   .console-stage.is-log-center {
     padding: var(--app-page-gutter-block, 12px) var(--app-page-gutter-inline, 12px);
@@ -1087,12 +1111,4 @@ html[data-theme-resolved="light"] .log-detail-raw pre {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .log-center-drawer,
-  .log-center-shell.is-drawer-open .log-center-drawer {
-    position: fixed;
-    inset: 14px;
-    width: auto;
-    height: auto;
-    margin-block: 0;
-  }
 }

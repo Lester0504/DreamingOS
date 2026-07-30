@@ -33,9 +33,24 @@
       severity: index % 17 === 0 ? 'VERY_HIGH' : index % 7 === 0 ? 'HIGH' : index % 3 === 0 ? 'MEDIUM' : 'LOW',
       event: index % 4 === 0 ? 'KERNEL_LOG' : 'SYSTEM_LOG',
       title: index % 4 === 0 ? '内核状态变化' : '系统服务事件',
-      message: `Fixture 旧版日志 ${index + 1}：接口状态与运行数据已更新`,
+      message: index === 0
+        ? `Fixture 超长描述 ${index + 1}：${'接口状态与运行数据已更新，该条目用于验证描述列截断与展开行为。'.repeat(6)}`
+        : `Fixture 旧版日志 ${index + 1}：接口状态与运行数据已更新`,
       timestamp: Date.now() - index * 1000,
       raw: `legacy raw fixture ${index + 1}`
+    }));
+
+    // 审计（Web/用户操作）日志：必须与常规日志是不同的行集合。
+    const auditRows = Array.from({ length: 18 }, (_, index) => ({
+      id: `audit-${index + 1}`,
+      source: 'webd',
+      username: index % 2 === 0 ? 'Lester' : 'operator',
+      severity: index % 5 === 0 ? 'HIGH' : 'LOW',
+      event: index % 3 === 0 ? 'CONFIG_MODIFIED' : 'NETWORK_ACCESSED',
+      title: '管理员操作',
+      message: `Fixture 审计日志 ${index + 1}：管理员修改了配置`,
+      timestamp: Date.now() - index * 1500,
+      raw: `audit raw fixture ${index + 1}`
     }));
 
     let instance = null;
@@ -54,7 +69,7 @@
           api: {
             fetch: async () => {
               requestCount += 1;
-              return { ok: true, data: { function_logs: rows, settings: { capabilities: { search: false } }, capabilities: { search: false } } };
+              return { ok: true, data: { function_logs: rows, user_logs: auditRows, settings: { capabilities: { search: false } }, capabilities: { search: false } } };
             },
             authHeaders: (headers = {}) => headers,
             routeTo: () => {}

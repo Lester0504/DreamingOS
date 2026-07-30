@@ -1,0 +1,13 @@
+# Linux kbuild output
+*.o
+*.ko
+*.cmd
+*.mod
+*.mod.c
+Module.symvers
+modules.order
+.tmp_versions/
+
+# Python contract-test cache
+__pycache__/
+*.py[cod]

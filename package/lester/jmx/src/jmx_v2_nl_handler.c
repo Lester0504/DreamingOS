@@ -19,15 +19,12 @@
 #include "jmx_v3_nl_handler.h"
 #include "jmx_conntrack.h"
 #include "jmx_log.h"
+#include "jmx_client.h"
 extern void jmx_v2_update_active_app(uint32_t appid, uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port, uint8_t proto);
 extern void jmx_v2_update_active_app6_ex(uint32_t appid,
 						 const uint8_t *src_ip6, const uint8_t *dst_ip6,
 						 uint16_t src_port, uint16_t dst_port, uint8_t proto,
 						 uint8_t app_proto, const char *host, uint8_t host_len);
-extern int af_update_client_app_info(void *node, int app_id, int drop,
-				     int from_conntrack, int is_http);
-extern void *find_af_client_by_ip(uint32_t ip);
-extern void *find_af_client_by_ipv6(const uint8_t *ip6);
 extern int g_record_enable;
 
 #define JMX_NL_ACT_RULE_FLUSH      10
@@ -216,7 +213,7 @@ int jmx_v2_nl_handle(const char *data, int len, uint32_t portid,
 				portid, nlmsg_seq);
 			return 1;
 		}
-		rc = jmx_v2_rules_commit(vm->version);
+		rc = jmx_v2_rules_commit(portid, vm->version);
 		if (rc != 0)
 			pr_err("jmx_v2: generation %u commit rejected; previous generation remains active\n",
 			       vm->version);
@@ -231,10 +228,18 @@ int jmx_v2_nl_handle(const char *data, int len, uint32_t portid,
 		return 1;
 
 	switch (action) {
-	case JMX_NL_ACT_RULE_FLUSH:
-		jmx_v2_rules_flush();
-		JMX_DEBUG_RATELIMITED(1, "jmx_v2: rules flushed\n");
+	case JMX_NL_ACT_RULE_FLUSH: {
+		int rc = jmx_v2_rules_begin(portid);
+
+		if (rc)
+			pr_warn_ratelimited("jmx_v2: FLUSH rejected owner=%u rc=%d\n",
+					    portid, rc);
+		else
+			JMX_DEBUG_RATELIMITED(1,
+				"jmx_v2: staging transaction started owner=%u\n",
+				portid);
 		return 1;
+	}
 
 	case JMX_NL_ACT_RULE_ADD: {
 		const struct v2_nl_rule *nr;
@@ -243,11 +248,11 @@ int jmx_v2_nl_handle(const char *data, int len, uint32_t portid,
 			return 1;
 		nr = (const struct v2_nl_rule *)(data + sizeof(int32_t));
 		if (v2_copy_rule(nr, &kr) != 0) {
-			jmx_v2_rule_add(NULL);
+			jmx_v2_rule_add(portid, NULL);
 			pr_warn_ratelimited("jmx_v2: invalid rule ignored\n");
 			return 1;
 		}
-		if (jmx_v2_rule_add(&kr) != 0)
+		if (jmx_v2_rule_add(portid, &kr) != 0)
 			pr_warn_ratelimited("jmx_v2: rule add rejected\n");
 		return 1;
 	}
@@ -261,13 +266,13 @@ int jmx_v2_nl_handle(const char *data, int len, uint32_t portid,
 			return 1;
 		count = bm->count;
 		if (count > 1024) {
-			jmx_v2_rule_add(NULL);
+			jmx_v2_rule_add(portid, NULL);
 			pr_err("jmx_v2: batch too large (%u)\n", count);
 			return 1;
 		}
 		expected = sizeof(struct v2_batch_msg) + sizeof(struct v2_nl_rule) * count;
 		if (len < (int)expected) {
-			jmx_v2_rule_add(NULL);
+			jmx_v2_rule_add(portid, NULL);
 			pr_warn_ratelimited("jmx_v2: short batch len=%d count=%u\n", len, count);
 			return 1;
 		}
@@ -276,11 +281,11 @@ int jmx_v2_nl_handle(const char *data, int len, uint32_t portid,
 			jmx_v2_rule_t kr;
 			const struct v2_nl_rule *nr = &rules[i];
 			if (v2_copy_rule(nr, &kr) != 0) {
-				jmx_v2_rule_add(NULL);
+				jmx_v2_rule_add(portid, NULL);
 				pr_warn_ratelimited("jmx_v2: invalid batch rule ignored\n");
 				continue;
 			}
-			if (jmx_v2_rule_add(&kr) != 0)
+			if (jmx_v2_rule_add(portid, &kr) != 0)
 				pr_warn_ratelimited("jmx_v2: batch rule add rejected\n");
 		}
 		JMX_DEBUG_RATELIMITED(1, "jmx_v2: batch added %u rules\n", count);
@@ -360,12 +365,14 @@ int jmx_v2_nl_handle(const char *data, int len, uint32_t portid,
 			 * no longer matches, but the UI/audit view should still reflect the
 			 * successful regex/DNS-cache classification. */
 			if (g_record_enable) {
-				void *cli = find_af_client_by_ip(rm->src_ip);
-					if (!cli)
-						cli = find_af_client_by_ip(rm->dst_ip);
-					if (cli)
-						af_update_client_app_info(cli, rm->appid, 0, 0, 0);
-				}
+					af_client_info_t *cli = af_client_get_by_ip(rm->src_ip);
+						if (!cli)
+							cli = af_client_get_by_ip(rm->dst_ip);
+						if (cli) {
+							af_update_client_app_info(cli, rm->appid, 0, 0, 0);
+							af_client_put(cli);
+						}
+					}
 
 			if (ct) {
 				ct->jmx_data.app_id = rm->appid;

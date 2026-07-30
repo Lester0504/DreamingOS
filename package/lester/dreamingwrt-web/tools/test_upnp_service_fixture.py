@@ -10,10 +10,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-# Override with PLAYWRIGHT_RUNTIME to point at a local Node + Playwright install.
-RUNTIME = Path(os.environ.get("PLAYWRIGHT_RUNTIME", Path.home() / ".cache/dreamingwrt-playwright"))
+RUNTIME = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies"
 NODE = Path(shutil.which("node") or RUNTIME / "node/bin/node")
-NODE_MODULES = RUNTIME / "node/node_modules"
+PROJECT_NODE_MODULES = ROOT.parents[1] / "openwrt-unifi-dashboard/node_modules"
+NODE_MODULES = PROJECT_NODE_MODULES if (PROJECT_NODE_MODULES / "playwright").exists() else RUNTIME / "node/node_modules"
 
 if not NODE.is_file():
     raise SystemExit(f"Node.js not found: {NODE}")
@@ -52,14 +52,29 @@ const { chromium } = require('playwright');
         title: node.querySelector('strong')?.textContent.trim(), expanded: node.getAttribute('aria-expanded')
       }));
       const disabled = Array.from(root.querySelectorAll('[data-upnp-field]:disabled')).map(node => node.dataset.upnpField);
+      const surface = root.querySelector('.upnp-settings-surface');
+      const surfaceRect = surface.getBoundingClientRect();
+      const groupBottoms = Array.from(root.querySelectorAll('[data-upnp-group]')).map(node => Math.round(node.getBoundingClientRect().bottom));
       return {
         viewport,
         tabs: Array.from(root.querySelectorAll('[data-upnp-tab]')).map(node => node.textContent.trim()),
         groups,
         disabled,
-        runtimeValues: Array.from(root.querySelectorAll('.upnp-runtime-summary strong')).map(node => node.textContent.trim()),
+        runtimeValues: Array.from(root.querySelectorAll('.upnp-runtime-summary dd')).map(node => node.textContent.trim()),
+        primarySwitches: root.querySelectorAll('.upnp-service-primary [data-upnp-field="enabled"]').length,
+        settingsRadius: getComputedStyle(root.querySelector('.upnp-settings-surface')).borderRadius,
+        settingsContentClipped: groupBottoms.some(bottom => bottom > Math.round(surfaceRect.bottom) + 1),
+        settingsHeight: Math.round(surfaceRect.height),
+        workbenchClientHeight: root.querySelector('.upnp-service-workbench').clientHeight,
+        workbenchScrollHeight: root.querySelector('.upnp-service-workbench').scrollHeight,
         overflow: document.documentElement.scrollWidth > innerWidth + 1 || root.scrollWidth > root.clientWidth + 1,
-        glassSurfaces: root.querySelectorAll('.upnp-settings-surface.dwrt-kit-glass-surface').length
+        glassSurfaces: root.querySelectorAll('.upnp-settings-surface.dwrt-kit-glass-surface').length,
+        stageOverflow:getComputedStyle(document.querySelector('.console-stage')).overflowY,
+        workbenchOverflow:getComputedStyle(root.querySelector('.upnp-service-workbench')).overflowY,
+        toolbarTop:Math.round(root.querySelector('.upnp-page-toolbar').getBoundingClientRect().top),
+        workbenchTop:Math.round(root.querySelector('.upnp-service-workbench').getBoundingClientRect().top),
+        actionCenter:Math.round(root.querySelector('.upnp-page-actions').getBoundingClientRect().top + root.querySelector('.upnp-page-actions').getBoundingClientRect().height / 2),
+        tabsCenter:Math.round(root.querySelector('.upnp-tabs').getBoundingClientRect().top + root.querySelector('.upnp-tabs').getBoundingClientRect().height / 2)
       };
     }, viewport);
     await page.locator('[data-upnp-group-toggle="runtime"]').click();
@@ -71,7 +86,7 @@ const { chromium } = require('playwright');
     const aclSheet = await page.evaluate(() => {
       const sheet = document.querySelector('.upnp-sheet');
       const rect = sheet.getBoundingClientRect();
-      return { open: Boolean(sheet), right: Math.abs(innerWidth - rect.right), inside: rect.left >= -1, saveDisabled: Boolean(sheet.querySelector('[data-upnp-editor-save]:disabled')) };
+      return { open: Boolean(sheet), right: Math.abs(innerWidth - rect.right), inside: rect.left >= -1, width: Math.round(rect.width), saveDisabled: Boolean(sheet.querySelector('[data-upnp-editor-save]:disabled')) };
     });
     await page.locator('[data-upnp-close]').last().click();
     await page.locator('[data-upnp-tab="dynamic"]').click();
@@ -101,10 +116,18 @@ const { chromium } = require('playwright');
         assert [item["expanded"] for item in settings["groups"]] == ["true", "false", "false"], result
         assert all(field in settings["disabled"] for field in ["pcp", "use_stun", "force_forwarding"]), result
         assert settings["runtimeValues"] == ["1", "0", "0", "已启用"], result
+        assert settings["primarySwitches"] == 1, result
+        assert settings["settingsRadius"] == "24px", result
+        assert not settings["settingsContentClipped"], result
+        if settings["viewport"]["width"] == 390:
+            assert settings["workbenchScrollHeight"] > settings["workbenchClientHeight"], result
         assert not settings["overflow"] and settings["glassSurfaces"] == 1, result
+        assert settings["stageOverflow"] == "hidden" and settings["workbenchOverflow"] == "auto", result
+        assert settings["workbenchTop"] > settings["toolbarTop"], result
+        assert abs(settings["actionCenter"] - settings["tabsCenter"]) <= 1, result
         assert result["expanded"] == ["false", "false", "true"], result
         assert result["acl"] == {"rows": 2, "createDisabled": False}, result
-        assert result["aclSheet"]["open"] and result["aclSheet"]["inside"] and result["aclSheet"]["right"] <= 1 and not result["aclSheet"]["saveDisabled"], result
+        assert result["aclSheet"]["open"] and result["aclSheet"]["inside"] and result["aclSheet"]["right"] <= 1 and result["aclSheet"]["width"] <= 460 and not result["aclSheet"]["saveDisabled"], result
         assert result["dynamic"]["rows"] == 1 and result["dynamic"]["editButtons"] == 0 and "不显示伪造流量" in result["dynamic"]["text"], result
         assert result["staticView"] == {"rows": 1, "createDisabled": True}, result
         assert result["staticSheet"]["open"] and not result["staticSheet"]["save"] and result["staticSheet"]["capability"], result

@@ -73,6 +73,35 @@ struct geo_runtime_set {
     int64_t element_count;
 };
 
+/* Counter readback is attributed with the generated
+ * `aegis_geo:<rule_id>:<direction>:<COUNTRY>` comment written by
+ * geo_write_rule_line(), so every packet/byte total belongs to an exact rule,
+ * direction and country. Nothing is inferred from rule order or nft handles.
+ *
+ * A single apply can materialize GEO_MAX_RULES * GEO_MAX_COUNTRIES * 4 rule
+ * lines, so per-line records are never retained. Totals are folded into fixed
+ * per-rule and per-country buckets while streaming, keeping this parser
+ * stack-safe and independent of table size.
+ */
+struct geo_counter_totals {
+    uint64_t inbound_packets;
+    uint64_t inbound_bytes;
+    uint64_t outbound_packets;
+    uint64_t outbound_bytes;
+    int rule_lines;
+    int counter_lines;
+};
+
+struct geo_rule_counter {
+    char rule_id[65];
+    struct geo_counter_totals totals;
+};
+
+struct geo_country_counter {
+    char country[3];
+    struct geo_counter_totals totals;
+};
+
 struct geo_country {
     char code[3];
     int ipv4_prefixes;
@@ -116,6 +145,15 @@ struct geo_runtime_counts {
     int rule_count;
     int64_t element_count;
     struct geo_runtime_set sets[GEO_READBACK_MAX_SETS];
+    struct geo_counter_totals counter_totals;
+    struct geo_rule_counter rule_counters[GEO_MAX_RULES];
+    int rule_counter_count;
+    struct geo_country_counter country_counters[GEO_MAX_COUNTRIES];
+    int country_counter_count;
+    int owned_rule_lines;
+    int foreign_rule_lines;
+    int rule_lines_without_counter;
+    int rule_counter_bucket_overflow;
 };
 
 struct geo_runtime_space {
@@ -1073,6 +1111,9 @@ enum geo_json_role {
     GEO_JSON_ROLE_ENTRY,
     GEO_JSON_ROLE_ENTRY_VALUE,
     GEO_JSON_ROLE_ELEMS,
+    GEO_JSON_ROLE_EXPR,
+    GEO_JSON_ROLE_EXPR_ITEM,
+    GEO_JSON_ROLE_COUNTER,
 };
 
 enum geo_json_value_type {
@@ -1129,6 +1170,12 @@ struct geo_json_entry {
     char family[16];
     char table[128];
     char name[128];
+    char comment[160];
+    int counter_seen;
+    int counter_packets_seen;
+    int counter_bytes_seen;
+    uint64_t counter_packets;
+    uint64_t counter_bytes;
 };
 
 struct geo_readback_parser {
@@ -1164,6 +1211,8 @@ struct geo_readback_parser {
 #define GEO_ENTRY_SEEN_TABLE  (1U << 2)
 #define GEO_ENTRY_SEEN_NAME   (1U << 3)
 #define GEO_ENTRY_SEEN_ELEM   (1U << 4)
+#define GEO_ENTRY_SEEN_COMMENT (1U << 5)
+#define GEO_ENTRY_SEEN_EXPR    (1U << 6)
 
 static int geo_readback_parser_fail(struct geo_readback_parser *parser)
 {
@@ -1255,10 +1304,156 @@ static int geo_json_relevant_entry_field(const char *key, unsigned int *bit,
     } else if (!strcmp(key, "elem")) {
         *bit = GEO_ENTRY_SEEN_ELEM;
         *required = GEO_JSON_VALUE_ARRAY;
+    } else if (!strcmp(key, "comment")) {
+        *bit = GEO_ENTRY_SEEN_COMMENT;
+        *required = GEO_JSON_VALUE_STRING;
+    } else if (!strcmp(key, "expr")) {
+        *bit = GEO_ENTRY_SEEN_EXPR;
+        *required = GEO_JSON_VALUE_ARRAY;
     } else {
         return 0;
     }
     return 1;
+}
+
+/* Parse the exact `aegis_geo:<rule_id>:<direction>:<COUNTRY>` comment written by
+ * geo_write_rule_line(). A rule line carrying any other comment, or a malformed
+ * one, is reported as foreign/unparsed instead of being attributed to a rule.
+ */
+static int geo_parse_owned_comment(const char *comment, char *rule_id, size_t rule_id_size,
+                                   int *inbound, char *country)
+{
+    const char *cursor, *direction_end, *country_start;
+    size_t rule_len, direction_len;
+
+    if (!comment || strncmp(comment, "aegis_geo:", 10))
+        return 0;
+    cursor = comment + 10;
+    direction_end = strchr(cursor, ':');
+    if (!direction_end || direction_end == cursor)
+        return 0;
+    rule_len = (size_t)(direction_end - cursor);
+    if (rule_len >= rule_id_size)
+        return 0;
+    memcpy(rule_id, cursor, rule_len);
+    rule_id[rule_len] = '\0';
+
+    cursor = direction_end + 1;
+    country_start = strchr(cursor, ':');
+    if (!country_start)
+        return 0;
+    direction_len = (size_t)(country_start - cursor);
+    if (direction_len == 7 && !memcmp(cursor, "inbound", 7))
+        *inbound = 1;
+    else if (direction_len == 8 && !memcmp(cursor, "outbound", 8))
+        *inbound = 0;
+    else
+        return 0;
+
+    country_start++;
+    if (strlen(country_start) != 2 ||
+        country_start[0] < 'A' || country_start[0] > 'Z' ||
+        country_start[1] < 'A' || country_start[1] > 'Z')
+        return 0;
+    country[0] = country_start[0];
+    country[1] = country_start[1];
+    country[2] = '\0';
+    return 1;
+}
+
+static int geo_counter_totals_add(struct geo_counter_totals *totals, int inbound,
+                                  int counter_present, uint64_t packets, uint64_t bytes)
+{
+    uint64_t *packet_slot = inbound ? &totals->inbound_packets : &totals->outbound_packets;
+    uint64_t *byte_slot = inbound ? &totals->inbound_bytes : &totals->outbound_bytes;
+
+    if (totals->rule_lines == INT_MAX)
+        return -1;
+    totals->rule_lines++;
+    if (!counter_present)
+        return 0;
+    if (packets > UINT64_MAX - *packet_slot || bytes > UINT64_MAX - *byte_slot ||
+        totals->counter_lines == INT_MAX)
+        return -1;
+    *packet_slot += packets;
+    *byte_slot += bytes;
+    totals->counter_lines++;
+    return 0;
+}
+
+/* Fold one owned rule line into the fixed per-rule and per-country buckets.
+ * A rule line whose counter expression is absent is counted as a rule line but
+ * never contributes fabricated zero traffic, so callers can tell "no counter"
+ * apart from "counter reads zero".
+ */
+static int geo_readback_rule_counter_commit(struct geo_readback_parser *parser,
+                                           const struct geo_json_entry *entry)
+{
+    struct geo_rule_counter *rule_bucket = NULL;
+    struct geo_country_counter *country_bucket = NULL;
+    char rule_id[65];
+    char country[3];
+    int inbound = 0;
+    int counter_present;
+    int i;
+
+    if (!(entry->seen & GEO_ENTRY_SEEN_COMMENT) ||
+        !geo_parse_owned_comment(entry->comment, rule_id, sizeof(rule_id), &inbound, country)) {
+        if (parser->counts.foreign_rule_lines != INT_MAX)
+            parser->counts.foreign_rule_lines++;
+        return 0;
+    }
+
+    counter_present = entry->counter_seen && entry->counter_packets_seen &&
+                      entry->counter_bytes_seen;
+    if (entry->counter_seen && !counter_present)
+        return geo_readback_parser_fail(parser);
+
+    if (parser->counts.owned_rule_lines == INT_MAX)
+        return geo_readback_parser_fail(parser);
+    parser->counts.owned_rule_lines++;
+    if (!counter_present && parser->counts.rule_lines_without_counter != INT_MAX)
+        parser->counts.rule_lines_without_counter++;
+
+    for (i = 0; i < parser->counts.rule_counter_count; i++)
+        if (!strcmp(parser->counts.rule_counters[i].rule_id, rule_id)) {
+            rule_bucket = &parser->counts.rule_counters[i];
+            break;
+        }
+    if (!rule_bucket) {
+        if (parser->counts.rule_counter_count >= GEO_MAX_RULES) {
+            parser->counts.rule_counter_bucket_overflow = 1;
+        } else {
+            rule_bucket = &parser->counts.rule_counters[parser->counts.rule_counter_count++];
+            memcpy(rule_bucket->rule_id, rule_id, strlen(rule_id) + 1);
+        }
+    }
+
+    for (i = 0; i < parser->counts.country_counter_count; i++)
+        if (!strcmp(parser->counts.country_counters[i].country, country)) {
+            country_bucket = &parser->counts.country_counters[i];
+            break;
+        }
+    if (!country_bucket) {
+        if (parser->counts.country_counter_count >= GEO_MAX_COUNTRIES) {
+            parser->counts.rule_counter_bucket_overflow = 1;
+        } else {
+            country_bucket =
+                &parser->counts.country_counters[parser->counts.country_counter_count++];
+            memcpy(country_bucket->country, country, 3);
+        }
+    }
+
+    if ((rule_bucket &&
+         geo_counter_totals_add(&rule_bucket->totals, inbound, counter_present,
+                                entry->counter_packets, entry->counter_bytes) != 0) ||
+        (country_bucket &&
+         geo_counter_totals_add(&country_bucket->totals, inbound, counter_present,
+                                entry->counter_packets, entry->counter_bytes) != 0) ||
+        geo_counter_totals_add(&parser->counts.counter_totals, inbound, counter_present,
+                               entry->counter_packets, entry->counter_bytes) != 0)
+        return geo_readback_parser_fail(parser);
+    return 0;
 }
 
 static int geo_readback_entry_commit(struct geo_readback_parser *parser)
@@ -1301,6 +1496,8 @@ static int geo_readback_entry_commit(struct geo_readback_parser *parser)
         if (parser->counts.rule_count >= GEO_READBACK_MAX_RULES)
             return geo_readback_parser_fail(parser);
         parser->counts.rule_count++;
+        if (geo_readback_rule_counter_commit(parser, entry) != 0)
+            return -1;
     } else if (entry->kind == GEO_NFT_ENTRY_ELEMENT) {
         if (!(entry->seen & GEO_ENTRY_SEEN_NAME))
             return geo_readback_parser_fail(parser);
@@ -1367,6 +1564,20 @@ static int geo_json_value_begin(struct geo_readback_parser *parser,
                 (parser->entry.kind == GEO_NFT_ENTRY_SET ||
                  parser->entry.kind == GEO_NFT_ENTRY_ELEMENT))
                 *new_role = GEO_JSON_ROLE_ELEMS;
+            if (bit == GEO_ENTRY_SEEN_EXPR && parser->entry.kind == GEO_NFT_ENTRY_RULE)
+                *new_role = GEO_JSON_ROLE_EXPR;
+        } else if (parent->role == GEO_JSON_ROLE_EXPR_ITEM &&
+                   !strcmp(parent->key, "counter") &&
+                   type == GEO_JSON_VALUE_OBJECT) {
+            /* `counter` can also appear as a non-object (for example
+             * `"counter": null` in a stateless listing). Only a real counter
+             * object carries packets/bytes, and anything else must still fall
+             * through to the normal container state transition below.
+             */
+            if (parser->entry.counter_seen)
+                return geo_readback_parser_fail(parser);
+            parser->entry.counter_seen = 1;
+            *new_role = GEO_JSON_ROLE_COUNTER;
         }
         parent->state = GEO_JSON_OBJECT_COMMA_OR_END;
     } else {
@@ -1378,6 +1589,9 @@ static int geo_json_value_begin(struct geo_readback_parser *parser,
                 return geo_readback_parser_fail(parser);
             memset(&parser->entry, 0, sizeof(parser->entry));
             *new_role = GEO_JSON_ROLE_ENTRY;
+        } else if (parent->role == GEO_JSON_ROLE_EXPR) {
+            if (type == GEO_JSON_VALUE_OBJECT)
+                *new_role = GEO_JSON_ROLE_EXPR_ITEM;
         } else if (parent->role == GEO_JSON_ROLE_ELEMS) {
             if (parser->entry.elements >= GEO_READBACK_MAX_ELEMENTS)
                 return geo_readback_parser_fail(parser);
@@ -1469,6 +1683,9 @@ static int geo_json_string_complete(struct geo_readback_parser *parser)
     } else if (!strcmp(container->key, "name")) {
         destination = parser->entry.name;
         destination_size = sizeof(parser->entry.name);
+    } else if (!strcmp(container->key, "comment")) {
+        destination = parser->entry.comment;
+        destination_size = sizeof(parser->entry.comment);
     }
     if (destination) {
         if (parser->token_overflow || parser->token_has_nul ||
@@ -1497,6 +1714,50 @@ static int geo_json_number_accepting(enum geo_json_number_state state)
 {
     return state == GEO_JSON_NUM_ZERO || state == GEO_JSON_NUM_INTEGER ||
            state == GEO_JSON_NUM_FRACTION || state == GEO_JSON_NUM_EXP_DIGIT;
+}
+
+/* Only `counter.packets` / `counter.bytes` are retained. Both must be exact
+ * unsigned integers; nft emits plain integers there, so a fractional, negative,
+ * exponent or overflowing value means the assumed contract no longer holds and
+ * the readback fails instead of reporting a rounded number.
+ */
+static int geo_json_number_complete(struct geo_readback_parser *parser)
+{
+    struct geo_json_container *container;
+    uint64_t value = 0;
+    size_t i;
+
+    if (!parser->depth)
+        return geo_readback_parser_fail(parser);
+    container = &parser->stack[parser->depth - 1];
+    if (container->type != GEO_JSON_OBJECT ||
+        container->role != GEO_JSON_ROLE_COUNTER)
+        return 0;
+    if (strcmp(container->key, "packets") && strcmp(container->key, "bytes"))
+        return 0;
+    if (parser->token_overflow || parser->token_has_nul || !parser->token_len)
+        return geo_readback_parser_fail(parser);
+    for (i = 0; i < parser->token_len; i++) {
+        unsigned char digit = (unsigned char)parser->token[i];
+
+        if (digit < '0' || digit > '9')
+            return geo_readback_parser_fail(parser);
+        if (value > (UINT64_MAX - (uint64_t)(digit - '0')) / 10ULL)
+            return geo_readback_parser_fail(parser);
+        value = value * 10ULL + (uint64_t)(digit - '0');
+    }
+    if (!strcmp(container->key, "packets")) {
+        if (parser->entry.counter_packets_seen)
+            return geo_readback_parser_fail(parser);
+        parser->entry.counter_packets_seen = 1;
+        parser->entry.counter_packets = value;
+    } else {
+        if (parser->entry.counter_bytes_seen)
+            return geo_readback_parser_fail(parser);
+        parser->entry.counter_bytes_seen = 1;
+        parser->entry.counter_bytes = value;
+    }
+    return 0;
 }
 
 static int geo_json_number_char(struct geo_readback_parser *parser, unsigned char ch,
@@ -1548,7 +1809,12 @@ static int geo_json_number_char(struct geo_readback_parser *parser, unsigned cha
         if (!geo_json_number_accepting(parser->number))
             return geo_readback_parser_fail(parser);
         parser->lexer = GEO_JSON_LEX_NORMAL;
+        return geo_json_number_complete(parser);
     }
+    if (parser->token_len + 1 < sizeof(parser->token))
+        parser->token[parser->token_len++] = (char)ch;
+    else
+        parser->token_overflow = 1;
     return 0;
 }
 
@@ -1743,6 +2009,10 @@ static int geo_readback_parser_feed(struct geo_readback_parser *parser,
             parser->lexer = GEO_JSON_LEX_NUMBER;
             parser->number = ch == '-' ? GEO_JSON_NUM_MINUS :
                              ch == '0' ? GEO_JSON_NUM_ZERO : GEO_JSON_NUM_INTEGER;
+            parser->token_len = 0;
+            parser->token_overflow = 0;
+            parser->token_has_nul = 0;
+            parser->token[parser->token_len++] = (char)ch;
             offset++;
         } else if (ch == 't' || ch == 'f' || ch == 'n') {
             enum geo_json_value_type value_type = ch == 't' ? GEO_JSON_VALUE_TRUE :
@@ -1766,8 +2036,11 @@ static int geo_readback_parser_finish(struct geo_readback_parser *parser,
     if (!parser || !counts || parser->failed)
         return -1;
     if (parser->lexer == GEO_JSON_LEX_NUMBER &&
-        geo_json_number_accepting(parser->number))
+        geo_json_number_accepting(parser->number)) {
+        if (geo_json_number_complete(parser) != 0)
+            return -1;
         parser->lexer = GEO_JSON_LEX_NORMAL;
+    }
     if (parser->lexer != GEO_JSON_LEX_NORMAL || parser->depth ||
         !parser->root_done || !parser->nftables_seen || parser->target_table_count != 1)
         return geo_readback_parser_fail(parser);
@@ -2117,6 +2390,15 @@ static void geo_add_capabilities(struct json_object *o, int ready)
     json_object_object_add(cap, "atomic_apply", json_object_new_boolean(nft));
     json_object_object_add(cap, "active_readback", json_object_new_boolean(nft));
     json_object_object_add(cap, "rollback", json_object_new_boolean(nft));
+    /* Per-country and per-rule packet/byte counters are read back from the
+     * generated nft rule comments, so they are available whenever the nft
+     * dataplane is available. Hit *events* are a separate producer and are not
+     * claimed here.
+     */
+    json_object_object_add(cap, "counters_supported", json_object_new_boolean(nft));
+    json_object_object_add(cap, "per_country_counters", json_object_new_boolean(nft));
+    json_object_object_add(cap, "per_rule_counters", json_object_new_boolean(nft));
+    json_object_object_add(cap, "counter_events_supported", json_object_new_boolean(0));
     json_object_object_add(cap, "per_packet_mmdb_lookup", json_object_new_boolean(0));
     memset(&space, 0, sizeof(space));
     (void)geo_runtime_space_check(NULL, geo_file_size_capped(GEO_NFT_PATH, 1) > 0,
@@ -2173,6 +2455,110 @@ static int geo_readback_matches_plan(const struct geo_plan *plan,
         }
     }
     return 1;
+}
+
+static void geo_add_counter_totals_json(struct json_object *target,
+                                        const struct geo_counter_totals *totals)
+{
+    uint64_t packets = totals->inbound_packets + totals->outbound_packets;
+    uint64_t bytes = totals->inbound_bytes + totals->outbound_bytes;
+
+    json_object_object_add(target, "packets", json_object_new_uint64(packets));
+    json_object_object_add(target, "bytes", json_object_new_uint64(bytes));
+    json_object_object_add(target, "inbound_packets",
+                           json_object_new_uint64(totals->inbound_packets));
+    json_object_object_add(target, "inbound_bytes",
+                           json_object_new_uint64(totals->inbound_bytes));
+    json_object_object_add(target, "outbound_packets",
+                           json_object_new_uint64(totals->outbound_packets));
+    json_object_object_add(target, "outbound_bytes",
+                           json_object_new_uint64(totals->outbound_bytes));
+    json_object_object_add(target, "rule_lines", json_object_new_int(totals->rule_lines));
+    json_object_object_add(target, "counter_lines", json_object_new_int(totals->counter_lines));
+}
+
+/* Live nft counter readback for the AegisXD-owned Geo table.
+ *
+ * Totals come only from rule lines carrying the generated
+ * `aegis_geo:<rule_id>:<direction>:<COUNTRY>` comment, so per-rule and
+ * per-country attribution is exact. When the table is absent the response is an
+ * explicit unsupported/inactive state rather than zeroed counters that would
+ * look like real "no traffic" data.
+ */
+struct json_object *aegisxd_geo_counters_json(void)
+{
+    struct json_object *resp = json_object_new_object();
+    struct json_object *rules, *countries;
+    struct geo_runtime_counts readback;
+    int table_state = geo_nft_table_state();
+    int i;
+
+    aegisxd_json_add_string(resp, "service", "dreamingwrt-aegisxd");
+    aegisxd_json_add_string(resp, "scope", "geo_country_counters");
+    aegisxd_json_add_string(resp, "nft_table", GEO_NFT_TABLE);
+    json_object_object_add(resp, "counters_supported",
+                           json_object_new_boolean(geo_nft_binary()[0] != '\0'));
+    if (!geo_nft_binary()[0]) {
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        json_object_object_add(resp, "active", json_object_new_boolean(0));
+        aegisxd_json_add_string(resp, "error", "nft_binary_missing");
+        return resp;
+    }
+    if (table_state < 0) {
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        json_object_object_add(resp, "active", json_object_new_boolean(0));
+        aegisxd_json_add_string(resp, "error", "nft_table_probe_failed");
+        aegisxd_json_add_string(resp, "reason", GEO_NFT_LOG);
+        return resp;
+    }
+    if (table_state == 0) {
+        json_object_object_add(resp, "ok", json_object_new_boolean(1));
+        json_object_object_add(resp, "active", json_object_new_boolean(0));
+        aegisxd_json_add_string(resp, "reason", "geo_nft_table_absent");
+        return resp;
+    }
+    if (geo_capture_readback(&readback) != 0 || !readback.table_found) {
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        json_object_object_add(resp, "active", json_object_new_boolean(1));
+        aegisxd_json_add_string(resp, "error", "geo_counter_readback_failed");
+        aegisxd_json_add_string(resp, "reason", GEO_NFT_LOG);
+        return resp;
+    }
+    json_object_object_add(resp, "ok", json_object_new_boolean(1));
+    json_object_object_add(resp, "active", json_object_new_boolean(1));
+    json_object_object_add(resp, "collected_at", json_object_new_int64(aegisxd_now_s()));
+    json_object_object_add(resp, "runtime_rule_line_count",
+                           json_object_new_int(readback.rule_count));
+    json_object_object_add(resp, "owned_rule_line_count",
+                           json_object_new_int(readback.owned_rule_lines));
+    json_object_object_add(resp, "foreign_rule_line_count",
+                           json_object_new_int(readback.foreign_rule_lines));
+    json_object_object_add(resp, "rule_lines_without_counter",
+                           json_object_new_int(readback.rule_lines_without_counter));
+    json_object_object_add(resp, "counters_truncated",
+                           json_object_new_boolean(readback.rule_counter_bucket_overflow));
+    geo_add_counter_totals_json(resp, &readback.counter_totals);
+
+    rules = json_object_new_array();
+    for (i = 0; i < readback.rule_counter_count; i++) {
+        struct json_object *item = json_object_new_object();
+
+        aegisxd_json_add_string(item, "rule_id", readback.rule_counters[i].rule_id);
+        geo_add_counter_totals_json(item, &readback.rule_counters[i].totals);
+        json_object_array_add(rules, item);
+    }
+    json_object_object_add(resp, "rules", rules);
+
+    countries = json_object_new_array();
+    for (i = 0; i < readback.country_counter_count; i++) {
+        struct json_object *item = json_object_new_object();
+
+        aegisxd_json_add_string(item, "country_code", readback.country_counters[i].country);
+        geo_add_counter_totals_json(item, &readback.country_counters[i].totals);
+        json_object_array_add(countries, item);
+    }
+    json_object_object_add(resp, "countries", countries);
+    return resp;
 }
 
 struct json_object *aegisxd_geo_get_json(void)

@@ -182,6 +182,7 @@ struct json_object *jmx_upnp_acl_delete_apply_result(const char *id);
 /* Firewall service */
 struct json_object *jmx_firewall_service_get(void);
 int  jmx_firewall_service_set(struct json_object *cfg);
+int  jmx_firewall_service_validate(struct json_object *cfg);
 struct json_object *jmx_firewall_service_apply(struct json_object *cfg);
 
 /* Geo-Block */
@@ -334,6 +335,10 @@ int nc_client_rate_limit_set_ex(const char *mac, const char *ip,
                                  int upload_kbps, int download_kbps,
                                  const char *protocol, const char *remark);
 int nc_client_rate_limit_delete(const char *mac);
+int nc_client_rate_limit_set_json(struct json_object *cfg,
+                                  const char **reason, const char **field);
+int nc_client_rate_limit_delete_json(struct json_object *cfg,
+                                     const char **reason, const char **field);
 int jmx_client_control_schedule_tick(void);
 struct json_object *jmx_log_center_get(void);
 struct json_object *jmx_log_center_query(struct json_object *cfg);

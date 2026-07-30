@@ -35,8 +35,8 @@ typedef enum {
 
 extern int current_log_level;
 
-static void af_log(LogLevel level, const char *func, int line, const char *format, ...){
-    if (level > current_log_level) 
+static inline void af_log(LogLevel level, const char *func, int line, const char *format, ...){
+    if ((int)level > current_log_level)
         return;
     
     FILE *log_file = fopen(LOG_FILE_PATH, "a");

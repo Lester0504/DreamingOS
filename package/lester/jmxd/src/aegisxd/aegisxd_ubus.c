@@ -589,6 +589,17 @@ static int aegisxd_handle_geo_apply(struct ubus_context *ctx, struct ubus_object
     return UBUS_STATUS_OK;
 }
 
+static int aegisxd_handle_geo_counters(struct ubus_context *ctx, struct ubus_object *obj,
+                                      struct ubus_request_data *req, const char *method,
+                                      struct blob_attr *msg)
+{
+    struct json_object *resp = aegisxd_geo_counters_json();
+    (void)obj; (void)method; (void)msg;
+    aegisxd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return UBUS_STATUS_OK;
+}
+
 static int aegisxd_handle_domain_overrides(struct ubus_context *ctx, struct ubus_object *obj,
                                            struct ubus_request_data *req, const char *method,
                                            struct blob_attr *msg)
@@ -723,6 +734,7 @@ static const struct ubus_method aegisxd_methods[] = {
     UBUS_METHOD("remove_domain_override", aegisxd_handle_domain_override_delete, aegisxd_any_policy),
     UBUS_METHOD("geo_get", aegisxd_handle_geo_get, aegisxd_any_policy),
     UBUS_METHOD("geo_apply", aegisxd_handle_geo_apply, aegisxd_any_policy),
+    UBUS_METHOD("geo_counters", aegisxd_handle_geo_counters, aegisxd_any_policy),
     UBUS_METHOD("suppress_signature", aegisxd_handle_suppress_signature, aegisxd_any_policy),
     UBUS_METHOD("unsuppress_signature", aegisxd_handle_unsuppress_signature, aegisxd_any_policy),
 };

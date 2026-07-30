@@ -10,7 +10,12 @@
 #include "jmx_uci.h"
 #include "jmx.h"
 #include "jmx_netconfig_db.h"
+#include "jmx_exec.h"
 
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,17 +23,53 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <arpa/inet.h>
 #include <uci.h>
 #include <json-c/json.h>
 #include <libubox/blobmsg_json.h>
 
 #define WM_ROLLBACK_DIR "/tmp/dreamingwrt-network-rollback"
+#define WM_COMMAND_TIMEOUT_MS 2500
+#define WM_COMMAND_OUTPUT_MAX (64U * 1024U)
 
 /* ── helpers ── */
 
 static int64_t wm_now(void) { return (int64_t)time(NULL); }
 static unsigned long wm_rollback_sequence;
+
+static int wm_token_ok(const char *value, size_t max_len)
+{
+    size_t i;
+    if (!value || !value[0])
+        return 0;
+    for (i = 0; value[i]; i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (i >= max_len || (!isalnum(c) && c != '_' && c != '-'))
+            return 0;
+    }
+    return i > 0;
+}
+
+static const char *wm_executable(const char *const paths[])
+{
+    size_t i;
+    for (i = 0; paths[i]; i++)
+        if (access(paths[i], X_OK) == 0)
+            return paths[i];
+    return NULL;
+}
+
+static int wm_capture(const char *path, char *const argv[],
+                      struct jmx_exec_result *result)
+{
+    memset(result, 0, sizeof(*result));
+    result->exit_code = -1;
+    if (!path || jmx_exec_capture(path, argv, WM_COMMAND_OUTPUT_MAX,
+                                  WM_COMMAND_TIMEOUT_MS, result) != 0)
+        return -1;
+    return result->exit_code == 0 && !result->timed_out && !result->truncated ? 0 : -1;
+}
 
 static const char *wm_mode_str(int m)
 {
@@ -101,57 +142,137 @@ static void wm_detect_lan(struct json_object *out)
 /* Detect default route (upstream gateway) */
 static void wm_detect_upstream(struct json_object *out)
 {
-    FILE *fp = popen("ip route show default 2>/dev/null", "r");
-    if (!fp) return;
-    char line[512];
-    if (fgets(line, sizeof(line), fp)) {
+    static const char *const paths[] = { "/sbin/ip", "/usr/sbin/ip", NULL };
+    const char *path = wm_executable(paths);
+    struct jmx_exec_result result;
+    char *argv[] = { (char *)path, "route", "show", "default", NULL };
+
+    if (wm_capture(path, argv, &result) == 0 && result.output) {
         /* parse "default via X.X.X.X dev eth1 ..." */
         char gw[64] = "", dev[32] = "";
         char *p;
-        p = strstr(line, " via ");
+        p = strstr(result.output, " via ");
         if (p) { p += 5; sscanf(p, "%63s", gw); }
-        p = strstr(line, " dev ");
+        p = strstr(result.output, " dev ");
         if (p) { p += 5; sscanf(p, "%31s", dev); }
         if (gw[0]) json_object_object_add(out, "upstream_gateway", json_object_new_string(gw));
         if (dev[0]) json_object_object_add(out, "upstream_iface", json_object_new_string(dev));
     }
-    pclose(fp);
+    jmx_exec_result_free(&result);
 }
 
 /* Detect DHCP server status on LAN */
 static int wm_dhcp_active(void)
 {
-    FILE *fp = popen("pgrep -f 'dnsmasq' >/dev/null 2>&1 && echo 1 || echo 0", "r");
-    if (!fp) return 0;
-    char c = '0';
-    fscanf(fp, "%c", &c);
-    pclose(fp);
-    return c == '1';
+    DIR *dir = opendir("/proc");
+    struct dirent *entry;
+    int found = 0;
+
+    if (!dir)
+        return 0;
+    while ((entry = readdir(dir)) != NULL) {
+        char path[64], comm[32];
+        FILE *fp;
+        size_t i;
+        for (i = 0; entry->d_name[i] && isdigit((unsigned char)entry->d_name[i]); i++) {}
+        if (!entry->d_name[0] || entry->d_name[i])
+            continue;
+        if (snprintf(path, sizeof(path), "/proc/%s/comm", entry->d_name) >= (int)sizeof(path))
+            continue;
+        fp = fopen(path, "re");
+        if (!fp)
+            continue;
+        if (fgets(comm, sizeof(comm), fp) && !strncmp(comm, "dnsmasq", 7) &&
+            (comm[7] == '\0' || comm[7] == '\n'))
+            found = 1;
+        fclose(fp);
+        if (found)
+            break;
+    }
+    closedir(dir);
+    return found;
 }
 
 /* Detect NAT/masquerade status */
 static int wm_nat_active(void)
 {
-    FILE *fp = popen("nft list chain inet nat postrouting 2>/dev/null | grep -q masquerade && echo 1 || echo 0", "r");
-    if (!fp) return 0;
-    char c = '0';
-    fscanf(fp, "%c", &c);
-    pclose(fp);
-    return c == '1';
+    static const char *const paths[] = { "/usr/sbin/nft", "/sbin/nft", NULL };
+    const char *path = wm_executable(paths);
+    struct jmx_exec_result result;
+    char *argv[] = { (char *)path, "list", "chain", "inet", "nat", "postrouting", NULL };
+    int active = 0;
+
+    if (wm_capture(path, argv, &result) == 0 && result.output &&
+        strstr(result.output, "masquerade"))
+        active = 1;
+    jmx_exec_result_free(&result);
+    return active;
 }
 
 /* Ping check (returns latency in ms, or -1 on failure) */
 static double wm_ping_check(const char *host)
 {
-    if (!host || !host[0]) return -1;
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "ping -c 1 -W 1 %s 2>/dev/null | grep 'time=' | sed 's/.*time=//;s/ .*//'", host);
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
+    static const char *const paths[] = { "/bin/ping", "/usr/bin/ping", NULL };
+    const char *path = wm_executable(paths);
+    struct jmx_exec_result result;
+    struct in_addr addr4;
+    struct in6_addr addr6;
     double ms = -1;
-    if (fscanf(fp, "%lf", &ms) != 1) ms = -1;
-    pclose(fp);
+    char *time_value;
+    char *argv[] = { (char *)path, "-c", "1", "-W", "1", (char *)host, NULL };
+
+    if (!host || (!inet_pton(AF_INET, host, &addr4) &&
+                  !inet_pton(AF_INET6, host, &addr6)))
+        return -1;
+    if (wm_capture(path, argv, &result) == 0 && result.output &&
+        (time_value = strstr(result.output, "time=")) != NULL &&
+        sscanf(time_value + 5, "%lf", &ms) != 1)
+        ms = -1;
+    jmx_exec_result_free(&result);
     return ms;
+}
+
+static int wm_service_action(const char *service, const char *action)
+{
+    struct jmx_exec_result result;
+    char path[128];
+    char *argv[] = { path, (char *)action, NULL };
+    int rc;
+
+    if (!service || !action || snprintf(path, sizeof(path), "/etc/init.d/%s", service) >=
+        (int)sizeof(path) || access(path, X_OK) != 0)
+        return -1;
+    rc = jmx_exec_wait(path, argv, 15000, &result);
+    if (rc == 0)
+        rc = result.exit_code == 0 && !result.timed_out ? 0 : -1;
+    jmx_exec_result_free(&result);
+    return rc;
+}
+
+static void wm_reload_services_async(void)
+{
+    pid_t child = fork();
+    int status;
+
+    if (child < 0)
+        return;
+    if (child == 0) {
+        pid_t worker = fork();
+        if (worker < 0)
+            _exit(1);
+        if (worker > 0)
+            _exit(0);
+        (void)setsid();
+        sleep(1);
+        if (wm_service_action("network", "reload") != 0)
+            (void)wm_service_action("network", "restart");
+        if (wm_service_action("dnsmasq", "reload") != 0)
+            (void)wm_service_action("dnsmasq", "restart");
+        if (wm_service_action("firewall", "reload") != 0)
+            (void)wm_service_action("firewall", "restart");
+        _exit(0);
+    }
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
 }
 
 /* Check if two IPs are in same /24 subnet */
@@ -211,12 +332,21 @@ static int wm_uci_readback(int target_mode, const char *lan_ip,
 /* Backup a UCI config file to rollback dir */
 static int wm_backup_config(const char *rollback_id, const char *config_name)
 {
-    char dir[256], src[256], dst[256];
-    snprintf(dir, sizeof(dir), "%s/%s", WM_ROLLBACK_DIR, rollback_id);
+    char dir[PATH_MAX], src[PATH_MAX], dst[PATH_MAX];
+    int path_len;
+    if (!wm_token_ok(rollback_id, 63) || !wm_token_ok(config_name, 31))
+        return -1;
+    path_len = snprintf(dir, sizeof(dir), "%s/%s", WM_ROLLBACK_DIR, rollback_id);
+    if (path_len < 0 || path_len >= (int)sizeof(dir))
+        return -1;
     mkdir(WM_ROLLBACK_DIR, 0755);
     mkdir(dir, 0755);
-    snprintf(src, sizeof(src), "/etc/config/%s", config_name);
-    snprintf(dst, sizeof(dst), "%s/%s", dir, config_name);
+    path_len = snprintf(src, sizeof(src), "/etc/config/%s", config_name);
+    if (path_len < 0 || path_len >= (int)sizeof(src))
+        return -1;
+    path_len = snprintf(dst, sizeof(dst), "%s/%s", dir, config_name);
+    if (path_len < 0 || path_len >= (int)sizeof(dst))
+        return -1;
     /* simple file copy */
     FILE *fi = fopen(src, "r");
     FILE *fo = fopen(dst, "w");
@@ -244,20 +374,37 @@ static int wm_backup_config(const char *rollback_id, const char *config_name)
 /* Restore a UCI config from rollback dir */
 static int wm_rollback_config(const char *rollback_id, const char *config_name)
 {
-    char src[256], dst[256];
-    snprintf(src, sizeof(src), "%s/%s/%s", WM_ROLLBACK_DIR, rollback_id, config_name);
-    snprintf(dst, sizeof(dst), "/etc/config/%s", config_name);
+    char src[PATH_MAX], dst[PATH_MAX];
+    int path_len;
+    if (!wm_token_ok(rollback_id, 63) || !wm_token_ok(config_name, 31))
+        return -1;
+    path_len = snprintf(src, sizeof(src), "%s/%s/%s", WM_ROLLBACK_DIR,
+                        rollback_id, config_name);
+    if (path_len < 0 || path_len >= (int)sizeof(src))
+        return -1;
+    path_len = snprintf(dst, sizeof(dst), "/etc/config/%s", config_name);
+    if (path_len < 0 || path_len >= (int)sizeof(dst))
+        return -1;
     FILE *fi = fopen(src, "r");
     if (!fi) return -1;
     FILE *fo = fopen(dst, "w");
     if (!fo) { fclose(fi); return -1; }
     char buf[4096];
     size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), fi)) > 0)
-        fwrite(buf, 1, n, fo);
-    fclose(fi);
-    fclose(fo);
-    return 0;
+    int rc = 0;
+    while ((n = fread(buf, 1, sizeof(buf), fi)) > 0) {
+        if (fwrite(buf, 1, n, fo) != n) {
+            rc = -1;
+            break;
+        }
+    }
+    if (ferror(fi) || fflush(fo) != 0 || fsync(fileno(fo)) != 0)
+        rc = -1;
+    if (fclose(fi) != 0)
+        rc = -1;
+    if (fclose(fo) != 0)
+        rc = -1;
+    return rc;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -371,7 +518,6 @@ struct json_object *dw_work_mode_preview(struct json_object *req)
     const char *lan_ip = wm_json_str(req, "lan_ip", "");
     const char *gateway = wm_json_str(req, "gateway", "");
     int disable_dhcp = wm_json_bool(req, "disable_dhcp", target_mode == 1);
-    int disable_nat = wm_json_bool(req, "disable_nat", target_mode == 1);
 
     /* Auto-detect if not provided */
     char auto_ip[64] = "", auto_gw[64] = "";
@@ -622,7 +768,7 @@ struct json_object *dw_work_mode_apply(struct json_object *req)
     }
 
     /* Step 5: Reload services (async, don't block) */
-    system("(sleep 1; /etc/init.d/network reload; /etc/init.d/dnsmasq restart; /etc/init.d/firewall reload) &");
+    wm_reload_services_async();
 
     /* Update kernel proc */
     extern void update_jmx_proc_u32_value(char *key, u_int32_t val);
@@ -677,8 +823,14 @@ struct json_object *dw_work_mode_rollback(struct json_object *req)
     }
 
     /* Check rollback dir exists */
-    char dir[256];
-    snprintf(dir, sizeof(dir), "%s/%s", WM_ROLLBACK_DIR, rollback_id);
+    char dir[PATH_MAX];
+    if (!wm_token_ok(rollback_id, 63) ||
+        snprintf(dir, sizeof(dir), "%s/%s", WM_ROLLBACK_DIR, rollback_id) >=
+            (int)sizeof(dir)) {
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        json_object_object_add(data, "message", json_object_new_string("回滚快照标识无效。"));
+        return jmx_gen_api_response_data(API_CODE_ERROR, data);
+    }
     struct stat st;
     if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
         json_object_object_add(data, "ok", json_object_new_boolean(0));
@@ -717,7 +869,7 @@ struct json_object *dw_work_mode_rollback(struct json_object *req)
         json_object_object_add(data, "error", json_object_new_string("runtime_restore_failed"));
         return jmx_gen_api_response_data(API_CODE_ERROR, data);
     }
-    system("(sleep 1; /etc/init.d/network reload; /etc/init.d/dnsmasq restart; /etc/init.d/firewall reload) &");
+    wm_reload_services_async();
 
     /* Update kernel proc with restored mode */
     extern void update_jmx_proc_u32_value(char *key, u_int32_t val);

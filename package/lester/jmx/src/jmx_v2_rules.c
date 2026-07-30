@@ -10,7 +10,9 @@
 #include <linux/spinlock.h>
 #include <linux/jhash.h>
 #include <linux/compiler.h>
+#include <linux/jiffies.h>
 #include <linux/mutex.h>
+#include <linux/workqueue.h>
 #include "jmx_v2_rules.h"
 #include "jmx_v2_ac.h"
 
@@ -58,12 +60,72 @@ static int active_idx;
 static rwlock_t active_generation_lock;
 static DEFINE_MUTEX(rules_update_lock);
 
+#define JMX_V2_TX_TIMEOUT (30U * HZ)
+
+static u32 staging_owner_portid;
+static unsigned long staging_deadline;
+static struct delayed_work rules_tx_expire_work;
+
 #define ACTIVE_SET()  (&rule_sets[READ_ONCE(active_idx)])
 #define STAGING_SET() (&rule_sets[1 - READ_ONCE(active_idx)])
 
 static inline uint32_t hash_appid(uint32_t appid)
 {
 	return jhash_1word(appid, 0) % JMX_V2_HASH_BUCKETS;
+}
+
+static void jmx_v2_rule_set_clear(struct jmx_v2_rule_set_k *s);
+
+/* rules_update_lock must be held. */
+static void jmx_v2_tx_reset_locked(bool clear_staging)
+{
+	if (clear_staging)
+		jmx_v2_rule_set_clear(STAGING_SET());
+	staging_owner_portid = 0;
+	staging_deadline = 0;
+}
+
+/* rules_update_lock must be held. */
+static bool jmx_v2_tx_expire_locked(void)
+{
+	if (!staging_owner_portid ||
+	    !time_after_eq(jiffies, staging_deadline))
+		return false;
+
+	pr_warn_ratelimited("jmx_v2: staging transaction owner=%u expired\n",
+			    staging_owner_portid);
+	jmx_v2_tx_reset_locked(true);
+	return true;
+}
+
+static void jmx_v2_tx_expire_workfn(struct work_struct *work)
+{
+	(void)work;
+	mutex_lock(&rules_update_lock);
+	jmx_v2_tx_expire_locked();
+	mutex_unlock(&rules_update_lock);
+}
+
+/* rules_update_lock must be held. */
+static int jmx_v2_tx_check_owner_locked(u32 owner_portid)
+{
+	if (!owner_portid)
+		return -EINVAL;
+	if (jmx_v2_tx_expire_locked())
+		return -ETIMEDOUT;
+	if (!staging_owner_portid)
+		return -ENOENT;
+	if (staging_owner_portid != owner_portid)
+		return -EPERM;
+	return 0;
+}
+
+/* rules_update_lock must be held. */
+static void jmx_v2_tx_refresh_locked(void)
+{
+	staging_deadline = jiffies + JMX_V2_TX_TIMEOUT;
+	mod_delayed_work(system_wq, &rules_tx_expire_work,
+			 JMX_V2_TX_TIMEOUT);
 }
 
 /* ── Init / Exit ── */
@@ -79,6 +141,9 @@ int jmx_v2_rules_init(void)
 	}
 	active_idx = 0;
 	rwlock_init(&active_generation_lock);
+	staging_owner_portid = 0;
+	staging_deadline = 0;
+	INIT_DELAYED_WORK(&rules_tx_expire_work, jmx_v2_tx_expire_workfn);
 	pr_info("jmx_v2: rules+AC initialized\n");
 	return 0;
 }
@@ -87,6 +152,8 @@ void jmx_v2_rules_exit(void)
 {
 	int i;
 
+	cancel_delayed_work_sync(&rules_tx_expire_work);
+	mutex_lock(&rules_update_lock);
 	write_lock_bh(&active_generation_lock);
 	for (i = 0; i < ARRAY_SIZE(rule_sets); i++) {
 		struct jmx_v2_rule_node *r;
@@ -113,6 +180,9 @@ void jmx_v2_rules_exit(void)
 		write_unlock_bh(&rule_sets[i].lock);
 	}
 	write_unlock_bh(&active_generation_lock);
+	staging_owner_portid = 0;
+	staging_deadline = 0;
+	mutex_unlock(&rules_update_lock);
 	pr_info("jmx_v2: rules+AC cleaned up\n");
 }
 
@@ -141,11 +211,27 @@ static void jmx_v2_rule_set_clear(struct jmx_v2_rule_set_k *s)
 	write_unlock_bh(&s->lock);
 }
 
-void jmx_v2_rules_flush(void)
+int jmx_v2_rules_begin(uint32_t owner_portid)
 {
+	int rc = 0;
+
+	if (!owner_portid)
+		return -EINVAL;
+
 	mutex_lock(&rules_update_lock);
+	jmx_v2_tx_expire_locked();
+	if (staging_owner_portid &&
+	    staging_owner_portid != owner_portid) {
+		rc = -EBUSY;
+		goto out;
+	}
+
 	jmx_v2_rule_set_clear(STAGING_SET());
+	staging_owner_portid = owner_portid;
+	jmx_v2_tx_refresh_locked();
+out:
 	mutex_unlock(&rules_update_lock);
+	return rc;
 }
 
 static int jmx_v2_rule_add_locked(const jmx_v2_rule_t *in)
@@ -206,19 +292,23 @@ invalid:
 	return -EINVAL;
 }
 
-int jmx_v2_rule_add(const jmx_v2_rule_t *in)
+int jmx_v2_rule_add(uint32_t owner_portid, const jmx_v2_rule_t *in)
 {
 	int rc;
 
 	mutex_lock(&rules_update_lock);
-	rc = jmx_v2_rule_add_locked(in);
+	rc = jmx_v2_tx_check_owner_locked(owner_portid);
+	if (!rc) {
+		rc = jmx_v2_rule_add_locked(in);
+		jmx_v2_tx_refresh_locked();
+	}
 	mutex_unlock(&rules_update_lock);
 	return rc;
 }
 
 /* ── Commit: build AC + atomic swap ── */
 
-int jmx_v2_rules_commit(uint32_t version)
+int jmx_v2_rules_commit(uint32_t owner_portid, uint32_t version)
 {
 	struct jmx_v2_rule_set_k *old;
 	struct jmx_v2_rule_set_k *new;
@@ -234,6 +324,9 @@ int jmx_v2_rules_commit(uint32_t version)
 	int i, j;
 
 	mutex_lock(&rules_update_lock);
+	build_rc = jmx_v2_tx_check_owner_locked(owner_portid);
+	if (build_rc)
+		goto owner_rejected;
 	old = ACTIVE_SET();
 	new = STAGING_SET();
 	memset(&ac_stats, 0, sizeof(ac_stats));
@@ -342,6 +435,8 @@ int jmx_v2_rules_commit(uint32_t version)
 		ac_stats.duplicate_payloads, rejected_invalid, rejected_nomem,
 		empty_rejected, regex_inactive, no_fixed_inactive,
 		ac_stats.nodes, ac_stats.edges, ac_stats.outputs);
+	jmx_v2_tx_reset_locked(false);
+	cancel_delayed_work(&rules_tx_expire_work);
 	mutex_unlock(&rules_update_lock);
 	return 0;
 
@@ -354,6 +449,12 @@ build_failed:
 		rejected_invalid + rejected_nomem + empty_rejected + eligible,
 		rejected_invalid, rejected_nomem, empty_rejected,
 		regex_inactive, no_fixed_inactive, build_rc);
+	jmx_v2_tx_reset_locked(true);
+	cancel_delayed_work(&rules_tx_expire_work);
+	mutex_unlock(&rules_update_lock);
+	return build_rc;
+
+owner_rejected:
 	mutex_unlock(&rules_update_lock);
 	return build_rc;
 }
