@@ -123,7 +123,20 @@
         mountAll: node => window.DWRT_UI_KIT.mountAll(node),
         lucideIcon: (...args) => window.DWRT_UI_KIT.lucideIcon(...args),
         statusBadgeMarkup: (...args) => window.DWRT_UI_KIT.statusBadgeMarkup(...args),
-        floatingSavebarMarkup: (...args) => window.DWRT_UI_KIT.floatingSavebarMarkup(...args)
+        floatingSavebarMarkup: (...args) => window.DWRT_UI_KIT.floatingSavebarMarkup(...args),
+        // The shell injects this for real routes; the fixture mirrors the same contract so a
+        // page that forgets to register sampled regions fails here instead of shipping.
+        scheduleAdaptiveForegroundSample: (delay = 0, scopeRoot = root) => {
+          setTimeout(() => {
+            const scope = scopeRoot || root;
+            if (!scope) return;
+            const nodes = [
+              ...(scope.matches?.('[data-adaptive-sample]') ? [scope] : []),
+              ...scope.querySelectorAll('[data-adaptive-sample]')
+            ];
+            nodes.forEach(node => node.setAttribute('data-adaptive-region', 'light'));
+          }, delay);
+        }
       },
       utils: { escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]) }
     });

@@ -216,6 +216,29 @@ typedef struct {
 
 
 static sqlite3 *g_db = NULL;
+
+/*
+ * Strict aa:bb:cc:dd:ee:ff check, mirroring webd_capture_safe_mac(). MAC values
+ * arrive both from ubus callers and from procfs records whose contents are
+ * ultimately declared by client devices, so they are validated before reaching
+ * any SQL statement. Defined here, ahead of both call sites.
+ */
+static int auditd_mac_format_ok(const char *mac)
+{
+    int i;
+
+    if (!mac || strlen(mac) != 17)
+        return 0;
+    for (i = 0; i < 17; i++) {
+        if ((i + 1) % 3 == 0) {
+            if (mac[i] != ':')
+                return 0;
+        } else if (!isxdigit((unsigned char)mac[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
 static struct ubus_context *g_ubus_ctx = NULL;
 static volatile int g_running = 1;
 static struct blob_buf g_b;
@@ -813,22 +836,37 @@ static int aggregate_and_store(int period)
 
         const char *ip = find_ip_for_mac(clients, nclients, seen_macs[m]);
 
+        /* The MAC originates from procfs records populated from client-declared
+         * addresses, so it is validated and then bound rather than interpolated.
+         * The table name is one of two internal constants. */
+        if (!auditd_mac_format_ok(seen_macs[m])) {
+            fprintf(stderr, "jmx_auditd: skipping malformed mac\n");
+            continue;
+        }
+
         /* UPSERT: update if exists, insert otherwise */
-        char sql[8192];
+        char sql[512];
         snprintf(sql, sizeof(sql),
             "INSERT INTO %s (timestamp, ipaddr, mac, appid_load) "
-            "VALUES (%ld, '%s', '%s', '%s') "
+            "VALUES (?1, ?2, ?3, ?4) "
             "ON CONFLICT(mac, timestamp) DO UPDATE SET "
-            "ipaddr='%s', appid_load='%s'",
-            table, (long)bucket, ip, seen_macs[m], appid_load,
-            ip, appid_load);
+            "ipaddr=excluded.ipaddr, appid_load=excluded.appid_load",
+            table);
 
-        char *err = NULL;
-        int rc = sqlite3_exec(g_db, sql, NULL, NULL, &err);
-        if (rc != SQLITE_OK) {
-            fprintf(stderr, "jmx_auditd: sql error: %s\n", err);
-            sqlite3_free(err);
+        sqlite3_stmt *ins = NULL;
+        if (sqlite3_prepare_v2(g_db, sql, -1, &ins, NULL) != SQLITE_OK) {
+            fprintf(stderr, "jmx_auditd: sql error: %s\n", sqlite3_errmsg(g_db));
             ok = 0;
+        } else {
+            sqlite3_bind_int64(ins, 1, (sqlite3_int64)bucket);
+            sqlite3_bind_text(ins, 2, ip ? ip : "", -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 3, seen_macs[m], -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 4, appid_load, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(ins) != SQLITE_DONE) {
+                fprintf(stderr, "jmx_auditd: sql error: %s\n", sqlite3_errmsg(g_db));
+                ok = 0;
+            }
+            sqlite3_finalize(ins);
         }
     }
 
@@ -1554,33 +1592,47 @@ static int handle_get_traffic(struct ubus_context *ctx, struct ubus_object *obj,
     const char *table = (strcmp(period, "day") == 0) ?
         "terminal_3proto_load_day" : "terminal_3proto_load_hour";
 
+    /* A malformed mac filter is rejected outright rather than being widened to
+     * "no filter", which would hand back the whole table to a caller that asked
+     * for one client. */
+    if (mac_filter && !auditd_mac_format_ok(mac_filter))
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    if (limit < 1)
+        limit = 1;
+    else if (limit > 5000)
+        limit = 5000;
+
+    /* Table name is one of two internal constants; the caller-supplied mac and
+     * limit are bound, never interpolated. */
     char sql[512];
-    if (mac_filter)
-        snprintf(sql, sizeof(sql),
-            "SELECT timestamp, ipaddr, mac, appid_load FROM %s "
-            "WHERE mac='%s' ORDER BY timestamp DESC LIMIT %d",
-            table, mac_filter, limit);
-    else
-        snprintf(sql, sizeof(sql),
-            "SELECT timestamp, ipaddr, mac, appid_load FROM %s "
-            "ORDER BY timestamp DESC LIMIT %d",
-            table, limit);
+    snprintf(sql, sizeof(sql),
+        "SELECT timestamp, ipaddr, mac, appid_load FROM %s %s"
+        "ORDER BY timestamp DESC LIMIT ?2",
+        table, mac_filter ? "WHERE mac=?1 " : "");
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        if (mac_filter)
+            sqlite3_bind_text(stmt, 1, mac_filter, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 2, limit);
+    }
 
     blob_buf_init(&g_b, 0);
     void *cookie = blobmsg_open_array(&g_b, "records");
     if (rc == SQLITE_OK) {
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             void *rec = blobmsg_open_table(&g_b, NULL);
+            /* The columns default to '' but are not NOT NULL, so a NULL would
+             * reach blobmsg_add_string() and strlen(NULL). */
+            const char *c_ip = (const char *)sqlite3_column_text(stmt, 1);
+            const char *c_mac = (const char *)sqlite3_column_text(stmt, 2);
+            const char *c_load = (const char *)sqlite3_column_text(stmt, 3);
+
             blobmsg_add_u32(&g_b, "timestamp", sqlite3_column_int(stmt, 0));
-            blobmsg_add_string(&g_b, "ipaddr",
-                               (const char *)sqlite3_column_text(stmt, 1));
-            blobmsg_add_string(&g_b, "mac",
-                               (const char *)sqlite3_column_text(stmt, 2));
-            blobmsg_add_string(&g_b, "appid_load",
-                               (const char *)sqlite3_column_text(stmt, 3));
+            blobmsg_add_string(&g_b, "ipaddr", c_ip ? c_ip : "");
+            blobmsg_add_string(&g_b, "mac", c_mac ? c_mac : "");
+            blobmsg_add_string(&g_b, "appid_load", c_load ? c_load : "");
             blobmsg_close_table(&g_b, rec);
         }
     }

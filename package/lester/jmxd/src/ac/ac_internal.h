@@ -398,6 +398,13 @@ int ac_db_pairing_token_status(const char *token_id,
                                struct ac_pairing_token_status *out);
 int ac_db_pairing_token_list(ac_pairing_token_visit_fn visit, void *opaque);
 int ac_db_pairing_token_revoke(const char *token_id);
+int ac_db_ap_label_valid(const char *value);
+/* ac_db_ap_update() outcomes; the caller maps these to HTTP statuses. */
+#define AC_AP_UPDATE_INVALID   (-1)
+#define AC_AP_UPDATE_NOT_FOUND (-2)
+#define AC_AP_UPDATE_DB_ERROR  (-3)
+int ac_db_ap_update(const char *ap_id, const char *name,
+                    const char *model_override);
 int ac_db_pairing_token_redeem(const char *token_id, const char *token,
                                const char *site_id,
                                const char *hardware_digest,
@@ -478,6 +485,8 @@ struct json_object *ac_pairing_token_create_json(int64_t ttl_seconds,
 struct json_object *ac_pairing_token_status_json(const char *token_id);
 struct json_object *ac_pairing_token_list_json(void);
 struct json_object *ac_pairing_token_revoke_json(const char *token_id);
+struct json_object *ac_ap_update_json(const char *ap_id, const char *name,
+                                      const char *model_override);
 struct json_object *ac_pairing_token_redeem_json(const char *token_id,
                                                   const char *token,
                                                   const char *site_id,

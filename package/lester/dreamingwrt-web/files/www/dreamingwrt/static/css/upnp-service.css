@@ -26,11 +26,10 @@
 }
 
 .upnp-service-route-host {
-  --upnp-gap: var(--app-page-gap, 16px);
-  --upnp-radius-card: var(--app-radius-card, 24px);
-  --upnp-radius-panel: var(--app-radius-panel, 18px);
-  --upnp-radius-control: var(--app-radius-control, 12px);
-  color: var(--adaptive-text, var(--app-text, var(--dwrt-glass-ink)));
+  /* Radii come from the same tokens DHCP uses, so surfaces, tabs and chips cannot drift. */
+  --upnp-radius-card: var(--app-radius-card, 8px);
+  --upnp-radius-control: var(--app-radius-control, 10px);
+  color: var(--color-text-primary, var(--app-text));
 }
 
 .upnp-service-shell {
@@ -40,7 +39,7 @@
   height: 100%;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 10px;
   overflow: hidden;
 }
@@ -59,39 +58,26 @@
 
 .upnp-page-toolbar::-webkit-scrollbar { display: none; }
 
-.upnp-page-toolbar-main {
+.upnp-page-toolbar-main,
+.upnp-page-actions {
   min-width: 0;
   display: flex;
   align-items: center;
-  flex: 0 0 auto;
 }
 
+.upnp-page-toolbar-main,
 .upnp-tabs {
-  min-width: 0;
-  min-height: 52px;
-  overflow: visible;
-}
-
-.upnp-tabs .dwrt-kit-tab {
-  min-width: 112px;
-  height: 42px;
   flex: 0 0 auto;
-  white-space: nowrap;
 }
 
 .upnp-page-actions {
   flex: 0 0 auto;
-  min-width: 0;
-  display: flex;
-  align-items: center;
   justify-content: flex-end;
   gap: 8px;
   margin-left: auto;
 }
 
 .upnp-page-actions .dwrt-kit-button {
-  min-height: 36px;
-  gap: 7px;
   white-space: nowrap;
 }
 
@@ -111,11 +97,11 @@
   min-width: 0;
   display: grid;
   align-content: start;
-  gap: var(--upnp-gap);
+  gap: var(--app-page-gap, 16px);
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
-  padding-bottom: var(--upnp-gap);
+  padding-bottom: var(--app-page-gap, 16px);
 }
 
 .upnp-settings-surface {
@@ -123,8 +109,8 @@
   min-width: 0;
   height: max-content;
   align-self: start;
-  overflow: hidden;
   border-radius: var(--upnp-radius-card);
+  overflow: hidden;
 }
 
 .upnp-settings-head {
@@ -134,7 +120,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  border-bottom: 1px solid rgba(255,255,255,.105);
+  border-bottom: 1px solid var(--color-border-subtle);
 }
 
 .upnp-settings-head > div,
@@ -164,7 +150,7 @@
 .upnp-setting-group-toggle strong,
 .upnp-setting-copy strong {
   min-width: 0;
-  color: var(--adaptive-text, var(--app-text, var(--dwrt-glass-ink)));
+  color: var(--color-text-primary, var(--app-text));
   font-size: 14px;
   font-weight: 760;
   line-height: 1.3;
@@ -177,7 +163,7 @@
 .upnp-capability-banner small,
 .upnp-capability-details li span {
   min-width: 0;
-  color: var(--adaptive-muted, var(--app-text-muted, var(--dwrt-glass-muted)));
+  color: var(--color-text-muted, var(--app-text-muted));
   font-size: 12px;
   font-weight: 520;
   line-height: 1.45;
@@ -185,19 +171,13 @@
 }
 
 .upnp-settings-icon {
-  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--app-accent, #2e82ff);
-  background: rgba(52,132,255,.12);
-  box-shadow: inset 0 0 0 1px rgba(86,158,255,.16);
-}
-
-.upnp-settings-icon {
-  width: 38px;
-  height: 38px;
-  border-radius: var(--upnp-radius-control);
+  color: var(--color-accent, var(--app-accent));
 }
 
 .upnp-service-primary {
@@ -209,7 +189,7 @@
   grid-template-columns: minmax(0, 1fr) 44px;
   align-items: center;
   gap: 14px;
-  border-bottom: 1px solid color-mix(in srgb, var(--app-text) 8%, transparent);
+  border-bottom: 1px solid var(--color-border-subtle);
 }
 
 .upnp-service-primary > span {
@@ -219,78 +199,47 @@
 }
 
 .upnp-service-primary strong {
-  color: var(--adaptive-text, var(--app-text, var(--dwrt-glass-ink)));
+  color: var(--color-text-primary, var(--app-text));
   font-size: 13px;
   font-weight: 720;
 }
 
 .upnp-service-primary small {
   overflow: hidden;
-  color: var(--adaptive-muted, var(--app-text-muted, var(--dwrt-glass-muted)));
+  color: var(--color-text-muted, var(--app-text-muted));
   font-size: 10px;
   line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.upnp-active-count {
-  color: var(--adaptive-muted, var(--app-text-muted, var(--dwrt-glass-muted)));
-  font-size: 12px;
-  font-weight: 650;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-.upnp-runtime-summary {
+/* Runtime status row. Geometry only: the card material, tones and typography come
+   from the shared .dwrt-kit-overview-grid component. */
+.upnp-overview.dwrt-kit-overview-grid {
   min-width: 0;
-  margin: 0;
-  padding: 0 18px;
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0;
-  border-bottom: 1px solid rgba(255,255,255,.09);
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
-.upnp-runtime-summary > div {
-  min-width: 0;
-  padding: 12px 14px;
-  display: grid;
-  gap: 3px;
+/* Below roughly 1180px a five-up row squeezes the detail lines into ellipses. Six equal
+   tracks let the five cards sit as 2+2+2 / 3+3 instead of leaving a ragged empty slot. */
+@media (max-width: 1180px) {
+  .upnp-overview.dwrt-kit-overview-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .upnp-overview .dwrt-kit-overview-card { grid-column: span 2; }
+  .upnp-overview .dwrt-kit-overview-card:nth-child(4) { grid-column: 1 / span 3; }
+  .upnp-overview .dwrt-kit-overview-card:nth-child(5) { grid-column: 4 / span 3; }
 }
 
-.upnp-runtime-summary > div:first-child {
-  padding-left: 0;
+/* This page keeps a settings workbench below the row, so the cards run shorter than
+   the dashboard default while leaving the shared material untouched. */
+.upnp-overview .dwrt-kit-overview-card {
+  min-height: 0;
+  padding: 14px 16px;
 }
 
-.upnp-runtime-summary > div + div {
-  border-left: 1px solid rgba(255,255,255,.08);
-}
+.upnp-overview .dwrt-kit-overview-content strong { font-size: 22px; }
 
-.upnp-runtime-summary dt {
-  color: var(--adaptive-muted, var(--app-text-muted, var(--dwrt-glass-muted)));
-  font-size: 10px;
-  font-weight: 650;
-}
-
-.upnp-runtime-summary dd {
-  min-width: 0;
-  margin: 0;
-  overflow: hidden;
-  color: var(--adaptive-text, var(--app-text, var(--dwrt-glass-ink)));
-  font-size: 13px;
-  font-weight: 760;
-  font-variant-numeric: tabular-nums;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.upnp-setting-groups {
-  min-width: 0;
-}
-
-.upnp-setting-group + .upnp-setting-group {
-  border-top: 1px solid rgba(255,255,255,.09);
-}
+.upnp-setting-groups { min-width: 0; }
+.upnp-setting-group + .upnp-setting-group { border-top: 1px solid var(--color-border-subtle); }
 
 .upnp-setting-group-toggle {
   appearance: none;
@@ -303,7 +252,6 @@
   align-items: center;
   gap: 12px;
   border: 0;
-  border-radius: 0;
   color: inherit;
   background: transparent;
   font: inherit;
@@ -311,38 +259,38 @@
   cursor: pointer;
 }
 
-.upnp-setting-group-toggle:hover {
-  background: rgba(255,255,255,.035);
-}
+.upnp-setting-group-toggle:hover { background: var(--dwrt-interactive-hover-bg); }
 
 .upnp-setting-group-toggle:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--app-accent, #2e82ff) 72%, white);
+  outline: 2px solid var(--dwrt-interactive-focus-ring);
   outline-offset: -3px;
 }
 
+.upnp-setting-group-index,
+.upnp-setting-group-toggle > em,
+.upnp-setting-group-toggle > svg,
+.upnp-setting-control > em,
+.upnp-field-label > em,
+.upnp-field-unit,
+.upnp-address small {
+  color: var(--color-text-muted, var(--app-text-muted));
+}
+
 .upnp-setting-group-index {
-  color: var(--adaptive-muted, var(--app-text-muted, var(--dwrt-glass-muted)));
   font-size: 10px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
 
 .upnp-setting-group-toggle > em {
-  color: var(--adaptive-muted, var(--app-text-muted, var(--dwrt-glass-muted)));
   font-size: 11px;
   font-style: normal;
   font-weight: 690;
   white-space: nowrap;
 }
 
-.upnp-setting-group-toggle > svg {
-  color: var(--adaptive-muted, var(--app-text-muted, var(--dwrt-glass-muted)));
-  transition: transform 180ms ease;
-}
-
-.upnp-setting-group.is-expanded .upnp-setting-group-toggle > svg {
-  transform: rotate(180deg);
-}
+.upnp-setting-group-toggle > svg { transition: transform 180ms ease; }
+.upnp-setting-group.is-expanded .upnp-setting-group-toggle > svg { transform: rotate(180deg); }
 
 .upnp-setting-group-body {
   margin: 0 18px 16px 52px;
@@ -357,9 +305,7 @@
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
-.upnp-control-grid {
-  column-gap: 18px;
-}
+.upnp-control-grid { column-gap: 18px; }
 
 .upnp-switch-row {
   box-sizing: border-box;
@@ -370,16 +316,10 @@
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 14px;
-  border-bottom: 1px solid rgba(255,255,255,.075);
+  border-bottom: 1px solid var(--color-border-subtle);
 }
 
-.upnp-switch-row.is-disabled {
-  opacity: .62;
-}
-
-.upnp-setting-copy {
-  min-width: 0;
-}
+.upnp-setting-copy { min-width: 0; }
 
 .upnp-switch-row .upnp-setting-copy {
   display: grid;
@@ -397,30 +337,16 @@
 
 .upnp-setting-control > em,
 .upnp-field-label > em {
-  color: var(--adaptive-muted, var(--app-text-muted, var(--dwrt-glass-muted)));
   font-size: 10px;
   font-style: normal;
   font-weight: 720;
 }
 
-.upnp-switch {
-  flex: 0 0 44px;
-  width: 44px;
-  min-height: 44px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-}
-
-.upnp-switch.is-disabled {
-  cursor: not-allowed;
-}
+.upnp-switch { flex: 0 0 44px; }
+.upnp-switch.is-disabled { cursor: not-allowed; }
 
 .upnp-form-grid,
-.upnp-editor-form {
-  gap: 14px 16px;
-}
+.upnp-editor-form { gap: 14px 16px; }
 
 .upnp-runtime-layout {
   min-width: 0;
@@ -436,14 +362,10 @@
 
 .upnp-field {
   min-width: 0;
-  display: grid;
   align-content: start;
-  gap: 6px;
 }
 
-.upnp-field.is-wide {
-  grid-column: 1 / -1;
-}
+.upnp-field.is-wide { grid-column: 1 / -1; }
 
 .upnp-field-label {
   min-width: 0;
@@ -451,9 +373,6 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  color: var(--adaptive-text, var(--app-text-secondary, var(--dwrt-glass-text)));
-  font-size: 12px;
-  font-weight: 680;
 }
 
 .upnp-field-control {
@@ -463,53 +382,11 @@
   align-items: center;
 }
 
-.upnp-field input,
-.upnp-field select {
-  appearance: none;
-  box-sizing: border-box;
-  width: 100%;
-  min-width: 0;
-  min-height: 40px;
-  padding: 0 11px;
-  border: 1px solid rgba(255,255,255,.13);
-  border-radius: var(--upnp-radius-control);
-  outline: 0;
-  color: var(--adaptive-text, var(--app-text, var(--dwrt-glass-ink)));
-  background: rgba(8,14,26,.20);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.04), inset 0 -12px 22px rgba(2,8,18,.08);
-  font: inherit;
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
-}
-
-.upnp-field select {
-  padding-right: 34px;
-  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
-  background-position: calc(100% - 17px) 18px, calc(100% - 12px) 18px;
-  background-size: 5px 5px, 5px 5px;
-  background-repeat: no-repeat;
-}
-
-.upnp-field input:focus,
-.upnp-field select:focus {
-  border-color: color-mix(in srgb, var(--app-accent, #2e82ff) 65%, rgba(255,255,255,.2));
-  box-shadow: 0 0 0 3px rgba(46,130,255,.13), inset 0 1px 5px rgba(0,0,0,.09);
-}
-
-.upnp-field input:disabled,
-.upnp-field select:disabled {
-  cursor: not-allowed;
-  opacity: .56;
-}
-
-.upnp-field-control input {
-  padding-right: 54px;
-}
+.upnp-field-control input { padding-right: 54px; }
 
 .upnp-field-unit {
   position: absolute;
-  right: 11px;
-  color: var(--adaptive-muted, var(--app-text-muted, var(--dwrt-glass-muted)));
+  right: 12px;
   font-size: 10px;
   font-weight: 720;
   pointer-events: none;
@@ -517,24 +394,22 @@
 
 .upnp-capability-details {
   margin-top: 12px;
-  border-top: 1px solid rgba(255,255,255,.075);
+  border-top: 1px solid var(--color-border-subtle);
 }
 
 .upnp-capability-details summary {
-  min-height: 38px;
+  min-height: 44px;
   display: flex;
   align-items: center;
   gap: 8px;
-  color: var(--adaptive-muted, var(--app-text-muted, var(--dwrt-glass-muted)));
+  color: var(--color-text-muted, var(--app-text-muted));
   font-size: 12px;
   font-weight: 660;
   cursor: pointer;
   list-style: none;
 }
 
-.upnp-capability-details summary::-webkit-details-marker {
-  display: none;
-}
+.upnp-capability-details summary::-webkit-details-marker { display: none; }
 
 .upnp-capability-details summary small {
   margin-left: auto;
@@ -556,17 +431,17 @@
 }
 
 .upnp-capability-details li strong {
-  color: var(--adaptive-text, var(--app-text-secondary, var(--dwrt-glass-text)));
+  color: var(--color-text-secondary, var(--app-text-secondary));
   font-size: 12px;
 }
 
 .upnp-capability-banner,
 .upnp-notice {
   min-width: 0;
-  border-radius: var(--upnp-radius-panel);
-  color: var(--adaptive-text, var(--app-text, var(--dwrt-glass-ink)));
-  background: color-mix(in srgb, var(--app-text) 5%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-text) 9%, transparent);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--upnp-radius-card);
+  color: var(--color-text-primary, var(--app-text));
+  background: var(--color-surface-control);
 }
 
 .upnp-capability-banner {
@@ -575,14 +450,11 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  color: #f5c166;
-  background: rgba(245,166,35,.08);
-  box-shadow: inset 0 0 0 1px rgba(245,166,35,.15);
 }
 
 .upnp-capability-banner > svg {
   flex: 0 0 auto;
-  color: #f0b44a;
+  color: var(--color-warning);
 }
 
 .upnp-capability-banner > span {
@@ -592,43 +464,33 @@
 }
 
 .upnp-capability-banner strong {
+  color: var(--color-warning);
   font-size: 12px;
   font-weight: 760;
 }
 
 .upnp-notice {
+  --upnp-notice-tone: var(--color-border-subtle);
   padding: 10px 13px;
   display: grid;
   gap: 4px;
+  border-left: 3px solid var(--upnp-notice-tone);
   font-size: 12px;
   font-weight: 620;
 }
 
-.upnp-notice.is-error {
-  box-shadow: inset 3px 0 0 rgba(235,78,93,.74), inset 0 0 0 1px rgba(235,78,93,.16);
-}
-
-.upnp-notice.is-warning {
-  box-shadow: inset 3px 0 0 rgba(240,180,74,.74), inset 0 0 0 1px rgba(240,180,74,.16);
-}
-
-.upnp-notice.is-success {
-  box-shadow: inset 3px 0 0 rgba(48,186,118,.74), inset 0 0 0 1px rgba(48,186,118,.16);
-}
+.upnp-notice.is-error { --upnp-notice-tone: var(--color-danger); }
+.upnp-notice.is-warning { --upnp-notice-tone: var(--color-warning); }
+.upnp-notice.is-success { --upnp-notice-tone: var(--color-success); }
 
 .upnp-table-card {
   min-width: 0;
   border-radius: var(--upnp-radius-card);
 }
-
-.upnp-table {
-  min-width: 940px;
-}
+.upnp-table { min-width: 940px; }
 
 .upnp-table th,
-.upnp-table td {
-  white-space: nowrap;
-}
+.upnp-table td { white-space: nowrap; }
 
 .upnp-table th:last-child,
 .upnp-table td:last-child {
@@ -643,25 +505,11 @@
   gap: 2px;
 }
 
-.upnp-address small {
-  color: var(--adaptive-muted, var(--app-text-muted, var(--dwrt-glass-muted)));
-  font-size: 11px;
-}
-
-.upnp-row-action {
-  width: 34px;
-  min-width: 34px;
-  min-height: 34px;
-  padding: 0;
-}
-
-.upnp-row-action:disabled {
-  opacity: .36;
-}
+.upnp-address small { font-size: 11px; }
 
 .upnp-sheet {
+  --dwrt-kit-sheet-width: min(460px, calc(100vw - var(--app-menu-glass-width, 0px) - 18px));
   z-index: 91;
-  width: min(460px, calc(100vw - var(--app-menu-glass-width, 0px) - 18px));
 }
 
 .upnp-sheet-body {
@@ -670,18 +518,14 @@
   gap: 16px;
 }
 
-.upnp-editor-switch {
-  border-bottom: 1px solid rgba(255,255,255,.08);
-}
+.upnp-editor-switch { border-bottom: 1px solid var(--color-border-subtle); }
 
 .upnp-editor-switch .upnp-switch-row {
   padding-inline: 0;
   border-bottom: 0;
 }
 
-.upnp-sheet-footer {
-  justify-content: space-between;
-}
+.upnp-sheet-footer { justify-content: space-between; }
 
 .upnp-sheet-footer > div {
   display: flex;
@@ -690,24 +534,22 @@
   gap: 8px;
 }
 
-.upnp-danger-action {
-  color: #ff7783;
-}
-
 .upnp-fallback-status {
+  min-height: 24px;
   display: inline-flex;
   align-items: center;
-  min-height: 24px;
-  border-radius: 999px;
-  padding: 0 9px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--upnp-radius-control);
+  padding: 0 8px;
+  color: var(--color-text-secondary, var(--app-text-secondary));
+  background: var(--color-surface-control);
   font-size: 11px;
   font-weight: 750;
-  background: rgba(127,142,162,.18);
 }
 
 .upnp-fallback-status.is-success {
-  color: #87edbd;
-  background: rgba(39,173,104,.16);
+  color: var(--color-success);
+  border-color: var(--color-success);
 }
 
 @media (max-width: 980px) {
@@ -722,27 +564,18 @@
 }
 
 @media (max-width: 720px) {
-  .upnp-page-actions {
-    display: flex;
-  }
-
   .upnp-search {
     --dwrt-search-expanded-width: min(240px, 62vw);
   }
 
-  .upnp-page-actions .dwrt-kit-button > span {
-    display: none;
-  }
+  .upnp-page-actions .dwrt-kit-button > span { display: none; }
 
   .upnp-page-actions .dwrt-kit-button {
-    width: 40px;
-    min-width: 40px;
+    width: 44px;
     padding: 0;
   }
 
-  .upnp-settings-head {
-    align-items: flex-start;
-  }
+  .upnp-settings-head { align-items: flex-start; }
 
   .upnp-settings-head > div:last-child {
     display: grid;
@@ -750,27 +583,20 @@
     gap: 5px;
   }
 
-  .upnp-runtime-summary {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
+  .upnp-overview.dwrt-kit-overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
-  .upnp-runtime-summary > div:nth-child(3) {
-    padding-left: 0;
-    border-left: 0;
-  }
+  .upnp-overview .dwrt-kit-overview-card,
+  .upnp-overview .dwrt-kit-overview-card:nth-child(4),
+  .upnp-overview .dwrt-kit-overview-card:nth-child(5) { grid-column: auto; }
 
   .upnp-setting-group-toggle {
     grid-template-columns: 28px minmax(0, 1fr) 18px;
     padding-inline: 14px;
   }
 
-  .upnp-setting-group-toggle > em {
-    display: none;
-  }
+  .upnp-setting-group-toggle > em { display: none; }
 
-  .upnp-setting-group-body {
-    margin: 0 14px 16px 42px;
-  }
+  .upnp-setting-group-body { margin: 0 14px 16px 42px; }
 
   .upnp-control-grid,
   .upnp-control-grid.is-runtime,
@@ -779,9 +605,7 @@
     grid-template-columns: 1fr;
   }
 
-  .upnp-switch-row {
-    min-height: 56px;
-  }
+  .upnp-switch-row { min-height: 56px; }
 
   .upnp-capability-details li {
     grid-template-columns: 1fr;
@@ -789,23 +613,25 @@
   }
 
   .upnp-sheet {
-    width: min(100vw, 460px);
+    --dwrt-kit-sheet-width: calc(100vw - 18px);
+    --dwrt-kit-sheet-max-width: calc(100vw - 18px);
   }
 }
 
 @media (max-width: 480px) {
-  .upnp-settings-head {
-    padding: 12px 14px;
-  }
+  .upnp-settings-head { padding: 12px 14px; }
 
-  .upnp-active-count {
-    display: none;
-  }
+  /* Five stacked cards would push the settings workbench off the first screen, so the
+     status row stays two-up and trades the icon badge for text room. */
+  .upnp-overview.dwrt-kit-overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .upnp-overview .dwrt-kit-overview-card { grid-template-columns: minmax(0, 1fr); padding: 12px 14px; }
+  /* The kit pins the badge with display:grid !important, so matching that weight is the
+     only way to drop it on narrow screens. */
+  .upnp-overview .dwrt-kit-overview-card .dwrt-kit-overview-icon { display: none !important; }
+  .upnp-overview .dwrt-kit-overview-content strong { font-size: 19px; }
 
   .upnp-setting-group-toggle small,
-  .upnp-setting-copy small {
-    white-space: normal;
-  }
+  .upnp-setting-copy small { white-space: normal; }
 
   .upnp-sheet-footer {
     align-items: stretch;
@@ -819,7 +645,5 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .upnp-setting-group-toggle > svg {
-    transition: none;
-  }
+  .upnp-setting-group-toggle > svg { transition: none; }
 }

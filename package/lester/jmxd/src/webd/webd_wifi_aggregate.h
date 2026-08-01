@@ -26,6 +26,16 @@ void webd_wifi_merge_station_events_capability(
 void webd_wifi_merge_survey_history(struct json_object *data,
                                     struct json_object *response);
 
+/*
+ * Joins client identity (display name, fingerprint model, image) onto
+ * data.stations[] by MAC, using the /api/v1/clients inventory as the authority.
+ * clients_response is the raw jmx response for the "clients" ubus method; when
+ * it is missing or carries no usable rows, every station gets
+ * identity_available=false plus identity_reason instead of placeholder values.
+ */
+void webd_wifi_merge_station_identity(struct json_object *data,
+                                      struct json_object *clients_response);
+
 /* True when AC status/list data contains at least one managed AP. */
 int webd_wifi_managed_available(struct json_object *ac_response);
 

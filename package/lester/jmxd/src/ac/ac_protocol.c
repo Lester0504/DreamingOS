@@ -68,6 +68,11 @@ struct json_object *ac_capabilities_json(void)
                   "phase2_transactional_apply_pending");
     ac_capability(cap, reasons, "ap_actions", 0,
                   "phase2_transactional_apply_pending");
+    /* Controller-side AP inventory edits (rename / model override). This is a
+     * local metadata write that never contacts the AP, so it is open while
+     * ap_actions stays closed; the App gates the rename affordance on this bit
+     * rather than on ap_actions. */
+    ac_capability(cap, reasons, "ap_inventory_edit", 1, NULL);
     ac_capability(cap, reasons, "offline_queue", 0,
                   "phase3_reconciliation_pending");
     ac_capability(cap, reasons, "transactional_apply", 0,
@@ -516,6 +521,55 @@ struct json_object *ac_pairing_token_list_json(void)
     json_object_object_add(root, "source", json_object_new_string(AC_SERVICE_NAME));
     json_object_object_add(root, "items", context.items);
     json_object_object_add(root, "count", json_object_new_int(count));
+    return root;
+}
+
+/*
+ * AP inventory update (rename / model override). Distinguishes a rejected value
+ * from a missing AP so the caller can map them to 400 and 404 respectively
+ * instead of a single opaque failure.
+ */
+struct json_object *ac_ap_update_json(const char *ap_id, const char *name,
+                                      const char *model_override)
+{
+    struct json_object *root;
+    struct json_object *data;
+    int rc;
+
+    if ((name && !ac_db_ap_label_valid(name)) ||
+        (model_override && !ac_db_ap_label_valid(model_override)))
+        return ac_pairing_error("ap_update", "invalid_name",
+                                "ap_label_rejected");
+    rc = ac_db_ap_update(ap_id, name, model_override);
+    if (rc == AC_AP_UPDATE_NOT_FOUND)
+        return ac_pairing_error("ap_update", "ap_not_found",
+                                "ap_id_not_adopted");
+    if (rc == AC_AP_UPDATE_DB_ERROR)
+        return ac_pairing_error("ap_update", "database_error",
+                                "ap_inventory_write_failed");
+    if (rc != 0)
+        return ac_pairing_error("ap_update", "invalid_name",
+                                "ap_label_rejected");
+    root = json_object_new_object();
+    data = json_object_new_object();
+    json_object_object_add(root, "ok", json_object_new_boolean(1));
+    json_object_object_add(root, "contract_version",
+                           json_object_new_string(AC_CONTRACT_VERSION));
+    json_object_object_add(root, "source", json_object_new_string(AC_SERVICE_NAME));
+    json_object_object_add(root, "operation", json_object_new_string("ap_update"));
+    json_object_object_add(data, "ap_id", json_object_new_string(ap_id));
+    if (name) {
+        json_object_object_add(data, "name", json_object_new_string(name));
+        /* Matches what the wifi aggregate derives once a configured name
+         * exists, so the App sees a consistent value from both endpoints. */
+        json_object_object_add(data, "name_source",
+                               json_object_new_string(name[0] ? "ac_inventory"
+                                                              : "ap_id_fallback"));
+    }
+    if (model_override)
+        json_object_object_add(data, "model_override",
+                               json_object_new_string(model_override));
+    json_object_object_add(root, "data", data);
     return root;
 }
 

@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "config_migrate.h"
+
 #ifndef DWRT_CONFIG_DB
 #define DWRT_CONFIG_DB "/etc/dreamingwrt/config.db"
 #endif
@@ -55,6 +57,8 @@ struct dwrt_config_restore_info {
     int lan_count;
     int pending;
     int backup_available;
+    int migrated;
+    int migrated_from_version;
 };
 
 struct dwrt_config_restore_hooks {

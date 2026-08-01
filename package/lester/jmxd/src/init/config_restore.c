@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #define _GNU_SOURCE 1
 #include "config_restore.h"
+#include "config_migrate.h"
 #include "../jmx_config_schema.h"
 
 #include <ctype.h>
@@ -545,11 +546,14 @@ static int state_write(const struct dwrt_config_restore_info *info)
         "{\"format\":\"%s\",\"phase\":\"%s\",\"operation_id\":\"%s\","
         "\"source_sha256\":\"%s\",\"size_bytes\":%llu,\"started_at\":%lld,"
         "\"deadline\":%lld,\"expected_lan_ip\":\"%s\",\"wan_count\":%d,"
-        "\"lan_count\":%d,\"error\":\"%s\"}\n",
+        "\"lan_count\":%d,\"migrated\":%s,\"migrated_from_version\":%d,"
+        "\"error\":\"%s\"}\n",
         DWRT_CONFIG_RESTORE_FORMAT, info->phase, info->operation_id,
         info->source_sha256, (unsigned long long)info->size_bytes,
         (long long)info->started_at, (long long)info->deadline,
-        info->expected_lan_ip, info->wan_count, info->lan_count, info->error);
+        info->expected_lan_ip, info->wan_count, info->lan_count,
+        info->migrated ? "true" : "false", info->migrated_from_version,
+        info->error);
     if (n <= 0 || (size_t)n >= sizeof(json))
         return -1;
     return write_atomic(DWRT_CONFIG_RESTORE_STATE, json, (size_t)n, 0600);
@@ -628,12 +632,47 @@ static int staged_validate(struct dwrt_config_restore_info *out)
         restore_error(out, "staged_database_hash_mismatch");
         return -1;
     }
+    /* A stale migration product from an earlier operation must never be reused. */
+    unlink(DWRT_CONFIG_MIGRATE_DB);
     {
         int validate_rc = sqlite_validate(DWRT_CONFIG_RESTORE_DB, out);
+
         if (validate_rc != 0) {
-            snprintf(out->error, sizeof(out->error),
-                     "staged_database_schema_or_integrity_invalid:%d", validate_rc);
-            return -1;
+            struct dwrt_migrate_report report;
+            int from_version = -1;
+
+            /* The staged library may simply be older than the current schema.
+             * Migrate a private copy through the explicit version chain; the
+             * uploaded file itself is never modified and the current config.db
+             * is not touched until apply succeeds. */
+            if (dwrt_config_migrate_needed(DWRT_CONFIG_RESTORE_DB, &from_version) != 1) {
+                snprintf(out->error, sizeof(out->error),
+                         "staged_database_schema_or_integrity_invalid:%d", validate_rc);
+                return -1;
+            }
+            if (ensure_dir(DWRT_CONFIG_MIGRATE_DIR, 0700) != 0) {
+                restore_error(out, "migration_staging_unavailable");
+                return -1;
+            }
+            if (dwrt_config_migrate_run(DWRT_CONFIG_RESTORE_DB,
+                                        DWRT_CONFIG_MIGRATE_DB, &report) != 0) {
+                (void)dwrt_config_migrate_write_report(DWRT_CONFIG_MIGRATE_REPORT, &report);
+                snprintf(out->error, sizeof(out->error), "config_migration_failed:%.*s",
+                         (int)(sizeof(out->error) - sizeof("config_migration_failed:")),
+                         report.error);
+                return -1;
+            }
+            snprintf(report.source_sha256, sizeof(report.source_sha256), "%s", actual_hash);
+            (void)dwrt_config_migrate_write_report(DWRT_CONFIG_MIGRATE_REPORT, &report);
+            validate_rc = sqlite_validate(DWRT_CONFIG_MIGRATE_DB, out);
+            if (validate_rc != 0) {
+                unlink(DWRT_CONFIG_MIGRATE_DB);
+                snprintf(out->error, sizeof(out->error),
+                         "migrated_database_schema_or_integrity_invalid:%d", validate_rc);
+                return -1;
+            }
+            out->migrated = 1;
+            out->migrated_from_version = report.from_version;
         }
     }
     snprintf(out->operation_id, sizeof(out->operation_id), "%s", upload_id);
@@ -959,7 +998,10 @@ int dwrt_config_restore_apply(const struct dwrt_config_restore_hooks *hooks,
     if (snapshot_current(out) != 0)
         goto fail;
     out->backup_available = 1;
-    if (replace_config_db(DWRT_CONFIG_RESTORE_DB) != 0) {
+    /* When the staged library needed migration, only the migrated product is
+     * schema-valid, so that is what gets published. */
+    if (replace_config_db(out->migrated ? DWRT_CONFIG_MIGRATE_DB
+                                        : DWRT_CONFIG_RESTORE_DB) != 0) {
         restore_error(out, "database_replace_failed");
         goto fail;
     }
@@ -1004,6 +1046,9 @@ int dwrt_config_restore_confirm(struct dwrt_config_restore_info *out)
     out->deadline = 0;
     out->pending = 0;
     out->error[0] = '\0';
+    /* The migrated copy holds real configuration data; drop it once the
+     * restore is confirmed so it cannot linger in staging. */
+    unlink(DWRT_CONFIG_MIGRATE_DB);
     if (unlink(DWRT_CONFIG_RESTORE_PENDING) != 0 && errno != ENOENT)
         return -1;
     if (fsync_parent(DWRT_CONFIG_RESTORE_PENDING) != 0 || state_write(out) != 0)
@@ -1031,6 +1076,7 @@ int dwrt_config_restore_rollback(const struct dwrt_config_restore_hooks *hooks,
     snprintf(out->error, sizeof(out->error), "%s", reason ? reason : "manual_rollback");
     out->deadline = 0;
     out->pending = 0;
+    unlink(DWRT_CONFIG_MIGRATE_DB);
     unlink(DWRT_CONFIG_RESTORE_PENDING);
     fsync_parent(DWRT_CONFIG_RESTORE_PENDING);
     state_write(out);

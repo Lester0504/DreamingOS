@@ -1,10 +1,58 @@
+const SYSTEM_USERS_VERSION = '20260729-user-avatar-01';
+
+function avatarText(value) {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    return avatarText(value.url || value.path || value.src || value.avatar_url || value.avatar);
+  }
+  return String(value).trim();
+}
+
+export function normalizeSystemUserAvatarUrl(value, baseHref = globalThis.location?.href || 'http://localhost/') {
+  let source = avatarText(value);
+  if (!source) return '';
+  if (/^data:image\/(?:png|jpeg|webp);base64,/i.test(source) || /^blob:/i.test(source)) return source;
+  if (source.includes('\\') || /(?:^|\/)\.\.(?:\/|$)/.test(source)) return '';
+  if (source.startsWith('/www/luci-static/')) source = source.slice(4);
+  else if (source.startsWith('/www/dreamingwrt/static/')) source = source.slice('/www/dreamingwrt'.length);
+  else if (/^(?:luci-static|static)\//i.test(source)) source = `/${source}`;
+  try {
+    const base = new URL(baseHref);
+    const url = new URL(source, base);
+    if (!/^https?:$/.test(url.protocol) || url.origin !== base.origin) return '';
+    if (!/^\/(?:luci-static|static)\//.test(url.pathname)) return '';
+    return `${url.pathname}${url.search}`;
+  } catch (_) {
+    return '';
+  }
+}
+
+export function withSystemUserAvatarRevision(value, revision, baseHref = globalThis.location?.href || 'http://localhost/') {
+  const normalized = normalizeSystemUserAvatarUrl(value, baseHref);
+  if (!normalized || /^(?:data:image|blob:)/i.test(normalized) || !revision) return normalized;
+  try {
+    const url = new URL(normalized, baseHref);
+    url.searchParams.set('v', String(revision));
+    return `${url.pathname}${url.search}`;
+  } catch (_) {
+    return normalized;
+  }
+}
+
+export function mergeSystemUserAvatar(users = [], current = {}) {
+  const username = avatarText(current.username).toLowerCase();
+  const avatarUrl = normalizeSystemUserAvatarUrl(current.avatar_url || current.avatarUrl || current.avatar);
+  if (!username || !avatarUrl) return users;
+  return users.map((user) => avatarText(user.username).toLowerCase() === username ? { ...user, avatarUrl } : user);
+}
+
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
   const api = context.api || {};
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
-  const VERSION = '20260710-02';
+  const VERSION = SYSTEM_USERS_VERSION;
   const USERS_ENDPOINT = '/api/v1/system/users';
   const GROUPS_ENDPOINT = '/api/v1/system/user-groups';
   const ROLES_ENDPOINT = '/api/v1/system/user-roles';
@@ -15,6 +63,7 @@ export function mount(context = {}) {
     mounted: true,
     loading: true,
     error: '',
+    groupsError: '',
     source: '',
     users: [],
     groups: [],
@@ -31,6 +80,8 @@ export function mount(context = {}) {
     importErrors: [],
     saving: false,
     notice: '',
+    currentUsername: '',
+    avatarRevision: Date.now(),
     seq: 0
   };
 
@@ -123,6 +174,7 @@ export function mount(context = {}) {
       assignments: asArray(value.assignments || value.sites || value.resources).map((item) => firstText(item)).filter(Boolean),
       credentials: asArray(value.credentials || value.auth_methods).map((item) => firstText(item)).filter(Boolean),
       twofa: Boolean(value.twofa_enabled || value.two_factor || value.otp_enabled),
+      avatarUrl: normalizeSystemUserAvatarUrl(value.avatar_url || value.avatarUrl || value.avatar || value.photo_url || value.profile_image),
       createdAt: firstNumber(value.created_at, value.added_at),
       updatedAt: firstNumber(value.updated_at),
       lastActivity: firstNumber(value.last_activity, value.last_login_at, value.last_seen),
@@ -156,6 +208,29 @@ export function mount(context = {}) {
     };
   }
 
+  // 404/405/501 means the route is genuinely absent; 401/403 are session or permission
+  // problems and 5xx is a backend fault. Reporting them all as "not implemented" hid a
+  // delivered capability.
+  function directoryUnavailabilityMessage(error) {
+    const status = Number(error?.status) || 0;
+    if (status === 404 || status === 405 || status === 501) return `用户目录接口未实现（HTTP ${status}），当前只显示真实登录用户。`;
+    if (status === 401) return '会话已失效，请重新登录后查看完整用户目录。';
+    if (status === 403) return '当前账号没有查看用户目录的权限，仅显示自身账号。';
+    if (status >= 500) return `用户目录读取失败：后端错误 HTTP ${status}。`;
+    if (status) return `用户目录读取失败：HTTP ${status}。`;
+    return `用户目录读取失败：${firstText(error?.message, '网络不可用')}。`;
+  }
+
+  function groupsUnavailabilityMessage(error) {
+    const status = Number(error?.status) || 0;
+    if (status === 404 || status === 405 || status === 501) return `用户组接口未实现（HTTP ${status}）`;
+    if (status === 401) return '会话已失效，请重新登录';
+    if (status === 403) return '当前账号没有查看用户组的权限';
+    if (status >= 500) return `用户组读取失败：后端错误 HTTP ${status}`;
+    if (status) return `用户组读取失败：HTTP ${status}`;
+    return `用户组读取失败：${firstText(error?.message, '网络不可用')}`;
+  }
+
   function fallbackUser(data = {}) {
     const admin = data.admin && typeof data.admin === 'object' ? data.admin : {};
     const twofa = data.twofa && typeof data.twofa === 'object' ? data.twofa : {};
@@ -165,6 +240,7 @@ export function mount(context = {}) {
       role: firstText(admin.role, localStorage.getItem('dreamingwrt.web.role'), 'admin'),
       status: 'active',
       twofa_enabled: Boolean(twofa.twofa_enabled || admin.two_factor),
+      avatar_url: firstText(admin.avatar_url, admin.avatar),
       last_login_at: admin.last_login_at,
       created_at: admin.created_at,
       permissions: admin.permissions || []
@@ -179,21 +255,29 @@ export function mount(context = {}) {
     try {
       const basic = await requestJson(BASIC_ENDPOINT);
       if (!state.mounted || seq !== state.seq) return;
-      const basicCapabilities = basic.capabilities && typeof basic.capabilities === 'object' ? basic.capabilities : {};
-      const directoryAdvertised = ['system_users', 'system_users_read', 'user_directory', 'user_management', 'web_users_crud']
-        .some((key) => basicCapabilities[key] === true);
-      if (!directoryAdvertised) {
+      const currentAdmin = basic.admin && typeof basic.admin === 'object' ? basic.admin : {};
+      state.currentUsername = firstText(currentAdmin.username, basic.twofa?.username, localStorage.getItem('dreamingwrt.web.username'));
+      // `/api/v1/system/users` is the authority for the user directory. The
+      // capability batch on `system/basic` is attached from the auth state and can be
+      // absent for session reasons, so it must not gate this request.
+      let usersData;
+      try {
+        usersData = await requestJson(USERS_ENDPOINT);
+      } catch (error) {
+        if (!state.mounted || seq !== state.seq) return;
         state.users = [fallbackUser(basic)];
         state.groups = [];
         state.roles = [];
         state.capabilities = normalizeCapabilities({});
         state.source = 'system/basic · 当前登录用户';
-        state.error = '用户目录管理协议尚未接入，当前只显示真实登录用户。';
+        state.error = directoryUnavailabilityMessage(error);
         return;
       }
-      const usersData = await requestJson(USERS_ENDPOINT);
       if (!state.mounted || seq !== state.seq) return;
-      state.users = asArray(usersData.users || usersData, ['users']).map(normalizeUser);
+      state.users = mergeSystemUserAvatar(
+        asArray(usersData.users || usersData, ['users']).map(normalizeUser),
+        { username: state.currentUsername, avatar_url: firstText(currentAdmin.avatar_url, currentAdmin.avatar) }
+      );
       state.capabilities = normalizeCapabilities(usersData);
       state.source = firstText(usersData.source, 'config.db:web_users');
       const [groupsResult, rolesResult] = await Promise.allSettled([requestJson(GROUPS_ENDPOINT), requestJson(ROLES_ENDPOINT)]);
@@ -201,6 +285,11 @@ export function mount(context = {}) {
       if (groupsResult.status === 'fulfilled') {
         state.groups = asArray(groupsResult.value.groups || groupsResult.value, ['groups']).map(normalizeGroup);
         state.capabilities.groups = true;
+        state.groupsError = '';
+      } else {
+        state.groups = [];
+        state.capabilities.groups = false;
+        state.groupsError = groupsUnavailabilityMessage(groupsResult.reason);
       }
       if (rolesResult.status === 'fulfilled') state.roles = asArray(rolesResult.value.roles || rolesResult.value, ['roles']);
     } catch (error) {
@@ -252,6 +341,12 @@ export function mount(context = {}) {
     return [...new Set(state.users.flatMap((user) => user.permissions).filter(Boolean))].sort();
   }
 
+  function avatarMarkup(user, large = false) {
+    const initial = escapeHtml((user.displayName || user.username).slice(0, 1).toUpperCase());
+    const avatarUrl = withSystemUserAvatarRevision(user.avatarUrl, state.avatarRevision);
+    return `<span class="system-user-avatar${large ? ' is-large' : ''}${avatarUrl ? ' has-image' : ''}" data-system-user-avatar-for="${escapeHtml(user.username)}" data-system-user-avatar-size="${large ? 'large' : 'compact'}">${avatarUrl ? `<img src="${escapeHtml(avatarUrl)}" alt="" data-system-user-avatar-image>` : ''}<span class="system-user-avatar-fallback" aria-hidden="true">${initial}</span></span>`;
+  }
+
   function filteredUsers() {
     const query = state.query.trim().toLowerCase();
     return state.users.filter((user) => {
@@ -263,7 +358,7 @@ export function mount(context = {}) {
 
   function userRow(user) {
     return `<tr data-system-user-id="${escapeHtml(user.id)}">
-      <td><button class="system-user-name" type="button" data-system-user-detail="${escapeHtml(user.id)}"><span class="system-user-avatar">${escapeHtml((user.displayName || user.username).slice(0, 1).toUpperCase())}</span><span><strong>${escapeHtml(user.displayName)}</strong><small>${escapeHtml(user.username)}</small></span></button></td>
+      <td><button class="system-user-name" type="button" data-system-user-detail="${escapeHtml(user.id)}">${avatarMarkup(user)}<span><strong>${escapeHtml(user.displayName)}</strong><small>${escapeHtml(user.username)}</small></span></button></td>
       <td>${statusMarkup(user)}</td>
       <td>${escapeHtml(user.email || '--')}</td>
       <td><time>${escapeHtml(formatTime(user.lastActivity))}</time></td>
@@ -294,10 +389,10 @@ export function mount(context = {}) {
 
   function renderTable() {
     const users = filteredUsers();
-    return `<section class="system-users-table-card dwrt-kit-table-wrap dwrt-kit-datatable-wrap dwrt-kit-glass-surface">
+    return `<section class="system-users-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface">
       <div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>用户</strong><span class="${state.error ? 'is-warning' : ''}">${escapeHtml(state.loading ? '正在读取用户目录' : state.error || `数据源：${state.source}`)}</span></div><div class="system-users-table-meta"><span class="dwrt-kit-table-count">${users.length} / ${state.users.length} 位用户</span><button type="button" data-system-user-refresh aria-label="刷新">${icon('refresh')}</button></div></div>
       <div class="dwrt-kit-table-scroll system-users-table-scroll">
-        <table class="dwrt-kit-table dwrt-kit-datatable system-users-table"><thead><tr><th>姓名</th><th>状态</th><th>邮箱</th><th>最后活动</th><th>分配</th><th>角色</th><th>权限</th></tr></thead><tbody>${state.loading ? '<tr><td colspan="7" class="dwrt-kit-table-empty">正在读取用户</td></tr>' : users.length ? users.map(userRow).join('') : `<tr><td colspan="7" class="dwrt-kit-table-empty">${escapeHtml(state.query || state.permission !== 'all' ? '没有匹配的用户' : state.error || '暂无用户')}</td></tr>`}</tbody></table>
+        <table class="dwrt-kit-table dwrt-kit-ikuai-table system-users-table"><thead><tr><th>姓名</th><th>状态</th><th>邮箱</th><th>最后活动</th><th>分配</th><th>角色</th><th>权限</th></tr></thead><tbody>${state.loading ? '<tr><td colspan="7" class="dwrt-kit-table-empty">正在读取用户</td></tr>' : users.length ? users.map(userRow).join('') : `<tr><td colspan="7" class="dwrt-kit-table-empty">${escapeHtml(state.query || state.permission !== 'all' ? '没有匹配的用户' : state.error || '暂无用户')}</td></tr>`}</tbody></table>
       </div>
     </section>`;
   }
@@ -313,7 +408,7 @@ export function mount(context = {}) {
       ['添加时间', formatTime(user.createdAt)],
       ['最后活动', formatTime(user.lastActivity)]
     ];
-    return `<button class="policy-drawer-backdrop dwrt-kit-sheet-overlay is-open" type="button" data-system-user-close aria-label="关闭用户详情"></button><aside class="system-users-drawer dwrt-kit-sheet policy-stable-glass is-open" aria-label="用户详情"><header class="dwrt-kit-sheet-header"><div><span>USER</span><strong>${escapeHtml(user.displayName)}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-system-user-close>×</button></header><div class="dwrt-kit-sheet-body system-users-drawer-body"><section class="system-user-profile"><span class="system-user-avatar is-large">${escapeHtml((user.displayName || user.username).slice(0, 1).toUpperCase())}</span><div><strong>${escapeHtml(user.displayName)}</strong><span>${escapeHtml(user.username)} · ${escapeHtml(statusLabel(user))}</span></div></section><div class="system-user-detail-list">${sections.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')}</div>${state.error ? `<div class="system-users-notice">${escapeHtml(state.error)}</div>` : ''}</div></aside>`;
+    return `<button class="policy-drawer-backdrop dwrt-kit-sheet-overlay is-open" type="button" data-system-user-close aria-label="关闭用户详情"></button><aside class="system-users-drawer dwrt-kit-sheet policy-stable-glass is-open" aria-label="用户详情"><header class="dwrt-kit-sheet-header"><div><span>USER</span><strong>${escapeHtml(user.displayName)}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-system-user-close>×</button></header><div class="dwrt-kit-sheet-body system-users-drawer-body"><section class="system-user-profile">${avatarMarkup(user, true)}<div><strong>${escapeHtml(user.displayName)}</strong><span>${escapeHtml(user.username)} · ${escapeHtml(statusLabel(user))}</span></div></section><div class="system-user-detail-list">${sections.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')}</div>${state.error ? `<div class="system-users-notice">${escapeHtml(state.error)}</div>` : ''}</div></aside>`;
   }
 
   function createDrawer() {
@@ -322,7 +417,7 @@ export function mount(context = {}) {
   }
 
   function groupsDrawer() {
-    return `<button class="policy-drawer-backdrop dwrt-kit-sheet-overlay is-open" type="button" data-system-user-close aria-label="关闭用户组"></button><aside class="system-users-drawer dwrt-kit-sheet policy-stable-glass is-open" aria-label="管理用户组"><header class="dwrt-kit-sheet-header"><div><span>USER GROUPS</span><strong>管理组</strong></div><button class="dwrt-kit-sheet-close" type="button" data-system-user-close>×</button></header><div class="dwrt-kit-sheet-body system-users-drawer-body"><div class="system-user-group-list">${state.groups.length ? state.groups.map((group) => `<div><span class="system-user-avatar">${escapeHtml(group.name.slice(0, 1).toUpperCase())}</span><span><strong>${escapeHtml(group.name)}</strong><small>${group.userCount} 位用户</small></span></div>`).join('') : `<div class="system-users-empty">${escapeHtml(state.capabilities.groups ? '暂无用户组' : '后端用户组协议尚未接入')}</div>`}</div></div><footer class="dwrt-kit-sheet-footer"><button class="policy-primary" type="button" disabled>创建组</button></footer></aside>`;
+    return `<button class="policy-drawer-backdrop dwrt-kit-sheet-overlay is-open" type="button" data-system-user-close aria-label="关闭用户组"></button><aside class="system-users-drawer dwrt-kit-sheet policy-stable-glass is-open" aria-label="管理用户组"><header class="dwrt-kit-sheet-header"><div><span>USER GROUPS</span><strong>管理组</strong></div><button class="dwrt-kit-sheet-close" type="button" data-system-user-close>×</button></header><div class="dwrt-kit-sheet-body system-users-drawer-body"><div class="system-user-group-list">${state.groups.length ? state.groups.map((group) => `<div><span class="system-user-avatar">${escapeHtml(group.name.slice(0, 1).toUpperCase())}</span><span><strong>${escapeHtml(group.name)}</strong><small>${group.userCount} 位用户</small></span></div>`).join('') : `<div class="system-users-empty">${escapeHtml(state.capabilities.groups ? '暂无用户组' : firstText(state.groupsError, '用户组读取失败'))}</div>`}</div></div><footer class="dwrt-kit-sheet-footer"><button class="policy-primary" type="button" disabled>创建组</button></footer></aside>`;
   }
 
   function importDrawer() {
@@ -355,6 +450,7 @@ export function mount(context = {}) {
     if (tbody) tbody.innerHTML = users.length ? users.map(userRow).join('') : '<tr><td colspan="7" class="dwrt-kit-table-empty">没有匹配的用户</td></tr>';
     if (count) count.textContent = `${users.length} / ${state.users.length} 位用户`;
     bindDetailActions();
+    bindAvatarImages(tbody);
   }
 
   function patchLoadedUsers() {
@@ -376,6 +472,7 @@ export function mount(context = {}) {
     root.querySelector('[data-system-user-create]')?.toggleAttribute('disabled', !state.capabilities.create);
     root.querySelector('[data-system-user-import]')?.toggleAttribute('disabled', !state.capabilities.import);
     bindDetailActions();
+    bindAvatarImages(root.querySelector('.system-users-table-card'));
   }
 
   function closeDrawer() {
@@ -393,6 +490,39 @@ export function mount(context = {}) {
     }));
   }
 
+  function bindAvatarImages(scope = root) {
+    scope?.querySelectorAll?.('[data-system-user-avatar-image]').forEach((image) => {
+      image.addEventListener('error', () => {
+        image.hidden = true;
+        image.closest('.system-user-avatar')?.classList.remove('has-image');
+      }, { once: true });
+    });
+  }
+
+  function patchUserAvatars(username) {
+    const user = state.users.find((item) => item.username.toLowerCase() === String(username || '').toLowerCase());
+    if (!user) return;
+    root.querySelectorAll('[data-system-user-avatar-for]').forEach((avatar) => {
+      if (String(avatar.dataset.systemUserAvatarFor || '').toLowerCase() !== user.username.toLowerCase()) return;
+      const large = avatar.dataset.systemUserAvatarSize === 'large';
+      avatar.outerHTML = avatarMarkup(user, large);
+    });
+    bindAvatarImages();
+  }
+
+  function onAdminAvatarChanged(event) {
+    if (!state.mounted) return;
+    const username = firstText(event?.detail?.username, state.currentUsername, localStorage.getItem('dreamingwrt.web.username'));
+    const avatarUrl = normalizeSystemUserAvatarUrl(event?.detail?.avatar_url || event?.detail?.avatarUrl);
+    if (!username || !avatarUrl) return;
+    state.avatarRevision = Date.now();
+    state.users = mergeSystemUserAvatar(state.users, { username, avatar_url: avatarUrl });
+    if (state.selected?.username?.toLowerCase() === username.toLowerCase()) {
+      state.selected = state.users.find((item) => item.id === state.selected.id) || state.selected;
+    }
+    patchUserAvatars(username);
+  }
+
   function bindEvents() {
     root.querySelector('[data-system-user-search]')?.addEventListener('input', (event) => { state.query = event.target.value || ''; patchTable(); });
     root.querySelector('[data-system-user-permission]')?.addEventListener('change', (event) => { state.permission = event.target.value || 'all'; patchTable(); });
@@ -408,6 +538,7 @@ export function mount(context = {}) {
     root.querySelector('[data-system-user-save]')?.addEventListener('click', saveUser);
     root.querySelector('[data-system-user-import-save]')?.addEventListener('click', importUsers);
     bindDetailActions();
+    bindAvatarImages();
   }
 
   function parseCsv(text) {
@@ -495,9 +626,10 @@ export function mount(context = {}) {
     }
   }
 
+  window.addEventListener('dwrt:admin-avatar-changed', onAdminAvatarChanged);
   render();
   load();
-  return { unmount() { state.mounted = false; state.seq += 1; root?.replaceChildren(); root?.classList.remove(MODULE_CLASS, 'policy-table-route-host', 'route-workspace'); } };
+  return { unmount() { state.mounted = false; state.seq += 1; window.removeEventListener('dwrt:admin-avatar-changed', onAdminAvatarChanged); root?.replaceChildren(); root?.classList.remove(MODULE_CLASS, 'policy-table-route-host', 'route-workspace'); } };
 }
 
 export default { mount };

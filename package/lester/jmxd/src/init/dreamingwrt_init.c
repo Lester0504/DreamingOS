@@ -227,6 +227,12 @@ static struct component g_components[] = {
     { .name = "dreamingwrt-apd", .path = "/usr/bin/dreamingwrt-apd", .enabled = 0, .critical = 0, .stop_timeout_sec = 6 },
     { .name = "dreamingwrt-aegisxd", .path = "/usr/bin/dreamingwrt-aegisxd", .enabled = 1, .stop_timeout_sec = 4 },
     { .name = "dreamingwrt-honeypotd", .path = "/usr/bin/dreamingwrt-honeypotd", .enabled = 0, .stop_timeout_sec = 4 },
+    /*
+     * Remote access is opt-in: the component ships disabled and its UCI config
+     * is closed by default, so enabling the service alone does not expose the
+     * router until a relay host and tunnel token are set.
+     */
+    { .name = "dreamingos-cloud", .path = "/usr/bin/dreamingos-cloud", .enabled = 0, .critical = 0, .stop_timeout_sec = 6 },
     { .name = "dreamingproxy", .path = "/usr/bin/dreamingproxyd", .alias_name = "dreamingproxyd", .enabled = 0, .stop_timeout_sec = 6 },
 };
 

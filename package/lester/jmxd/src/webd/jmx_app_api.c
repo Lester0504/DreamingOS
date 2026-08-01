@@ -785,6 +785,7 @@ static int app_response_status(struct json_object *resp, int current_status)
                 return 404;
             if (code_s && (!strcmp(code_s, "reservation_not_found") ||
                            !strcmp(code_s, "profile_not_found") ||
+                           !strcmp(code_s, "network_not_found") ||
                            !strcmp(code_s, "package_not_found") ||
                            !strcmp(code_s, "account_not_found") ||
                            !strcmp(code_s, "ledger_not_found") ||
@@ -835,8 +836,28 @@ static int app_response_status(struct json_object *resp, int current_status)
                            !strcmp(code_s, "dns_validation_failed") ||
                            !strcmp(code_s, "upnp_mapping_invalid") ||
                            !strcmp(code_s, "missing_expected_revision") ||
-                           !strcmp(code_s, "invalid_expected_revision")))
+                           !strcmp(code_s, "invalid_expected_revision") ||
+                           !strcmp(code_s, "invalid_items") ||
+                           !strcmp(code_s, "invalid_action") ||
+                           !strcmp(code_s, "invalid_mac") ||
+                           !strcmp(code_s, "missing_id") ||
+                           !strcmp(code_s, "ip_outside_network_subnet")))
                 return 422;
+            /* IPAM item failures keep their root cause: a rolled back write is
+             * storage/consistency state, not a malformed request. */
+            if (code_s && (!strcmp(code_s, "transaction_busy") ||
+                           !strcmp(code_s, "transaction_rolled_back") ||
+                           !strcmp(code_s, "refresh_rolled_back") ||
+                           !strcmp(code_s, "ipam_address_write_failed") ||
+                           !strcmp(code_s, "ipam_address_delete_failed") ||
+                           !strcmp(code_s, "ipam_metadata_write_failed") ||
+                           !strcmp(code_s, "dhcp_reservation_write_failed") ||
+                           !strcmp(code_s, "dhcp_reservation_cleanup_failed") ||
+                           !strcmp(code_s, "dhcp_exclude_write_failed") ||
+                           !strcmp(code_s, "dhcp_exclude_cleanup_failed") ||
+                           !strcmp(code_s, "stale_reservation_cleanup_failed") ||
+                           !strcmp(code_s, "readback_mismatch")))
+                return 503;
             if (code_s && !strcmp(code_s, "rate_limited"))
                 return 429;
             if (code_s && (!strcmp(code_s, "upnp_static_mapping_unsupported") ||
@@ -1563,6 +1584,9 @@ static void webd_system_db_diagnostic_add(struct json_object *resp,
 #define WEBD_DB_INIT_RETRY_MS 250
 #define WEBD_DB_INIT_RETRY_TOTAL_MS 8000
 #define WEBD_AC_PAIRING_WRITES_PER_MINUTE 10
+/* AP inventory edits are cheap local metadata writes, so they get their own
+ * budget instead of competing with the pairing-token budget. */
+#define WEBD_AC_INVENTORY_WRITES_PER_MINUTE 30
 
 static int g_app_port = APP_API_DEFAULT_PORT;
 static char g_app_bind_addr[64] = "0.0.0.0";
@@ -1775,6 +1799,20 @@ static int app_db_init(void)
     if (app_db_add_column_if_missing("app_devices", "approved_by", "approved_by TEXT NOT NULL DEFAULT ''") != 0)
         goto fail;
     if (app_db_add_column_if_missing("app_devices", "status_token_hash", "status_token_hash TEXT NOT NULL DEFAULT ''") != 0)
+        goto fail;
+    /*
+     * Remote-access audit columns (GAP-RL-06). dreamingos-cloud updates these
+     * when it serves a request over the relay, so the UI can tell local access
+     * from remote. Added as migrations because existing installs already have
+     * this table.
+     */
+    if (app_db_add_column_if_missing(
+            "app_devices", "last_remote_seen",
+            "last_remote_seen INTEGER NOT NULL DEFAULT 0") != 0)
+        goto fail;
+    if (app_db_add_column_if_missing(
+            "app_devices", "last_access_path",
+            "last_access_path TEXT NOT NULL DEFAULT 'local'") != 0)
         goto fail;
     if (app_db_exec_checked(
         "UPDATE app_devices SET approval_state='approved',approved_at=paired_at "
@@ -4277,6 +4315,62 @@ static int app_pair_web_owner_count(int *count_out)
 
 static struct json_object *jmx_app_pair_error(const char *error, const char *message);
 
+/*
+ * Attaches the relay identity block the App needs to reach this router through
+ * the cloud relay (GAP-RL-01):
+ *
+ *   "relay": {"router_id": "...", "router_public_key": "<base64 32B X25519>"}
+ *
+ * Sourced from dreamingos-cloud over ubus rather than generated here, because
+ * that daemon owns the key material and router_id must come from the router
+ * itself; if the relay could assign it, a relay operator could point a stored
+ * App profile at a different router.
+ *
+ * Absence is not an error. When the component is not installed or not enabled,
+ * the block is simply omitted and the App stays local-only, which is what makes
+ * a phased rollout safe. A short timeout keeps a stalled component from
+ * delaying the login path.
+ */
+static void app_attach_relay_identity(struct json_object *resp)
+{
+    struct json_object *reply;
+    struct json_object *data = NULL;
+    struct json_object *ok = NULL;
+    struct json_object *router_id = NULL;
+    struct json_object *public_key = NULL;
+    struct json_object *relay;
+
+    if (!resp)
+        return;
+    reply = app_ubus_invoke_object_timeout("dreamingos.cloud", "identity",
+                                          NULL, 1000);
+    if (!reply)
+        return;
+    if (!json_object_object_get_ex(reply, "ok", &ok) || !ok ||
+        !json_object_get_boolean(ok) ||
+        !json_object_object_get_ex(reply, "data", &data) || !data ||
+        !json_object_object_get_ex(data, "router_id", &router_id) ||
+        !json_object_object_get_ex(data, "router_public_key", &public_key) ||
+        !router_id || !public_key ||
+        !json_object_is_type(router_id, json_type_string) ||
+        !json_object_is_type(public_key, json_type_string)) {
+        json_object_put(reply);
+        return;
+    }
+
+    relay = json_object_new_object();
+    if (!relay) {
+        json_object_put(reply);
+        return;
+    }
+    json_object_object_add(relay, "router_id",
+                           json_object_new_string(json_object_get_string(router_id)));
+    json_object_object_add(relay, "router_public_key",
+                           json_object_new_string(json_object_get_string(public_key)));
+    json_object_object_add(resp, "relay", relay);
+    json_object_put(reply);
+}
+
 static struct json_object *jmx_app_pair_init_ex(struct json_object *req,
                                                 const char *client_ip,
                                                 int *http_status)
@@ -4486,6 +4580,7 @@ static struct json_object *jmx_app_pair_confirm_ex(struct json_object *req,
     json_object_object_add(resp, "refresh_token", json_object_new_string(refresh_tok));
     json_object_object_add(resp, "expires_in", json_object_new_int(ACCESS_TTL_S));
     json_object_object_add(resp, "device_id", json_object_new_string(device_id));
+    app_attach_relay_identity(resp);
     if (http_status)
         *http_status = 200;
     return resp;
@@ -4608,6 +4703,7 @@ static struct json_object *jmx_app_login_ex(struct json_object *req,
     json_object_object_add(resp, "refresh_token", json_object_new_string(refresh_tok));
     json_object_object_add(resp, "expires_in", json_object_new_int(ACCESS_TTL_S));
     json_object_object_add(resp, "device_id", json_object_new_string(device_id));
+    app_attach_relay_identity(resp);
     if (http_status)
         *http_status = 200;
     return resp;
@@ -4917,17 +5013,115 @@ char *jmx_app_validate_token(const char *token)
     return jmx_app_validate_token_ex(token, NULL);
 }
 
+/*
+ * Decodes a base64 value that must yield exactly `expected` bytes.
+ *
+ * Self-contained rather than reusing webd_base64_decode_strict() because that
+ * helper is defined much further down this file and the project builds with
+ * -Werror=implicit-function-declaration; a forward declaration for one small
+ * fixed-size decode is more indirection than the check is worth.
+ */
+static int webd_app_base64_decode_exact(const char *encoded, unsigned char *out,
+                                        size_t expected)
+{
+    unsigned char buffer[64];
+    size_t length, padding = 0;
+    int decoded_length;
+
+    if (!encoded || !out || !expected)
+        return -1;
+    length = strlen(encoded);
+    /* EVP_DecodeBlock writes in 3-byte groups, so the scratch buffer has to
+     * hold the rounded-up size rather than exactly `expected`. */
+    if (!length || (length % 4) != 0 || length / 4 * 3 > sizeof(buffer))
+        return -1;
+    if (encoded[length - 1] == '=')
+        padding++;
+    if (length > 1 && encoded[length - 2] == '=')
+        padding++;
+
+    decoded_length = EVP_DecodeBlock(buffer, (const unsigned char *)encoded,
+                                     (int)length);
+    if (decoded_length <= 0 || (size_t)decoded_length < padding)
+        return -1;
+    if ((size_t)decoded_length - padding != expected)
+        return -1;
+    memcpy(out, buffer, expected);
+    OPENSSL_cleanse(buffer, sizeof(buffer));
+    return 0;
+}
+
+/*
+ * Fingerprint of an App's registered key material (GAP-RL-02).
+ *
+ * SHA256 of the raw 32-byte X25519 agreement key, first 8 bytes, uppercase hex
+ * grouped in fours: A1B2-C3D4-E5F6-0718. The App computes the same value, so a
+ * user can compare the two by eye and notice a substituted key.
+ *
+ * Returns 0 on success. Anything that is not the expected JSON shape yields a
+ * failure rather than a partial value, so the caller reports null plus a reason
+ * instead of showing a fingerprint that means nothing.
+ */
+static int webd_app_device_key_fingerprint(const char *stored, char *out,
+                                           size_t out_size)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_length = 0;
+    unsigned char raw[32];
+    struct json_object *root;
+    struct json_object *value = NULL;
+    const char *encoded;
+    size_t i, o = 0;
+    int rc = -1;
+
+    if (!stored || !stored[0] || !out || out_size < 20)
+        return -1;
+    root = json_tokener_parse(stored);
+    if (!root || !json_object_is_type(root, json_type_object))
+        goto done;
+    if (!json_object_object_get_ex(root, "kex_pub", &value) || !value ||
+        !json_object_is_type(value, json_type_string))
+        goto done;
+    encoded = json_object_get_string(value);
+    if (webd_app_base64_decode_exact(encoded, raw, sizeof(raw)) != 0)
+        goto done;
+    /* EVP rather than the SHA256() shortcut so this file needs no extra
+     * OpenSSL header beyond the evp.h it already includes. */
+    if (EVP_Digest(raw, sizeof(raw), digest, &digest_length, EVP_sha256(),
+                   NULL) != 1 || digest_length < 8)
+        goto done;
+    for (i = 0; i < 8; i++) {
+        if (i && i % 2 == 0)
+            out[o++] = '-';
+        out[o++] = hex[(digest[i] >> 4) & 0x0f];
+        out[o++] = hex[digest[i] & 0x0f];
+    }
+    out[o] = '\0';
+    rc = 0;
+done:
+    if (root)
+        json_object_put(root);
+    OPENSSL_cleanse(raw, sizeof(raw));
+    return rc;
+}
+
 struct json_object *jmx_app_devices_list(void)
 {
     struct json_object *arr = json_object_new_array();
     sqlite3_stmt *st = app_prepare(
         "SELECT id,name,platform,paired_at,last_seen,role,enabled,pair_expires_at,"
-        "approval_state,approved_at,approved_by "
+        "approval_state,approved_at,approved_by,public_key,last_remote_seen,last_access_path "
         "FROM app_devices WHERE paired_at>0 OR pair_expires_at=0 OR pair_expires_at>=strftime('%s','now') "
         "ORDER BY last_seen DESC");
     if (st) {
         while (sqlite3_step(st) == SQLITE_ROW) {
             struct json_object *o = json_object_new_object();
+            const char *stored_key = (const char *)sqlite3_column_text(st, 11);
+            int64_t last_remote = sqlite3_column_int64(st, 12);
+            const char *access_path = (const char *)sqlite3_column_text(st, 13);
+            char fingerprint[24];
+
             json_object_object_add(o, "id", json_object_new_string((const char *)sqlite3_column_text(st, 0)));
             json_object_object_add(o, "name", json_object_new_string((const char *)sqlite3_column_text(st, 1)));
             json_object_object_add(o, "platform", json_object_new_string((const char *)sqlite3_column_text(st, 2)));
@@ -4945,6 +5139,36 @@ struct json_object *jmx_app_devices_list(void)
             json_object_object_add(o, "expires_at", json_object_new_int64(sqlite3_column_int64(st, 7)));
             json_object_object_add(o, "approved_at", json_object_new_int64(sqlite3_column_int64(st, 9)));
             webd_obj_add_str(o, "approved_by", (const char *)sqlite3_column_text(st, 10));
+
+            /* Key fingerprint, plus an explicit reason when it cannot be
+             * derived; an App paired before key upload has no material here. */
+            if (webd_app_device_key_fingerprint(stored_key, fingerprint,
+                                                sizeof(fingerprint)) == 0) {
+                json_object_object_add(o, "public_key_fingerprint",
+                                       json_object_new_string(fingerprint));
+            } else {
+                json_object_object_add(o, "public_key_fingerprint", NULL);
+                json_object_object_add(o, "public_key_fingerprint_reason",
+                                       json_object_new_string(
+                                           stored_key && stored_key[0] ?
+                                               "key_material_unparsable" :
+                                               "key_material_absent"));
+            }
+
+            /* Remote-access audit signal (GAP-RL-06). null rather than 0 so the
+             * UI can distinguish "never" from "at the epoch". */
+            if (last_remote > 0) {
+                json_object_object_add(o, "last_remote_seen",
+                                       json_object_new_int64(last_remote));
+            } else {
+                json_object_object_add(o, "last_remote_seen", NULL);
+                json_object_object_add(o, "last_remote_seen_reason",
+                                       json_object_new_string("no_remote_access_recorded"));
+            }
+            json_object_object_add(o, "last_access_path",
+                                   access_path && access_path[0] ?
+                                       json_object_new_string(access_path) :
+                                       json_object_new_string("local"));
             json_object_array_add(arr, o);
         }
         sqlite3_finalize(st);
@@ -7020,24 +7244,43 @@ static void webd_audit_login_result(struct json_object *request,
                          success ? "" : error);
 }
 
-static int webd_ac_audit_reserve(const char *actor, const char *source_ip,
-                                 const char *action, sqlite3_int64 *audit_id)
+/*
+ * Reserves an audit row for an AC write and enforces a per-actor, per-source-IP
+ * rate limit in the same transaction, so two concurrent requests cannot both
+ * observe a count below the limit.
+ *
+ * rate_action_sql selects which prior actions count toward the limit, and
+ * limit_per_minute is that family's budget. Pairing-token writes and AP
+ * inventory writes are counted separately: a burst of renames must not consume
+ * the budget that protects token issuance.
+ */
+static int webd_ac_audit_reserve_ex(const char *actor, const char *source_ip,
+                                    const char *action,
+                                    const char *rate_action_sql,
+                                    int limit_per_minute,
+                                    sqlite3_int64 *audit_id)
 {
     sqlite3_stmt *st = NULL;
     sqlite3_int64 now = now_s();
     int count = 0;
     int rc = -1;
+    char count_sql[320];
 
     if (audit_id)
         *audit_id = 0;
     if (!g_app_db || !actor || !actor[0] || !source_ip || !source_ip[0] ||
-        !action || !action[0] ||
-        sqlite3_exec(g_app_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK)
+        !action || !action[0] || !rate_action_sql || !rate_action_sql[0] ||
+        limit_per_minute <= 0)
         return -1;
-    st = app_prepare(
+    /* rate_action_sql is a caller-side literal, never request data. */
+    if ((size_t)snprintf(count_sql, sizeof(count_sql),
         "SELECT COUNT(*) FROM api_audit_log "
         "WHERE ts>=?1 AND actor=?2 AND source_ip=?3 "
-        "AND action IN ('ac.pairing_token.create','ac.pairing_token.revoke')");
+        "AND action IN (%s)", rate_action_sql) >= sizeof(count_sql))
+        return -1;
+    if (sqlite3_exec(g_app_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK)
+        return -1;
+    st = app_prepare(count_sql);
     if (!st)
         goto rollback;
     sqlite3_bind_int64(st, 1, now - 60);
@@ -7048,7 +7291,7 @@ static int webd_ac_audit_reserve(const char *actor, const char *source_ip,
     count = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
     st = NULL;
-    if (count >= WEBD_AC_PAIRING_WRITES_PER_MINUTE) {
+    if (count >= limit_per_minute) {
         sqlite3_exec(g_app_db, "ROLLBACK", NULL, NULL, NULL);
         return 1;
     }
@@ -7080,6 +7323,26 @@ rollback:
 rollback_after_commit:
     sqlite3_exec(g_app_db, "ROLLBACK", NULL, NULL, NULL);
     return rc;
+}
+
+static int webd_ac_audit_reserve(const char *actor, const char *source_ip,
+                                 const char *action, sqlite3_int64 *audit_id)
+{
+    return webd_ac_audit_reserve_ex(
+        actor, source_ip, action,
+        "'ac.pairing_token.create','ac.pairing_token.revoke'",
+        WEBD_AC_PAIRING_WRITES_PER_MINUTE, audit_id);
+}
+
+static int webd_ac_inventory_audit_reserve(const char *actor,
+                                           const char *source_ip,
+                                           const char *action,
+                                           sqlite3_int64 *audit_id)
+{
+    return webd_ac_audit_reserve_ex(actor, source_ip, action,
+                                    "'ac.ap.update'",
+                                    WEBD_AC_INVENTORY_WRITES_PER_MINUTE,
+                                    audit_id);
 }
 
 static void webd_ac_audit_finish(sqlite3_int64 audit_id,
@@ -12293,6 +12556,60 @@ static void webd_control_rule_add_aliases(struct json_object *rule)
     webd_control_rule_add_runtime_contract(rule);
 }
 
+/*
+ * Single source of truth for the client-control write capabilities. Both the
+ * per-client profile and the rule list report these, so they must be derived
+ * once here instead of being restated at each call site.
+ *
+ * `control_rule_crud` and `client_control_rule_api` describe the CRUD surface,
+ * which requires the persisted rule table to be reachable. The rate-limit
+ * capability additionally depends on the tc/ifb dataplane the writer uses, and
+ * fail-closed reflects that the write path rejects anything it cannot enforce
+ * rather than persisting it silently.
+ */
+static int webd_client_control_store_ready(void)
+{
+    sqlite3_stmt *st;
+
+    if (app_db_open_runtime() != 0)
+        return 0;
+    st = config_prepare("SELECT 1 FROM client_control_rules LIMIT 1");
+    if (!st)
+        return 0;
+    sqlite3_finalize(st);
+    return 1;
+}
+
+static void webd_client_control_add_capabilities(struct json_object *cap)
+{
+    int store_ready;
+    int rate_limit_ready;
+
+    if (!cap)
+        return;
+    store_ready = webd_client_control_store_ready();
+    /* The rate-limit writer programs tc on the LAN bridge; without that
+     * dataplane the capability must not be advertised. */
+    rate_limit_ready = store_ready && access("/sbin/tc", X_OK) == 0;
+
+    json_object_object_add(cap, "control_rule_crud", json_object_new_boolean(store_ready));
+    json_object_object_add(cap, "client_control_rule_api", json_object_new_boolean(store_ready));
+    json_object_object_add(cap, "client_control_fail_closed", json_object_new_boolean(store_ready));
+    json_object_object_add(cap, "client_control_rate_limit",
+                           json_object_new_boolean(rate_limit_ready));
+    if (!store_ready)
+        webd_obj_add_str(cap, "client_control_unavailable_reason",
+                         "client_control_rules_store_unavailable");
+    else if (!rate_limit_ready)
+        webd_obj_add_str(cap, "client_control_rate_limit_reason",
+                         "tc_dataplane_binary_unavailable");
+}
+
+/*
+ * Shared projection for client control rules. `mac` selects a single client's
+ * rules; passing NULL returns every rule so the list endpoint and the
+ * per-client profile cannot drift apart.
+ */
 static struct json_object *webd_client_control_rules_load(const char *mac)
 {
     struct json_object *arr = json_object_new_array();
@@ -12300,16 +12617,23 @@ static struct json_object *webd_client_control_rules_load(const char *mac)
 
     if (!arr)
         return NULL;
-    if (!mac || !mac[0] || app_db_open_runtime() != 0)
+    if (app_db_open_runtime() != 0)
         return arr;
-    st = config_prepare(
-        "SELECT id,mac,name,enabled,control_type,schedule_mode,days_json,days_text,start_time,end_time,"
-        "limit_mode,up_limit,up_unit,down_limit,down_unit,line,protocol,note,runtime_apply,apply_state,"
-        "apply_reason,created_at,updated_at,last_runtime_enabled,last_runtime_apply_at,last_runtime_reason "
-        "FROM client_control_rules WHERE mac=?1 ORDER BY updated_at DESC,id");
+    st = mac && mac[0]
+        ? config_prepare(
+            "SELECT id,mac,name,enabled,control_type,schedule_mode,days_json,days_text,start_time,end_time,"
+            "limit_mode,up_limit,up_unit,down_limit,down_unit,line,protocol,note,runtime_apply,apply_state,"
+            "apply_reason,created_at,updated_at,last_runtime_enabled,last_runtime_apply_at,last_runtime_reason "
+            "FROM client_control_rules WHERE mac=?1 ORDER BY updated_at DESC,id")
+        : config_prepare(
+            "SELECT id,mac,name,enabled,control_type,schedule_mode,days_json,days_text,start_time,end_time,"
+            "limit_mode,up_limit,up_unit,down_limit,down_unit,line,protocol,note,runtime_apply,apply_state,"
+            "apply_reason,created_at,updated_at,last_runtime_enabled,last_runtime_apply_at,last_runtime_reason "
+            "FROM client_control_rules ORDER BY updated_at DESC,id");
     if (!st)
         return arr;
-    sqlite3_bind_text(st, 1, mac, -1, SQLITE_TRANSIENT);
+    if (mac && mac[0])
+        sqlite3_bind_text(st, 1, mac, -1, SQLITE_TRANSIENT);
     while (sqlite3_step(st) == SQLITE_ROW) {
         const char *days_json = (const char *)sqlite3_column_text(st, 6);
         const char *days_text = (const char *)sqlite3_column_text(st, 7);
@@ -12461,7 +12785,16 @@ static int webd_client_control_rule_restore_snapshot(const char *id, const char 
         goto rollback;
     if (sqlite3_exec(g_config_db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK)
         goto rollback_after_commit;
-    rc = 0;
+    st = config_prepare(
+        "SELECT COUNT(*) FROM main.client_control_rules WHERE id=?1 AND mac=?2");
+    if (!st)
+        goto out;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, mac, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 1)
+        rc = 0;
+    sqlite3_finalize(st);
+    st = NULL;
     goto out;
 
 rollback:
@@ -12482,6 +12815,192 @@ static void webd_client_control_rule_drop_snapshot(void)
     if (g_config_db)
         sqlite3_exec(g_config_db, "DROP TABLE IF EXISTS temp.client_control_rule_rollback",
                      NULL, NULL, NULL);
+}
+
+static int webd_client_control_rule_compensating_delete(const char *id, const char *mac)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+
+    if (!id || !id[0] || !mac || !mac[0] || !g_config_db ||
+        sqlite3_exec(g_config_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK)
+        return -1;
+    st = config_prepare(
+        "DELETE FROM main.client_control_rules WHERE id=?1 AND mac=?2");
+    if (!st)
+        goto rollback;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, mac, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(g_config_db) != 1) {
+        sqlite3_finalize(st);
+        st = NULL;
+        goto rollback;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (sqlite3_exec(g_config_db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK)
+        goto rollback_after_commit;
+    st = config_prepare(
+        "SELECT COUNT(*) FROM main.client_control_rules WHERE id=?1 AND mac=?2");
+    if (!st)
+        return -1;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, mac, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0)
+        rc = 0;
+    sqlite3_finalize(st);
+    return rc;
+
+rollback:
+    if (st)
+        sqlite3_finalize(st);
+    sqlite3_exec(g_config_db, "ROLLBACK", NULL, NULL, NULL);
+    return -1;
+rollback_after_commit:
+    sqlite3_exec(g_config_db, "ROLLBACK", NULL, NULL, NULL);
+    return -1;
+}
+
+static int webd_client_control_runtime_restore_from_db(const char *id, const char *mac)
+{
+    struct json_object *params = NULL;
+    sqlite3_stmt *st = NULL;
+    char state[64] = "";
+    char reason[160] = "";
+    int runtime_apply = 0;
+    int64_t last_apply_at = 0;
+    int pending = -1;
+
+    if (!id || !id[0] || !mac || !mac[0] || !g_config_db)
+        return -1;
+    params = json_object_new_object();
+    if (!params)
+        return -1;
+    json_object_object_add(params, "mac", json_object_new_string(mac));
+    if (!app_ubus_call_ok("client_rate_limit_delete", params)) {
+        json_object_put(params);
+        return -1;
+    }
+    json_object_put(params);
+    if (sqlite3_exec(g_config_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK)
+        return -1;
+    st = config_prepare(
+        "UPDATE main.client_control_rules SET runtime_apply=0,apply_state='queued',"
+        "apply_reason='rollback_runtime_reconcile',last_runtime_enabled=-1,"
+        "last_runtime_apply_at=0,last_runtime_reason='rollback_runtime_reconcile' "
+        "WHERE mac=?1");
+    if (!st)
+        goto rollback;
+    sqlite3_bind_text(st, 1, mac, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_DONE) {
+        sqlite3_finalize(st);
+        st = NULL;
+        goto rollback;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (sqlite3_exec(g_config_db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK)
+        return -1;
+    if (!webd_client_control_schedule_tick_request())
+        return -1;
+    if (!webd_client_control_rule_runtime_refresh(id, mac, &runtime_apply,
+                                                   state, sizeof(state),
+                                                   reason, sizeof(reason),
+                                                   &last_apply_at))
+        return -1;
+    if (!runtime_apply &&
+        (!strcmp(state, "failed") || !strcmp(state, "pending") ||
+         !strcmp(state, "queued")))
+        return -1;
+    st = config_prepare(
+        "SELECT COUNT(*) FROM main.client_control_rules WHERE mac=?1 "
+        "AND apply_state IN ('failed','pending','queued')");
+    if (!st)
+        return -1;
+    sqlite3_bind_text(st, 1, mac, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW)
+        pending = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    if (pending != 0)
+        return -1;
+    return 0;
+
+rollback:
+    if (st)
+        sqlite3_finalize(st);
+    sqlite3_exec(g_config_db, "ROLLBACK", NULL, NULL, NULL);
+    return -1;
+}
+
+static int webd_client_control_runtime_reconcile_after_create_rollback(const char *id,
+                                                                        const char *mac)
+{
+    struct json_object *params = NULL;
+    sqlite3_stmt *st = NULL;
+    int absent = 0;
+    int pending = -1;
+
+    if (!id || !id[0] || !mac || !mac[0] || !g_config_db)
+        return -1;
+    st = config_prepare(
+        "SELECT COUNT(*) FROM main.client_control_rules WHERE id=?1 AND mac=?2");
+    if (!st)
+        return -1;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, mac, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0)
+        absent = 1;
+    sqlite3_finalize(st);
+    if (!absent)
+        return -1;
+    params = json_object_new_object();
+    if (!params)
+        return -1;
+    json_object_object_add(params, "mac", json_object_new_string(mac));
+    if (!app_ubus_call_ok("client_rate_limit_delete", params)) {
+        json_object_put(params);
+        return -1;
+    }
+    json_object_put(params);
+    if (sqlite3_exec(g_config_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK)
+        return -1;
+    st = config_prepare(
+        "UPDATE main.client_control_rules SET runtime_apply=0,apply_state='queued',"
+        "apply_reason='rollback_runtime_reconcile',last_runtime_enabled=-1,"
+        "last_runtime_apply_at=0,last_runtime_reason='rollback_runtime_reconcile' "
+        "WHERE mac=?1");
+    if (!st)
+        goto create_rollback;
+    sqlite3_bind_text(st, 1, mac, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_DONE) {
+        sqlite3_finalize(st);
+        st = NULL;
+        goto create_rollback;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (sqlite3_exec(g_config_db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK)
+        return -1;
+    if (!webd_client_control_schedule_tick_request())
+        return -1;
+    st = config_prepare(
+        "SELECT COUNT(*) FROM main.client_control_rules WHERE mac=?1 "
+        "AND apply_state IN ('failed','pending','queued')");
+    if (!st)
+        return -1;
+    sqlite3_bind_text(st, 1, mac, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW)
+        pending = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    if (pending != 0)
+        return -1;
+    return 0;
+
+create_rollback:
+    if (st)
+        sqlite3_finalize(st);
+    sqlite3_exec(g_config_db, "ROLLBACK", NULL, NULL, NULL);
+    return -1;
 }
 
 static struct json_object *webd_client_control_rule_upsert_response(struct json_object *body,
@@ -12517,6 +13036,7 @@ static struct json_object *webd_client_control_rule_upsert_response(struct json_
     int down_limit = app_nc_json_int(body, "down_limit", app_nc_json_int(body, "download_limit", 0));
     int runtime_apply = 0;
     int schedule_tick_ok = 0;
+    int compensation_ok = 1;
     int had_existing = 0;
     int64_t last_apply_at = 0;
     int64_t ts = now_s();
@@ -12684,22 +13204,24 @@ static struct json_object *webd_client_control_rule_upsert_response(struct json_
                                                  apply_reason, sizeof(apply_reason),
                                                  &last_apply_at);
     if ((!schedule_tick_ok || (enabled && !runtime_apply)) && g_config_db) {
-        sqlite3_stmt *rollback = NULL;
         if (had_existing) {
-            webd_client_control_rule_restore_snapshot(id, norm_mac);
+            compensation_ok =
+                webd_client_control_rule_restore_snapshot(id, norm_mac) == 0 &&
+                webd_client_control_runtime_restore_from_db(id, norm_mac) == 0;
         } else {
-            rollback = config_prepare("DELETE FROM client_control_rules WHERE id=?1 AND mac=?2");
-            if (rollback) {
-                sqlite3_bind_text(rollback, 1, id, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(rollback, 2, norm_mac, -1, SQLITE_TRANSIENT);
-                sqlite3_step(rollback);
-                sqlite3_finalize(rollback);
-            }
+            compensation_ok =
+                webd_client_control_rule_compensating_delete(id, norm_mac) == 0 &&
+                webd_client_control_runtime_reconcile_after_create_rollback(
+                    id, norm_mac) == 0;
         }
-        webd_client_control_schedule_tick_request();
     } else if (had_existing)
         webd_client_control_rule_drop_snapshot();
-    if (!schedule_tick_ok) {
+    if (!compensation_ok) {
+        if (status) *status = 500;
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        webd_obj_add_str(resp, "error", "rollback_failed_runtime_state_unknown");
+        webd_obj_add_str(resp, "consistency", "unknown_manual_reconciliation_required");
+    } else if (!schedule_tick_ok) {
         if (status) *status = 503;
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         webd_obj_add_str(resp, "error", "schedule_worker_unavailable");
@@ -12710,9 +13232,10 @@ static struct json_object *webd_client_control_rule_upsert_response(struct json_
     } else {
         json_object_object_add(resp, "ok", json_object_new_boolean(1));
     }
-    json_object_object_add(resp, "changed", json_object_new_boolean(schedule_tick_ok && (!enabled || runtime_apply)));
-    json_object_object_add(resp, "persisted", json_object_new_boolean(schedule_tick_ok && (!enabled || runtime_apply)));
+    json_object_object_add(resp, "changed", json_object_new_boolean(compensation_ok && schedule_tick_ok && (!enabled || runtime_apply)));
+    json_object_object_add(resp, "persisted", json_object_new_boolean(compensation_ok && schedule_tick_ok && (!enabled || runtime_apply)));
     json_object_object_add(resp, "applied", json_object_new_boolean(runtime_apply));
+    json_object_object_add(resp, "rollback_verified", json_object_new_boolean(compensation_ok));
     webd_obj_add_str(resp, "apply_state", apply_state);
     webd_obj_add_str(resp, "runtime_reason", apply_reason);
     webd_obj_add_str(data, "id", id);
@@ -12752,6 +13275,7 @@ static struct json_object *webd_client_control_rule_toggle_response(struct json_
     int up_limit = 0, down_limit = 0;
     int runtime_apply = 0;
     int schedule_tick_ok = 0;
+    int compensation_ok = 1;
     int64_t last_apply_at = 0;
     char control_type[64] = "";
     char name[160] = "";
@@ -12892,11 +13416,17 @@ static struct json_object *webd_client_control_rule_toggle_response(struct json_
                                                  apply_reason, sizeof(apply_reason),
                                                  &last_apply_at);
     if (!schedule_tick_ok || (enabled && !runtime_apply)) {
-        webd_client_control_rule_restore_snapshot(id, norm_mac);
-        webd_client_control_schedule_tick_request();
+        compensation_ok =
+            webd_client_control_rule_restore_snapshot(id, norm_mac) == 0 &&
+            webd_client_control_runtime_restore_from_db(id, norm_mac) == 0;
     } else
         webd_client_control_rule_drop_snapshot();
-    if (!schedule_tick_ok || !runtime_apply) {
+    if (!compensation_ok) {
+        if (status) *status = 500;
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        webd_obj_add_str(resp, "error", "rollback_failed_runtime_state_unknown");
+        webd_obj_add_str(resp, "consistency", "unknown_manual_reconciliation_required");
+    } else if (!schedule_tick_ok || !runtime_apply) {
         if (status) *status = 503;
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         webd_obj_add_str(resp, "error", schedule_tick_ok ?
@@ -12904,9 +13434,10 @@ static struct json_object *webd_client_control_rule_toggle_response(struct json_
     } else {
         json_object_object_add(resp, "ok", json_object_new_boolean(1));
     }
-    json_object_object_add(resp, "changed", json_object_new_boolean(schedule_tick_ok && (!enabled || runtime_apply)));
-    json_object_object_add(resp, "persisted", json_object_new_boolean(schedule_tick_ok && (!enabled || runtime_apply)));
+    json_object_object_add(resp, "changed", json_object_new_boolean(compensation_ok && schedule_tick_ok && (!enabled || runtime_apply)));
+    json_object_object_add(resp, "persisted", json_object_new_boolean(compensation_ok && schedule_tick_ok && (!enabled || runtime_apply)));
     json_object_object_add(resp, "applied", json_object_new_boolean(runtime_apply));
+    json_object_object_add(resp, "rollback_verified", json_object_new_boolean(compensation_ok));
     webd_obj_add_str(resp, "apply_state", apply_state);
     webd_obj_add_str(resp, "runtime_reason", apply_reason);
     webd_obj_add_str(data, "id", id);
@@ -13057,6 +13588,46 @@ static struct json_object *webd_client_control_rule_delete_response(struct json_
     json_object_object_add(data, "schedule_tick_requested", json_object_new_boolean(schedule_tick_ok));
     json_object_object_add(resp, "data", data);
     jmx_app_audit_log("web", "", "client_control_rule.delete", "medium", norm_mac, "", "");
+    return resp;
+}
+
+/*
+ * Aggregated read for the client rate-limit page. The write routes are per
+ * rule, but the page needs every rule plus the write capabilities in one
+ * response; it deliberately does not walk client_profile per device.
+ */
+static struct json_object *webd_client_control_rules_response(int *status)
+{
+    struct json_object *resp = json_object_new_object();
+    struct json_object *cap = json_object_new_object();
+    struct json_object *rules;
+
+    if (status) *status = 200;
+    if (!resp || !cap) {
+        json_object_put(resp);
+        json_object_put(cap);
+        if (status) *status = 500;
+        return NULL;
+    }
+    webd_client_control_add_capabilities(cap);
+    if (app_db_open_runtime() != 0) {
+        /* Fail closed: report the outage instead of an empty rule set that
+         * would look like "no rules configured". */
+        if (status) *status = 503;
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        webd_obj_add_str(resp, "error", "db_unavailable");
+        json_object_object_add(resp, "items", json_object_new_array());
+        json_object_object_add(resp, "capabilities", cap);
+        return resp;
+    }
+    rules = webd_client_control_rules_load(NULL);
+    if (!rules)
+        rules = json_object_new_array();
+    json_object_object_add(resp, "ok", json_object_new_boolean(1));
+    json_object_object_add(resp, "count",
+                           json_object_new_int((int)json_object_array_length(rules)));
+    json_object_object_add(resp, "capabilities", cap);
+    json_object_object_add(resp, "items", rules);
     return resp;
 }
 
@@ -13368,10 +13939,7 @@ static struct json_object *webd_client_profile_response(const struct http_req *r
     json_object_object_add(cap, "policies", json_object_new_boolean(policies_available));
     json_object_object_add(cap, "control_rules", json_object_new_boolean(
         control_rules && json_object_array_length(control_rules) > 0));
-    json_object_object_add(cap, "control_rule_crud", json_object_new_boolean(1));
-    json_object_object_add(cap, "client_control_rule_api", json_object_new_boolean(1));
-    json_object_object_add(cap, "client_control_fail_closed", json_object_new_boolean(1));
-    json_object_object_add(cap, "client_control_rate_limit", json_object_new_boolean(1));
+    webd_client_control_add_capabilities(cap);
     json_object_object_add(cap, "client_control_l4_filter", json_object_new_boolean(1));
     json_object_object_add(cap, "client_control_l4_filter_action", json_object_new_string("rate_limit_only"));
     json_object_object_add(cap, "client_control_protocol_scoped_rate_limit", json_object_new_boolean(1));
@@ -24628,9 +25196,13 @@ static void webd_audit_read_query(const struct http_req *req, struct json_object
 static void webd_audit_add_caps(struct json_object *data,
                                 int persistent_url_records,
                                 int protocol_snapshots,
-                                int flow_summary_supported)
+                                int flow_summary_supported,
+                                int online_records_historical,
+                                int im_records_supported,
+                                int filter_exclude_supported)
 {
     struct json_object *cap;
+    struct json_object *reasons;
 
     if (!data)
         return;
@@ -24642,17 +25214,36 @@ static void webd_audit_add_caps(struct json_object *data,
     json_object_object_add(cap, "url_domains_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "traffic_audit_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "online_records_supported", json_object_new_boolean(1));
-    json_object_object_add(cap, "online_records_historical", json_object_new_boolean(0));
+    json_object_object_add(cap, "online_records_historical", json_object_new_boolean(online_records_historical));
     json_object_object_add(cap, "online_records_runtime_fallback", json_object_new_boolean(1));
-    json_object_object_add(cap, "im_records_supported", json_object_new_boolean(0));
+    json_object_object_add(cap, "im_records_supported", json_object_new_boolean(im_records_supported));
     json_object_object_add(cap, "protocol_summary_supported", json_object_new_boolean(protocol_snapshots || flow_summary_supported));
     json_object_object_add(cap, "protocol_snapshot_supported", json_object_new_boolean(protocol_snapshots));
     json_object_object_add(cap, "protocol_flow_summary_fallback", json_object_new_boolean(flow_summary_supported));
     json_object_object_add(cap, "app_audit_supported", json_object_new_boolean(flow_summary_supported));
     json_object_object_add(cap, "app_flow_summary_supported", json_object_new_boolean(flow_summary_supported));
-    json_object_object_add(cap, "filter_exclude_supported", json_object_new_boolean(0));
+    json_object_object_add(cap, "filter_exclude_supported", json_object_new_boolean(filter_exclude_supported));
     json_object_object_add(cap, "pagination", json_object_new_boolean(1));
     json_object_object_add(cap, "export_source", json_object_new_string("current_page"));
+    reasons = json_object_new_object();
+    if (!persistent_url_records)
+        webd_obj_add_str(reasons, "url_persistent_records_available",
+                         "audit_url_event_source_unavailable");
+    if (!online_records_historical)
+        webd_obj_add_str(reasons, "online_records_historical",
+                         "online_event_journal_not_available");
+    if (!im_records_supported)
+        webd_obj_add_str(reasons, "im_records_supported",
+                         "im_presence_collector_not_available");
+    if (!protocol_snapshots)
+        webd_obj_add_str(reasons, "protocol_snapshot_supported",
+                         flow_summary_supported ?
+                         "protocol_snapshot_unavailable_using_flow_summary" :
+                         "protocol_snapshot_source_unavailable");
+    if (!filter_exclude_supported)
+        webd_obj_add_str(reasons, "filter_exclude_supported",
+                         "audit_bff_exclude_filters_not_implemented");
+    json_object_object_add(cap, "reasons", reasons);
     json_object_object_add(data, "capabilities", cap);
 }
 
@@ -24668,6 +25259,23 @@ static int webd_audit_status_table_rows(struct json_object *status, const char *
         struct json_object *t = json_object_array_get_idx(tables, i);
         if (!strcmp(app_nc_json_str(t, "name", ""), name))
             return app_nc_json_int(t, "rows", 0);
+    }
+    return 0;
+}
+
+static int webd_audit_status_has_table(struct json_object *status, const char *name)
+{
+    struct json_object *tables = webd_obj_child_array(status, "tables");
+    int i, n;
+
+    if (!tables || !name)
+        return 0;
+    n = (int)json_object_array_length(tables);
+    for (i = 0; i < n; i++) {
+        struct json_object *table = json_object_array_get_idx(tables, i);
+
+        if (!strcmp(app_nc_json_str(table, "name", ""), name))
+            return 1;
     }
     return 0;
 }
@@ -24968,7 +25576,14 @@ static struct json_object *webd_audit_status_response(const struct http_req *req
         json_object_object_add(data, "tables", json_object_get(webd_obj_child_array(status, "tables")));
     if (status && webd_obj_child_obj(status, "worker"))
         json_object_object_add(data, "worker", json_object_get(webd_obj_child_obj(status, "worker")));
-    webd_audit_add_caps(data, url_rows > 0, protocol_rows > 0, flow_rows > 0);
+    webd_audit_add_caps(data,
+                         webd_audit_status_has_table(status, "audit_url_event"),
+                         webd_audit_status_has_table(status, "audit_protocol_snapshot"),
+                         flow_rows > 0, 0, 0, 0);
+    json_object_object_add(data, "url_persistent_records_present",
+                           json_object_new_boolean(url_rows > 0));
+    json_object_object_add(data, "protocol_snapshot_records_present",
+                           json_object_new_boolean(protocol_rows > 0));
     webd_obj_add_str(data, "source", "jmxd.audit_status+audit_view");
     if (!status) {
         json_object_object_add(data, "degraded", json_object_new_boolean(1));
@@ -25122,7 +25737,7 @@ static struct json_object *webd_audit_urls_response(const struct http_req *req,
     if (persistent) {
         src_records = webd_obj_child_array(persistent, "urls");
         persistent_total = app_nc_json_int(persistent, "total", src_records ? (int)json_object_array_length(src_records) : 0);
-        if (src_records && (persistent_total > 0 || json_object_array_length(src_records) > 0)) {
+        if (src_records) {
             use_persistent = 1;
             source = !strcasecmp(q.mode, "domains") ?
                 "jmxd.audit_urls.audit_url_event.domain_aggregate" :
@@ -25183,7 +25798,9 @@ static struct json_object *webd_audit_urls_response(const struct http_req *req,
     } else {
         json_object_object_add(data, "persistent", json_object_new_boolean(1));
     }
-    webd_audit_add_caps(data, use_persistent, 0, 0);
+    webd_audit_add_caps(data, use_persistent, 0, 0, 0, 0, 0);
+    json_object_object_add(data, "url_persistent_records_present",
+                           json_object_new_boolean(total_records > 0));
     json_object_put(url_audit);
     if (persistent) json_object_put(persistent);
     if (view) json_object_put(view);
@@ -25215,7 +25832,7 @@ static struct json_object *webd_audit_online_records_response(const struct http_
     json_object_object_add(data, "historical_exact", json_object_new_boolean(0));
     json_object_object_add(data, "degraded", json_object_new_boolean(1));
     webd_obj_add_str(data, "reason", "runtime_client_list_only; dhcp/arp/wifi online event journal pending");
-    webd_audit_add_caps(data, 0, 0, 0);
+    webd_audit_add_caps(data, 0, 0, 0, 0, 0, 0);
     if (view) json_object_put(view);
     return webd_envelope(data, "webd.audit.online_records_bff");
 }
@@ -25242,10 +25859,13 @@ static struct json_object *webd_audit_im_records_response(const struct http_req 
     json_object_object_add(data, "items", rows);
     webd_audit_add_page_meta(data, &q, total, (int)json_object_array_length(webd_obj_child_array(data, "im_records")),
                              "audit_view.im_records");
-    json_object_object_add(data, "im_records_supported", json_object_new_boolean(total > 0));
+    json_object_object_add(data, "im_records_supported", json_object_new_boolean(0));
+    json_object_object_add(data, "records_present", json_object_new_boolean(total > 0));
     json_object_object_add(data, "degraded", json_object_new_boolean(1));
-    webd_obj_add_str(data, "reason", total > 0 ? "audit_view_im_runtime" : "im_presence_collector_not_available_yet");
-    webd_audit_add_caps(data, 0, 0, 0);
+    webd_obj_add_str(data, "reason", total > 0 ?
+                     "runtime_projection_only_not_persistent_im_presence" :
+                     "im_presence_collector_not_available_yet");
+    webd_audit_add_caps(data, 0, 0, 0, 0, 0, 0);
     if (view) json_object_put(view);
     return webd_envelope(data, "webd.audit.im_records_bff");
 }
@@ -25281,7 +25901,7 @@ static struct json_object *webd_audit_traffic_response(const struct http_req *re
     json_object_object_add(data, "historical_exact", json_object_new_boolean(0));
     json_object_object_add(data, "degraded", json_object_new_boolean(1));
     webd_obj_add_str(data, "reason", "runtime_client_traffic_only; audit_traffic_day ledger pending");
-    webd_audit_add_caps(data, 0, 0, 0);
+    webd_audit_add_caps(data, 0, 0, 0, 0, 0, 0);
     if (view) json_object_put(view);
     return webd_envelope(data, "webd.audit.traffic_bff");
 }
@@ -25369,6 +25989,7 @@ static struct json_object *webd_audit_protocols_response(const struct http_req *
 {
     struct webd_audit_bff_query q;
     struct json_object *view;
+    struct json_object *status;
     struct json_object *src;
     struct json_object *flow_summary = NULL;
     struct json_object *rows;
@@ -25376,10 +25997,14 @@ static struct json_object *webd_audit_protocols_response(const struct http_req *
     struct json_object *proto_src = NULL;
     int total = 0;
     int flow_fallback = 0;
+    int protocol_source_available = 0;
 
     if (http_status)
         *http_status = 200;
     webd_audit_read_query(req, body, &q);
+    status = webd_audit_fetch_status();
+    protocol_source_available =
+        webd_audit_status_has_table(status, "audit_protocol_snapshot");
     view = webd_audit_fetch_view();
     src = webd_obj_child_array(view, "protocols");
     if (!src || json_object_array_length(src) == 0) {
@@ -25410,16 +26035,21 @@ static struct json_object *webd_audit_protocols_response(const struct http_req *
     json_object_object_add(data, "items", rows);
     webd_audit_add_page_meta(data, &q, total, (int)json_object_array_length(webd_obj_child_array(data, "protocols")),
                              flow_fallback ? "jmxd.audit_flow_app_summary.service_fallback" : "audit_view.protocols");
-    json_object_object_add(data, "protocol_snapshot_supported", json_object_new_boolean(!flow_fallback));
+    json_object_object_add(data, "protocol_snapshot_supported",
+                           json_object_new_boolean(protocol_source_available));
+    json_object_object_add(data, "protocol_snapshot_records_present",
+                           json_object_new_boolean(!flow_fallback && total > 0));
     json_object_object_add(data, "flow_summary_fallback", json_object_new_boolean(flow_fallback));
     if (flow_fallback) {
         json_object_object_add(data, "degraded", json_object_new_boolean(1));
         webd_obj_add_str(data, "reason", "audit_protocol_snapshot_empty_using_flow_service_summary");
     }
-    webd_audit_add_caps(data, 0, !flow_fallback, flow_fallback);
+    webd_audit_add_caps(data, 0, protocol_source_available, flow_fallback,
+                         0, 0, 0);
     json_object_put(proto_src);
     if (flow_summary) json_object_put(flow_summary);
     if (view) json_object_put(view);
+    if (status) json_object_put(status);
     return webd_envelope(data, "webd.audit.protocols_bff");
 }
 
@@ -25640,7 +26270,7 @@ static struct json_object *webd_audit_apps_response(const struct http_req *req,
     json_object_object_add(data, "flow_summary_fallback", json_object_new_boolean(1));
     json_object_object_add(data, "degraded", json_object_new_boolean(flow_summary ? 0 : 1));
     webd_obj_add_str(data, "reason", flow_summary ? "application_audit_from_flow_summary" : "audit_flow_app_summary_unavailable");
-    webd_audit_add_caps(data, 0, 0, flow_summary != NULL);
+    webd_audit_add_caps(data, 0, 0, flow_summary != NULL, 0, 0, 0);
     json_object_put(app_src);
     if (flow_summary) json_object_put(flow_summary);
     return webd_envelope(data, "webd.audit.apps_bff");
@@ -28226,6 +28856,10 @@ static struct json_object *webd_wifi_aggregate_response(int runtime_status)
     struct json_object *ac_capabilities = runtime_status ?
         app_ubus_invoke_object_timeout("dreamingwrt.ac", "capabilities", NULL,
                                        1500) : NULL;
+    /* Client identity for the station join. Only the runtime view carries
+     * stations, so the config view does not pay for this call. */
+    struct json_object *clients = runtime_status ?
+        app_ubus_invoke_timeout("clients", NULL, 2500) : NULL;
     struct json_object *data = webd_wifi_aggregate_data_with_resolver(
         local, managed, runtime_status, webd_fingerprint_model_image_resolve);
     struct json_object *response;
@@ -28260,10 +28894,14 @@ static struct json_object *webd_wifi_aggregate_response(int runtime_status)
         webd_wifi_merge_survey_history(data, survey_history);
     if (data && runtime_status)
         webd_wifi_merge_station_events_capability(data, ac_capabilities);
+    if (data && runtime_status)
+        webd_wifi_merge_station_identity(data, clients);
     if (scan_results)
         json_object_put(scan_results);
     if (ac_capabilities)
         json_object_put(ac_capabilities);
+    if (clients)
+        json_object_put(clients);
     if (survey_history)
         json_object_put(survey_history);
     if (survey_params)
@@ -28601,6 +29239,86 @@ invalid:
     return NULL;
 }
 
+/*
+ * Operator-supplied AP inventory label (display name / model override).
+ * Mirrors ac_db_ap_label_valid() in the controller: bounded length, no control
+ * characters. The value is stored as inventory metadata and is never handed to
+ * a shell or pushed to the AP, so printable UTF-8 is accepted as-is; the length
+ * bound is in bytes because that is what the controller column enforces.
+ */
+static int webd_ac_ap_label_valid(const char *value)
+{
+    size_t len = value ? strlen(value) : 0;
+    size_t i;
+
+    if (!value || len > 64)
+        return 0;
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)value[i];
+
+        if (c < 0x20 || c == 0x7f)
+            return 0;
+    }
+    return 1;
+}
+
+/*
+ * Body for PATCH /api/v1/ac/aps/{ap_id}. Both fields are optional but at least
+ * one must be present, otherwise the request would report success without
+ * changing anything. Unknown keys are rejected the same way the other AC write
+ * bodies reject them, so a client typo fails loudly instead of being ignored.
+ */
+static struct json_object *webd_ac_ap_update_params(const char *ap_id,
+                                                    struct json_object *body,
+                                                    int *http_status)
+{
+    struct json_object *value = NULL;
+    struct json_object *params;
+    const char *name = NULL;
+    const char *model_override = NULL;
+
+    if (!body || !json_object_is_type(body, json_type_object))
+        goto invalid;
+    json_object_object_foreach(body, key, ignored) {
+        (void)ignored;
+        if (strcmp(key, "name") && strcmp(key, "model_override"))
+            goto invalid;
+    }
+    if (json_object_object_get_ex(body, "name", &value)) {
+        if (!value || !json_object_is_type(value, json_type_string))
+            goto invalid;
+        name = json_object_get_string(value);
+        if (!webd_ac_ap_label_valid(name))
+            goto invalid;
+    }
+    if (json_object_object_get_ex(body, "model_override", &value)) {
+        if (!value || !json_object_is_type(value, json_type_string))
+            goto invalid;
+        model_override = json_object_get_string(value);
+        if (!webd_ac_ap_label_valid(model_override))
+            goto invalid;
+    }
+    if (!name && !model_override)
+        goto invalid;
+
+    params = json_object_new_object();
+    if (!params) {
+        if (http_status) *http_status = 500;
+        return NULL;
+    }
+    json_object_object_add(params, "ap_id", json_object_new_string(ap_id));
+    if (name)
+        json_object_object_add(params, "name", json_object_new_string(name));
+    if (model_override)
+        json_object_object_add(params, "model_override",
+                               json_object_new_string(model_override));
+    return params;
+
+invalid:
+    if (http_status) *http_status = 400;
+    return NULL;
+}
+
 static int webd_ac_http_status(struct json_object *resp, int default_status)
 {
     struct json_object *ok = NULL;
@@ -28622,6 +29340,12 @@ static int webd_ac_http_status(struct json_object *resp, int default_status)
     }
     if (!strcmp(error_code, "not_found"))
         return 404;
+    /* AC reports a missing AP inventory row with a route-specific code so the
+     * App can distinguish it from a missing route. */
+    if (!strcmp(error_code, "ap_not_found"))
+        return 404;
+    if (!strcmp(error_code, "invalid_name"))
+        return 400;
     if (!strcmp(error_code, "idempotency_conflict") ||
         !strcmp(error_code, "not_found_or_conflict"))
         return 409;
@@ -46831,6 +47555,224 @@ static void webd_mark_system_basic_stale(struct json_object *resp, int age_ms)
     }
 }
 
+static int webd_read_int64_file(const char *path, int64_t *value)
+{
+    FILE *fp;
+    long long parsed;
+
+    if (!path || !value || !(fp = fopen(path, "r")))
+        return -1;
+    if (fscanf(fp, "%lld", &parsed) != 1) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    *value = (int64_t)parsed;
+    return 0;
+}
+
+static struct json_object *webd_system_cpu_interrupt_runtime(void)
+{
+    struct json_object *rows = json_object_new_array();
+    FILE *fp = fopen("/proc/stat", "r");
+    char line[1024];
+
+    if (!fp)
+        return rows;
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned int cpu;
+        unsigned long long user = 0, nice = 0, system = 0, idle = 0;
+        unsigned long long iowait = 0, irq = 0, softirq = 0, steal = 0;
+        unsigned long long total, busy;
+        char path[256];
+        char text[64] = "";
+        int64_t frequency_khz = 0;
+        struct json_object *row;
+
+        if (sscanf(line, "cpu%u %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &cpu, &user, &nice, &system, &idle, &iowait, &irq,
+                   &softirq, &steal) != 9)
+            continue;
+        total = user + nice + system + idle + iowait + irq + softirq + steal;
+        busy = user + nice + system + irq + softirq + steal;
+        row = json_object_new_object();
+        json_object_object_add(row, "id", json_object_new_int64(cpu));
+        json_object_object_add(row, "cpu", json_object_new_int64(cpu));
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%u/cpufreq/scaling_cur_freq", cpu);
+        if (webd_read_int64_file(path, &frequency_khz) != 0) {
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%u/cpufreq/cpuinfo_cur_freq", cpu);
+            webd_read_int64_file(path, &frequency_khz);
+        }
+        if (frequency_khz > 0) {
+            snprintf(text, sizeof(text), "%.2f GHz",
+                     (double)frequency_khz / 1000000.0);
+            webd_obj_add_str(row, "frequency", text);
+            json_object_object_add(row, "frequency_khz",
+                                   json_object_new_int64(frequency_khz));
+        } else {
+            json_object_object_add(row, "frequency", json_object_new_null());
+            json_object_object_add(row, "frequency_khz", json_object_new_null());
+        }
+        json_object_object_add(row, "usage_percent",
+                               total ? json_object_new_double((double)busy * 100.0 / (double)total) :
+                                       json_object_new_null());
+        webd_obj_add_str(row, "usage_source", "proc_stat_since_boot_jiffies");
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%u/topology/physical_package_id", cpu);
+        app_read_first_line(path, text, sizeof(text));
+        if (text[0])
+            json_object_object_add(row, "physical_id", json_object_new_int(atoi(text)));
+        else
+            json_object_object_add(row, "physical_id", json_object_new_null());
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%u/topology/core_id", cpu);
+        app_read_first_line(path, text, sizeof(text));
+        if (text[0])
+            json_object_object_add(row, "core_id", json_object_new_int(atoi(text)));
+        else
+            json_object_object_add(row, "core_id", json_object_new_null());
+        json_object_object_add(row, "hardirq_ticks", json_object_new_int64((int64_t)irq));
+        json_object_object_add(row, "softirq_ticks", json_object_new_int64((int64_t)softirq));
+        json_object_object_add(row, "hard_irq_enabled", json_object_new_boolean(1));
+        json_object_object_add(row, "soft_irq_enabled", json_object_new_boolean(1));
+        webd_obj_add_str(row, "interrupt_state_semantic", "online_observable_not_toggle");
+        json_object_array_add(rows, row);
+    }
+    fclose(fp);
+    return rows;
+}
+
+static int webd_interrupt_descriptor_interface(const char *descriptor,
+                                                char *ifname, size_t ifname_len)
+{
+    DIR *dir;
+    struct dirent *entry;
+
+    if (!descriptor || !ifname || ifname_len == 0)
+        return 0;
+    ifname[0] = '\0';
+    dir = opendir("/sys/class/net");
+    if (!dir)
+        return 0;
+    while ((entry = readdir(dir)) != NULL) {
+        size_t n = strlen(entry->d_name);
+        const char *match;
+
+        if (!n || entry->d_name[0] == '.' || !strcmp(entry->d_name, "lo"))
+            continue;
+        match = strstr(descriptor, entry->d_name);
+        if (match && (match == descriptor || !isalnum((unsigned char)match[-1])) &&
+            !isalnum((unsigned char)match[n])) {
+            snprintf(ifname, ifname_len, "%s", entry->d_name);
+            closedir(dir);
+            return 1;
+        }
+    }
+    closedir(dir);
+    return 0;
+}
+
+static struct json_object *webd_system_nic_interrupt_runtime(void)
+{
+    struct json_object *rows = json_object_new_array();
+    FILE *fp = fopen("/proc/interrupts", "r");
+    char line[4096];
+    int cpu_count = 0;
+
+    if (!fp)
+        return rows;
+    if (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while ((p = strstr(p, "CPU")) != NULL) {
+            char *end = NULL;
+            (void)strtol(p + 3, &end, 10);
+            if (end == p + 3)
+                break;
+            cpu_count++;
+            p = end;
+        }
+    }
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line, *end = NULL;
+        long irq;
+        unsigned long long total = 0;
+        char descriptor[2048] = "";
+        char ifname[IFNAMSIZ] = "";
+        char path[160], affinity[256] = "";
+        struct json_object *row;
+        int i;
+
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (!isdigit((unsigned char)*p))
+            continue;
+        irq = strtol(p, &end, 10);
+        if (end == p || *end != ':')
+            continue;
+        p = end + 1;
+        for (i = 0; i < cpu_count; i++) {
+            unsigned long long count;
+            while (*p && isspace((unsigned char)*p))
+                p++;
+            if (!isdigit((unsigned char)*p))
+                break;
+            count = strtoull(p, &end, 10);
+            if (end == p)
+                break;
+            total += count;
+            p = end;
+        }
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        snprintf(descriptor, sizeof(descriptor), "%s", p);
+        descriptor[strcspn(descriptor, "\r\n")] = '\0';
+        if (!webd_interrupt_descriptor_interface(descriptor, ifname, sizeof(ifname)))
+            continue;
+        snprintf(path, sizeof(path), "/proc/irq/%ld/effective_affinity_list", irq);
+        app_read_first_line(path, affinity, sizeof(affinity));
+        if (!affinity[0]) {
+            snprintf(path, sizeof(path), "/proc/irq/%ld/smp_affinity_list", irq);
+            app_read_first_line(path, affinity, sizeof(affinity));
+        }
+        row = json_object_new_object();
+        webd_obj_add_str(row, "ifname", ifname);
+        json_object_object_add(row, "irq", json_object_new_int64(irq));
+        webd_obj_add_str(row, "queue", descriptor);
+        if (affinity[0])
+            webd_obj_add_str(row, "affinity", affinity);
+        else
+            json_object_object_add(row, "affinity", json_object_new_null());
+        json_object_object_add(row, "interrupt_count",
+                               json_object_new_int64((int64_t)total));
+        json_object_object_add(row, "enabled", json_object_new_boolean(1));
+        webd_obj_add_str(row, "source", "proc_interrupts+proc_irq_affinity");
+        json_object_array_add(rows, row);
+    }
+    fclose(fp);
+    return rows;
+}
+
+static void webd_system_basic_attach_interrupt_runtime(struct json_object *data)
+{
+    struct json_object *advanced = NULL;
+
+    if (!data || !json_object_is_type(data, json_type_object))
+        return;
+    if (!json_object_object_get_ex(data, "advanced", &advanced) || !advanced ||
+        !json_object_is_type(advanced, json_type_object)) {
+        advanced = json_object_new_object();
+        json_object_object_add(data, "advanced", advanced);
+    }
+    json_object_object_add(advanced, "cpu_interrupts",
+                           webd_system_cpu_interrupt_runtime());
+    json_object_object_add(advanced, "nic_interrupts",
+                           webd_system_nic_interrupt_runtime());
+    webd_obj_add_str(advanced, "interrupt_runtime_source",
+                     "proc_stat+sysfs_cpu+proc_interrupts+proc_irq_affinity");
+}
+
 static struct json_object *webd_system_basic_response(int *status)
 {
     int cache_age_ms = 0;
@@ -46844,9 +47786,16 @@ static struct json_object *webd_system_basic_response(int *status)
     if (cached && !cache_stale)
         return cached;
 
-    upstream = app_ubus_invoke_timeout("dreamingwrt_system_settings_get", NULL, 8000);
+    upstream = app_ubus_invoke_timeout("dreamingwrt_system_settings_get", NULL, 3000);
     data = webd_data_from_jmx_response(upstream);
+    if (!data) {
+        if (upstream)
+            json_object_put(upstream);
+        upstream = app_ubus_invoke_timeout("dreamingwrt_system_settings", NULL, 3000);
+        data = webd_data_from_jmx_response(upstream);
+    }
     if (data) {
+        webd_system_basic_attach_interrupt_runtime(data);
         resp = webd_envelope(data, "jmxd.dreamingwrt_system_settings_get");
         if (resp)
             jmx_cache_put_with_stale("system_basic", resp, 5, 30);
@@ -47019,6 +47968,74 @@ static void webd_system_basic_attach_auth_state(struct json_object *resp,
     }
     if (twofa)
         json_object_put(twofa);
+}
+
+static void webd_clients_mark_stale(struct json_object *resp, int age_ms)
+{
+    struct json_object *meta = NULL;
+    struct json_object *data = NULL;
+
+    if (!resp)
+        return;
+    if (!json_object_object_get_ex(resp, "meta", &meta) || !meta ||
+        !json_object_is_type(meta, json_type_object)) {
+        meta = webd_meta("webd.clients_cache");
+        json_object_object_add(resp, "meta", meta);
+    }
+    json_object_object_add(meta, "cached", json_object_new_boolean(1));
+    json_object_object_add(meta, "stale", json_object_new_boolean(1));
+    json_object_object_add(meta, "degraded", json_object_new_boolean(1));
+    json_object_object_add(meta, "cache_age_ms", json_object_new_int(age_ms));
+    webd_obj_add_str(meta, "source_error", "clients_upstream_unavailable");
+    if (json_object_object_get_ex(resp, "data", &data) && data &&
+        json_object_is_type(data, json_type_object)) {
+        json_object_object_add(data, "stale", json_object_new_boolean(1));
+        json_object_object_add(data, "degraded", json_object_new_boolean(1));
+        json_object_object_add(data, "cache_age_ms", json_object_new_int(age_ms));
+        webd_obj_add_str(data, "source_error", "clients_upstream_unavailable");
+    }
+}
+
+static struct json_object *webd_clients_response(int *http_status)
+{
+    int cache_age_ms = 0;
+    int cache_stale = 0;
+    struct json_object *cached = jmx_cache_get_allow_stale(
+        "clients_inventory", 30, &cache_age_ms, &cache_stale);
+    struct json_object *upstream;
+    struct json_object *data = NULL;
+    struct json_object *clients = NULL;
+
+    if (cached && !cache_stale)
+        return cached;
+    upstream = app_ubus_invoke_timeout("clients", NULL, 2500);
+    data = webd_data_from_jmx_response(upstream);
+    if (data && json_object_object_get_ex(data, "clients", &clients) && clients &&
+        json_object_is_type(clients, json_type_array)) {
+        jmx_cache_put_with_stale("clients_inventory", upstream, 2, 30);
+        json_object_put(data);
+        if (cached)
+            json_object_put(cached);
+        return upstream;
+    }
+    if (data)
+        json_object_put(data);
+    if (upstream)
+        json_object_put(upstream);
+    if (cached) {
+        struct json_object *response = webd_json_clone(cached);
+
+        json_object_put(cached);
+        if (response) {
+            webd_clients_mark_stale(response, cache_age_ms);
+            return response;
+        }
+    }
+    if (http_status)
+        *http_status = 503;
+    return webd_error("source_unavailable",
+                      "client inventory source is not available",
+                      "dreamingwrt.clients", "webd.clients");
 }
 
 static void webd_system_settings_scrub_sensitive(struct json_object *o)
@@ -49444,6 +50461,34 @@ static struct json_object *webd_flowd_wan_health_response(struct json_object *bo
     json_object_put(data);
     json_object_put(core);
     return resp;
+}
+
+static struct json_object *webd_wan_slas_response(const char *id, int *http_status)
+{
+    struct json_object *params = json_object_new_object();
+    struct json_object *config;
+    struct json_object *items = NULL;
+
+    if (id && id[0])
+        json_object_object_add(params, "id", json_object_new_string(id));
+    config = app_ubus_invoke_object("dreamingwrt.flowd", "wan_sla_list", params);
+    json_object_put(params);
+    if (!config || !app_nc_json_bool(config, "ok", 0) ||
+        !json_object_object_get_ex(config, "items", &items) || !items) {
+        if (config) json_object_put(config);
+        if (http_status) *http_status = 503;
+        return webd_error("source_unavailable", "WAN SLA source is unavailable",
+                          "dreamingwrt.flowd wan_sla_list", "webd.wan_sla");
+    }
+    if (id && id[0] && json_object_array_length(items) == 0) {
+        json_object_put(config);
+        if (http_status) *http_status = 404;
+        return webd_error("not_found", "WAN SLA does not exist", id, "webd.wan_sla");
+    }
+    {
+        struct json_object *envelope = webd_envelope(config, "webd.wan_sla");
+        return envelope;
+    }
 }
 
 static struct json_object *webd_monitor_ubus_response(const char *method,
@@ -52432,6 +53477,8 @@ static void handle_client(int fd)
           strcmp(req.method, "GET") && strcmp(req.method, "HEAD")) ||
          (!strncmp(req.path, "/api/v1/ac/pairing-tokens", 25) &&
           strcmp(req.method, "GET") && strcmp(req.method, "HEAD")) ||
+         (!strncmp(req.path, "/api/v1/ac/aps", 14) &&
+          strcmp(req.method, "GET") && strcmp(req.method, "HEAD")) ||
          !strcmp(req.path, "/api/v1/auth/pair/approve")) &&
         !webd_cookie_write_csrf_ok(&req)) {
         struct json_object *err = webd_error("csrf_rejected",
@@ -54203,6 +55250,64 @@ static void handle_client(int fd)
         resp = app_ubus_object_or_error("dreamingwrt.flowd", "wan_health_delete", body_json);
         status = app_response_status(resp, status);
     }
+    else if (!strcmp(req.path, "/api/v1/network/wan-slas") &&
+             (!strcmp(req.method, "GET") || !strcmp(req.method, "HEAD"))) {
+        resp = webd_wan_slas_response(NULL, &status);
+    }
+    else if (!strcmp(req.path, "/api/v1/network/wan-slas/preview") &&
+             (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
+        resp = app_ubus_object_or_error("dreamingwrt.flowd", "wan_sla_preview", body_json);
+        status = app_routed_http_status(resp, status);
+    }
+    else if (!strncmp(req.path, "/api/v1/network/wan-slas/", 25) &&
+             req.path[25] && !strchr(req.path + 25, '/') &&
+             (!strcmp(req.method, "GET") || !strcmp(req.method, "HEAD"))) {
+        if (!webd_safe_token(req.path + 25)) {
+            status = 400;
+            resp = webd_error("invalid_id", "WAN SLA id is invalid", "id", "webd.wan_sla");
+        } else {
+            resp = webd_wan_slas_response(req.path + 25, &status);
+        }
+    }
+    else if ((!strcmp(req.path, "/api/v1/network/wan-slas") &&
+              !strcmp(req.method, "POST")) ||
+             (!strncmp(req.path, "/api/v1/network/wan-slas/", 25) &&
+              req.path[25] && !strchr(req.path + 25, '/') &&
+              (!strcmp(req.method, "PUT") || !strcmp(req.method, "PATCH") ||
+               !strcmp(req.method, "DELETE")))) {
+        const char *id = !strncmp(req.path, "/api/v1/network/wan-slas/", 25) ?
+                         req.path + 25 : "";
+        const char *method = "wan_sla_commit";
+        struct json_object *write_result;
+
+        if (id[0] && !webd_safe_token(id)) {
+            status = 400;
+            resp = webd_error("invalid_id", "WAN SLA id is invalid", "id", "webd.wan_sla");
+        } else {
+            if (id[0])
+                json_object_object_add(body_json, "id", json_object_new_string(id));
+            json_object_object_add(body_json, "operation",
+                json_object_new_string(!strcmp(req.method, "DELETE") ? "delete" : "upsert"));
+            write_result = app_ubus_object_or_error("dreamingwrt.flowd", method, body_json);
+            status = app_routed_http_status(write_result, status);
+            if (app_nc_json_bool(write_result, "ok", 0)) {
+                resp = write_result;
+                jmx_app_audit_log(device_id[0] ? device_id : "http", device_id,
+                                  !strcmp(req.method, "DELETE") ?
+                                      "network.wan_sla.delete" : "network.wan_sla.upsert",
+                                  "medium", id, "", "");
+            } else {
+                const char *error = app_nc_json_str(write_result, "error", "");
+                if (!strcmp(error, "revision_conflict"))
+                    status = 409;
+                else if (!strcmp(error, "expected_revision_required"))
+                    status = 422;
+                else if (!strcmp(error, "not_found"))
+                    status = 404;
+                resp = write_result;
+            }
+        }
+    }
     else if (!strcmp(req.path, "/api/v1/flowd/split-rules") && !strcmp(req.method, "GET")) {
         resp = app_ubus_object_or_error("dreamingwrt.flowd", "split_rules_get", body_json);
         status = app_response_status(resp, status);
@@ -54547,18 +55652,18 @@ static void handle_client(int fd)
     }
     else if (!strcmp(req.path, "/api/v1/network/gateway-ports") &&
              !strcmp(req.method, "GET")) {
-        resp = app_ubus_invoke_timeout("gateway_ports_get", NULL, 5000);
-        status = app_response_status(resp, status);
+        resp = app_routed_call("gateway_ports_get", NULL);
+        status = app_routed_http_status(resp, status);
     }
     else if (!strcmp(req.path, "/api/v1/network/gateway-ports/preview") &&
              (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
-        resp = app_ubus_invoke_timeout("gateway_ports_preview", body_json, 10000);
-        status = app_response_status(resp, status);
+        resp = app_routed_call("gateway_ports_preview", body_json);
+        status = app_routed_http_status(resp, status);
     }
     else if (!strcmp(req.path, "/api/v1/network/gateway-ports/apply") &&
              (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
-        resp = app_ubus_invoke_timeout("gateway_ports_apply", body_json, 30000);
-        status = app_response_status(resp, status);
+        resp = app_routed_call("gateway_ports_apply", body_json);
+        status = app_routed_http_status(resp, status);
         jmx_app_audit_log(device_id[0] ? device_id : "http", device_id,
                           "network.gateway_ports.apply", "high", req.path,
                           authenticated_role, app_ubus_response_ok(resp) ? "success" : "failed");
@@ -55929,14 +57034,31 @@ static void handle_client(int fd)
     else if (!strcmp(req.path, "/api/v1/bulk-ip") && !strcmp(req.method, "GET")) {
         resp = app_ubus_invoke("bulk_ip_get", NULL);
     }
+    else if (!strcmp(req.path, "/api/v1/bulk-ip/transactions") && !strcmp(req.method, "POST")) {
+        resp = app_ubus_invoke("bulk_ip_transaction", body_json);
+        status = app_response_status(resp, status);
+    }
+    else if (!strcmp(req.path, "/api/v1/bulk-ip/refresh") && !strcmp(req.method, "POST")) {
+        resp = app_ubus_invoke("bulk_ip_refresh", body_json);
+        status = app_response_status(resp, status);
+    }
     else if (!strcmp(req.path, "/api/v1/bulk-ip/reserve") && (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
-        resp = app_ubus_ok_only("bulk_ip_reserve", body_json);
+        struct json_object *request=json_object_new_object(),*items=json_object_new_array(),*snapshot=app_ubus_invoke("bulk_ip_get",NULL),*data=NULL,*rev=NULL;
+        json_object_object_add(request,"action",json_object_new_string("reserve"));
+        json_object_object_add(request,"network_id",json_object_new_string(app_nc_json_str(body_json,"network_id","lan")));
+        json_object_array_add(items,json_object_get(body_json)); json_object_object_add(request,"items",items);
+        if(snapshot&&json_object_object_get_ex(snapshot,"data",&data)&&data&&json_object_object_get_ex(data,"revision",&rev))json_object_object_add(request,"expected_revision",json_object_get(rev));
+        resp = app_ubus_invoke("bulk_ip_transaction",request); json_object_put(request); if(snapshot)json_object_put(snapshot);
+        status = app_response_status(resp,status);
     }
     else if (!strcmp(req.path, "/api/v1/bulk-ip/delete") && !strcmp(req.method, "POST")) {
         const char *id = app_nc_json_str(body_json, "id", "");
-        struct json_object *params = app_json_id_param(id);
-        resp = app_ubus_ok_only("bulk_ip_delete", params);
-        json_object_put(params);
+        struct json_object *request=json_object_new_object(),*items=json_object_new_array(),*item=app_json_id_param(id),*snapshot=app_ubus_invoke("bulk_ip_get",NULL),*data=NULL,*rev=NULL;
+        json_object_object_add(request,"action",json_object_new_string("delete"));
+        json_object_object_add(request,"network_id",json_object_new_string(app_nc_json_str(body_json,"network_id","lan")));
+        json_object_array_add(items,item); json_object_object_add(request,"items",items);
+        if(snapshot&&json_object_object_get_ex(snapshot,"data",&data)&&data&&json_object_object_get_ex(data,"revision",&rev))json_object_object_add(request,"expected_revision",json_object_get(rev));
+        resp = app_ubus_invoke("bulk_ip_transaction",request); json_object_put(request); if(snapshot)json_object_put(snapshot);
         status = app_response_status(resp, status);
     }
     /* ── Firewall service ── */
@@ -56346,12 +57468,15 @@ static void handle_client(int fd)
     }
     /* ── Clients ── */
     else if (!strcmp(req.path, "/api/v1/clients")) {
-        resp = app_ubus_invoke("clients", NULL);
+        resp = webd_clients_response(&status);
     }
     else if (!strcmp(req.path, "/api/v1/client_profile") && !strcmp(req.method, "GET")) {
         resp = webd_client_profile_response(&req);
         if (!app_nc_json_bool(resp, "ok", 0))
             status = 400;
+    }
+    else if (!strcmp(req.path, "/api/v1/client_control_rules") && !strcmp(req.method, "GET")) {
+        resp = webd_client_control_rules_response(&status);
     }
     else if (!strcmp(req.path, "/api/v1/client_control_rule") && !strcmp(req.method, "POST")) {
         resp = webd_client_control_rule_upsert_response(body_json, 0, &status);
@@ -57095,6 +58220,75 @@ static void handle_client(int fd)
     else if (!strcmp(req.path, "/api/v1/ac/aps") && !strcmp(req.method, "GET")) {
         resp = app_ubus_object_or_error("dreamingwrt.ac", "aps_list", NULL);
         status = webd_ac_http_status(resp, status);
+    }
+    /*
+     * AP inventory edit (rename / model override). Both fields live only in the
+     * controller database, so this does not depend on the AP-facing apply
+     * capabilities that are still closed; it is gated on ap_inventory_edit
+     * rather than ap_actions.
+     */
+    else if (!strncmp(req.path, "/api/v1/ac/aps/", 15) &&
+             req.path[15] && !strchr(req.path + 15, '/') &&
+             !strcmp(req.method, "PATCH")) {
+        const char *ap_id = req.path + 15;
+
+        if (!webd_ac_token_id_valid(ap_id)) {
+            status = 400;
+            resp = webd_error("invalid_ap_id", "ap_id must be a UUID v4",
+                              "ap_id", "webd.ac");
+            jmx_app_audit_log_ex(device_id, device_id, "ac.ap.update",
+                                 "medium", "", req.client_ip, "failed",
+                                 "invalid_ap_id");
+        } else {
+            struct json_object *params =
+                webd_ac_ap_update_params(ap_id, body_json, &status);
+
+            if (!params) {
+                resp = status == 500 ?
+                    webd_error("internal_error", "could not allocate AC request",
+                               "request", "webd.ac") :
+                    webd_error("invalid_name",
+                               "name and model_override must be printable strings "
+                               "of at most 64 bytes, and at least one is required",
+                               "name|model_override", "webd.ac");
+                jmx_app_audit_log_ex(device_id, device_id, "ac.ap.update",
+                                     "medium", ap_id, req.client_ip, "failed",
+                                     status == 500 ? "allocation_failed" :
+                                                     "invalid_request");
+            } else {
+                sqlite3_int64 audit_id = 0;
+                const char *result;
+                int reserve_rc = webd_ac_inventory_audit_reserve(
+                    device_id, req.client_ip, "ac.ap.update", &audit_id);
+
+                if (reserve_rc == 1) {
+                    status = 429;
+                    resp = webd_error("rate_limited",
+                                      "AP inventory write rate limit exceeded",
+                                      "30 writes per actor and source IP per minute",
+                                      "webd.ac");
+                    jmx_app_audit_log_ex(device_id, device_id,
+                                         "ac.ap.rate_limited", "medium", ap_id,
+                                         req.client_ip, "rejected",
+                                         "write_rate_limit_exceeded");
+                } else if (reserve_rc != 0) {
+                    status = 503;
+                    resp = webd_error("audit_unavailable",
+                                      "AP inventory write audit could not be reserved",
+                                      "apid.db", "webd.ac");
+                } else {
+                    resp = app_ubus_object_or_error("dreamingwrt.ac",
+                                                    "ap_update", params);
+                    result = webd_ac_response_ok(resp) ? "success" : "failed";
+                    webd_ac_audit_finish(audit_id, device_id, req.client_ip,
+                                         "ac.ap.update", ap_id, result,
+                                         result[0] == 's' ? "" :
+                                         "upstream_failed");
+                }
+                status = webd_ac_http_status(resp, status);
+                json_object_put(params);
+            }
+        }
     }
     else if (!strcmp(req.path, "/api/v1/ac/capabilities") && !strcmp(req.method, "GET")) {
         resp = app_ubus_object_or_error("dreamingwrt.ac", "capabilities", NULL);
@@ -58063,7 +59257,11 @@ static void handle_client(int fd)
         http_send_json(fd, status, resp);
         json_object_put(resp);
     } else {
-        http_send(fd, 500, "Internal Server Error", "text/plain", "error", 5);
+        resp = webd_error("internal_error",
+                          "backend returned no JSON response",
+                          req.path, "webd.dispatch");
+        http_send_json(fd, 500, resp);
+        json_object_put(resp);
     }
 
     free(device_id);

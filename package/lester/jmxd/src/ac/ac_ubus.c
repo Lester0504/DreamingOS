@@ -208,6 +208,20 @@ static const struct blobmsg_policy ac_token_policy[__AC_TOKEN_MAX] = {
     [AC_TOKEN_ID] = { .name = "token_id", .type = BLOBMSG_TYPE_STRING },
 };
 
+enum {
+    AC_AP_UPDATE_AP_ID,
+    AC_AP_UPDATE_NAME,
+    AC_AP_UPDATE_MODEL_OVERRIDE,
+    __AC_AP_UPDATE_MAX,
+};
+
+static const struct blobmsg_policy ac_ap_update_policy[__AC_AP_UPDATE_MAX] = {
+    [AC_AP_UPDATE_AP_ID] = { .name = "ap_id", .type = BLOBMSG_TYPE_STRING },
+    [AC_AP_UPDATE_NAME] = { .name = "name", .type = BLOBMSG_TYPE_STRING },
+    [AC_AP_UPDATE_MODEL_OVERRIDE] = { .name = "model_override",
+                                      .type = BLOBMSG_TYPE_STRING },
+};
+
 /* JSON-to-blobmsg bridges (webd REST and the ubus CLI both use
  * blobmsg_add_json_from_string) encode every integer with the smallest
  * width that fits, so an INT64 contract field arrives as INT32 whenever
@@ -749,10 +763,45 @@ static int ac_handle_pairing_token_revoke(
     return ac_reply_json(ctx, req, response);
 }
 
+/*
+ * Renames an adopted AP and/or sets its model override. Both are controller-side
+ * inventory fields, so this does not need a session with the AP and stays
+ * available while the AP-facing apply capabilities are still closed.
+ */
+static int ac_handle_ap_update(struct ubus_context *ctx, struct ubus_object *obj,
+                               struct ubus_request_data *req, const char *method,
+                               struct blob_attr *msg)
+{
+    struct blob_attr *tb[__AC_AP_UPDATE_MAX];
+    const char *ap_id;
+    const char *name = NULL;
+    const char *model_override = NULL;
+
+    (void)obj;
+    (void)method;
+    if (!ac_message_is_strict(msg, ac_ap_update_policy, __AC_AP_UPDATE_MAX,
+                              1U << AC_AP_UPDATE_AP_ID) ||
+        blobmsg_parse(ac_ap_update_policy, __AC_AP_UPDATE_MAX, tb,
+                      blob_data(msg), blob_len(msg)) != 0)
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    ap_id = blobmsg_get_string(tb[AC_AP_UPDATE_AP_ID]);
+    if (tb[AC_AP_UPDATE_NAME])
+        name = blobmsg_get_string(tb[AC_AP_UPDATE_NAME]);
+    if (tb[AC_AP_UPDATE_MODEL_OVERRIDE])
+        model_override = blobmsg_get_string(tb[AC_AP_UPDATE_MODEL_OVERRIDE]);
+    /* At least one mutable field must be present; an ap_id-only call would
+     * otherwise report success without changing anything. */
+    if (!name && !model_override)
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    return ac_reply_json(ctx, req,
+                         ac_ap_update_json(ap_id, name, model_override));
+}
+
 static const struct ubus_method ac_methods[] = {
     UBUS_METHOD_NOARG("status", ac_handle_status),
     UBUS_METHOD_NOARG("capabilities", ac_handle_capabilities),
     UBUS_METHOD_NOARG("aps_list", ac_handle_aps_list),
+    UBUS_METHOD("ap_update", ac_handle_ap_update, ac_ap_update_policy),
     UBUS_METHOD("pairing_token_create", ac_handle_pairing_token_create,
                 ac_create_policy),
     UBUS_METHOD_NOARG("pairing_token_list", ac_handle_pairing_token_list),

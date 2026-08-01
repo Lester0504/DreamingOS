@@ -97,6 +97,9 @@ static const struct route_risk g_route_risks[] = {
     { "/api/v1/network/lans",     "POST,PUT,PATCH,DELETE", JMX_RISK_HIGH },
     { "/api/v1/network/lans/",    "DELETE", JMX_RISK_HIGH },
     { "/api/v1/network/gateway-ports/apply", "POST,PUT", JMX_RISK_HIGH },
+    { "/api/v1/network/wan-slas/", "PUT,PATCH,DELETE", JMX_RISK_MEDIUM },
+    { "/api/v1/network/wan-slas",  "POST", JMX_RISK_MEDIUM },
+    { "/api/v1/network/wan-slas/preview", "POST,PUT", JMX_RISK_MEDIUM },
     { "/api/v1/network/gateway-shadow/apply", "POST,PUT", JMX_RISK_HIGH },
     { "/api/v1/network/gateway-shadow/disable", "POST,PUT", JMX_RISK_HIGH },
     { "/api/v1/network/gateway-shadow/pairing/approve", "POST,PUT", JMX_RISK_HIGH },
@@ -124,6 +127,7 @@ static const struct route_risk g_route_risks[] = {
     { "/api/v1/flow-control/",    "POST",   JMX_RISK_MEDIUM },
 
     /* Per-client controls mutate tc/ifb runtime state and require admin. */
+    { "/api/v1/client_control_rules", "GET", JMX_RISK_LOW },
     { "/api/v1/client_control_rule", "POST,PUT,PATCH,DELETE", JMX_RISK_MEDIUM },
     { "/api/v1/client_protocol_control", "POST,PUT,PATCH,DELETE", JMX_RISK_MEDIUM },
 
@@ -202,6 +206,11 @@ static const struct route_risk g_route_risks[] = {
     /* VPN reads are observable; every write remains owner-only and fail-closed. */
     { "/api/v1/vpn",              "POST,PUT,PATCH,DELETE", JMX_RISK_HIGH },
     { "/api/v1/vpn",              "GET,HEAD", JMX_RISK_LOW },
+    /* Read-only aggregate; only GET is dispatched, but the write methods are
+     * declared explicitly so they keep the HIGH treatment they inherited from
+     * the /api/v1/vpn prefix before matching became boundary-aware. */
+    { "/api/v1/vpn_status",       "POST,PUT,PATCH,DELETE", JMX_RISK_HIGH },
+    { "/api/v1/vpn_status",       "GET,HEAD", JMX_RISK_LOW },
     { "/api/v1/services/vpn",     "POST,PUT,PATCH,DELETE", JMX_RISK_HIGH },
     { "/api/v1/services/vpn/apply","POST", JMX_RISK_HIGH },
     { "/api/v1/services/vpn",     "GET,HEAD", JMX_RISK_LOW },
@@ -228,6 +237,10 @@ static const struct route_risk g_route_risks[] = {
     /* AC controller reads are observable; pairing-token lifecycle is admin-grade. */
     { "/api/v1/ac/status",         "GET,HEAD", JMX_RISK_LOW },
     { "/api/v1/ac/aps",            "GET,HEAD", JMX_RISK_LOW },
+    /* AP inventory edits (rename / model override) are controller-side metadata
+     * only, but they change what every operator sees, so they stay admin-grade.
+     * The trailing '/' makes this an explicit id subtree. */
+    { "/api/v1/ac/aps/",           "PATCH", JMX_RISK_MEDIUM },
     { "/api/v1/ac/capabilities",   "GET,HEAD", JMX_RISK_LOW },
     { "/api/v1/ac/pairing-tokens", "GET,HEAD", JMX_RISK_LOW },
     { "/api/v1/ac/pairing-tokens", "POST,DELETE", JMX_RISK_MEDIUM },
@@ -282,10 +295,12 @@ static const struct route_risk g_route_risks[] = {
     { "/api/v1/auth/2fa/prepare",   "POST", JMX_RISK_LOW },
     { "/api/v1/auth/2fa/enable",    "POST", JMX_RISK_MEDIUM },
     { "/api/v1/auth/2fa/disable",   "POST", JMX_RISK_MEDIUM },
+    /* More specific paths first: matching returns on the first hit, so the
+     * bare /api/v1/auth/security entries must not shadow the failure log. */
+    { "/api/v1/auth/security/failures/clear", "POST", JMX_RISK_MEDIUM },
+    { "/api/v1/auth/security/failures", "GET", JMX_RISK_MEDIUM },
     { "/api/v1/auth/security",      "GET", JMX_RISK_LOW },
     { "/api/v1/auth/security",      "POST,PUT,PATCH", JMX_RISK_MEDIUM },
-    { "/api/v1/auth/security/failures", "GET", JMX_RISK_MEDIUM },
-    { "/api/v1/auth/security/failures/clear", "POST", JMX_RISK_MEDIUM },
 
     /* Logd — reads are low, collector/settings/event writes are admin-grade. */
     { "/api/v1/logd/status",        "GET", JMX_RISK_LOW },
@@ -471,6 +486,8 @@ static const struct route_risk g_route_risks[] = {
     { "/api/v1/topology/node/ports/apply",     "POST,PUT", JMX_RISK_MEDIUM },
     { "/api/v1/network/gateway-ports/preview", "POST,PUT", JMX_RISK_LOW },
     { "/api/v1/network/gateway-ports",         "GET", JMX_RISK_LOW },
+    { "/api/v1/network/wan-slas",              "GET,HEAD", JMX_RISK_LOW },
+    { "/api/v1/network/wan-slas/",             "GET,HEAD", JMX_RISK_LOW },
     { "/api/v1/network/gateway-shadow",        "GET,HEAD", JMX_RISK_LOW },
     { "/api/v1/network/gateway-shadow/status", "GET,HEAD", JMX_RISK_LOW },
     { "/api/v1/topology/node/ports",           "GET,POST", JMX_RISK_LOW },
@@ -607,6 +624,29 @@ static const struct route_risk g_route_risks[] = {
     { NULL, NULL, JMX_RISK_LOW }
 };
 
+/*
+ * Prefix matching with a segment boundary requirement.
+ *
+ * A plain strncmp() lets a short entry swallow longer sibling routes, which is
+ * how "/api/v1/auth/security" ended up governing
+ * "/api/v1/auth/security/failures" and downgrading it to LOW. An entry now
+ * matches only when the request path ends there or continues with '/'.
+ *
+ * Entries written with a trailing '/' keep their original meaning: they are
+ * deliberate "this subtree, including ids" prefixes, so a bare strncmp() is
+ * correct for them.
+ */
+static int route_prefix_matches(const char *path, const char *prefix)
+{
+    size_t len = strlen(prefix);
+
+    if (strncmp(path, prefix, len) != 0)
+        return 0;
+    if (len && prefix[len - 1] == '/')
+        return 1;
+    return path[len] == '\0' || path[len] == '/';
+}
+
 jmx_risk_t jmx_perm_route_risk(const char *method, const char *path)
 {
     const struct route_risk *r;
@@ -614,7 +654,7 @@ jmx_risk_t jmx_perm_route_risk(const char *method, const char *path)
     if (!method || !path || !method[0] || !path[0]) return JMX_RISK_BLOCKED;
 
     for (r = g_route_risks; r->prefix; r++) {
-        if (strncmp(path, r->prefix, strlen(r->prefix)) != 0) continue;
+        if (!route_prefix_matches(path, r->prefix)) continue;
         if (!method_matches(method, r->methods)) continue;
         return r->risk;
     }

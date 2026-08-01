@@ -19,10 +19,14 @@ def test_all_gateway_shadow_routes_are_integrated() -> None:
     for suffix in ("", "/status", "/preflight", "/pairing/start", "/pairing/approve", "/save", "/apply", "/disable"):
         assert f"{suffix}'" in MODULE or suffix == ""
     menu = json.loads(MENU_PATH.read_text())
-    network = next(item for item in menu["items"] if item["id"] == "network-config")
-    item = next(item for item in network["children"] if item["id"] == "gateway-shadow")
+    system = next(item for item in menu["items"] if item["id"] == "system")
+    item = next(item for item in system["children"] if item["id"] == "system-high-availability")
     assert item["module"] == "native/gateway-shadow.js"
     assert item["style"] == "/static/css/gateway-shadow.css"
+    assert item["label"] == "高可用性"
+    assert item["path"] == "/app/#/system/high-availability"
+    network = next(item for item in menu["items"] if item["id"] == "network-config")
+    assert not [child for child in network["children"] if child["id"] == "gateway-shadow"]
 
 
 def test_writes_fail_closed_on_capability_owner_and_preflight() -> None:
@@ -63,6 +67,18 @@ def test_design_system_and_responsive_contract() -> None:
     assert "@media (prefers-reduced-motion: reduce)" in STYLE
     assert "backdrop-filter" not in STYLE
     assert "letter-spacing: 0" in STYLE
+
+
+def test_glass_material_matches_shared_page_surface() -> None:
+    # design.md: wallpaper-facing panels must consume the shared kit glass material
+    # and must not paint a competing background locally.
+    assert MODULE.count("dwrt-kit-glass-surface") >= 6
+    for panel in ("shadow-surface", "shadow-operation-bar", "shadow-preflight", "shadow-availability", "shadow-risk"):
+        marker = f'class="{panel}'
+        index = MODULE.index(marker)
+        assert "dwrt-kit-glass-surface" in MODULE[index:index + 200], panel
+    assert "shadow-risk { border" in STYLE
+    assert "background: color-mix(in srgb, var(--color-warning" not in STYLE
 
 
 def test_gzip_assets_match_sources() -> None:

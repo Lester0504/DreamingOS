@@ -105,6 +105,18 @@ export function mount(context = {}) {
     return keys.some((key) => caps?.[key] === true || caps?.[key] === 1 || String(caps?.[key]).toLowerCase() === 'true');
   }
 
+  // Distinguish "not implemented" from session, permission and backend faults so the
+  // page never reports a delivered capability as missing.
+  function unavailabilityMessage(error, subject) {
+    const status = Number(error?.status) || 0;
+    if (status === 404 || status === 405 || status === 501) return `${subject}接口未实现（HTTP ${status}）。`;
+    if (status === 401) return '会话已失效，请重新登录后查看电源计划。';
+    if (status === 403) return '当前账号没有查看电源计划的权限。';
+    if (status >= 500) return `${subject}读取失败：后端错误 HTTP ${status}。`;
+    if (status) return `${subject}读取失败：HTTP ${status}。`;
+    return `${subject}读取失败：${firstText(error?.message, '网络不可用')}。`;
+  }
+
   function normalizeCapabilities(payload = {}) {
     const caps = payload.capabilities && typeof payload.capabilities === 'object' ? payload.capabilities : {};
     return {
@@ -195,27 +207,23 @@ export function mount(context = {}) {
       state.uptime = uptime;
       state.uptimeMeasuredAt = performance.now();
     }
-    const basicPayload = basicResult.status === 'fulfilled' ? basicResult.value : {};
-    const basicCaps = basicPayload.capabilities && typeof basicPayload.capabilities === 'object' ? basicPayload.capabilities : {};
-    const powerAdvertised = boolCapability(basicCaps, 'system_power_read', 'system_power', 'power_management');
-    if (powerAdvertised) {
-      try {
-        const powerPayload = await requestJson(ENDPOINTS.power);
-        if (!state.mounted || seq !== state.seq) return;
-        applyPowerPayload(powerPayload);
-      } catch (_) {
-        state.capabilities = emptyCapabilities();
-        state.schedulesKnown = false;
-        state.schedules = [];
-        state.error = '电源计划能力已声明，但接口当前不可用。';
-      }
-    } else {
+    // `/api/v1/system/power` owns the authoritative power capabilities and the
+    // `schedules` array, so it is requested unconditionally. Gating it behind the
+    // `system/basic` auth-state capabilities used to hide a delivered feature
+    // whenever that batch was absent.
+    let powerReachable = false;
+    try {
+      const powerPayload = await requestJson(ENDPOINTS.power);
+      if (!state.mounted || seq !== state.seq) return;
+      applyPowerPayload(powerPayload);
+      powerReachable = true;
+    } catch (error) {
       state.capabilities = emptyCapabilities();
       state.schedulesKnown = false;
       state.schedules = [];
-      state.error = '电源计划接口尚未接入；当前仅显示真实运行时间。';
+      state.error = unavailabilityMessage(error, '电源计划');
     }
-    if (fallbackPayloads.length === 0) state.error = '系统状态与电源计划接口均不可用。';
+    if (!powerReachable && fallbackPayloads.length === 0) state.error = '系统状态与电源计划接口均不可用。';
     state.loading = false;
     state.refreshing = false;
     render();
@@ -270,8 +278,8 @@ export function mount(context = {}) {
     const next = nextSchedule();
     const cards = [
       { key: 'uptime', label: '运行时间', value: formatUptime(currentUptime()), detail: state.uptime === null ? '等待系统状态接口' : '自本次系统启动', tone: 'info', icon: icon('clock') },
-      { key: 'schedule-count', label: '计划条数', value: state.schedulesKnown ? String(state.schedules.length) : '--', detail: state.schedulesKnown ? `${state.schedules.filter((item) => item.enabled).length} 条已启用` : '等待电源计划接口', tone: 'ok', icon: icon('list') },
-      { key: 'next-run', label: '下次执行', value: next ? formatDateTime(next.nextRun) : '--', detail: next ? `${eventLabel(next.event)} · ${next.name}` : state.schedulesKnown ? '暂无待执行计划' : '等待电源计划接口', tone: 'warn', icon: icon('calendar') }
+      { key: 'schedule-count', label: '计划条数', value: state.schedulesKnown ? String(state.schedules.length) : '--', detail: state.schedulesKnown ? `${state.schedules.filter((item) => item.enabled).length} 条已启用` : firstText(state.error, '电源计划读取失败'), tone: 'ok', icon: icon('list') },
+      { key: 'next-run', label: '下次执行', value: next ? formatDateTime(next.nextRun) : '--', detail: next ? `${eventLabel(next.event)} · ${next.name}` : state.schedulesKnown ? '暂无待执行计划' : firstText(state.error, '电源计划读取失败'), tone: 'warn', icon: icon('calendar') }
     ];
     return typeof renderer === 'function'
       ? renderer(cards, { label: '电源状态概览', className: 'system-power-summary' })
@@ -327,7 +335,7 @@ export function mount(context = {}) {
   function schedulesMarkup() {
     let body = '';
     if (state.loading) body = '<tr><td colspan="9" class="dwrt-kit-table-empty">正在读取电源计划</td></tr>';
-    else if (!state.schedulesKnown) body = '<tr><td colspan="9" class="dwrt-kit-table-empty">后端尚未提供结构化电源计划接口</td></tr>';
+    else if (!state.schedulesKnown) body = `<tr><td colspan="9" class="dwrt-kit-table-empty">${escapeHtml(firstText(state.error, '电源计划读取失败'))}</td></tr>`;
     else if (!state.schedules.length) body = '<tr><td colspan="9" class="dwrt-kit-table-empty">暂无关机或重启计划</td></tr>';
     else body = state.schedules.map(scheduleRow).join('');
     return `<main class="system-power-schedules"><section class="system-power-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>重启计划</strong></div><span class="dwrt-kit-table-count">${state.schedulesKnown ? `${state.schedules.length} 条` : '--'}</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table system-power-table"><thead><tr><th class="system-power-check-cell"><input type="checkbox" aria-label="全选计划"></th><th>名称</th><th>计划事件</th><th>周期</th><th>日期</th><th>时间</th><th>备注</th><th>状态</th><th>操作</th></tr></thead><tbody>${body}</tbody></table></div></section></main>`;

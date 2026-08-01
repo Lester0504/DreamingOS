@@ -4829,8 +4829,11 @@ struct json_object *ac_db_aps_list_json(int64_t observed_at,
                                json_object_new_string(reported ? reported : ""));
         json_object_object_add(item, "model_override",
                                json_object_new_string(override ? override : ""));
+        /* True now that ac_db_ap_update() provides a write path. The override
+         * is controller-side inventory metadata, so it does not depend on the
+         * transactional apply work that gates the AP-facing capabilities. */
         json_object_object_add(item, "override_supported",
-                               json_object_new_boolean(0));
+                               json_object_new_boolean(1));
         json_object_object_add(item, "model", json_object_new_string(
             override && override[0] ? override : (reported ? reported : "")));
         json_object_object_add(item, "board_name", json_object_new_string(
@@ -5224,6 +5227,86 @@ int ac_db_pairing_token_list(ac_pairing_token_visit_fn visit, void *opaque)
     }
     sqlite3_finalize(st);
     return rows;
+}
+
+/*
+ * Operator-supplied AP label. Rejects control characters and enforces a length
+ * bound; the value is inventory metadata only and is never handed to a shell or
+ * pushed to the AP.
+ */
+int ac_db_ap_label_valid(const char *value)
+{
+    size_t len;
+
+    if (!value)
+        return 0;
+    len = strlen(value);
+    if (len > 64)
+        return 0;
+    for (; *value; value++)
+        if ((unsigned char)*value < 0x20 || (unsigned char)*value == 0x7f)
+            return 0;
+    return 1;
+}
+
+/*
+ * Updates the mutable inventory fields of an adopted AP. Both fields live only
+ * in the controller database: renaming does not require a session with the AP,
+ * which is why this is available while the transactional apply capabilities
+ * remain closed. Passing NULL leaves a field untouched.
+ *
+ * Returns 0 on success, AC_AP_UPDATE_INVALID for a rejected argument,
+ * AC_AP_UPDATE_NOT_FOUND when no adopted AP carries that ap_id, and
+ * AC_AP_UPDATE_DB_ERROR for a store failure, so the caller can map each to a
+ * distinct HTTP status instead of one opaque 400.
+ */
+int ac_db_ap_update(const char *ap_id, const char *name,
+                    const char *model_override)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = AC_AP_UPDATE_DB_ERROR;
+
+    if (!g_ac_db || !ac_uuid_valid(ap_id))
+        return AC_AP_UPDATE_INVALID;
+    if (!name && !model_override)
+        return AC_AP_UPDATE_INVALID;
+    if (name && !ac_db_ap_label_valid(name))
+        return AC_AP_UPDATE_INVALID;
+    if (model_override && !ac_db_ap_label_valid(model_override))
+        return AC_AP_UPDATE_INVALID;
+    if (ac_exec("BEGIN IMMEDIATE") != 0)
+        return AC_AP_UPDATE_DB_ERROR;
+    if (sqlite3_prepare_v2(g_ac_db,
+            "UPDATE ac_aps SET "
+            "name=CASE WHEN ?2 IS NULL THEN name ELSE ?2 END,"
+            "model_override=CASE WHEN ?3 IS NULL THEN model_override ELSE ?3 END "
+            "WHERE ap_id=?1 AND adoption_state='adopted'",
+            -1, &st, NULL) != SQLITE_OK)
+        goto done;
+    sqlite3_bind_text(st, 1, ap_id, -1, SQLITE_TRANSIENT);
+    if (name)
+        sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(st, 2);
+    if (model_override)
+        sqlite3_bind_text(st, 3, model_override, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(st, 3);
+    if (sqlite3_step(st) != SQLITE_DONE)
+        goto done;
+    /* SQLite counts rows matched by the UPDATE, not rows whose stored value
+     * differed, so a rename to the identical name still reports one change.
+     * Zero changes therefore means no adopted AP carries this ap_id. */
+    if (sqlite3_changes(g_ac_db) != 1) {
+        rc = AC_AP_UPDATE_NOT_FOUND;
+        goto done;
+    }
+    rc = 0;
+done:
+    if (st)
+        sqlite3_finalize(st);
+    ac_exec(rc == 0 ? "COMMIT" : "ROLLBACK");
+    return rc;
 }
 
 int ac_db_pairing_token_revoke(const char *token_id)

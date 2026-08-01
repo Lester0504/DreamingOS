@@ -1,4 +1,4 @@
-const VERSION = '20260730-upnp-dhcp-unify-05';
+const VERSION = '20260801-upnp-overview-cards-02';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -280,7 +280,8 @@ export function mount(context = {}) {
       activity: 'activity',
       clock: 'clock',
       lockKeyhole: 'lock-keyhole',
-      network: 'chart-network'
+      network: 'chart-network',
+      ethernetPort: 'ethernet-port'
     }[name] || name;
     const rendered = typeof ui.lucideIcon === 'function' ? ui.lucideIcon(lucideName, { size, strokeWidth: 1.8 }) : '';
     if (rendered) return rendered;
@@ -295,7 +296,8 @@ export function mount(context = {}) {
       activity: '<path d="M3 12h4l2-6 4 12 2-6h6"></path>',
       clock: '<circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path>',
       lockKeyhole: '<circle cx="12" cy="16" r="1"></circle><rect x="5" y="10" width="14" height="11" rx="2"></rect><path d="M8 10V7a4 4 0 0 1 8 0v3"></path>',
-      network: '<rect x="4" y="4" width="6" height="6" rx="1"></rect><rect x="14" y="14" width="6" height="6" rx="1"></rect><path d="M7 10v4a3 3 0 0 0 3 3h4"></path>'
+      network: '<rect x="4" y="4" width="6" height="6" rx="1"></rect><rect x="14" y="14" width="6" height="6" rx="1"></rect><path d="M7 10v4a3 3 0 0 0 3 3h4"></path>',
+      ethernetPort: '<rect x="3" y="8" width="18" height="12" rx="2"></rect><path d="M7 8V4h10v4"></path><path d="M8 12v3m4-3v3m4-3v3"></path>'
     };
     return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.network}</svg>`;
   }
@@ -322,7 +324,7 @@ export function mount(context = {}) {
   }
 
   function searchMarkup(placeholder) {
-    return `<label class="policy-search policy-search-main upnp-search" data-dwrt-component="expand-search" data-dwrt-expand-search="true"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-upnp-search value="${escapeHtml(state.query)}" placeholder="${escapeHtml(placeholder)}"></label>`;
+    return `<label class="policy-search policy-search-main upnp-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-upnp-search value="${escapeHtml(state.query)}" placeholder="${escapeHtml(placeholder)}"></label>`;
   }
 
   function canCreateCurrent() {
@@ -342,7 +344,7 @@ export function mount(context = {}) {
     const messages = [state.error, state.mappingsError, state.notice].filter(Boolean);
     if (!messages.length) return '';
     const tone = state.error || state.noticeTone === 'bad' ? 'is-error' : state.mappingsError ? 'is-warning' : 'is-success';
-    return `<div class="upnp-notice ${tone}" role="status">${messages.map((message) => `<span>${escapeHtml(message)}</span>`).join('')}</div>`;
+    return `<div class="upnp-notice ${tone}" role="status" data-adaptive-sample>${messages.map((message) => `<span>${escapeHtml(message)}</span>`).join('')}</div>`;
   }
 
   function switchControl(field, checked, options = {}) {
@@ -362,15 +364,15 @@ export function mount(context = {}) {
     const disabled = options.disabled === true;
     const type = options.type || 'text';
     const unit = options.unit ? `<span class="upnp-field-unit">${escapeHtml(options.unit)}</span>` : '';
-    return `<label class="upnp-field ${options.wide ? 'is-wide' : ''} ${disabled ? 'is-disabled' : ''}"><span class="upnp-field-label">${escapeHtml(label)}${disabled ? '<em>只读</em>' : ''}</span><span class="upnp-field-control"><input type="${type}" data-upnp-field="${escapeHtml(field)}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(options.placeholder || '')}" ${options.min !== undefined ? `min="${options.min}"` : ''} ${options.max !== undefined ? `max="${options.max}"` : ''} ${disabled ? 'disabled' : ''}>${unit}</span>${options.help ? `<small>${escapeHtml(options.help)}</small>` : ''}</label>`;
+    return `<label class="upnp-field ${options.wide ? 'is-wide' : ''} ${disabled ? 'is-disabled' : ''}" data-dwrt-component="field"><span class="upnp-field-label" data-dwrt-field-label>${escapeHtml(label)}${disabled ? '<em>只读</em>' : ''}</span><span class="upnp-field-control"><input type="${type}" data-upnp-field="${escapeHtml(field)}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(options.placeholder || '')}" ${options.min !== undefined ? `min="${options.min}"` : ''} ${options.max !== undefined ? `max="${options.max}"` : ''} ${disabled ? 'disabled' : ''}>${unit}</span>${options.help ? `<small data-dwrt-field-description>${escapeHtml(options.help)}</small>` : ''}</label>`;
   }
 
   function editorField(label, field, value, options = {}) {
     const disabled = options.disabled === true;
     if (options.type === 'select') {
-      return `<label class="upnp-field ${options.wide ? 'is-wide' : ''}"><span class="upnp-field-label">${escapeHtml(label)}</span><select data-upnp-editor-field="${escapeHtml(field)}" ${disabled ? 'disabled' : ''}>${options.options.map(([key, text]) => `<option value="${escapeHtml(key)}" ${String(value) === String(key) ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></label>`;
+      return `<label class="upnp-field ${options.wide ? 'is-wide' : ''}" data-dwrt-component="field"><span class="upnp-field-label" data-dwrt-field-label>${escapeHtml(label)}</span><select class="dwrt-kit-select" data-dwrt-component="select" data-upnp-editor-field="${escapeHtml(field)}" ${disabled ? 'disabled' : ''}>${options.options.map(([key, text]) => `<option value="${escapeHtml(key)}" ${String(value) === String(key) ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></label>`;
     }
-    return `<label class="upnp-field ${options.wide ? 'is-wide' : ''}"><span class="upnp-field-label">${escapeHtml(label)}</span><input type="${options.type || 'text'}" data-upnp-editor-field="${escapeHtml(field)}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(options.placeholder || '')}" ${options.min !== undefined ? `min="${options.min}"` : ''} ${options.max !== undefined ? `max="${options.max}"` : ''} ${disabled ? 'disabled' : ''}></label>`;
+    return `<label class="upnp-field ${options.wide ? 'is-wide' : ''}" data-dwrt-component="field"><span class="upnp-field-label" data-dwrt-field-label>${escapeHtml(label)}</span><input type="${options.type || 'text'}" data-upnp-editor-field="${escapeHtml(field)}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(options.placeholder || '')}" ${options.min !== undefined ? `min="${options.min}"` : ''} ${options.max !== undefined ? `max="${options.max}"` : ''} ${disabled ? 'disabled' : ''}></label>`;
   }
 
   function capabilityDetails(items) {
@@ -419,11 +421,9 @@ export function mount(context = {}) {
       { capability: 'stun_host', label: 'STUN 地址', reason: 'STUN 参数写入能力尚未开放。' },
       { capability: 'stun_port', label: 'STUN 端口', reason: 'STUN 参数写入能力尚未开放。' }
     ])}`;
-    const stats = state.draft.stats || {};
-    return `<section class="upnp-settings-surface dwrt-kit-glass-surface" data-dwrt-component="surface">
-      <header class="upnp-settings-head"><div><span class="upnp-settings-icon">${icon('router', 22)}</span><span><strong>UPnP 服务</strong><small>${escapeHtml(state.draft.external_iface || '未指定外网接口')} · ${state.draft.internal_ifaces.length ? escapeHtml(state.draft.internal_ifaces.join('、')) : '未指定内网接口'}</small></span></div><div>${statusBadge(state.draft.enabled ? '运行中' : '已关闭', state.draft.enabled ? 'success' : 'muted')}<span class="upnp-active-count">${Math.max(firstNumber(stats.active_mappings), state.dynamicMappings.length)} 个动态映射</span></div></header>
+    return `<section class="upnp-settings-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass" data-adaptive-sample>
+      <header class="upnp-settings-head"><div><span class="upnp-settings-icon">${icon('router', 22)}</span><span><strong>UPnP 服务</strong><small>${escapeHtml(state.draft.external_iface || '未指定外网接口')} · ${state.draft.internal_ifaces.length ? escapeHtml(state.draft.internal_ifaces.join('、')) : '未指定内网接口'}</small></span></div><div>${statusBadge(state.draft.enabled ? '运行中' : '已关闭', state.draft.enabled ? 'success' : 'muted')}</div></header>
       <div class="upnp-service-primary" data-upnp-control="enabled"><span><strong>启用 UPnP IGD</strong><small>允许受信任终端动态申请端口映射</small></span>${switchControl('enabled', state.draft.enabled, { disabled: !writable, label: '启用 UPnP IGD' })}</div>
-      <dl class="upnp-runtime-summary" aria-label="UPnP 运行状态"><div><dt>当前映射</dt><dd>${Math.max(firstNumber(stats.active_mappings), state.dynamicMappings.length)}</dd></div><div><dt>今日请求</dt><dd>${firstNumber(stats.requests_today).toLocaleString()}</dd></div><div><dt>今日拒绝</dt><dd>${firstNumber(stats.denied_today).toLocaleString()}</dd></div><div><dt>安全模式</dt><dd>${state.draft.secure_mode ? '已启用' : '已关闭'}</dd></div></dl>
       <div class="upnp-setting-groups">
         ${settingGroup('protocol', '01', '协议与安全', '控制端口映射协议与跨主机保护', '5 项', protocolBody)}
         ${settingGroup('boundary', '02', '网络边界与端口范围', '指定外网、内网、端口边界与链路带宽', '6 项', boundaryBody)}
@@ -432,8 +432,25 @@ export function mount(context = {}) {
     </section>${dirtyBarMarkup()}`;
   }
 
+  // Runtime status reads as a row of shared overview cards above the workbench, the
+  // same shape DHCP and DNS use, so the numbers are scannable before the settings.
+  function overviewMarkup() {
+    const renderer = ui.overviewCardsMarkup || window.DWRT_UI_KIT?.overviewCardsMarkup;
+    if (typeof renderer !== 'function') return '';
+    const stats = state.draft.stats || {};
+    const activeMappings = Math.max(firstNumber(stats.active_mappings), state.dynamicMappings.length);
+    const denied = firstNumber(stats.denied_today);
+    const interfaces = state.draft.internal_ifaces.length ? state.draft.internal_ifaces.join('、') : '未指定内网接口';
+    return renderer([
+      { key: 'service', label: 'UPnP IGD', value: state.draft.enabled ? '运行中' : '已关闭', detail: state.draft.external_iface || '未指定外网接口', tone: state.draft.enabled ? 'ok' : 'warn', icon: icon('router', 22) },
+      { key: 'mappings', label: '当前映射', value: String(activeMappings), detail: `${state.staticMappings.length} 条静态映射`, tone: 'info', icon: icon('network', 22) },
+      { key: 'requests', label: '今日请求', value: firstNumber(stats.requests_today).toLocaleString(), detail: `${denied.toLocaleString()} 次拒绝`, tone: denied ? 'warn' : 'neutral', icon: icon('activity', 22) },
+      { key: 'security', label: '安全模式', value: state.draft.secure_mode ? '已启用' : '已关闭', detail: state.draft.natpmp_enabled ? 'NAT-PMP 已启用' : '仅 UPnP IGD', tone: state.draft.secure_mode ? 'ok' : 'warn', icon: icon('shieldCheck', 22) },
+      { key: 'boundary', label: '内网接口', value: String(state.draft.internal_ifaces.length || 0), detail: interfaces, tone: 'neutral', icon: icon('ethernetPort', 22) }
+    ], { className: 'upnp-overview', label: 'UPnP 运行状态' });
+  }
   function tableShell(title, meta, headings, rows, empty, count = rows.length) {
-    return `<section class="dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface upnp-table-card" data-dwrt-component="data-table"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(meta)}</span></div><span class="dwrt-kit-table-count">${count} 条</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table upnp-table"><thead><tr>${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody data-upnp-table-body>${state.loading ? `<tr><td colspan="${headings.length}" class="dwrt-kit-table-empty">正在读取配置</td></tr>` : rows.length ? rows.join('') : `<tr><td colspan="${headings.length}" class="dwrt-kit-table-empty">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
+    return `<section class="dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap upnp-table-card" data-dwrt-component="data-table" data-dwrt-surface="dense-surface" data-adaptive-sample><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(meta)}</span></div><span class="dwrt-kit-table-count">${count} 条</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table upnp-table"><thead><tr>${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody data-upnp-table-body>${state.loading ? `<tr><td colspan="${headings.length}" class="dwrt-kit-table-empty">正在读取配置</td></tr>` : rows.length ? rows.join('') : `<tr><td colspan="${headings.length}" class="dwrt-kit-table-empty">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
   }
 
   function aclMarkup() {
@@ -465,7 +482,7 @@ export function mount(context = {}) {
   }
 
   function capabilityBanner(text) {
-    return `<div class="upnp-capability-banner">${icon('lockKeyhole', 18)}<span><strong>能力受限</strong><small>${escapeHtml(text)}</small></span></div>`;
+    return `<div class="upnp-capability-banner" data-adaptive-sample>${icon('lockKeyhole', 18)}<span><strong>能力受限</strong><small>${escapeHtml(text)}</small></span></div>`;
   }
 
   function dirtyBarMarkup() {
@@ -521,8 +538,9 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'upnp-service-route-host');
-    root.innerHTML = `<section class="upnp-service-shell" data-upnp-version="${VERSION}">${toolbarMarkup()}<main class="upnp-service-workbench">${noticeMarkup()}${renderContent()}</main>${aclDrawer()}${mappingDrawer()}${deleteConfirmationMarkup()}</section>`;
+    root.innerHTML = `<section class="upnp-service-shell" data-upnp-version="${VERSION}">${toolbarMarkup()}${overviewMarkup()}<main class="upnp-service-workbench">${noticeMarkup()}${renderContent()}</main>${aclDrawer()}${mappingDrawer()}${deleteConfirmationMarkup()}</section>`;
     ui.mountAll?.(root);
+    ui.scheduleAdaptiveForegroundSample?.(20, root);
   }
 
   function readPath(object, path) {
@@ -569,6 +587,7 @@ export function mount(context = {}) {
     const nextScroll = nextCard.querySelector('.dwrt-kit-table-scroll');
     if (nextScroll) { nextScroll.scrollTop = top; nextScroll.scrollLeft = left; }
     ui.mountAll?.(nextCard);
+    ui.scheduleAdaptiveForegroundSample?.(20, nextCard);
   }
 
   function resetDraft() {
@@ -820,6 +839,7 @@ export function mount(context = {}) {
         const next = template.content.querySelector('#upnp-group-runtime');
         if (next) body.replaceWith(next);
         ui.mountAll?.(root.querySelector('#upnp-group-runtime'));
+        ui.scheduleAdaptiveForegroundSample?.(20, root.querySelector('#upnp-group-runtime'));
       }
     }
     patchSavebar();

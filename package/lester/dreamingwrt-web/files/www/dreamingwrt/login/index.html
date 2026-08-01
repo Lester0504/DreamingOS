@@ -474,50 +474,29 @@
       function applyLiquidGlass(data) {
         const material = data && data.material_glass && typeof data.material_glass === 'object'
           ? data.material_glass
-          : null;
-        const source = data && data.liquid_glass ? { ...data, ...data.liquid_glass } : data;
-        const rawOpacity = numberFromTheme(source, ['login_glass_opacity', 'glass_opacity'], LIQUID_GLASS.opacity);
-        const legacyBlur = numberFromTheme(source, ['login_glass_blur', 'glass_blur', 'blur_radius'], 6);
-        const legacyRefraction = numberFromTheme(source, ['login_glass_refraction_offset', 'refraction_offset'], 120);
-        const legacyDispersion = numberFromTheme(source, ['login_glass_dispersion', 'dispersion'], 0);
+          : {};
         const vars = {
-          cornerRadius: numberFromTheme(source, ['login_glass_corner_radius', 'glass_corner_radius', 'corner_radius'], LIQUID_GLASS.cornerRadius),
-          mode: material?.mode || LIQUID_GLASS.mode || 'shader',
-          displacementScale: material
-            ? Math.max(0, Math.min(180, Number(material.displacement_scale ?? LIQUID_GLASS.displacementScale)))
-            : Math.max(0, Math.min(180, legacyRefraction * (80 / 120))),
-          baseBlur: material
-            ? Math.max(0, Math.min(16, Number(material.base_blur ?? LIQUID_GLASS.baseBlur)))
-            : Math.max(2.4, Math.min(6, 3.2 + (legacyBlur - 6) * 0.08)),
+          cornerRadius: LIQUID_GLASS.cornerRadius,
+          mode: material.mode || LIQUID_GLASS.mode || 'shader',
+          displacementScale: Math.max(0, Math.min(180, Number(material.displacement_scale ?? LIQUID_GLASS.displacementScale))),
+          baseBlur: Math.max(0, Math.min(16, Number(material.base_blur ?? LIQUID_GLASS.baseBlur))),
           blurAmount: 0,
-          saturation: material
-            ? Math.max(70, Math.min(220, Number(material.saturation ?? LIQUID_GLASS.saturation)))
-            : LIQUID_GLASS.saturation,
-          aberrationIntensity: material
-            ? Math.max(0, Math.min(8, Number(material.aberration_intensity ?? LIQUID_GLASS.aberrationIntensity)))
-            : Math.max(0, Math.min(8, 2 + legacyDispersion)),
-          neutralDensity: material
-            ? Math.max(0.025, Math.min(0.18, Number(material.neutral_density ?? LIQUID_GLASS.neutralDensity)))
-            : materialDensityFromLegacyOpacity(rawOpacity),
-          neutralColor: material?.neutral_color || LIQUID_GLASS.neutralColor,
-          preserveCenter: material ? material.preserve_center !== false : true,
-          borderWidth: material
-            ? Math.max(0, Math.min(2, Number(material.border_width ?? LIQUID_GLASS.borderWidth)))
-            : numberFromTheme(source, ['login_glass_border_width', 'border_width'], LIQUID_GLASS.borderWidth),
-          opacity: Math.max(0, Math.min(1, rawOpacity)),
-          highlight: material
-            ? Math.max(0, Math.min(0.65, Number(material.highlight ?? LIQUID_GLASS.highlight)))
-            : numberFromTheme(source, ['login_glass_highlight', 'highlight_strength'], LIQUID_GLASS.highlight),
-          highlightAngle: material
-            ? Math.max(0, Math.min(360, Number(material.highlight_angle ?? 135)))
-            : 135,
-          borderColor: androidColorToCss(material?.border_color || stringFromTheme(source, ['login_glass_border_color', 'border_color'], LIQUID_GLASS.borderColor))
+          saturation: Math.max(70, Math.min(220, Number(material.saturation ?? LIQUID_GLASS.saturation))),
+          aberrationIntensity: Math.max(0, Math.min(8, Number(material.aberration_intensity ?? LIQUID_GLASS.aberrationIntensity))),
+          neutralDensity: Math.max(0.025, Math.min(0.18, Number(material.neutral_density ?? LIQUID_GLASS.neutralDensity))),
+          neutralColor: material.neutral_color || LIQUID_GLASS.neutralColor,
+          preserveCenter: material.preserve_center !== false,
+          borderWidth: Math.max(0, Math.min(2, Number(material.border_width ?? LIQUID_GLASS.borderWidth))),
+          opacity: LIQUID_GLASS.opacity,
+          highlight: Math.max(0, Math.min(0.65, Number(material.highlight ?? LIQUID_GLASS.highlight))),
+          highlightAngle: Math.max(0, Math.min(360, Number(material.highlight_angle ?? 135))),
+          borderColor: androidColorToCss(material.border_color || LIQUID_GLASS.borderColor)
         };
         document.documentElement.style.setProperty('--lg-corner-radius', `${vars.cornerRadius}px`);
-        document.documentElement.style.setProperty('--lg-blur-radius', `${legacyBlur}px`);
-        document.documentElement.style.setProperty('--lg-refraction-offset', `${legacyRefraction}px`);
-        document.documentElement.style.setProperty('--lg-refraction-height', `${numberFromTheme(source, ['login_glass_refraction_height', 'refraction_height'], 12)}px`);
-        document.documentElement.style.setProperty('--lg-dispersion', `${legacyDispersion}`);
+        document.documentElement.style.setProperty('--lg-blur-radius', `${vars.baseBlur}px`);
+        document.documentElement.style.setProperty('--lg-refraction-offset', `${vars.displacementScale}px`);
+        document.documentElement.style.setProperty('--lg-refraction-height', '12px');
+        document.documentElement.style.setProperty('--lg-dispersion', `${vars.aberrationIntensity}`);
         document.documentElement.style.setProperty('--lg-border-width', `${vars.borderWidth}px`);
         document.documentElement.style.setProperty('--lg-glass-opacity', `${vars.opacity}`);
         document.documentElement.style.setProperty('--dwrt-glass-base-blur', `${vars.baseBlur}px`);
@@ -532,10 +511,8 @@
 
       async function initTheme() {
         try {
-          const { body } = await getJson('/api/v1/bootstrap?appearance=1');
-          const bootstrap = body && body.data ? body.data : body;
-          const appearance = bootstrap && bootstrap.appearance && typeof bootstrap.appearance === 'object' ? bootstrap.appearance : null;
-          const data = appearance && appearance.login && typeof appearance.login === 'object' ? appearance.login : appearance;
+          const { body } = await getJson('/api/v1/public/appearance');
+          const data = body && body.data ? body.data : body;
           if (!data) return;
           window.DWRTShellPrewarm?.writeThemeSnapshot(data);
           applyLiquidGlass(data);

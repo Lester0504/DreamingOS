@@ -1380,6 +1380,203 @@ void webd_wifi_merge_station_events_capability(
                         "/api/v1/wifi/connectivity/events");
 }
 
+/* Lower-cases a MAC and drops separators so the two inventories can be
+ * compared regardless of how each side formats the address. Returns 0 when the
+ * result is not a 12-hex-digit address, which keeps malformed values from
+ * matching each other by accident. */
+static int wifi_mac_key(const char *mac, char *out, size_t out_len)
+{
+    size_t n = 0;
+
+    if (!mac || !out || out_len < 13)
+        return 0;
+    for (; *mac; mac++) {
+        unsigned char c = (unsigned char)*mac;
+
+        if (c == ':' || c == '-' || c == '.')
+            continue;
+        if (c >= '0' && c <= '9')
+            ;
+        else if (c >= 'a' && c <= 'f')
+            ;
+        else if (c >= 'A' && c <= 'F')
+            c = (unsigned char)(c - 'A' + 'a');
+        else
+            return 0;
+        if (n >= 12)
+            return 0;
+        out[n++] = (char)c;
+    }
+    out[n] = '\0';
+    return n == 12;
+}
+
+static struct json_object *wifi_client_rows(struct json_object *clients_response)
+{
+    struct json_object *root;
+    struct json_object *rows;
+
+    if (!wifi_response_available(clients_response))
+        return NULL;
+    root = wifi_response_root(clients_response);
+    rows = wifi_child_array(root, "clients");
+    if (!rows)
+        rows = wifi_child_array(root, "devices");
+    return rows;
+}
+
+/* Picks the client row for a station MAC. Exact match only: guessing across
+ * near-miss addresses would attach one device's name and photo to another. */
+static struct json_object *wifi_client_for_mac(struct json_object *rows,
+                                               const char *station_key)
+{
+    size_t i;
+
+    for (i = 0; rows && i < json_object_array_length(rows); i++) {
+        struct json_object *row = json_object_array_get_idx(rows, i);
+        char key[16];
+
+        if (!row || !json_object_is_type(row, json_type_object))
+            continue;
+        if (!wifi_mac_key(wifi_string(row, "mac", ""), key, sizeof(key)))
+            continue;
+        if (!strcmp(key, station_key))
+            return row;
+    }
+    return NULL;
+}
+
+/*
+ * Attaches the client-inventory identity to each station so the App can list
+ * an AP's clients and jump to the device detail page without doing its own MAC
+ * matching. Only identity fields are copied; the Wi-Fi metrics already on the
+ * station are left untouched.
+ *
+ * Every station gets identity_available plus, when false, identity_reason, so a
+ * station the client inventory does not know about is visibly unresolved
+ * instead of silently carrying its MAC as a display name.
+ */
+void webd_wifi_merge_station_identity(struct json_object *data,
+                                      struct json_object *clients_response)
+{
+    struct json_object *stations = wifi_child_array(data, "stations");
+    struct json_object *rows = wifi_client_rows(clients_response);
+    const char *source_reason = rows ? "station_mac_not_in_client_inventory" :
+                                       "client_inventory_unavailable";
+    size_t i;
+
+    for (i = 0; stations && i < json_object_array_length(stations); i++) {
+        struct json_object *station = json_object_array_get_idx(stations, i);
+        struct json_object *client;
+        struct json_object *fingerprint;
+        const char *mac;
+        const char *name;
+        const char *image_url;
+        char key[16];
+
+        if (!station || !json_object_is_type(station, json_type_object))
+            continue;
+        mac = wifi_string(station, "mac", wifi_string(station, "client_mac", ""));
+        /* Publish the address the App should align on, normalized to the
+         * colon-separated lower-case form /api/v1/clients uses. */
+        if (wifi_mac_key(mac, key, sizeof(key))) {
+            char pretty[18];
+
+            snprintf(pretty, sizeof(pretty),
+                     "%c%c:%c%c:%c%c:%c%c:%c%c:%c%c",
+                     key[0], key[1], key[2], key[3], key[4], key[5],
+                     key[6], key[7], key[8], key[9], key[10], key[11]);
+            wifi_replace_string(station, "mac", pretty);
+        } else {
+            wifi_replace_null(station, "mac");
+            wifi_replace_string(station, "mac_reason", "station_mac_not_reported");
+            wifi_replace_bool(station, "identity_available", 0);
+            wifi_replace_string(station, "identity_reason",
+                                "station_mac_not_reported");
+            continue;
+        }
+        client = wifi_client_for_mac(rows, key);
+        if (!client) {
+            wifi_replace_bool(station, "identity_available", 0);
+            wifi_replace_string(station, "identity_reason", source_reason);
+            wifi_replace_null(station, "display_name");
+            wifi_replace_null(station, "hostname");
+            wifi_replace_null(station, "image_url");
+            wifi_replace_string(station, "identity_source", "unavailable");
+            continue;
+        }
+        fingerprint = wifi_child_object(client, "fingerprint");
+        name = wifi_first_nonempty(wifi_string(client, "name", ""),
+                                   wifi_string(client, "display_name", ""),
+                                   wifi_string(client, "hostname", ""));
+        image_url = wifi_string(client, "image_url", "");
+        wifi_replace_bool(station, "identity_available", 1);
+        wifi_replace_string(station, "identity_source", "client_inventory");
+        if (name[0])
+            wifi_replace_string(station, "display_name", name);
+        else {
+            wifi_replace_null(station, "display_name");
+            wifi_replace_string(station, "display_name_reason",
+                                "client_row_without_name");
+        }
+        if (wifi_string(client, "hostname", "")[0])
+            wifi_replace_string(station, "hostname",
+                                wifi_string(client, "hostname", ""));
+        else {
+            wifi_replace_null(station, "hostname");
+            wifi_replace_string(station, "hostname_reason",
+                                "client_hostname_not_reported");
+        }
+        if (image_url[0]) {
+            wifi_replace_string(station, "image_url", image_url);
+            wifi_replace_string(station, "image_source",
+                                wifi_string(client, "image_source",
+                                            "client_inventory"));
+        } else {
+            wifi_replace_null(station, "image_url");
+            wifi_replace_string(station, "image_reason",
+                                "client_image_not_resolved");
+        }
+        if (wifi_string(client, "ip", "")[0])
+            wifi_replace_string(station, "ip", wifi_string(client, "ip", ""));
+        if (fingerprint) {
+            struct json_object *out = json_object_new_object();
+            const char *device_name = wifi_string(fingerprint, "device_name", "");
+            const char *vendor = wifi_string(fingerprint, "vendor_name", "");
+            const char *device_type = wifi_string(fingerprint, "device_type", "");
+
+            if (device_name[0])
+                json_object_object_add(out, "device_name",
+                                       json_object_new_string(device_name));
+            else {
+                json_object_object_add(out, "device_name", json_object_new_null());
+                json_object_object_add(out, "device_name_reason",
+                    json_object_new_string("fingerprint_model_unresolved"));
+            }
+            if (vendor[0])
+                json_object_object_add(out, "vendor_name",
+                                       json_object_new_string(vendor));
+            if (device_type[0])
+                json_object_object_add(out, "device_type",
+                                       json_object_new_string(device_type));
+            json_object_object_del(station, "fingerprint");
+            json_object_object_add(station, "fingerprint", out);
+        } else {
+            json_object_object_del(station, "fingerprint");
+            wifi_replace_null(station, "fingerprint");
+            wifi_replace_string(station, "fingerprint_reason",
+                                "client_row_without_fingerprint");
+        }
+    }
+    if (stations) {
+        struct json_object *capabilities = wifi_ensure_object(data, "capabilities");
+
+        wifi_capability_bool(capabilities, "station_identity", rows ? 1 : 0);
+        wifi_capability_reason(capabilities, "station_identity",
+                               rows ? "available" : "client_inventory_unavailable");
+    }
+}
+
 struct json_object *webd_wifi_aggregate_data_with_resolver(
     struct json_object *local_response, struct json_object *ac_response,
     int runtime_status, webd_wifi_model_image_resolver_fn image_resolver)

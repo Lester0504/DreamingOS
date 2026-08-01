@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN" data-theme-resolved="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ipam-workbench-fixture-02</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/ip-address-management.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-control-material.css">
+  <style>
+    :root {
+      --app-page-gutter-block: 14px; --app-page-gutter-inline: 14px; --app-radius-card: 24px;
+      --app-text: rgb(239 245 252); --app-text-secondary: rgb(211 224 239); --app-text-muted: rgb(167 187 210);
+      --app-accent: rgb(46 139 255); --color-accent: var(--app-accent); --color-danger: rgb(239 86 99);
+      --color-warning: rgb(238 177 52); --color-border-subtle: rgb(255 255 255 / .12);
+      --dwrt-glass-neutral-color: 10 16 25; --dwrt-glass-neutral-density: .08; --dwrt-glass-saturation: 140%;
+      --lg-material-blur-soft: .5px; --dwrt-kit-text: var(--app-text); --dwrt-kit-muted: var(--app-text-muted);
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body.dwrt-app { display: block; color: var(--app-text); background: linear-gradient(145deg, rgb(22 55 86), rgb(35 72 61)); font-family: Lato, "PingFang SC", system-ui, sans-serif; }
+    .console-stage, #routePreview { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+  </style>
+</head>
+<body class="dwrt-app">
+  <main class="console-stage"><div id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script src="../../files/www/dreamingwrt/static/js/dwrt-data-registry.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/ip-address-management.js';
+
+    const payload = {
+      code: 2000,
+      data: {
+        ts: 1785496983,
+        selected_network: 'invalid-selected-network',
+        networks: [
+          {
+            id: 'lan', name: 'LAN', subnet: '192.168.30.1/24', gateway: '192.168.30.1',
+            dhcp_pool: '192.168.30.100-192.168.30.249', total: 254, used: 4, reserved: 1, conflicts: 1,
+            addresses: [
+              { id: 'lan-gateway', ip: '192.168.30.1', hostname: 'Gateway', type: 'gateway', source: 'interface', status: 'used', note: '网关/接口地址', last_seen: 1785496983 },
+              { id: 'lan-workstation', ip: '192.168.30.100', mac: 'bc:24:11:90:f7:ca', hostname: 'Workstation', owner: 'Lester', type: 'client', source: 'dhcp', status: 'used', note: 'DHCP lease', last_seen: 1785427079 },
+              { id: 'lan-printer', ip: '192.168.30.120', mac: '02:00:00:00:00:12', hostname: 'Printer', type: 'infrastructure', source: 'static', status: 'reserved', note: '固定打印机地址', last_seen: 1785496000 },
+              { id: 'lan-conflict', ip: '192.168.30.199', mac: '3e:64:a9:93:c5:f5', hostname: 'Unknown', type: 'unknown', source: 'arp', status: 'conflict', conflict: true, note: 'ARP/neigh', last_seen: 1785496983 }
+            ]
+          },
+          {
+            id: 'guest', name: 'Guest', subnet: '192.168.40.1/24', gateway: '192.168.40.1',
+            dhcp_pool: '192.168.40.100-192.168.40.249', total: 254, used: 1, reserved: 0, conflicts: 0,
+            addresses: [
+              { id: 'guest-phone', ip: '192.168.40.101', mac: '02:00:00:00:40:01', hostname: 'Phone', type: 'client', source: 'dhcp', status: 'used', note: '访客租约', last_seen: 1785496500 }
+            ]
+          }
+        ],
+        import_jobs: []
+      }
+    };
+
+    const root = document.getElementById('routePreview');
+    const registry = window.DWRT_DATA_REGISTRY;
+    let scenario = 'ready';
+    let controller = null;
+    let instance = null;
+    const requests = [];
+
+    function clone(value) { return structuredClone(value); }
+    function abortError() { return Object.assign(new Error('aborted'), { name: 'AbortError' }); }
+    registry.define('network.ipam', { url: '/api/v1/bulk-ip', owner: 'jmxd.ipam', ttlMs: 0 });
+    registry.fetcher = async (url, request = {}) => {
+      requests.push({ method: String(request.method || 'GET').toUpperCase(), url: String(url) });
+      if (scenario === 'loading') return new Promise((resolve, reject) => {
+        const rejectAbort = () => reject(abortError());
+        if (request.signal?.aborted) rejectAbort();
+        else request.signal?.addEventListener('abort', rejectAbort, { once: true });
+      });
+      if (scenario === 'error' || scenario === 'lkg-fail') throw Object.assign(new Error('fixture IPAM read failed'), { status: 503 });
+      return new Response(JSON.stringify(clone(payload)), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+
+    async function remount(nextScenario = 'ready') {
+      instance?.unmount?.();
+      controller?.abort();
+      registry.clear('network.ipam');
+      registry.define('network.ipam', { url: '/api/v1/bulk-ip', owner: 'jmxd.ipam', ttlMs: 0 });
+      scenario = nextScenario === 'lkg' ? 'ready' : nextScenario;
+      requests.length = 0;
+      controller = new AbortController();
+      instance = mount({
+        root, registry, signal: controller.signal,
+        ui: {
+          mountAll: node => window.DWRT_UI_KIT.mountAll(node),
+          statusBadgeMarkup: (...args) => window.DWRT_UI_KIT.statusBadgeMarkup(...args)
+        },
+        utils: { escapeHtml }
+      });
+      if (nextScenario === 'lkg') {
+        await waitFor(() => root.querySelectorAll('[data-ipam-detail]').length === 4);
+        scenario = 'lkg-fail';
+        await instance.refresh();
+      } else if (nextScenario !== 'loading') {
+        await waitFor(() => scenario === 'error'
+          ? root.textContent.includes('fixture IPAM read failed')
+          : root.querySelectorAll('[data-ipam-detail]').length === 4);
+      } else {
+        await waitFor(() => root.textContent.includes('正在读取地址'));
+      }
+      return contract();
+    }
+
+    async function waitFor(predicate) {
+      for (let index = 0; index < 120; index += 1) {
+        if (predicate()) return true;
+        await new Promise(resolve => setTimeout(resolve, 16));
+      }
+      throw new Error(`fixture timeout: ${scenario}`);
+    }
+
+    function contract() {
+      const table = root.querySelector('.ipam-table');
+      const scroller = root.querySelector('.ipam-table-scroll');
+      const workbench = root.querySelector('.ipam-workbench');
+      const toolbar = root.querySelector('.ipam-page-toolbar');
+      const firstRow = root.querySelector('.ipam-address-row');
+      const tableElement = root.querySelector('.ipam-table table');
+      return {
+        scenario,
+        selectedNetwork: root.querySelector('[data-ipam-network]')?.value || '',
+        rows: root.querySelectorAll('[data-ipam-detail]').length,
+        summaryMetrics: root.querySelectorAll('[data-ipam-summary-value]').length,
+        tableCount: root.querySelectorAll('[data-dwrt-component="data-table"]').length,
+        columnCount: root.querySelectorAll('.ipam-table thead th').length,
+        text: root.innerText,
+        pageOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+        rootOverflow: root.scrollWidth > root.clientWidth + 1,
+        tableOverflow: Boolean(scroller && scroller.scrollWidth > scroller.clientWidth + 1),
+        tableRadius: table ? getComputedStyle(table).borderRadius : '',
+        tableSurface: table ? getComputedStyle(table).backgroundImage : '',
+        workbenchBackground: workbench ? getComputedStyle(workbench).backgroundColor : '',
+        workbenchBackdrop: workbench ? getComputedStyle(workbench).backdropFilter : '',
+        toolbarHeight: toolbar ? Math.round(toolbar.getBoundingClientRect().height) : 0,
+        tableDisplay: tableElement ? getComputedStyle(tableElement).display : '',
+        headerDisplay: root.querySelector('.ipam-table thead') ? getComputedStyle(root.querySelector('.ipam-table thead')).display : '',
+        rowDisplay: firstRow ? getComputedStyle(firstRow).display : '',
+        requests: clone(requests)
+      };
+    }
+
+    window.IPAM_FIXTURE = { remount, contract, requests, scenarios: ['ready', 'loading', 'error', 'lkg'] };
+    await remount('ready');
+  </script>
+</body>
+</html>

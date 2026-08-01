@@ -107,6 +107,7 @@ export function mount(context = {}) {
   const state = {
     mounted: true,
     tab: isGlobal ? 'chat' : 'settings',
+    settingsTab: 'overview',
     drawerOpen: Boolean(initialRequest.prompt),
     historyPage: 1,
     historyPageSize: 10,
@@ -1309,7 +1310,7 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.toggle('ai-global-host', isGlobal);
     root.classList.toggle('ai-settings-route-host', !isGlobal);
-    root.innerHTML = isGlobal ? globalMarkup() : `<main class="ai-assistant-shell ai-settings-route-shell"><div class="ai-view-host">${settingsView()}</div></main>`;
+    root.innerHTML = isGlobal ? globalMarkup() : `<main class="ai-assistant-shell ai-settings-route-shell"><header class="ai-settings-route-header">${settingsTabsMarkup()}</header><div class="ai-view-host">${settingsView()}</div></main>`;
     ui.mountAll?.(root);
     bindEvents();
     if (isGlobal) bindGlobalEvents();
@@ -1716,8 +1717,8 @@ export function mount(context = {}) {
       <form class="ai-settings-card ai-page-card dwrt-kit-page-surface dwrt-kit-glass-surface" data-ai-scroll="settings">
         <div class="ai-settings-heading">
           <div>
-            <strong>LLM 接入设置</strong>
-            <span>模型提供商、凭据、生成参数与工具授权由路由器统一管理</span>
+            <strong>${escapeHtml(settingsTabLabel())}</strong>
+            <span>${escapeHtml(settingsTabDescription())}</span>
           </div>
           <label class="ai-switch" title="启用 AI">
             <input type="checkbox" data-ai-config="enabled" ${state.config.enabled ? 'checked' : ''}>
@@ -1725,7 +1726,83 @@ export function mount(context = {}) {
           </label>
         </div>
         ${state.settingsError ? `<div class="ai-inline-message error">${icon('alert')}<span>${escapeHtml(state.settingsError)}</span></div>` : ''}
-        <div class="ai-settings-section">
+        ${settingsTabContent(provider, apiBaseHelp)}
+        ${settingsFooter()}
+      </form>${oauthDisconnectConfirmation()}
+    `;
+  }
+
+  const SETTINGS_TABS = [
+    ['overview', '概览', '接入状态、当前生效模型与运行参数总览'],
+    ['provider', '供应商设置', '模型提供商、认证方式与凭据由路由器统一管理'],
+    ['advanced', '高级设置', '模型接口、生成参数与工具授权策略']
+  ];
+
+  function settingsTab() {
+    return SETTINGS_TABS.some(([id]) => id === state.settingsTab) ? state.settingsTab : 'overview';
+  }
+
+  function settingsTabLabel() {
+    return SETTINGS_TABS.find(([id]) => id === settingsTab())?.[1] || '概览';
+  }
+
+  function settingsTabDescription() {
+    return SETTINGS_TABS.find(([id]) => id === settingsTab())?.[2] || '';
+  }
+
+  function settingsTabsMarkup() {
+    const active = settingsTab();
+    return `<nav class="dwrt-kit-tabs dwrt-kit-page-tabs ai-primary-tabs ai-settings-tabs" data-dwrt-component="tabs" role="tablist" aria-label="LLM 接入设置视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${SETTINGS_TABS.map(([id, label]) => `<button class="dwrt-kit-tab ${active === id ? 'is-active' : ''}" type="button" role="tab" data-ai-settings-tab="${id}" data-value="${id}" aria-selected="${active === id ? 'true' : 'false'}">${escapeHtml(label)}</button>`).join('')}</nav>`;
+  }
+
+  function settingsTabContent(provider, apiBaseHelp) {
+    const tab = settingsTab();
+    if (tab === 'overview') return settingsOverviewSection();
+    if (tab === 'advanced') return settingsAdvancedSection(provider, apiBaseHelp);
+    return settingsProviderSection();
+  }
+
+  function settingsOverviewSection() {
+    const statusText = connectionSummaryText();
+    const authLabel = state.config.auth_mode === 'oauth' ? 'OAuth' : 'API Key';
+    const credentialText = state.config.auth_mode === 'oauth'
+      ? (oauthStatus()?.connected ? '已连接' : oauthStatus()?.pending ? '授权未完成' : '未连接')
+      : state.config.api_key_set ? '已保存' : '未配置';
+    const items = [
+      { key: 'status', label: '接入状态', value: statusText, detail: state.config.enabled ? '路由器已启用 AI 能力' : 'AI 能力当前关闭', tone: state.config.enabled && credentialReady() ? 'ok' : state.config.enabled ? 'warn' : 'neutral', icon: icon('shield') },
+      { key: 'provider', label: '模型提供商', value: oauthProviderLabel(state.config.provider), detail: `认证方式 ${authLabel} · 凭据${credentialText}`, tone: 'info', icon: icon('link') },
+      { key: 'model', label: '默认模型', value: firstText(state.config.model, '--'), detail: `最大输出 ${state.config.max_tokens} token`, tone: 'neutral', icon: icon('file') },
+      { key: 'runtime', label: '生成参数', value: `温度 ${Number(state.config.temperature).toFixed(1)}`, detail: `思考强度 ${REASONING_LABELS[state.config.reasoning_effort] || state.config.reasoning_effort || 'auto'} · ${toolPolicyLabel(state.config.tool_policy)}`, tone: 'neutral', icon: icon('key') }
+    ];
+    const cards = typeof ui.overviewCardsMarkup === 'function'
+      ? ui.overviewCardsMarkup(items, { label: 'LLM 接入概览', className: 'ai-settings-summary' })
+      : `<section class="dwrt-kit-overview-grid ai-settings-summary" aria-label="LLM 接入概览">${items.map((item) => `<article class="dwrt-kit-overview-card is-${item.tone}"><div class="dwrt-kit-overview-content"><span class="dwrt-kit-overview-label">${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong><small>${escapeHtml(item.detail)}</small></div><span class="dwrt-kit-overview-icon">${item.icon}</span></article>`).join('')}</section>`;
+    const apiBase = firstText(state.config.api_base, '使用提供商默认地址');
+    return `<div class="ai-settings-section ai-settings-overview">
+      ${cards}
+      <dl class="ai-settings-facts">
+        <div><dt>API 地址</dt><dd>${escapeHtml(apiBase)}</dd></div>
+        <div><dt>系统提示词</dt><dd>${state.config.system_prompt ? '已设置' : '未设置'}</dd></div>
+        <div><dt>工具授权策略</dt><dd>${escapeHtml(toolPolicyLabel(state.config.tool_policy))}</dd></div>
+        <div><dt>配置状态</dt><dd>${configDirty() ? '有未保存的修改' : '已与路由器同步'}</dd></div>
+      </dl>
+      <p class="ai-settings-hint">概览仅展示当前生效配置。修改提供商与凭据请前往“供应商设置”，调整模型接口与生成参数请前往“高级设置”。</p>
+    </div>`;
+  }
+
+  function toolPolicyLabel(value) {
+    return TOOL_POLICIES.find(([id]) => id === value)?.[1] || String(value || '--');
+  }
+
+  function connectionSummaryText() {
+    if (state.loading) return '读取中';
+    if (!state.config.enabled) return '未启用';
+    if (credentialReady()) return '就绪';
+    return state.config.auth_mode === 'oauth' ? 'OAuth 未连接' : '缺少 API Key';
+  }
+
+  function settingsProviderSection() {
+    return `<div class="ai-settings-section">
           <div class="ai-section-title"><strong>模型提供商</strong><span>Model provider</span></div>
           <div class="ai-provider-grid" role="radiogroup" aria-label="模型提供商">
             ${PROVIDERS.map((item) => `
@@ -1745,8 +1822,11 @@ export function mount(context = {}) {
           </div>
           ${state.oauth.available && oauthProvider() && oauthProvider()?.supported !== true ? `<div class="ai-auth-mode-hint">${icon('key')}<span>${escapeHtml(oauthReason(oauthProvider()?.reason, '当前提供商仅支持 API Key 接入。'))}</span></div>` : ''}
           ${state.config.auth_mode === 'oauth' ? oauthPanel() : `<div class="ai-settings-grid"><label class="ai-field ai-field-wide"><span>API Key</span><input type="password" autocomplete="new-password" value="${escapeHtml(state.config.api_key_input)}" placeholder="${state.config.api_key_set ? `已保存 ${state.config.api_key_hint || ''}，留空不修改` : '输入 API Key'}" data-ai-config="api_key_input"><small>${state.config.clear_api_key ? '保存后将清除已保存密钥' : state.config.api_key_set ? '密钥已保存，页面不会回显完整内容' : '密钥仅提交到路由器配置接口'}</small></label>${state.config.api_key_set ? `<button class="ai-secondary-button ai-clear-key-button" type="button" data-ai-clear-key>${state.config.clear_api_key ? '撤销清除密钥' : '清除已保存密钥'}</button>` : ''}</div>`}
-        </div>
-        <div class="ai-settings-section">
+        </div>`;
+  }
+
+  function settingsAdvancedSection(provider, apiBaseHelp) {
+    return `<div class="ai-settings-section">
           <div class="ai-section-title"><strong>模型与接口</strong><span>Model runtime</span></div>
           <div class="ai-settings-grid">
             <label class="ai-field ai-field-wide"><span>API 地址</span><input type="url" value="${escapeHtml(state.config.api_base)}" placeholder="${escapeHtml(provider.base || 'https://example.com/v1')}" data-ai-config="api_base"><small>${escapeHtml(apiBaseHelp)}</small></label>
@@ -1762,8 +1842,11 @@ export function mount(context = {}) {
             <label class="ai-field"><span>工具授权策略</span><select data-ai-config="tool_policy">${TOOL_POLICIES.map(([value, label]) => `<option value="${value}" ${state.config.tool_policy === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label>
             <label class="ai-field ai-field-wide"><span>系统提示词</span><textarea rows="4" placeholder="可选" data-ai-config="system_prompt">${escapeHtml(state.config.system_prompt)}</textarea></label>
           </div>
-        </div>
-        <div class="ai-settings-footer">
+        </div>`;
+  }
+
+  function settingsFooter() {
+    return `<div class="ai-settings-footer">
           <div class="ai-settings-status">
             ${connectionBadge()}
             <span>${state.notice ? escapeHtml(state.notice) : configDirty() ? '有未保存的修改' : '配置已同步'}</span>
@@ -1773,9 +1856,7 @@ export function mount(context = {}) {
             <button class="ai-secondary-button" type="button" data-ai-sync-models ${state.syncingModels ? 'disabled' : ''}>${state.syncingModels ? icon('loader') : icon('refresh')}${state.config.capabilities.provider_models_sync ? '同步模型' : '刷新模型列表'}</button>
             <button class="ai-primary-button" type="button" data-ai-save ${state.saving || !configDirty() ? 'disabled' : ''}>${state.saving ? icon('loader') : icon('save')}保存设置</button>
           </div>
-        </div>
-      </form>${oauthDisconnectConfirmation()}
-    `;
+        </div>`;
   }
 
   function connectionBadge() {
@@ -1826,7 +1907,21 @@ export function mount(context = {}) {
 
   function bindEvents() {
     root.querySelector('.ai-settings-card')?.addEventListener('submit', (event) => event.preventDefault());
-    root.querySelector('.ai-primary-tabs')?.addEventListener('dwrt-tab-change', (event) => {
+    const settingsTabs = root.querySelector('.ai-settings-tabs');
+    if (settingsTabs) {
+      const selectTab = (value) => {
+        if (!value || value === state.settingsTab) return;
+        if (!SETTINGS_TABS.some(([id]) => id === value)) return;
+        state.settingsTab = value;
+        state.settingsError = '';
+        render();
+      };
+      settingsTabs.addEventListener('dwrt-tab-change', (event) => selectTab(event.detail?.value));
+      settingsTabs.querySelectorAll('[data-ai-settings-tab]').forEach((button) => {
+        button.addEventListener('click', () => selectTab(button.dataset.aiSettingsTab));
+      });
+    }
+    root.querySelector('.ai-primary-tabs:not(.ai-settings-tabs)')?.addEventListener('dwrt-tab-change', (event) => {
       const value = event.detail?.value;
       if (!value || value === state.tab) return;
       setTab(value);

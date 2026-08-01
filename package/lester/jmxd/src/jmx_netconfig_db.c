@@ -16,6 +16,8 @@
 #include "jmx_signature_db.h"
 #include "jmx_system.h"
 #include "jmx_system_data_path.h"
+#include "jmx_exec.h"
+#include "jmx_mmcli_kv.h"
 
 #include <sqlite3.h>
 #include <stdio.h>
@@ -24,6 +26,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -35,11 +38,15 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <math.h>
 #include <uci.h>
 #include <openssl/evp.h>
 #include <sys/types.h>
 #include <sys/prctl.h>
+#include <sys/random.h>
+#include <sys/socket.h>
 #include <net/if.h>
 #include <libubox/blobmsg_json.h>
 #include <libubus.h>
@@ -102,6 +109,7 @@ static void nc_hybrid_row_to_json(sqlite3_stmt *st, struct json_object *o);
 static void nc_wan_merge_runtime(const char *wan_id, const char *ifname, struct json_object *wan_obj);
 static int nc_irq_affinity_path_writable(const char *path);
 static int nc_irq_affinity_any_writable(void);
+static int nc_adv_recover_pending_publish(void);
 
 static sqlite3 *g_netconfig_db = NULL;
 static char g_netconfig_db_path[256] = JMX_NETCONFIG_DB_PATH_DEFAULT;
@@ -115,6 +123,8 @@ static void nc_netctl_db_init(void);
 static void nc_wifi_db_init(void);
 
 #define NC_NETWORK_BATCH_MAX 64
+#define NC_FIREWALL_GROUP_MAX 256
+#define NC_FIREWALL_TOTAL_MAX 512
 
 int64_t nc_now_s(void) { return (int64_t)time(NULL); }
 
@@ -192,6 +202,25 @@ int nc_step_done(sqlite3_stmt *st)
         return -1;
     }
     return 0;
+}
+
+/*
+ * Transaction helpers. `BEGIN IMMEDIATE` can fail with SQLITE_BUSY when another
+ * process holds the write lock, and a bare `nc_exec("BEGIN IMMEDIATE")` silently
+ * drops that error: the following statements then run in autocommit mode, so a
+ * partial write reports success. These wrappers exist so callers cannot forget
+ * to check, and so the commit/rollback decision stays in one place.
+ */
+int nc_txn_begin(void)
+{
+    return nc_exec("BEGIN IMMEDIATE");
+}
+
+int nc_txn_end(int rc)
+{
+    if (nc_exec(rc == 0 ? "COMMIT" : "ROLLBACK") != 0 && rc == 0)
+        return -1;
+    return rc;
 }
 
 int nc_sqlite_changes(void)
@@ -1971,6 +2000,10 @@ int jmx_netconfig_db_init(void)
     int rc;
     if (g_netconfig_db) return 0;
     nc_mkdirs();
+    if (nc_adv_recover_pending_publish() != 0) {
+        LOG_ERROR("advanced routing publish recovery failed; refusing database startup\n");
+        return -1;
+    }
     rc = sqlite3_open(g_netconfig_db_path, &g_netconfig_db);
     if (rc != SQLITE_OK) {
         LOG_ERROR("open netconfig db failed: %s\n",
@@ -7651,31 +7684,79 @@ done:
  * wan_status: merged config + runtime for one or all WANs
  * ══════════════════════════════════════════════════════════════════════ */
 
+#define NC_NETWORK_STATUS_MAX (1024U * 1024U)
+
+static int nc_buffer_append(char **buf, size_t *len, size_t *cap,
+                            const void *data, size_t data_len, size_t max_len)
+{
+    size_t need;
+    size_t next;
+    char *grown;
+
+    if (!buf || !len || !cap || (!data && data_len != 0) || *len > max_len ||
+        data_len > max_len - *len)
+        return -1;
+    need = *len + data_len + 1;
+    if (need < *len || need > max_len + 1)
+        return -1;
+    if (need > *cap) {
+        next = *cap ? *cap : 4096;
+        while (next < need) {
+            if (next > (max_len + 1) / 2) {
+                next = max_len + 1;
+                break;
+            }
+            next *= 2;
+        }
+        grown = realloc(*buf, next);
+        if (!grown)
+            return -1;
+        *buf = grown;
+        *cap = next;
+    }
+    if (data_len)
+        memcpy(*buf + *len, data, data_len);
+    *len += data_len;
+    (*buf)[*len] = '\0';
+    return 0;
+}
+
+static char *nc_network_status_read(FILE *fp)
+{
+    char *buf = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+    char line[1024];
+
+    if (!fp)
+        return NULL;
+    while (fgets(line, sizeof(line), fp)) {
+        size_t line_len = strlen(line);
+        if (nc_buffer_append(&buf, &len, &cap, line, line_len,
+                             NC_NETWORK_STATUS_MAX) != 0) {
+            free(buf);
+            return NULL;
+        }
+    }
+    if (ferror(fp)) {
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
 static struct json_object *nc_network_status_json(const char *ifname)
 {
     char cmd[256];
     FILE *fp;
     char *buf = NULL;
-    size_t buf_sz = 0, buf_cap = 0;
-    char line[1024];
     struct json_object *out = NULL;
 
     if (!ifname || !ifname[0]) return NULL;
     snprintf(cmd, sizeof(cmd), "/bin/ubus call network.interface.%s status 2>/dev/null", ifname);
     fp = popen(cmd, "r");
     if (!fp) return NULL;
-    while (fgets(line, sizeof(line), fp)) {
-        size_t ll = strlen(line);
-        if (buf_sz + ll + 1 > buf_cap) {
-            char *nbuf;
-            buf_cap = buf_cap ? buf_cap * 2 : 4096;
-            nbuf = realloc(buf, buf_cap);
-            if (!nbuf) { free(buf); buf = NULL; break; }
-            buf = nbuf;
-        }
-        memcpy(buf + buf_sz, line, ll + 1);
-        buf_sz += ll;
-    }
+    buf = nc_network_status_read(fp);
     pclose(fp);
     if (buf && buf[0]) out = json_tokener_parse(buf);
     free(buf);
@@ -7761,8 +7842,6 @@ static void nc_wan_merge_runtime(const char *wan_id, const char *ifname, struct 
     char cmd[256];
     FILE *fp;
     char *buf = NULL;
-    size_t buf_sz = 0, buf_cap = 0;
-    char line[1024];
 
     if (!ifname || !ifname[0]) {
         struct json_object *rt = json_object_new_object();
@@ -7785,12 +7864,7 @@ static void nc_wan_merge_runtime(const char *wan_id, const char *ifname, struct 
         json_object_object_add(wan_obj, "runtime", rt);
         return;
     }
-    while (fgets(line, sizeof(line), fp)) {
-        size_t ll = strlen(line);
-        if (buf_sz + ll + 1 > buf_cap) { buf_cap = buf_cap ? buf_cap * 2 : 4096; buf = realloc(buf, buf_cap); }
-        memcpy(buf + buf_sz, line, ll + 1);
-        buf_sz += ll;
-    }
+    buf = nc_network_status_read(fp);
     pclose(fp);
 
     struct json_object *rt = json_object_new_object();
@@ -9179,7 +9253,9 @@ void nc_dhcp_refresh_leases(void)
     fp = fopen("/tmp/dhcp.leases", "r");
     if (!fp) fp = fopen("/var/dhcp.leases", "r");
     if (!fp) return;
-    nc_exec("BEGIN IMMEDIATE");
+    /* Cache refresh: if the write lock is held, skip this pass instead of
+     * writing every row in autocommit mode. The next refresh will retry. */
+    if (nc_txn_begin() != 0) { fclose(fp); return; }
     while (fgets(line, sizeof(line), fp)) {
         char mac[32], ip[64], host[128], clientid[128];
         long long exp = 0;
@@ -9482,7 +9558,7 @@ int jmx_dhcp_service_set(struct json_object *cfg)
     access_arr = nc_dhcp_access_list_from_payload(dhcp);
     prefix_arr = nc_dhcp_prefixes_from_payload(dhcp);
     { char err[128]; if (nc_dhcp_validate_scope(lan_id, ps, pe, arr, err, sizeof(err)) != 0 || nc_dhcp_validate_access_list(access_arr, err, sizeof(err)) != 0 || nc_dhcp_validate_prefix_reservations(lan_id, prefix_arr, err, sizeof(err)) != 0) { LOG_ERROR("dhcp_service_set validation failed: %s", err); return -2; } }
-    nc_exec("BEGIN IMMEDIATE");
+    if (nc_txn_begin() != 0) return -1;
     if (nc_prepare(&st,"INSERT INTO dhcp_scope(id,lan_id,enabled,tagname,pool_start,pool_end,exclude_pool,gateway,netmask,dns1,dns2,lease_minutes,domain,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) ON CONFLICT(id) DO UPDATE SET lan_id=excluded.lan_id,enabled=excluded.enabled,tagname=excluded.tagname,pool_start=excluded.pool_start,pool_end=excluded.pool_end,exclude_pool=excluded.exclude_pool,gateway=excluded.gateway,netmask=excluded.netmask,dns1=excluded.dns1,dns2=excluded.dns2,lease_minutes=excluded.lease_minutes,domain=excluded.domain,updated_at=excluded.updated_at") == 0) {
         sqlite3_bind_text(st,1,scope_id,-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,2,lan_id,-1,SQLITE_TRANSIENT); sqlite3_bind_int(st,3,nc_json_bool_def(dhcp,"enabled",1)); sqlite3_bind_text(st,4,nc_json_str_def(dhcp,"tagname",""),-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,5,ps,-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,6,pe,-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,7,excl,-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,8,nc_json_str_def(dhcp,"gateway",""),-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,9,nc_json_str_def(dhcp,"netmask",""),-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,10,nc_json_str_def(dhcp,"dns1",""),-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,11,nc_json_str_def(dhcp,"dns2",""),-1,SQLITE_TRANSIENT); sqlite3_bind_int(st,12,nc_json_int_def(dhcp,"lease",120)); sqlite3_bind_text(st,13,nc_json_str_def(dhcp,"domain",""),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(st,14,nc_now_s()); if(nc_step_done(st)==0)rc=0; sqlite3_finalize(st);
     }
@@ -10288,8 +10364,14 @@ static void nc_upnp_refresh_mappings(void)
     if (!fp) fp = fopen("/var/run/miniupnpd.leases", "r");
     if (!fp) fp = fopen("/tmp/miniupnpd.leases", "r");
     if (!fp) return;
-    nc_exec("BEGIN IMMEDIATE");
-    nc_exec("DELETE FROM upnp_mapping_cache");
+    /* Same as the DHCP lease refresh: without the transaction the DELETE would
+     * commit on its own and briefly empty the cache. */
+    if (nc_txn_begin() != 0) { fclose(fp); return; }
+    if (nc_exec("DELETE FROM upnp_mapping_cache") != 0) {
+        nc_txn_end(-1);
+        fclose(fp);
+        return;
+    }
     while (fgets(line, sizeof(line), fp)) {
         char proto[16] = "", int_ip[64] = "", desc[192] = "", id[96];
         int eport = 0, iport = 0, lease = 0;
@@ -12555,44 +12637,374 @@ int nc_run_quiet(const char *cmd)
     return -1;
 }
 
-static int nc_nft_guarded_apply(const char *ruleset, char *detail, size_t detail_len)
+#define NC_NETCTL_NFT_RULESET "/etc/dreamingwrt/network_control.nft"
+#define NC_NETCTL_NFT_TABLE "dreamingwrt_netctl"
+#define NC_NETCTL_EXEC_TIMEOUT_MS 10000
+#define NC_NETCTL_CAPTURE_OUTPUT_MAX (256U * 1024U)
+#define NC_NETCTL_RUNTIME_DIR "/run/dreamingwrt"
+
+static int nc_netctl_trusted_tool(const char *path)
 {
-    char bak[256];
-    if(detail && detail_len) detail[0] = 0;
-    if(!ruleset || access(ruleset, R_OK) != 0) { if(detail) snprintf(detail, detail_len, "ruleset_missing"); return -1; }
-    if(!nc_file_exists("/usr/sbin/nft") && !nc_file_exists("/sbin/nft")) { if(detail) snprintf(detail, detail_len, "nft_binary_missing"); return -2; }
-    if(nc_run_quiet("nft -c -f /etc/dreamingwrt/network_control.nft >/tmp/dw-netctl-nft-check.log 2>&1") != 0) { if(detail) snprintf(detail, detail_len, "nft_check_failed:/tmp/dw-netctl-nft-check.log"); return -3; }
-    snprintf(bak, sizeof(bak), "/tmp/dw-netctl-nft-%ld.bak", (long)getpid());
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "nft list table inet dreamingwrt_netctl >%s 2>/dev/null || true", bak);
-    nc_run_quiet(cmd);
-    nc_run_quiet("nft delete table inet dreamingwrt_netctl >/dev/null 2>&1 || true");
-    if(nc_run_quiet("nft -f /etc/dreamingwrt/network_control.nft >/tmp/dw-netctl-nft-apply.log 2>&1") != 0) {
-        if(access(bak, R_OK) == 0) { snprintf(cmd, sizeof(cmd), "nft -f %s >/dev/null 2>&1 || true", bak); nc_run_quiet(cmd); }
-        if(detail) snprintf(detail, detail_len, "nft_apply_failed_rollback_attempted:/tmp/dw-netctl-nft-apply.log");
-        unlink(bak); return -4;
-    }
-    if(nc_run_quiet("nft list table inet dreamingwrt_netctl >/tmp/dw-netctl-nft-health.log 2>&1") != 0) {
-        if(access(bak, R_OK) == 0) { snprintf(cmd, sizeof(cmd), "nft -f %s >/dev/null 2>&1 || true", bak); nc_run_quiet(cmd); }
-        if(detail) snprintf(detail, detail_len, "nft_health_failed_rollback_attempted:/tmp/dw-netctl-nft-health.log");
-        unlink(bak); return -5;
-    }
-    unlink(bak);
-    if(detail) snprintf(detail, detail_len, "nft_applied");
+    struct stat st;
+
+    return path && lstat(path, &st) == 0 && S_ISREG(st.st_mode) &&
+           st.st_uid == 0 && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
+           (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
+}
+
+static const char *nc_nft_tool_path(void)
+{
+    if (nc_netctl_trusted_tool("/usr/sbin/nft"))
+        return "/usr/sbin/nft";
+    if (nc_netctl_trusted_tool("/sbin/nft"))
+        return "/sbin/nft";
+    return NULL;
+}
+
+static int nc_netctl_exec_ok(int rc, const struct jmx_exec_result *result)
+{
+    if (rc != 0 || !result || result->timed_out || result->truncated ||
+        result->term_signal != 0 || result->exit_code != 0)
+        return -1;
     return 0;
 }
 
-static int nc_tc_guarded_apply(const char *script, char *detail, size_t detail_len)
+static int nc_nft_capture(const char *path, char *const argv[],
+                          struct jmx_exec_result *result)
 {
-    if(detail && detail_len) detail[0] = 0;
-    if(!script || access(script, R_OK) != 0) { if(detail) snprintf(detail, detail_len, "script_missing"); return -1; }
-    if(!nc_file_exists("/sbin/tc") && !nc_file_exists("/usr/sbin/tc")) { if(detail) snprintf(detail, detail_len, "tc_binary_missing"); return -2; }
-    if(!nc_file_exists("/sbin/ip") && !nc_file_exists("/usr/sbin/ip")) { if(detail) snprintf(detail, detail_len, "ip_binary_missing"); return -3; }
-    if(nc_run_quiet("sh /etc/dreamingwrt/network_control_tc.sh >/tmp/dw-netctl-tc-apply.log 2>&1") != 0) { if(detail) snprintf(detail, detail_len, "tc_apply_failed:/tmp/dw-netctl-tc-apply.log"); return -4; }
-    if(nc_run_quiet("tc qdisc show dev ifb0 >/tmp/dw-netctl-tc-health.log 2>&1") != 0) { if(detail) snprintf(detail, detail_len, "tc_health_failed:/tmp/dw-netctl-tc-health.log"); return -5; }
-    if(detail) snprintf(detail, detail_len, "tc_applied");
+    if (!path || !argv || !result)
+        return -1;
+    memset(result, 0, sizeof(*result));
+    result->exit_code = -1;
+    return jmx_exec_capture(path, argv, NC_NETCTL_CAPTURE_OUTPUT_MAX,
+                            NC_NETCTL_EXEC_TIMEOUT_MS, result);
+}
+
+static int nc_netctl_secure_backup_write(const char *data, size_t data_len,
+                                         char *path, size_t path_len)
+{
+    struct stat st;
+    int dirfd = -1;
+    int fd = -1;
+    int attempt;
+    char name[96] = {0};
+
+    if (!data || data_len == 0 || !path || path_len == 0)
+        return -1;
+    path[0] = '\0';
+    if (mkdir(NC_NETCTL_RUNTIME_DIR, 0700) != 0 && errno != EEXIST)
+        return -1;
+    dirfd = open(NC_NETCTL_RUNTIME_DIR,
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0 || fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        goto out;
+    for (attempt = 0; attempt < 32; attempt++) {
+        unsigned long long nonce = 0;
+        ssize_t off = 0;
+
+        if (getrandom(&nonce, sizeof(nonce), 0) != (ssize_t)sizeof(nonce))
+            goto out;
+        snprintf(name, sizeof(name), ".netctl-nft-%016llx", nonce);
+        fd = openat(dirfd, name,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                    0600);
+        if (fd < 0) {
+            if (errno == EEXIST)
+                continue;
+            goto out;
+        }
+        while ((size_t)off < data_len) {
+            ssize_t written = write(fd, data + off, data_len - (size_t)off);
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+                goto out;
+            off += written;
+        }
+        if (fsync(fd) != 0 || close(fd) != 0) {
+            fd = -1;
+            (void)unlinkat(dirfd, name, 0);
+            goto out;
+        }
+        fd = -1;
+        {
+            int n = snprintf(path, path_len, "%s/%s",
+                             NC_NETCTL_RUNTIME_DIR, name);
+            if (n < 0 || (size_t)n >= path_len) {
+            (void)unlinkat(dirfd, name, 0);
+            path[0] = '\0';
+            goto out;
+            }
+        }
+        close(dirfd);
+        return 0;
+    }
+
+out:
+    if (fd >= 0) {
+        close(fd);
+        if (name[0])
+            (void)unlinkat(dirfd, name, 0);
+    }
+    if (dirfd >= 0)
+        close(dirfd);
+    return -1;
+}
+
+static int nc_nft_table_capture(const char *nft,
+                                struct jmx_exec_result *result, int *present)
+{
+    char *list_argv[] = { (char *)nft, "list", "table", "inet",
+                          NC_NETCTL_NFT_TABLE, NULL };
+    char *tables_argv[] = { (char *)nft, "list", "tables", NULL };
+    int rc;
+
+    if (!nft || !result || !present)
+        return -1;
+    *present = 0;
+    rc = nc_nft_capture(nft, list_argv, result);
+    if (nc_netctl_exec_ok(rc, result) == 0) {
+        if (!result->output ||
+            !strstr(result->output, "table inet " NC_NETCTL_NFT_TABLE))
+            return -1;
+        *present = 1;
+        return 0;
+    }
+    if (rc != 0 || result->timed_out || result->truncated ||
+        result->term_signal != 0 || result->exit_code < 0)
+        return -1;
+    jmx_exec_result_free(result);
+    rc = nc_nft_capture(nft, tables_argv, result);
+    if (nc_netctl_exec_ok(rc, result) != 0 || !result->output)
+        return -1;
+    if (strstr(result->output, "table inet " NC_NETCTL_NFT_TABLE))
+        return -1;
+    *present = 0;
     return 0;
 }
+
+static int nc_nft_delete_table(const char *nft)
+{
+    struct jmx_exec_result result;
+    char *argv[] = { (char *)nft, "delete", "table", "inet",
+                     NC_NETCTL_NFT_TABLE, NULL };
+    int present = 0;
+    int rc;
+
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    if (nc_nft_table_capture(nft, &result, &present) != 0) {
+        jmx_exec_result_free(&result);
+        return -1;
+    }
+    jmx_exec_result_free(&result);
+    if (!present)
+        return 0;
+    rc = jmx_exec_wait(nft, argv, NC_NETCTL_EXEC_TIMEOUT_MS, &result);
+    if (nc_netctl_exec_ok(rc, &result) != 0) {
+        jmx_exec_result_free(&result);
+        return -1;
+    }
+    jmx_exec_result_free(&result);
+    if (nc_nft_table_capture(nft, &result, &present) != 0 || present) {
+        jmx_exec_result_free(&result);
+        return -1;
+    }
+    jmx_exec_result_free(&result);
+    return 0;
+}
+
+static int nc_nft_apply_file(const char *nft, const char *path)
+{
+    struct jmx_exec_result result;
+    char *argv[] = { (char *)nft, "-f", (char *)path, NULL };
+    int rc;
+
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    rc = jmx_exec_wait(nft, argv, NC_NETCTL_EXEC_TIMEOUT_MS, &result);
+    if (nc_netctl_exec_ok(rc, &result) != 0) {
+        jmx_exec_result_free(&result);
+        return -1;
+    }
+    jmx_exec_result_free(&result);
+    return 0;
+}
+
+static int nc_nft_readback_verify(const char *nft)
+{
+    struct jmx_exec_result result;
+    int present = 0;
+    int ok;
+
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    ok = nc_nft_table_capture(nft, &result, &present) == 0 && present &&
+         result.output && strstr(result.output, "chain input") &&
+         strstr(result.output, "chain forward_mark") &&
+         strstr(result.output, "chain forward");
+    jmx_exec_result_free(&result);
+    return ok ? 0 : -1;
+}
+
+static int nc_nft_rollback(const char *nft, int backup_present,
+                           const char *backup_path)
+{
+    struct jmx_exec_result result;
+    int present = 0;
+
+    if (nc_nft_delete_table(nft) != 0)
+        return -1;
+    if (backup_present) {
+        if (!backup_path || !backup_path[0] ||
+            nc_nft_apply_file(nft, backup_path) != 0)
+            return -1;
+        memset(&result, 0, sizeof(result));
+        result.exit_code = -1;
+        if (nc_nft_table_capture(nft, &result, &present) != 0 || !present ||
+            !result.output ||
+            !strstr(result.output, "table inet " NC_NETCTL_NFT_TABLE)) {
+            jmx_exec_result_free(&result);
+            return -1;
+        }
+        jmx_exec_result_free(&result);
+        return 0;
+    }
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    if (nc_nft_table_capture(nft, &result, &present) != 0 || present) {
+        jmx_exec_result_free(&result);
+        return -1;
+    }
+    jmx_exec_result_free(&result);
+    return 0;
+}
+
+struct nc_nft_transaction {
+    char backup_path[256];
+    int backup_present;
+    int applied;
+};
+
+static void nc_nft_transaction_finish(struct nc_nft_transaction *transaction)
+{
+    if (!transaction)
+        return;
+    if (transaction->backup_path[0])
+        unlink(transaction->backup_path);
+    memset(transaction, 0, sizeof(*transaction));
+}
+
+static int nc_nft_transaction_restore(struct nc_nft_transaction *transaction)
+{
+    const char *nft;
+
+    if (!transaction || !transaction->applied)
+        return 0;
+    nft = nc_nft_tool_path();
+    if (!nft || nc_nft_rollback(nft, transaction->backup_present,
+                                transaction->backup_path) != 0)
+        return -1;
+    nc_nft_transaction_finish(transaction);
+    return 0;
+}
+
+static int nc_nft_guarded_apply(const char *ruleset, char *detail,
+                                size_t detail_len,
+                                struct nc_nft_transaction *transaction)
+{
+    struct jmx_exec_result backup;
+    struct jmx_exec_result check;
+    const char *nft = nc_nft_tool_path();
+    char backup_path[256] = {0};
+    char *check_argv[] = { (char *)nft, "--check", "--file",
+                           (char *)ruleset, NULL };
+    int backup_present = 0;
+    int mutated = 0;
+    int rc;
+
+    if (transaction)
+        memset(transaction, 0, sizeof(*transaction));
+    if (detail && detail_len)
+        detail[0] = '\0';
+    if (!ruleset || strcmp(ruleset, NC_NETCTL_NFT_RULESET) != 0 ||
+        access(ruleset, R_OK) != 0) {
+        if (detail) snprintf(detail, detail_len, "nft_ruleset_missing");
+        return -1;
+    }
+    if (!nft) {
+        if (detail) snprintf(detail, detail_len, "nft_binary_missing_or_untrusted");
+        return -2;
+    }
+    check_argv[0] = (char *)nft;
+    memset(&check, 0, sizeof(check));
+    check.exit_code = -1;
+    rc = nc_nft_capture(nft, check_argv, &check);
+    if (nc_netctl_exec_ok(rc, &check) != 0) {
+        if (detail) snprintf(detail, detail_len, "nft_check_failed");
+        jmx_exec_result_free(&check);
+        return -3;
+    }
+    jmx_exec_result_free(&check);
+
+    memset(&backup, 0, sizeof(backup));
+    backup.exit_code = -1;
+    if (nc_nft_table_capture(nft, &backup, &backup_present) != 0) {
+        if (detail) snprintf(detail, detail_len, "nft_backup_read_failed");
+        jmx_exec_result_free(&backup);
+        return -4;
+    }
+    if (backup_present &&
+        nc_netctl_secure_backup_write(backup.output, backup.output_len,
+                                      backup_path, sizeof(backup_path)) != 0) {
+        if (detail) snprintf(detail, detail_len, "nft_backup_store_failed");
+        jmx_exec_result_free(&backup);
+        return -5;
+    }
+    jmx_exec_result_free(&backup);
+
+    mutated = backup_present;
+    if (nc_nft_delete_table(nft) != 0) {
+        if (detail) snprintf(detail, detail_len, "nft_delete_failed");
+        goto rollback;
+    }
+    if (nc_nft_apply_file(nft, ruleset) != 0) {
+        if (detail) snprintf(detail, detail_len, "nft_apply_failed");
+        mutated = 1;
+        goto rollback;
+    }
+    mutated = 1;
+    if (nc_nft_readback_verify(nft) != 0) {
+        if (detail) snprintf(detail, detail_len, "nft_readback_failed");
+        goto rollback;
+    }
+    if (transaction) {
+        transaction->backup_present = backup_present;
+        transaction->applied = 1;
+        snprintf(transaction->backup_path, sizeof(transaction->backup_path),
+                 "%s", backup_path);
+        backup_path[0] = '\0';
+    }
+    if (backup_path[0]) unlink(backup_path);
+    if (detail) snprintf(detail, detail_len, "nft_applied_and_verified");
+    return 0;
+
+rollback:
+    if (mutated && nc_nft_rollback(nft, backup_present, backup_path) != 0) {
+        if (detail) snprintf(detail, detail_len, "nft_rollback_failed");
+        if (backup_path[0]) unlink(backup_path);
+        return -7;
+    }
+    if (detail) snprintf(detail, detail_len, "nft_apply_failed_rollback_verified");
+    if (backup_path[0]) unlink(backup_path);
+    return -6;
+}
+
+struct nc_tc_plan;
+static int nc_tc_plan_count(void);
+static int nc_tc_guarded_apply(char *detail, size_t detail_len,
+                               struct nc_tc_plan *previous_out);
 int nc_uci_set_pkg(struct uci_context *ctx, const char *pkg_name,
                    const char *section, const char *option,
                    const char *value)
@@ -15148,6 +15560,56 @@ static void nc_multicast_runtime_status(struct json_object *status, struct json_
     json_object_object_add(status,"groups",json_object_new_int(groups)); json_object_object_add(status,"subscribers",json_object_new_int(subs)); json_object_object_add(status,"rx_rate",json_object_new_int64(0)); json_object_object_add(status,"tx_rate",json_object_new_int64(0)); json_object_object_add(status,"dropped",json_object_new_int64(0)); json_object_object_add(status,"last_change",json_object_new_int64(nc_now_s()));
 }
 
+/*
+ * Multicast write/apply capabilities. The write path persists to config.db and
+ * apply renders /etc/config/dreamingwrt_multicast, so those are reported from
+ * the database being reachable. Feature-level keys follow the runtime tools the
+ * rendered config actually needs, and anything without a closed loop stays
+ * false with a reason instead of being advertised optimistically.
+ */
+static void nc_multicast_add_caps(struct json_object *root)
+{
+    struct json_object *caps = json_object_new_object();
+    int store_ready = jmx_netconfig_db_init() == 0;
+    int bridge_tool = nc_file_exists("/sbin/bridge") || nc_file_exists("/usr/sbin/bridge");
+    int igmpproxy = nc_file_exists("/usr/sbin/igmpproxy") ||
+                    nc_file_exists("/etc/init.d/igmpproxy");
+    int udpxy = nc_file_exists("/usr/sbin/udpxy") || nc_file_exists("/usr/bin/udpxy");
+
+    if (!caps)
+        return;
+    json_object_object_add(caps, "service_update", json_object_new_boolean(store_ready));
+    json_object_object_add(caps, "config_update", json_object_new_boolean(store_ready));
+    json_object_object_add(caps, "multicast_update", json_object_new_boolean(store_ready));
+    json_object_object_add(caps, "service_apply", json_object_new_boolean(store_ready));
+    json_object_object_add(caps, "config_apply", json_object_new_boolean(store_ready));
+    json_object_object_add(caps, "multicast_apply", json_object_new_boolean(store_ready));
+    json_object_object_add(caps, "allowed_group_crud", json_object_new_boolean(store_ready));
+    json_object_object_add(caps, "udpxy_instance_crud", json_object_new_boolean(store_ready));
+    json_object_object_add(caps, "igmp_proxy", json_object_new_boolean(igmpproxy));
+    json_object_object_add(caps, "udpxy", json_object_new_boolean(udpxy));
+    json_object_object_add(caps, "snooping_runtime_readback", json_object_new_boolean(bridge_tool));
+    json_object_object_add(caps, "service_fail_closed", json_object_new_boolean(1));
+    /* Throughput accounting per multicast group is not collected yet, so the
+     * page must not present the zeros in status as measured rates. */
+    json_object_object_add(caps, "group_rate_metrics", json_object_new_boolean(0));
+    if (!store_ready)
+        json_object_object_add(caps, "service_unavailable_reason",
+                               json_object_new_string("config_db_unavailable"));
+    if (!igmpproxy)
+        json_object_object_add(caps, "igmp_proxy_reason",
+                               json_object_new_string("igmpproxy_not_installed"));
+    if (!udpxy)
+        json_object_object_add(caps, "udpxy_reason",
+                               json_object_new_string("udpxy_not_installed"));
+    if (!bridge_tool)
+        json_object_object_add(caps, "snooping_runtime_reason",
+                               json_object_new_string("bridge_tool_unavailable"));
+    json_object_object_add(caps, "group_rate_metrics_reason",
+                           json_object_new_string("per_group_throughput_accounting_not_implemented"));
+    json_object_object_add(root, "capabilities", caps);
+}
+
 struct json_object *jmx_multicast_service_get(void)
 {
     struct json_object *data=json_object_new_object(), *igmp=json_object_new_object(), *iptv=json_object_new_object(), *udpxy=json_object_new_object(), *disc=json_object_new_object(), *status=json_object_new_object(), *groups=json_object_new_array(), *inst=json_object_new_array(), *allowed=json_object_new_array();
@@ -15164,7 +15626,7 @@ struct json_object *jmx_multicast_service_get(void)
     if (nc_prepare(&st,"SELECT id,group_addr,source_addr,downstream,remark,enabled FROM multicast_allowed_group WHERE enabled=1 ORDER BY id")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object(); nc_add_text(o,"id",st,0); nc_add_text(o,"group",st,1); nc_add_text(o,"source",st,2); nc_add_text(o,"downstream",st,3); nc_add_text(o,"remark",st,4); json_object_array_add(allowed,o);} sqlite3_finalize(st);}
     json_object_object_add(udpxy,"instances",inst); json_object_object_add(disc,"allowed_groups",allowed); nc_multicast_runtime_status(status,groups);
 done:
-    json_object_object_add(data,"ts",json_object_new_int64(nc_now_s())); json_object_object_add(data,"igmp_proxy",igmp); json_object_object_add(data,"iptv_passthrough",iptv); json_object_object_add(data,"udpxy",udpxy); json_object_object_add(data,"discovery",disc); json_object_object_add(data,"status",status); json_object_object_add(data,"group_state",groups); return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
+    json_object_object_add(data,"ts",json_object_new_int64(nc_now_s())); json_object_object_add(data,"igmp_proxy",igmp); json_object_object_add(data,"iptv_passthrough",iptv); json_object_object_add(data,"udpxy",udpxy); json_object_object_add(data,"discovery",disc); json_object_object_add(data,"status",status); json_object_object_add(data,"group_state",groups); nc_multicast_add_caps(data); return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
 }
 
 int jmx_multicast_service_set(struct json_object *cfg)
@@ -15173,7 +15635,7 @@ int jmx_multicast_service_set(struct json_object *cfg)
     if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_multicast_db_init(); if(nc_multicast_validate(cfg)!=0)return -1;
     json_object_object_get_ex(cfg,"igmp_proxy",&igmp); json_object_object_get_ex(cfg,"iptv_passthrough",&iptv); json_object_object_get_ex(cfg,"udpxy",&ud); json_object_object_get_ex(cfg,"discovery",&disc);
     json_object_object_get_ex(igmp,"downstreams",&arr); down=nc_json_array_to_string(arr,"[]"); json_object_object_get_ex(igmp,"alt_subnets",&arr); alt=nc_json_array_to_string(arr,"[\"0.0.0.0/0\"]"); json_object_object_get_ex(iptv,"stb_ports",&arr); ports=nc_json_array_to_string(arr,"[]");
-    nc_exec("BEGIN IMMEDIATE");
+    if (nc_txn_begin() != 0) return -1;
     if(nc_prepare(&st,"INSERT INTO multicast_config(id,igmp_enabled,igmp_version,quick_leave,upstream,downstreams,alt_subnets,iptv_enabled,iptv_wan_iface,iptv_lan_iface,iptv_vlan_id,iptv_stb_ports,iptv_mode,iptv_keep_internet,udpxy_enabled,udpxy_listen_iface,udpxy_listen_port,udpxy_source_iface,udpxy_buffer_kb,udpxy_max_clients,mdns_reflector,ssdp_relay,igmp_snooping,mld_snooping,querier,query_interval,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26) ON CONFLICT(id) DO UPDATE SET igmp_enabled=excluded.igmp_enabled,igmp_version=excluded.igmp_version,quick_leave=excluded.quick_leave,upstream=excluded.upstream,downstreams=excluded.downstreams,alt_subnets=excluded.alt_subnets,iptv_enabled=excluded.iptv_enabled,iptv_wan_iface=excluded.iptv_wan_iface,iptv_lan_iface=excluded.iptv_lan_iface,iptv_vlan_id=excluded.iptv_vlan_id,iptv_stb_ports=excluded.iptv_stb_ports,iptv_mode=excluded.iptv_mode,iptv_keep_internet=excluded.iptv_keep_internet,udpxy_enabled=excluded.udpxy_enabled,udpxy_listen_iface=excluded.udpxy_listen_iface,udpxy_listen_port=excluded.udpxy_listen_port,udpxy_source_iface=excluded.udpxy_source_iface,udpxy_buffer_kb=excluded.udpxy_buffer_kb,udpxy_max_clients=excluded.udpxy_max_clients,mdns_reflector=excluded.mdns_reflector,ssdp_relay=excluded.ssdp_relay,igmp_snooping=excluded.igmp_snooping,mld_snooping=excluded.mld_snooping,querier=excluded.querier,query_interval=excluded.query_interval,updated_at=excluded.updated_at")==0){
         sqlite3_bind_int(st,1,nc_json_bool_def(igmp,"enabled",0)); sqlite3_bind_text(st,2,nc_json_str_def(igmp,"version","3"),-1,SQLITE_TRANSIENT); sqlite3_bind_int(st,3,nc_json_bool_def(igmp,"quick_leave",1)); sqlite3_bind_text(st,4,nc_json_str_def(igmp,"upstream",""),-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,5,down,-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,6,alt,-1,SQLITE_TRANSIENT); sqlite3_bind_int(st,7,nc_json_bool_def(iptv,"enabled",0)); sqlite3_bind_text(st,8,nc_json_str_def(iptv,"wan_iface",""),-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,9,nc_json_str_def(iptv,"lan_iface",""),-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,10,nc_json_str_def(iptv,"vlan_id",""),-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,11,ports,-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,12,nc_json_str_def(iptv,"mode","bridge"),-1,SQLITE_TRANSIENT); sqlite3_bind_int(st,13,nc_json_bool_def(iptv,"keep_internet",1)); sqlite3_bind_int(st,14,nc_json_bool_def(ud,"enabled",0)); sqlite3_bind_text(st,15,nc_json_str_def(ud,"listen_iface",""),-1,SQLITE_TRANSIENT); sqlite3_bind_int(st,16,nc_json_int_def(ud,"listen_port",4022)); sqlite3_bind_text(st,17,nc_json_str_def(ud,"source_iface",""),-1,SQLITE_TRANSIENT); sqlite3_bind_int(st,18,nc_json_int_def(ud,"buffer_kb",2048)); sqlite3_bind_int(st,19,nc_json_int_def(ud,"max_clients",64)); sqlite3_bind_int(st,20,nc_json_bool_def(disc,"mdns_reflector",1)); sqlite3_bind_int(st,21,nc_json_bool_def(disc,"ssdp_relay",1)); sqlite3_bind_int(st,22,nc_json_bool_def(disc,"igmp_snooping",1)); sqlite3_bind_int(st,23,nc_json_bool_def(disc,"mld_snooping",0)); sqlite3_bind_int(st,24,nc_json_bool_def(disc,"querier",1)); sqlite3_bind_int(st,25,nc_json_int_def(disc,"query_interval",125)); sqlite3_bind_int64(st,26,nc_now_s()); if(nc_step_done(st)==0)rc=0; sqlite3_finalize(st); st=NULL; }
     if(rc==0){nc_exec("DELETE FROM multicast_udpxy_instance"); if(json_object_object_get_ex(ud,"instances",&arr)&&arr&&json_object_is_type(arr,json_type_array)){for(i=0,n=json_object_array_length(arr);i<n;i++){struct json_object*x=json_object_array_get_idx(arr,i); if(nc_prepare(&st,"INSERT INTO multicast_udpxy_instance(id,name,source_iface,listen_iface,listen_port,subscribe_interval,external_access,enabled,remark,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)")==0){sqlite3_bind_text(st,1,nc_json_str_def(x,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(x,"name",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(x,"source_iface",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(x,"listen_iface",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,5,nc_json_int_def(x,"listen_port",4022));sqlite3_bind_int(st,6,nc_json_int_def(x,"subscribe_interval",30));sqlite3_bind_int(st,7,nc_json_bool_def(x,"external_access",0));sqlite3_bind_int(st,8,nc_json_bool_def(x,"enabled",1));sqlite3_bind_text(st,9,nc_json_str_def(x,"remark",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,10,nc_now_s()); if(nc_step_done(st)!=0)rc=-1; sqlite3_finalize(st);}}}}
@@ -15198,12 +15660,24 @@ int jmx_multicast_service_apply(int dry_run)
 
 static void nc_ipam_db_init(void)
 {
+    nc_exec("CREATE TABLE IF NOT EXISTS ipam_meta (id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL DEFAULT 1,updated_at INTEGER NOT NULL DEFAULT 0)");
+    nc_exec("INSERT OR IGNORE INTO ipam_meta(id,revision,updated_at) VALUES(1,1,0)");
     nc_exec("CREATE TABLE IF NOT EXISTS ipam_network (id TEXT PRIMARY KEY,name TEXT NOT NULL,ifname TEXT DEFAULT '',subnet TEXT NOT NULL,gateway TEXT DEFAULT '',dhcp_pool TEXT DEFAULT '',enabled INTEGER DEFAULT 1,updated_at INTEGER NOT NULL)");
     nc_exec("CREATE TABLE IF NOT EXISTS ipam_address (id TEXT PRIMARY KEY,network_id TEXT NOT NULL,ip TEXT NOT NULL,mac TEXT DEFAULT '',hostname TEXT DEFAULT '',owner TEXT DEFAULT '',type TEXT DEFAULT 'unknown',source TEXT DEFAULT 'manual',status TEXT DEFAULT 'reserved',note TEXT DEFAULT '',last_seen INTEGER DEFAULT 0,updated_at INTEGER NOT NULL,UNIQUE(network_id, ip, mac))");
     nc_exec("CREATE TABLE IF NOT EXISTS ipam_import_job (id TEXT PRIMARY KEY,filename TEXT DEFAULT '',rows INTEGER DEFAULT 0,success INTEGER DEFAULT 0,failed INTEGER DEFAULT 0,error TEXT DEFAULT '',created_at INTEGER NOT NULL)");
     nc_exec("CREATE INDEX IF NOT EXISTS idx_ipam_address_network_ip ON ipam_address(network_id, ip)");
     nc_exec("CREATE INDEX IF NOT EXISTS idx_ipam_address_mac ON ipam_address(mac)");
     nc_exec("CREATE INDEX IF NOT EXISTS idx_ipam_address_status ON ipam_address(status)");
+    if (nc_table_exists("bulk_ip_reservation")) {
+        /* Migration is one atomic step, but nc_ipam_db_init() may also be
+         * reached from inside an open transaction; nesting BEGIN would fail and
+         * silently leave the legacy table half-migrated. */
+        int own_tx = g_netconfig_db && sqlite3_get_autocommit(g_netconfig_db);
+        if (own_tx && nc_exec("BEGIN IMMEDIATE") != 0) return;
+        nc_exec("INSERT OR IGNORE INTO ipam_address(id,network_id,ip,mac,hostname,owner,type,source,status,note,last_seen,updated_at) SELECT id,COALESCE(NULLIF(network_id,''),'lan'),ip,lower(mac),hostname,owner,'static','reservation','reserved',note,0,updated_at FROM bulk_ip_reservation WHERE id<>'' AND ip<>''");
+        nc_exec("DELETE FROM bulk_ip_reservation WHERE EXISTS (SELECT 1 FROM ipam_address a WHERE a.id=bulk_ip_reservation.id AND a.network_id=COALESCE(NULLIF(bulk_ip_reservation.network_id,''),'lan') AND a.ip=bulk_ip_reservation.ip AND a.mac=lower(bulk_ip_reservation.mac) AND a.source='reservation')");
+        if (own_tx && nc_exec("COMMIT") != 0) nc_exec("ROLLBACK");
+    }
 }
 
 static int nc_ipv4_cidr_parse(const char *cidr, char *ip, size_t ip_len, int *prefix)
@@ -15236,6 +15710,7 @@ static int nc_cidr_total_hosts(const char *cidr)
 static void nc_ipam_seed_networks(void)
 {
     sqlite3_stmt *st = NULL, *ins = NULL;
+    nc_exec("UPDATE ipam_network SET enabled=0");
     if (nc_prepare(&st, "SELECT l.id,l.name,l.ifname,COALESCE(la.ip,''),COALESCE(la.prefix,24),COALESCE(d.pool_start,''),COALESCE(d.pool_end,'') FROM lan l LEFT JOIN lan_address la ON la.lan_id=l.id AND la.is_primary=1 LEFT JOIN dhcp_scope d ON d.lan_id=l.id WHERE l.enabled=1") == 0) {
         while (sqlite3_step(st) == SQLITE_ROW) {
             char subnet[64] = "", pool[96] = "";
@@ -15244,19 +15719,40 @@ static void nc_ipam_seed_networks(void)
             if (!id || !id[0] || !ip || !ip[0]) continue;
             snprintf(subnet,sizeof(subnet),"%s/%d",ip,prefix);
             if (ps && ps[0] && pe && pe[0]) snprintf(pool,sizeof(pool),"%s-%s",ps,pe);
-            if (nc_prepare(&ins,"INSERT OR IGNORE INTO ipam_network(id,name,ifname,subnet,gateway,dhcp_pool,enabled,updated_at) VALUES(?1,?2,?3,?4,?5,?6,1,?7)")==0){sqlite3_bind_text(ins,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(ins,2,name?name:id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(ins,3,ifn?ifn:"",-1,SQLITE_TRANSIENT);sqlite3_bind_text(ins,4,subnet,-1,SQLITE_TRANSIENT);sqlite3_bind_text(ins,5,ip,-1,SQLITE_TRANSIENT);sqlite3_bind_text(ins,6,pool,-1,SQLITE_TRANSIENT);sqlite3_bind_int64(ins,7,nc_now_s());nc_step_done(ins);sqlite3_finalize(ins);ins=NULL;}
+            if (nc_prepare(&ins,"INSERT INTO ipam_network(id,name,ifname,subnet,gateway,dhcp_pool,enabled,updated_at) VALUES(?1,?2,?3,?4,?5,?6,1,?7) ON CONFLICT(id) DO UPDATE SET name=excluded.name,ifname=excluded.ifname,subnet=excluded.subnet,gateway=excluded.gateway,dhcp_pool=excluded.dhcp_pool,enabled=1,updated_at=excluded.updated_at")==0){sqlite3_bind_text(ins,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(ins,2,name?name:id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(ins,3,ifn?ifn:"",-1,SQLITE_TRANSIENT);sqlite3_bind_text(ins,4,subnet,-1,SQLITE_TRANSIENT);sqlite3_bind_text(ins,5,ip,-1,SQLITE_TRANSIENT);sqlite3_bind_text(ins,6,pool,-1,SQLITE_TRANSIENT);sqlite3_bind_int64(ins,7,nc_now_s());nc_step_done(ins);sqlite3_finalize(ins);ins=NULL;}
         }
         sqlite3_finalize(st);
     }
 }
 
-static void nc_ipam_upsert_addr(const char *network_id, const char *ip, const char *mac, const char *hostname, const char *owner, const char *type, const char *source, const char *status, const char *note, int64_t last_seen)
+static int nc_ipam_upsert_addr_id(const char *requested_id, const char *network_id,
+                                  const char *ip, const char *mac,
+                                  const char *hostname, const char *owner,
+                                  const char *type, const char *source,
+                                  const char *status, const char *note,
+                                  int64_t last_seen)
 {
-    sqlite3_stmt *st = NULL; char id[160], macn[32] = "";
-    if (!network_id || !network_id[0] || !nc_ipv4_ok(ip)) return;
-    if (mac && mac[0]) { if (!nc_mac_normalize(mac, macn, sizeof(macn))) return; }
-    snprintf(id,sizeof(id),"%s_%s_%s",network_id,ip,macn[0]?macn:source);
-    if(nc_prepare(&st,"INSERT INTO ipam_address(id,network_id,ip,mac,hostname,owner,type,source,status,note,last_seen,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(network_id,ip,mac) DO UPDATE SET hostname=excluded.hostname,owner=COALESCE(NULLIF(excluded.owner,''),owner),type=excluded.type,source=excluded.source,status=excluded.status,note=COALESCE(NULLIF(excluded.note,''),note),last_seen=excluded.last_seen,updated_at=excluded.updated_at")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,network_id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,ip,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,macn,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,hostname?hostname:"",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,owner?owner:"",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,type?type:"unknown",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,source?source:"manual",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,9,status?status:"reserved",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,10,note?note:"",-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,11,last_seen);sqlite3_bind_int64(st,12,nc_now_s());nc_step_done(st);sqlite3_finalize(st);}
+    sqlite3_stmt *st = NULL; char id[160], macn[32] = ""; int rc = -1;
+    if (!network_id || !network_id[0] || !nc_ipv4_ok(ip)) return -1;
+    if (mac && mac[0] && !nc_mac_normalize(mac, macn, sizeof(macn))) return -1;
+    if (requested_id && requested_id[0]) {
+        if (!nc_safe_id_ok(requested_id)) return -1;
+        snprintf(id, sizeof(id), "%s", requested_id);
+    } else {
+        snprintf(id,sizeof(id),"%s_%s_%s",network_id,ip,macn[0]?macn:source);
+    }
+    if(nc_prepare(&st,"INSERT INTO ipam_address(id,network_id,ip,mac,hostname,owner,type,source,status,note,last_seen,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(network_id,ip,mac) DO UPDATE SET id=excluded.id,hostname=excluded.hostname,owner=COALESCE(NULLIF(excluded.owner,''),owner),type=excluded.type,source=excluded.source,status=excluded.status,note=COALESCE(NULLIF(excluded.note,''),note),last_seen=excluded.last_seen,updated_at=excluded.updated_at")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,network_id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,ip,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,macn,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,hostname?hostname:"",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,owner?owner:"",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,type?type:"unknown",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,source?source:"manual",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,9,status?status:"reserved",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,10,note?note:"",-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,11,last_seen);sqlite3_bind_int64(st,12,nc_now_s());rc=nc_step_done(st);sqlite3_finalize(st);}
+    return rc;
+}
+
+static int nc_ipam_upsert_addr(const char *network_id, const char *ip,
+                               const char *mac, const char *hostname,
+                               const char *owner, const char *type,
+                               const char *source, const char *status,
+                               const char *note, int64_t last_seen)
+{
+    return nc_ipam_upsert_addr_id(NULL, network_id, ip, mac, hostname, owner,
+                                  type, source, status, note, last_seen);
 }
 
 static void nc_ipam_refresh_sources(void)
@@ -15266,8 +15762,15 @@ static void nc_ipam_refresh_sources(void)
     if(nc_prepare(&st,"SELECT id,gateway FROM ipam_network WHERE enabled=1")==0){while(sqlite3_step(st)==SQLITE_ROW){const char*n=(const char*)sqlite3_column_text(st,0);const char*gw=(const char*)sqlite3_column_text(st,1); if(gw&&gw[0]) nc_ipam_upsert_addr(n,gw,"","Gateway","","gateway","interface","used","网关/接口地址",now);} sqlite3_finalize(st);}
     if(nc_prepare(&st,"SELECT s.lan_id,r.ip,r.mac,r.name,r.remark,r.enabled FROM dhcp_reservation r JOIN dhcp_scope s ON s.id=r.scope_id")==0){while(sqlite3_step(st)==SQLITE_ROW){nc_ipam_upsert_addr((const char*)sqlite3_column_text(st,0),(const char*)sqlite3_column_text(st,1),(const char*)sqlite3_column_text(st,2),(const char*)sqlite3_column_text(st,3),"","unknown","reservation",sqlite3_column_int(st,5)?"reserved":"offline",(const char*)sqlite3_column_text(st,4),0);} sqlite3_finalize(st);}
     if(nc_prepare(&st,"SELECT mac,scope_id,hostname,ip,online,updated_at FROM dhcp_lease_cache")==0){while(sqlite3_step(st)==SQLITE_ROW){const char*scope=(const char*)sqlite3_column_text(st,1); char netid[64]=""; if(scope&&scope[0]&&nc_prepare(&nq,"SELECT lan_id FROM dhcp_scope WHERE id=?1")==0){sqlite3_bind_text(nq,1,scope,-1,SQLITE_TRANSIENT); if(sqlite3_step(nq)==SQLITE_ROW&&sqlite3_column_text(nq,0))snprintf(netid,sizeof(netid),"%s",(const char*)sqlite3_column_text(nq,0)); sqlite3_finalize(nq); nq=NULL;} if(netid[0]) nc_ipam_upsert_addr(netid,(const char*)sqlite3_column_text(st,3),(const char*)sqlite3_column_text(st,0),(const char*)sqlite3_column_text(st,2),"","unknown","dhcp",sqlite3_column_int(st,4)?"used":"offline","DHCP lease",sqlite3_column_int64(st,5));} sqlite3_finalize(st);}
-    fp=popen("ip neigh show 2>/dev/null", "r");
-    if(fp){while(fgets(line,sizeof(line),fp)){char ip[64]="", dev[64]="", mac[64]=""; if(sscanf(line,"%63s dev %63s lladdr %63s",ip,dev,mac)>=3&&nc_ipv4_ok(ip)){if(nc_prepare(&st,"SELECT id,subnet FROM ipam_network WHERE enabled=1")==0){while(sqlite3_step(st)==SQLITE_ROW){const char*nid=(const char*)sqlite3_column_text(st,0),*sub=(const char*)sqlite3_column_text(st,1); if(nc_ip_in_cidr_text(ip,sub)){nc_ipam_upsert_addr(nid,ip,mac,"","","unknown","arp","used","ARP/neigh",now);break;}}sqlite3_finalize(st);}}}pclose(fp);}
+    /* Kernel neighbour table is read directly: no shell boundary, no child process. */
+    fp=fopen("/proc/net/arp","r");
+    if(fp){int header=1;while(fgets(line,sizeof(line),fp)){char ip[64]="",hw[32]="",flags[32]="",mac[64]="",mask[64]="",dev[64]="";
+        if(header){header=0;continue;}
+        if(sscanf(line,"%63s %31s %31s %63s %63s %63s",ip,hw,flags,mac,mask,dev)!=6)continue;
+        if(!nc_ipv4_ok(ip)||!strcmp(mac,"00:00:00:00:00:00"))continue;
+        if(nc_prepare(&st,"SELECT id,subnet FROM ipam_network WHERE enabled=1")==0){while(sqlite3_step(st)==SQLITE_ROW){const char*nid=(const char*)sqlite3_column_text(st,0),*sub=(const char*)sqlite3_column_text(st,1); if(nc_ip_in_cidr_text(ip,sub)){nc_ipam_upsert_addr(nid,ip,mac,"","","unknown","arp","used","ARP/neigh",now);break;}}sqlite3_finalize(st);st=NULL;}
+    }fclose(fp);}
+    (void)nq;
 }
 
 static void nc_ipam_mark_conflicts(void)
@@ -15279,13 +15782,30 @@ static void nc_ipam_mark_conflicts(void)
 
 struct json_object *jmx_bulk_ip_get(void)
 {
-    struct json_object *data=json_object_new_object(), *nets=json_object_new_array(), *jobs=json_object_new_array(); sqlite3_stmt *st=NULL,*a=NULL; const char *selected="";
-    if(jmx_netconfig_db_init()!=0) goto done; nc_ipam_db_init(); nc_dhcp_refresh_leases(); nc_ipam_refresh_sources(); nc_ipam_mark_conflicts();
-    if(nc_prepare(&st,"SELECT id,name,subnet,gateway,dhcp_pool FROM ipam_network WHERE enabled=1 ORDER BY id")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*n=json_object_new_object(),*addrs=json_object_new_array(); const char*nid=(const char*)sqlite3_column_text(st,0); if(!selected[0]) selected=nid; nc_add_text(n,"id",st,0); nc_add_text(n,"name",st,1); nc_add_text(n,"subnet",st,2); nc_add_text(n,"gateway",st,3); nc_add_text(n,"dhcp_pool",st,4); json_object_object_add(n,"total",json_object_new_int(nc_cidr_total_hosts((const char*)sqlite3_column_text(st,2))));
+    struct json_object *data=json_object_new_object(), *nets=json_object_new_array(), *jobs=json_object_new_array(); sqlite3_stmt *st=NULL,*a=NULL;
+    /* selected_network must own its bytes: sqlite3_column_text() memory dies at finalize. */
+    char selected[64] = "";
+    if(jmx_netconfig_db_init()!=0) goto done; nc_ipam_db_init();
+    if(nc_prepare(&st,"SELECT id,name,subnet,gateway,dhcp_pool FROM ipam_network WHERE enabled=1 ORDER BY id")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*n=json_object_new_object(),*addrs=json_object_new_array(); const char*nid=(const char*)sqlite3_column_text(st,0); if(!selected[0]&&nid&&nid[0]) snprintf(selected,sizeof(selected),"%s",nid); nc_add_text(n,"id",st,0); nc_add_text(n,"name",st,1); nc_add_text(n,"subnet",st,2); nc_add_text(n,"gateway",st,3); nc_add_text(n,"dhcp_pool",st,4); json_object_object_add(n,"total",json_object_new_int(nc_cidr_total_hosts((const char*)sqlite3_column_text(st,2))));
         if(nc_prepare(&a,"SELECT id,ip,mac,hostname,owner,type,source,status,note,last_seen FROM ipam_address WHERE network_id=?1 ORDER BY ip,mac")==0){int used=0,res=0,conf=0; sqlite3_bind_text(a,1,nid,-1,SQLITE_TRANSIENT); while(sqlite3_step(a)==SQLITE_ROW){struct json_object*o=json_object_new_object(); const char*status=(const char*)sqlite3_column_text(a,7); nc_add_text(o,"id",a,0); nc_add_text(o,"ip",a,1); nc_add_text(o,"mac",a,2); nc_add_text(o,"hostname",a,3); nc_add_text(o,"owner",a,4); nc_add_text(o,"type",a,5); nc_add_text(o,"source",a,6); nc_add_text(o,"status",a,7); nc_add_text(o,"note",a,8); json_object_object_add(o,"last_seen",json_object_new_int64(sqlite3_column_int64(a,9))); json_object_array_add(addrs,o); if(status&&!strcmp(status,"used"))used++; else if(status&&!strcmp(status,"reserved"))res++; else if(status&&!strcmp(status,"conflict"))conf++; } sqlite3_finalize(a); a=NULL; json_object_object_add(n,"used",json_object_new_int(used)); json_object_object_add(n,"reserved",json_object_new_int(res)); json_object_object_add(n,"conflicts",json_object_new_int(conf));}
         json_object_object_add(n,"addresses",addrs); json_object_array_add(nets,n);}sqlite3_finalize(st);}
     if(nc_prepare(&st,"SELECT id,filename,rows,success,failed,created_at FROM ipam_import_job ORDER BY created_at DESC LIMIT 20")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*j=json_object_new_object(); nc_add_text(j,"id",st,0); nc_add_text(j,"filename",st,1); json_object_object_add(j,"rows",json_object_new_int(sqlite3_column_int(st,2))); json_object_object_add(j,"success",json_object_new_int(sqlite3_column_int(st,3))); json_object_object_add(j,"failed",json_object_new_int(sqlite3_column_int(st,4))); json_object_object_add(j,"ts",json_object_new_int64(sqlite3_column_int64(st,5))); json_object_array_add(jobs,j);}sqlite3_finalize(st);}
 done:
+    {
+        struct json_object *caps=json_object_new_object(); sqlite3_int64 revision=1;
+        if(g_netconfig_db&&nc_prepare(&st,"SELECT revision FROM ipam_meta WHERE id=1")==0){if(sqlite3_step(st)==SQLITE_ROW)revision=sqlite3_column_int64(st,0);sqlite3_finalize(st);st=NULL;}
+        json_object_object_add(caps,"ipam_read",json_object_new_boolean(1));
+        json_object_object_add(caps,"ipam_transaction",json_object_new_boolean(1));
+        json_object_object_add(caps,"ipam_conflict_readback",json_object_new_boolean(1));
+        json_object_object_add(caps,"ipam_dynamic_refresh",json_object_new_boolean(1));
+        json_object_object_add(caps,"ipam_dynamic_refresh_endpoint",json_object_new_string("POST /api/v1/bulk-ip/refresh"));
+        json_object_object_add(caps,"ipam_item_error_detail",json_object_new_boolean(1));
+        json_object_object_add(caps,"ipam_read_is_side_effect_free",json_object_new_boolean(1));
+        json_object_object_add(caps,"dhcp_runtime_reload_atomic",json_object_new_boolean(0));
+        json_object_object_add(caps,"dhcp_runtime_reload_reason",json_object_new_string("dhcp_process_reload_not_part_of_sqlite_transaction"));
+        json_object_object_add(data,"revision",json_object_new_int64(revision));
+        json_object_object_add(data,"capabilities",caps);
+    }
     json_object_object_add(data,"ts",json_object_new_int64(nc_now_s())); json_object_object_add(data,"selected_network",json_object_new_string(selected)); json_object_object_add(data,"networks",nets); json_object_object_add(data,"import_jobs",jobs); return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
 }
 static void nc_ipam_slug_ip(const char *ip, char *out, size_t out_len)
@@ -15315,53 +15835,283 @@ static int nc_ipam_sync_dhcp_reservation(const char *network_id, const char *ip,
     return rc;
 }
 
+#define NC_IPAM_EXCLUDE_MAX 1024
+#define NC_IPAM_EXCLUDE_SEP ", \t\r\n"
+
+/*
+ * exclude_pool is a separated token list, so membership must be compared token
+ * by token: a substring test reports 192.168.1.2 as present inside
+ * 192.168.1.20 and silently skips a required write.
+ */
+static int nc_ipam_exclude_has(const char *list, const char *ip)
+{
+    char tmp[NC_IPAM_EXCLUDE_MAX]; char *save = NULL, *tok;
+    if (!list || !list[0] || !ip || !ip[0]) return 0;
+    if (strlen(list) >= sizeof(tmp)) return -1;
+    snprintf(tmp, sizeof(tmp), "%s", list);
+    for (tok = strtok_r(tmp, NC_IPAM_EXCLUDE_SEP, &save); tok; tok = strtok_r(NULL, NC_IPAM_EXCLUDE_SEP, &save))
+        if (!strcmp(tok, ip)) return 1;
+    return 0;
+}
+
+/* Loads the first DHCP scope of a network. Returns 1 when a scope exists, 0
+ * when the network has none, and -1 when the stored list does not fit the
+ * fixed buffer (truncating it would drop live exclusions). */
+static int nc_ipam_scope_exclude_load(const char *network_id, char *scope, size_t scope_len,
+                                      char *pool, size_t pool_len)
+{
+    sqlite3_stmt *st = NULL; int found = 0, overflow = 0;
+    if (scope && scope_len) scope[0] = '\0';
+    if (pool && pool_len) pool[0] = '\0';
+    if (nc_prepare(&st, "SELECT id,COALESCE(exclude_pool,'') FROM dhcp_scope WHERE lan_id=?1 ORDER BY id LIMIT 1") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, network_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *sid = (const char *)sqlite3_column_text(st, 0);
+        const char *cur = (const char *)sqlite3_column_text(st, 1);
+        if (sid && sid[0]) { found = 1; snprintf(scope, scope_len, "%s", sid); }
+        if (cur) { if (strlen(cur) >= pool_len) overflow = 1; else snprintf(pool, pool_len, "%s", cur); }
+    }
+    sqlite3_finalize(st);
+    if (overflow) return -1;
+    return found;
+}
+
+static int nc_ipam_scope_exclude_store(const char *scope, const char *pool)
+{
+    sqlite3_stmt *st = NULL; int rc = -1;
+    if (nc_prepare(&st, "UPDATE dhcp_scope SET exclude_pool=?1,updated_at=?2 WHERE id=?3") != 0) return -1;
+    sqlite3_bind_text(st, 1, pool, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, nc_now_s());
+    sqlite3_bind_text(st, 3, scope, -1, SQLITE_TRANSIENT);
+    rc = nc_step_done(st); sqlite3_finalize(st);
+    if (rc == 0 && sqlite3_changes(g_netconfig_db) != 1) rc = -1;
+    return rc;
+}
+
 static int nc_ipam_add_exclude_ip(const char *network_id, const char *ip)
 {
-    sqlite3_stmt *st = NULL; char scope[96] = "", cur[1024] = "", next[1200]; int rc = -1;
+    char scope[96] = "", cur[NC_IPAM_EXCLUDE_MAX] = "", next[NC_IPAM_EXCLUDE_MAX + 64]; int found, has;
     if (!network_id || !network_id[0] || !nc_ipv4_ok(ip)) return -1;
-    if (nc_prepare(&st, "SELECT id,exclude_pool FROM dhcp_scope WHERE lan_id=?1 ORDER BY id LIMIT 1") == 0) {
-        sqlite3_bind_text(st, 1, network_id, -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(st) == SQLITE_ROW) { if (sqlite3_column_text(st,0)) snprintf(scope,sizeof(scope),"%s",(const char*)sqlite3_column_text(st,0)); if (sqlite3_column_text(st,1)) snprintf(cur,sizeof(cur),"%s",(const char*)sqlite3_column_text(st,1)); }
-        sqlite3_finalize(st); st = NULL;
-    }
-    if (!scope[0]) return -1;
-    if (strstr(cur, ip)) return 0;
+    found = nc_ipam_scope_exclude_load(network_id, scope, sizeof(scope), cur, sizeof(cur));
+    if (found != 1) return -1;
+    has = nc_ipam_exclude_has(cur, ip);
+    if (has < 0) return -1;
+    if (has == 1) return 0;
+    if (strlen(cur) + (cur[0] ? 1 : 0) + strlen(ip) >= sizeof(next)) return -1;
     snprintf(next, sizeof(next), "%s%s%s", cur, cur[0] ? "," : "", ip);
-    if (nc_prepare(&st, "UPDATE dhcp_scope SET exclude_pool=?1,updated_at=?2 WHERE id=?3") == 0) {
-        sqlite3_bind_text(st,1,next,-1,SQLITE_TRANSIENT); sqlite3_bind_int64(st,2,nc_now_s()); sqlite3_bind_text(st,3,scope,-1,SQLITE_TRANSIENT); rc=nc_step_done(st); sqlite3_finalize(st);
-    }
-    return rc;
+    return nc_ipam_scope_exclude_store(scope, next);
+}
+
+/*
+ * The exclude token belongs to the DHCP scope, not to a single IPAM row, so it
+ * may only be withdrawn once no remaining exclude-typed address still needs it.
+ */
+static int nc_ipam_exclude_still_required(const char *network_id, const char *ip)
+{
+    sqlite3_stmt *st = NULL; int required = -1;
+    if (nc_prepare(&st, "SELECT COUNT(*) FROM ipam_address WHERE network_id=?1 AND ip=?2 AND source='exclude'") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, network_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, ip, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) required = sqlite3_column_int(st, 0) > 0 ? 1 : 0;
+    sqlite3_finalize(st);
+    return required;
 }
 
 static int nc_ipam_remove_exclude_ip(const char *network_id, const char *ip)
 {
-    sqlite3_stmt *st = NULL; char scope[96] = "", cur[1024] = "", next[1024] = ""; int rc = -1;
-    char tmp[1024], *save = NULL, *tok;
+    char scope[96] = "", cur[NC_IPAM_EXCLUDE_MAX] = "", next[NC_IPAM_EXCLUDE_MAX] = "";
+    char tmp[NC_IPAM_EXCLUDE_MAX]; char *save = NULL, *tok; int found, still, has;
     if (!network_id || !network_id[0] || !nc_ipv4_ok(ip)) return -1;
-    if (nc_prepare(&st, "SELECT id,exclude_pool FROM dhcp_scope WHERE lan_id=?1 ORDER BY id LIMIT 1") == 0) {
-        sqlite3_bind_text(st, 1, network_id, -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(st) == SQLITE_ROW) { if (sqlite3_column_text(st,0)) snprintf(scope,sizeof(scope),"%s",(const char*)sqlite3_column_text(st,0)); if (sqlite3_column_text(st,1)) snprintf(cur,sizeof(cur),"%s",(const char*)sqlite3_column_text(st,1)); }
-        sqlite3_finalize(st); st = NULL;
+    still = nc_ipam_exclude_still_required(network_id, ip);
+    if (still < 0) return -1;
+    if (still == 1) return 0;
+    found = nc_ipam_scope_exclude_load(network_id, scope, sizeof(scope), cur, sizeof(cur));
+    if (found < 0) return -1;
+    /* A network without a DHCP scope has no exclude list to clean up. */
+    if (found == 0) return 0;
+    has = nc_ipam_exclude_has(cur, ip);
+    if (has < 0) return -1;
+    if (has == 0) return 0;
+    snprintf(tmp, sizeof(tmp), "%s", cur);
+    for (tok = strtok_r(tmp, NC_IPAM_EXCLUDE_SEP, &save); tok; tok = strtok_r(NULL, NC_IPAM_EXCLUDE_SEP, &save)) {
+        if (!strcmp(tok, ip)) continue;
+        if (strlen(next) + (next[0] ? 1 : 0) + strlen(tok) >= sizeof(next)) return -1;
+        if (next[0]) strncat(next, ",", sizeof(next) - strlen(next) - 1);
+        strncat(next, tok, sizeof(next) - strlen(next) - 1);
     }
-    if (!scope[0]) return -1;
-    snprintf(tmp,sizeof(tmp),"%s",cur);
-    for(tok=strtok_r(tmp,", \t\r\n",&save);tok;tok=strtok_r(NULL,", \t\r\n",&save)) if(strcmp(tok,ip)){ if(next[0]) strncat(next,",",sizeof(next)-strlen(next)-1); strncat(next,tok,sizeof(next)-strlen(next)-1); }
-    if (nc_prepare(&st, "UPDATE dhcp_scope SET exclude_pool=?1,updated_at=?2 WHERE id=?3") == 0) { sqlite3_bind_text(st,1,next,-1,SQLITE_TRANSIENT); sqlite3_bind_int64(st,2,nc_now_s()); sqlite3_bind_text(st,3,scope,-1,SQLITE_TRANSIENT); rc=nc_step_done(st); sqlite3_finalize(st); }
+    return nc_ipam_scope_exclude_store(scope, next);
+}
+
+/*
+ * Reservations are keyed by (scope, mac): only drop the DHCP row when no
+ * remaining IPAM reservation for the same network/IP still claims that MAC.
+ */
+static int nc_ipam_prune_dhcp_reservation(const char *network_id, const char *ip)
+{
+    sqlite3_stmt *st = NULL; int rc;
+    if (!network_id || !network_id[0] || !nc_ipv4_ok(ip)) return -1;
+    if (nc_prepare(&st,
+            "DELETE FROM dhcp_reservation WHERE ip=?1 AND scope_id IN (SELECT id FROM dhcp_scope WHERE lan_id=?2) "
+            "AND NOT EXISTS (SELECT 1 FROM ipam_address a WHERE a.network_id=?2 AND a.ip=?1 "
+            "AND a.source='reservation' AND a.mac<>'' AND a.mac=lower(dhcp_reservation.mac))") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, ip, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, network_id, -1, SQLITE_TRANSIENT);
+    rc = nc_step_done(st); sqlite3_finalize(st);
     return rc;
 }
 
 static int nc_ipam_network_exists(const char *nid, char *subnet, size_t subnet_len)
 { sqlite3_stmt *st=NULL; int ok=0; if(nc_prepare(&st,"SELECT subnet FROM ipam_network WHERE id=?1 AND enabled=1")==0){sqlite3_bind_text(st,1,nid,-1,SQLITE_TRANSIENT); if(sqlite3_step(st)==SQLITE_ROW){ok=1;if(subnet)snprintf(subnet,subnet_len,"%s",(const char*)sqlite3_column_text(st,0));}sqlite3_finalize(st);} return ok; }
 
+static sqlite3_int64 nc_ipam_revision(void)
+{
+    sqlite3_stmt *st=NULL; sqlite3_int64 revision=1;
+    if(nc_prepare(&st,"SELECT revision FROM ipam_meta WHERE id=1")==0){if(sqlite3_step(st)==SQLITE_ROW)revision=sqlite3_column_int64(st,0);sqlite3_finalize(st);}
+    return revision;
+}
+
+static struct json_object *nc_ipam_transaction_error(const char *error,
+                                                       sqlite3_int64 revision)
+{
+    struct json_object *data=json_object_new_object();
+    json_object_object_add(data,"ok",json_object_new_boolean(0));
+    json_object_object_add(data,"error",json_object_new_string(error));
+    json_object_object_add(data,"revision",json_object_new_int64(revision));
+    return jmx_gen_api_response_data(API_CODE_ERROR,data);
+}
+
+struct json_object *jmx_bulk_ip_transaction(struct json_object *cfg)
+{
+    struct json_object *expected_obj=NULL,*items=NULL,*ips=NULL,*results=json_object_new_array();
+    const char *nid,*action; char subnet[64]; sqlite3_int64 expected_revision,current_revision,new_revision;
+    int i,n,rc=0,failed_index=-1; const char *failed_reason=NULL;
+    if(!cfg||jmx_netconfig_db_init()!=0){json_object_put(results);return nc_ipam_transaction_error("storage_error",0);}
+    nc_ipam_db_init();
+    if(nc_exec("BEGIN IMMEDIATE")!=0){json_object_put(results);return nc_ipam_transaction_error("transaction_busy",nc_ipam_revision());}
+    nc_ipam_seed_networks();
+    current_revision=nc_ipam_revision();
+    if(!json_object_object_get_ex(cfg,"expected_revision",&expected_obj)||!expected_obj){nc_exec("ROLLBACK");json_object_put(results);return nc_ipam_transaction_error("missing_expected_revision",current_revision);}
+    expected_revision=json_object_get_int64(expected_obj);
+    if(expected_revision<1){nc_exec("ROLLBACK");json_object_put(results);return nc_ipam_transaction_error("invalid_expected_revision",current_revision);}
+    if(expected_revision!=current_revision){nc_exec("ROLLBACK");json_object_put(results);return nc_ipam_transaction_error("revision_conflict",current_revision);}
+    nid=nc_json_str_def(cfg,"network_id",""); action=nc_json_str_def(cfg,"action","");
+    if(!nc_ipam_network_exists(nid,subnet,sizeof(subnet))){nc_exec("ROLLBACK");json_object_put(results);return nc_ipam_transaction_error("network_not_found",current_revision);}
+    json_object_object_get_ex(cfg,"items",&items); json_object_object_get_ex(cfg,"ips",&ips);
+    if(!strcmp(action,"free")&&!items) items=ips;
+    if(!items||!json_object_is_type(items,json_type_array)||(n=json_object_array_length(items))<1||n>1000){nc_exec("ROLLBACK");json_object_put(results);return nc_ipam_transaction_error("invalid_items",current_revision);}
+    if(strcmp(action,"reserve")&&strcmp(action,"free")&&strcmp(action,"delete")&&strcmp(action,"metadata-update")){nc_exec("ROLLBACK");json_object_put(results);return nc_ipam_transaction_error("invalid_action",current_revision);}
+    for(i=0;i<n&&rc==0;i++){
+        struct json_object *x=json_object_array_get_idx(items,i),*result=json_object_new_object();
+        const char *ip=json_object_is_type(x,json_type_string)?json_object_get_string(x):nc_json_str_def(x,"ip","");
+        const char *id=json_object_is_type(x,json_type_object)?nc_json_str_def(x,"id",""):"";
+        const char *reason=NULL;
+        json_object_object_add(result,"index",json_object_new_int(i));
+        if(ip&&ip[0])json_object_object_add(result,"ip",json_object_new_string(ip));
+        if(id&&id[0])json_object_object_add(result,"id",json_object_new_string(id));
+        if(!strcmp(action,"reserve")){
+            const char *mac=nc_json_str_def(x,"mac",""); char macn[32]="", expected_id[160]=""; sqlite3_stmt *verify=NULL; int present=0;
+            if(!nc_ip_in_cidr_text(ip,subnet)){rc=-1;reason="ip_outside_network_subnet";}
+            else if(mac[0]&&!nc_mac_normalize(mac,macn,sizeof(macn))){rc=-1;reason="invalid_mac";}
+            if(rc==0&&macn[0]&&nc_prepare(&verify,"DELETE FROM ipam_address WHERE network_id=?1 AND mac=?2 AND source='reservation' AND ip<>?3")==0){sqlite3_bind_text(verify,1,nid,-1,SQLITE_TRANSIENT);sqlite3_bind_text(verify,2,macn,-1,SQLITE_TRANSIENT);sqlite3_bind_text(verify,3,ip,-1,SQLITE_TRANSIENT);rc=nc_step_done(verify);sqlite3_finalize(verify);verify=NULL;if(rc!=0)reason="stale_reservation_cleanup_failed";}
+            if(rc==0){if(id[0])snprintf(expected_id,sizeof(expected_id),"%s",id);else snprintf(expected_id,sizeof(expected_id),"%s_%s_%s",nid,ip,macn[0]?macn:"exclude");rc=nc_ipam_upsert_addr_id(expected_id,nid,ip,macn,nc_json_str_def(x,"hostname",""),nc_json_str_def(x,"owner",""),nc_json_str_def(x,"type",macn[0]?"unknown":"reserved"),macn[0]?"reservation":"exclude","reserved",nc_json_str_def(x,"note",""),0);if(rc!=0)reason="ipam_address_write_failed";if(rc==0&&macn[0]){rc=nc_ipam_sync_dhcp_reservation(nid,ip,macn,nc_json_str_def(x,"hostname",""),nc_json_str_def(x,"note",""));if(rc!=0)reason="dhcp_reservation_write_failed";}else if(rc==0){rc=nc_ipam_add_exclude_ip(nid,ip);if(rc!=0)reason="dhcp_exclude_write_failed";}}
+            if(rc==0&&nc_prepare(&verify,"SELECT 1 FROM ipam_address WHERE id=?1 AND network_id=?2 AND ip=?3 AND mac=?4 AND source=?5")==0){sqlite3_bind_text(verify,1,expected_id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(verify,2,nid,-1,SQLITE_TRANSIENT);sqlite3_bind_text(verify,3,ip,-1,SQLITE_TRANSIENT);sqlite3_bind_text(verify,4,macn,-1,SQLITE_TRANSIENT);sqlite3_bind_text(verify,5,macn[0]?"reservation":"exclude",-1,SQLITE_TRANSIENT);present=sqlite3_step(verify)==SQLITE_ROW;sqlite3_finalize(verify);if(!present){rc=-1;reason="readback_mismatch";}}
+        }else if(!strcmp(action,"free")){
+            sqlite3_stmt *st=NULL; if(!nc_ip_in_cidr_text(ip,subnet)){rc=-1;reason="ip_outside_network_subnet";}
+            if(rc==0&&nc_prepare(&st,"DELETE FROM ipam_address WHERE network_id=?1 AND ip=?2 AND source IN ('manual','reservation','exclude','import')")==0){sqlite3_bind_text(st,1,nid,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,ip,-1,SQLITE_TRANSIENT);rc=nc_step_done(st);sqlite3_finalize(st);if(rc!=0)reason="ipam_address_delete_failed";if(rc==0){rc=nc_ipam_remove_exclude_ip(nid,ip);if(rc!=0)reason="dhcp_exclude_cleanup_failed";}}
+            if(rc==0){rc=nc_ipam_prune_dhcp_reservation(nid,ip);if(rc!=0)reason="dhcp_reservation_cleanup_failed";}
+        }else if(!strcmp(action,"delete")){
+            sqlite3_stmt *st=NULL; char deleted_ip[64]=""; if(!id[0]){rc=-1;reason="missing_id";}
+            if(rc==0&&nc_prepare(&st,"SELECT ip FROM ipam_address WHERE network_id=?1 AND id=?2 AND source IN ('manual','reservation','exclude','import')")==0){sqlite3_bind_text(st,1,nid,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,id,-1,SQLITE_TRANSIENT);if(sqlite3_step(st)==SQLITE_ROW&&sqlite3_column_text(st,0))snprintf(deleted_ip,sizeof(deleted_ip),"%s",(const char*)sqlite3_column_text(st,0));else{rc=-1;reason="reservation_not_found";}sqlite3_finalize(st);}
+            if(rc==0&&nc_prepare(&st,"DELETE FROM ipam_address WHERE network_id=?1 AND id=?2 AND source IN ('manual','reservation','exclude','import')")==0){sqlite3_bind_text(st,1,nid,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,id,-1,SQLITE_TRANSIENT);rc=nc_step_done(st);sqlite3_finalize(st);if(rc==0&&sqlite3_changes(g_netconfig_db)!=1)rc=-1;if(rc!=0)reason="ipam_address_delete_failed";}
+            if(rc==0){rc=nc_ipam_remove_exclude_ip(nid,deleted_ip);if(rc!=0)reason="dhcp_exclude_cleanup_failed";}
+            if(rc==0){rc=nc_ipam_prune_dhcp_reservation(nid,deleted_ip);if(rc!=0)reason="dhcp_reservation_cleanup_failed";}
+        }else if(!strcmp(action,"metadata-update")){
+            sqlite3_stmt *st=NULL; if(!id[0]){rc=-1;reason="missing_id";}
+            if(rc==0&&nc_prepare(&st,"UPDATE ipam_address SET owner=?1,type=?2,note=?3,updated_at=?4 WHERE network_id=?5 AND id=?6")==0){sqlite3_bind_text(st,1,nc_json_str_def(x,"owner",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(x,"type","unknown"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(x,"note",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,4,nc_now_s());sqlite3_bind_text(st,5,nid,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,id,-1,SQLITE_TRANSIENT);rc=nc_step_done(st);sqlite3_finalize(st);if(rc==0&&sqlite3_changes(g_netconfig_db)!=1){rc=-1;reason="reservation_not_found";}else if(rc!=0)reason="ipam_metadata_write_failed";}
+        }else{rc=-1;reason="invalid_action";}
+        if(rc!=0&&failed_index<0){failed_index=i;failed_reason=reason?reason:"transaction_item_failed";}
+        json_object_object_add(result,"applied",json_object_new_boolean(rc==0));
+        json_object_object_add(result,"error",rc==0?json_object_new_null():json_object_new_string(reason?reason:"transaction_item_failed"));
+        json_object_array_add(results,result);
+    }
+    if(rc==0){sqlite3_stmt *st=NULL;if(nc_prepare(&st,"UPDATE ipam_meta SET revision=revision+1,updated_at=?1 WHERE id=1 AND revision=?2")==0){sqlite3_bind_int64(st,1,nc_now_s());sqlite3_bind_int64(st,2,expected_revision);rc=nc_step_done(st);sqlite3_finalize(st);if(rc==0&&sqlite3_changes(g_netconfig_db)!=1)rc=-1;}else rc=-1;if(rc!=0&&!failed_reason)failed_reason="revision_conflict";}
+    if(rc!=0||nc_exec("COMMIT")!=0){
+        struct json_object *data=json_object_new_object(); int j;
+        if(!failed_reason)failed_reason="storage_error";
+        nc_exec("ROLLBACK");
+        for(j=0;j<(int)json_object_array_length(results);j++){
+            struct json_object *item=json_object_array_get_idx(results,j);
+            struct json_object *prior=NULL; const char *kept=NULL;
+            if(json_object_object_get_ex(item,"error",&prior)&&prior&&json_object_is_type(prior,json_type_string))kept=json_object_get_string(prior);
+            json_object_object_add(item,"applied",json_object_new_boolean(0));
+            json_object_object_add(item,"rolled_back",json_object_new_boolean(1));
+            json_object_object_add(item,"error",json_object_new_string(kept&&kept[0]?kept:"transaction_rolled_back"));
+        }
+        json_object_object_add(data,"ok",json_object_new_boolean(0));
+        json_object_object_add(data,"error",json_object_new_string(failed_reason));
+        json_object_object_add(data,"rolled_back",json_object_new_boolean(1));
+        json_object_object_add(data,"failed_index",failed_index>=0?json_object_new_int(failed_index):json_object_new_null());
+        json_object_object_add(data,"failed_reason",json_object_new_string(failed_reason));
+        json_object_object_add(data,"revision",json_object_new_int64(current_revision));
+        json_object_object_add(data,"results",results);
+        return jmx_gen_api_response_data(API_CODE_ERROR,data);
+    }
+    new_revision=nc_ipam_revision();
+    {
+        struct json_object *data=json_object_new_object(),*envelope=jmx_bulk_ip_get(),*snapshot=NULL;
+        if(envelope&&json_object_object_get_ex(envelope,"data",&snapshot)&&snapshot)snapshot=json_object_get(snapshot);else snapshot=json_object_new_object();
+        if(envelope)json_object_put(envelope);
+        json_object_object_add(data,"ok",json_object_new_boolean(1));json_object_object_add(data,"revision",json_object_new_int64(new_revision));json_object_object_add(data,"results",results);json_object_object_add(data,"readback",snapshot);
+        json_object_object_add(data,"runtime_applied",json_object_new_boolean(0));json_object_object_add(data,"runtime_reason",json_object_new_string("dhcp_process_reload_not_part_of_sqlite_transaction"));
+        return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
+    }
+}
+
+/*
+ * Dynamic discovery (DHCP leases, gateway rows, ARP/neigh) is a write path, so
+ * it needs an owner of its own now that GET is side-effect free. It runs in one
+ * transaction and bumps the same revision readers compare against, so a client
+ * cannot mistake a refresh-induced change for a stale snapshot.
+ */
+struct json_object *jmx_bulk_ip_refresh(struct json_object *cfg)
+{
+    struct json_object *data=json_object_new_object(); sqlite3_stmt *st=NULL;
+    sqlite3_int64 before=0,after=0; int rc=0;
+    (void)cfg;
+    if(jmx_netconfig_db_init()!=0){json_object_object_add(data,"ok",json_object_new_boolean(0));json_object_object_add(data,"error",json_object_new_string("storage_error"));return jmx_gen_api_response_data(API_CODE_ERROR,data);}
+    nc_ipam_db_init();
+    nc_dhcp_refresh_leases();
+    if(nc_exec("BEGIN IMMEDIATE")!=0){json_object_object_add(data,"ok",json_object_new_boolean(0));json_object_object_add(data,"error",json_object_new_string("transaction_busy"));json_object_object_add(data,"revision",json_object_new_int64(nc_ipam_revision()));return jmx_gen_api_response_data(API_CODE_ERROR,data);}
+    before=nc_ipam_revision();
+    nc_ipam_refresh_sources();
+    nc_ipam_mark_conflicts();
+    if(nc_prepare(&st,"UPDATE ipam_meta SET revision=revision+1,updated_at=?1 WHERE id=1 AND revision=?2")==0){sqlite3_bind_int64(st,1,nc_now_s());sqlite3_bind_int64(st,2,before);rc=nc_step_done(st);sqlite3_finalize(st);if(rc==0&&sqlite3_changes(g_netconfig_db)!=1)rc=-1;}else rc=-1;
+    if(rc!=0||nc_exec("COMMIT")!=0){nc_exec("ROLLBACK");json_object_object_add(data,"ok",json_object_new_boolean(0));json_object_object_add(data,"error",json_object_new_string("refresh_rolled_back"));json_object_object_add(data,"rolled_back",json_object_new_boolean(1));json_object_object_add(data,"revision",json_object_new_int64(before));return jmx_gen_api_response_data(API_CODE_ERROR,data);}
+    after=nc_ipam_revision();
+    {
+        struct json_object *envelope=jmx_bulk_ip_get(),*snapshot=NULL;
+        if(envelope&&json_object_object_get_ex(envelope,"data",&snapshot)&&snapshot)snapshot=json_object_get(snapshot);else snapshot=json_object_new_object();
+        if(envelope)json_object_put(envelope);
+        json_object_object_add(data,"ok",json_object_new_boolean(1));
+        json_object_object_add(data,"revision",json_object_new_int64(after));
+        json_object_object_add(data,"sources",nc_json_array_from_text("[\"ipam_network\",\"dhcp_reservation\",\"dhcp_lease_cache\",\"proc_net_arp\"]"));
+        json_object_object_add(data,"readback",snapshot);
+    }
+    return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
+}
+
 int jmx_bulk_ip_set(struct json_object *cfg)
 {
-    const char *nid=nc_json_str_def(cfg,"network_id",""); const char *action=nc_json_str_def(cfg,"action",""); char subnet[64]; struct json_object *arr=NULL; int i,n,rc=0;
-    if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_ipam_db_init(); nc_ipam_seed_networks(); if(!nc_ipam_network_exists(nid,subnet,sizeof(subnet)))return -1;
-    nc_exec("BEGIN IMMEDIATE");
-    if(!strcmp(action,"reserve")){ if(!json_object_object_get_ex(cfg,"items",&arr)||!arr||!json_object_is_type(arr,json_type_array)||json_object_array_length(arr)>1000) rc=-1; else { for(i=0,n=json_object_array_length(arr);i<n&&rc==0;i++){struct json_object*x=json_object_array_get_idx(arr,i); const char*ip=nc_json_str_def(x,"ip",""); const char*mac=nc_json_str_def(x,"mac",""); char macn[32]=""; if(!nc_ip_in_cidr_text(ip,subnet)) {rc=-1;break;} if(mac[0]&&!nc_mac_normalize(mac,macn,sizeof(macn))){rc=-1;break;} nc_ipam_upsert_addr(nid,ip,macn,nc_json_str_def(x,"hostname",""),nc_json_str_def(x,"owner",""),nc_json_str_def(x,"type",macn[0]?"unknown":"reserved"),macn[0]?"manual":"exclude",macn[0]?"reserved":"reserved",nc_json_str_def(x,"note",""),0); if(macn[0]) nc_ipam_sync_dhcp_reservation(nid,ip,macn,nc_json_str_def(x,"hostname",""),nc_json_str_def(x,"note","")); else nc_ipam_add_exclude_ip(nid,ip); }} }
-    else if(!strcmp(action,"free")){ if(!json_object_object_get_ex(cfg,"ips",&arr)||!arr||!json_object_is_type(arr,json_type_array)||json_object_array_length(arr)>1000) rc=-1; else { sqlite3_stmt*st=NULL; for(i=0,n=json_object_array_length(arr);i<n&&rc==0;i++){const char*ip=json_object_get_string(json_object_array_get_idx(arr,i)); if(!nc_ip_in_cidr_text(ip,subnet)){rc=-1;break;} if(nc_prepare(&st,"DELETE FROM ipam_address WHERE network_id=?1 AND ip=?2 AND source IN ('manual','exclude','import')")==0){sqlite3_bind_text(st,1,nid,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,ip,-1,SQLITE_TRANSIENT); if(nc_step_done(st)!=0)rc=-1; sqlite3_finalize(st); nc_ipam_remove_exclude_ip(nid,ip);}} }}
-    else rc=-1;
-    nc_exec(rc==0?"COMMIT":"ROLLBACK"); return rc;
+    struct json_object *request,*response,*code=NULL; int ok=0;
+    if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_ipam_db_init();
+    request=json_tokener_parse(json_object_to_json_string(cfg)); if(!request)return -1;
+    if(!json_object_object_get_ex(request,"expected_revision",&code))json_object_object_add(request,"expected_revision",json_object_new_int64(nc_ipam_revision()));
+    response=jmx_bulk_ip_transaction(request); json_object_put(request);
+    if(response&&json_object_object_get_ex(response,"code",&code))ok=json_object_get_int(code)==API_CODE_SUCCESS;
+    if(response)json_object_put(response); return ok?0:-1;
 }
 static int nc_csv_split_line(char *line, char cols[][256], int max_cols)
 {
@@ -15394,7 +16144,8 @@ struct json_object *jmx_bulk_ip_import(struct json_object *cfg)
     struct json_object *data=json_object_new_object(), *rows=NULL; const char*nid=nc_json_str_def(cfg,"network_id",""); const char*fn=nc_json_str_def(cfg,"filename",""); char subnet[64], job[80]; int i,n,ok=0,fail=0;
     if(jmx_netconfig_db_init()!=0){json_object_object_add(data,"ok",json_object_new_boolean(0));return jmx_gen_api_response_data(API_CODE_ERROR,data);} nc_ipam_db_init(); nc_ipam_seed_networks(); snprintf(job,sizeof(job),"job-%lld",(long long)nc_now_s());
     if(!json_object_object_get_ex(cfg,"rows",&rows)||!rows||!json_object_is_type(rows,json_type_array)){ const char *csv = nc_json_str_def(cfg,"csv",""); rows = nc_ipam_rows_from_csv(csv); } else json_object_get(rows);
-    if(!nc_ipam_network_exists(nid,subnet,sizeof(subnet))||!rows||!json_object_is_type(rows,json_type_array)||json_object_array_length(rows)>1000){ if(rows)json_object_put(rows); json_object_object_add(data,"ok",json_object_new_boolean(0));return jmx_gen_api_response_data(API_CODE_ERROR,data);} n=json_object_array_length(rows); nc_exec("BEGIN IMMEDIATE");
+    if(!nc_ipam_network_exists(nid,subnet,sizeof(subnet))||!rows||!json_object_is_type(rows,json_type_array)||json_object_array_length(rows)>1000){ if(rows)json_object_put(rows); json_object_object_add(data,"ok",json_object_new_boolean(0));return jmx_gen_api_response_data(API_CODE_ERROR,data);} n=json_object_array_length(rows);
+    if(nc_txn_begin()!=0){ json_object_put(rows); json_object_object_add(data,"ok",json_object_new_boolean(0)); json_object_object_add(data,"error",json_object_new_string("store_busy")); return jmx_gen_api_response_data(API_CODE_ERROR,data); }
     for(i=0;i<n;i++){struct json_object*r=json_object_array_get_idx(rows,i); const char*ip=nc_json_str_def(r,"ip",""); const char*mac=nc_json_str_def(r,"mac",""); char macn[32]=""; if(!nc_ip_in_cidr_text(ip,subnet)||(mac[0]&&!nc_mac_normalize(mac,macn,sizeof(macn)))){fail++;continue;} nc_ipam_upsert_addr(nid,ip,macn,nc_json_str_def(r,"hostname",""),nc_json_str_def(r,"owner",""),nc_json_str_def(r,"type","unknown"),"import",nc_json_str_def(r,"status",macn[0]?"reserved":"reserved"),nc_json_str_def(r,"note",""),0); ok++; }
     {sqlite3_stmt*st=NULL; if(nc_prepare(&st,"INSERT INTO ipam_import_job(id,filename,rows,success,failed,error,created_at) VALUES(?1,?2,?3,?4,?5,'',?6)")==0){sqlite3_bind_text(st,1,job,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,fn,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,3,n);sqlite3_bind_int(st,4,ok);sqlite3_bind_int(st,5,fail);sqlite3_bind_int64(st,6,nc_now_s());nc_step_done(st);sqlite3_finalize(st);}}
     nc_exec("COMMIT"); if(rows)json_object_put(rows); json_object_object_add(data,"ok",json_object_new_boolean(1)); json_object_object_add(data,"id",json_object_new_string(job)); json_object_object_add(data,"rows",json_object_new_int(n)); json_object_object_add(data,"success",json_object_new_int(ok)); json_object_object_add(data,"failed",json_object_new_int(fail)); return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
@@ -15403,7 +16154,8 @@ struct json_object *jmx_bulk_ip_import(struct json_object *cfg)
 struct json_object *jmx_bulk_ip_export(struct json_object *cfg)
 {
     struct json_object *data=json_object_new_object(), *rows=json_object_new_array(); const char*nid=nc_json_str_def(cfg,"network_id",""); sqlite3_stmt*st=NULL;
-    if(jmx_netconfig_db_init()!=0) goto done; nc_ipam_db_init(); nc_ipam_refresh_sources();
+    /* Export is a read: dynamic ingestion belongs to jmx_bulk_ip_refresh(). */
+    if(jmx_netconfig_db_init()!=0) goto done; nc_ipam_db_init();
     if(nc_prepare(&st,nid[0]?"SELECT ip,mac,hostname,owner,type,note,status,network_id FROM ipam_address WHERE network_id=?1 ORDER BY ip,mac":"SELECT ip,mac,hostname,owner,type,note,status,network_id FROM ipam_address ORDER BY network_id,ip,mac")==0){if(nid[0])sqlite3_bind_text(st,1,nid,-1,SQLITE_TRANSIENT); while(sqlite3_step(st)==SQLITE_ROW){struct json_object*r=json_object_new_object(); nc_add_text(r,"ip",st,0); nc_add_text(r,"mac",st,1); nc_add_text(r,"hostname",st,2); nc_add_text(r,"owner",st,3); nc_add_text(r,"type",st,4); nc_add_text(r,"note",st,5); nc_add_text(r,"status",st,6); nc_add_text(r,"network_id",st,7); json_object_array_add(rows,r);}sqlite3_finalize(st);}
 done:
     json_object_object_add(data,"format",json_object_new_string("json")); json_object_object_add(data,"columns",nc_json_array_from_text("[\"ip\",\"mac\",\"hostname\",\"owner\",\"type\",\"note\",\"status\"]")); json_object_object_add(data,"rows",rows); return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
@@ -15491,7 +16243,8 @@ int jmx_vpn_config_set(struct json_object *cfg)
     struct json_object *g=NULL,*arr=NULL; sqlite3_stmt*st=NULL; int rc=0,i,n; char *routes=NULL,*dns=NULL,*ln=NULL,*rn=NULL,*protos=NULL;
     if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_vpn_db_init();
     json_object_object_get_ex(cfg,"servers",&arr); if(nc_vpn_validate_array(arr,"server")!=0)return -1; json_object_object_get_ex(cfg,"clients",&arr); if(nc_vpn_validate_array(arr,"client")!=0)return -1; json_object_object_get_ex(cfg,"site_to_site",&arr); if(nc_vpn_validate_array(arr,"site")!=0)return -1;
-    nc_exec("BEGIN IMMEDIATE"); json_object_object_get_ex(cfg,"global",&g); if(g&&nc_prepare(&st,"INSERT INTO vpn_global(id,enabled,route_mode,dns_mode,firewall_zone,auto_nat,certificate_authority,account_backend,log_level,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,route_mode=excluded.route_mode,dns_mode=excluded.dns_mode,firewall_zone=excluded.firewall_zone,auto_nat=excluded.auto_nat,certificate_authority=excluded.certificate_authority,account_backend=excluded.account_backend,log_level=excluded.log_level,updated_at=excluded.updated_at")==0){sqlite3_bind_int(st,1,nc_json_bool_def(g,"enabled",1));sqlite3_bind_text(st,2,nc_json_str_def(g,"route_mode","policy"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(g,"dns_mode","push"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(g,"firewall_zone","vpn"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,5,nc_json_bool_def(g,"auto_nat",1));sqlite3_bind_text(st,6,nc_json_str_def(g,"certificate_authority",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(g,"account_backend","local"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(g,"log_level","info"),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,9,nc_now_s());if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}
+    if (nc_txn_begin() != 0) return -1;
+    json_object_object_get_ex(cfg,"global",&g); if(g&&nc_prepare(&st,"INSERT INTO vpn_global(id,enabled,route_mode,dns_mode,firewall_zone,auto_nat,certificate_authority,account_backend,log_level,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,route_mode=excluded.route_mode,dns_mode=excluded.dns_mode,firewall_zone=excluded.firewall_zone,auto_nat=excluded.auto_nat,certificate_authority=excluded.certificate_authority,account_backend=excluded.account_backend,log_level=excluded.log_level,updated_at=excluded.updated_at")==0){sqlite3_bind_int(st,1,nc_json_bool_def(g,"enabled",1));sqlite3_bind_text(st,2,nc_json_str_def(g,"route_mode","policy"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(g,"dns_mode","push"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(g,"firewall_zone","vpn"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,5,nc_json_bool_def(g,"auto_nat",1));sqlite3_bind_text(st,6,nc_json_str_def(g,"certificate_authority",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(g,"account_backend","local"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(g,"log_level","info"),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,9,nc_now_s());if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}
     if(rc==0&&json_object_object_get_ex(cfg,"servers",&arr)&&arr){nc_exec("DELETE FROM vpn_server");for(i=0,n=json_object_array_length(arr);i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);json_object_object_get_ex(o,"routes",&g);routes=nc_json_array_to_string(g,"[]");json_object_object_get_ex(o,"dns",&g);dns=nc_json_array_to_string(g,"[]");if(nc_prepare(&st,"INSERT INTO vpn_server(id,protocol,name,enabled,listen,address_pool,local_address,port,auth,routes,dns,mtu,mru,lcp_interval,force_internet,client_isolation,vlan_binding,remark,sort_order,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)")==0){sqlite3_bind_text(st,1,nc_json_str_def(o,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(o,"protocol",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(o,"name",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,4,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,5,nc_json_str_def(o,"listen",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,nc_json_str_def(o,"address_pool",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(o,"local_address",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(o,"port",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,9,nc_json_str_def(o,"auth","local"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,10,routes,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,11,dns,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,12,nc_json_int_def(o,"mtu",0));sqlite3_bind_int(st,13,nc_json_int_def(o,"mru",0));sqlite3_bind_int(st,14,nc_json_int_def(o,"lcp_interval",0));sqlite3_bind_int(st,15,nc_json_bool_def(o,"force_internet",0));sqlite3_bind_int(st,16,nc_json_bool_def(o,"client_isolation",0));sqlite3_bind_int(st,17,nc_json_bool_def(o,"vlan_binding",0));sqlite3_bind_text(st,18,nc_json_str_def(o,"remark",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,19,nc_json_int_def(o,"sort_order",1000));sqlite3_bind_int64(st,20,nc_now_s());if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}free(routes);free(dns);routes=dns=NULL;}}
     if(rc==0&&json_object_object_get_ex(cfg,"clients",&arr)&&arr){nc_exec("DELETE FROM vpn_client");for(i=0,n=json_object_array_length(arr);i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);json_object_object_get_ex(o,"routes",&g);routes=nc_json_array_to_string(g,"[]");if(nc_prepare(&st,"INSERT INTO vpn_client(id,protocol,name,enabled,remote,iface,bind_wan,auth,username,local_address,server_address,routes,nat,remark,sort_order,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)")==0){sqlite3_bind_text(st,1,nc_json_str_def(o,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(o,"protocol",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(o,"name",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,4,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,5,nc_json_str_def(o,"remote",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,nc_json_str_def(o,"iface",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(o,"bind_wan",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(o,"auth",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,9,nc_json_str_def(o,"username",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,10,nc_json_str_def(o,"local_address",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,11,nc_json_str_def(o,"server_address",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,12,routes,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,13,nc_json_bool_def(o,"nat",0));sqlite3_bind_text(st,14,nc_json_str_def(o,"remark",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,15,nc_json_int_def(o,"sort_order",1000));sqlite3_bind_int64(st,16,nc_now_s());if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}free(routes);routes=NULL;}}
     if(rc==0&&json_object_object_get_ex(cfg,"site_to_site",&arr)&&arr){nc_exec("DELETE FROM vpn_site");for(i=0,n=json_object_array_length(arr);i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);json_object_object_get_ex(o,"local_networks",&g);ln=nc_json_array_to_string(g,"[]");json_object_object_get_ex(o,"remote_networks",&g);rn=nc_json_array_to_string(g,"[]");if(nc_prepare(&st,"INSERT INTO vpn_site(id,type,name,enabled,local_networks,remote_networks,peer,wan,remark,sort_order,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")==0){sqlite3_bind_text(st,1,nc_json_str_def(o,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(o,"type",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(o,"name",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,4,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,5,ln,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,rn,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(o,"peer",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(o,"wan",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,9,nc_json_str_def(o,"remark",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,10,nc_json_int_def(o,"sort_order",1000));sqlite3_bind_int64(st,11,nc_now_s());if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}free(ln);free(rn);ln=rn=NULL;}}
@@ -15564,6 +16317,7 @@ static void nc_flow_db_init(void)
     nc_exec("CREATE TABLE IF NOT EXISTS flow_client_limits (id TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,client TEXT NOT NULL,ip TEXT NOT NULL DEFAULT '',device_group TEXT NOT NULL DEFAULT '',upload_kbps INTEGER NOT NULL DEFAULT 0,download_kbps INTEGER NOT NULL DEFAULT 0,mode TEXT NOT NULL DEFAULT 'inherit',remark TEXT NOT NULL DEFAULT '')");
     nc_exec("CREATE TABLE IF NOT EXISTS flow_runtime_hits (id INTEGER PRIMARY KEY AUTOINCREMENT,ts INTEGER NOT NULL,rule_id TEXT NOT NULL,client TEXT NOT NULL DEFAULT '',src_ip TEXT NOT NULL DEFAULT '',dst TEXT NOT NULL DEFAULT '',action TEXT NOT NULL,target TEXT NOT NULL,up_bytes INTEGER NOT NULL DEFAULT 0,down_bytes INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '')");
     nc_exec("INSERT OR IGNORE INTO flow_global(id,updated_at) VALUES(1,0)");
+    nc_exec("UPDATE flow_global SET apply_state='draft',last_apply_at=0 WHERE apply_state='applied'");
     nc_exec("INSERT OR IGNORE INTO flow_qos(id) VALUES(1)");
     nc_exec("INSERT OR IGNORE INTO flow_classes(id,name,priority,guarantee,ceiling,latency_target,examples,color) VALUES('realtime','实时',1,20,100,18,'游戏 / 会议 / 语音','#1d7dff')");
     nc_exec("INSERT OR IGNORE INTO flow_classes(id,name,priority,guarantee,ceiling,latency_target,examples,color) VALUES('streaming','流媒体',3,10,100,50,'视频 / 直播','#7c3aed')");
@@ -15625,6 +16379,12 @@ struct json_object *jmx_flow_control_get(void)
     if(nc_prepare(&st,"SELECT r.id,r.enabled,r.priority,r.name,r.type,r.source,r.destination,r.apps,r.protocol,r.action,r.target,r.qos_class,r.schedule,r.fallback,r.sticky,COALESCE((SELECT COUNT(*) FROM flow_runtime_hits h WHERE h.rule_id=r.id),0),r.remark FROM flow_rules r ORDER BY r.priority,r.id")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();nc_add_text(o,"id",st,0);json_object_object_add(o,"enabled",json_object_new_boolean(sqlite3_column_int(st,1)));json_object_object_add(o,"priority",json_object_new_int(sqlite3_column_int(st,2)));nc_add_text(o,"name",st,3);nc_add_text(o,"type",st,4);nc_add_text(o,"source",st,5);nc_add_text(o,"destination",st,6);nc_add_text(o,"apps",st,7);nc_add_text(o,"protocol",st,8);nc_add_text(o,"action",st,9);nc_add_text(o,"target",st,10);nc_add_text(o,"qos_class",st,11);nc_add_text(o,"schedule",st,12);nc_add_text(o,"fallback",st,13);json_object_object_add(o,"sticky",json_object_new_boolean(sqlite3_column_int(st,14)));json_object_object_add(o,"hits",json_object_new_int64(sqlite3_column_int64(st,15)));nc_add_text(o,"remark",st,16);json_object_array_add(rules,o);}sqlite3_finalize(st);}
     if(nc_prepare(&st,"SELECT id,enabled,client,ip,device_group,upload_kbps,download_kbps,mode,remark FROM flow_client_limits ORDER BY id")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();nc_add_text(o,"id",st,0);json_object_object_add(o,"enabled",json_object_new_boolean(sqlite3_column_int(st,1)));nc_add_text(o,"client",st,2);nc_add_text(o,"ip",st,3);nc_add_text(o,"group",st,4);json_object_object_add(o,"upload_kbps",json_object_new_int(sqlite3_column_int(st,5)));json_object_object_add(o,"download_kbps",json_object_new_int(sqlite3_column_int(st,6)));nc_add_text(o,"mode",st,7);nc_add_text(o,"remark",st,8);json_object_array_add(limits,o);}sqlite3_finalize(st);}
 done:
+    json_object_object_add(g,"configured_enabled",json_object_new_boolean(nc_json_bool_def(g,"enabled",0)));
+    json_object_object_add(g,"runtime_applied",json_object_new_boolean(0));
+    json_object_object_add(g,"runtime_reason",json_object_new_string("dataplane_apply_executor_missing"));
+    json_object_object_add(q,"configured_enabled",json_object_new_boolean(nc_json_bool_def(q,"enabled",0)));
+    json_object_object_add(q,"runtime_applied",json_object_new_boolean(0));
+    json_object_object_add(q,"runtime_reason",json_object_new_string("dataplane_apply_executor_missing"));
     json_object_object_add(status,"active_flows",json_object_new_int(nc_vpn_count_table("flow_runtime_hits","WHERE ts > strftime('%s','now')-300")));json_object_object_add(status,"shaped_flows",json_object_new_int(0));json_object_object_add(status,"steered_flows",json_object_new_int(0));json_object_object_add(status,"fallback_flows",json_object_new_int(0));json_object_object_add(status,"queue_delay_ms",json_object_new_int(0));json_object_object_add(status,"dropped_packets",json_object_new_int64(0));
 
     /* Smart mode */
@@ -15645,13 +16405,13 @@ done:
       if(nc_prepare(&st,"SELECT id,name,ifname,carrier,enabled FROM wan ORDER BY id")==0){ while(sqlite3_step(st)==SQLITE_ROW){ struct json_object *w = json_object_new_object(); nc_add_text(w,"id",st,0); nc_add_text(w,"name",st,1); nc_add_text(w,"ifname",st,2); nc_add_text(w,"carrier",st,3); json_object_object_add(w,"enabled",json_object_new_boolean(sqlite3_column_int(st,4))); json_object_object_add(w,"status",json_object_new_string(sqlite3_column_int(st,4)?"ok":"disabled")); json_object_array_add(wans,w); } sqlite3_finalize(st); st=NULL; }
       json_object_object_add(data,"wans",wans); }
 
-    json_object_object_add(data,"ts",json_object_new_int64(nc_now_s()));json_object_object_add(data,"global",g);json_object_object_add(data,"qos",q);json_object_object_add(data,"classes",classes);json_object_object_add(data,"groups",groups);json_object_object_add(data,"rules",rules);json_object_object_add(data,"client_limits",limits);json_object_object_add(data,"status",status);return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
+    json_object_object_add(data,"ts",json_object_new_int64(nc_now_s()));json_object_object_add(data,"source_of_truth",json_object_new_string("legacy_flow_control_config"));json_object_object_add(data,"authoritative_runtime_source",json_object_new_string("dreamingwrt.flowd"));json_object_object_add(data,"runtime_applied",json_object_new_boolean(0));json_object_object_add(data,"runtime_reason",json_object_new_string("dataplane_apply_executor_missing"));json_object_object_add(data,"legacy_config_model",json_object_new_boolean(1));json_object_object_add(data,"global",g);json_object_object_add(data,"qos",q);json_object_object_add(data,"classes",classes);json_object_object_add(data,"groups",groups);json_object_object_add(data,"rules",rules);json_object_object_add(data,"client_limits",limits);json_object_object_add(data,"status",status);return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
 }
 
 int jmx_flow_control_set(struct json_object *cfg)
 {
     struct json_object *o=NULL,*arr=NULL,*members=NULL; sqlite3_stmt*st=NULL; int rc=0,i,n,j,m;
-    if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_flow_db_init(); if(nc_flow_validate(cfg)!=0)return -1; nc_exec("BEGIN IMMEDIATE");
+    if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_flow_db_init(); if(nc_flow_validate(cfg)!=0)return -1; if(nc_txn_begin()!=0)return -1;
     if(json_object_object_get_ex(cfg,"global",&o)&&o&&nc_prepare(&st,"INSERT INTO flow_global(id,enabled,mode,default_policy,unknown_policy,dpi_required,log_decisions,sticky_session,apply_state,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,'draft',?8) ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,mode=excluded.mode,default_policy=excluded.default_policy,unknown_policy=excluded.unknown_policy,dpi_required=excluded.dpi_required,log_decisions=excluded.log_decisions,sticky_session=excluded.sticky_session,apply_state='draft',updated_at=excluded.updated_at")==0){sqlite3_bind_int(st,1,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,2,nc_json_str_def(o,"mode","smart"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(o,"default_policy","auto"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"unknown_policy","normal"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,5,nc_json_bool_def(o,"dpi_required",1));sqlite3_bind_int(st,6,nc_json_bool_def(o,"log_decisions",1));sqlite3_bind_int(st,7,nc_json_bool_def(o,"sticky_session",1));sqlite3_bind_int64(st,8,nc_now_s());if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);} 
     if(rc==0&&json_object_object_get_ex(cfg,"qos",&o)&&o&&nc_prepare(&st,"INSERT INTO flow_qos(id,enabled,scheduler,total_download_mbps,total_upload_mbps,latency_target_ms,per_host_fairness,ack_filter,diffserv) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,scheduler=excluded.scheduler,total_download_mbps=excluded.total_download_mbps,total_upload_mbps=excluded.total_upload_mbps,latency_target_ms=excluded.latency_target_ms,per_host_fairness=excluded.per_host_fairness,ack_filter=excluded.ack_filter,diffserv=excluded.diffserv")==0){sqlite3_bind_int(st,1,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,2,nc_json_str_def(o,"scheduler","cake"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,3,nc_json_int_def(o,"total_download_mbps",1000));sqlite3_bind_int(st,4,nc_json_int_def(o,"total_upload_mbps",100));sqlite3_bind_int(st,5,nc_json_int_def(o,"latency_target_ms",25));sqlite3_bind_int(st,6,nc_json_bool_def(o,"per_host_fairness",1));sqlite3_bind_int(st,7,nc_json_bool_def(o,"ack_filter",1));sqlite3_bind_text(st,8,nc_json_str_def(o,"diffserv","diffserv4"),-1,SQLITE_TRANSIENT);if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);} 
     if(rc==0&&json_object_object_get_ex(cfg,"classes",&arr)&&arr){nc_exec("DELETE FROM flow_classes");for(i=0,n=json_object_array_length(arr);i<n;i++){o=json_object_array_get_idx(arr,i);if(nc_prepare(&st,"INSERT INTO flow_classes(id,name,priority,guarantee,ceiling,latency_target,examples,color) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")==0){sqlite3_bind_text(st,1,nc_json_str_def(o,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(o,"name",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,3,nc_json_int_def(o,"priority",100));sqlite3_bind_int(st,4,nc_json_int_def(o,"guarantee",0));sqlite3_bind_int(st,5,nc_json_int_def(o,"ceiling",100));sqlite3_bind_int(st,6,nc_json_int_def(o,"latency_target",100));sqlite3_bind_text(st,7,nc_json_str_def(o,"examples",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(o,"color",""),-1,SQLITE_TRANSIENT);if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}}}
@@ -15707,7 +16467,7 @@ int jmx_flow_control_smart_set(struct json_object *cfg)
 {
     if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_flow_db_init();
     sqlite3_stmt *st=NULL; int rc=0;
-    nc_exec("BEGIN IMMEDIATE");
+    if (nc_txn_begin() != 0) return -1;
     struct json_object *v=NULL;
     if(json_object_object_get_ex(cfg,"mode",&v) && v) {
         if(nc_prepare(&st,"UPDATE flow_smart SET mode=?1,updated_at=?2 WHERE id=1")==0) {
@@ -15736,7 +16496,7 @@ int jmx_flow_control_priority_set(struct json_object *cfg)
 {
     if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_flow_db_init();
     sqlite3_stmt *st=NULL; int rc=0;
-    nc_exec("BEGIN IMMEDIATE");
+    if (nc_txn_begin() != 0) return -1;
     json_object_object_foreach(cfg, k, v) {
         if(nc_prepare(&st,"INSERT INTO flow_smart_priority(app_key,priority,updated_at) VALUES(?1,?2,?3) ON CONFLICT(app_key) DO UPDATE SET priority=excluded.priority,updated_at=excluded.updated_at")==0) {
             sqlite3_bind_text(st,1,k,-1,SQLITE_TRANSIENT);
@@ -15751,11 +16511,10 @@ int jmx_flow_control_priority_set(struct json_object *cfg)
 
 struct json_object *jmx_flow_control_apply(struct json_object *cfg)
 {
-    struct json_object *data=json_object_new_object(),*summary=json_object_new_object(); int dry=nc_json_bool_def(cfg,"dry_run",0); sqlite3_stmt*st=NULL; FILE*fp=NULL;
+    struct json_object *data=json_object_new_object(),*summary=json_object_new_object(); int dry=nc_json_bool_def(cfg,"dry_run",0);
     if(jmx_netconfig_db_init()!=0){json_object_object_add(data,"ok",json_object_new_boolean(0));return jmx_gen_api_response_data(API_CODE_ERROR,data);} nc_flow_db_init();
     json_object_object_add(summary,"groups",json_object_new_int(nc_vpn_count_table("flow_groups","WHERE enabled=1")));json_object_object_add(summary,"rules",json_object_new_int(nc_vpn_count_table("flow_rules","WHERE enabled=1")));json_object_object_add(summary,"client_limits",json_object_new_int(nc_vpn_count_table("flow_client_limits","WHERE enabled=1")));json_object_object_add(summary,"tc_scheduler",json_object_new_string("cake"));
-    if(!dry){fp=fopen("/etc/config/dreamingwrt_flow","w");if(fp){fprintf(fp,"config flow 'main'\n\toption generated_by 'jmxd'\n\toption updated_at '%lld'\n\n",(long long)nc_now_s());if(nc_prepare(&st,"SELECT id,name,mode,hash FROM flow_groups WHERE enabled=1 ORDER BY id")==0){while(sqlite3_step(st)==SQLITE_ROW)fprintf(fp,"config group '%s'\n\toption name '%s'\n\toption mode '%s'\n\toption hash '%s'\n\n",(const char*)sqlite3_column_text(st,0),(const char*)sqlite3_column_text(st,1),(const char*)sqlite3_column_text(st,2),(const char*)sqlite3_column_text(st,3));sqlite3_finalize(st);}if(nc_prepare(&st,"SELECT id,priority,type,action,target,qos_class,protocol FROM flow_rules WHERE enabled=1 ORDER BY priority,id")==0){while(sqlite3_step(st)==SQLITE_ROW)fprintf(fp,"config rule '%s'\n\toption priority '%d'\n\toption type '%s'\n\toption action '%s'\n\toption target '%s'\n\toption qos_class '%s'\n\toption protocol '%s'\n\n",(const char*)sqlite3_column_text(st,0),sqlite3_column_int(st,1),(const char*)sqlite3_column_text(st,2),(const char*)sqlite3_column_text(st,3),(const char*)sqlite3_column_text(st,4),(const char*)sqlite3_column_text(st,5),(const char*)sqlite3_column_text(st,6));sqlite3_finalize(st);}if(nc_prepare(&st,"SELECT id,ip,upload_kbps,download_kbps,mode FROM flow_client_limits WHERE enabled=1 ORDER BY id")==0){while(sqlite3_step(st)==SQLITE_ROW)fprintf(fp,"config client_limit '%s'\n\toption ip '%s'\n\toption upload_kbps '%d'\n\toption download_kbps '%d'\n\toption mode '%s'\n\n",(const char*)sqlite3_column_text(st,0),(const char*)sqlite3_column_text(st,1),sqlite3_column_int(st,2),sqlite3_column_int(st,3),(const char*)sqlite3_column_text(st,4));sqlite3_finalize(st);}fclose(fp);} if(nc_prepare(&st,"UPDATE flow_global SET apply_state='applied',last_apply_at=?1 WHERE id=1")==0){sqlite3_bind_int64(st,1,nc_now_s());nc_step_done(st);sqlite3_finalize(st);}}
-    json_object_object_add(data,"ok",json_object_new_boolean(1));json_object_object_add(data,"dry_run",json_object_new_boolean(dry));json_object_object_add(data,"applied",json_object_new_boolean(!dry));json_object_object_add(data,"summary",summary);return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
+    json_object_object_add(data,"ok",json_object_new_boolean(dry));json_object_object_add(data,"dry_run",json_object_new_boolean(dry));json_object_object_add(data,"planned",json_object_new_boolean(dry));json_object_object_add(data,"configured",json_object_new_boolean(1));json_object_object_add(data,"applied",json_object_new_boolean(0));json_object_object_add(data,"runtime_applied",json_object_new_boolean(0));json_object_object_add(data,"runtime_reason",json_object_new_string("dataplane_apply_executor_missing"));json_object_object_add(data,"error",json_object_new_string(dry?"":"capability_disabled"));json_object_object_add(data,"message",json_object_new_string(dry?"legacy flow-control plan only; no nft, tc, ip rule, or route mutation was performed":"legacy flow-control apply is disabled until the authoritative flowd transaction supports verified dataplane apply and rollback"));json_object_object_add(data,"summary",summary);return jmx_gen_api_response_data(dry?API_CODE_SUCCESS:API_CODE_ERROR,data);
 }
 
 struct json_object *jmx_flow_control_rule_test(struct json_object *cfg)
@@ -15773,7 +16532,7 @@ int jmx_flow_control_group_carrier_set(struct json_object *cfg)
     if (!json_object_object_get_ex(cfg, "groups", &arr) || !arr || !json_object_is_type(arr, json_type_array)) return -1;
     sqlite3_stmt *st = NULL;
     int rc = 0, i, n;
-    nc_exec("BEGIN IMMEDIATE");
+    if (nc_txn_begin() != 0) return -1;
     for (i = 0, n = json_object_array_length(arr); i < n; i++) {
         struct json_object *o = json_object_array_get_idx(arr, i);
         const char *id = nc_json_str_def(o, "id", "");
@@ -15964,15 +16723,111 @@ out:
     return rc;
 }
 
-static int nc_firewall_validate(struct json_object *cfg)
+static int nc_firewall_priority_compare(const void *left, const void *right)
 {
-    struct json_object *arr=NULL,*o=NULL; int i,n,j;
-    if(json_object_object_get_ex(cfg,"protect",&o)&&o){const char*mode=nc_json_str_def(o,"identify_mode","device_and_traffic");if(!nc_identification_mode_ok(mode))return -1;}
-    if(json_object_object_get_ex(cfg,"zones",&arr)&&arr&&json_object_is_type(arr,json_type_array))for(i=0,n=json_object_array_length(arr);i<n;i++){o=json_object_array_get_idx(arr,i);if(!nc_safe_id_ok(nc_json_str_def(o,"id",""))||!nc_fw_zone_name_ok(nc_json_str_def(o,"name",""))||!nc_fw_policy_ok(nc_json_str_def(o,"input","reject"))||!nc_fw_policy_ok(nc_json_str_def(o,"output","accept"))||!nc_fw_policy_ok(nc_json_str_def(o,"forward","reject")))return -1;}
-    if(json_object_object_get_ex(cfg,"rules",&arr)&&arr&&json_object_is_type(arr,json_type_array))for(i=0,n=json_object_array_length(arr);i<n;i++){int pri; o=json_object_array_get_idx(arr,i); if(!nc_safe_id_ok(nc_json_str_def(o,"id",""))||!nc_fw_stack_ok(nc_json_str_def(o,"stack","ipv4"))||!nc_fw_action_ok(nc_json_str_def(o,"action","reject"))||!nc_fw_portish_ok(nc_json_str_def(o,"src_port","any"))||!nc_fw_portish_ok(nc_json_str_def(o,"dest_port","any")))return -1; pri=nc_json_int_def(o,"priority",1000); for(j=i+1;j<n;j++) if(pri==nc_json_int_def(json_object_array_get_idx(arr,j),"priority",1000))return -1;}
-    if(json_object_object_get_ex(cfg,"forwards",&arr)&&arr&&json_object_is_type(arr,json_type_array))for(i=0,n=json_object_array_length(arr);i<n;i++){o=json_object_array_get_idx(arr,i);if(!nc_safe_id_ok(nc_json_str_def(o,"id",""))||!nc_fw_portish_ok(nc_json_str_def(o,"src_dport",""))||!nc_fw_portish_ok(nc_json_str_def(o,"dest_port","")))return -1;}
-    if(json_object_object_get_ex(cfg,"nat_rules",&arr)&&arr&&json_object_is_type(arr,json_type_array))for(i=0,n=json_object_array_length(arr);i<n;i++){o=json_object_array_get_idx(arr,i);if(!nc_safe_id_ok(nc_json_str_def(o,"id",""))||!nc_fw_nat_type_ok(nc_json_str_def(o,"type","snat"))||!nc_fw_portish_ok(nc_json_str_def(o,"to_port","")))return -1;}
-    if(json_object_object_get_ex(cfg,"ipsets",&arr)&&arr&&json_object_is_type(arr,json_type_array))for(i=0,n=json_object_array_length(arr);i<n;i++){o=json_object_array_get_idx(arr,i);if(!nc_safe_id_ok(nc_json_str_def(o,"id",""))||!nc_fw_zone_name_ok(nc_json_str_def(o,"name",""))||!nc_fw_family_ok(nc_json_str_def(o,"family","ipv4")))return -1;}
+    const int a = *(const int *)left;
+    const int b = *(const int *)right;
+
+    return (a > b) - (a < b);
+}
+
+int jmx_firewall_service_validate(struct json_object *cfg)
+{
+    static const char *groups[] = {
+        "zones", "rules", "forwards", "nat_rules", "ipsets", NULL
+    };
+    struct json_object *arr = NULL, *o = NULL, *value = NULL;
+    int priorities[NC_FIREWALL_GROUP_MAX];
+    size_t total = 0;
+    int i, n;
+
+    if (!cfg || !json_object_is_type(cfg, json_type_object))
+        return -1;
+    if (json_object_object_get_ex(cfg, "protect", &o)) {
+        if (!o || !json_object_is_type(o, json_type_object))
+            return -1;
+        if (json_object_object_get_ex(o, "identify_mode", &value) &&
+            (!value || !json_object_is_type(value, json_type_string)))
+            return -1;
+        if (!nc_identification_mode_ok(
+                nc_json_str_def(o, "identify_mode", "device_and_traffic")))
+            return -1;
+    }
+    for (i = 0; groups[i]; i++) {
+        if (!json_object_object_get_ex(cfg, groups[i], &arr))
+            continue;
+        if (!arr || !json_object_is_type(arr, json_type_array))
+            return -1;
+        n = json_object_array_length(arr);
+        if (n < 0 || n > NC_FIREWALL_GROUP_MAX ||
+            total > NC_FIREWALL_TOTAL_MAX - (size_t)n)
+            return -1;
+        total += (size_t)n;
+        for (int item = 0; item < n; item++) {
+            o = json_object_array_get_idx(arr, item);
+            if (!o || !json_object_is_type(o, json_type_object))
+                return -1;
+        }
+    }
+
+    if (json_object_object_get_ex(cfg, "zones", &arr)) {
+        for (i = 0, n = json_object_array_length(arr); i < n; i++) {
+            o = json_object_array_get_idx(arr, i);
+            if (!nc_safe_id_ok(nc_json_str_def(o, "id", "")) ||
+                !nc_fw_zone_name_ok(nc_json_str_def(o, "name", "")) ||
+                !nc_fw_policy_ok(nc_json_str_def(o, "input", "reject")) ||
+                !nc_fw_policy_ok(nc_json_str_def(o, "output", "accept")) ||
+                !nc_fw_policy_ok(nc_json_str_def(o, "forward", "reject")))
+                return -1;
+        }
+    }
+    if (json_object_object_get_ex(cfg, "rules", &arr)) {
+        for (i = 0, n = json_object_array_length(arr); i < n; i++) {
+            o = json_object_array_get_idx(arr, i);
+            if (!nc_safe_id_ok(nc_json_str_def(o, "id", "")) ||
+                !nc_fw_stack_ok(nc_json_str_def(o, "stack", "ipv4")) ||
+                !nc_fw_action_ok(nc_json_str_def(o, "action", "reject")) ||
+                !nc_fw_portish_ok(nc_json_str_def(o, "src_port", "any")) ||
+                !nc_fw_portish_ok(nc_json_str_def(o, "dest_port", "any")))
+                return -1;
+            if (json_object_object_get_ex(o, "priority", &value) &&
+                (!value || !json_object_is_type(value, json_type_int)))
+                return -1;
+            priorities[i] = nc_json_int_def(o, "priority", 1000);
+        }
+        qsort(priorities, (size_t)n, sizeof(priorities[0]),
+              nc_firewall_priority_compare);
+        for (i = 1; i < n; i++)
+            if (priorities[i - 1] == priorities[i])
+                return -1;
+    }
+    if (json_object_object_get_ex(cfg, "forwards", &arr)) {
+        for (i = 0, n = json_object_array_length(arr); i < n; i++) {
+            o = json_object_array_get_idx(arr, i);
+            if (!nc_safe_id_ok(nc_json_str_def(o, "id", "")) ||
+                !nc_fw_portish_ok(nc_json_str_def(o, "src_dport", "")) ||
+                !nc_fw_portish_ok(nc_json_str_def(o, "dest_port", "")))
+                return -1;
+        }
+    }
+    if (json_object_object_get_ex(cfg, "nat_rules", &arr)) {
+        for (i = 0, n = json_object_array_length(arr); i < n; i++) {
+            o = json_object_array_get_idx(arr, i);
+            if (!nc_safe_id_ok(nc_json_str_def(o, "id", "")) ||
+                !nc_fw_nat_type_ok(nc_json_str_def(o, "type", "snat")) ||
+                !nc_fw_portish_ok(nc_json_str_def(o, "to_port", "")))
+                return -1;
+        }
+    }
+    if (json_object_object_get_ex(cfg, "ipsets", &arr)) {
+        for (i = 0, n = json_object_array_length(arr); i < n; i++) {
+            o = json_object_array_get_idx(arr, i);
+            if (!nc_safe_id_ok(nc_json_str_def(o, "id", "")) ||
+                !nc_fw_zone_name_ok(nc_json_str_def(o, "name", "")) ||
+                !nc_fw_family_ok(nc_json_str_def(o, "family", "ipv4")))
+                return -1;
+        }
+    }
     return 0;
 }
 
@@ -16020,28 +16875,535 @@ done:
     return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
 }
 
-int jmx_firewall_service_set(struct json_object *cfg)
+typedef int (*nc_fw_bind_row_fn)(sqlite3_stmt *st, struct json_object *row,
+                                 int sort_order);
+
+static int nc_fw_bind_text(sqlite3_stmt *st, int index, const char *value)
 {
-    struct json_object *o=NULL,*arr=NULL; sqlite3_stmt*st=NULL; int rc=0,i,n; if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_firewall_db_init(); if(nc_firewall_validate(cfg)!=0)return -1; nc_exec("BEGIN IMMEDIATE");
-    if(json_object_object_get_ex(cfg,"protect",&o)&&o&&nc_prepare(&st,"INSERT INTO firewall_global(id,geo_block,identify_mode,ids_enabled,syn_flood,invalid_drop,fullcone_nat,fullcone_nat6,nat6,flow_offload,default_input,default_output,default_forward,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(id) DO UPDATE SET geo_block=excluded.geo_block,identify_mode=excluded.identify_mode,ids_enabled=excluded.ids_enabled,syn_flood=excluded.syn_flood,invalid_drop=excluded.invalid_drop,fullcone_nat=excluded.fullcone_nat,fullcone_nat6=excluded.fullcone_nat6,nat6=excluded.nat6,flow_offload=excluded.flow_offload,default_input=excluded.default_input,default_output=excluded.default_output,default_forward=excluded.default_forward,updated_at=excluded.updated_at")==0){sqlite3_bind_int(st,1,nc_json_bool_def(o,"geo_block",0));sqlite3_bind_text(st,2,nc_json_str_def(o,"identify_mode","device_and_traffic"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,3,nc_json_bool_def(o,"ids_enabled",0));sqlite3_bind_int(st,4,nc_json_bool_def(o,"syn_flood",1));sqlite3_bind_int(st,5,nc_json_bool_def(o,"invalid_drop",0));sqlite3_bind_text(st,6,nc_json_str_def(o,"fullcone_nat","off"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,7,nc_json_bool_def(o,"fullcone_nat6",0));sqlite3_bind_int(st,8,nc_json_bool_def(o,"nat6",0));sqlite3_bind_text(st,9,nc_json_str_def(o,"flow_offload","none"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,10,nc_json_str_def(o,"default_input","accept"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,11,nc_json_str_def(o,"default_output","accept"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,12,nc_json_str_def(o,"default_forward","reject"),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,13,nc_now_s());if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}
-    if(rc==0&&json_object_object_get_ex(cfg,"protect",&o)&&o&&nc_prepare(&st,"UPDATE network_control_global SET record_enabled=?1,updated_at=?2 WHERE id=1")==0){sqlite3_bind_int(st,1,strcmp(nc_json_str_def(o,"identify_mode","device_and_traffic"),"disabled")!=0);sqlite3_bind_int64(st,2,nc_now_s());if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);st=NULL;}
-    if(rc==0&&json_object_object_get_ex(cfg,"zones",&arr)&&arr){nc_exec("DELETE FROM firewall_zone");for(i=0,n=json_object_array_length(arr);i<n;i++){o=json_object_array_get_idx(arr,i);if(nc_prepare(&st,"INSERT INTO firewall_zone(id,name,networks,input,output,forward,masq,mtu_fix,forwards,enabled,sort_order) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")==0){sqlite3_bind_text(st,1,nc_json_str_def(o,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(o,"name",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(o,"networks",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"input","reject"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"output","accept"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,nc_json_str_def(o,"forward","reject"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,7,nc_json_bool_def(o,"masq",0));sqlite3_bind_int(st,8,nc_json_bool_def(o,"mtu_fix",0));sqlite3_bind_text(st,9,nc_json_str_def(o,"forwards",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,10,nc_json_bool_def(o,"enabled",1));sqlite3_bind_int(st,11,nc_json_int_def(o,"sort_order",i));if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}}}
-    if(rc==0&&json_object_object_get_ex(cfg,"rules",&arr)&&arr){nc_exec("DELETE FROM firewall_rule");for(i=0,n=json_object_array_length(arr);i<n;i++){o=json_object_array_get_idx(arr,i);if(nc_prepare(&st,"INSERT INTO firewall_rule(id,enabled,name,stack,proto,action,direction_match,direction,priority,src,dest,src_port,dest_port,in_iface,out_iface,schedule,remark,sort_order,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)")==0){sqlite3_bind_text(st,1,nc_json_str_def(o,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,2,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,3,nc_json_str_def(o,"name",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"stack","ipv4"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"proto","all"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,nc_json_str_def(o,"action","reject"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(o,"direction_match","stateful"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(o,"direction",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,9,nc_json_int_def(o,"priority",1000));sqlite3_bind_text(st,10,nc_json_str_def(o,"src","any"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,11,nc_json_str_def(o,"dest","any"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,12,nc_json_str_def(o,"src_port","any"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,13,nc_json_str_def(o,"dest_port","any"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,14,nc_json_str_def(o,"in_iface",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,15,nc_json_str_def(o,"out_iface",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,16,nc_json_str_def(o,"schedule","always"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,17,nc_json_str_def(o,"remark",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,18,i);sqlite3_bind_int64(st,19,nc_now_s());if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}}}
-    if(rc==0&&json_object_object_get_ex(cfg,"forwards",&arr)&&arr){nc_exec("DELETE FROM firewall_forward");for(i=0,n=json_object_array_length(arr);i<n;i++){o=json_object_array_get_idx(arr,i);if(nc_prepare(&st,"INSERT INTO firewall_forward(id,enabled,name,proto,src,src_dport,dest,dest_ip,dest_port,reflection,remark,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)")==0){sqlite3_bind_text(st,1,nc_json_str_def(o,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,2,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,3,nc_json_str_def(o,"name",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"proto","tcp"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"src","wan"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,nc_json_str_def(o,"src_dport",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(o,"dest","lan"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(o,"dest_ip",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,9,nc_json_str_def(o,"dest_port",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,10,nc_json_bool_def(o,"reflection",0));sqlite3_bind_text(st,11,nc_json_str_def(o,"remark",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,12,nc_now_s());if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}}}
-    if(rc==0&&json_object_object_get_ex(cfg,"nat_rules",&arr)&&arr){nc_exec("DELETE FROM firewall_nat_rule");for(i=0,n=json_object_array_length(arr);i<n;i++){o=json_object_array_get_idx(arr,i);if(nc_prepare(&st,"INSERT INTO firewall_nat_rule(id,enabled,name,type,src,dest,proto,to_addr,to_port,remark,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")==0){sqlite3_bind_text(st,1,nc_json_str_def(o,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,2,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,3,nc_json_str_def(o,"name",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"type","snat"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"src",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,nc_json_str_def(o,"dest",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(o,"proto","all"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(o,"to_addr",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,9,nc_json_str_def(o,"to_port",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,10,nc_json_str_def(o,"remark",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,11,nc_now_s());if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}}}
-    if(rc==0&&json_object_object_get_ex(cfg,"ipsets",&arr)&&arr){nc_exec("DELETE FROM firewall_ipset");for(i=0,n=json_object_array_length(arr);i<n;i++){o=json_object_array_get_idx(arr,i);if(nc_prepare(&st,"INSERT INTO firewall_ipset(id,name,family,match_type,source,remark,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7)")==0){sqlite3_bind_text(st,1,nc_json_str_def(o,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(o,"name",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(o,"family","ipv4"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"match",nc_json_str_def(o,"match_type","dest_ip")),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"source","manual"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,nc_json_str_def(o,"remark",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,7,nc_now_s());if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}}}
-    nc_exec(rc==0?"COMMIT":"ROLLBACK"); return rc;
+    return sqlite3_bind_text(st, index, value, -1, SQLITE_TRANSIENT) == SQLITE_OK
+        ? 0 : -1;
 }
 
-static const char *nc_fw_target_uc(const char *a){if(!strcmp(a,"accept"))return "ACCEPT"; if(!strcmp(a,"drop"))return "DROP"; return "REJECT";}
+static int nc_fw_bind_int(sqlite3_stmt *st, int index, int value)
+{
+    return sqlite3_bind_int(st, index, value) == SQLITE_OK ? 0 : -1;
+}
+
+static int nc_fw_bind_int64(sqlite3_stmt *st, int index, sqlite3_int64 value)
+{
+    return sqlite3_bind_int64(st, index, value) == SQLITE_OK ? 0 : -1;
+}
+
+static int nc_fw_bind_zone(sqlite3_stmt *st, struct json_object *o, int order)
+{
+    return nc_fw_bind_text(st, 1, nc_json_str_def(o, "id", "")) ||
+           nc_fw_bind_text(st, 2, nc_json_str_def(o, "name", "")) ||
+           nc_fw_bind_text(st, 3, nc_json_str_def(o, "networks", "")) ||
+           nc_fw_bind_text(st, 4, nc_json_str_def(o, "input", "reject")) ||
+           nc_fw_bind_text(st, 5, nc_json_str_def(o, "output", "accept")) ||
+           nc_fw_bind_text(st, 6, nc_json_str_def(o, "forward", "reject")) ||
+           nc_fw_bind_int(st, 7, nc_json_bool_def(o, "masq", 0)) ||
+           nc_fw_bind_int(st, 8, nc_json_bool_def(o, "mtu_fix", 0)) ||
+           nc_fw_bind_text(st, 9, nc_json_str_def(o, "forwards", "")) ||
+           nc_fw_bind_int(st, 10, nc_json_bool_def(o, "enabled", 1)) ||
+           nc_fw_bind_int(st, 11, nc_json_int_def(o, "sort_order", order))
+        ? -1 : 0;
+}
+
+static int nc_fw_bind_rule(sqlite3_stmt *st, struct json_object *o, int order)
+{
+    return nc_fw_bind_text(st, 1, nc_json_str_def(o, "id", "")) ||
+           nc_fw_bind_int(st, 2, nc_json_bool_def(o, "enabled", 1)) ||
+           nc_fw_bind_text(st, 3, nc_json_str_def(o, "name", "")) ||
+           nc_fw_bind_text(st, 4, nc_json_str_def(o, "stack", "ipv4")) ||
+           nc_fw_bind_text(st, 5, nc_json_str_def(o, "proto", "all")) ||
+           nc_fw_bind_text(st, 6, nc_json_str_def(o, "action", "reject")) ||
+           nc_fw_bind_text(st, 7, nc_json_str_def(o, "direction_match", "stateful")) ||
+           nc_fw_bind_text(st, 8, nc_json_str_def(o, "direction", "")) ||
+           nc_fw_bind_int(st, 9, nc_json_int_def(o, "priority", 1000)) ||
+           nc_fw_bind_text(st, 10, nc_json_str_def(o, "src", "any")) ||
+           nc_fw_bind_text(st, 11, nc_json_str_def(o, "dest", "any")) ||
+           nc_fw_bind_text(st, 12, nc_json_str_def(o, "src_port", "any")) ||
+           nc_fw_bind_text(st, 13, nc_json_str_def(o, "dest_port", "any")) ||
+           nc_fw_bind_text(st, 14, nc_json_str_def(o, "in_iface", "")) ||
+           nc_fw_bind_text(st, 15, nc_json_str_def(o, "out_iface", "")) ||
+           nc_fw_bind_text(st, 16, nc_json_str_def(o, "schedule", "always")) ||
+           nc_fw_bind_text(st, 17, nc_json_str_def(o, "remark", "")) ||
+           nc_fw_bind_int(st, 18, order) ||
+           nc_fw_bind_int64(st, 19, nc_now_s())
+        ? -1 : 0;
+}
+
+static int nc_fw_bind_forward(sqlite3_stmt *st, struct json_object *o, int order)
+{
+    (void)order;
+    return nc_fw_bind_text(st, 1, nc_json_str_def(o, "id", "")) ||
+           nc_fw_bind_int(st, 2, nc_json_bool_def(o, "enabled", 1)) ||
+           nc_fw_bind_text(st, 3, nc_json_str_def(o, "name", "")) ||
+           nc_fw_bind_text(st, 4, nc_json_str_def(o, "proto", "tcp")) ||
+           nc_fw_bind_text(st, 5, nc_json_str_def(o, "src", "wan")) ||
+           nc_fw_bind_text(st, 6, nc_json_str_def(o, "src_dport", "")) ||
+           nc_fw_bind_text(st, 7, nc_json_str_def(o, "dest", "lan")) ||
+           nc_fw_bind_text(st, 8, nc_json_str_def(o, "dest_ip", "")) ||
+           nc_fw_bind_text(st, 9, nc_json_str_def(o, "dest_port", "")) ||
+           nc_fw_bind_int(st, 10, nc_json_bool_def(o, "reflection", 0)) ||
+           nc_fw_bind_text(st, 11, nc_json_str_def(o, "remark", "")) ||
+           nc_fw_bind_int64(st, 12, nc_now_s())
+        ? -1 : 0;
+}
+
+static int nc_fw_bind_nat(sqlite3_stmt *st, struct json_object *o, int order)
+{
+    (void)order;
+    return nc_fw_bind_text(st, 1, nc_json_str_def(o, "id", "")) ||
+           nc_fw_bind_int(st, 2, nc_json_bool_def(o, "enabled", 1)) ||
+           nc_fw_bind_text(st, 3, nc_json_str_def(o, "name", "")) ||
+           nc_fw_bind_text(st, 4, nc_json_str_def(o, "type", "snat")) ||
+           nc_fw_bind_text(st, 5, nc_json_str_def(o, "src", "")) ||
+           nc_fw_bind_text(st, 6, nc_json_str_def(o, "dest", "")) ||
+           nc_fw_bind_text(st, 7, nc_json_str_def(o, "proto", "all")) ||
+           nc_fw_bind_text(st, 8, nc_json_str_def(o, "to_addr", "")) ||
+           nc_fw_bind_text(st, 9, nc_json_str_def(o, "to_port", "")) ||
+           nc_fw_bind_text(st, 10, nc_json_str_def(o, "remark", "")) ||
+           nc_fw_bind_int64(st, 11, nc_now_s())
+        ? -1 : 0;
+}
+
+static int nc_fw_bind_ipset(sqlite3_stmt *st, struct json_object *o, int order)
+{
+    (void)order;
+    return nc_fw_bind_text(st, 1, nc_json_str_def(o, "id", "")) ||
+           nc_fw_bind_text(st, 2, nc_json_str_def(o, "name", "")) ||
+           nc_fw_bind_text(st, 3, nc_json_str_def(o, "family", "ipv4")) ||
+           nc_fw_bind_text(st, 4, nc_json_str_def(
+               o, "match", nc_json_str_def(o, "match_type", "dest_ip"))) ||
+           nc_fw_bind_text(st, 5, nc_json_str_def(o, "source", "manual")) ||
+           nc_fw_bind_text(st, 6, nc_json_str_def(o, "remark", "")) ||
+           nc_fw_bind_int64(st, 7, nc_now_s())
+        ? -1 : 0;
+}
+
+static int nc_fw_replace_group(struct json_object *rows, const char *delete_sql,
+                               const char *insert_sql, nc_fw_bind_row_fn bind_row)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+    int count;
+
+    if (nc_prepare(&st, insert_sql) != 0)
+        return -1;
+    if (nc_exec(delete_sql) != 0)
+        goto out;
+    count = json_object_array_length(rows);
+    for (int i = 0; i < count; i++) {
+        if (bind_row(st, json_object_array_get_idx(rows, i), i) != 0 ||
+            nc_step_done(st) != 0 || sqlite3_reset(st) != SQLITE_OK ||
+            sqlite3_clear_bindings(st) != SQLITE_OK)
+            goto out;
+    }
+    rc = 0;
+out:
+    if (sqlite3_finalize(st) != SQLITE_OK)
+        rc = -1;
+    return rc;
+}
+
+static int nc_fw_save_protect(struct json_object *o)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+
+    if (nc_prepare(&st,
+        "INSERT INTO firewall_global(id,geo_block,identify_mode,ids_enabled,"
+        "syn_flood,invalid_drop,fullcone_nat,fullcone_nat6,nat6,flow_offload,"
+        "default_input,default_output,default_forward,updated_at) "
+        "VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) "
+        "ON CONFLICT(id) DO UPDATE SET geo_block=excluded.geo_block,"
+        "identify_mode=excluded.identify_mode,ids_enabled=excluded.ids_enabled,"
+        "syn_flood=excluded.syn_flood,invalid_drop=excluded.invalid_drop,"
+        "fullcone_nat=excluded.fullcone_nat,fullcone_nat6=excluded.fullcone_nat6,"
+        "nat6=excluded.nat6,flow_offload=excluded.flow_offload,"
+        "default_input=excluded.default_input,default_output=excluded.default_output,"
+        "default_forward=excluded.default_forward,updated_at=excluded.updated_at") != 0)
+        return -1;
+    if (nc_fw_bind_int(st, 1, nc_json_bool_def(o, "geo_block", 0)) ||
+        nc_fw_bind_text(st, 2, nc_json_str_def(o, "identify_mode", "device_and_traffic")) ||
+        nc_fw_bind_int(st, 3, nc_json_bool_def(o, "ids_enabled", 0)) ||
+        nc_fw_bind_int(st, 4, nc_json_bool_def(o, "syn_flood", 1)) ||
+        nc_fw_bind_int(st, 5, nc_json_bool_def(o, "invalid_drop", 0)) ||
+        nc_fw_bind_text(st, 6, nc_json_str_def(o, "fullcone_nat", "off")) ||
+        nc_fw_bind_int(st, 7, nc_json_bool_def(o, "fullcone_nat6", 0)) ||
+        nc_fw_bind_int(st, 8, nc_json_bool_def(o, "nat6", 0)) ||
+        nc_fw_bind_text(st, 9, nc_json_str_def(o, "flow_offload", "none")) ||
+        nc_fw_bind_text(st, 10, nc_json_str_def(o, "default_input", "accept")) ||
+        nc_fw_bind_text(st, 11, nc_json_str_def(o, "default_output", "accept")) ||
+        nc_fw_bind_text(st, 12, nc_json_str_def(o, "default_forward", "reject")) ||
+        nc_fw_bind_int64(st, 13, nc_now_s()) || nc_step_done(st) != 0)
+        goto out;
+    rc = 0;
+out:
+    if (sqlite3_finalize(st) != SQLITE_OK)
+        rc = -1;
+    if (rc != 0)
+        return -1;
+
+    st = NULL;
+    rc = -1;
+    if (nc_prepare(&st,
+        "UPDATE network_control_global SET record_enabled=?1,updated_at=?2 WHERE id=1") != 0)
+        return -1;
+    if (nc_fw_bind_int(st, 1, strcmp(nc_json_str_def(
+            o, "identify_mode", "device_and_traffic"), "disabled") != 0) ||
+        nc_fw_bind_int64(st, 2, nc_now_s()) || nc_step_done(st) != 0)
+        goto finish;
+    rc = 0;
+finish:
+    if (sqlite3_finalize(st) != SQLITE_OK)
+        rc = -1;
+    return rc;
+}
+
+static int nc_fw_finish_transaction(int write_rc)
+{
+    if (write_rc == 0 && nc_exec("COMMIT") == 0)
+        return 0;
+    nc_exec("ROLLBACK");
+    return -1;
+}
+
+int jmx_firewall_service_set(struct json_object *cfg)
+{
+    struct json_object *value = NULL;
+
+    if (jmx_firewall_service_validate(cfg) != 0 ||
+        jmx_netconfig_db_init() != 0)
+        return -1;
+    nc_firewall_db_init();
+    if(nc_exec("BEGIN IMMEDIATE")!=0)return -1;
+
+    /* nc_fw_replace_group owns checked nc_exec("DELETE FROM firewall_*") calls. */
+
+    if (json_object_object_get_ex(cfg, "protect", &value) &&
+        nc_fw_save_protect(value) != 0)
+        goto rollback;
+    if (json_object_object_get_ex(cfg, "zones", &value) &&
+        nc_fw_replace_group(value, "DELETE FROM firewall_zone",
+            "INSERT INTO firewall_zone(id,name,networks,input,output,forward,masq,mtu_fix,forwards,enabled,sort_order) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", nc_fw_bind_zone) != 0)
+        goto rollback;
+    if (json_object_object_get_ex(cfg, "rules", &value) &&
+        nc_fw_replace_group(value, "DELETE FROM firewall_rule",
+            "INSERT INTO firewall_rule(id,enabled,name,stack,proto,action,direction_match,direction,priority,src,dest,src_port,dest_port,in_iface,out_iface,schedule,remark,sort_order,updated_at) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)", nc_fw_bind_rule) != 0)
+        goto rollback;
+    if (json_object_object_get_ex(cfg, "forwards", &value) &&
+        nc_fw_replace_group(value, "DELETE FROM firewall_forward",
+            "INSERT INTO firewall_forward(id,enabled,name,proto,src,src_dport,dest,dest_ip,dest_port,reflection,remark,updated_at) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)", nc_fw_bind_forward) != 0)
+        goto rollback;
+    if (json_object_object_get_ex(cfg, "nat_rules", &value) &&
+        nc_fw_replace_group(value, "DELETE FROM firewall_nat_rule",
+            "INSERT INTO firewall_nat_rule(id,enabled,name,type,src,dest,proto,to_addr,to_port,remark,updated_at) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", nc_fw_bind_nat) != 0)
+        goto rollback;
+    if (json_object_object_get_ex(cfg, "ipsets", &value) &&
+        nc_fw_replace_group(value, "DELETE FROM firewall_ipset",
+            "INSERT INTO firewall_ipset(id,name,family,match_type,source,remark,updated_at) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7)", nc_fw_bind_ipset) != 0)
+        goto rollback;
+
+    if (nc_exec("COMMIT") != 0) {
+        nc_exec("ROLLBACK");
+        return -1;
+    }
+    return 0;
+rollback:
+    return nc_fw_finish_transaction(-1);
+}
+
+static const char *nc_fw_target_uc(const char *a){if(!strcmp(a,"accept"))return "ACCEPT"; if(!strcmp(a,"drop"))return "DROP"; if(!strcmp(a,"redirect"))return "REDIRECT"; return "REJECT";}
+
+static int nc_fw_uci_text_ok(const char *s, size_t max_len)
+{
+    const unsigned char *p = (const unsigned char *)(s ? s : "");
+
+    if (strlen((const char *)p) > max_len)
+        return 0;
+    for (; *p; p++)
+        if (*p < 0x20 || *p == 0x7f)
+            return 0;
+    return 1;
+}
+
+static int nc_fw_proto_ok(const char *s)
+{
+    static const char *allowed[] = {
+        "all", "any", "tcp", "udp", "icmp", "icmpv6", "esp", "ah",
+        "gre", "sctp", "udplite", NULL
+    };
+    char copy[128], *save = NULL, *token;
+    int count = 0;
+
+    if (!s || !s[0] || strlen(s) >= sizeof(copy))
+        return 0;
+    snprintf(copy, sizeof(copy), "%s", s);
+    for (token = strtok_r(copy, ", ", &save); token;
+         token = strtok_r(NULL, ", ", &save)) {
+        int matched = 0;
+        for (int i = 0; allowed[i]; i++)
+            if (!strcasecmp(token, allowed[i])) { matched = 1; break; }
+        if (!matched || ++count > 8)
+            return 0;
+    }
+    return count > 0;
+}
+
+static int nc_fw_port_expr_ok(const char *s)
+{
+    char copy[256], *save = NULL, *token;
+    int count = 0;
+
+    if (!s || !s[0] || !strcmp(s, "any"))
+        return 1;
+    if (strlen(s) >= sizeof(copy))
+        return 0;
+    snprintf(copy, sizeof(copy), "%s", s);
+    for (token = strtok_r(copy, ", ", &save); token;
+         token = strtok_r(NULL, ", ", &save)) {
+        char *sep = strchr(token, '-');
+        char *end = NULL;
+        long first, last;
+
+        if (!sep)
+            sep = strchr(token, ':');
+        if (sep)
+            *sep++ = '\0';
+        errno = 0;
+        first = strtol(token, &end, 10);
+        if (errno || !end || *end || first < 1 || first > 65535)
+            return 0;
+        last = first;
+        if (sep) {
+            errno = 0;
+            last = strtol(sep, &end, 10);
+            if (errno || !end || *end || last < first || last > 65535)
+                return 0;
+        }
+        if (++count > 64)
+            return 0;
+    }
+    return count > 0;
+}
+
+static int nc_fw_addr_expr_ok(const char *s, int allow_empty)
+{
+    char copy[512], *save = NULL, *token;
+    int count = 0;
+
+    if (!s || !s[0])
+        return allow_empty;
+    if (!strcmp(s, "any"))
+        return 1;
+    if (strlen(s) >= sizeof(copy))
+        return 0;
+    snprintf(copy, sizeof(copy), "%s", s);
+    for (token = strtok_r(copy, ", ", &save); token;
+         token = strtok_r(NULL, ", ", &save)) {
+        struct in_addr a4;
+        struct in6_addr a6;
+        char *slash;
+        char *end = NULL;
+        long prefix;
+        int family = AF_UNSPEC;
+
+        if (*token == '!') token++;
+        if (!*token) return 0;
+        slash = strchr(token, '/');
+        if (slash) *slash++ = '\0';
+        if (inet_pton(AF_INET, token, &a4) == 1) family = AF_INET;
+        else if (inet_pton(AF_INET6, token, &a6) == 1) family = AF_INET6;
+        else return 0;
+        if (slash) {
+            errno = 0;
+            prefix = strtol(slash, &end, 10);
+            if (errno || !end || *end || prefix < 0 ||
+                prefix > (family == AF_INET ? 32 : 128))
+                return 0;
+        }
+        if (++count > 64) return 0;
+    }
+    return count > 0;
+}
+
+static int nc_fw_uci_value(FILE *fp, const char *keyword, const char *value)
+{
+    const unsigned char *p = (const unsigned char *)(value ? value : "");
+    const char *name;
+
+    if (!fp || !keyword ||
+        (strncmp(keyword, "option ", 7) && strncmp(keyword, "list ", 5)) ||
+        !(name = strchr(keyword, ' ')) || !nc_fw_zone_name_ok(name + 1) ||
+        !nc_fw_uci_text_ok((const char *)p, 1024))
+        return -1;
+    if (fprintf(fp, "\t%s '", keyword) < 0)
+        return -1;
+    for (; *p; p++) {
+        if (*p == '\'' && fputs("'\\''", fp) == EOF)
+            return -1;
+        else if (*p != '\'' && fputc(*p, fp) == EOF)
+            return -1;
+    }
+    return fputs("'\n", fp) == EOF ? -1 : 0;
+}
+
+static int nc_fw_uci_int(FILE *fp, const char *keyword, int value)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", value);
+    return nc_fw_uci_value(fp, keyword, buf);
+}
+
+static int nc_fw_artifact_open(int *dirfd_out, char *tmp_name, size_t tmp_len)
+{
+    struct stat st;
+    int dirfd, fd = -1;
+
+    if (!dirfd_out || !tmp_name || tmp_len == 0)
+        return -1;
+    *dirfd_out = -1;
+    dirfd = open("/etc/config", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0 || fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        if (dirfd >= 0) close(dirfd);
+        return -1;
+    }
+    for (int attempt = 0; attempt < 32; attempt++) {
+        snprintf(tmp_name, tmp_len, ".dreamingwrt_firewall.%ld.%08lx.%d.tmp",
+                 (long)getpid(), (unsigned long)random(), attempt);
+        fd = openat(dirfd, tmp_name,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                    0600);
+        if (fd >= 0) break;
+        if (errno != EEXIST) break;
+    }
+    if (fd < 0) { close(dirfd); return -1; }
+    *dirfd_out = dirfd;
+    return fd;
+}
 
 struct json_object *jmx_firewall_service_apply(struct json_object *cfg)
 {
-    struct json_object *data=json_object_new_object(),*summary=json_object_new_object(),*warnings=json_object_new_array(); sqlite3_stmt*st=NULL; FILE*fp=NULL; int dry=nc_json_bool_def(cfg,"dry_run",0);
-    if(jmx_netconfig_db_init()!=0){json_object_object_add(data,"ok",json_object_new_boolean(0));return jmx_gen_api_response_data(API_CODE_ERROR,data);} nc_firewall_db_init();
-    json_object_object_add(summary,"zones",json_object_new_int(nc_vpn_count_table("firewall_zone","WHERE enabled=1")));json_object_object_add(summary,"rules",json_object_new_int(nc_vpn_count_table("firewall_rule","WHERE enabled=1")));json_object_object_add(summary,"forwards",json_object_new_int(nc_vpn_count_table("firewall_forward","WHERE enabled=1")));json_object_object_add(summary,"nat_rules",json_object_new_int(nc_vpn_count_table("firewall_nat_rule","WHERE enabled=1")));json_object_object_add(summary,"ipsets",json_object_new_int(nc_vpn_count_table("firewall_ipset","")));
-    if(!dry){fp=fopen("/etc/config/dreamingwrt_firewall","w");if(fp){fprintf(fp,"# generated by jmxd; preview/apply source for /etc/config/firewall\n");if(nc_prepare(&st,"SELECT name,networks,input,output,forward,masq,mtu_fix,forwards FROM firewall_zone WHERE enabled=1 ORDER BY sort_order,name")==0){while(sqlite3_step(st)==SQLITE_ROW){fprintf(fp,"config zone\n\toption name '%s'\n\toption input '%s'\n\toption output '%s'\n\toption forward '%s'\n\toption masq '%d'\n\toption mtu_fix '%d'\n",(const char*)sqlite3_column_text(st,0),nc_fw_target_uc((const char*)sqlite3_column_text(st,2)),nc_fw_target_uc((const char*)sqlite3_column_text(st,3)),nc_fw_target_uc((const char*)sqlite3_column_text(st,4)),sqlite3_column_int(st,5),sqlite3_column_int(st,6));fprintf(fp,"\t# networks %s\n\t# forwards %s\n\n",(const char*)sqlite3_column_text(st,1),(const char*)sqlite3_column_text(st,7));}sqlite3_finalize(st);}if(nc_prepare(&st,"SELECT name,stack,proto,action,src,dest,src_port,dest_port,in_iface,out_iface,remark FROM firewall_rule WHERE enabled=1 ORDER BY priority,sort_order,id")==0){while(sqlite3_step(st)==SQLITE_ROW){fprintf(fp,"config rule\n\toption name '%s'\n\toption proto '%s'\n\toption target '%s'\n\toption src_ip '%s'\n\toption dest_ip '%s'\n\toption src_port '%s'\n\toption dest_port '%s'\n\toption family '%s'\n\toption extra '--comment dreamingwrt:%s'\n\n",(const char*)sqlite3_column_text(st,0),(const char*)sqlite3_column_text(st,2),nc_fw_target_uc((const char*)sqlite3_column_text(st,3)),(const char*)sqlite3_column_text(st,4),(const char*)sqlite3_column_text(st,5),(const char*)sqlite3_column_text(st,6),(const char*)sqlite3_column_text(st,7),(const char*)sqlite3_column_text(st,1),(const char*)sqlite3_column_text(st,10));}sqlite3_finalize(st);}if(nc_prepare(&st,"SELECT name,proto,src,src_dport,dest,dest_ip,dest_port,reflection FROM firewall_forward WHERE enabled=1 ORDER BY id")==0){while(sqlite3_step(st)==SQLITE_ROW){fprintf(fp,"config redirect\n\toption name '%s'\n\toption proto '%s'\n\toption src '%s'\n\toption src_dport '%s'\n\toption dest '%s'\n\toption dest_ip '%s'\n\toption dest_port '%s'\n\toption reflection '%d'\n\n",(const char*)sqlite3_column_text(st,0),(const char*)sqlite3_column_text(st,1),(const char*)sqlite3_column_text(st,2),(const char*)sqlite3_column_text(st,3),(const char*)sqlite3_column_text(st,4),(const char*)sqlite3_column_text(st,5),(const char*)sqlite3_column_text(st,6),sqlite3_column_int(st,7));}sqlite3_finalize(st);}if(nc_prepare(&st,"SELECT name,family,match_type FROM firewall_ipset ORDER BY name")==0){while(sqlite3_step(st)==SQLITE_ROW){fprintf(fp,"config ipset\n\toption name '%s'\n\toption family '%s'\n\tlist match '%s'\n\n",(const char*)sqlite3_column_text(st,0),(const char*)sqlite3_column_text(st,1),(const char*)sqlite3_column_text(st,2));}sqlite3_finalize(st);}fclose(fp);}json_object_array_add(warnings,json_object_new_string("phase1_writes_/etc/config/dreamingwrt_firewall_preview_only_not_live_firewall"));}
-    json_object_object_add(data,"ok",json_object_new_boolean(1));json_object_object_add(data,"dry_run",json_object_new_boolean(dry));json_object_object_add(data,"applied",json_object_new_boolean(!dry));json_object_object_add(data,"summary",summary);json_object_object_add(data,"warnings",warnings);return jmx_gen_api_response_data(API_CODE_SUCCESS,data);
+    struct json_object *data = json_object_new_object();
+    struct json_object *summary = json_object_new_object();
+    struct json_object *warnings = json_object_new_array();
+    sqlite3_stmt *st = NULL;
+    FILE *fp = NULL;
+    char tmp_name[128] = "";
+    int dirfd = -1, fd = -1, dry = nc_json_bool_def(cfg, "dry_run", 0);
+    int artifact_generated = 0, validated = dry ? 0 : 1, write_failed = 0;
+    int step_rc = SQLITE_DONE;
+
+    if (jmx_netconfig_db_init() != 0) {
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        json_object_object_add(data, "error", json_object_new_string("database_unavailable"));
+        return jmx_gen_api_response_data(API_CODE_ERROR, data);
+    }
+    nc_firewall_db_init();
+    json_object_object_add(summary, "zones", json_object_new_int(nc_vpn_count_table("firewall_zone", "WHERE enabled=1")));
+    json_object_object_add(summary, "rules", json_object_new_int(nc_vpn_count_table("firewall_rule", "WHERE enabled=1")));
+    json_object_object_add(summary, "forwards", json_object_new_int(nc_vpn_count_table("firewall_forward", "WHERE enabled=1")));
+    json_object_object_add(summary, "nat_rules", json_object_new_int(nc_vpn_count_table("firewall_nat_rule", "WHERE enabled=1")));
+    json_object_object_add(summary, "ipsets", json_object_new_int(nc_vpn_count_table("firewall_ipset", "")));
+
+    if (!dry) {
+        fd = nc_fw_artifact_open(&dirfd, tmp_name, sizeof(tmp_name));
+        if (fd < 0 || !(fp = fdopen(fd, "w"))) {
+            if (fd >= 0) close(fd);
+            write_failed = 1;
+            goto artifact_done;
+        }
+        if (fputs("# generated by jmxd; preview artifact only, not live firewall4\n", fp) == EOF)
+            write_failed = 1;
+
+#define FW_VALUE(keyword, value) do { if (nc_fw_uci_value(fp, (keyword), (value)) != 0) write_failed = 1; } while (0)
+#define FW_INT(keyword, value) do { if (nc_fw_uci_int(fp, (keyword), (value)) != 0) write_failed = 1; } while (0)
+        if (!write_failed && nc_prepare(&st, "SELECT name,input,output,forward,masq,mtu_fix FROM firewall_zone WHERE enabled=1 ORDER BY sort_order,name") == 0) {
+            while ((step_rc = sqlite3_step(st)) == SQLITE_ROW && !write_failed) {
+                const char *name = nc_sql_text(st, 0), *input = nc_sql_text(st, 1);
+                const char *output = nc_sql_text(st, 2), *forward = nc_sql_text(st, 3);
+                if (!nc_fw_zone_name_ok(name) || !nc_fw_policy_ok(input) ||
+                    !nc_fw_policy_ok(output) || !nc_fw_policy_ok(forward)) { validated = 0; break; }
+                if (fputs("config zone\n", fp) == EOF) write_failed = 1;
+                FW_VALUE("option name", name); FW_VALUE("option input", nc_fw_target_uc(input));
+                FW_VALUE("option output", nc_fw_target_uc(output)); FW_VALUE("option forward", nc_fw_target_uc(forward));
+                FW_INT("option masq", sqlite3_column_int(st, 4)); FW_INT("option mtu_fix", sqlite3_column_int(st, 5));
+                if (fputc('\n', fp) == EOF) write_failed = 1;
+            }
+            sqlite3_finalize(st); st = NULL;
+            if (step_rc != SQLITE_DONE && validated) write_failed = 1;
+        } else if (!write_failed) write_failed = 1;
+
+        step_rc = SQLITE_DONE;
+        if (!write_failed && validated && nc_prepare(&st, "SELECT name,stack,proto,action,src,dest,src_port,dest_port,remark FROM firewall_rule WHERE enabled=1 ORDER BY priority,sort_order,id") == 0) {
+            while ((step_rc = sqlite3_step(st)) == SQLITE_ROW && !write_failed) {
+                const char *name=nc_sql_text(st,0),*stack=nc_sql_text(st,1),*proto=nc_sql_text(st,2),*action=nc_sql_text(st,3);
+                const char *src=nc_sql_text(st,4),*dest=nc_sql_text(st,5),*sp=nc_sql_text(st,6),*dp=nc_sql_text(st,7),*remark=nc_sql_text(st,8);
+                if (!nc_fw_uci_text_ok(name,128)||!nc_fw_stack_ok(stack)||!nc_fw_proto_ok(proto)||!nc_fw_action_ok(action)||
+                    !nc_fw_addr_expr_ok(src,0)||!nc_fw_addr_expr_ok(dest,0)||!nc_fw_port_expr_ok(sp)||!nc_fw_port_expr_ok(dp)||!nc_fw_uci_text_ok(remark,512)) { validated=0; break; }
+                if (fputs("config rule\n",fp)==EOF) write_failed=1;
+                FW_VALUE("option name",name); FW_VALUE("option proto",proto); FW_VALUE("option target",nc_fw_target_uc(action));
+                FW_VALUE("option src_ip",src); FW_VALUE("option dest_ip",dest); FW_VALUE("option src_port",sp); FW_VALUE("option dest_port",dp);
+                FW_VALUE("option family",stack); FW_VALUE("option comment",remark); if(fputc('\n',fp)==EOF)write_failed=1;
+            }
+            sqlite3_finalize(st); st=NULL; if(step_rc!=SQLITE_DONE&&validated)write_failed=1;
+        } else if (!write_failed && validated) write_failed=1;
+
+        step_rc = SQLITE_DONE;
+        if (!write_failed && validated && nc_prepare(&st,"SELECT name,proto,src,src_dport,dest,dest_ip,dest_port,reflection FROM firewall_forward WHERE enabled=1 ORDER BY id")==0) {
+            while((step_rc=sqlite3_step(st))==SQLITE_ROW&&!write_failed){const char*name=nc_sql_text(st,0),*proto=nc_sql_text(st,1),*src=nc_sql_text(st,2),*sp=nc_sql_text(st,3),*dest=nc_sql_text(st,4),*dip=nc_sql_text(st,5),*dp=nc_sql_text(st,6);if(!nc_fw_uci_text_ok(name,128)||!nc_fw_proto_ok(proto)||!nc_fw_zone_name_ok(src)||!nc_fw_port_expr_ok(sp)||!nc_fw_zone_name_ok(dest)||!nc_fw_addr_expr_ok(dip,1)||!nc_fw_port_expr_ok(dp)){validated=0;break;}if(fputs("config redirect\n",fp)==EOF)write_failed=1;FW_VALUE("option name",name);FW_VALUE("option proto",proto);FW_VALUE("option src",src);FW_VALUE("option src_dport",sp);FW_VALUE("option dest",dest);FW_VALUE("option dest_ip",dip);FW_VALUE("option dest_port",dp);FW_INT("option reflection",sqlite3_column_int(st,7));if(fputc('\n',fp)==EOF)write_failed=1;}sqlite3_finalize(st);st=NULL;if(step_rc!=SQLITE_DONE&&validated)write_failed=1;
+        } else if (!write_failed && validated) write_failed=1;
+
+        step_rc = SQLITE_DONE;
+        if (!write_failed && validated && nc_prepare(&st,"SELECT name,family,match_type FROM firewall_ipset ORDER BY name")==0) {
+            while((step_rc=sqlite3_step(st))==SQLITE_ROW&&!write_failed){const char*name=nc_sql_text(st,0),*family=nc_sql_text(st,1),*match=nc_sql_text(st,2);if(!nc_fw_zone_name_ok(name)||!nc_fw_family_ok(family)||!nc_fw_zone_name_ok(match)){validated=0;break;}if(fputs("config ipset\n",fp)==EOF)write_failed=1;FW_VALUE("option name",name);FW_VALUE("option family",family);FW_VALUE("list match",match);if(fputc('\n',fp)==EOF)write_failed=1;}sqlite3_finalize(st);st=NULL;if(step_rc!=SQLITE_DONE&&validated)write_failed=1;
+        } else if (!write_failed && validated) write_failed=1;
+#undef FW_VALUE
+#undef FW_INT
+        if (fflush(fp) != 0) write_failed = 1;
+        if (fsync(fileno(fp)) != 0) write_failed = 1;
+        if (fclose(fp) != 0) write_failed = 1;
+        fp = NULL;
+        if (!write_failed && validated &&
+            renameat(dirfd, tmp_name, dirfd, "dreamingwrt_firewall") == 0) {
+            tmp_name[0] = '\0';
+            if (fsync(dirfd) == 0)
+                artifact_generated = 1;
+            else {
+                unlinkat(dirfd, "dreamingwrt_firewall", 0);
+                (void)fsync(dirfd);
+                write_failed = 1;
+            }
+        } else
+            write_failed = write_failed || validated;
+artifact_done:
+        if (st) sqlite3_finalize(st);
+        if (fp) fclose(fp);
+        if (dirfd >= 0) { if (!artifact_generated && tmp_name[0]) unlinkat(dirfd,tmp_name,0); close(dirfd); }
+    }
+    json_object_array_add(warnings,json_object_new_string("preview_only_live_firewall4_executor_not_connected"));
+    json_object_object_add(data,"ok",json_object_new_boolean(dry||(validated&&artifact_generated)));
+    json_object_object_add(data,"dry_run",json_object_new_boolean(dry));
+    json_object_object_add(data,"persisted",json_object_new_boolean(1));
+    json_object_object_add(data,"artifact_generated",json_object_new_boolean(artifact_generated));
+    json_object_object_add(data,"validated",json_object_new_boolean(validated));
+    if(dry)json_object_object_add(data,"validation_reason",json_object_new_string("artifact_not_rendered_in_dry_run"));
+    json_object_object_add(data,"runtime_applied",json_object_new_boolean(0));
+    json_object_object_add(data,"readback_verified",json_object_new_boolean(0));
+    json_object_object_add(data,"applied",json_object_new_boolean(0));
+    json_object_object_add(data,"runtime_reason",json_object_new_string("firewall4_transaction_executor_pending"));
+    if(!dry&&(!validated||write_failed)){json_object_object_add(data,"error",json_object_new_string(!validated?"firewall_artifact_validation_failed":"firewall_artifact_write_failed"));json_object_object_add(data,"message",json_object_new_string("firewall preview artifact was not published"));}
+    json_object_object_add(data,"summary",summary);json_object_object_add(data,"warnings",warnings);
+    return jmx_gen_api_response_data((dry||(validated&&artifact_generated))?API_CODE_SUCCESS:API_CODE_ERROR,data);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -16840,22 +18202,28 @@ int jmx_cellular_service_set(struct json_object *cfg)
     int failover_threshold = nc_json_int_def(cfg, "failover_threshold", 3);
     int probe_interval = nc_json_int_def(cfg, "probe_interval", 60);
     const char *probe_host = nc_json_str_def(cfg, "probe_host", "8.8.8.8");
-    nc_exec("BEGIN IMMEDIATE");
+    if (nc_txn_begin() != 0)
+        return -1;
+    int rc = 0;
     sqlite3_stmt *st = NULL;
-    if (nc_prepare(&st, "UPDATE cellular_global SET enabled=?,default_slot=?,failover_mode=?,failover_threshold=?,probe_interval=?,probe_host=?,updated_at=? WHERE id=1") == 0) {
+    if (nc_prepare(&st, "UPDATE cellular_global SET enabled=?,default_slot=?,failover_mode=?,failover_threshold=?,probe_interval=?,probe_host=?,updated_at=? WHERE id=1") != 0) {
+        rc = -1;
+    } else {
         sqlite3_bind_int(st, 1, enabled); sqlite3_bind_text(st, 2, default_slot, -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 3, failover_mode, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 4, failover_threshold); sqlite3_bind_int(st, 5, probe_interval); sqlite3_bind_text(st, 6, probe_host, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 7, (sqlite3_int64)nc_now_s());
-        sqlite3_step(st); sqlite3_finalize(st);
+        if (nc_step_done(st) != 0) rc = -1;
+        sqlite3_finalize(st);
     }
-    nc_exec("COMMIT");
-    return 0;
+    return nc_txn_end(rc);
 }
 
 /* ── Cellular slot_set: add or update a modem slot ── */
 int jmx_cellular_slot_set(struct json_object *cfg)
 {
-    if (jmx_netconfig_db_init() != 0 || !cfg) return -1; nc_cellular_db_init();
+    if (jmx_netconfig_db_init() != 0 || !cfg)
+        return -1;
+    nc_cellular_db_init();
     const char *id = nc_json_str_def(cfg, "id", "");
     const char *name = nc_json_str_def(cfg, "name", "Modem");
     const char *modem_path = nc_json_str_def(cfg, "modem_path", "");
@@ -16874,9 +18242,15 @@ int jmx_cellular_slot_set(struct json_object *cfg)
     int sort_order = nc_json_int_def(cfg, "sort_order", 0);
     char uid[64]; snprintf(uid, sizeof(uid), "%s", id);
     if (!uid[0]) { snprintf(uid, sizeof(uid), "slot_%ld", nc_now_s()); }
-    nc_exec("BEGIN IMMEDIATE");
+    if (modem_path[0] && !jmx_mmcli_selector_ok(modem_path))
+        return -1;
+    if (nc_txn_begin() != 0)
+        return -1;
+    int rc = 0;
     sqlite3_stmt *st = NULL;
-    if (nc_prepare(&st, "INSERT OR REPLACE INTO cellular_slot(id,name,modem_path,dev_type,enabled,apn,auth_type,username,password,pincode,network_type,roaming,mTU,dial_num,remark,sort_order,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)") == 0) {
+    if (nc_prepare(&st, "INSERT OR REPLACE INTO cellular_slot(id,name,modem_path,dev_type,enabled,apn,auth_type,username,password,pincode,network_type,roaming,mTU,dial_num,remark,sort_order,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)") != 0) {
+        rc = -1;
+    } else {
         sqlite3_bind_text(st, 1, uid, -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 3, modem_path, -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 4, dev_type, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 5, enabled); sqlite3_bind_text(st, 6, apn, -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 7, auth_type, -1, SQLITE_TRANSIENT);
@@ -16885,27 +18259,35 @@ int jmx_cellular_slot_set(struct json_object *cfg)
         sqlite3_bind_int(st, 12, roaming); sqlite3_bind_int(st, 13, mtu); sqlite3_bind_text(st, 14, dial_num, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 15, remark, -1, SQLITE_TRANSIENT); sqlite3_bind_int(st, 16, sort_order);
         sqlite3_bind_int64(st, 17, (sqlite3_int64)nc_now_s());
-        sqlite3_step(st); sqlite3_finalize(st);
+        if (nc_step_done(st) != 0) rc = -1;
+        sqlite3_finalize(st);
     }
-    nc_exec("COMMIT");
-    return 0;
+    return nc_txn_end(rc);
 }
 
 /* ── Cellular slot_delete ── */
 int jmx_cellular_slot_delete(const char *id)
 {
-    if (jmx_netconfig_db_init() != 0 || !id || !id[0]) return -1; nc_cellular_db_init();
-    nc_exec("BEGIN IMMEDIATE");
+    if (jmx_netconfig_db_init() != 0 || !id || !id[0])
+        return -1;
+    nc_cellular_db_init();
+    if (nc_txn_begin() != 0)
+        return -1;
+    int rc = 0;
     sqlite3_stmt *st = NULL;
-    if (nc_prepare(&st, "DELETE FROM cellular_slot WHERE id=?") == 0) { sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT); sqlite3_step(st); sqlite3_finalize(st); }
-    nc_exec("COMMIT");
-    return 0;
+    if (nc_prepare(&st, "DELETE FROM cellular_slot WHERE id=?") != 0) {
+        rc = -1;
+    } else { sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT); if (nc_step_done(st) != 0) rc = -1;
+        sqlite3_finalize(st); }
+    return nc_txn_end(rc);
 }
 
 /* ── Cellular apn_profile_set: add or update APN profile ── */
 int jmx_cellular_apn_profile_set(struct json_object *cfg)
 {
-    if (jmx_netconfig_db_init() != 0 || !cfg) return -1; nc_cellular_db_init();
+    if (jmx_netconfig_db_init() != 0 || !cfg)
+        return -1;
+    nc_cellular_db_init();
     const char *id = nc_json_str_def(cfg, "id", "");
     const char *name = nc_json_str_def(cfg, "name", "");
     const char *apn = nc_json_str_def(cfg, "apn", "");
@@ -16917,88 +18299,171 @@ int jmx_cellular_apn_profile_set(struct json_object *cfg)
     const char *remark = nc_json_str_def(cfg, "remark", "");
     char uid[64]; snprintf(uid, sizeof(uid), "%s", id);
     if (!uid[0]) { snprintf(uid, sizeof(uid), "apn_%ld", nc_now_s()); }
-    nc_exec("BEGIN IMMEDIATE");
+    if (nc_txn_begin() != 0)
+        return -1;
+    int rc = 0;
     sqlite3_stmt *st = NULL;
-    if (nc_prepare(&st, "INSERT OR REPLACE INTO cellular_apn_profile(id,name,apn,auth_type,username,password,dial_num,network_type,remark,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)") == 0) {
+    if (nc_prepare(&st, "INSERT OR REPLACE INTO cellular_apn_profile(id,name,apn,auth_type,username,password,dial_num,network_type,remark,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)") != 0) {
+        rc = -1;
+    } else {
         sqlite3_bind_text(st, 1, uid, -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 3, apn, -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 4, auth_type, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 5, username, -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 6, password, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 7, dial_num, -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 8, network_type, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 9, remark, -1, SQLITE_TRANSIENT); sqlite3_bind_int64(st, 10, (sqlite3_int64)nc_now_s());
-        sqlite3_step(st); sqlite3_finalize(st);
+        if (nc_step_done(st) != 0) rc = -1;
+        sqlite3_finalize(st);
     }
-    nc_exec("COMMIT");
-    return 0;
+    return nc_txn_end(rc);
 }
 
 /* ── Cellular apn_profile_delete ── */
 int jmx_cellular_apn_profile_delete(const char *id)
 {
-    if (jmx_netconfig_db_init() != 0 || !id || !id[0]) return -1; nc_cellular_db_init();
-    nc_exec("BEGIN IMMEDIATE");
+    if (jmx_netconfig_db_init() != 0 || !id || !id[0])
+        return -1;
+    nc_cellular_db_init();
+    if (nc_txn_begin() != 0)
+        return -1;
+    int rc = 0;
     sqlite3_stmt *st = NULL;
-    if (nc_prepare(&st, "DELETE FROM cellular_apn_profile WHERE id=?") == 0) { sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT); sqlite3_step(st); sqlite3_finalize(st); }
-    nc_exec("COMMIT");
-    return 0;
+    if (nc_prepare(&st, "DELETE FROM cellular_apn_profile WHERE id=?") != 0) {
+        rc = -1;
+    } else { sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT); if (nc_step_done(st) != 0) rc = -1;
+        sqlite3_finalize(st); }
+    return nc_txn_end(rc);
 }
 
 /* ── Cellular sms_delete ── */
 int jmx_cellular_sms_delete(const char *id)
 {
-    if (jmx_netconfig_db_init() != 0 || !id || !id[0]) return -1; nc_cellular_db_init();
-    nc_exec("BEGIN IMMEDIATE");
+    if (jmx_netconfig_db_init() != 0 || !id || !id[0])
+        return -1;
+    nc_cellular_db_init();
+    if (nc_txn_begin() != 0)
+        return -1;
+    int rc = 0;
     sqlite3_stmt *st = NULL;
-    if (nc_prepare(&st, "DELETE FROM cellular_sms WHERE id=?") == 0) { sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT); sqlite3_step(st); sqlite3_finalize(st); }
-    nc_exec("COMMIT");
-    return 0;
+    if (nc_prepare(&st, "DELETE FROM cellular_sms WHERE id=?") != 0) {
+        rc = -1;
+    } else { sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT); if (nc_step_done(st) != 0) rc = -1;
+        sqlite3_finalize(st); }
+    return nc_txn_end(rc);
 }
 
 /* ── Cellular probe: read runtime info from modem ── */
+#define NC_CELLULAR_MMCLI_OUTPUT_MAX (64U * 1024U)
+#define NC_CELLULAR_MMCLI_TIMEOUT_MS 5000
+
+static const char *nc_cellular_mmcli_path(void)
+{
+    static const char *paths[] = { "/usr/bin/mmcli", "/bin/mmcli" };
+    size_t i;
+
+    for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        if (access(paths[i], X_OK) == 0)
+            return paths[i];
+    }
+    return NULL;
+}
+
+static int nc_cellular_mmcli_capture(const char *selector, int sim,
+                                     struct jmx_exec_result *result)
+{
+    const char *path = nc_cellular_mmcli_path();
+    char *argv[] = {
+        (char *)path, "-K", sim ? "-i" : "-m", (char *)selector, NULL
+    };
+
+    if (!path || !result || !jmx_mmcli_selector_ok(selector))
+        return -1;
+    memset(result, 0, sizeof(*result));
+    if (jmx_exec_capture(path, argv, NC_CELLULAR_MMCLI_OUTPUT_MAX,
+                         NC_CELLULAR_MMCLI_TIMEOUT_MS, result) != 0)
+        return -1;
+    if (result->timed_out || result->truncated || result->term_signal != 0 ||
+        result->exit_code != 0 || !result->output) {
+        jmx_exec_result_free(result);
+        return -1;
+    }
+    return 0;
+}
+
 static void nc_cellular_probe_slot(struct json_object *slot)
 {
-    const char *dev_type = nc_json_str_def(slot, "dev_type", "");
     const char *modem_path = nc_json_str_def(slot, "modem_path", "");
-    int signal = 0;
-    char operator[128] = "", iccid[64] = "", imei[64] = "";
-    /* Try qmi/mbim/modemmanager probe */
-    char cmd[256];
-    if (modem_path[0]) {
-        snprintf(cmd, sizeof(cmd), "mmcli -m %s 2>/dev/null | grep -m1 'signal quality' | awk '{print $NF}' | tr -d '%%'", modem_path);
-        FILE *fp = popen(cmd, "r");
-        if (fp) { char line[64]=""; if (fgets(line, sizeof(line), fp)) signal = atoi(line); pclose(fp); }
-        snprintf(cmd, sizeof(cmd), "mmcli -m %s 2>/dev/null | grep -m1 'operator name' | sed 's/.*: //'", modem_path);
-        FILE *fp2 = popen(cmd, "r");
-        if (fp2) { if (fgets(operator, sizeof(operator), fp2)) { size_t l = strlen(operator); if (l > 0 && operator[l-1] == '\n') operator[l-1] = 0; } pclose(fp2); }
-        snprintf(cmd, sizeof(cmd), "mmcli -m %s 2>/dev/null | grep -m1 'equipment id' | sed 's/.*: //'", modem_path);
-        FILE *fp3 = popen(cmd, "r");
-        if (fp3) { if (fgets(imei, sizeof(imei), fp3)) { size_t l = strlen(imei); if (l > 0 && imei[l-1] == '\n') imei[l-1] = 0; } pclose(fp3); }
-        snprintf(cmd, sizeof(cmd), "mmcli -m %s 2>/dev/null | grep -m1 'sim id' | sed 's/.*: //'", modem_path);
-        FILE *fp4 = popen(cmd, "r");
-        if (fp4) { if (fgets(iccid, sizeof(iccid), fp4)) { size_t l = strlen(iccid); if (l > 0 && iccid[l-1] == '\n') iccid[l-1] = 0; } pclose(fp4); }
+    struct jmx_mmcli_probe probe = {0};
+    struct jmx_exec_result result;
+    sqlite3_stmt *st = NULL;
+    int fields = 0;
+
+    if (!jmx_mmcli_selector_ok(modem_path) ||
+        nc_cellular_mmcli_capture(modem_path, 0, &result) != 0)
+        return;
+    fields = jmx_mmcli_parse_keyvalue(result.output, &probe, 0);
+    jmx_exec_result_free(&result);
+    if (fields < 0)
+        return;
+
+    if (probe.sim_path[0] &&
+        nc_cellular_mmcli_capture(probe.sim_path, 1, &result) == 0) {
+        int sim_fields = jmx_mmcli_parse_keyvalue(result.output, &probe, 1);
+        jmx_exec_result_free(&result);
+        if (sim_fields > 0)
+            fields += sim_fields;
     }
-    if (signal > 0) json_object_object_add(slot, "signal", json_object_new_int(signal));
-    if (operator[0]) json_object_object_add(slot, "operator", json_object_new_string(operator));
-    if (imei[0]) json_object_object_add(slot, "imei", json_object_new_string(imei));
-    if (iccid[0]) json_object_object_add(slot, "iccid", json_object_new_string(iccid));
-    /* Update DB with probed values */
-    if (signal > 0 || operator[0] || imei[0]) {
-        nc_exec("BEGIN IMMEDIATE");
-        sqlite3_stmt *st = NULL;
-        if (nc_prepare(&st, "UPDATE cellular_slot SET signal=?,operator=?,imei=?,iccid=?,updated_at=? WHERE id=?") == 0) {
-            sqlite3_bind_int(st, 1, signal); sqlite3_bind_text(st, 2, operator, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 3, imei, -1, SQLITE_TRANSIENT); sqlite3_bind_text(st, 4, iccid, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(st, 5, (sqlite3_int64)nc_now_s());
-            sqlite3_bind_text(st, 6, nc_json_str_def(slot, "id", ""), -1, SQLITE_TRANSIENT);
-            sqlite3_step(st); sqlite3_finalize(st);
-        }
-        nc_exec("COMMIT");
-    }
+    if (fields == 0)
+        return;
+
+    if (probe.has_signal)
+        json_object_object_add(slot, "signal", json_object_new_int(probe.signal));
+    if (probe.operator_name[0])
+        json_object_object_add(slot, "operator",
+                               json_object_new_string(probe.operator_name));
+    if (probe.imei[0])
+        json_object_object_add(slot, "imei", json_object_new_string(probe.imei));
+    if (probe.iccid[0])
+        json_object_object_add(slot, "iccid", json_object_new_string(probe.iccid));
+
+    if (nc_exec("BEGIN IMMEDIATE") != 0)
+        return;
+    if (nc_prepare(&st,
+        "UPDATE cellular_slot SET "
+        "signal=CASE WHEN ?1 THEN ?2 ELSE signal END,"
+        "operator=CASE WHEN ?3<>'' THEN ?3 ELSE operator END,"
+        "imei=CASE WHEN ?4<>'' THEN ?4 ELSE imei END,"
+        "iccid=CASE WHEN ?5<>'' THEN ?5 ELSE iccid END,"
+        "updated_at=?6 WHERE id=?7") != 0)
+        goto rollback;
+    sqlite3_bind_int(st, 1, probe.has_signal);
+    sqlite3_bind_int(st, 2, probe.signal);
+    sqlite3_bind_text(st, 3, probe.operator_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, probe.imei, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, probe.iccid, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)nc_now_s());
+    sqlite3_bind_text(st, 7, nc_json_str_def(slot, "id", ""), -1,
+                      SQLITE_TRANSIENT);
+    if (nc_step_done(st) != 0)
+        goto rollback;
+    sqlite3_finalize(st);
+    st = NULL;
+    if (nc_exec("COMMIT") == 0)
+        return;
+
+rollback:
+    if (st)
+        sqlite3_finalize(st);
+    (void)nc_exec("ROLLBACK");
 }
 
 /* ── Cellular service_apply: SQLite → UCI ── */
 int jmx_cellular_service_apply(int dry_run)
 {
-    if (jmx_netconfig_db_init() != 0) return -1; nc_cellular_db_init();
+    if (jmx_netconfig_db_init() != 0)
+        return -1;
+    nc_cellular_db_init();
+    if (dry_run)
+        return 0;
     /* Probe all enabled slots first */
     sqlite3_stmt *st = NULL;
     if (nc_prepare(&st, "SELECT id,name,modem_path,dev_type,enabled,sim_id,iccid,imei,operator,signal,apn,auth_type,username,password,pincode,network_type,roaming,mTU,dial_num,remark,sort_order,updated_at FROM cellular_slot WHERE enabled=1 ORDER BY sort_order,id") == 0) {
@@ -17019,7 +18484,6 @@ int jmx_cellular_service_apply(int dry_run)
         sqlite3_finalize(st);
     }
     /* Generate UCI config */
-    if (dry_run) return 0;
     FILE *fp = fopen("/etc/config/dreamingwrt_cellular", "w");
     if (fp) {
         fprintf(fp, "# generated by jmxd cellular apply\n");
@@ -17219,7 +18683,7 @@ int jmx_wifi_config_save(struct json_object *cfg)
     return -3;
 #if 0
     if(nc_wifi_phy_count()<=0)return -2;
-    nc_wifi_db_init(); struct json_object *v=NULL; sqlite3_stmt*st=NULL; nc_exec("BEGIN IMMEDIATE");
+    nc_wifi_db_init(); struct json_object *v=NULL; sqlite3_stmt*st=NULL; if(nc_txn_begin()!=0)return -1;
     struct json_object *g=NULL; if(json_object_object_get_ex(cfg,"global",&g)&&g){ if(nc_prepare(&st,"UPDATE wifi_global SET enabled=?,country=?,speed_profile=?,mesh=?,auto_link=?,band_steering=?,fast_roaming=?,mlo=?,dfs_enabled=?,roam_assist=?,roam_threshold=?,multicast_enhance=?,airtime_fairness=?,isolated_guest=?,updated_at=? WHERE id=1")==0){sqlite3_bind_int(st,1,nc_json_bool_def(g,"enabled",1));sqlite3_bind_text(st,2,nc_json_str_def(g,"country","CN"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(g,"speed_profile","conservative"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,4,nc_json_bool_def(g,"mesh",0));sqlite3_bind_int(st,5,nc_json_bool_def(g,"auto_link",1));sqlite3_bind_int(st,6,nc_json_bool_def(g,"band_steering",1));sqlite3_bind_int(st,7,nc_json_bool_def(g,"fast_roaming",1));sqlite3_bind_int(st,8,nc_json_bool_def(g,"mlo",0));sqlite3_bind_int(st,9,nc_json_bool_def(g,"dfs_enabled",1));sqlite3_bind_int(st,10,nc_json_bool_def(g,"roam_assist",0));sqlite3_bind_int(st,11,nc_json_int_def(g,"roam_threshold",-75));sqlite3_bind_int(st,12,nc_json_bool_def(g,"multicast_enhance",1));sqlite3_bind_int(st,13,nc_json_bool_def(g,"airtime_fairness",1));sqlite3_bind_int(st,14,nc_json_bool_def(g,"isolated_guest",0));sqlite3_bind_int64(st,15,(sqlite3_int64)nc_now_s());sqlite3_step(st);sqlite3_finalize(st);} }
     struct json_object *arr=NULL; if(json_object_object_get_ex(cfg,"radios",&arr)&&json_object_is_type(arr,json_type_array)){int n=json_object_array_length(arr);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);const char*id=nc_json_str_def(o,"id",""); if(!id[0])continue; struct json_object*w=NULL; char *widths=NULL; json_object_object_get_ex(o,"supported_widths",&w); widths=nc_json_array_to_string(w,""); if(nc_prepare(&st,"INSERT OR REPLACE INTO wifi_radios(id,band,device,phy,hwmode,channel,width,htmode,txpower,supported_widths,country,enabled,excluded_channels,bssid,driver,virtual_interfaces,max_vaps,reserved_vaps,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(o,"band",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(o,"device",id),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"phy",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"hwmode",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,6,nc_json_int_def(o,"channel",0));sqlite3_bind_int(st,7,nc_json_int_def(o,"width",20));sqlite3_bind_text(st,8,nc_json_str_def(o,"htmode",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,9,nc_json_int_def(o,"txpower",0));sqlite3_bind_text(st,10,widths?widths:"",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,11,nc_json_str_def(o,"country",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,12,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,13,nc_json_str_def(o,"excluded_channels",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,14,nc_json_str_def(o,"bssid",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,15,nc_json_str_def(o,"type",nc_json_str_def(o,"driver","")),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,16,nc_json_int_def(o,"interfaces",0));sqlite3_bind_int(st,17,nc_json_int_def(o,"max_vaps",8));sqlite3_bind_int(st,18,nc_json_int_def(o,"reserved_vaps",1));sqlite3_bind_int64(st,19,(sqlite3_int64)nc_now_s());sqlite3_step(st);sqlite3_finalize(st);} if(widths)free(widths);}}
     if(json_object_object_get_ex(cfg,"ssids",&arr)&&json_object_is_type(arr,json_type_array)){int n=json_object_array_length(arr);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);const char*id=nc_json_str_def(o,"id",""); if(!id[0])continue; json_object*b=NULL; json_object_object_get_ex(o,"bands",&b); char*bands=nc_json_array_to_string(b,nc_json_str_def(o,"bands","2g,5g")); if(nc_prepare(&st,"INSERT OR REPLACE INTO wifi_ssids(id,name,network,security,encryption,protocol,bands,enabled,mlo,fast_roaming,ieee80211r,ieee80211k,ieee80211v,rrm,qbssload,mobility_domain,nasid,ft_over_ds,ft_psk_generate_local,reassociation_deadline,key_rotation,hidden,isolate,pmf,vlan,remark,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(o,"name","WiFi"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(o,"network","lan"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"security","WPA3 Personal"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"encryption","sae+ccmp"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,nc_json_str_def(o,"protocol","auto"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,bands?bands:"2g,5g",-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,8,nc_json_bool_def(o,"enabled",1));sqlite3_bind_int(st,9,nc_json_bool_def(o,"mlo",0));sqlite3_bind_int(st,10,nc_json_bool_def(o,"fast_roaming",1));sqlite3_bind_int(st,11,nc_json_bool_def(o,"ieee80211r",0));sqlite3_bind_int(st,12,nc_json_bool_def(o,"ieee80211k",0));sqlite3_bind_int(st,13,nc_json_bool_def(o,"ieee80211v",0));sqlite3_bind_int(st,14,nc_json_bool_def(o,"rrm",0));sqlite3_bind_int(st,15,nc_json_bool_def(o,"qbssload",0));sqlite3_bind_text(st,16,nc_json_str_def(o,"mobility_domain",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,17,nc_json_str_def(o,"nasid",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,18,nc_json_bool_def(o,"ft_over_ds",1));sqlite3_bind_int(st,19,nc_json_bool_def(o,"ft_psk_generate_local",1));sqlite3_bind_int(st,20,nc_json_int_def(o,"reassociation_deadline",1000));sqlite3_bind_int(st,21,nc_json_bool_def(o,"key_rotation",0));sqlite3_bind_int(st,22,nc_json_bool_def(o,"hidden",0));sqlite3_bind_int(st,23,nc_json_bool_def(o,"isolate",0));sqlite3_bind_text(st,24,nc_json_str_def(o,"pmf","optional"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,25,nc_json_str_def(o,"vlan",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,26,nc_json_str_def(o,"remark",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,27,(sqlite3_int64)nc_now_s());sqlite3_step(st);sqlite3_finalize(st);} if(bands)free(bands);}}
@@ -17761,6 +19225,220 @@ static int nc_adv_family_ok(const char*s){return s&&(!strcmp(s,"ipv4")||!strcmp(
 static int nc_adv_action_ok(const char*s){return s&&(!strcmp(s,"route_table")||!strcmp(s,"route_group")||!strcmp(s,"main")||!strcmp(s,"drop")||!strcmp(s,"mark"));}
 static int nc_adv_table_id_ok(int id){return id>0 && id<32768 && id!=255 && id!=254 && id!=253;}
 
+#define NC_ADV_MAX_ITEMS 512
+
+static int nc_adv_text_ok(const char *text, size_t max_len)
+{
+    const unsigned char *p = (const unsigned char *)(text ? text : "");
+
+    if (strlen((const char *)p) > max_len)
+        return 0;
+    for (; *p; p++)
+        if (*p < 0x20 || *p == 0x7f)
+            return 0;
+    return 1;
+}
+
+static int nc_adv_ip_cidr_ok(const char *text, int family, int allow_empty)
+{
+    char copy[INET6_ADDRSTRLEN + 5];
+    char *slash;
+    char *end = NULL;
+    long prefix;
+    struct in_addr addr4;
+    struct in6_addr addr6;
+
+    if (!text || !text[0])
+        return allow_empty;
+    if (!strcmp(text, "default"))
+        return 1;
+    if (strlen(text) >= sizeof(copy))
+        return 0;
+    snprintf(copy, sizeof(copy), "%s", text);
+    slash = strchr(copy, '/');
+    if (slash) {
+        *slash++ = '\0';
+        if (!*slash || strchr(slash, '/'))
+            return 0;
+        errno = 0;
+        prefix = strtol(slash, &end, 10);
+        if (errno || !end || *end || prefix < 0 ||
+            prefix > (family == AF_INET6 ? 128 : 32))
+            return 0;
+    }
+    return family == AF_INET6 ? inet_pton(AF_INET6, copy, &addr6) == 1 :
+                               inet_pton(AF_INET, copy, &addr4) == 1;
+}
+
+static int nc_adv_ifname_ok(const char *ifname, int require_runtime)
+{
+    if (!ifname || !ifname[0])
+        return 1;
+    if (!nc_physical_port_ifname_strict_ok(ifname))
+        return 0;
+    return !require_runtime || if_nametoindex(ifname) > 0;
+}
+
+static int nc_adv_route_type_ok(const char *type)
+{
+    return type && !strcmp(type, "unicast");
+}
+
+static int nc_adv_proto_ok(const char *proto)
+{
+    return proto && (!strcmp(proto, "all") || !strcmp(proto, "tcp") ||
+                     !strcmp(proto, "udp"));
+}
+
+static int nc_adv_table_ref_ok(const char *table)
+{
+    return table && (!strcmp(table, "main") || !strcmp(table, "default") ||
+                     !strcmp(table, "local") || nc_adv_id_ok(table));
+}
+
+static int nc_adv_object_value_ok(const char *value)
+{
+    return nc_adv_ip_cidr_ok(value, AF_INET, 0);
+}
+
+static int nc_adv_validate_array(struct json_object *arr)
+{
+    int count;
+
+    if (!arr || !json_object_is_type(arr, json_type_array))
+        return -1;
+    count = json_object_array_length(arr);
+    if (count < 0 || count > NC_ADV_MAX_ITEMS)
+        return -1;
+    for (int i = 0; i < count; i++)
+        if (!json_object_array_get_idx(arr, i) ||
+            !json_object_is_type(json_object_array_get_idx(arr, i), json_type_object))
+            return -1;
+    return 0;
+}
+
+static int nc_adv_validate_config(struct json_object *cfg, int require_runtime_ifname)
+{
+    static const char *array_keys[] = {
+        "tables", "static_routes", "route_objects", "cross_services",
+        "policy_rules", NULL
+    };
+    struct json_object *arr = NULL;
+    struct json_object *global = NULL;
+    int total = 0;
+
+    if (!cfg || !json_object_is_type(cfg, json_type_object))
+        return -1;
+    if (json_object_object_get_ex(cfg, "global", &global) &&
+        (!global || !json_object_is_type(global, json_type_object)))
+        return -1;
+    if (global && !nc_adv_table_ref_ok(
+            nc_json_str_def(global, "default_table", "main")))
+        return -1;
+    for (int k = 0; array_keys[k]; k++) {
+        if (!json_object_object_get_ex(cfg, array_keys[k], &arr))
+            continue;
+        if (nc_adv_validate_array(arr) != 0)
+            return -1;
+        total += json_object_array_length(arr);
+        if (total > NC_ADV_MAX_ITEMS)
+            return -1;
+    }
+    if (json_object_object_get_ex(cfg, "tables", &arr)) {
+        for (int i = 0; i < json_object_array_length(arr); i++) {
+            struct json_object *o = json_object_array_get_idx(arr, i);
+            const char *id = nc_json_str_def(o, "id", "");
+            const char *gateway = nc_json_str_def(o, "gateway", "");
+            if (!nc_adv_id_ok(id) ||
+                !nc_adv_table_id_ok(nc_json_int_def(o, "table_id", 0)) ||
+                !nc_adv_text_ok(nc_json_str_def(o, "name", id), 128) ||
+                !nc_adv_ip_cidr_ok(gateway, AF_INET, 1))
+                return -1;
+        }
+    }
+    if (json_object_object_get_ex(cfg, "static_routes", &arr)) {
+        for (int i = 0; i < json_object_array_length(arr); i++) {
+            struct json_object *o = json_object_array_get_idx(arr, i);
+            const char *id = nc_json_str_def(o, "id", "");
+            const char *family = nc_json_str_def(o, "family", "ipv4");
+            const char *gateway = nc_json_str_def(o, "gateway", "");
+            const char *ifname = nc_json_str_def(o, "interface", "");
+            const char *table = nc_json_str_def(o, "table",
+                nc_json_str_def(o, "route_table", "main"));
+            const char *type = nc_json_str_def(o, "type",
+                nc_json_str_def(o, "route_type", "unicast"));
+            int af = !strcmp(family, "ipv6") ? AF_INET6 : AF_INET;
+            int metric = nc_json_int_def(o, "metric", 0);
+            int mtu = nc_json_int_def(o, "mtu", 1500);
+
+            if (!nc_adv_id_ok(id) ||
+                (strcmp(family, "ipv4") && strcmp(family, "ipv6")) ||
+                !nc_adv_ip_cidr_ok(nc_json_str_def(o, "destination", ""), af, 0) ||
+                !nc_adv_ip_cidr_ok(gateway, af, 1) ||
+                !nc_adv_ifname_ok(ifname, require_runtime_ifname) ||
+                !nc_adv_table_ref_ok(table) || !nc_adv_route_type_ok(type) ||
+                metric < 0 || metric > 1000000 || mtu < 576 || mtu > 65535 ||
+                !nc_adv_text_ok(nc_json_str_def(o, "name", id), 128) ||
+                !nc_adv_text_ok(nc_json_str_def(o, "comment", ""), 512))
+                return -1;
+        }
+    }
+    if (json_object_object_get_ex(cfg, "route_objects", &arr)) {
+        for (int i = 0; i < json_object_array_length(arr); i++) {
+            struct json_object *o = json_object_array_get_idx(arr, i);
+            struct json_object *members = NULL;
+            const char *id = nc_json_str_def(o, "id", "");
+            const char *family = nc_json_str_def(o, "family", "ipv4");
+            const char *type = nc_json_str_def(o, "type",
+                nc_json_str_def(o, "object_type", "ip_group"));
+            const char *value = nc_json_str_def(o, "value", "");
+
+            if (!nc_adv_id_ok(id) || strcmp(type, "ip_group") ||
+                strcmp(family, "ipv4") ||
+                !nc_adv_text_ok(nc_json_str_def(o, "name", id), 128) ||
+                (value[0] && !nc_adv_object_value_ok(value)))
+                return -1;
+            if (json_object_object_get_ex(o, "members", &members)) {
+                if (!members || !json_object_is_type(members, json_type_array) ||
+                    json_object_array_length(members) > NC_ADV_MAX_ITEMS)
+                    return -1;
+                for (int j = 0; j < json_object_array_length(members); j++) {
+                    struct json_object *member = json_object_array_get_idx(members, j);
+                    if (!member || !json_object_is_type(member, json_type_string) ||
+                        !nc_adv_object_value_ok(json_object_get_string(member)))
+                        return -1;
+                }
+            }
+        }
+    }
+    if (json_object_object_get_ex(cfg, "policy_rules", &arr)) {
+        for (int i = 0; i < json_object_array_length(arr); i++) {
+            struct json_object *o = json_object_array_get_idx(arr, i);
+            const char *id = nc_json_str_def(o, "id", "");
+            const char *proto = nc_json_str_def(o, "proto", "all");
+            const char *ports = nc_json_str_def(o, "ports", "any");
+            const char *action = nc_json_str_def(o, "action", "route_table");
+            const char *source = nc_json_str_def(o, "source_object", "");
+            const char *destination = nc_json_str_def(o, "dest_object", "");
+            const char *table = nc_json_str_def(o, "table",
+                nc_json_str_def(o, "route_table", nc_json_str_def(o, "target", "")));
+            int priority = nc_json_int_def(o, "priority", 1000 + i);
+
+            if (!nc_adv_id_ok(id) || (source[0] && !nc_adv_id_ok(source)) ||
+                (destination[0] && !nc_adv_id_ok(destination)) ||
+                !nc_adv_proto_ok(proto) ||
+                !nc_fw_port_expr_ok(ports) || strcmp(action, "route_table") ||
+                !nc_adv_table_ref_ok(table) || !strcmp(table, "local") ||
+                strcmp(nc_json_str_def(o, "schedule", "always"), "always") ||
+                priority < 0 || priority > 1000000 ||
+                !nc_adv_text_ok(nc_json_str_def(o, "name", id), 128) ||
+                !nc_adv_text_ok(nc_json_str_def(o, "comment", ""), 512))
+                return -1;
+        }
+    }
+    return 0;
+}
+
 static char *nc_adv_array_text(struct json_object *o, const char *key, const char *def)
 {
     struct json_object *v=NULL; if(json_object_object_get_ex(o,key,&v)&&v&&json_object_is_type(v,json_type_array)) return nc_json_array_to_string(v,def); return strdup(nc_json_str_def(o,key,def));
@@ -17786,22 +19464,160 @@ struct json_object *jmx_advanced_routing_get(void)
     if(nc_prepare(&st,"SELECT enabled,engine,apply_state,last_apply_at,default_table,object_revision,health_aware,log_policy_hits FROM advanced_routing_global WHERE id=1")==0&&sqlite3_step(st)==SQLITE_ROW){struct json_object*g=json_object_new_object();json_object_object_add(g,"enabled",json_object_new_boolean(sqlite3_column_int(st,0)));nc_add_text(g,"engine",st,1);nc_add_text(g,"apply_state",st,2);json_object_object_add(g,"last_apply_at",json_object_new_int64(sqlite3_column_int64(st,3)));nc_add_text(g,"default_table",st,4);json_object_object_add(g,"object_revision",json_object_new_int(sqlite3_column_int(st,5)));json_object_object_add(g,"health_aware",json_object_new_boolean(sqlite3_column_int(st,6)));json_object_object_add(g,"log_policy_hits",json_object_new_boolean(sqlite3_column_int(st,7)));json_object_object_add(d,"global",g);sqlite3_finalize(st);} struct json_object*a=json_object_new_array();nc_adv_add_table_json(a);json_object_object_add(d,"tables",a);a=json_object_new_array();nc_adv_add_static_routes_json(a);json_object_object_add(d,"static_routes",a);a=json_object_new_array();nc_adv_add_objects_json(a);json_object_object_add(d,"route_objects",a);a=json_object_new_array();nc_adv_add_cross_json(a);json_object_object_add(d,"cross_services",a);a=json_object_new_array();nc_adv_add_rules_json(a);json_object_object_add(d,"policy_rules",a);json_object_object_add(d,"external_policies",json_object_new_array());a=json_object_new_array();nc_adv_add_hits_json(a);json_object_object_add(d,"rule_hits",a);return jmx_gen_api_response_data(API_CODE_SUCCESS,d);
 }
 
-static int nc_adv_set_global(struct json_object*g)
-{sqlite3_stmt*st=NULL;if(!g)return 0;if(nc_prepare(&st,"UPDATE advanced_routing_global SET enabled=?,default_table=?,health_aware=?,log_policy_hits=?,updated_at=? WHERE id=1")==0){sqlite3_bind_int(st,1,nc_json_bool_def(g,"enabled",1));sqlite3_bind_text(st,2,nc_json_str_def(g,"default_table","main"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,3,nc_json_bool_def(g,"health_aware",1));sqlite3_bind_int(st,4,nc_json_bool_def(g,"log_policy_hits",1));sqlite3_bind_int64(st,5,(sqlite3_int64)nc_now_s());sqlite3_step(st);sqlite3_finalize(st);}return 0;}
-static int nc_adv_set_tables(struct json_object*arr)
-{if(!arr||!json_object_is_type(arr,json_type_array))return 0;sqlite3_stmt*st=NULL;int n=json_object_array_length(arr);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);const char*id=nc_json_str_def(o,"id","");int tid=nc_json_int_def(o,"table_id",0);if(!nc_adv_id_ok(id)||!nc_adv_table_id_ok(tid))return -1;if(nc_prepare(&st,"INSERT OR REPLACE INTO route_table(id,name,table_id,role,gateway,metric,enabled,updated_at) VALUES(?,?,?,?,?,?,?,?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(o,"name",id),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,3,tid);sqlite3_bind_text(st,4,nc_json_str_def(o,"role",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"gateway",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,6,nc_json_int_def(o,"metric",0));sqlite3_bind_int(st,7,nc_json_bool_def(o,"enabled",1));sqlite3_bind_int64(st,8,(sqlite3_int64)nc_now_s());sqlite3_step(st);sqlite3_finalize(st);}}return 0;}
-static int nc_adv_set_static_routes(struct json_object*arr)
-{if(!arr||!json_object_is_type(arr,json_type_array))return 0;sqlite3_stmt*st=NULL;int n=json_object_array_length(arr);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);const char*id=nc_json_str_def(o,"id","");const char*f=nc_json_str_def(o,"family","ipv4");if(!nc_adv_id_ok(id)||!nc_adv_family_ok(f)||!nc_json_str_def(o,"destination","")[0])return -1;if(nc_prepare(&st,"INSERT OR REPLACE INTO static_route(id,enabled,name,family,destination,gateway,interface,route_table,metric,mtu,route_type,comment,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,2,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,3,nc_json_str_def(o,"name",id),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,f,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"destination",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,nc_json_str_def(o,"gateway",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(o,"interface",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(o,"table",nc_json_str_def(o,"route_table","main")),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,9,nc_json_int_def(o,"metric",0));sqlite3_bind_int(st,10,nc_json_int_def(o,"mtu",1500));sqlite3_bind_text(st,11,nc_json_str_def(o,"type",nc_json_str_def(o,"route_type","unicast")),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,12,nc_json_str_def(o,"comment",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,13,(sqlite3_int64)nc_now_s());sqlite3_step(st);sqlite3_finalize(st);}}return 0;}
-static int nc_adv_set_objects(struct json_object*arr)
-{if(!arr||!json_object_is_type(arr,json_type_array))return 0;sqlite3_stmt*st=NULL;int n=json_object_array_length(arr);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);const char*id=nc_json_str_def(o,"id","");const char*f=nc_json_str_def(o,"family","mixed");if(!nc_adv_id_ok(id)||!nc_adv_family_ok(f))return -1;if(nc_prepare(&st,"INSERT OR REPLACE INTO route_object(id,enabled,name,object_type,family,value,comment,updated_at) VALUES(?,?,?,?,?,?,?,?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,2,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,3,nc_json_str_def(o,"name",id),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"type",nc_json_str_def(o,"object_type","ip_group")),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,f,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,nc_json_str_def(o,"value",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(o,"comment",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,8,(sqlite3_int64)nc_now_s());sqlite3_step(st);sqlite3_finalize(st);} nc_prepare(&st,"DELETE FROM route_object_member WHERE object_id=?"); if(st){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);} struct json_object*m=NULL;if(json_object_object_get_ex(o,"members",&m)&&json_object_is_type(m,json_type_array)){int mn=json_object_array_length(m);for(int j=0;j<mn;j++){const char*v=nc_json_string_at(m,j);if(nc_prepare(&st,"INSERT INTO route_object_member(object_id,value,label,sort_order) VALUES(?,?,?,?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,v,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,v,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,4,j);sqlite3_step(st);sqlite3_finalize(st);}}}}return 0;}
-static int nc_adv_set_cross(struct json_object*arr)
-{if(!arr||!json_object_is_type(arr,json_type_array))return 0;sqlite3_stmt*st=NULL;int n=json_object_array_length(arr);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);const char*id=nc_json_str_def(o,"id","");if(!nc_adv_id_ok(id))return -1;if(nc_prepare(&st,"INSERT OR REPLACE INTO cross_l3_service(id,enabled,name,service_type,server_ip,scope,listen_port,version,access_rate,remark,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,2,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,3,nc_json_str_def(o,"name",id),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"service_type","snmp"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"server_ip",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,nc_json_str_def(o,"scope",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(o,"listen_port","161"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(o,"version","V2"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,9,nc_json_str_def(o,"access_rate",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,10,nc_json_str_def(o,"remark",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,11,(sqlite3_int64)nc_now_s());sqlite3_step(st);sqlite3_finalize(st);}}return 0;}
-static int nc_adv_set_rules(struct json_object*arr)
-{if(!arr||!json_object_is_type(arr,json_type_array))return 0;sqlite3_stmt*st=NULL;int n=json_object_array_length(arr);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);const char*id=nc_json_str_def(o,"id","");const char*act=nc_json_str_def(o,"action","route_table");if(!nc_adv_id_ok(id)||!nc_adv_action_ok(act))return -1;if(nc_prepare(&st,"INSERT OR REPLACE INTO policy_route_rule(id,enabled,priority,name,source_object,dest_object,proto,ports,action,target,route_table,schedule,sticky,comment,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,2,nc_json_bool_def(o,"enabled",1));sqlite3_bind_int(st,3,nc_json_int_def(o,"priority",1000+i));sqlite3_bind_text(st,4,nc_json_str_def(o,"name",id),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"source_object",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,nc_json_str_def(o,"dest_object",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(o,"proto","all"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(o,"ports","any"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,9,act,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,10,nc_json_str_def(o,"target",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,11,nc_json_str_def(o,"table",nc_json_str_def(o,"route_table","")),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,12,nc_json_str_def(o,"schedule","always"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,13,nc_json_bool_def(o,"sticky",1));sqlite3_bind_text(st,14,nc_json_str_def(o,"comment",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,15,(sqlite3_int64)nc_now_s());sqlite3_step(st);sqlite3_finalize(st);}}return 0;}
+static int nc_adv_statement_done(sqlite3_stmt *st, int bind_rc)
+{
+    int rc = bind_rc;
+    if (!st)
+        return -1;
+    if (rc == 0 && nc_step_done(st) != 0)
+        rc = -1;
+    if (sqlite3_finalize(st) != SQLITE_OK)
+        rc = -1;
+    return rc;
+}
+
+static int nc_adv_set_global(struct json_object *g)
+{
+    sqlite3_stmt *st = NULL;
+    int rc;
+    if (!g) return 0;
+    if (nc_prepare(&st, "UPDATE advanced_routing_global SET enabled=?1,default_table=?2,health_aware=?3,log_policy_hits=?4,updated_at=?5 WHERE id=1") != 0)
+        return -1;
+    rc = nc_fw_bind_int(st, 1, nc_json_bool_def(g, "enabled", 1)) ||
+         nc_fw_bind_text(st, 2, nc_json_str_def(g, "default_table", "main")) ||
+         nc_fw_bind_int(st, 3, nc_json_bool_def(g, "health_aware", 1)) ||
+         nc_fw_bind_int(st, 4, nc_json_bool_def(g, "log_policy_hits", 1)) ||
+         nc_fw_bind_int64(st, 5, nc_now_s());
+    return nc_adv_statement_done(st, rc ? -1 : 0);
+}
+
+static int nc_adv_set_tables(struct json_object *arr)
+{
+    for (int i = 0; i < json_object_array_length(arr); i++) {
+        struct json_object *o = json_object_array_get_idx(arr, i);
+        sqlite3_stmt *st = NULL;
+        const char *id = nc_json_str_def(o, "id", "");
+        int rc;
+        if (nc_prepare(&st, "INSERT OR REPLACE INTO route_table(id,name,table_id,role,gateway,metric,enabled,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)") != 0)
+            return -1;
+        rc = nc_fw_bind_text(st, 1, id) || nc_fw_bind_text(st, 2, nc_json_str_def(o, "name", id)) ||
+             nc_fw_bind_int(st, 3, nc_json_int_def(o, "table_id", 0)) || nc_fw_bind_text(st, 4, nc_json_str_def(o, "role", "")) ||
+             nc_fw_bind_text(st, 5, nc_json_str_def(o, "gateway", "")) || nc_fw_bind_int(st, 6, nc_json_int_def(o, "metric", 0)) ||
+             nc_fw_bind_int(st, 7, nc_json_bool_def(o, "enabled", 1)) || nc_fw_bind_int64(st, 8, nc_now_s());
+        if (nc_adv_statement_done(st, rc ? -1 : 0) != 0) return -1;
+    }
+    return 0;
+}
+
+static int nc_adv_set_static_routes(struct json_object *arr)
+{
+    for (int i = 0; i < json_object_array_length(arr); i++) {
+        struct json_object *o = json_object_array_get_idx(arr, i);
+        sqlite3_stmt *st = NULL;
+        const char *id = nc_json_str_def(o, "id", "");
+        int rc;
+        if (nc_prepare(&st, "INSERT OR REPLACE INTO static_route(id,enabled,name,family,destination,gateway,interface,route_table,metric,mtu,route_type,comment,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)") != 0)
+            return -1;
+        rc = nc_fw_bind_text(st,1,id) || nc_fw_bind_int(st,2,nc_json_bool_def(o,"enabled",1)) ||
+             nc_fw_bind_text(st,3,nc_json_str_def(o,"name",id)) || nc_fw_bind_text(st,4,nc_json_str_def(o,"family","ipv4")) ||
+             nc_fw_bind_text(st,5,nc_json_str_def(o,"destination","")) || nc_fw_bind_text(st,6,nc_json_str_def(o,"gateway","")) ||
+             nc_fw_bind_text(st,7,nc_json_str_def(o,"interface","")) || nc_fw_bind_text(st,8,nc_json_str_def(o,"table",nc_json_str_def(o,"route_table","main"))) ||
+             nc_fw_bind_int(st,9,nc_json_int_def(o,"metric",0)) || nc_fw_bind_int(st,10,nc_json_int_def(o,"mtu",1500)) ||
+             nc_fw_bind_text(st,11,nc_json_str_def(o,"type",nc_json_str_def(o,"route_type","unicast"))) ||
+             nc_fw_bind_text(st,12,nc_json_str_def(o,"comment","")) || nc_fw_bind_int64(st,13,nc_now_s());
+        if (nc_adv_statement_done(st, rc ? -1 : 0) != 0) return -1;
+    }
+    return 0;
+}
+
+static int nc_adv_set_objects(struct json_object *arr)
+{
+    for (int i = 0; i < json_object_array_length(arr); i++) {
+        struct json_object *o = json_object_array_get_idx(arr, i), *members = NULL;
+        sqlite3_stmt *st = NULL;
+        const char *id = nc_json_str_def(o, "id", "");
+        int rc;
+        if (nc_prepare(&st, "INSERT OR REPLACE INTO route_object(id,enabled,name,object_type,family,value,comment,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)") != 0)
+            return -1;
+        rc = nc_fw_bind_text(st,1,id) || nc_fw_bind_int(st,2,nc_json_bool_def(o,"enabled",1)) ||
+             nc_fw_bind_text(st,3,nc_json_str_def(o,"name",id)) || nc_fw_bind_text(st,4,nc_json_str_def(o,"type",nc_json_str_def(o,"object_type","ip_group"))) ||
+             nc_fw_bind_text(st,5,nc_json_str_def(o,"family","ipv4")) || nc_fw_bind_text(st,6,nc_json_str_def(o,"value","")) ||
+             nc_fw_bind_text(st,7,nc_json_str_def(o,"comment","")) || nc_fw_bind_int64(st,8,nc_now_s());
+        if (nc_adv_statement_done(st, rc ? -1 : 0) != 0) return -1;
+        if (nc_prepare(&st, "DELETE FROM route_object_member WHERE object_id=?1") != 0) return -1;
+        if (nc_adv_statement_done(st, nc_fw_bind_text(st,1,id)) != 0) return -1;
+        if (json_object_object_get_ex(o, "members", &members)) {
+            for (int j = 0; j < json_object_array_length(members); j++) {
+                const char *value = json_object_get_string(json_object_array_get_idx(members,j));
+                if (nc_prepare(&st, "INSERT INTO route_object_member(object_id,value,label,sort_order) VALUES(?1,?2,?3,?4)") != 0) return -1;
+                rc = nc_fw_bind_text(st,1,id) || nc_fw_bind_text(st,2,value) || nc_fw_bind_text(st,3,value) || nc_fw_bind_int(st,4,j);
+                if (nc_adv_statement_done(st, rc ? -1 : 0) != 0) return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int nc_adv_set_cross(struct json_object *arr)
+{
+    for (int i = 0; i < json_object_array_length(arr); i++) {
+        struct json_object *o = json_object_array_get_idx(arr, i);
+        sqlite3_stmt *st = NULL;
+        const char *id = nc_json_str_def(o,"id","");
+        int rc;
+        if (nc_prepare(&st,"INSERT OR REPLACE INTO cross_l3_service(id,enabled,name,service_type,server_ip,scope,listen_port,version,access_rate,remark,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)") != 0) return -1;
+        rc = nc_fw_bind_text(st,1,id) || nc_fw_bind_int(st,2,nc_json_bool_def(o,"enabled",1)) || nc_fw_bind_text(st,3,nc_json_str_def(o,"name",id)) ||
+             nc_fw_bind_text(st,4,nc_json_str_def(o,"service_type","snmp")) || nc_fw_bind_text(st,5,nc_json_str_def(o,"server_ip","")) ||
+             nc_fw_bind_text(st,6,nc_json_str_def(o,"scope","")) || nc_fw_bind_text(st,7,nc_json_str_def(o,"listen_port","161")) ||
+             nc_fw_bind_text(st,8,nc_json_str_def(o,"version","V2")) || nc_fw_bind_text(st,9,nc_json_str_def(o,"access_rate","")) ||
+             nc_fw_bind_text(st,10,nc_json_str_def(o,"remark","")) || nc_fw_bind_int64(st,11,nc_now_s());
+        if (nc_adv_statement_done(st, rc ? -1 : 0) != 0) return -1;
+    }
+    return 0;
+}
+
+static int nc_adv_set_rules(struct json_object *arr)
+{
+    for (int i = 0; i < json_object_array_length(arr); i++) {
+        struct json_object *o = json_object_array_get_idx(arr, i);
+        sqlite3_stmt *st = NULL;
+        const char *id = nc_json_str_def(o,"id","");
+        int rc;
+        if (nc_prepare(&st,"INSERT OR REPLACE INTO policy_route_rule(id,enabled,priority,name,source_object,dest_object,proto,ports,action,target,route_table,schedule,sticky,comment,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)") != 0) return -1;
+        rc = nc_fw_bind_text(st,1,id) || nc_fw_bind_int(st,2,nc_json_bool_def(o,"enabled",1)) || nc_fw_bind_int(st,3,nc_json_int_def(o,"priority",1000+i)) ||
+             nc_fw_bind_text(st,4,nc_json_str_def(o,"name",id)) || nc_fw_bind_text(st,5,nc_json_str_def(o,"source_object","")) ||
+             nc_fw_bind_text(st,6,nc_json_str_def(o,"dest_object","")) || nc_fw_bind_text(st,7,nc_json_str_def(o,"proto","all")) ||
+             nc_fw_bind_text(st,8,nc_json_str_def(o,"ports","any")) || nc_fw_bind_text(st,9,nc_json_str_def(o,"action","route_table")) ||
+             nc_fw_bind_text(st,10,nc_json_str_def(o,"target","")) || nc_fw_bind_text(st,11,nc_json_str_def(o,"table",nc_json_str_def(o,"route_table",""))) ||
+             nc_fw_bind_text(st,12,nc_json_str_def(o,"schedule","always")) || nc_fw_bind_int(st,13,nc_json_bool_def(o,"sticky",1)) ||
+             nc_fw_bind_text(st,14,nc_json_str_def(o,"comment","")) || nc_fw_bind_int64(st,15,nc_now_s());
+        if (nc_adv_statement_done(st, rc ? -1 : 0) != 0) return -1;
+    }
+    return 0;
+}
 
 int jmx_advanced_routing_set(struct json_object *cfg)
 {
-    if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_adv_route_db_init(); struct json_object*v=NULL; int rc=0; nc_exec("BEGIN IMMEDIATE"); if(json_object_object_get_ex(cfg,"global",&v))rc|=nc_adv_set_global(v); if(json_object_object_get_ex(cfg,"tables",&v))rc|=nc_adv_set_tables(v); if(json_object_object_get_ex(cfg,"static_routes",&v))rc|=nc_adv_set_static_routes(v); if(json_object_object_get_ex(cfg,"route_objects",&v))rc|=nc_adv_set_objects(v); if(json_object_object_get_ex(cfg,"cross_services",&v))rc|=nc_adv_set_cross(v); if(json_object_object_get_ex(cfg,"policy_rules",&v))rc|=nc_adv_set_rules(v); if(rc==0)nc_exec("UPDATE advanced_routing_global SET object_revision=object_revision+1,apply_state='draft',updated_at=strftime('%s','now') WHERE id=1"); nc_exec(rc==0?"COMMIT":"ROLLBACK"); return rc==0?0:-1;
+    struct json_object *v = NULL;
+    int rc = 0;
+
+    if (nc_adv_validate_config(cfg, 0) != 0 || jmx_netconfig_db_init() != 0)
+        return -1;
+    nc_adv_route_db_init();
+    if (nc_exec("BEGIN IMMEDIATE") != 0)
+        return -1;
+    if (json_object_object_get_ex(cfg,"global",&v)) rc |= nc_adv_set_global(v);
+    if (json_object_object_get_ex(cfg,"tables",&v)) rc |= nc_adv_set_tables(v);
+    if (json_object_object_get_ex(cfg,"static_routes",&v)) rc |= nc_adv_set_static_routes(v);
+    if (json_object_object_get_ex(cfg,"route_objects",&v)) rc |= nc_adv_set_objects(v);
+    if (json_object_object_get_ex(cfg,"cross_services",&v)) rc |= nc_adv_set_cross(v);
+    if (json_object_object_get_ex(cfg,"policy_rules",&v)) rc |= nc_adv_set_rules(v);
+    if (rc == 0)
+        rc = nc_exec("UPDATE advanced_routing_global SET object_revision=object_revision+1,apply_state='draft',updated_at=strftime('%s','now') WHERE id=1");
+    if (rc == 0 && nc_exec("COMMIT") == 0)
+        return 0;
+    nc_exec("ROLLBACK");
+    return -1;
 }
 
 static void nc_shquote(FILE *fp, const char *s)
@@ -17811,14 +19627,43 @@ static void nc_shquote(FILE *fp, const char *s)
     fputc('\'', fp);
 }
 
-static int nc_adv_table_id_by_name(const char *name)
+static int nc_adv_table_id_by_name(const char *name, int *table_id)
 {
-    if(!name || !name[0] || !strcmp(name,"main")) return 254;
-    if(!strcmp(name,"default")) return 253;
-    if(!strcmp(name,"local")) return 255;
-    sqlite3_stmt *st=NULL; int tid=0;
-    if(nc_prepare(&st,"SELECT table_id FROM route_table WHERE id=? AND enabled=1")==0){sqlite3_bind_text(st,1,name,-1,SQLITE_TRANSIENT);if(sqlite3_step(st)==SQLITE_ROW)tid=sqlite3_column_int(st,0);sqlite3_finalize(st);} 
-    return tid;
+    sqlite3_stmt *st = NULL;
+    int step_rc;
+    int rc = -1;
+
+    if (!table_id)
+        return -1;
+    *table_id = 0;
+    if (!name || !name[0] || !strcmp(name, "main")) {
+        *table_id = 254;
+        return 0;
+    }
+    if (!strcmp(name, "default")) {
+        *table_id = 253;
+        return 0;
+    }
+    if (!strcmp(name, "local")) {
+        *table_id = 255;
+        return 0;
+    }
+    if (nc_prepare(&st,
+        "SELECT table_id FROM route_table WHERE id=? AND enabled=1") != 0)
+        return -1;
+    if (sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT) != SQLITE_OK)
+        goto out;
+    step_rc = sqlite3_step(st);
+    if (step_rc == SQLITE_ROW) {
+        *table_id = sqlite3_column_int(st, 0);
+        rc = 0;
+    } else if (step_rc == SQLITE_DONE) {
+        rc = 0;
+    }
+out:
+    if (sqlite3_finalize(st) != SQLITE_OK)
+        rc = -1;
+    return rc;
 }
 
 static unsigned nc_adv_rule_mark(const char *id, int prio)
@@ -17831,7 +19676,95 @@ static unsigned nc_adv_rule_mark(const char *id, int prio)
     return 0x7000u | (h ? h : 1u);
 }
 
-static void nc_adv_emit_route_cmd(FILE *fp, const char *family, const char *dst, const char *gw, const char *ifn, const char *table, int metric, int mtu, const char *rtype)
+#define NC_ADV_RUNTIME_DIR "/run/dreamingwrt"
+
+static int nc_adv_open_runtime_log(char *path, size_t path_len)
+{
+    struct stat st;
+    int dirfd = -1;
+    int fd = -1;
+    int attempt;
+    char name[128];
+
+    if (!path || path_len == 0)
+        return -1;
+    path[0] = '\0';
+    if (mkdir(NC_ADV_RUNTIME_DIR, 0700) != 0 && errno != EEXIST)
+        return -1;
+    dirfd = open(NC_ADV_RUNTIME_DIR,
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0 || fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        goto out;
+    for (attempt = 0; attempt < 32; attempt++) {
+        snprintf(name, sizeof(name), "advanced-routing-%ld-%lld-%08lx-%d.log",
+                 (long)getpid(), (long long)nc_now_s(),
+                 (unsigned long)random(), attempt);
+        fd = openat(dirfd, name,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                    0600);
+        if (fd >= 0) {
+            if (snprintf(path, path_len, "%s/%s", NC_ADV_RUNTIME_DIR, name) >=
+                (int)path_len) {
+                close(fd);
+                unlinkat(dirfd, name, 0);
+                fd = -1;
+            }
+            break;
+        }
+        if (errno != EEXIST)
+            break;
+    }
+out:
+    if (dirfd >= 0)
+        close(dirfd);
+    return fd;
+}
+
+static int nc_adv_run_script(int logfd)
+{
+    const char *argv[] = { "/bin/sh", "/etc/dreamingwrt/advanced_routing_apply.sh", NULL };
+    pid_t pid;
+    int status;
+
+    if (logfd < 0)
+        return -1;
+    pid = fork();
+    if (pid < 0) {
+        close(logfd);
+        return -1;
+    }
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDONLY | O_CLOEXEC);
+
+        if (devnull >= 0) {
+            if (dup2(devnull, STDIN_FILENO) < 0)
+                _exit(126);
+            if (devnull > STDERR_FILENO)
+                close(devnull);
+        }
+        if (dup2(logfd, STDOUT_FILENO) < 0 || dup2(logfd, STDERR_FILENO) < 0)
+            _exit(126);
+        if (logfd > STDERR_FILENO)
+            close(logfd);
+        clearenv();
+        setenv("PATH", "/usr/sbin:/usr/bin:/sbin:/bin", 1);
+        execv(argv[0], (char * const *)argv);
+        _exit(127);
+    }
+    close(logfd);
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int nc_adv_emit_route_cmd(FILE *fp, const char *family, const char *dst,
+                                 const char *gw, const char *ifn,
+                                 const char *table, int metric, int mtu,
+                                 const char *rtype)
 {
     const int v6 = family && !strcmp(family,"ipv6");
     fprintf(fp, "%s route replace ", v6?"ip -6":"ip"); nc_shquote(fp, dst&&dst[0]?dst:(v6?"::/0":"0.0.0.0/0"));
@@ -17841,80 +19774,1454 @@ static void nc_adv_emit_route_cmd(FILE *fp, const char *family, const char *dst,
     if(metric > 0) fprintf(fp, " metric %d", metric);
     if(mtu > 0 && mtu != 1500) fprintf(fp, " mtu %d", mtu);
     fprintf(fp, " table "); nc_shquote(fp, table&&table[0]?table:"main");
-    fprintf(fp, " || echo route_failed:%s >>/tmp/dw-adv-routing-apply.log\n", dst&&dst[0]?dst:"default");
+    fprintf(fp, " || { printf 'route_failed:%%s\\n' ");
+    nc_shquote(fp, dst&&dst[0]?dst:"default");
+    fprintf(fp, "; exit 5; }\n");
+    return ferror(fp) ? -1 : 0;
 }
 
-static void nc_adv_emit_obj_nft(FILE *fp, const char *obj, const char *dir, int *has_match)
+static int nc_adv_emit_obj_nft(FILE *fp, const char *obj, const char *dir,
+                               int *has_match)
 {
-    if(!obj || !obj[0]) return;
+    int step_rc;
     sqlite3_stmt *st=NULL;
-    if(nc_prepare(&st,"SELECT value FROM route_object WHERE id=? AND enabled=1 UNION ALL SELECT m.value FROM route_object_member m JOIN route_object o ON o.id=m.object_id WHERE o.id=? AND o.enabled=1 ORDER BY value")==0){
-        sqlite3_bind_text(st,1,obj,-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,2,obj,-1,SQLITE_TRANSIENT);
-        int n=0; while(sqlite3_step(st)==SQLITE_ROW){ const char *v=(const char*)sqlite3_column_text(st,0); if(!v||!v[0]) continue; if(n++==0) fprintf(fp," ip %s { ",dir); else fprintf(fp,", "); fprintf(fp,"%s",v); }
-        if(n>0){ fprintf(fp," }"); if(has_match)*has_match=1; }
+
+    if(!obj || !obj[0]) return 0;
+    if(nc_prepare(&st,"SELECT value FROM route_object WHERE id=? AND enabled=1 UNION ALL SELECT m.value FROM route_object_member m JOIN route_object o ON o.id=m.object_id WHERE o.id=? AND o.enabled=1 ORDER BY value")!=0)
+        return -1;
+    if (sqlite3_bind_text(st,1,obj,-1,SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st,2,obj,-1,SQLITE_TRANSIENT) != SQLITE_OK) {
         sqlite3_finalize(st);
+        return -1;
     }
+    int n=0;
+    while((step_rc=sqlite3_step(st))==SQLITE_ROW){ const char *v=(const char*)sqlite3_column_text(st,0); if(!v||!v[0]) continue; if(!nc_adv_object_value_ok(v)){sqlite3_finalize(st);return -1;} if(n++==0) fprintf(fp," ip %s { ",dir); else fprintf(fp,", "); fprintf(fp,"%s",v); }
+    if(n>0){ fprintf(fp," }"); if(has_match)*has_match=1; }
+    if (step_rc != SQLITE_DONE || sqlite3_finalize(st) != SQLITE_OK || ferror(fp))
+        return -1;
+    return n;
 }
 
 static int nc_adv_generate_runtime(FILE *script_path, FILE *nft_fp)
 {
     sqlite3_stmt *st=NULL;
-    fprintf(script_path, "#!/bin/sh\nset -u\n: >/tmp/dw-adv-routing-apply.log\ncommand -v ip >/dev/null 2>&1 || { echo missing_ip >>/tmp/dw-adv-routing-apply.log; exit 3; }\n");
+    int step_rc;
+
+    fprintf(script_path, "#!/bin/sh\nset -eu\ncommand -v ip >/dev/null 2>&1 || { echo missing_ip; exit 3; }\n");
     fprintf(script_path, "mkdir -p /etc/iproute2/rt_tables.d /etc/dreamingwrt\n");
 
     fprintf(nft_fp, "flush table inet dreamingwrt_pbr\n");
     fprintf(nft_fp, "table inet dreamingwrt_pbr {\n\tchain prerouting {\n\t\ttype filter hook prerouting priority mangle; policy accept;\n");
 
-    if(nc_prepare(&st,"SELECT id,table_id FROM route_table WHERE enabled=1 ORDER BY table_id")==0){
-        while(sqlite3_step(st)==SQLITE_ROW){ const char *id=(const char*)sqlite3_column_text(st,0); if(!id)continue; fprintf(script_path,"ip route flush table "); nc_shquote(script_path,id); fprintf(script_path," 2>/dev/null || true\nip -6 route flush table "); nc_shquote(script_path,id); fprintf(script_path," 2>/dev/null || true\n"); }
-        sqlite3_finalize(st);
-    }
+    if (nc_prepare(&st,
+        "SELECT COUNT(*) FROM cross_l3_service WHERE enabled=1") != 0)
+        return -1;
+    step_rc = sqlite3_step(st);
+    if (step_rc != SQLITE_ROW || sqlite3_column_int(st, 0) != 0 ||
+        sqlite3_finalize(st) != SQLITE_OK)
+        return -1;
+    st = NULL;
+
+    if(nc_prepare(&st,"SELECT id,table_id FROM route_table WHERE enabled=1 ORDER BY table_id")!=0)
+        return -1;
+    while((step_rc=sqlite3_step(st))==SQLITE_ROW){ const char *id=(const char*)sqlite3_column_text(st,0); if(!id)continue; fprintf(script_path,"ip route flush table "); nc_shquote(script_path,id); fprintf(script_path," 2>/dev/null || true\nip -6 route flush table "); nc_shquote(script_path,id); fprintf(script_path," 2>/dev/null || true\n"); }
+    if (step_rc != SQLITE_DONE || sqlite3_finalize(st) != SQLITE_OK)
+        return -1;
+    st = NULL;
     fprintf(script_path, "for p in $(seq 10000 19999); do ip rule del pref $p 2>/dev/null || true; ip -6 rule del pref $p 2>/dev/null || true; done\n");
 
-    if(nc_prepare(&st,"SELECT family,destination,gateway,interface,route_table,metric,mtu,route_type FROM static_route WHERE enabled=1 ORDER BY metric,id")==0){
-        while(sqlite3_step(st)==SQLITE_ROW) nc_adv_emit_route_cmd(script_path,(const char*)sqlite3_column_text(st,0),(const char*)sqlite3_column_text(st,1),(const char*)sqlite3_column_text(st,2),(const char*)sqlite3_column_text(st,3),(const char*)sqlite3_column_text(st,4),sqlite3_column_int(st,5),sqlite3_column_int(st,6),(const char*)sqlite3_column_text(st,7));
-        sqlite3_finalize(st);
+    if(nc_prepare(&st,"SELECT family,destination,gateway,interface,route_table,metric,mtu,route_type FROM static_route WHERE enabled=1 ORDER BY metric,id")!=0)
+        return -1;
+    while((step_rc=sqlite3_step(st))==SQLITE_ROW) {
+        const char *family = (const char *)sqlite3_column_text(st, 0);
+        const char *destination = (const char *)sqlite3_column_text(st, 1);
+        const char *gateway = (const char *)sqlite3_column_text(st, 2);
+        const char *ifname = (const char *)sqlite3_column_text(st, 3);
+        const char *table = (const char *)sqlite3_column_text(st, 4);
+        const char *type = (const char *)sqlite3_column_text(st, 7);
+        int af = family && !strcmp(family, "ipv6") ? AF_INET6 : AF_INET;
+        int metric = sqlite3_column_int(st, 5);
+        int mtu = sqlite3_column_int(st, 6);
+        int table_id = 0;
+        char table_text[16];
+
+        if (!family || (strcmp(family, "ipv4") && strcmp(family, "ipv6")) ||
+            !nc_adv_ip_cidr_ok(destination, af, 0) ||
+            !nc_adv_ip_cidr_ok(gateway, af, 1) ||
+            !nc_adv_ifname_ok(ifname, 1) || !nc_adv_route_type_ok(type) ||
+            metric < 0 || metric > 1000000 || mtu < 576 || mtu > 65535 ||
+            nc_adv_table_id_by_name(table, &table_id) != 0 || table_id <= 0) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+        snprintf(table_text, sizeof(table_text), "%d", table_id);
+        if (nc_adv_emit_route_cmd(script_path, family, destination, gateway,
+                                  ifname, table_text, metric, mtu, type) != 0) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+    }
+    if (step_rc != SQLITE_DONE || sqlite3_finalize(st) != SQLITE_OK)
+        return -1;
+    st = NULL;
+
+    if(nc_prepare(&st,"SELECT id,priority,source_object,dest_object,proto,ports,action,target,route_table FROM policy_route_rule WHERE enabled=1 ORDER BY priority,id")!=0)
+        return -1;
+    while((step_rc=sqlite3_step(st))==SQLITE_ROW){
+            const char *id=(const char*)sqlite3_column_text(st,0), *src=(const char*)sqlite3_column_text(st,2), *dst=(const char*)sqlite3_column_text(st,3), *proto=(const char*)sqlite3_column_text(st,4), *ports=(const char*)sqlite3_column_text(st,5), *action=(const char*)sqlite3_column_text(st,6), *target=(const char*)sqlite3_column_text(st,7), *rt=(const char*)sqlite3_column_text(st,8);
+            int tid = 0;
+            int src_count, dst_count;
+            int prio=sqlite3_column_int(st,1); const char *table=(rt&&rt[0])?rt:target; unsigned mark=nc_adv_rule_mark(id,prio);
+            if (!nc_adv_id_ok(id) || prio < 0 || prio > 1000000 ||
+                !nc_adv_proto_ok(proto) || !nc_fw_port_expr_ok(ports) ||
+                !action || strcmp(action, "route_table") ||
+                nc_adv_table_id_by_name(table, &tid) != 0 || tid <= 0 || tid == 255) {
+                sqlite3_finalize(st);
+                return -1;
+            }
+            int has=0; fprintf(nft_fp,"\t\t");
+            src_count = nc_adv_emit_obj_nft(nft_fp,src,"saddr",&has);
+            dst_count = nc_adv_emit_obj_nft(nft_fp,dst,"daddr",&has);
+            if (src_count < 0 || dst_count < 0 ||
+                (src && src[0] && src_count == 0) ||
+                (dst && dst[0] && dst_count == 0)) {
+                sqlite3_finalize(st);
+                return -1;
+            }
+            if(proto && (!strcmp(proto,"tcp")||!strcmp(proto,"udp"))) { fprintf(nft_fp," %s",proto); if(ports&&ports[0]&&strcmp(ports,"any")) fprintf(nft_fp," dport { %s }",ports); has=1; }
+            if(!has) { sqlite3_finalize(st); return -1; }
+            fprintf(nft_fp," meta mark set 0x%04x ct mark set 0x%04x comment \"dwrt-pbr:%s\"\n",mark,mark,id?id:"rule");
+            fprintf(script_path,"ip rule add pref %d fwmark 0x%04x/0xffff table %d\n",10000+(prio%9000),mark,tid);
+            fprintf(script_path,"ip -6 rule add pref %d fwmark 0x%04x/0xffff table %d\n",10000+(prio%9000),mark,tid);
+    }
+    if (step_rc != SQLITE_DONE || sqlite3_finalize(st) != SQLITE_OK)
+        return -1;
+    fprintf(nft_fp,"\t}\n}\n");
+    fprintf(script_path,"command -v nft >/dev/null 2>&1 || { echo missing_nft; exit 4; }\nnft -f /etc/dreamingwrt/advanced_routing_pbr.nft\nip route flush cache 2>/dev/null || true\nexit 0\n");
+    return ferror(script_path) || ferror(nft_fp) ? -1 : 0;
+}
+
+struct nc_adv_artifact {
+    const char *dir_path;
+    const char *name;
+    mode_t mode;
+    int dirfd;
+    FILE *fp;
+    char tmp_name[128];
+    char backup_name[128];
+    int backup_made;
+    int published;
+};
+
+#ifndef NC_ADV_RT_TABLES_DIR
+#define NC_ADV_RT_TABLES_DIR "/etc/iproute2/rt_tables.d"
+#endif
+#ifndef NC_ADV_CONFIG_DIR
+#define NC_ADV_CONFIG_DIR "/etc/config"
+#endif
+#ifndef NC_ADV_STATE_DIR
+#define NC_ADV_STATE_DIR "/etc/dreamingwrt"
+#endif
+#define NC_ADV_JOURNAL_DIR NC_ADV_STATE_DIR
+#define NC_ADV_JOURNAL_NAME ".advanced_routing_publish.journal"
+#define NC_ADV_LOCK_NAME ".advanced_routing_publish.lock"
+#define NC_ADV_JOURNAL_MAGIC UINT64_C(0x445741524a4e4c31)
+#define NC_ADV_JOURNAL_VERSION 1U
+#define NC_ADV_JOURNAL_PREPARED 1U
+#define NC_ADV_JOURNAL_COMMITTED 2U
+#define NC_ADV_ARTIFACT_COUNT 4U
+
+#ifndef NC_ADV_TRUSTED_UID
+#define NC_ADV_TRUSTED_UID 0
+#endif
+#ifndef NC_ADV_DIR_IS_TRUSTED
+#define NC_ADV_DIR_IS_TRUSTED(st) \
+    ((st).st_uid == NC_ADV_TRUSTED_UID && \
+     ((st).st_mode & (S_IWGRP | S_IWOTH)) == 0)
+#endif
+#ifndef NC_ADV_FAULT_POINT
+#define NC_ADV_FAULT_POINT(point) ((void)0)
+#endif
+#ifndef NC_ADV_FSYNC_DIR
+#define NC_ADV_FSYNC_DIR(fd) fsync(fd)
+#endif
+
+struct nc_adv_artifact_spec {
+    const char *dir_path;
+    const char *name;
+    mode_t mode;
+};
+
+static const struct nc_adv_artifact_spec nc_adv_artifact_specs[] = {
+    { NC_ADV_RT_TABLES_DIR, "dreamingwrt.conf", 0644 },
+    { NC_ADV_CONFIG_DIR, "dreamingwrt_advanced_routing", 0600 },
+    { NC_ADV_STATE_DIR, "advanced_routing_apply.sh", 0700 },
+    { NC_ADV_STATE_DIR, "advanced_routing_pbr.nft", 0600 },
+};
+
+struct nc_adv_file_identity {
+    uint64_t dev;
+    uint64_t ino;
+};
+
+struct nc_adv_journal_entry {
+    struct nc_adv_file_identity old_file;
+    struct nc_adv_file_identity new_file;
+    uint32_t had_old;
+    uint32_t reserved;
+};
+
+struct nc_adv_publish_journal {
+    uint64_t magic;
+    uint64_t transaction_id;
+    uint32_t version;
+    uint32_t state;
+    uint32_t count;
+    uint32_t reserved;
+    struct nc_adv_journal_entry entries[NC_ADV_ARTIFACT_COUNT];
+    uint64_t checksum;
+};
+
+static void nc_adv_artifacts_init(struct nc_adv_artifact *artifacts,
+                                  size_t count);
+
+static int nc_adv_open_trusted_dir(const char *path)
+{
+    struct stat st;
+    char component[NAME_MAX + 1];
+    const char *cursor;
+    int fd = -1;
+
+    if (!path || path[0] != '/')
+        return -1;
+    fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        !NC_ADV_DIR_IS_TRUSTED(st))
+        return -1;
+    cursor = path + 1;
+    while (*cursor) {
+        const char *slash = strchr(cursor, '/');
+        size_t len = slash ? (size_t)(slash - cursor) : strlen(cursor);
+        int nextfd;
+
+        if (len == 0 || len > NAME_MAX ||
+            (len == 1 && cursor[0] == '.') ||
+            (len == 2 && cursor[0] == '.' && cursor[1] == '.'))
+            goto fail;
+        memcpy(component, cursor, len);
+        component[len] = '\0';
+        nextfd = openat(fd, component,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (nextfd < 0) {
+            goto fail;
+        }
+        close(fd);
+        fd = nextfd;
+        if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+            !NC_ADV_DIR_IS_TRUSTED(st))
+            goto fail;
+        cursor = slash ? slash + 1 : cursor + len;
+    }
+    if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        !NC_ADV_DIR_IS_TRUSTED(st))
+        goto fail;
+    return fd;
+
+fail:
+    if (fd >= 0)
+        close(fd);
+    return -1;
+}
+
+static int nc_adv_stat_regular_at(int dirfd, const char *name,
+                                  struct stat *st, int *present)
+{
+    if (!name || !st || !present)
+        return -1;
+    if (fstatat(dirfd, name, st, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) {
+            memset(st, 0, sizeof(*st));
+            *present = 0;
+            return 0;
+        }
+        return -1;
+    }
+    if (!S_ISREG(st->st_mode) || st->st_uid != NC_ADV_TRUSTED_UID ||
+        (st->st_mode & (S_IWGRP | S_IWOTH)) != 0 || st->st_nlink != 1)
+        return -1;
+    *present = 1;
+    return 0;
+}
+
+static struct nc_adv_file_identity nc_adv_identity(const struct stat *st)
+{
+    struct nc_adv_file_identity identity = { 0, 0 };
+
+    if (st) {
+        identity.dev = (uint64_t)st->st_dev;
+        identity.ino = (uint64_t)st->st_ino;
+    }
+    return identity;
+}
+
+static int nc_adv_identity_matches(const struct stat *st,
+                                   const struct nc_adv_file_identity *identity)
+{
+    return st && identity && (uint64_t)st->st_dev == identity->dev &&
+        (uint64_t)st->st_ino == identity->ino;
+}
+
+static uint64_t nc_adv_journal_checksum(const struct nc_adv_publish_journal *journal)
+{
+    const unsigned char *bytes = (const unsigned char *)journal;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    size_t len = offsetof(struct nc_adv_publish_journal, checksum);
+
+    for (size_t i = 0; i < len; i++) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static int nc_adv_write_all(int fd, const void *buffer, size_t length)
+{
+    const unsigned char *cursor = buffer;
+
+    while (length > 0) {
+        ssize_t written = write(fd, cursor, length);
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (written == 0)
+            return -1;
+        cursor += written;
+        length -= (size_t)written;
+    }
+    return 0;
+}
+
+static int nc_adv_read_all(int fd, void *buffer, size_t length)
+{
+    unsigned char *cursor = buffer;
+
+    while (length > 0) {
+        ssize_t got = read(fd, cursor, length);
+        if (got < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (got == 0)
+            return -1;
+        cursor += got;
+        length -= (size_t)got;
+    }
+    return 0;
+}
+
+static uint64_t nc_adv_transaction_id(void)
+{
+    uint64_t id = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode) ||
+            nc_adv_read_all(fd, &id, sizeof(id)) != 0)
+            id = 0;
+        close(fd);
+    }
+    if (id == 0) {
+        id = ((uint64_t)(unsigned long)getpid() << 32) ^
+            (uint64_t)time(NULL) ^ ((uint64_t)(unsigned long)random() << 1);
+    }
+    return id ? id : UINT64_C(1);
+}
+
+static int nc_adv_journal_tmp_name(char *buffer, size_t length, uint64_t txid)
+{
+    int n = snprintf(buffer, length, ".advanced_routing_publish.%016llx.tmp",
+                     (unsigned long long)txid);
+    return n > 0 && (size_t)n < length ? 0 : -1;
+}
+
+static int nc_adv_artifact_names(struct nc_adv_artifact *artifact,
+                                 uint64_t txid, size_t index)
+{
+    int tmp_len;
+    int backup_len;
+
+    if (!artifact || !artifact->name || index >= NC_ADV_ARTIFACT_COUNT)
+        return -1;
+    tmp_len = snprintf(artifact->tmp_name, sizeof(artifact->tmp_name),
+        ".%s.%016llx.%zu.tmp", artifact->name,
+        (unsigned long long)txid, index);
+    backup_len = snprintf(artifact->backup_name, sizeof(artifact->backup_name),
+        ".%s.%016llx.%zu.rollback", artifact->name,
+        (unsigned long long)txid, index);
+    return tmp_len > 0 && (size_t)tmp_len < sizeof(artifact->tmp_name) &&
+        backup_len > 0 && (size_t)backup_len < sizeof(artifact->backup_name)
+        ? 0 : -1;
+}
+
+static int nc_adv_journal_write(int journal_dirfd,
+                                struct nc_adv_publish_journal *journal,
+                                int create_only)
+{
+    struct stat st;
+    char tmp_name[96];
+    int present = 0;
+    int fd = -1;
+    int rc = -1;
+
+    if (!journal || nc_adv_journal_tmp_name(tmp_name, sizeof(tmp_name),
+                                            journal->transaction_id) != 0)
+        return -1;
+    journal->checksum = nc_adv_journal_checksum(journal);
+    fd = openat(journal_dirfd, tmp_name,
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return -1;
+    if (fchmod(fd, 0600) != 0 ||
+        nc_adv_write_all(fd, journal, sizeof(*journal)) != 0 ||
+        fsync(fd) != 0)
+        goto out;
+    NC_ADV_FAULT_POINT("journal_file_synced");
+    if (close(fd) != 0) {
+        fd = -1;
+        goto out;
+    }
+    fd = -1;
+    if (create_only) {
+        if (fstatat(journal_dirfd, NC_ADV_JOURNAL_NAME, &st,
+                    AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+            goto out;
+        if (linkat(journal_dirfd, tmp_name, journal_dirfd,
+                   NC_ADV_JOURNAL_NAME, 0) != 0 || NC_ADV_FSYNC_DIR(journal_dirfd) != 0)
+            goto out;
+        NC_ADV_FAULT_POINT("journal_linked");
+        if (unlinkat(journal_dirfd, tmp_name, 0) != 0 ||
+            NC_ADV_FSYNC_DIR(journal_dirfd) != 0)
+            goto out;
+        NC_ADV_FAULT_POINT("journal_tmp_removed");
+    } else {
+        if (nc_adv_stat_regular_at(journal_dirfd, NC_ADV_JOURNAL_NAME,
+                                   &st, &present) != 0 || !present)
+            goto out;
+        if (renameat(journal_dirfd, tmp_name, journal_dirfd,
+                     NC_ADV_JOURNAL_NAME) != 0 || NC_ADV_FSYNC_DIR(journal_dirfd) != 0)
+            goto out;
+        NC_ADV_FAULT_POINT("journal_replaced");
+    }
+    rc = 0;
+
+out:
+    if (fd >= 0)
+        close(fd);
+    if (rc != 0)
+        unlinkat(journal_dirfd, tmp_name, 0);
+    return rc;
+}
+
+static int nc_adv_journal_read(int journal_dirfd,
+                               struct nc_adv_publish_journal *journal)
+{
+    struct stat st;
+    char extra;
+    char tmp_name[96];
+    int fd;
+
+    if (!journal)
+        return -1;
+    if (fstatat(journal_dirfd, NC_ADV_JOURNAL_NAME, &st,
+                AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != NC_ADV_TRUSTED_UID ||
+        (st.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        (st.st_nlink != 1 && st.st_nlink != 2) ||
+        st.st_size != (off_t)sizeof(*journal))
+        return -1;
+    fd = openat(journal_dirfd, NC_ADV_JOURNAL_NAME,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != NC_ADV_TRUSTED_UID ||
+        (st.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        (st.st_nlink != 1 && st.st_nlink != 2) ||
+        nc_adv_read_all(fd, journal, sizeof(*journal)) != 0 ||
+        read(fd, &extra, 1) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (close(fd) != 0)
+        return -1;
+    if (journal->magic != NC_ADV_JOURNAL_MAGIC ||
+        journal->version != NC_ADV_JOURNAL_VERSION ||
+        journal->count != NC_ADV_ARTIFACT_COUNT ||
+        (journal->state != NC_ADV_JOURNAL_PREPARED &&
+         journal->state != NC_ADV_JOURNAL_COMMITTED) ||
+        journal->reserved != 0 ||
+        journal->checksum != nc_adv_journal_checksum(journal))
+        return -1;
+    for (size_t i = 0; i < journal->count; i++) {
+        if (journal->entries[i].had_old > 1 ||
+            journal->entries[i].reserved != 0 ||
+            journal->entries[i].new_file.dev == 0 ||
+            journal->entries[i].new_file.ino == 0 ||
+            (journal->entries[i].had_old &&
+             (journal->entries[i].old_file.dev == 0 ||
+              journal->entries[i].old_file.ino == 0)))
+            return -1;
+    }
+    if (nc_adv_journal_tmp_name(tmp_name, sizeof(tmp_name),
+                                journal->transaction_id) != 0)
+        return -1;
+    return 0;
+}
+
+static int nc_adv_journal_read_named(int journal_dirfd, const char *name,
+                                     struct nc_adv_publish_journal *journal)
+{
+    struct stat st;
+    char extra;
+    int fd;
+
+    if (!name || !journal ||
+        fstatat(journal_dirfd, name, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(st.st_mode) || st.st_uid != NC_ADV_TRUSTED_UID ||
+        (st.st_mode & (S_IWGRP | S_IWOTH)) != 0 || st.st_nlink != 1 ||
+        st.st_size != (off_t)sizeof(*journal))
+        return -1;
+    fd = openat(journal_dirfd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != NC_ADV_TRUSTED_UID ||
+        (st.st_mode & (S_IWGRP | S_IWOTH)) != 0 || st.st_nlink != 1 ||
+        nc_adv_read_all(fd, journal, sizeof(*journal)) != 0 ||
+        read(fd, &extra, 1) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (close(fd) != 0 || journal->magic != NC_ADV_JOURNAL_MAGIC ||
+        journal->version != NC_ADV_JOURNAL_VERSION ||
+        journal->transaction_id == 0 ||
+        journal->count != NC_ADV_ARTIFACT_COUNT || journal->reserved != 0 ||
+        (journal->state != NC_ADV_JOURNAL_PREPARED &&
+         journal->state != NC_ADV_JOURNAL_COMMITTED) ||
+        journal->checksum != nc_adv_journal_checksum(journal))
+        return -1;
+    for (size_t i = 0; i < journal->count; i++) {
+        if (journal->entries[i].had_old > 1 ||
+            journal->entries[i].reserved != 0 ||
+            journal->entries[i].new_file.dev == 0 ||
+            journal->entries[i].new_file.ino == 0 ||
+            (journal->entries[i].had_old &&
+             (journal->entries[i].old_file.dev == 0 ||
+              journal->entries[i].old_file.ino == 0)))
+            return -1;
+    }
+    return 0;
+}
+
+static int nc_adv_journal_same_transaction(
+    const struct nc_adv_publish_journal *left,
+    const struct nc_adv_publish_journal *right)
+{
+    return left && right && left->magic == right->magic &&
+        left->transaction_id == right->transaction_id &&
+        left->version == right->version && left->count == right->count &&
+        !memcmp(left->entries, right->entries, sizeof(left->entries));
+}
+
+static int nc_adv_cleanup_unpublished_journal(
+    int journal_dirfd, const char *journal_name,
+    const struct nc_adv_publish_journal *journal)
+{
+    struct nc_adv_artifact artifacts[NC_ADV_ARTIFACT_COUNT];
+    struct stat target_st;
+    struct stat tmp_st;
+    struct stat backup_st;
+    int target_present;
+    int tmp_present;
+    int backup_present;
+    int rc = -1;
+
+    if (!journal_name || !journal ||
+        journal->state != NC_ADV_JOURNAL_PREPARED)
+        return -1;
+    nc_adv_artifacts_init(artifacts, NC_ADV_ARTIFACT_COUNT);
+    for (size_t i = 0; i < NC_ADV_ARTIFACT_COUNT; i++) {
+        target_present = tmp_present = backup_present = 0;
+        artifacts[i].dirfd = nc_adv_open_trusted_dir(artifacts[i].dir_path);
+        if (artifacts[i].dirfd < 0 ||
+            nc_adv_artifact_names(&artifacts[i], journal->transaction_id, i) != 0 ||
+            nc_adv_stat_regular_at(artifacts[i].dirfd, artifacts[i].name,
+                &target_st, &target_present) != 0 ||
+            nc_adv_stat_regular_at(artifacts[i].dirfd, artifacts[i].tmp_name,
+                &tmp_st, &tmp_present) != 0 ||
+            nc_adv_stat_regular_at(artifacts[i].dirfd, artifacts[i].backup_name,
+                &backup_st, &backup_present) != 0 || backup_present || !tmp_present ||
+            !nc_adv_identity_matches(&tmp_st, &journal->entries[i].new_file))
+            goto out;
+        if (journal->entries[i].had_old) {
+            if (!target_present ||
+                !nc_adv_identity_matches(&target_st,
+                                         &journal->entries[i].old_file))
+                goto out;
+        } else if (target_present) {
+            goto out;
+        }
+    }
+    for (size_t i = 0; i < NC_ADV_ARTIFACT_COUNT; i++) {
+        if (unlinkat(artifacts[i].dirfd, artifacts[i].tmp_name, 0) != 0 ||
+            NC_ADV_FSYNC_DIR(artifacts[i].dirfd) != 0)
+            goto out;
+    }
+    if (unlinkat(journal_dirfd, journal_name, 0) != 0 ||
+        NC_ADV_FSYNC_DIR(journal_dirfd) != 0)
+        goto out;
+    rc = 0;
+
+out:
+    for (size_t i = 0; i < NC_ADV_ARTIFACT_COUNT; i++) {
+        if (artifacts[i].dirfd >= 0)
+            close(artifacts[i].dirfd);
+    }
+    return rc;
+}
+
+static int nc_adv_cleanup_orphan_journals(int journal_dirfd)
+{
+    static const char prefix[] = ".advanced_routing_publish.";
+    static const char suffix[] = ".tmp";
+    struct dirent *entry;
+    DIR *dir;
+    int scanfd;
+    int rc = 0;
+
+    scanfd = dup(journal_dirfd);
+    if (scanfd < 0)
+        return -1;
+    dir = fdopendir(scanfd);
+    if (!dir) {
+        close(scanfd);
+        return -1;
+    }
+    while ((entry = readdir(dir)) != NULL) {
+        struct nc_adv_publish_journal journal;
+        char expected[96];
+        size_t name_len = strlen(entry->d_name);
+        size_t prefix_len = sizeof(prefix) - 1;
+        size_t suffix_len = sizeof(suffix) - 1;
+
+        if (name_len != prefix_len + 16 + suffix_len ||
+            memcmp(entry->d_name, prefix, prefix_len) != 0 ||
+            memcmp(entry->d_name + name_len - suffix_len,
+                   suffix, suffix_len) != 0)
+            continue;
+        for (size_t i = prefix_len; i < prefix_len + 16; i++) {
+            if (!isxdigit((unsigned char)entry->d_name[i]) ||
+                (entry->d_name[i] >= 'A' && entry->d_name[i] <= 'F')) {
+                rc = -1;
+                break;
+            }
+        }
+        if (rc != 0 ||
+            nc_adv_journal_read_named(journal_dirfd, entry->d_name,
+                                      &journal) != 0 ||
+            nc_adv_journal_tmp_name(expected, sizeof(expected),
+                                    journal.transaction_id) != 0 ||
+            strcmp(expected, entry->d_name) ||
+            nc_adv_cleanup_unpublished_journal(journal_dirfd,
+                                               entry->d_name, &journal) != 0) {
+            rc = -1;
+            break;
+        }
+    }
+    closedir(dir);
+    return rc;
+}
+
+static int nc_adv_artifact_open(struct nc_adv_artifact *artifact,
+                                uint64_t txid, size_t index)
+{
+    struct stat dir_st;
+    struct stat target_st;
+    int fd = -1;
+
+    if (!artifact || !artifact->dir_path || !artifact->name)
+        return -1;
+    artifact->dirfd = nc_adv_open_trusted_dir(artifact->dir_path);
+    if (artifact->dirfd < 0 || fstat(artifact->dirfd, &dir_st) != 0 ||
+        !S_ISDIR(dir_st.st_mode) || !NC_ADV_DIR_IS_TRUSTED(dir_st))
+        goto fail;
+    if (fstatat(artifact->dirfd, artifact->name, &target_st,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+        if (!S_ISREG(target_st.st_mode) ||
+            target_st.st_uid != NC_ADV_TRUSTED_UID ||
+            (target_st.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+            target_st.st_nlink != 1)
+            goto fail;
+    } else if (errno != ENOENT) {
+        goto fail;
+    }
+    if (nc_adv_artifact_names(artifact, txid, index) != 0)
+        goto fail;
+    fd = openat(artifact->dirfd, artifact->tmp_name,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                artifact->mode);
+    if (fd < 0)
+        goto fail;
+    artifact->fp = fdopen(fd, "w");
+    if (!artifact->fp) {
+        close(fd);
+        unlinkat(artifact->dirfd, artifact->tmp_name, 0);
+        artifact->tmp_name[0] = '\0';
+        goto fail;
+    }
+    return 0;
+fail:
+    if (artifact->dirfd >= 0) {
+        close(artifact->dirfd);
+        artifact->dirfd = -1;
+    }
+    return -1;
+}
+
+static int nc_adv_artifact_finish(struct nc_adv_artifact *artifact)
+{
+    FILE *fp = artifact ? artifact->fp : NULL;
+    int rc = 0;
+
+    if (!fp)
+        return -1;
+    if (fflush(fp) != 0 || ferror(fp) ||
+        fchmod(fileno(fp), artifact->mode) != 0 || fsync(fileno(fp)) != 0)
+        rc = -1;
+    if (fclose(fp) != 0)
+        rc = -1;
+    artifact->fp = NULL;
+    return rc;
+}
+
+static void nc_adv_artifacts_abort(struct nc_adv_artifact *artifacts,
+                                   size_t count, int restore)
+{
+    while (count > 0) {
+        struct nc_adv_artifact *artifact = &artifacts[--count];
+
+        if (artifact->fp) {
+            fclose(artifact->fp);
+            artifact->fp = NULL;
+        }
+        if (artifact->dirfd < 0)
+            continue;
+        if (restore && artifact->published)
+            unlinkat(artifact->dirfd, artifact->name, 0);
+        if (restore && artifact->backup_made) {
+            if (renameat(artifact->dirfd, artifact->backup_name,
+                         artifact->dirfd, artifact->name) == 0)
+                artifact->backup_made = 0;
+        }
+        if (artifact->tmp_name[0])
+            unlinkat(artifact->dirfd, artifact->tmp_name, 0);
+        (void)NC_ADV_FSYNC_DIR(artifact->dirfd);
+    }
+}
+
+static int nc_adv_publish_lock(int journal_dirfd)
+{
+    struct stat st;
+    int fd;
+
+    fd = openat(journal_dirfd, NC_ADV_LOCK_NAME,
+        O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != NC_ADV_TRUSTED_UID ||
+        (st.st_mode & (S_IWGRP | S_IWOTH)) != 0 || st.st_nlink != 1 ||
+        fchmod(fd, 0600) != 0 || fsync(fd) != 0 ||
+        NC_ADV_FSYNC_DIR(journal_dirfd) != 0 || flock(fd, LOCK_EX) != 0) {
+        if (fd >= 0)
+            close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int nc_adv_recover_publish_locked(const char *journal_dir_path,
+                                         struct nc_adv_artifact *artifacts,
+                                         size_t count, int *committed_out)
+{
+    struct nc_adv_publish_journal journal;
+    struct stat journal_st;
+    struct stat target_st[NC_ADV_ARTIFACT_COUNT];
+    struct stat tmp_st[NC_ADV_ARTIFACT_COUNT];
+    struct stat backup_st[NC_ADV_ARTIFACT_COUNT];
+    int target_present[NC_ADV_ARTIFACT_COUNT] = { 0 };
+    int tmp_present[NC_ADV_ARTIFACT_COUNT] = { 0 };
+    int backup_present[NC_ADV_ARTIFACT_COUNT] = { 0 };
+    int journal_present = 0;
+    int journal_dirfd = -1;
+    int rc = -1;
+    char journal_tmp_name[96] = "";
+
+    if (committed_out)
+        *committed_out = 0;
+    if (!journal_dir_path || !artifacts || count != NC_ADV_ARTIFACT_COUNT)
+        return -1;
+    journal_dirfd = nc_adv_open_trusted_dir(journal_dir_path);
+    if (journal_dirfd < 0)
+        return -1;
+    if (fstatat(journal_dirfd, NC_ADV_JOURNAL_NAME, &journal_st,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT)
+            rc = nc_adv_cleanup_orphan_journals(journal_dirfd);
+        goto out;
+    }
+    journal_present = 1;
+    if (nc_adv_journal_read(journal_dirfd, &journal) != 0)
+        goto out;
+    if (committed_out)
+        *committed_out = journal.state == NC_ADV_JOURNAL_COMMITTED;
+    if (nc_adv_journal_tmp_name(journal_tmp_name, sizeof(journal_tmp_name),
+                                journal.transaction_id) != 0)
+        goto out;
+    {
+        struct stat linked_tmp_st;
+        if (fstatat(journal_dirfd, journal_tmp_name, &linked_tmp_st,
+                    AT_SYMLINK_NOFOLLOW) == 0) {
+            if (!S_ISREG(linked_tmp_st.st_mode))
+                goto out;
+            if (linked_tmp_st.st_dev != journal_st.st_dev ||
+                linked_tmp_st.st_ino != journal_st.st_ino) {
+                struct nc_adv_publish_journal pending;
+                if (journal.state != NC_ADV_JOURNAL_PREPARED ||
+                    nc_adv_journal_read_named(journal_dirfd, journal_tmp_name,
+                                              &pending) != 0 ||
+                    pending.state != NC_ADV_JOURNAL_COMMITTED ||
+                    !nc_adv_journal_same_transaction(&journal, &pending))
+                    goto out;
+            }
+            if (unlinkat(journal_dirfd, journal_tmp_name, 0) != 0 ||
+                NC_ADV_FSYNC_DIR(journal_dirfd) != 0)
+                goto out;
+        } else if (errno != ENOENT) {
+            goto out;
+        }
     }
 
-    if(nc_prepare(&st,"SELECT id,priority,source_object,dest_object,proto,ports,action,target,route_table FROM policy_route_rule WHERE enabled=1 ORDER BY priority,id")==0){
-        while(sqlite3_step(st)==SQLITE_ROW){
-            const char *id=(const char*)sqlite3_column_text(st,0), *src=(const char*)sqlite3_column_text(st,2), *dst=(const char*)sqlite3_column_text(st,3), *proto=(const char*)sqlite3_column_text(st,4), *ports=(const char*)sqlite3_column_text(st,5), *action=(const char*)sqlite3_column_text(st,6), *target=(const char*)sqlite3_column_text(st,7), *rt=(const char*)sqlite3_column_text(st,8);
-            int prio=sqlite3_column_int(st,1); const char *table=(rt&&rt[0])?rt:target; int tid=nc_adv_table_id_by_name(table); unsigned mark=nc_adv_rule_mark(id,prio); if(tid<=0 || (action && (!strcmp(action,"drop")||!strcmp(action,"main")))) continue;
-            int has=0; fprintf(nft_fp,"\t\t"); nc_adv_emit_obj_nft(nft_fp,src,"saddr",&has); nc_adv_emit_obj_nft(nft_fp,dst,"daddr",&has);
-            if(proto && (!strcmp(proto,"tcp")||!strcmp(proto,"udp"))) { fprintf(nft_fp," %s",proto); if(ports&&ports[0]&&strcmp(ports,"any")) fprintf(nft_fp," dport { %s }",ports); has=1; }
-            if(!has) fprintf(nft_fp," meta mark 0x0/0x0");
-            fprintf(nft_fp," meta mark set 0x%04x ct mark set 0x%04x comment \"dwrt-pbr:%s\"\n",mark,mark,id?id:"rule");
-            fprintf(script_path,"ip rule add pref %d fwmark 0x%04x/0xffff table %d 2>/dev/null || true\n",10000+(prio%9000),mark,tid);
-            fprintf(script_path,"ip -6 rule add pref %d fwmark 0x%04x/0xffff table %d 2>/dev/null || true\n",10000+(prio%9000),mark,tid);
+    for (size_t i = 0; i < count; i++) {
+        artifacts[i].dirfd = nc_adv_open_trusted_dir(artifacts[i].dir_path);
+        if (artifacts[i].dirfd < 0 ||
+            nc_adv_artifact_names(&artifacts[i], journal.transaction_id, i) != 0 ||
+            nc_adv_stat_regular_at(artifacts[i].dirfd, artifacts[i].name,
+                &target_st[i], &target_present[i]) != 0 ||
+            nc_adv_stat_regular_at(artifacts[i].dirfd, artifacts[i].tmp_name,
+                &tmp_st[i], &tmp_present[i]) != 0 ||
+            nc_adv_stat_regular_at(artifacts[i].dirfd, artifacts[i].backup_name,
+                &backup_st[i], &backup_present[i]) != 0)
+            goto out;
+
+        if (target_present[i] &&
+            !nc_adv_identity_matches(&target_st[i], &journal.entries[i].old_file) &&
+            !nc_adv_identity_matches(&target_st[i], &journal.entries[i].new_file))
+            goto out;
+        if (tmp_present[i] &&
+            !nc_adv_identity_matches(&tmp_st[i], &journal.entries[i].new_file))
+            goto out;
+        if (backup_present[i] &&
+            (!journal.entries[i].had_old ||
+             !nc_adv_identity_matches(&backup_st[i], &journal.entries[i].old_file)))
+            goto out;
+
+        if (journal.state == NC_ADV_JOURNAL_PREPARED) {
+            if (journal.entries[i].had_old) {
+                int target_is_old = target_present[i] &&
+                    nc_adv_identity_matches(&target_st[i], &journal.entries[i].old_file);
+                int target_is_new = target_present[i] &&
+                    nc_adv_identity_matches(&target_st[i], &journal.entries[i].new_file);
+                if (backup_present[i]) {
+                    if ((target_present[i] && !target_is_new) ||
+                        (tmp_present[i] && target_is_new))
+                        goto out;
+                } else if (!target_is_old || target_is_new) {
+                    goto out;
+                }
+            } else {
+                int new_count = (target_present[i] ? 1 : 0) +
+                    (tmp_present[i] ? 1 : 0);
+                if (backup_present[i] || new_count > 1)
+                    goto out;
+            }
+        } else {
+            if (!target_present[i] ||
+                !nc_adv_identity_matches(&target_st[i], &journal.entries[i].new_file) ||
+                tmp_present[i] || (!journal.entries[i].had_old && backup_present[i]))
+                goto out;
         }
-        sqlite3_finalize(st);
     }
-    fprintf(nft_fp,"\t}\n}\n");
-    fprintf(script_path,"command -v nft >/dev/null 2>&1 && nft -f /etc/dreamingwrt/advanced_routing_pbr.nft >>/tmp/dw-adv-routing-apply.log 2>&1 || true\nip route flush cache 2>/dev/null || true\nexit 0\n");
+
+    if (journal.state == NC_ADV_JOURNAL_PREPARED) {
+        for (size_t n = count; n > 0; n--) {
+            size_t i = n - 1;
+            if (journal.entries[i].had_old) {
+                if (backup_present[i]) {
+                    if (target_present[i] &&
+                        unlinkat(artifacts[i].dirfd, artifacts[i].name, 0) != 0)
+                        goto out;
+                    if (tmp_present[i] &&
+                        unlinkat(artifacts[i].dirfd, artifacts[i].tmp_name, 0) != 0)
+                        goto out;
+                    if (renameat(artifacts[i].dirfd, artifacts[i].backup_name,
+                                 artifacts[i].dirfd, artifacts[i].name) != 0)
+                        goto out;
+                } else if (tmp_present[i] &&
+                           unlinkat(artifacts[i].dirfd,
+                                    artifacts[i].tmp_name, 0) != 0) {
+                    goto out;
+                }
+            } else {
+                if (target_present[i] &&
+                    unlinkat(artifacts[i].dirfd, artifacts[i].name, 0) != 0)
+                    goto out;
+                if (tmp_present[i] &&
+                    unlinkat(artifacts[i].dirfd, artifacts[i].tmp_name, 0) != 0)
+                    goto out;
+            }
+            if (NC_ADV_FSYNC_DIR(artifacts[i].dirfd) != 0)
+                goto out;
+            NC_ADV_FAULT_POINT("recovery_artifact");
+        }
+    } else {
+        for (size_t i = 0; i < count; i++) {
+            if (backup_present[i] &&
+                unlinkat(artifacts[i].dirfd, artifacts[i].backup_name, 0) != 0)
+                goto out;
+            if (NC_ADV_FSYNC_DIR(artifacts[i].dirfd) != 0)
+                goto out;
+            NC_ADV_FAULT_POINT("recovery_artifact");
+        }
+    }
+    if (unlinkat(journal_dirfd, NC_ADV_JOURNAL_NAME, 0) != 0 ||
+        NC_ADV_FSYNC_DIR(journal_dirfd) != 0)
+        goto out;
+    journal_present = 0;
+    NC_ADV_FAULT_POINT("recovery_journal_removed");
+    if (journal_tmp_name[0]) {
+        struct stat tmp_journal_st;
+        int tmp_journal_present = 0;
+        if (nc_adv_stat_regular_at(journal_dirfd, journal_tmp_name,
+                &tmp_journal_st, &tmp_journal_present) != 0)
+            goto out;
+        if (tmp_journal_present &&
+            (unlinkat(journal_dirfd, journal_tmp_name, 0) != 0 ||
+             NC_ADV_FSYNC_DIR(journal_dirfd) != 0))
+            goto out;
+    }
+    rc = 0;
+
+out:
+    if (journal_present && rc != 0)
+        LOG_ERROR("advanced routing journal recovery refused unsafe or ambiguous state\n");
+    for (size_t i = 0; i < count; i++) {
+        if (artifacts[i].dirfd >= 0) {
+            close(artifacts[i].dirfd);
+            artifacts[i].dirfd = -1;
+        }
+    }
+    if (journal_dirfd >= 0)
+        close(journal_dirfd);
+    return rc;
+}
+
+static int nc_adv_recover_publish(const char *journal_dir_path,
+                                  struct nc_adv_artifact *artifacts,
+                                  size_t count)
+{
+    int journal_dirfd;
+    int lockfd;
+    int rc;
+
+    journal_dirfd = nc_adv_open_trusted_dir(journal_dir_path);
+    if (journal_dirfd < 0)
+        return -1;
+    lockfd = nc_adv_publish_lock(journal_dirfd);
+    if (lockfd < 0) {
+        close(journal_dirfd);
+        return -1;
+    }
+    rc = nc_adv_recover_publish_locked(journal_dir_path, artifacts, count, NULL);
+    close(lockfd);
+    close(journal_dirfd);
+    return rc;
+}
+
+static int nc_adv_artifacts_publish(struct nc_adv_artifact *artifacts,
+                                    size_t count, uint64_t transaction_id,
+                                    const char *journal_dir_path)
+{
+    struct nc_adv_publish_journal journal;
+    struct nc_adv_artifact recovery_artifacts[NC_ADV_ARTIFACT_COUNT];
+    int journal_dirfd = -1;
+    int lockfd = -1;
+    int committed = 0;
+    int journal_owned = 0;
+    int recovered_committed = 0;
+    size_t i;
+
+    if (!artifacts || count != NC_ADV_ARTIFACT_COUNT ||
+        !journal_dir_path || transaction_id == 0)
+        return -1;
+    memset(&journal, 0, sizeof(journal));
+    journal.magic = NC_ADV_JOURNAL_MAGIC;
+    journal.transaction_id = transaction_id;
+    journal.version = NC_ADV_JOURNAL_VERSION;
+    journal.state = NC_ADV_JOURNAL_PREPARED;
+    journal.count = (uint32_t)count;
+    journal_dirfd = nc_adv_open_trusted_dir(journal_dir_path);
+    if (journal_dirfd < 0)
+        return -1;
+    lockfd = nc_adv_publish_lock(journal_dirfd);
+    if (lockfd < 0)
+        goto rollback;
+    nc_adv_artifacts_init(recovery_artifacts, NC_ADV_ARTIFACT_COUNT);
+    if (nc_adv_recover_publish_locked(journal_dir_path, recovery_artifacts,
+                                      count, NULL) != 0)
+        goto rollback;
+
+    for (i = 0; i < count; i++) {
+        struct nc_adv_artifact *artifact = &artifacts[i];
+        struct stat target_st;
+        struct stat tmp_st;
+        int target_present = 0;
+        int tmp_present = 0;
+
+        if (nc_adv_stat_regular_at(artifact->dirfd, artifact->name,
+                                   &target_st, &target_present) != 0 ||
+            nc_adv_stat_regular_at(artifact->dirfd, artifact->tmp_name,
+                                   &tmp_st, &tmp_present) != 0 || !tmp_present)
+            goto rollback;
+        journal.entries[i].had_old = target_present ? 1U : 0U;
+        if (target_present)
+            journal.entries[i].old_file = nc_adv_identity(&target_st);
+        journal.entries[i].new_file = nc_adv_identity(&tmp_st);
+    }
+    journal_owned = 1;
+    if (nc_adv_journal_write(journal_dirfd, &journal, 1) != 0)
+        goto rollback;
+    NC_ADV_FAULT_POINT("journal_prepared");
+
+    for (i = 0; i < count; i++) {
+        struct nc_adv_artifact *artifact = &artifacts[i];
+
+        if (journal.entries[i].had_old) {
+            if (renameat(artifact->dirfd, artifact->name, artifact->dirfd,
+                         artifact->backup_name) != 0)
+                goto rollback;
+            artifact->backup_made = 1;
+            if (NC_ADV_FSYNC_DIR(artifact->dirfd) != 0)
+                goto rollback;
+            NC_ADV_FAULT_POINT("artifact_backed_up");
+        }
+        if (renameat(artifact->dirfd, artifact->tmp_name, artifact->dirfd,
+                     artifact->name) != 0)
+            goto rollback;
+        artifact->tmp_name[0] = '\0';
+        artifact->published = 1;
+        if (NC_ADV_FSYNC_DIR(artifact->dirfd) != 0)
+            goto rollback;
+        NC_ADV_FAULT_POINT("artifact_published");
+    }
+
+    journal.state = NC_ADV_JOURNAL_COMMITTED;
+    if (nc_adv_journal_write(journal_dirfd, &journal, 0) != 0)
+        goto rollback;
+    committed = 1;
+    NC_ADV_FAULT_POINT("journal_committed");
+    for (i = 0; i < count; i++) {
+        struct nc_adv_artifact *artifact = &artifacts[i];
+        if (artifact->backup_made &&
+            unlinkat(artifact->dirfd, artifact->backup_name, 0) != 0)
+            goto rollback;
+        artifact->backup_made = 0;
+        if (NC_ADV_FSYNC_DIR(artifact->dirfd) != 0)
+            goto rollback;
+        NC_ADV_FAULT_POINT("artifact_cleanup");
+    }
+    if (unlinkat(journal_dirfd, NC_ADV_JOURNAL_NAME, 0) != 0 ||
+        NC_ADV_FSYNC_DIR(journal_dirfd) != 0)
+        goto rollback;
+    close(lockfd);
+    close(journal_dirfd);
     return 0;
+
+rollback:
+    if (!journal_owned) {
+        nc_adv_artifacts_abort(artifacts, count, 0);
+        if (lockfd >= 0)
+            close(lockfd);
+        if (journal_dirfd >= 0)
+            close(journal_dirfd);
+        return -1;
+    }
+    nc_adv_artifacts_init(recovery_artifacts, NC_ADV_ARTIFACT_COUNT);
+    if (nc_adv_recover_publish_locked(journal_dir_path, recovery_artifacts,
+                                      count, &recovered_committed) == 0) {
+        if (lockfd >= 0)
+            close(lockfd);
+        if (journal_dirfd >= 0)
+            close(journal_dirfd);
+        return (committed || recovered_committed) ? 0 : -1;
+    } else {
+        LOG_ERROR("advanced routing publish rollback requires startup recovery\n");
+    }
+    if (lockfd >= 0)
+        close(lockfd);
+    if (journal_dirfd >= 0)
+        close(journal_dirfd);
+    return -1;
+}
+
+static void nc_adv_artifacts_close(struct nc_adv_artifact *artifacts,
+                                   size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (artifacts[i].dirfd >= 0) {
+            close(artifacts[i].dirfd);
+            artifacts[i].dirfd = -1;
+        }
+    }
+}
+
+static void nc_adv_artifacts_init(struct nc_adv_artifact *artifacts,
+                                  size_t count)
+{
+    if (!artifacts || count != NC_ADV_ARTIFACT_COUNT)
+        return;
+    memset(artifacts, 0, sizeof(*artifacts) * count);
+    for (size_t i = 0; i < count; i++) {
+        artifacts[i].dir_path = nc_adv_artifact_specs[i].dir_path;
+        artifacts[i].name = nc_adv_artifact_specs[i].name;
+        artifacts[i].mode = nc_adv_artifact_specs[i].mode;
+        artifacts[i].dirfd = -1;
+    }
+}
+
+static int nc_adv_recover_pending_publish(void)
+{
+    struct nc_adv_artifact artifacts[NC_ADV_ARTIFACT_COUNT];
+
+    nc_adv_artifacts_init(artifacts, NC_ADV_ARTIFACT_COUNT);
+    return nc_adv_recover_publish(NC_ADV_JOURNAL_DIR, artifacts,
+                                  NC_ADV_ARTIFACT_COUNT);
+}
+
+static int nc_adv_generate_rt_tables(FILE *fp)
+{
+    sqlite3_stmt *st = NULL;
+    int step_rc;
+
+    if (!fp || nc_prepare(&st,
+        "SELECT table_id,id FROM route_table WHERE enabled=1 ORDER BY table_id") != 0)
+        return -1;
+    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *id = (const char *)sqlite3_column_text(st, 1);
+        int table_id = sqlite3_column_int(st, 0);
+        if (!id || !nc_adv_id_ok(id) || !nc_adv_table_id_ok(table_id) ||
+            fprintf(fp, "%d dwrt_%s\n", table_id, id) < 0) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+    }
+    if (step_rc != SQLITE_DONE || sqlite3_finalize(st) != SQLITE_OK || ferror(fp))
+        return -1;
+    return 0;
+}
+
+static int nc_adv_generate_draft_config(FILE *fp)
+{
+    sqlite3_stmt *st = NULL;
+    int step_rc;
+
+    if (!fp || fprintf(fp,
+        "# generated by jmxd; runtime source for network route/route6 + policy routing\n") < 0 ||
+        nc_prepare(&st,
+        "SELECT id,family,destination,gateway,interface,route_table,metric,mtu,route_type,comment FROM static_route WHERE enabled=1 ORDER BY metric,id") != 0)
+        return -1;
+    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *family = (const char *)sqlite3_column_text(st, 1);
+        const char *id = (const char *)sqlite3_column_text(st, 0);
+        const char *destination = (const char *)sqlite3_column_text(st, 2);
+        const char *gateway = (const char *)sqlite3_column_text(st, 3);
+        const char *ifname = (const char *)sqlite3_column_text(st, 4);
+        const char *table = (const char *)sqlite3_column_text(st, 5);
+        const char *type = (const char *)sqlite3_column_text(st, 8);
+        const char *comment = (const char *)sqlite3_column_text(st, 9);
+        int af = family && !strcmp(family, "ipv6") ? AF_INET6 : AF_INET;
+        int metric = sqlite3_column_int(st, 6);
+        int mtu = sqlite3_column_int(st, 7);
+        int table_id = 0;
+        char table_text[16];
+
+        if (!id || !nc_adv_id_ok(id) ||
+            (!family || (strcmp(family, "ipv4") && strcmp(family, "ipv6"))) ||
+            !nc_adv_ip_cidr_ok(destination, af, 0) ||
+            !nc_adv_ip_cidr_ok(gateway, af, 1) ||
+            !nc_adv_ifname_ok(ifname, 1) || !nc_adv_route_type_ok(type) ||
+            !nc_adv_text_ok(comment, 512) || metric < 0 || metric > 1000000 ||
+            mtu < 576 || mtu > 65535 ||
+            nc_adv_table_id_by_name(table, &table_id) != 0 || table_id <= 0) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+        snprintf(table_text, sizeof(table_text), "%d", table_id);
+        if (fprintf(fp, "config %s '%s'\n",
+                    af == AF_INET6 ? "route6" : "route", id) < 0 ||
+            (ifname && ifname[0] && nc_fw_uci_value(fp, "option interface", ifname) != 0) ||
+            nc_fw_uci_value(fp, "option target", destination) != 0 ||
+            (gateway && gateway[0] && nc_fw_uci_value(fp, "option gateway", gateway) != 0) ||
+            nc_fw_uci_int(fp, "option metric", metric) != 0 ||
+            nc_fw_uci_value(fp, "option table", table_text) != 0 ||
+            nc_fw_uci_int(fp, "option mtu", mtu) != 0 ||
+            nc_fw_uci_value(fp, "option type", type) != 0 ||
+            nc_fw_uci_value(fp, "option comment", comment ? comment : "") != 0 ||
+            fputc('\n', fp) == EOF) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+    }
+    if (step_rc != SQLITE_DONE || sqlite3_finalize(st) != SQLITE_OK || ferror(fp))
+        return -1;
+    return 0;
+}
+
+static int nc_adv_set_apply_state(const char *state, int set_apply_time)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+
+    if (nc_prepare(&st, set_apply_time
+        ? "UPDATE advanced_routing_global SET apply_state=?1,last_apply_at=strftime('%s','now'),updated_at=strftime('%s','now') WHERE id=1"
+        : "UPDATE advanced_routing_global SET apply_state=?1,updated_at=strftime('%s','now') WHERE id=1") != 0)
+        return -1;
+    if (sqlite3_bind_text(st, 1, state, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        nc_step_done(st) == 0 && sqlite3_changes(g_netconfig_db) == 1)
+        rc = 0;
+    if (sqlite3_finalize(st) != SQLITE_OK)
+        rc = -1;
+    return rc;
 }
 
 struct json_object *jmx_advanced_routing_apply(struct json_object *cfg)
 {
-    if(jmx_netconfig_db_init()!=0){struct json_object*d=json_object_new_object();json_object_object_add(d,"ok",json_object_new_boolean(0));return jmx_gen_api_response_data(API_CODE_ERROR,d);} nc_adv_route_db_init();
-    int dry=nc_json_bool_def(cfg,"dry_run",0); int apply_runtime=nc_json_bool_def(cfg,"apply_runtime",1);
-    struct json_object*d=json_object_new_object(),*warnings=json_object_new_array(),*summary=json_object_new_object(),*runtime=json_object_new_object(); sqlite3_stmt*st=NULL; FILE*fp=NULL;
-    if(!dry){
-        mkdir("/etc/iproute2",0755);mkdir("/etc/iproute2/rt_tables.d",0755);mkdir("/etc/dreamingwrt",0755);
-        fp=fopen("/etc/iproute2/rt_tables.d/dreamingwrt.conf","w");if(fp){if(nc_prepare(&st,"SELECT table_id,id FROM route_table WHERE enabled=1 ORDER BY table_id")==0){while(sqlite3_step(st)==SQLITE_ROW)fprintf(fp,"%d dwrt_%s\n",sqlite3_column_int(st,0),(const char*)sqlite3_column_text(st,1));sqlite3_finalize(st);}fclose(fp);} 
-        fp=fopen("/etc/config/dreamingwrt_advanced_routing","w");if(fp){fprintf(fp,"# generated by jmxd; runtime source for network route/route6 + policy routing\n");if(nc_prepare(&st,"SELECT id,family,destination,gateway,interface,route_table,metric,mtu,route_type,comment FROM static_route WHERE enabled=1 ORDER BY metric,id")==0){while(sqlite3_step(st)==SQLITE_ROW){const char*fam=(const char*)sqlite3_column_text(st,1);fprintf(fp,"config %s '%s'\n\toption interface '%s'\n\toption target '%s'\n\toption gateway '%s'\n\toption metric '%d'\n\toption table '%s'\n\toption mtu '%d'\n\toption type '%s'\n\toption comment '%s'\n\n",(!strcmp(fam,"ipv6"))?"route6":"route",(const char*)sqlite3_column_text(st,0),(const char*)sqlite3_column_text(st,4),(const char*)sqlite3_column_text(st,2),(const char*)sqlite3_column_text(st,3),sqlite3_column_int(st,6),(const char*)sqlite3_column_text(st,5),sqlite3_column_int(st,7),(const char*)sqlite3_column_text(st,8),(const char*)sqlite3_column_text(st,9));}sqlite3_finalize(st);}fclose(fp);} 
-        FILE *sh=fopen("/etc/dreamingwrt/advanced_routing_apply.sh","w"); FILE *nf=fopen("/etc/dreamingwrt/advanced_routing_pbr.nft","w");
-        if(sh&&nf){nc_adv_generate_runtime(sh,nf);fclose(sh);fclose(nf);chmod("/etc/dreamingwrt/advanced_routing_apply.sh",0755);json_object_object_add(runtime,"script",json_object_new_string("/etc/dreamingwrt/advanced_routing_apply.sh"));json_object_object_add(runtime,"nft_file",json_object_new_string("/etc/dreamingwrt/advanced_routing_pbr.nft")); if(apply_runtime){int rc=nc_run_quiet("sh /etc/dreamingwrt/advanced_routing_apply.sh >/tmp/dw-adv-routing-run.log 2>&1");json_object_object_add(runtime,"apply_rc",json_object_new_int(rc));json_object_object_add(runtime,"apply_log",json_object_new_string("/tmp/dw-adv-routing-run.log")); if(rc!=0)json_object_array_add(warnings,json_object_new_string("advanced routing runtime apply failed; see /tmp/dw-adv-routing-run.log"));}}
-        else { if(sh)fclose(sh); if(nf)fclose(nf); json_object_array_add(warnings,json_object_new_string("failed to write advanced routing runtime files")); }
-        nc_exec("UPDATE advanced_routing_global SET apply_state='applied',last_apply_at=strftime('%s','now') WHERE id=1");
+    const char *rt_path = "/etc/iproute2/rt_tables.d/dreamingwrt.conf";
+    const char *draft_path = "/etc/config/dreamingwrt_advanced_routing";
+    const char *script_path = "/etc/dreamingwrt/advanced_routing_apply.sh";
+    const char *nft_path = "/etc/dreamingwrt/advanced_routing_pbr.nft";
+    const char *failed_stage = "";
+    const char *reason = "";
+    const char *apply_state = "dry_run";
+    int dry = nc_json_bool_def(cfg, "dry_run", 0);
+    int apply_runtime = nc_json_bool_def(cfg, "apply_runtime", 1);
+    int artifact_generated = 0;
+    int runtime_attempted = 0;
+    int runtime_applied = 0;
+    int readback_verified = 0;
+    int response_ok = 1;
+    int apply_rc = 0;
+    uint64_t transaction_id = 0;
+    int tables = 0, routes = 0, objects = 0, cross = 0, rules = 0;
+    char log_path[256] = "";
+    struct json_object *d = json_object_new_object();
+    struct json_object *warnings = json_object_new_array();
+    struct json_object *summary = json_object_new_object();
+    struct json_object *runtime = json_object_new_object();
+    sqlite3_stmt *st = NULL;
+    struct nc_adv_artifact artifacts[NC_ADV_ARTIFACT_COUNT];
+    const size_t artifact_count = sizeof(artifacts) / sizeof(artifacts[0]);
+
+    nc_adv_artifacts_init(artifacts, artifact_count);
+    if (jmx_netconfig_db_init() != 0) {
+        response_ok = 0;
+        failed_stage = "database_init";
+        reason = "advanced_routing_database_unavailable";
+        apply_state = "failed";
+        goto response;
     }
-    int tables=0,routes=0,objects=0,cross=0,rules=0; if(nc_prepare(&st,"SELECT (SELECT COUNT(*) FROM route_table),(SELECT COUNT(*) FROM static_route),(SELECT COUNT(*) FROM route_object),(SELECT COUNT(*) FROM cross_l3_service),(SELECT COUNT(*) FROM policy_route_rule)")==0&&sqlite3_step(st)==SQLITE_ROW){tables=sqlite3_column_int(st,0);routes=sqlite3_column_int(st,1);objects=sqlite3_column_int(st,2);cross=sqlite3_column_int(st,3);rules=sqlite3_column_int(st,4);sqlite3_finalize(st);} 
-    json_object_object_add(summary,"tables",json_object_new_int(tables));json_object_object_add(summary,"static_routes",json_object_new_int(routes));json_object_object_add(summary,"route_objects",json_object_new_int(objects));json_object_object_add(summary,"cross_services",json_object_new_int(cross));json_object_object_add(summary,"policy_rules",json_object_new_int(rules));
-    if(dry) json_object_array_add(warnings,json_object_new_string("dry_run: no files written and no runtime apply"));
-    json_object_object_add(runtime,"rt_tables_file",json_object_new_string("/etc/iproute2/rt_tables.d/dreamingwrt.conf"));
-    json_object_object_add(runtime,"draft_config",json_object_new_string("/etc/config/dreamingwrt_advanced_routing"));
-    json_object_object_add(runtime,"runtime_apply",json_object_new_string(dry?"dry_run":(apply_runtime?"attempted":"files_only")));
-    json_object_object_add(d,"ok",json_object_new_boolean(1));json_object_object_add(d,"dry_run",json_object_new_boolean(dry));json_object_object_add(d,"applied",json_object_new_boolean(!dry));json_object_object_add(d,"summary",summary);json_object_object_add(d,"runtime",runtime);json_object_object_add(d,"warnings",warnings);return jmx_gen_api_response_data(API_CODE_SUCCESS,d);
+    nc_adv_route_db_init();
+    if (dry) {
+        json_object_array_add(warnings,
+            json_object_new_string("dry_run: no files written and no runtime apply"));
+        goto summary_query;
+    }
+
+#define NC_ADV_MKDIR(path, mode, stage) do { \
+        struct stat dir_st; \
+        if ((mkdir((path), (mode)) != 0 && errno != EEXIST) || \
+            stat((path), &dir_st) != 0 || !S_ISDIR(dir_st.st_mode)) { \
+            failed_stage = (stage); \
+            reason = "advanced_routing_directory_prepare_failed"; \
+            goto failed; \
+        } \
+    } while (0)
+    NC_ADV_MKDIR("/etc/iproute2", 0755, "prepare_iproute2_directory");
+    NC_ADV_MKDIR("/etc/iproute2/rt_tables.d", 0755, "prepare_rt_tables_directory");
+    NC_ADV_MKDIR("/etc/dreamingwrt", 0755, "prepare_dreamingwrt_directory");
+#undef NC_ADV_MKDIR
+
+    if (nc_adv_recover_pending_publish() != 0) {
+        failed_stage = "recover_pending_publish";
+        reason = "advanced_routing_publish_recovery_failed";
+        goto failed;
+    }
+    transaction_id = nc_adv_transaction_id();
+    for (size_t i = 0; i < artifact_count; i++) {
+        if (nc_adv_artifact_open(&artifacts[i], transaction_id, i) != 0) {
+            failed_stage = "open_artifact_staging";
+            reason = "advanced_routing_artifact_open_failed";
+            goto failed;
+        }
+    }
+    if (nc_adv_generate_rt_tables(artifacts[0].fp) != 0 ||
+        nc_adv_artifact_finish(&artifacts[0]) != 0) {
+        failed_stage = "generate_rt_tables";
+        reason = "advanced_routing_artifact_write_failed";
+        goto failed;
+    }
+    if (nc_adv_generate_draft_config(artifacts[1].fp) != 0 ||
+        nc_adv_artifact_finish(&artifacts[1]) != 0) {
+        failed_stage = "generate_draft_config";
+        reason = "advanced_routing_artifact_write_failed";
+        goto failed;
+    }
+    if (nc_adv_generate_runtime(artifacts[2].fp, artifacts[3].fp) != 0 ||
+        nc_adv_artifact_finish(&artifacts[2]) != 0 ||
+        nc_adv_artifact_finish(&artifacts[3]) != 0) {
+        failed_stage = "generate_runtime_artifacts";
+        reason = "advanced_routing_artifact_write_failed";
+        goto failed;
+    }
+    if (nc_adv_artifacts_publish(artifacts, artifact_count, transaction_id,
+                                 NC_ADV_JOURNAL_DIR) != 0) {
+        failed_stage = "publish_runtime_artifacts";
+        reason = "advanced_routing_artifact_publish_failed";
+        goto failed;
+    }
+    artifact_generated = 1;
+    apply_state = "staged";
+    if (!apply_runtime) {
+        reason = "runtime_apply_not_requested";
+        if (nc_adv_set_apply_state(apply_state, 0) != 0) {
+            failed_stage = "persist_staged_state";
+            reason = "advanced_routing_state_update_failed";
+            goto failed;
+        }
+        goto summary_query;
+    }
+
+    runtime_attempted = 1;
+    {
+        int logfd = nc_adv_open_runtime_log(log_path, sizeof(log_path));
+        if (logfd < 0) {
+            apply_rc = -1;
+            failed_stage = "open_runtime_log";
+            reason = "advanced_routing_runtime_log_failed";
+            goto failed;
+        }
+        apply_rc = nc_adv_run_script(logfd);
+    }
+    if (apply_rc != 0) {
+        failed_stage = "runtime_apply";
+        reason = "advanced_routing_runtime_apply_failed";
+        goto failed;
+    }
+    runtime_applied = 1;
+    apply_state = "runtime_unverified";
+    reason = "advanced_routing_runtime_readback_pending";
+    if (nc_adv_set_apply_state(apply_state, 1) != 0) {
+        failed_stage = "persist_runtime_state";
+        reason = "advanced_routing_state_update_failed";
+        goto failed;
+    }
+    json_object_array_add(warnings,
+        json_object_new_string("runtime command succeeded; ip rule/route/nft readback is pending"));
+    goto summary_query;
+
+failed:
+    response_ok = 0;
+    apply_state = "failed";
+    nc_adv_artifacts_abort(artifacts, artifact_count, 0);
+    if (g_netconfig_db && nc_adv_set_apply_state("failed", 0) != 0 &&
+        strcmp(failed_stage, "database_init") != 0) {
+        failed_stage = "persist_failure_state";
+        reason = "advanced_routing_state_update_failed";
+    }
+
+summary_query:
+    if (g_netconfig_db && nc_prepare(&st,
+        "SELECT (SELECT COUNT(*) FROM route_table),(SELECT COUNT(*) FROM static_route),"
+        "(SELECT COUNT(*) FROM route_object),(SELECT COUNT(*) FROM cross_l3_service),"
+        "(SELECT COUNT(*) FROM policy_route_rule)") == 0) {
+        int step_rc = sqlite3_step(st);
+        if (step_rc == SQLITE_ROW) {
+            tables = sqlite3_column_int(st, 0);
+            routes = sqlite3_column_int(st, 1);
+            objects = sqlite3_column_int(st, 2);
+            cross = sqlite3_column_int(st, 3);
+            rules = sqlite3_column_int(st, 4);
+        } else if (response_ok) {
+            response_ok = 0;
+            failed_stage = "summary_query";
+            reason = "advanced_routing_database_read_failed";
+            apply_state = "failed";
+        }
+        if (sqlite3_finalize(st) != SQLITE_OK && response_ok) {
+            response_ok = 0;
+            failed_stage = "summary_finalize";
+            reason = "advanced_routing_database_read_failed";
+            apply_state = "failed";
+        }
+        st = NULL;
+    } else if (g_netconfig_db && response_ok) {
+        response_ok = 0;
+        failed_stage = "summary_prepare";
+        reason = "advanced_routing_database_read_failed";
+        apply_state = "failed";
+    }
+
+response:
+    nc_adv_artifacts_close(artifacts, artifact_count);
+    json_object_object_add(summary, "tables", json_object_new_int(tables));
+    json_object_object_add(summary, "static_routes", json_object_new_int(routes));
+    json_object_object_add(summary, "route_objects", json_object_new_int(objects));
+    json_object_object_add(summary, "cross_services", json_object_new_int(cross));
+    json_object_object_add(summary, "policy_rules", json_object_new_int(rules));
+    json_object_object_add(runtime, "rt_tables_file", json_object_new_string(rt_path));
+    json_object_object_add(runtime, "draft_config", json_object_new_string(draft_path));
+    json_object_object_add(runtime, "script", json_object_new_string(script_path));
+    json_object_object_add(runtime, "nft_file", json_object_new_string(nft_path));
+    json_object_object_add(runtime, "runtime_apply", json_object_new_string(
+        dry ? "dry_run" : (apply_runtime ? "attempted" : "files_only")));
+    json_object_object_add(runtime, "apply_rc", json_object_new_int(apply_rc));
+    json_object_object_add(runtime, "apply_log", json_object_new_string(log_path));
+    json_object_object_add(d, "ok", json_object_new_boolean(response_ok));
+    json_object_object_add(d, "dry_run", json_object_new_boolean(dry));
+    json_object_object_add(d, "apply_state", json_object_new_string(apply_state));
+    json_object_object_add(d, "reason", json_object_new_string(reason));
+    json_object_object_add(d, "failed_stage", json_object_new_string(failed_stage));
+    json_object_object_add(d, "artifact_generated", json_object_new_boolean(artifact_generated));
+    json_object_object_add(d, "runtime_attempted", json_object_new_boolean(runtime_attempted));
+    json_object_object_add(d, "runtime_applied", json_object_new_boolean(runtime_applied));
+    json_object_object_add(d, "readback_verified", json_object_new_boolean(readback_verified));
+    json_object_object_add(d, "applied", json_object_new_boolean(0));
+    json_object_object_add(d, "summary", summary);
+    json_object_object_add(d, "runtime", runtime);
+    json_object_object_add(d, "warnings", warnings);
+    return jmx_gen_api_response_data(response_ok ? API_CODE_SUCCESS : API_CODE_ERROR, d);
 }
 struct json_object *jmx_advanced_routing_status(void)
 {
@@ -17998,7 +21305,7 @@ static int nc_custom_save_tags(struct json_object*arr)
 
 int jmx_custom_config_save(struct json_object *cfg)
 {
-    if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_custom_db_init(); struct json_object*v=NULL; int rc=0; nc_exec("BEGIN IMMEDIATE"); if(json_object_object_get_ex(cfg,"protocols",&v))rc|=nc_custom_save_protocols(v); if(json_object_object_get_ex(cfg,"advanced_protocols",&v))rc|=nc_custom_save_signatures(v); if(json_object_object_get_ex(cfg,"port_groups",&v))rc|=nc_custom_save_port_groups(v); if(json_object_object_get_ex(cfg,"service_templates",&v))rc|=nc_custom_save_templates(v); if(json_object_object_get_ex(cfg,"protocol_tags",&v))rc|=nc_custom_save_tags(v); if(rc==0)nc_exec("UPDATE custom_config_status SET apply_state='draft',pending_runtime=1,updated_at=strftime('%s','now') WHERE id=1"); nc_exec(rc==0?"COMMIT":"ROLLBACK"); return rc==0?0:-1;
+    if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_custom_db_init(); struct json_object*v=NULL; int rc=0; if(nc_txn_begin()!=0)return -1; if(json_object_object_get_ex(cfg,"protocols",&v))rc|=nc_custom_save_protocols(v); if(json_object_object_get_ex(cfg,"advanced_protocols",&v))rc|=nc_custom_save_signatures(v); if(json_object_object_get_ex(cfg,"port_groups",&v))rc|=nc_custom_save_port_groups(v); if(json_object_object_get_ex(cfg,"service_templates",&v))rc|=nc_custom_save_templates(v); if(json_object_object_get_ex(cfg,"protocol_tags",&v))rc|=nc_custom_save_tags(v); if(rc==0)nc_exec("UPDATE custom_config_status SET apply_state='draft',pending_runtime=1,updated_at=strftime('%s','now') WHERE id=1"); nc_exec(rc==0?"COMMIT":"ROLLBACK"); return rc==0?0:-1;
 }
 
 struct json_object *jmx_custom_config_apply(struct json_object *cfg)
@@ -18086,12 +21393,16 @@ static void nc_netctl_db_init(void)
     nc_exec("CREATE TABLE IF NOT EXISTS network_control_other (id INTEGER PRIMARY KEY CHECK (id = 1),anti_share_enabled INTEGER NOT NULL DEFAULT 1,ttl_value INTEGER NOT NULL DEFAULT 1,dns_hijack_protect INTEGER NOT NULL DEFAULT 1,block_proxy_vpn INTEGER NOT NULL DEFAULT 0,block_unknown_quic INTEGER NOT NULL DEFAULT 0,scope TEXT NOT NULL DEFAULT 'lan',schedule TEXT NOT NULL DEFAULT 'always',updated_at INTEGER NOT NULL DEFAULT 0)");
     nc_exec("CREATE TABLE IF NOT EXISTS network_control_event (id INTEGER PRIMARY KEY AUTOINCREMENT,ts INTEGER NOT NULL,rule_id TEXT NOT NULL DEFAULT '',type TEXT NOT NULL DEFAULT '',client TEXT NOT NULL DEFAULT '',source TEXT NOT NULL DEFAULT '',target TEXT NOT NULL DEFAULT '',action TEXT NOT NULL DEFAULT '',reason TEXT NOT NULL DEFAULT '',bytes INTEGER NOT NULL DEFAULT 0)");
     nc_exec("CREATE TABLE IF NOT EXISTS network_control_status (id INTEGER PRIMARY KEY CHECK (id = 1),apply_state TEXT NOT NULL DEFAULT 'draft',last_apply_at INTEGER NOT NULL DEFAULT 0,warnings TEXT NOT NULL DEFAULT '',updated_at INTEGER NOT NULL DEFAULT 0)");
+    nc_exec("CREATE TABLE IF NOT EXISTS network_control_tc_runtime (rule_id TEXT NOT NULL,direction TEXT NOT NULL CHECK(direction IN ('ingress','egress')),pref INTEGER NOT NULL,family INTEGER NOT NULL,address TEXT NOT NULL,protocol TEXT NOT NULL,src_port INTEGER NOT NULL DEFAULT 0,dest_port INTEGER NOT NULL DEFAULT 0,rate_kbit INTEGER NOT NULL,PRIMARY KEY(direction,pref))");
+    nc_exec("CREATE TABLE IF NOT EXISTS network_control_tc_state (id INTEGER PRIMARY KEY CHECK(id=1),ifname TEXT NOT NULL DEFAULT '',generation INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0,clsact_owned INTEGER NOT NULL DEFAULT 0)");
+    nc_exec("INSERT OR IGNORE INTO network_control_tc_state(id) VALUES(1)");
     nc_add_column_if_missing("network_control_global", "appfilter_enabled", "INTEGER NOT NULL DEFAULT 1");
     nc_add_column_if_missing("network_control_global", "macfilter_enabled", "INTEGER NOT NULL DEFAULT 1");
     nc_add_column_if_missing("network_control_global", "record_enabled", "INTEGER NOT NULL DEFAULT 1");
     nc_add_column_if_missing("network_control_global", "revision", "INTEGER NOT NULL DEFAULT 1");
     nc_add_column_if_missing("network_control_rule", "runtime_rule_id", "INTEGER NOT NULL DEFAULT 0");
     nc_add_column_if_missing("network_control_app_rule", "filter_quic", "INTEGER NOT NULL DEFAULT 0");
+    nc_add_column_if_missing("network_control_tc_state", "clsact_owned", "INTEGER NOT NULL DEFAULT 0");
     nc_exec("INSERT OR IGNORE INTO network_control_global(id) VALUES(1)");
     nc_exec("INSERT OR IGNORE INTO network_control_other(id) VALUES(1)");
     nc_exec("INSERT OR IGNORE INTO network_control_status(id,warnings) VALUES(1,'phase1 persistence only; nft/tc/url runtime pending')");
@@ -18138,7 +21449,7 @@ static int nc_netctl_save_terminal(struct json_object*arr){NC_NETCTL_SAVE_DETAIL
 
 int jmx_network_control_save(struct json_object *cfg)
 {
-    if(!cfg||jmx_netconfig_db_init()!=0)return -1;nc_netctl_db_init();struct json_object*v=NULL;int rc=0;nc_exec("BEGIN IMMEDIATE");if(json_object_object_get_ex(cfg,"global",&v)&&v){sqlite3_stmt*st=NULL;struct json_object*f=NULL;int app=json_object_object_get_ex(v,"appfilter_enabled",&f)?json_object_get_boolean(f):-1;int mac=json_object_object_get_ex(v,"macfilter_enabled",&f)?json_object_get_boolean(f):-1;int rec=json_object_object_get_ex(v,"record_enabled",&f)?json_object_get_boolean(f):-1;if(nc_prepare(&st,"UPDATE network_control_global SET enabled=?,mode=?,default_action=?,schedule_default=?,appfilter_enabled=CASE WHEN ?<0 THEN appfilter_enabled ELSE ? END,macfilter_enabled=CASE WHEN ?<0 THEN macfilter_enabled ELSE ? END,record_enabled=CASE WHEN ?<0 THEN record_enabled ELSE ? END,apply_state='draft',updated_at=? WHERE id=1")==0){sqlite3_bind_int(st,1,nc_json_bool_def(v,"enabled",1));sqlite3_bind_text(st,2,nc_json_str_def(v,"mode","balanced"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(v,"default_action","allow"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(v,"schedule_default","always"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,5,app);sqlite3_bind_int(st,6,app);sqlite3_bind_int(st,7,mac);sqlite3_bind_int(st,8,mac);sqlite3_bind_int(st,9,rec);sqlite3_bind_int(st,10,rec);sqlite3_bind_int64(st,11,(sqlite3_int64)nc_now_s());sqlite3_step(st);sqlite3_finalize(st);}}
+    if(!cfg||jmx_netconfig_db_init()!=0)return -1;nc_netctl_db_init();struct json_object*v=NULL;int rc=0;if(nc_txn_begin()!=0)return -1;if(json_object_object_get_ex(cfg,"global",&v)&&v){sqlite3_stmt*st=NULL;struct json_object*f=NULL;int app=json_object_object_get_ex(v,"appfilter_enabled",&f)?json_object_get_boolean(f):-1;int mac=json_object_object_get_ex(v,"macfilter_enabled",&f)?json_object_get_boolean(f):-1;int rec=json_object_object_get_ex(v,"record_enabled",&f)?json_object_get_boolean(f):-1;if(nc_prepare(&st,"UPDATE network_control_global SET enabled=?,mode=?,default_action=?,schedule_default=?,appfilter_enabled=CASE WHEN ?<0 THEN appfilter_enabled ELSE ? END,macfilter_enabled=CASE WHEN ?<0 THEN macfilter_enabled ELSE ? END,record_enabled=CASE WHEN ?<0 THEN record_enabled ELSE ? END,apply_state='draft',updated_at=? WHERE id=1")==0){sqlite3_bind_int(st,1,nc_json_bool_def(v,"enabled",1));sqlite3_bind_text(st,2,nc_json_str_def(v,"mode","balanced"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(v,"default_action","allow"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(v,"schedule_default","always"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,5,app);sqlite3_bind_int(st,6,app);sqlite3_bind_int(st,7,mac);sqlite3_bind_int(st,8,mac);sqlite3_bind_int(st,9,rec);sqlite3_bind_int(st,10,rec);sqlite3_bind_int64(st,11,(sqlite3_int64)nc_now_s());sqlite3_step(st);sqlite3_finalize(st);}}
     if(json_object_object_get_ex(cfg,"connection_limits",&v))rc|=nc_netctl_save_connection(v);if(json_object_object_get_ex(cfg,"mac_rules",&v))rc|=nc_netctl_save_mac(v);if(json_object_object_get_ex(cfg,"url_access_rules",&v))rc|=nc_netctl_save_url_access(v);if(json_object_object_get_ex(cfg,"url_rewrite_rules",&v))rc|=nc_netctl_save_url_rewrite(v);if(json_object_object_get_ex(cfg,"app_rules",&v))rc|=nc_netctl_save_app(v);if(json_object_object_get_ex(cfg,"terminal_limits",&v))rc|=nc_netctl_save_terminal(v);if(json_object_object_get_ex(cfg,"app_whitelist",&v))rc|=nc_rulesd_replace_whitelist(v,"app");if(json_object_object_get_ex(cfg,"mac_whitelist",&v))rc|=nc_rulesd_replace_whitelist(v,"mac");if(json_object_object_get_ex(cfg,"other_control",&v)&&v){sqlite3_stmt*st=NULL;if(nc_prepare(&st,"UPDATE network_control_other SET anti_share_enabled=?,ttl_value=?,dns_hijack_protect=?,block_proxy_vpn=?,block_unknown_quic=?,scope=?,schedule=?,updated_at=? WHERE id=1")==0){sqlite3_bind_int(st,1,nc_json_bool_def(v,"anti_share_enabled",1));sqlite3_bind_int(st,2,nc_json_int_def(v,"ttl_value",1));sqlite3_bind_int(st,3,nc_json_bool_def(v,"dns_hijack_protect",1));sqlite3_bind_int(st,4,nc_json_bool_def(v,"block_proxy_vpn",0));sqlite3_bind_int(st,5,nc_json_bool_def(v,"block_unknown_quic",0));sqlite3_bind_text(st,6,nc_json_str_def(v,"scope","lan"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(v,"schedule","always"),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,8,(sqlite3_int64)nc_now_s());sqlite3_step(st);sqlite3_finalize(st);}}
     if(rc==0)rc|=nc_exec("UPDATE network_control_global SET revision=revision+1,apply_state='draft',updated_at=strftime('%s','now') WHERE id=1");
     if(rc==0)rc|=nc_exec("UPDATE network_control_status SET apply_state='draft',warnings='saved; runtime apply pending',updated_at=strftime('%s','now') WHERE id=1");
@@ -19529,54 +22840,152 @@ static int nc_nft_gen_mac_rules(FILE *fp)
 {
     sqlite3_stmt *st = NULL;
     int count = 0;
-    if(nc_prepare(&st, "SELECT d.mac, r.name, d.mode FROM network_control_rule r JOIN network_control_mac_rule d ON d.rule_id=r.id WHERE r.type='mac' AND r.enabled=1 ORDER BY r.priority, r.id")==0) {
-        while(sqlite3_step(st)==SQLITE_ROW) {
+    int step_rc;
+
+    if (!fp || nc_prepare(&st, "SELECT d.mac, r.name, d.mode FROM network_control_rule r JOIN network_control_mac_rule d ON d.rule_id=r.id WHERE r.type='mac' AND r.enabled=1 ORDER BY r.priority, r.id") != 0)
+        return -1;
+    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
             const char *mac = (const char*)sqlite3_column_text(st, 0);
             const char *name = (const char*)sqlite3_column_text(st, 1);
             const char *mode = (const char*)sqlite3_column_text(st, 2);
-            if(!mac || !mac[0]) continue;
+            const unsigned char *p;
+
+            if (!nc_netctl_mac_ok(mac) || !name || strlen(name) > 128 ||
+                !mode || (strcmp(mode, "deny") && strcmp(mode, "block") &&
+                          strcmp(mode, "allow")))
+                goto fail;
+            for (p = (const unsigned char *)name; *p; p++)
+                if (*p < 0x20 || *p == 0x7f)
+                    goto fail;
             if(!strcmp(mode, "deny") || !strcmp(mode, "block")) {
-                fprintf(fp, "\t\tether saddr %s drop  # %s\n", mac, name?name:"mac_block");
+                if (fprintf(fp, "\t\tether saddr %s drop  # %s\n", mac, name) < 0)
+                    goto fail;
             } else if(!strcmp(mode, "allow")) {
-                fprintf(fp, "\t\tether saddr %s accept  # %s\n", mac, name?name:"mac_allow");
+                if (fprintf(fp, "\t\tether saddr %s accept  # %s\n", mac, name) < 0)
+                    goto fail;
             }
             count++;
-        }
-        sqlite3_finalize(st);
     }
-    return count;
+    sqlite3_finalize(st);
+    return step_rc == SQLITE_DONE ? count : -1;
+
+fail:
+    sqlite3_finalize(st);
+    return -1;
 }
 
 int nc_sig_open(sqlite3 **db);
-static void nc_nft_emit_port_rule(FILE*fp,const char*proto,int a,int b,unsigned mark,int app_id,const char*rule_name)
-{if(b>a)fprintf(fp,"\t\t%s dport %d-%d meta mark set 0x%04x ct mark set 0x%04x  # dpi app=%d rule=%s\n",proto,a,b,mark,mark,app_id,rule_name?rule_name:"app");else fprintf(fp,"\t\t%s dport %d meta mark set 0x%04x ct mark set 0x%04x  # dpi app=%d rule=%s\n",proto,a,mark,mark,app_id,rule_name?rule_name:"app");}
+static int nc_netctl_comment_ok(const char *text, size_t max_len)
+{
+    const unsigned char *p = (const unsigned char *)text;
+    size_t len;
+
+    if (!text || (len = strlen(text)) == 0 || len > max_len)
+        return 0;
+    for (; *p; p++)
+        if (*p < 0x20 || *p == 0x7f)
+            return 0;
+    return 1;
+}
+
+static int nc_nft_emit_port_rule(FILE *fp, const char *proto, int a, int b,
+                                 unsigned mark, int app_id,
+                                 const char *rule_name)
+{
+    if (!fp || (!proto || (strcmp(proto, "tcp") && strcmp(proto, "udp"))) ||
+        a < 1 || a > 65535 || b < a || b > 65535 || app_id < 1 ||
+        !nc_netctl_comment_ok(rule_name, 128))
+        return -1;
+    if (b > a)
+        return fprintf(fp, "\t\t%s dport %d-%d meta mark set 0x%04x ct mark set 0x%04x  # dpi app=%d rule=%s\n",
+                       proto, a, b, mark, mark, app_id, rule_name) < 0 ? -1 : 0;
+    return fprintf(fp, "\t\t%s dport %d meta mark set 0x%04x ct mark set 0x%04x  # dpi app=%d rule=%s\n",
+                   proto, a, mark, mark, app_id, rule_name) < 0 ? -1 : 0;
+}
 static int nc_nft_app_emit_ports(FILE *fp,sqlite3 *sig,int app_id,unsigned mark,const char*rule_name)
-{sqlite3_stmt*ps=NULL;int n=0;if(sqlite3_prepare_v2(sig,"SELECT DISTINCT COALESCE(NULLIF(r.proto,''),'both'),p.min_port,p.max_port FROM dpi_rule r JOIN dpi_rule_port p ON p.rule_id=r.rule_id WHERE r.enabled=1 AND r.app_id=? AND p.min_port IS NOT NULL AND p.min_port>0 ORDER BY r.proto,p.min_port,p.max_port",-1,&ps,NULL)==SQLITE_OK){sqlite3_bind_int(ps,1,app_id);while(sqlite3_step(ps)==SQLITE_ROW){const char*proto=(const char*)sqlite3_column_text(ps,0);int a=sqlite3_column_int(ps,1),b=sqlite3_column_int(ps,2);if(b<=0)b=a;if(a<=0||b<a)continue;if(!proto||!*proto||!strcmp(proto,"both")){nc_nft_emit_port_rule(fp,"tcp",a,b,mark,app_id,rule_name);nc_nft_emit_port_rule(fp,"udp",a,b,mark,app_id,rule_name);n+=2;}else if(!strcmp(proto,"tcp")||!strcmp(proto,"udp")){nc_nft_emit_port_rule(fp,proto,a,b,mark,app_id,rule_name);n++;}}sqlite3_finalize(ps);}return n;}
+{
+    sqlite3_stmt *ps = NULL;
+    int n = 0, step_rc;
+
+    if (!fp || !sig || app_id < 1 || !nc_netctl_comment_ok(rule_name, 128) ||
+        sqlite3_prepare_v2(sig, "SELECT DISTINCT COALESCE(NULLIF(r.proto,''),'both'),p.min_port,p.max_port FROM dpi_rule r JOIN dpi_rule_port p ON p.rule_id=r.rule_id WHERE r.enabled=1 AND r.app_id=? AND p.min_port IS NOT NULL AND p.min_port>0 ORDER BY r.proto,p.min_port,p.max_port", -1, &ps, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(ps, 1, app_id);
+    while ((step_rc = sqlite3_step(ps)) == SQLITE_ROW) {
+        const char *proto = (const char *)sqlite3_column_text(ps, 0);
+        int a = sqlite3_column_int(ps, 1), b = sqlite3_column_int(ps, 2);
+
+        if (b <= 0) b = a;
+        if (a < 1 || a > 65535 || b < a || b > 65535 || !proto)
+            goto fail;
+        if (!strcmp(proto, "both")) {
+            if (nc_nft_emit_port_rule(fp, "tcp", a, b, mark, app_id, rule_name) != 0 ||
+                nc_nft_emit_port_rule(fp, "udp", a, b, mark, app_id, rule_name) != 0)
+                goto fail;
+            n += 2;
+        } else if (!strcmp(proto, "tcp") || !strcmp(proto, "udp")) {
+            if (nc_nft_emit_port_rule(fp, proto, a, b, mark, app_id, rule_name) != 0)
+                goto fail;
+            n++;
+        } else {
+            goto fail;
+        }
+    }
+    sqlite3_finalize(ps);
+    return step_rc == SQLITE_DONE ? n : -1;
+
+fail:
+    sqlite3_finalize(ps);
+    return -1;
+}
 
 static int nc_nft_for_each_app_rule(FILE *fp, int emit_mark)
 {
-    sqlite3_stmt *st = NULL; sqlite3 *sig=NULL; int count = 0, ridx = 1;
-    if(emit_mark && nc_sig_open(&sig)!=0){fprintf(fp,"\t\t# app dpi runtime disabled: signature db unavailable\n");return 0;}
-    if(nc_prepare(&st, "SELECT r.id,d.app_ids,d.action,r.name FROM network_control_rule r JOIN network_control_app_rule d ON d.rule_id=r.id WHERE r.type='app' AND r.enabled=1 ORDER BY r.priority, r.id")==0) {
-        while(sqlite3_step(st)==SQLITE_ROW) {
+    sqlite3_stmt *st = NULL; sqlite3 *sig=NULL; int count = 0, ridx = 1, step_rc;
+    if (!fp || (emit_mark && nc_sig_open(&sig) != 0))
+        return -1;
+    if (nc_prepare(&st, "SELECT r.id,d.app_ids,d.action,r.name FROM network_control_rule r JOIN network_control_app_rule d ON d.rule_id=r.id WHERE r.type='app' AND r.enabled=1 ORDER BY r.priority, r.id") != 0)
+        goto fail;
+    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
             const char *rule_id=(const char*)sqlite3_column_text(st,0); const char *app_ids=(const char*)sqlite3_column_text(st,1);
             const char *action=(const char*)sqlite3_column_text(st,2); const char *name=(const char*)sqlite3_column_text(st,3);
-            if(!app_ids||!app_ids[0]) continue; unsigned mark=(unsigned)(0x0100 | (ridx&0xff)); if(ridx<255)ridx++;
-            if(emit_mark){
-                fprintf(fp,"\t\t# app classify: %s id=%s action=%s app_ids=%s mark=0x%04x\n",name?name:"",rule_id?rule_id:"",action?action:"block",app_ids,mark);
-                struct json_object*a=nc_json_array_from_text(app_ids); int an=json_object_array_length(a),emitted=0;
-                for(int i=0;i<an;i++){struct json_object*v=json_object_array_get_idx(a,i);int app_id=json_object_get_int(v);if(app_id>0)emitted+=nc_nft_app_emit_ports(fp,sig,app_id,mark,name?name:rule_id);}json_object_put(a);
-                if(emitted<=0)fprintf(fp,"\t\t# app rule has no dpi_rule_port hits; app_ids=%s\n",app_ids);
-            } else {
-                if(!action||!strcmp(action,"block")||!strcmp(action,"deny"))fprintf(fp,"\t\tmeta mark 0x%04x drop  # app_block %s\n",mark,name?name:"app_block");
-                else if(!strcmp(action,"allow"))fprintf(fp,"\t\tmeta mark 0x%04x accept  # app_allow %s\n",mark,name?name:"app_allow");
+            struct json_object *a = NULL;
+            unsigned mark;
+            int an;
+
+            if (!rule_id || !nc_valid_name(rule_id) || strlen(rule_id) > 95 ||
+                !nc_netctl_comment_ok(name, 128) || !app_ids || !app_ids[0] ||
+                !action || (strcmp(action, "block") && strcmp(action, "deny") &&
+                            strcmp(action, "allow")))
+                goto fail;
+            a = json_tokener_parse(app_ids);
+            if (!a || !json_object_is_type(a, json_type_array) ||
+                (an = (int)json_object_array_length(a)) < 1 ||
+                an > NC_AEGIS_APPFILTER_MAX_APP_IDS) {
+                if (a) json_object_put(a);
+                goto fail;
             }
+            mark=(unsigned)(0x0100 | (ridx&0xff)); if(ridx<255)ridx++;
+            if(emit_mark){
+                int emitted=0;
+                if (fprintf(fp,"\t\t# app classify: %s id=%s action=%s mark=0x%04x\n",name,rule_id,action,mark) < 0) { json_object_put(a); goto fail; }
+                for(int i=0;i<an;i++){struct json_object*v=json_object_array_get_idx(a,i);int app_id;if(!v||!json_object_is_type(v,json_type_int)||(app_id=json_object_get_int(v))<1){json_object_put(a);goto fail;}int added=nc_nft_app_emit_ports(fp,sig,app_id,mark,name);if(added<0){json_object_put(a);goto fail;}emitted+=added;}
+                if(emitted<=0 && fprintf(fp,"\t\t# app rule has no dpi_rule_port hits\n") < 0){json_object_put(a);goto fail;}
+            } else {
+                if((!strcmp(action,"block")||!strcmp(action,"deny")) && fprintf(fp,"\t\tmeta mark 0x%04x drop  # app_block %s\n",mark,name)<0){json_object_put(a);goto fail;}
+                if(!strcmp(action,"allow") && fprintf(fp,"\t\tmeta mark 0x%04x accept  # app_allow %s\n",mark,name)<0){json_object_put(a);goto fail;}
+            }
+            json_object_put(a);
             count++;
-        }
-        sqlite3_finalize(st);
     }
+    sqlite3_finalize(st);
     if(sig) sqlite3_close(sig);
-    return count;
+    return step_rc == SQLITE_DONE ? count : -1;
+
+fail:
+    if (st) sqlite3_finalize(st);
+    if (sig) sqlite3_close(sig);
+    return -1;
 }
 static int nc_nft_gen_app_mark_rules(FILE *fp){return nc_nft_for_each_app_rule(fp,1);}
 static int nc_nft_gen_app_action_rules(FILE *fp){return nc_nft_for_each_app_rule(fp,0);}
@@ -19585,168 +22994,1394 @@ static int nc_nft_gen_connection_limit_rules(FILE *fp)
 {
     sqlite3_stmt *st = NULL;
     int count = 0;
-    if(nc_prepare(&st, "SELECT d.protocol, d.wan_port, d.connection_limit, d.burst, d.action, r.name FROM network_control_rule r JOIN network_control_connection_limit d ON d.rule_id=r.id WHERE r.type='connection_limit' AND r.enabled=1 ORDER BY r.priority, r.id")==0) {
-        while(sqlite3_step(st)==SQLITE_ROW) {
+    int step_rc;
+    if (!fp || nc_prepare(&st, "SELECT d.protocol, d.wan_port, d.connection_limit, d.burst, d.action, r.name FROM network_control_rule r JOIN network_control_connection_limit d ON d.rule_id=r.id WHERE r.type='connection_limit' AND r.enabled=1 ORDER BY r.priority, r.id") != 0)
+        return -1;
+    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
             const char *proto = (const char*)sqlite3_column_text(st, 0);
             const char *wan_port = (const char*)sqlite3_column_text(st, 1);
             int limit = sqlite3_column_int(st, 2);
             int burst = sqlite3_column_int(st, 3);
             const char *action = (const char*)sqlite3_column_text(st, 4);
             const char *name = (const char*)sqlite3_column_text(st, 5);
-            if(limit <= 0) limit = 600;
-            if(burst <= 0) burst = 80;
+            int tcp, udp;
+            if (!proto || (!strcmp(proto, "tcp") ? 0 : !strcmp(proto, "udp") ? 0 :
+                           !strcmp(proto, "tcp,udp") ? 0 : !strcmp(proto, "udp,tcp") ? 0 : -1) < 0 ||
+                !wan_port || !nc_netctl_comment_ok(name, 128) || !action ||
+                (strcmp(action, "limit") && strcmp(action, "block") && strcmp(action, "deny")) ||
+                limit < 1 || limit > 10000000 || burst < 1 || burst > 1000000)
+                goto fail;
+            if (strcmp(wan_port, "any")) {
+                int first = 0, last = 0; char tail = '\0';
+                if (sscanf(wan_port, "%d-%d%c", &first, &last, &tail) == 2) {
+                    if (first < 1 || last < first || last > 65535) goto fail;
+                } else if (sscanf(wan_port, "%d%c", &first, &tail) == 1) {
+                    if (first < 1 || first > 65535) goto fail;
+                } else goto fail;
+            }
+            tcp = !strcmp(proto, "tcp") || strstr(proto, "tcp") != NULL;
+            udp = !strcmp(proto, "udp") || strstr(proto, "udp") != NULL;
             /* nftables meter/limit */
             fprintf(fp, "\t\t# connection limit: %s (proto=%s port=%s limit=%d burst=%d)\n",
                     name?name:"", proto?proto:"tcp,udp", wan_port?wan_port:"any", limit, burst);
-            if(strstr(proto, "tcp")) {
+            if(tcp) {
                 if(wan_port && strcmp(wan_port, "any") && wan_port[0])
                     fprintf(fp, "\t\ttcp dport %s ct count over %d drop\n", wan_port, limit);
                 else
                     fprintf(fp, "\t\tmeta l4proto tcp ct count over %d drop\n", limit);
             }
-            if(strstr(proto, "udp")) {
+            if(udp) {
                 if(wan_port && strcmp(wan_port, "any") && wan_port[0])
                     fprintf(fp, "\t\tudp dport %s ct count over %d drop\n", wan_port, limit);
                 else
                     fprintf(fp, "\t\tmeta l4proto udp ct count over %d drop\n", limit);
             }
             count++;
-        }
-        sqlite3_finalize(st);
     }
-    return count;
+    sqlite3_finalize(st);
+    return step_rc == SQLITE_DONE && !ferror(fp) ? count : -1;
+
+fail:
+    sqlite3_finalize(st);
+    return -1;
 }
 
-/* ── tc qdisc generation for terminal speed limits ─────────────── */
-static int nc_tc_gen_terminal_limits(FILE *fp)
+/* ── Structured tc policing for terminal speed limits ─────────── */
+#define NC_NETCTL_TC_TIMEOUT_MS 10000
+#define NC_NETCTL_TC_OUTPUT_MAX (256U * 1024U)
+#define NC_NETCTL_TC_MAX_RULES 512
+#define NC_NETCTL_TC_PREF_SPAN 1000
+#define NC_NETCTL_TC_INGRESS_PREF_BASE 7000
+#define NC_NETCTL_TC_EGRESS_PREF_BASE 8000
+#define NC_NETCTL_TC_LOCK "network-control-tc.lock"
+
+struct nc_tc_rule {
+    char rule_id[96];
+    char direction[16];
+    char address[INET6_ADDRSTRLEN];
+    char protocol[16];
+    int pref;
+    int family;
+    int src_port;
+    int dest_port;
+    int rate_kbit;
+};
+
+struct nc_tc_plan {
+    char ifname[IFNAMSIZ];
+    struct nc_tc_rule rules[NC_NETCTL_TC_MAX_RULES];
+    size_t count;
+    int clsact_owned;
+};
+
+static const char *nc_tc_tool_path(void)
+{
+    if (nc_netctl_trusted_tool("/usr/sbin/tc"))
+        return "/usr/sbin/tc";
+    if (nc_netctl_trusted_tool("/usr/libexec/tc-full"))
+        return "/usr/libexec/tc-full";
+    if (nc_netctl_trusted_tool("/sbin/tc"))
+        return "/sbin/tc";
+    return NULL;
+}
+
+static int nc_tc_result_ok(int rc, const struct jmx_exec_result *result)
+{
+    if (rc != 0 || !result || result->timed_out || result->truncated ||
+        result->term_signal != 0 || result->exit_code != 0)
+        return -1;
+    return 0;
+}
+
+static int nc_tc_exec_wait(const char *tc, char *const argv[])
+{
+    struct jmx_exec_result result;
+    int rc;
+
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    rc = jmx_exec_wait(tc, argv, NC_NETCTL_TC_TIMEOUT_MS, &result);
+    if (nc_tc_result_ok(rc, &result) != 0) {
+        jmx_exec_result_free(&result);
+        return -1;
+    }
+    jmx_exec_result_free(&result);
+    return 0;
+}
+
+static int nc_tc_exec_capture(const char *tc, char *const argv[],
+                              struct jmx_exec_result *result)
+{
+    int rc;
+
+    if (!tc || !argv || !result)
+        return -1;
+    memset(result, 0, sizeof(*result));
+    result->exit_code = -1;
+    rc = jmx_exec_capture(tc, argv, NC_NETCTL_TC_OUTPUT_MAX,
+                          NC_NETCTL_TC_TIMEOUT_MS, result);
+    return nc_tc_result_ok(rc, result);
+}
+
+static int nc_tc_port_value(const char *text, int *port)
+{
+    char *end = NULL;
+    long value;
+
+    if (!port)
+        return -1;
+    *port = 0;
+    if (!text || !text[0] || !strcasecmp(text, "any") || !strcmp(text, "*"))
+        return 0;
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno || !end || *end || value < 1 || value > 65535)
+        return -1;
+    *port = (int)value;
+    return 0;
+}
+
+static int nc_tc_protocol_ok(const char *protocol, int family,
+                             int src_port, int dest_port)
+{
+    if (!protocol || !protocol[0] || !strcasecmp(protocol, "all") ||
+        !strcasecmp(protocol, "any"))
+        return src_port == 0 && dest_port == 0;
+    if (!strcasecmp(protocol, "tcp") || !strcasecmp(protocol, "udp"))
+        return 1;
+    if (!strcasecmp(protocol, "icmp"))
+        return family == AF_INET && src_port == 0 && dest_port == 0;
+    if (!strcasecmp(protocol, "icmpv6") ||
+        !strcasecmp(protocol, "ipv6-icmp"))
+        return family == AF_INET6 && src_port == 0 && dest_port == 0;
+    return 0;
+}
+
+static unsigned int nc_tc_rule_hash(const char *id, const char *direction)
+{
+    const unsigned char *p;
+    unsigned int hash = 2166136261U;
+
+    for (p = (const unsigned char *)(id ? id : ""); *p; p++)
+        hash = (hash ^ *p) * 16777619U;
+    for (p = (const unsigned char *)(direction ? direction : ""); *p; p++)
+        hash = (hash ^ *p) * 16777619U;
+    return hash;
+}
+
+static int nc_tc_pref_used(const struct nc_tc_plan *plan, int pref)
+{
+    size_t i;
+
+    for (i = 0; plan && i < plan->count; i++)
+        if (plan->rules[i].pref == pref)
+            return 1;
+    return 0;
+}
+
+static int nc_tc_assign_pref(struct nc_tc_plan *plan, const char *rule_id,
+                             const char *direction)
+{
+    int base = !strcmp(direction, "ingress") ?
+               NC_NETCTL_TC_INGRESS_PREF_BASE : NC_NETCTL_TC_EGRESS_PREF_BASE;
+    unsigned int slot = nc_tc_rule_hash(rule_id, direction) %
+                        NC_NETCTL_TC_PREF_SPAN;
+    unsigned int i;
+
+    for (i = 0; i < NC_NETCTL_TC_PREF_SPAN; i++) {
+        int pref = base + (int)((slot + i) % NC_NETCTL_TC_PREF_SPAN);
+        if (!nc_tc_pref_used(plan, pref))
+            return pref;
+    }
+    return -1;
+}
+
+static int nc_tc_lan_ifname(char *ifname, size_t ifname_len)
 {
     sqlite3_stmt *st = NULL;
-    int count = 0;
-    /* Get all terminal_limit rules */
-    if(nc_prepare(&st, "SELECT d.limit_type, d.line, d.address, d.protocol, d.speed_mode, d.src_port, d.dest_port, d.upload_mbps, d.download_mbps, r.name FROM network_control_rule r JOIN network_control_terminal_limit d ON d.rule_id=r.id WHERE r.type='terminal_limit' AND r.enabled=1 ORDER BY r.priority, r.id")==0) {
-        while(sqlite3_step(st)==SQLITE_ROW) {
-            const char *limit_type = (const char*)sqlite3_column_text(st, 0);
-            const char *line = (const char*)sqlite3_column_text(st, 1);
-            const char *addr = (const char*)sqlite3_column_text(st, 2);
-            const char *proto = (const char*)sqlite3_column_text(st, 3);
-            const char *speed_mode = (const char*)sqlite3_column_text(st, 4);
-            const char *sp = (const char*)sqlite3_column_text(st, 5);
-            const char *dp = (const char*)sqlite3_column_text(st, 6);
-            double up = sqlite3_column_double(st, 7);
-            double down = sqlite3_column_double(st, 8);
-            const char *name = (const char*)sqlite3_column_text(st, 9);
-            if(!addr || !addr[0]) continue;
-            int shared = (speed_mode && !strcmp(speed_mode, "shared"));
-            fprintf(fp, "# terminal_limit: %s (addr=%s up=%.1fM down=%.1fM %s)\n",
-                    name?name:"", addr, up, down, shared?"shared":"per_ip");
-            /* Mark packets matching this terminal in nft chain, then tc picks up marks */
-            fprintf(fp, "nft add rule inet dreamingwrt_netctl forward ip daddr %s meta mark set 0x1001\n", addr);
-            fprintf(fp, "nft add rule inet dreamingwrt_netctl forward ip saddr %s meta mark set 0x1002\n", addr);
-            /* tc class for upload limit */
-            if(up > 0) {
-                int kbps = (int)(up * 1024);
-                fprintf(fp, "tc class add dev ifb0 parent 1:1 classid 1:%d htb rate %dkbit ceil %dkbit\n", 10+count, kbps, kbps);
-                fprintf(fp, "tc filter add dev ifb0 parent 1: protocol ip prio %d handle 0x1001 fw classid 1:%d\n", 10+count, 10+count);
-            }
-            /* tc class for download limit */
-            if(down > 0) {
-                int kbps = (int)(down * 1024);
-                fprintf(fp, "tc class add dev ifb0 parent 1:1 classid 1:%d htb rate %dkbit ceil %dkbit\n", 100+count, kbps, kbps);
-                fprintf(fp, "tc filter add dev ifb0 parent 1: protocol ip prio %d handle 0x1002 fw classid 1:%d\n", 100+count, 100+count);
-            }
-            count++;
-        }
+    const char *value = NULL;
+
+    if (!ifname || ifname_len < 2)
+        return -1;
+    snprintf(ifname, ifname_len, "br-lan");
+    if (nc_prepare(&st,
+        "SELECT lan_ifname FROM legacy_jmx_settings WHERE id=1") == 0 &&
+        sqlite3_step(st) == SQLITE_ROW)
+        value = (const char *)sqlite3_column_text(st, 0);
+    if (value && value[0])
+        snprintf(ifname, ifname_len, "%s", value);
+    if (st)
         sqlite3_finalize(st);
-    }
-    return count;
+    return nc_physical_port_ifname_strict_ok(ifname) &&
+           if_nametoindex(ifname) != 0 ? 0 : -1;
 }
 
-static int nc_tc_write_ruleset(const char *path)
+static int nc_tc_plan_append(struct nc_tc_plan *plan, const char *rule_id,
+                             const char *direction, const char *address,
+                             const char *protocol, int family, int src_port,
+                             int dest_port, double rate_mbps)
 {
-    FILE *fp = fopen(path, "w");
-    if(!fp) return -1;
-    fprintf(fp, "#!/bin/sh\n# DreamingWrt tc speed limit script - auto generated\n");
-    fprintf(fp, "# Apply: sh %s\n\n", path);
-    fprintf(fp, "# Setup IFB for ingress shaping\n");
-    fprintf(fp, "ip link add ifb0 type ifb 2>/dev/null\nip link set ifb0 up\n");
-    fprintf(fp, "tc qdisc add dev ifb0 root handle 1: htb default 10\n");
-    fprintf(fp, "tc class add dev ifb0 parent 1: classid 1:1 htb rate 1000mbit\n\n");
-    int cnt = nc_tc_gen_terminal_limits(fp);
-    fprintf(fp, "\necho 'tc rules applied: %d terminal limits'\n", cnt);
-    fclose(fp);
-    chmod(path, 0755);
-    return cnt;
+    struct nc_tc_rule *rule;
+    double rate_kbit;
+    int pref;
+
+    if (!plan || !rule_id || !rule_id[0] || !direction || !address ||
+        !address[0] || rate_mbps <= 0 ||
+        plan->count >= NC_NETCTL_TC_MAX_RULES)
+        return -1;
+    pref = nc_tc_assign_pref(plan, rule_id, direction);
+    rate_kbit = rate_mbps * 1000.0;
+    if (pref < 0 || rate_kbit < 1.0 || rate_kbit > 10000000.0)
+        return -1;
+    rule = &plan->rules[plan->count++];
+    memset(rule, 0, sizeof(*rule));
+    snprintf(rule->rule_id, sizeof(rule->rule_id), "%s", rule_id);
+    snprintf(rule->direction, sizeof(rule->direction), "%s", direction);
+    snprintf(rule->address, sizeof(rule->address), "%s", address);
+    snprintf(rule->protocol, sizeof(rule->protocol), "%s",
+             protocol && protocol[0] ? protocol : "all");
+    rule->pref = pref;
+    rule->family = family;
+    rule->src_port = src_port;
+    rule->dest_port = dest_port;
+    rule->rate_kbit = (int)(rate_kbit + 0.5);
+    return 0;
+}
+
+static int nc_tc_build_plan(struct nc_tc_plan *plan)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+
+    if (!plan)
+        return -1;
+    memset(plan, 0, sizeof(*plan));
+    if (nc_tc_lan_ifname(plan->ifname, sizeof(plan->ifname)) != 0)
+        return -1;
+    if (nc_prepare(&st,
+        "SELECT r.id,d.limit_type,d.line,d.address,d.protocol,d.speed_mode,"
+        "d.src_port,d.dest_port,d.upload_mbps,d.download_mbps "
+        "FROM network_control_rule r JOIN network_control_terminal_limit d "
+        "ON d.rule_id=r.id WHERE r.type='terminal_limit' AND r.enabled=1 "
+        "ORDER BY r.priority,r.id") != 0)
+        return -1;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *rule_id = (const char *)sqlite3_column_text(st, 0);
+        const char *limit_type = (const char *)sqlite3_column_text(st, 1);
+        const char *line = (const char *)sqlite3_column_text(st, 2);
+        const char *address = (const char *)sqlite3_column_text(st, 3);
+        const char *protocol = (const char *)sqlite3_column_text(st, 4);
+        const char *speed_mode = (const char *)sqlite3_column_text(st, 5);
+        const char *src_port_text = (const char *)sqlite3_column_text(st, 6);
+        const char *dest_port_text = (const char *)sqlite3_column_text(st, 7);
+        double upload_mbps = sqlite3_column_double(st, 8);
+        double download_mbps = sqlite3_column_double(st, 9);
+        struct in_addr v4;
+        struct in6_addr v6;
+        int family;
+        int src_port;
+        int dest_port;
+
+        if (!rule_id || !rule_id[0] || !limit_type ||
+            strcasecmp(limit_type, "ip") || !line ||
+            (strcasecmp(line, "all") && strcmp(line, "*")) ||
+            !speed_mode || (strcasecmp(speed_mode, "shared") &&
+                            strcasecmp(speed_mode, "per_ip")) ||
+            !address || !address[0])
+            goto out;
+        if (inet_pton(AF_INET, address, &v4) == 1)
+            family = AF_INET;
+        else if (inet_pton(AF_INET6, address, &v6) == 1)
+            family = AF_INET6;
+        else
+            goto out;
+        if (nc_tc_port_value(src_port_text, &src_port) != 0 ||
+            nc_tc_port_value(dest_port_text, &dest_port) != 0 ||
+            !nc_tc_protocol_ok(protocol, family, src_port, dest_port) ||
+            upload_mbps < 0 || download_mbps < 0)
+            goto out;
+        if (upload_mbps > 0 &&
+            nc_tc_plan_append(plan, rule_id, "ingress", address, protocol,
+                              family, src_port, dest_port,
+                              upload_mbps) != 0)
+            goto out;
+        if (download_mbps > 0 &&
+            nc_tc_plan_append(plan, rule_id, "egress", address, protocol,
+                              family, src_port, dest_port,
+                              download_mbps) != 0)
+            goto out;
+    }
+    rc = 0;
+
+out:
+    sqlite3_finalize(st);
+    return rc;
+}
+
+static int nc_tc_load_committed_plan(struct nc_tc_plan *plan)
+{
+    sqlite3_stmt *st = NULL;
+
+    if (!plan)
+        return -1;
+    memset(plan, 0, sizeof(*plan));
+    if (nc_prepare(&st,
+        "SELECT ifname,clsact_owned FROM network_control_tc_state WHERE id=1") == 0 &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        const char *ifname = (const char *)sqlite3_column_text(st, 0);
+        if (ifname)
+            snprintf(plan->ifname, sizeof(plan->ifname), "%s", ifname);
+        plan->clsact_owned = sqlite3_column_int(st, 1) == 1;
+    }
+    if (st) {
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (nc_prepare(&st,
+        "SELECT rule_id,direction,pref,family,address,protocol,src_port,"
+        "dest_port,rate_kbit FROM network_control_tc_runtime "
+        "ORDER BY direction,pref") != 0)
+        return -1;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        struct nc_tc_rule *rule;
+
+        if (plan->count >= NC_NETCTL_TC_MAX_RULES) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+        rule = &plan->rules[plan->count++];
+        memset(rule, 0, sizeof(*rule));
+        snprintf(rule->rule_id, sizeof(rule->rule_id), "%s",
+                 sqlite3_column_text(st, 0));
+        snprintf(rule->direction, sizeof(rule->direction), "%s",
+                 sqlite3_column_text(st, 1));
+        rule->pref = sqlite3_column_int(st, 2);
+        rule->family = sqlite3_column_int(st, 3);
+        snprintf(rule->address, sizeof(rule->address), "%s",
+                 sqlite3_column_text(st, 4));
+        snprintf(rule->protocol, sizeof(rule->protocol), "%s",
+                 sqlite3_column_text(st, 5));
+        rule->src_port = sqlite3_column_int(st, 6);
+        rule->dest_port = sqlite3_column_int(st, 7);
+        rule->rate_kbit = sqlite3_column_int(st, 8);
+    }
+    sqlite3_finalize(st);
+    if ((plan->count || plan->clsact_owned) &&
+        (!nc_physical_port_ifname_strict_ok(plan->ifname) ||
+         if_nametoindex(plan->ifname) == 0))
+        return -1;
+    return 0;
+}
+
+static int nc_tc_store_committed_plan(const struct nc_tc_plan *plan)
+{
+    sqlite3_stmt *st = NULL;
+    size_t i;
+    int ok = 0;
+
+    if (!plan ||
+        ((plan->count || plan->clsact_owned) &&
+         (!nc_physical_port_ifname_strict_ok(plan->ifname) ||
+          if_nametoindex(plan->ifname) == 0)) ||
+        (!plan->count && !plan->clsact_owned && plan->ifname[0] &&
+         !nc_physical_port_ifname_strict_ok(plan->ifname)))
+        return -1;
+    if (nc_exec("BEGIN IMMEDIATE") != 0)
+        return -1;
+    if (nc_exec("DELETE FROM network_control_tc_runtime") != 0)
+        goto out;
+    if (nc_prepare(&st,
+        "INSERT INTO network_control_tc_runtime(rule_id,direction,pref,family,"
+        "address,protocol,src_port,dest_port,rate_kbit) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)") != 0)
+        goto out;
+    for (i = 0; i < plan->count; i++) {
+        const struct nc_tc_rule *rule = &plan->rules[i];
+
+        sqlite3_reset(st);
+        sqlite3_clear_bindings(st);
+        sqlite3_bind_text(st, 1, rule->rule_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, rule->direction, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 3, rule->pref);
+        sqlite3_bind_int(st, 4, rule->family);
+        sqlite3_bind_text(st, 5, rule->address, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 6, rule->protocol, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 7, rule->src_port);
+        sqlite3_bind_int(st, 8, rule->dest_port);
+        sqlite3_bind_int(st, 9, rule->rate_kbit);
+        if (sqlite3_step(st) != SQLITE_DONE)
+            goto out;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (nc_prepare(&st,
+        "INSERT INTO network_control_tc_state(id,ifname,generation,updated_at,clsact_owned) "
+        "VALUES(1,?1,1,strftime('%s','now'),?2) ON CONFLICT(id) DO UPDATE SET "
+        "ifname=excluded.ifname,generation=generation+1,"
+        "updated_at=excluded.updated_at,clsact_owned=excluded.clsact_owned") != 0)
+        goto out;
+    sqlite3_bind_text(st, 1, plan->ifname, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, plan->clsact_owned ? 1 : 0);
+    if (sqlite3_step(st) != SQLITE_DONE)
+        goto out;
+    sqlite3_finalize(st);
+    st = NULL;
+    if (nc_exec("COMMIT") != 0)
+        goto out;
+    return 0;
+
+out:
+    if (st)
+        sqlite3_finalize(st);
+    ok = nc_exec("ROLLBACK");
+    (void)ok;
+    return -1;
+}
+
+static int nc_tc_qdisc_has_clsact(const char *tc, const char *ifname,
+                                  int *present)
+{
+    struct jmx_exec_result result;
+    struct json_object *root = NULL;
+    char *argv[] = { (char *)tc, "-j", "qdisc", "show", "dev",
+                     (char *)ifname, NULL };
+    int ok = 0;
+
+    if (!present)
+        return -1;
+    *present = 0;
+    if (nc_tc_exec_capture(tc, argv, &result) != 0 || !result.output)
+        goto out;
+    root = json_tokener_parse(result.output);
+    if (!root || !json_object_is_type(root, json_type_array))
+        goto out;
+    for (size_t i = 0; i < json_object_array_length(root); i++) {
+        struct json_object *item = json_object_array_get_idx(root, i);
+        struct json_object *kind = NULL;
+        if (item && json_object_object_get_ex(item, "kind", &kind) &&
+            kind && !strcmp(json_object_get_string(kind), "clsact")) {
+            *present = 1;
+            break;
+        }
+    }
+    ok = 1;
+
+out:
+    if (root) json_object_put(root);
+    jmx_exec_result_free(&result);
+    return ok ? 0 : -1;
+}
+
+static int nc_tc_ensure_clsact(const char *tc, const char *ifname, int *created)
+{
+    char *argv[] = { (char *)tc, "qdisc", "add", "dev", (char *)ifname,
+                     "clsact", NULL };
+    int present = 0;
+
+    if (!created)
+        return -1;
+    *created = 0;
+    if (nc_tc_qdisc_has_clsact(tc, ifname, &present) != 0)
+        return -1;
+    if (!present) {
+        if (nc_tc_exec_wait(tc, argv) != 0)
+            return -1;
+        *created = 1;
+    }
+    return nc_tc_qdisc_has_clsact(tc, ifname, &present) == 0 && present ? 0 : -1;
+}
+
+static int nc_tc_rate_token_kbit(const char *text, char **end_out,
+                                 unsigned long *rate_kbit)
+{
+    char *end = NULL;
+    unsigned long value;
+    unsigned long multiplier;
+    size_t suffix_len;
+
+    if (!text || !end_out || !rate_kbit)
+        return -1;
+    errno = 0;
+    value = strtoul(text, &end, 10);
+    if (errno || !end || end == text)
+        return -1;
+    if (!strncasecmp(end, "Kbit", 4)) {
+        multiplier = 1;
+        suffix_len = 4;
+    } else if (!strncasecmp(end, "Mbit", 4)) {
+        multiplier = 1000;
+        suffix_len = 4;
+    } else if (!strncasecmp(end, "Gbit", 4)) {
+        multiplier = 1000000;
+        suffix_len = 4;
+    } else if (!strncasecmp(end, "bit", 3)) {
+        if (value % 1000 != 0)
+            return -1;
+        value /= 1000;
+        multiplier = 1;
+        suffix_len = 3;
+    } else {
+        return -1;
+    }
+    if (value > ULONG_MAX / multiplier)
+        return -1;
+    *rate_kbit = value * multiplier;
+    *end_out = end + suffix_len;
+    return 0;
+}
+
+static int nc_tc_remove_owned_clsact(const char *tc, const char *ifname,
+                                     int owned)
+{
+    char *argv[] = { (char *)tc, "qdisc", "delete", "dev",
+                     (char *)ifname, "clsact", NULL };
+    int present = 0;
+
+    if (!owned)
+        return 0;
+    if (nc_tc_qdisc_has_clsact(tc, ifname, &present) != 0)
+        return -1;
+    if (!present)
+        return 0;
+    if (nc_tc_exec_wait(tc, argv) != 0)
+        return -1;
+    return nc_tc_qdisc_has_clsact(tc, ifname, &present) == 0 &&
+           !present ? 0 : -1;
+}
+
+static int nc_tc_rule_readback(const char *tc, const char *ifname,
+                               const struct nc_tc_rule *rule, int *present)
+{
+    struct jmx_exec_result result;
+    struct jmx_exec_result detail;
+    struct json_object *root = NULL;
+    char pref[16];
+    char *argv[] = { (char *)tc, "-j", "-s", "-d", "filter", "show", "dev",
+                     (char *)ifname, (char *)rule->direction, "pref", pref,
+                     NULL };
+    char *detail_argv[] = { (char *)tc, "-s", "-d", "filter", "show",
+                            "dev", (char *)ifname, (char *)rule->direction,
+                            "pref", pref, NULL };
+    const char *expected_family;
+    const char *expected_addr_key;
+    int ok = 0;
+    int matched = 0;
+
+    if (!rule || !present)
+        return -1;
+    *present = 0;
+    memset(&result, 0, sizeof(result));
+    memset(&detail, 0, sizeof(detail));
+    result.exit_code = -1;
+    detail.exit_code = -1;
+    snprintf(pref, sizeof(pref), "%d", rule->pref);
+    if (nc_tc_exec_capture(tc, argv, &result) != 0 || !result.output)
+        goto out;
+    root = json_tokener_parse(result.output);
+    if (!root || !json_object_is_type(root, json_type_array))
+        goto out;
+    if (json_object_array_length(root) == 0) {
+        ok = 1;
+        goto out;
+    }
+    expected_family = rule->family == AF_INET6 ? "ipv6" : "ip";
+    expected_addr_key = !strcmp(rule->direction, "ingress") ?
+                        "src_ip" : "dst_ip";
+    for (size_t i = 0; i < json_object_array_length(root); i++) {
+        struct json_object *item = json_object_array_get_idx(root, i);
+        struct json_object *protocol = NULL, *kind = NULL, *options = NULL;
+        struct json_object *keys = NULL, *value = NULL, *actions = NULL;
+        int action_ok = 0;
+
+        if (!item || !json_object_object_get_ex(item, "options", &options) ||
+            !options || !json_object_is_type(options, json_type_object))
+            continue;
+        if (!json_object_object_get_ex(item, "protocol", &protocol) ||
+            !protocol || strcmp(json_object_get_string(protocol), expected_family) ||
+            !json_object_object_get_ex(item, "kind", &kind) || !kind ||
+            strcmp(json_object_get_string(kind), "flower") ||
+            !json_object_object_get_ex(options, "keys", &keys) || !keys ||
+            !json_object_is_type(keys, json_type_object) ||
+            !json_object_object_get_ex(keys, expected_addr_key, &value) || !value ||
+            strcmp(json_object_get_string(value), rule->address))
+            goto out;
+        if (strcasecmp(rule->protocol, "all") &&
+            strcasecmp(rule->protocol, "any")) {
+            if (!json_object_object_get_ex(keys, "ip_proto", &value) || !value ||
+                strcasecmp(json_object_get_string(value), rule->protocol))
+                goto out;
+        } else if (json_object_object_get_ex(keys, "ip_proto", &value)) {
+            goto out;
+        }
+        if (rule->src_port) {
+            if (!json_object_object_get_ex(keys, "src_port", &value) || !value ||
+                json_object_get_int(value) != rule->src_port)
+                goto out;
+        } else if (json_object_object_get_ex(keys, "src_port", &value)) {
+            goto out;
+        }
+        if (rule->dest_port) {
+            if (!json_object_object_get_ex(keys, "dst_port", &value) || !value ||
+                json_object_get_int(value) != rule->dest_port)
+                goto out;
+        } else if (json_object_object_get_ex(keys, "dst_port", &value)) {
+            goto out;
+        }
+        if (!json_object_object_get_ex(options, "actions", &actions) || !actions ||
+            !json_object_is_type(actions, json_type_array) ||
+            json_object_array_length(actions) != 1)
+            goto out;
+        {
+            struct json_object *action = json_object_array_get_idx(actions, 0);
+            struct json_object *control = NULL, *type = NULL;
+            if (action && json_object_object_get_ex(action, "kind", &value) &&
+                value && !strcmp(json_object_get_string(value), "police") &&
+                json_object_object_get_ex(action, "control_action", &control) &&
+                control && json_object_object_get_ex(control, "type", &type) &&
+                type && !strcmp(json_object_get_string(type), "drop"))
+                action_ok = 1;
+        }
+        if (!action_ok || matched)
+            goto out;
+        matched = 1;
+    }
+    if (!matched || nc_tc_exec_capture(tc, detail_argv, &detail) != 0 ||
+        !detail.output)
+        goto out;
+    {
+        const char *cursor = detail.output;
+        int rate_matches = 0;
+
+        while ((cursor = strstr(cursor, " rate ")) != NULL) {
+            char *end = NULL;
+            unsigned long rate;
+
+            cursor += 6;
+            if (nc_tc_rate_token_kbit(cursor, &end, &rate) != 0 ||
+                (*end && !isspace((unsigned char)*end)) ||
+                rate != (unsigned long)rule->rate_kbit)
+                goto out;
+            rate_matches++;
+            cursor = end;
+        }
+        if (rate_matches != 1)
+            goto out;
+    }
+    *present = 1;
+    ok = 1;
+
+out:
+    if (root) json_object_put(root);
+    jmx_exec_result_free(&result);
+    jmx_exec_result_free(&detail);
+    return ok ? 0 : -1;
+}
+
+static int nc_tc_rule_delete(const char *tc, const char *ifname,
+                             const struct nc_tc_rule *rule)
+{
+    char pref[16];
+    char *argv[] = { (char *)tc, "filter", "delete", "dev",
+                     (char *)ifname, (char *)rule->direction, "pref", pref,
+                     NULL };
+    int present = 0;
+
+    if (nc_tc_rule_readback(tc, ifname, rule, &present) != 0)
+        return -1;
+    if (!present)
+        return 0;
+    snprintf(pref, sizeof(pref), "%d", rule->pref);
+    if (nc_tc_exec_wait(tc, argv) != 0)
+        return -1;
+    return nc_tc_rule_readback(tc, ifname, rule, &present) == 0 &&
+           !present ? 0 : -1;
+}
+
+static int nc_tc_rule_install(const char *tc, const char *ifname,
+                              const struct nc_tc_rule *rule)
+{
+    char pref[16];
+    char rate[32];
+    char src_port[16];
+    char dest_port[16];
+    const char *family = rule->family == AF_INET6 ? "ipv6" : "ip";
+    const char *addr_key = !strcmp(rule->direction, "ingress") ?
+                           "src_ip" : "dst_ip";
+    char *argv[36];
+    int n = 0;
+    int present = 0;
+
+    snprintf(pref, sizeof(pref), "%d", rule->pref);
+    snprintf(rate, sizeof(rate), "%dkbit", rule->rate_kbit);
+    argv[n++] = (char *)tc;
+    argv[n++] = "filter";
+    if (nc_tc_rule_readback(tc, ifname, rule, &present) != 0)
+        return -1;
+    if (present)
+        return 0;
+    argv[n++] = "add";
+    argv[n++] = "dev";
+    argv[n++] = (char *)ifname;
+    argv[n++] = (char *)rule->direction;
+    argv[n++] = "protocol";
+    argv[n++] = (char *)family;
+    argv[n++] = "pref";
+    argv[n++] = pref;
+    argv[n++] = "flower";
+    argv[n++] = (char *)addr_key;
+    argv[n++] = (char *)rule->address;
+    if (strcasecmp(rule->protocol, "all") &&
+        strcasecmp(rule->protocol, "any")) {
+        argv[n++] = "ip_proto";
+        argv[n++] = (char *)rule->protocol;
+    }
+    if (rule->src_port) {
+        snprintf(src_port, sizeof(src_port), "%d", rule->src_port);
+        argv[n++] = "src_port";
+        argv[n++] = src_port;
+    }
+    if (rule->dest_port) {
+        snprintf(dest_port, sizeof(dest_port), "%d", rule->dest_port);
+        argv[n++] = "dst_port";
+        argv[n++] = dest_port;
+    }
+    argv[n++] = "action";
+    argv[n++] = "police";
+    argv[n++] = "rate";
+    argv[n++] = rate;
+    argv[n++] = "burst";
+    argv[n++] = "64k";
+    argv[n++] = "conform-exceed";
+    argv[n++] = "drop";
+    argv[n] = NULL;
+    if (nc_tc_exec_wait(tc, argv) != 0)
+        return -1;
+    return nc_tc_rule_readback(tc, ifname, rule, &present) == 0 &&
+           present ? 0 : -1;
+}
+
+static int nc_tc_plan_verify(const char *tc, const struct nc_tc_plan *plan)
+{
+    size_t i;
+
+    for (i = 0; plan && i < plan->count; i++) {
+        int present = 0;
+        if (nc_tc_rule_readback(tc, plan->ifname, &plan->rules[i],
+                                &present) != 0 || !present)
+            return -1;
+    }
+    return 0;
+}
+
+static int nc_tc_plan_remove(const char *tc, const struct nc_tc_plan *plan)
+{
+    size_t i;
+
+    if (!plan)
+        return -1;
+    for (i = 0; i < plan->count; i++)
+        if (nc_tc_rule_delete(tc, plan->ifname, &plan->rules[i]) != 0)
+            return -1;
+    return 0;
+}
+
+static int nc_tc_plan_install(const char *tc, struct nc_tc_plan *plan)
+{
+    size_t i;
+    int created = 0;
+
+    if (!plan || nc_tc_ensure_clsact(tc, plan->ifname, &created) != 0)
+        return -1;
+    if (created)
+        plan->clsact_owned = 1;
+    for (i = 0; i < plan->count; i++)
+        if (nc_tc_rule_install(tc, plan->ifname, &plan->rules[i]) != 0)
+            return -1;
+    return nc_tc_plan_verify(tc, plan);
+}
+
+static int nc_tc_rollback(const char *tc, const struct nc_tc_plan *current,
+                          struct nc_tc_plan *previous)
+{
+    int rollback_rc = 0;
+
+    if (current && current->ifname[0] &&
+        nc_tc_plan_remove(tc, current) != 0)
+        rollback_rc = -1;
+    if (current && current->ifname[0] && current->clsact_owned &&
+        (!previous || !previous->count) &&
+        nc_tc_remove_owned_clsact(tc, current->ifname, 1) != 0)
+        rollback_rc = -1;
+    if (previous && previous->count) {
+        if (nc_tc_plan_install(tc, previous) != 0 ||
+            nc_tc_plan_verify(tc, previous) != 0)
+            rollback_rc = -1;
+    } else if (previous && previous->clsact_owned) {
+        int created = 0;
+        if (nc_tc_ensure_clsact(tc, previous->ifname, &created) != 0)
+            rollback_rc = -1;
+    }
+    return rollback_rc;
+}
+
+static int nc_tc_lock_open(void)
+{
+    struct stat st;
+    int dirfd = -1;
+    int lockfd = -1;
+
+    if (mkdir(NC_NETCTL_RUNTIME_DIR, 0700) != 0 && errno != EEXIST)
+        return -1;
+    dirfd = open(NC_NETCTL_RUNTIME_DIR,
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0 || fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        goto out;
+    lockfd = openat(dirfd, NC_NETCTL_TC_LOCK,
+                    O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lockfd < 0 || fstat(lockfd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        flock(lockfd, LOCK_EX | LOCK_NB) != 0) {
+        if (lockfd >= 0) close(lockfd);
+        lockfd = -1;
+    }
+
+out:
+    if (dirfd >= 0) close(dirfd);
+    return lockfd;
+}
+
+static int nc_tc_plan_count(void)
+{
+    struct nc_tc_plan plan;
+    return nc_tc_build_plan(&plan) == 0 ? (int)plan.count : -1;
+}
+
+static int nc_tc_guarded_apply(char *detail, size_t detail_len,
+                               struct nc_tc_plan *previous_out)
+{
+    struct nc_tc_plan desired;
+    struct nc_tc_plan previous;
+    const char *tc;
+    int lockfd = -1;
+    int mutated = 0;
+
+    if (detail && detail_len)
+        detail[0] = '\0';
+    if (nc_tc_build_plan(&desired) != 0) {
+        if (detail) snprintf(detail, detail_len, "tc_plan_invalid");
+        return -2;
+    }
+    if (nc_tc_load_committed_plan(&previous) != 0) {
+        if (detail) snprintf(detail, detail_len, "tc_backup_load_failed");
+        return -3;
+    }
+    if (previous_out)
+        *previous_out = previous;
+    if (!strcmp(previous.ifname, desired.ifname))
+        desired.clsact_owned = previous.clsact_owned;
+    if (!desired.count && !previous.count && !previous.clsact_owned) {
+        if (nc_tc_store_committed_plan(&desired) != 0) {
+            if (detail) snprintf(detail, detail_len, "tc_empty_plan_commit_failed");
+            return -1;
+        }
+        if (detail) snprintf(detail, detail_len, "tc_no_rules");
+        return 0;
+    }
+    tc = nc_tc_tool_path();
+    if (!tc) {
+        if (detail) snprintf(detail, detail_len, "tc_binary_missing_or_untrusted");
+        return -1;
+    }
+    if (desired.count && (previous.count || previous.clsact_owned) &&
+        strcmp(previous.ifname, desired.ifname)) {
+        if (detail) snprintf(detail, detail_len, "tc_interface_change_requires_cleanup");
+        return -4;
+    }
+    lockfd = nc_tc_lock_open();
+    if (lockfd < 0) {
+        if (detail) snprintf(detail, detail_len, "tc_apply_in_progress_or_lock_failed");
+        return -5;
+    }
+    if (previous.count && nc_tc_plan_verify(tc, &previous) != 0) {
+        if (detail) snprintf(detail, detail_len, "tc_backup_readback_mismatch");
+        close(lockfd);
+        return -6;
+    }
+    if (previous.count) {
+        mutated = 1;
+        if (nc_tc_plan_remove(tc, &previous) != 0) {
+        if (detail) snprintf(detail, detail_len, "tc_delete_failed");
+        goto rollback;
+        }
+    }
+    if (desired.count && nc_tc_plan_install(tc, &desired) != 0) {
+        mutated = 1;
+        if (detail) snprintf(detail, detail_len, "tc_apply_or_readback_failed");
+        goto rollback;
+    }
+    mutated = mutated || desired.count > 0;
+    if (!desired.count && previous.clsact_owned) {
+        mutated = 1;
+        if (nc_tc_remove_owned_clsact(tc, previous.ifname, 1) != 0) {
+            if (detail) snprintf(detail, detail_len, "tc_owned_clsact_cleanup_failed");
+            goto rollback;
+        }
+        desired.clsact_owned = 0;
+    }
+    if (nc_tc_store_committed_plan(&desired) != 0) {
+        if (detail) snprintf(detail, detail_len, "tc_commit_failed");
+        goto rollback;
+    }
+    if (desired.count && nc_tc_plan_verify(tc, &desired) != 0) {
+        if (detail) snprintf(detail, detail_len, "tc_committed_readback_failed");
+        goto rollback_store;
+    }
+    close(lockfd);
+    if (detail) snprintf(detail, detail_len, "tc_applied_and_verified");
+    return 0;
+
+rollback_store:
+    if (nc_tc_rollback(tc, &desired, &previous) != 0 ||
+        nc_tc_store_committed_plan(&previous) != 0) {
+        if (detail) snprintf(detail, detail_len, "tc_rollback_failed");
+        close(lockfd);
+        return -8;
+    }
+    if (detail) snprintf(detail, detail_len, "tc_apply_failed_rollback_verified");
+    close(lockfd);
+    return -7;
+rollback:
+    if (mutated && nc_tc_rollback(tc, &desired, &previous) != 0) {
+        if (detail) snprintf(detail, detail_len, "tc_rollback_failed");
+        close(lockfd);
+        return -8;
+    }
+    if (detail) snprintf(detail, detail_len, "tc_apply_failed_rollback_verified");
+    close(lockfd);
+    return -7;
+}
+
+static int nc_tc_restore_previous(const struct nc_tc_plan *previous)
+{
+    struct nc_tc_plan current;
+    struct nc_tc_plan restore;
+    const char *tc;
+    int lockfd;
+    int rc = -1;
+
+    if (!previous || nc_tc_load_committed_plan(&current) != 0)
+        return -1;
+    restore = *previous;
+    if (!current.count && !current.clsact_owned && !previous->count &&
+        !previous->clsact_owned)
+        return nc_tc_store_committed_plan(previous);
+    tc = nc_tc_tool_path();
+    if (!tc)
+        return -1;
+    lockfd = nc_tc_lock_open();
+    if (lockfd < 0)
+        return -1;
+    if (nc_tc_rollback(tc, &current, &restore) == 0 &&
+        nc_tc_store_committed_plan(&restore) == 0 &&
+        (!restore.count || nc_tc_plan_verify(tc, &restore) == 0))
+        rc = 0;
+    close(lockfd);
+    return rc;
+}
+
+static int nc_netctl_apply_lock_open(void)
+{
+    struct stat st;
+    int dirfd = -1;
+    int lockfd = -1;
+
+    if (mkdir(NC_NETCTL_RUNTIME_DIR, 0700) != 0 && errno != EEXIST)
+        return -1;
+    dirfd = open(NC_NETCTL_RUNTIME_DIR,
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0 || fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        goto out;
+    lockfd = openat(dirfd, "network-control-apply.lock",
+                    O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lockfd < 0 || fstat(lockfd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        flock(lockfd, LOCK_EX | LOCK_NB) != 0) {
+        if (lockfd >= 0)
+            close(lockfd);
+        lockfd = -1;
+    }
+
+out:
+    if (dirfd >= 0)
+        close(dirfd);
+    return lockfd;
+}
+
+static int nc_netctl_persist_apply_status(int applied, const char *nft_state,
+                                          const char *tc_state)
+{
+    sqlite3_stmt *st = NULL;
+    char status_text[384];
+    const char *state = applied ? "applied" : "failed";
+    int rollback_rc;
+
+    snprintf(status_text, sizeof(status_text), "nft=%s; tc=%s",
+             nft_state ? nft_state : "unknown",
+             tc_state ? tc_state : "unknown");
+    if (nc_exec("BEGIN IMMEDIATE") != 0)
+        return -1;
+    if (nc_prepare(&st,
+        "UPDATE network_control_status SET apply_state=?1,"
+        "last_apply_at=strftime('%s','now'),warnings=?2,"
+        "updated_at=strftime('%s','now') WHERE id=1") != 0)
+        goto failed;
+    sqlite3_bind_text(st, 1, state, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, status_text, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(g_netconfig_db) != 1)
+        goto failed;
+    sqlite3_finalize(st);
+    st = NULL;
+    if (nc_prepare(&st,
+        "UPDATE network_control_global SET apply_state=?1,"
+        "last_apply_at=strftime('%s','now') WHERE id=1") != 0)
+        goto failed;
+    sqlite3_bind_text(st, 1, state, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(g_netconfig_db) != 1)
+        goto failed;
+    sqlite3_finalize(st);
+    st = NULL;
+    if (nc_exec("COMMIT") != 0)
+        goto failed;
+    return 0;
+
+failed:
+    if (st)
+        sqlite3_finalize(st);
+    rollback_rc = nc_exec("ROLLBACK");
+    (void)rollback_rc;
+    return -1;
 }
 
 static int nc_nft_write_ruleset(const char *path)
 {
-    FILE *fp = fopen(path, "w");
-    if(!fp) return -1;
-    fprintf(fp, "# DreamingWrt network_control nft ruleset - auto generated\n");
-    fprintf(fp, "# Do not edit manually; regenerated by jmx network_control_apply\n\n");
-    fprintf(fp, "table inet dreamingwrt_netctl {\n");
+    struct stat st;
+    FILE *fp = NULL;
+    int dirfd = -1, fd = -1, rc = -1;
+    int mac_cnt, conn_cnt, app_mark, app_cnt;
+    char temporary[96] = {0};
+    char backup[96] = {0};
+    unsigned long long nonce;
+    int backup_present = 0;
+    int published = 0;
+
+    if (!path || strcmp(path, NC_NETCTL_NFT_RULESET) != 0)
+        return -1;
+    dirfd = open("/etc/dreamingwrt",
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0 || fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        goto out;
+    for (int attempt = 0; attempt < 32; attempt++) {
+        if (getrandom(&nonce, sizeof(nonce), 0) != (ssize_t)sizeof(nonce))
+            goto out;
+        snprintf(temporary, sizeof(temporary),
+                 ".network_control.nft.%016llx", nonce);
+        fd = openat(dirfd, temporary,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                    0600);
+        if (fd >= 0)
+            break;
+        if (errno != EEXIST)
+            goto out;
+        temporary[0] = '\0';
+    }
+    if (fd < 0 || fchmod(fd, 0600) != 0 || fchown(fd, 0, 0) != 0 ||
+        !(fp = fdopen(fd, "w")))
+        goto out;
+    fd = -1;
+    if (fprintf(fp, "# DreamingWrt network_control nft ruleset - auto generated\n") < 0 ||
+        fprintf(fp, "# Do not edit manually; regenerated by jmx network_control_apply\n\n") < 0 ||
+        fprintf(fp, "table inet dreamingwrt_netctl {\n") < 0)
+        goto out;
 
     /* --- input chain: MAC filter + connection limits --- */
-    fprintf(fp, "\tchain input {\n");
-    fprintf(fp, "\t\ttype filter hook input priority 0; policy accept;\n");
-    int mac_cnt = nc_nft_gen_mac_rules(fp);
-    int conn_cnt = nc_nft_gen_connection_limit_rules(fp);
-    fprintf(fp, "\t}\n\n");
+    if (fprintf(fp, "\tchain input {\n") < 0 ||
+        fprintf(fp, "\t\ttype filter hook input priority 0; policy accept;\n") < 0)
+        goto out;
+    mac_cnt = nc_nft_gen_mac_rules(fp);
+    conn_cnt = nc_nft_gen_connection_limit_rules(fp);
+    if (mac_cnt < 0 || conn_cnt < 0 || fprintf(fp, "\t}\n\n") < 0)
+        goto out;
 
     /* --- forward mark chain: classify packets BEFORE the action chain --- */
-    fprintf(fp, "\tchain forward_mark {\n");
-    fprintf(fp, "\t\ttype filter hook forward priority -150; policy accept;\n");
-    int app_mark = nc_nft_gen_app_mark_rules(fp);
-    fprintf(fp, "\t}\n\n");
+    if (fprintf(fp, "\tchain forward_mark {\n") < 0 ||
+        fprintf(fp, "\t\ttype filter hook forward priority -150; policy accept;\n") < 0)
+        goto out;
+    app_mark = nc_nft_gen_app_mark_rules(fp);
+    if (app_mark < 0 || fprintf(fp, "\t}\n\n") < 0)
+        goto out;
 
     /* --- forward chain: MAC + app action + connection limits --- */
-    fprintf(fp, "\tchain forward {\n");
-    fprintf(fp, "\t\ttype filter hook forward priority 0; policy accept;\n");
-    nc_nft_gen_mac_rules(fp);
-    int app_cnt = nc_nft_gen_app_action_rules(fp);
-    nc_nft_gen_connection_limit_rules(fp);
-    fprintf(fp, "\t}\n");
+    if (fprintf(fp, "\tchain forward {\n") < 0 ||
+        fprintf(fp, "\t\ttype filter hook forward priority 0; policy accept;\n") < 0 ||
+        nc_nft_gen_mac_rules(fp) < 0)
+        goto out;
+    app_cnt = nc_nft_gen_app_action_rules(fp);
+    if (app_cnt < 0 || nc_nft_gen_connection_limit_rules(fp) < 0 ||
+        fprintf(fp, "\t}\n}\n") < 0 || fflush(fp) != 0 ||
+        fsync(fileno(fp)) != 0 || fclose(fp) != 0) {
+        fp = NULL;
+        goto out;
+    }
+    fp = NULL;
+    if (fstatat(dirfd, "network_control.nft", &st,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+        if (!S_ISREG(st.st_mode) || st.st_uid != 0 ||
+            (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+            goto out;
+        snprintf(backup, sizeof(backup),
+                 ".network_control.nft.backup.%016llx", nonce);
+        if (linkat(dirfd, "network_control.nft", dirfd, backup, 0) != 0)
+            goto out;
+        backup_present = 1;
+    } else if (errno != ENOENT) {
+        goto out;
+    }
+    if (renameat(dirfd, temporary, dirfd, "network_control.nft") != 0)
+        goto out;
+    temporary[0] = '\0';
+    published = 1;
+    if (fsync(dirfd) != 0) {
+        if (backup_present) {
+            if (renameat(dirfd, backup, dirfd, "network_control.nft") == 0)
+                backup[0] = '\0';
+        } else {
+            (void)unlinkat(dirfd, "network_control.nft", 0);
+        }
+        (void)fsync(dirfd);
+        goto out;
+    }
+    if (backup_present) {
+        if (unlinkat(dirfd, backup, 0) == 0) {
+            backup[0] = '\0';
+            (void)fsync(dirfd);
+        } else {
+            backup[0] = '\0';
+        }
+    }
+    rc = mac_cnt + conn_cnt + app_mark + app_cnt;
 
-    fprintf(fp, "}\n");
-    fclose(fp);
-    return mac_cnt + conn_cnt + app_mark + app_cnt;
+out:
+    if (fp)
+        fclose(fp);
+    else if (fd >= 0)
+        close(fd);
+    if (dirfd >= 0) {
+        if (temporary[0])
+            (void)unlinkat(dirfd, temporary, 0);
+        if (backup[0]) {
+            if (published)
+                (void)renameat(dirfd, backup, dirfd, "network_control.nft");
+            else
+                (void)unlinkat(dirfd, backup, 0);
+            (void)fsync(dirfd);
+        }
+        close(dirfd);
+    }
+    return rc;
 }
 
 struct json_object *jmx_network_control_apply(struct json_object *cfg)
 {
-    if(jmx_netconfig_db_init()!=0){struct json_object*d=json_object_new_object();json_object_object_add(d,"ok",json_object_new_boolean(0));return jmx_gen_api_response_data(API_CODE_ERROR,d);}nc_netctl_db_init();int dry=nc_json_bool_def(cfg,"dry_run",0);int compat_mac=0,compat_app=0,nft_count=0,tc_count=0,nft_rc=99,tc_rc=99,apply_nft=0,apply_tc=0,runtime_ok=1;char nft_detail[160]="not_attempted",tc_detail[160]="not_attempted";struct json_object*d=json_object_new_object(),*warnings=json_object_new_array(),*runtime=json_object_new_object();
-    if(!dry){
-        mkdir("/etc/dreamingwrt",0755);
-        FILE*fp=fopen("/etc/dreamingwrt/network_control.json","w");if(fp){struct json_object*resp=jmx_network_control_get();struct json_object*data=NULL;if(json_object_object_get_ex(resp,"data",&data))fprintf(fp,"%s\n",json_object_to_json_string_ext(data,JSON_C_TO_STRING_PRETTY));json_object_put(resp);fclose(fp);}
-        FILE*mfp=fopen("/etc/config/dreamingwrt_macfilter","w");sqlite3_stmt*cs=NULL;if(mfp){fprintf(mfp,"# DreamingWrt MAC filter compat - auto generated\n");if(nc_prepare(&cs,"SELECT r.id,d.mac,d.mode,r.schedule,r.remark FROM network_control_rule r JOIN network_control_mac_rule d ON d.rule_id=r.id WHERE r.type='mac' AND r.enabled=1 ORDER BY r.priority,r.id")==0){while(sqlite3_step(cs)==SQLITE_ROW){const char*mac=(const char*)sqlite3_column_text(cs,1);const char*mode=(const char*)sqlite3_column_text(cs,2);const char*remark=(const char*)sqlite3_column_text(cs,4);if(mac&&mac[0]){fprintf(mfp,"config macfilter\n\toption mac '%s'\n\toption action '%s'\n\toption remark '%s'\n",mac,mode&&mode[0]?mode:"block",remark?remark:"");compat_mac++;}}sqlite3_finalize(cs);}fclose(mfp);}
-        FILE*afp=fopen("/etc/config/dreamingwrt_appfilter","w");sqlite3_stmt*as=NULL;if(afp){fprintf(afp,"# DreamingWrt app filter compat - auto generated\n");if(nc_prepare(&as,"SELECT r.id,d.app_ids,d.action,r.schedule,r.remark FROM network_control_rule r JOIN network_control_app_rule d ON d.rule_id=r.id WHERE r.type='app' AND r.enabled=1 ORDER BY r.priority,r.id")==0){while(sqlite3_step(as)==SQLITE_ROW){const char*app_ids=(const char*)sqlite3_column_text(as,1);const char*action=(const char*)sqlite3_column_text(as,2);const char*remark=(const char*)sqlite3_column_text(as,4);if(app_ids&&app_ids[0]){fprintf(afp,"config appfilter\n\toption app_ids '%s'\n\toption action '%s'\n\toption remark '%s'\n",app_ids,action&&action[0]?action:"block",remark?remark:"");compat_app++;}}sqlite3_finalize(as);}fclose(afp);}
-        nft_count=nc_nft_write_ruleset("/etc/dreamingwrt/network_control.nft");
-        tc_count=nc_tc_write_ruleset("/etc/dreamingwrt/network_control_tc.sh");
-        apply_nft = nc_json_bool_def(cfg, "apply_nft", 1);
-        apply_tc = nc_json_bool_def(cfg, "apply_tc", 1);
-        nft_rc = apply_nft ? nc_nft_guarded_apply("/etc/dreamingwrt/network_control.nft", nft_detail, sizeof(nft_detail)) : 99;
-        tc_rc = apply_tc ? nc_tc_guarded_apply("/etc/dreamingwrt/network_control_tc.sh", tc_detail, sizeof(tc_detail)) : 99;
-        runtime_ok = (!apply_nft || nft_rc == 0) && (!apply_tc || tc_rc == 0);
-        char warn_sql[512];
-        snprintf(warn_sql, sizeof(warn_sql), "UPDATE network_control_status SET apply_state='%s',last_apply_at=strftime('%%s','now'),warnings='compat UCI + nft/tc generated; nft=%s; tc=%s',updated_at=strftime('%%s','now') WHERE id=1", runtime_ok ? "applied" : "failed", apply_nft?nft_detail:"generated_only", apply_tc?tc_detail:"generated_only");
-        nc_exec(runtime_ok ? "UPDATE network_control_global SET apply_state='applied',last_apply_at=strftime('%s','now') WHERE id=1" : "UPDATE network_control_global SET apply_state='failed',last_apply_at=strftime('%s','now') WHERE id=1");
-        nc_exec(warn_sql);
+    struct json_object *data = json_object_new_object();
+    struct json_object *runtime = json_object_new_object();
+    struct json_object *warnings = json_object_new_array();
+    struct nc_tc_plan tc_previous;
+    struct nc_nft_transaction nft_transaction;
+    char nft_detail[160] = "not_attempted";
+    char tc_detail[160] = "not_attempted";
+    int dry = cfg ? nc_json_bool_def(cfg, "dry_run", 0) : 0;
+    int apply_nft = cfg ? nc_json_bool_def(cfg, "apply_nft", 1) : 1;
+    int apply_tc = cfg ? nc_json_bool_def(cfg, "apply_tc", 1) : 1;
+    int nft_count = 0;
+    int tc_count = 0;
+    int nft_rc = 99;
+    int tc_rc = 99;
+    int runtime_ok = dry;
+    int apply_lock = -1;
+    int tc_applied = 0;
+    int nft_applied = 0;
+    int status_persisted = 0;
+
+    memset(&tc_previous, 0, sizeof(tc_previous));
+    memset(&nft_transaction, 0, sizeof(nft_transaction));
+    if (jmx_netconfig_db_init() != 0) {
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        json_object_object_add(data, "error",
+                               json_object_new_string("database_unavailable"));
+        goto response;
     }
-    json_object_object_add(runtime,"jmx_mac_filter",json_object_new_string(dry?"dry_run":(compat_mac>0?"compat_written":"no_rules")));
-    json_object_object_add(runtime,"jmx_app_filter",json_object_new_string(dry?"dry_run":(compat_app>0?"compat_written":"no_rules")));
-    json_object_object_add(runtime,"nft",json_object_new_string(dry?"dry_run":(nft_count>0?"ruleset_generated":"no_rules")));
-    json_object_object_add(runtime,"nft_file",json_object_new_string("/etc/dreamingwrt/network_control.nft"));
-    json_object_object_add(runtime,"tc",json_object_new_string(dry?"dry_run":(tc_count>0?"script_generated":"no_rules")));
-    json_object_object_add(runtime,"tc_file",json_object_new_string("/etc/dreamingwrt/network_control_tc.sh"));
-    json_object_object_add(runtime,"apply_nft",json_object_new_string(dry?"dry_run":(apply_nft?"guarded_attempted":"disabled_by_request")));
-    json_object_object_add(runtime,"apply_tc",json_object_new_string(dry?"dry_run":(apply_tc?"guarded_attempted":"disabled_by_request")));
-    json_object_object_add(runtime,"nft_rc",json_object_new_int(nft_rc));
-    json_object_object_add(runtime,"tc_rc",json_object_new_int(tc_rc));
-    json_object_object_add(runtime,"nft_detail",json_object_new_string(nft_detail));
-    json_object_object_add(runtime,"tc_detail",json_object_new_string(tc_detail));
-    json_object_array_add(warnings,json_object_new_string("URL HTTPS rewrite is unsupported without proxy/MITM; only HTTP/DNS redirect can be implemented later"));
-    json_object_array_add(warnings,json_object_new_string("nft/tc real runtime apply runs by default; pass apply_nft/apply_tc=false to skip; guarded rollback is best-effort"));
-    json_object_object_add(d,"ok",json_object_new_boolean(dry||runtime_ok));json_object_object_add(d,"dry_run",json_object_new_boolean(dry));json_object_object_add(d,"applied",json_object_new_boolean(!dry&&runtime_ok));if(!dry&&!runtime_ok){json_object_object_add(d,"error",json_object_new_string("runtime_apply_failed"));json_object_object_add(d,"message",json_object_new_string("network control was saved but nft/tc runtime apply failed"));}json_object_object_add(d,"export",json_object_new_string("/etc/dreamingwrt/network_control.json"));json_object_object_add(d,"runtime",runtime);json_object_object_add(d,"warnings",warnings);return jmx_gen_api_response_data((dry||runtime_ok)?API_CODE_SUCCESS:API_CODE_ERROR,d);
+    nc_netctl_db_init();
+    if (dry)
+        goto response;
+
+    apply_lock = nc_netctl_apply_lock_open();
+    if (apply_lock < 0) {
+        snprintf(nft_detail, sizeof(nft_detail), "apply_in_progress_or_lock_failed");
+        snprintf(tc_detail, sizeof(tc_detail), "apply_in_progress_or_lock_failed");
+        nft_rc = -10;
+        tc_rc = -10;
+        goto persist_status;
+    }
+    if (mkdir("/etc/dreamingwrt", 0755) != 0 && errno != EEXIST) {
+        snprintf(nft_detail, sizeof(nft_detail), "runtime_directory_prepare_failed");
+        snprintf(tc_detail, sizeof(tc_detail), "runtime_directory_prepare_failed");
+        nft_rc = -11;
+        tc_rc = -11;
+        goto persist_status;
+    }
+
+    nft_count = nc_nft_write_ruleset(NC_NETCTL_NFT_RULESET);
+    tc_count = nc_tc_plan_count();
+    if (nft_count < 0) {
+        nft_rc = -12;
+        snprintf(nft_detail, sizeof(nft_detail), "nft_ruleset_generation_failed");
+        tc_rc = -12;
+        snprintf(tc_detail, sizeof(tc_detail), "tc_skipped_nft_generation_failed");
+        goto persist_status;
+    }
+    if (tc_count < 0) {
+        tc_rc = -2;
+        snprintf(tc_detail, sizeof(tc_detail), "tc_plan_invalid");
+        nft_rc = -8;
+        snprintf(nft_detail, sizeof(nft_detail), "nft_skipped_invalid_tc_plan");
+        goto persist_status;
+    }
+
+    if (apply_tc) {
+        tc_rc = nc_tc_guarded_apply(tc_detail, sizeof(tc_detail),
+                                    &tc_previous);
+        if (tc_rc != 0) {
+            nft_rc = -13;
+            snprintf(nft_detail, sizeof(nft_detail), "nft_skipped_tc_apply_failed");
+            goto persist_status;
+        }
+        tc_applied = 1;
+    }
+    if (apply_nft) {
+        nft_rc = nc_nft_guarded_apply(NC_NETCTL_NFT_RULESET,
+                                      nft_detail, sizeof(nft_detail),
+                                      &nft_transaction);
+        if (nft_rc != 0) {
+            if (tc_applied) {
+                if (nc_tc_restore_previous(&tc_previous) != 0) {
+                    tc_rc = -9;
+                    snprintf(tc_detail, sizeof(tc_detail),
+                             "tc_compensation_after_nft_failure_failed");
+                } else {
+                    tc_rc = -7;
+                    snprintf(tc_detail, sizeof(tc_detail),
+                             "tc_rollback_after_nft_failure_verified");
+                }
+            }
+            goto persist_status;
+        }
+        nft_applied = 1;
+    }
+    runtime_ok = 1;
+
+persist_status:
+    {
+        const char *nft_state = apply_nft ? nft_detail : "disabled_by_request";
+        const char *tc_state = apply_tc ? tc_detail : "disabled_by_request";
+
+        if (nc_netctl_persist_apply_status(runtime_ok, nft_state, tc_state) == 0) {
+            status_persisted = 1;
+            if (runtime_ok)
+                nc_nft_transaction_finish(&nft_transaction);
+        } else if (runtime_ok) {
+            if (nft_applied && nc_nft_transaction_restore(&nft_transaction) != 0) {
+                nft_rc = -15;
+                snprintf(nft_detail, sizeof(nft_detail),
+                         "nft_compensation_after_status_failure_failed");
+            } else if (nft_applied) {
+                nft_rc = -14;
+                snprintf(nft_detail, sizeof(nft_detail),
+                         "nft_rollback_after_status_failure_verified");
+            }
+            if (tc_applied && nc_tc_restore_previous(&tc_previous) != 0) {
+                tc_rc = -11;
+                snprintf(tc_detail, sizeof(tc_detail),
+                         "tc_compensation_after_status_failure_failed");
+            } else if (tc_applied) {
+                tc_rc = -10;
+                snprintf(tc_detail, sizeof(tc_detail),
+                         "tc_rollback_after_status_failure_verified");
+            }
+            runtime_ok = 0;
+            (void)nc_netctl_persist_apply_status(0, nft_detail, tc_detail);
+        } else {
+            runtime_ok = 0;
+        }
+    }
+    if (apply_lock >= 0) {
+        close(apply_lock);
+        apply_lock = -1;
+    }
+
+response:
+    json_object_object_add(runtime, "jmx_mac_filter",
+                           json_object_new_string(dry ? "dry_run" : "config_db"));
+    json_object_object_add(runtime, "jmx_app_filter",
+                           json_object_new_string(dry ? "dry_run" : "config_db"));
+    json_object_object_add(runtime, "nft",
+                           json_object_new_string(dry ? "dry_run" :
+                           nft_count > 0 ? "ruleset_generated" : "no_rules"));
+    json_object_object_add(runtime, "nft_file",
+                           json_object_new_string(NC_NETCTL_NFT_RULESET));
+    json_object_object_add(runtime, "tc",
+                           json_object_new_string(dry ? "dry_run" :
+                           tc_count > 0 ? "structured_plan" : "no_rules"));
+    json_object_object_add(runtime, "tc_source",
+                           json_object_new_string("config_db"));
+    json_object_object_add(runtime, "apply_nft",
+                           json_object_new_string(dry ? "dry_run" :
+                           apply_nft ? "guarded_attempted" : "disabled_by_request"));
+    json_object_object_add(runtime, "apply_tc",
+                           json_object_new_string(dry ? "dry_run" :
+                           apply_tc ? "guarded_attempted" : "disabled_by_request"));
+    json_object_object_add(runtime, "nft_rc", json_object_new_int(nft_rc));
+    json_object_object_add(runtime, "tc_rc", json_object_new_int(tc_rc));
+    json_object_object_add(runtime, "nft_detail",
+                           json_object_new_string(nft_detail));
+    json_object_object_add(runtime, "tc_detail",
+                           json_object_new_string(tc_detail));
+    json_object_object_add(runtime, "status_persisted",
+                           json_object_new_boolean(status_persisted));
+    json_object_array_add(warnings, json_object_new_string(
+        "URL HTTPS rewrite is unsupported without proxy/MITM"));
+    json_object_array_add(warnings, json_object_new_string(
+        "nft/tc apply is bounded, read back, single-flight, and compensated"));
+    json_object_object_add(data, "ok", json_object_new_boolean(dry || runtime_ok));
+    json_object_object_add(data, "dry_run", json_object_new_boolean(dry));
+    json_object_object_add(data, "applied",
+                           json_object_new_boolean(!dry && runtime_ok));
+    if (!dry && !runtime_ok) {
+        json_object_object_add(data, "error",
+                               json_object_new_string("runtime_apply_failed"));
+        json_object_object_add(data, "message", json_object_new_string(
+            "network control runtime apply failed and compensation was attempted"));
+    }
+    json_object_object_add(data, "runtime", runtime);
+    json_object_object_add(data, "warnings", warnings);
+    if (apply_lock >= 0)
+        close(apply_lock);
+    if (!nft_transaction.applied || runtime_ok)
+        nc_nft_transaction_finish(&nft_transaction);
+    return jmx_gen_api_response_data((dry || runtime_ok) ?
+                                     API_CODE_SUCCESS : API_CODE_ERROR, data);
 }
 
 int jmx_network_control_rules_bulk_delete(struct json_object *cfg)
@@ -19759,7 +24394,7 @@ int jmx_network_control_rules_bulk_delete(struct json_object *cfg)
     int n = json_object_array_length(ids);
     if(n == 0) return 0;
     int deleted = 0;
-    nc_exec("BEGIN IMMEDIATE");
+    if (nc_txn_begin() != 0) return -1;
     for(int i = 0; i < n; i++) {
         const char *id = json_object_get_string(json_object_array_get_idx(ids, i));
         if(!id || !nc_valid_name(id)) continue;
@@ -19802,11 +24437,13 @@ struct json_object *jmx_network_control_status(void)
         else
             json_object_object_add(runtime,"nft",json_object_new_string("not_generated"));
     }{
-        struct stat tc_st;
-        if(stat("/etc/dreamingwrt/network_control_tc.sh", &tc_st)==0 && tc_st.st_size > 0)
-            json_object_object_add(runtime,"tc",json_object_new_string("script_generated"));
-        else
-            json_object_object_add(runtime,"tc",json_object_new_string("not_generated"));
+        int tc_runtime_count = 0;
+        if(nc_prepare(&st,"SELECT COUNT(*) FROM network_control_tc_runtime")==0 && sqlite3_step(st)==SQLITE_ROW)
+            tc_runtime_count=sqlite3_column_int(st,0);
+        if(st){sqlite3_finalize(st);st=NULL;}
+        json_object_object_add(runtime,"tc",json_object_new_string(tc_runtime_count>0?"structured_runtime_committed":"no_rules"));
+        json_object_object_add(runtime,"tc_rule_count",json_object_new_int(tc_runtime_count));
+        json_object_object_add(runtime,"tc_source",json_object_new_string("config_db"));
     }json_object_object_add(d,"runtime",runtime);if(nc_prepare(&st,"SELECT id,type FROM network_control_rule ORDER BY type,priority,id")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();nc_add_text(o,"id",st,0);nc_add_text(o,"type",st,1);json_object_object_add(o,"installed",json_object_new_boolean(0));json_object_object_add(o,"backend",json_object_new_string("pending_runtime"));json_object_array_add(rules,o);}sqlite3_finalize(st);}json_object_object_add(d,"rules",rules);return jmx_gen_api_response_data(API_CODE_SUCCESS,d);
 }
 struct json_object *jmx_network_control_rule_test(struct json_object *cfg)
@@ -19831,6 +24468,93 @@ static int nc_log_type_ok(const char*s){return s&&(!strcmp(s,"user")||!strcmp(s,
 static int nc_log_level_ok(const char*s){return s&&(!strcmp(s,"info")||!strcmp(s,"notice")||!strcmp(s,"warning")||!strcmp(s,"error"));}
 static int nc_log_format_ok(const char*s){return s&&(!strcmp(s,"csv")||!strcmp(s,"json"));}
 static int nc_log_safe_token(const char*s){if(!s)return 0;for(const char*p=s;*p;p++)if(!(isalnum((unsigned char)*p)||*p=='.'||*p=='-'||*p=='_'||*p==':' ))return 0;return 1;}
+#define NC_LOG_RUNTIME_DIR "/run/dreamingwrt"
+#define NC_LOG_EXPORT_DIR NC_LOG_RUNTIME_DIR "/log_exports"
+
+static int nc_log_export_open(char *id, size_t id_len, const char *fmt,
+                              int *dirfd_out)
+{
+    struct stat st;
+    struct timespec now;
+    int dirfd = -1, fd = -1, attempt;
+
+    if (!id || id_len == 0 || !fmt || !dirfd_out)
+        return -1;
+    *dirfd_out = -1;
+    if (mkdir(NC_LOG_RUNTIME_DIR, 0700) != 0 && errno != EEXIST)
+        return -1;
+    dirfd = open(NC_LOG_RUNTIME_DIR,
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0 || fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        goto fail;
+    if (mkdirat(dirfd, "log_exports", 0700) != 0 && errno != EEXIST)
+        goto fail;
+    close(dirfd);
+    dirfd = open(NC_LOG_EXPORT_DIR,
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0 || fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        goto fail;
+    clock_gettime(CLOCK_REALTIME, &now);
+    for (attempt = 0; attempt < 32; attempt++) {
+        if (snprintf(id, id_len, "logs-legacy-%lld-%09ld-%ld-%08lx-%d.%s",
+                     (long long)now.tv_sec, now.tv_nsec, (long)getpid(),
+                     (unsigned long)random(), attempt, fmt) >= (int)id_len)
+            goto fail;
+        fd = openat(dirfd, id,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                    0600);
+        if (fd >= 0) {
+            *dirfd_out = dirfd;
+            return fd;
+        }
+        if (errno != EEXIST)
+            break;
+    }
+fail:
+    if (dirfd >= 0)
+        close(dirfd);
+    return -1;
+}
+
+static int nc_log_csv_field(FILE *fp, const char *s)
+{
+    const char *p;
+    int quote = 0;
+    int neutralize;
+
+    if (!fp)
+        return -1;
+    if (!s)
+        s = "";
+    neutralize = s[0] == '=' || s[0] == '+' || s[0] == '-' || s[0] == '@';
+    for (p = s; *p; p++) {
+        if (*p == '"' || *p == ',' || *p == '\r' || *p == '\n') {
+            quote = 1;
+            break;
+        }
+    }
+    if (neutralize)
+        quote = 1;
+    if (!quote)
+        return fputs(s, fp) == EOF ? -1 : 0;
+    if (fputc('"', fp) == EOF || (neutralize && fputc('\'', fp) == EOF))
+        return -1;
+    for (p = s; *p; p++) {
+        if (*p == '"' && fputc('"', fp) == EOF)
+            return -1;
+        if (fputc(*p, fp) == EOF)
+            return -1;
+    }
+    return fputc('"', fp) == EOF ? -1 : 0;
+}
+
+static int nc_log_csv_json_field(FILE *fp, struct json_object *row,
+                                 const char *key)
+{
+    return nc_log_csv_field(fp, nc_json_str_def(row, key, ""));
+}
 static sqlite3_int64 nc_log_range_start(const char*r,sqlite3_int64 now){if(!r||!*r)return 0;if(!strcmp(r,"1d"))return now-86400;if(!strcmp(r,"3d"))return now-3*86400;if(!strcmp(r,"1w"))return now-7*86400;if(!strcmp(r,"2w"))return now-14*86400;if(!strcmp(r,"1m"))return now-30*86400;return 0;}
 static unsigned nc_log_hash(const char*s){unsigned h=2166136261u;if(!s)return h;while(*s){h^=(unsigned char)*s++;h*=16777619u;}return h;}
 static void nc_log_event_json(struct json_object*a,sqlite3_stmt*st)
@@ -19866,7 +24590,82 @@ struct json_object *jmx_log_center_query(struct json_object *cfg)
 {if(jmx_netconfig_db_init()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);nc_log_db_init();const char*type=nc_json_str_def(cfg,"type","");const char*level=nc_json_str_def(cfg,"level","");if(type[0]&&!nc_log_type_ok(type))return jmx_gen_api_response_data(API_CODE_ERROR,NULL);if(level[0]&&!nc_log_level_ok(level))return jmx_gen_api_response_data(API_CODE_ERROR,NULL);struct json_object*d=json_object_new_object();json_object_object_add(d,"records",nc_log_query_array(type,nc_json_str_def(cfg,"range","1d"),level,nc_json_str_def(cfg,"query",""),nc_json_int_def(cfg,"limit",100)));return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
 
 struct json_object *jmx_log_center_export(struct json_object *cfg)
-{if(jmx_netconfig_db_init()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);nc_log_db_init();const char*fmt=nc_json_str_def(cfg,"format","json");if(!nc_log_format_ok(fmt))return jmx_gen_api_response_data(API_CODE_ERROR,NULL);struct json_object*records=nc_log_query_array(nc_json_str_def(cfg,"type",""),nc_json_str_def(cfg,"range","1w"),nc_json_str_def(cfg,"level",""),nc_json_str_def(cfg,"query",""),nc_json_int_def(cfg,"limit",1000));mkdir("/tmp/dreamingwrt",0755);char path[128];snprintf(path,sizeof(path),"/tmp/dreamingwrt/log_export_%lld.%s",(long long)nc_now_s(),fmt);FILE*fp=fopen(path,"w");if(fp){if(!strcmp(fmt,"json")){fprintf(fp,"%s\n",json_object_to_json_string_ext(records,JSON_C_TO_STRING_PRETTY));}else{fprintf(fp,"id,type,ts,level,source,module,iface,username,ip,mac,title,event,detail,state,target\n");int n=json_object_array_length(records);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(records,i);fprintf(fp,"%s,%s,%lld,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",nc_json_str_def(o,"id",""),nc_json_str_def(o,"type",""),(long long)json_object_get_int64(json_object_object_get(o,"ts")),nc_json_str_def(o,"level",""),nc_json_str_def(o,"source",""),nc_json_str_def(o,"module",""),nc_json_str_def(o,"iface",""),nc_json_str_def(o,"username",""),nc_json_str_def(o,"ip",""),nc_json_str_def(o,"mac",""),nc_json_str_def(o,"title",""),nc_json_str_def(o,"event",""),nc_json_str_def(o,"detail",""),nc_json_str_def(o,"state",""),nc_json_str_def(o,"target",""));}}fclose(fp);}struct json_object*d=json_object_new_object();json_object_object_add(d,"path",json_object_new_string(path));json_object_object_add(d,"format",json_object_new_string(fmt));json_object_object_add(d,"count",json_object_new_int(json_object_array_length(records)));json_object_put(records);return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
+{
+    static const char *fields[] = {
+        "id", "type", "level", "source", "module", "iface", "username",
+        "ip", "mac", "title", "event", "detail", "state", "target", NULL
+    };
+    struct json_object *records = NULL, *data = NULL;
+    const char *fmt;
+    char id[128], download_url[192];
+    FILE *fp = NULL;
+    int dirfd = -1, fd = -1, count, write_failed = 0;
+
+    if (jmx_netconfig_db_init() != 0)
+        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
+    nc_log_db_init();
+    fmt = nc_json_str_def(cfg, "format", "json");
+    if (!nc_log_format_ok(fmt))
+        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
+    records = nc_log_query_array(nc_json_str_def(cfg, "type", ""),
+                                 nc_json_str_def(cfg, "range", "1w"),
+                                 nc_json_str_def(cfg, "level", ""),
+                                 nc_json_str_def(cfg, "query", ""),
+                                 nc_json_int_def(cfg, "limit", 1000));
+    if (!records)
+        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
+    count = json_object_array_length(records);
+    fd = nc_log_export_open(id, sizeof(id), fmt, &dirfd);
+    if (fd < 0 || !(fp = fdopen(fd, "w"))) {
+        if (fd >= 0) close(fd);
+        if (dirfd >= 0) { unlinkat(dirfd, id, 0); close(dirfd); }
+        json_object_put(records);
+        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
+    }
+    if (!strcmp(fmt, "json")) {
+        if (fprintf(fp, "%s\n", json_object_to_json_string_ext(
+                records, JSON_C_TO_STRING_PRETTY)) < 0)
+            write_failed = 1;
+    } else {
+        if (fputs("id,type,ts,level,source,module,iface,username,ip,mac,title,event,detail,state,target\n", fp) == EOF)
+            write_failed = 1;
+        for (int i = 0; i < count && !write_failed; i++) {
+            struct json_object *row = json_object_array_get_idx(records, i);
+            struct json_object *ts = NULL;
+            if (nc_log_csv_json_field(fp, row, fields[0]) != 0 || fputc(',', fp) == EOF ||
+                nc_log_csv_json_field(fp, row, fields[1]) != 0 || fputc(',', fp) == EOF)
+                write_failed = 1;
+            json_object_object_get_ex(row, "ts", &ts);
+            if (!write_failed && fprintf(fp, "%lld,", (long long)json_object_get_int64(ts)) < 0)
+                write_failed = 1;
+            for (int k = 2; fields[k] && !write_failed; k++) {
+                if (nc_log_csv_json_field(fp, row, fields[k]) != 0 ||
+                    (fields[k + 1] ? fputc(',', fp) == EOF : fputc('\n', fp) == EOF))
+                    write_failed = 1;
+            }
+        }
+    }
+    if (fflush(fp) != 0)
+        write_failed = 1;
+    if (fsync(fileno(fp)) != 0)
+        write_failed = 1;
+    if (fclose(fp) != 0)
+        write_failed = 1;
+    json_object_put(records);
+    if (write_failed) {
+        unlinkat(dirfd, id, 0);
+        close(dirfd);
+        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
+    }
+    close(dirfd);
+    data = json_object_new_object();
+    snprintf(download_url, sizeof(download_url), "/api/v1/logs/download?id=%s", id);
+    json_object_object_add(data, "id", json_object_new_string(id));
+    json_object_object_add(data, "download_url", json_object_new_string(download_url));
+    json_object_object_add(data, "format", json_object_new_string(fmt));
+    json_object_object_add(data, "count", json_object_new_int(count));
+    return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+}
 
 struct json_object *jmx_log_center_clear(struct json_object *cfg)
 {if(jmx_netconfig_db_init()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);nc_log_db_init();const char*type=nc_json_str_def(cfg,"type","");sqlite3_int64 before=json_object_get_int64(json_object_object_get(cfg,"before"));if(!nc_log_type_ok(type)||before<=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);sqlite3_stmt*st=NULL;int changed=0;if(nc_prepare(&st,"DELETE FROM log_event WHERE type=? AND ts<?")==0){sqlite3_bind_text(st,1,type,-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,2,before);sqlite3_step(st);sqlite3_finalize(st);changed=sqlite3_changes(g_netconfig_db);}struct json_object*d=json_object_new_object();json_object_object_add(d,"cleared",json_object_new_int(changed));return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
@@ -20389,7 +25188,7 @@ static struct json_object *nc_log_warning_rules_json(void)
 
 int jmx_log_center_warning_rules_set(struct json_object *cfg)
 {
-    if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_log_db_init(); struct json_object*rules=NULL; if(!json_object_object_get_ex(cfg,"rules",&rules)||!json_object_is_type(rules,json_type_array))return -1; nc_exec("BEGIN IMMEDIATE"); nc_exec("DELETE FROM warning_rule"); sqlite3_int64 now=(sqlite3_int64)nc_now_s(); int rc=0;
+    if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_log_db_init(); struct json_object*rules=NULL; if(!json_object_object_get_ex(cfg,"rules",&rules)||!json_object_is_type(rules,json_type_array))return -1; if(nc_txn_begin()!=0)return -1; nc_exec("DELETE FROM warning_rule"); sqlite3_int64 now=(sqlite3_int64)nc_now_s(); int rc=0;
     int n=json_object_array_length(rules); for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(rules,i);const char*id=nc_json_str_def(o,"id","");const char*name=nc_json_str_def(o,"name","");const char*type=nc_json_str_def(o,"type","");const char*expr=nc_json_str_def(o,"trigger_expr","");if(!nc_valid_name(id)||!name[0]||strlen(name)>64||!type[0]||!expr[0]){rc=-1;break;}struct json_object*v=NULL;json_object_object_get_ex(o,"channels",&v);char*channels=nc_json_array_to_string(v,nc_json_str_def(o,"channels","console"));sqlite3_stmt*st=NULL;if(nc_prepare(&st,"INSERT INTO warning_rule(id,enabled,name,type,target,trigger_expr,channels,cooldown_sec,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,2,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,3,name,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,type,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"target",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,expr,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,channels?channels:"console",-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,8,nc_json_int_def(o,"cooldown_sec",300));sqlite3_bind_int64(st,9,now);sqlite3_bind_int64(st,10,now);if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);} if(channels)free(channels); if(rc)break;}
     nc_exec(rc==0?"COMMIT":"ROLLBACK"); return rc;
 }
@@ -20651,7 +25450,8 @@ struct json_object *jmx_log_center_delivery_update(struct json_object *cfg)
 int jmx_log_center_channels_set(struct json_object *cfg)
 {
     if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_log_delivery_db_init(); struct json_object*arr=NULL; if(!json_object_object_get_ex(cfg,"channels",&arr)||!json_object_is_type(arr,json_type_array))return -1;
-    nc_exec("BEGIN IMMEDIATE"); nc_exec("DELETE FROM notification_channel WHERE id!='console'"); sqlite3_int64 now=(sqlite3_int64)nc_now_s(); int rc=0,n=json_object_array_length(arr);
+    if (nc_txn_begin() != 0) return -1;
+    nc_exec("DELETE FROM notification_channel WHERE id!='console'"); sqlite3_int64 now=(sqlite3_int64)nc_now_s(); int rc=0,n=json_object_array_length(arr);
     for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);const char*id=nc_json_str_def(o,"id","");const char*type=nc_json_str_def(o,"type","");const char*name=nc_json_str_def(o,"name",id);if(!nc_valid_name(id)||!type[0]||!name[0]||strlen(name)>64){rc=-1;break;}struct json_object*conf=NULL;json_object_object_get_ex(o,"config",&conf);const char*confstr=conf?json_object_to_json_string(conf):"{}";int enc_len=0;char*enc_conf=nc_channel_config_encrypt(confstr,&enc_len);sqlite3_stmt*st=NULL;if(nc_prepare(&st,"INSERT OR REPLACE INTO notification_channel(id,enabled,type,name,config,created_at,updated_at) VALUES(?,?,?,?,?,COALESCE((SELECT created_at FROM notification_channel WHERE id=?),?),?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,2,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,3,type,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,name,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,enc_conf?enc_conf:confstr,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,id,-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,7,now);sqlite3_bind_int64(st,8,now);if(nc_step_done(st)!=0)rc=-1;sqlite3_finalize(st);}else rc=-1;if(enc_conf)free(enc_conf);if(rc)break;}
     nc_exec(rc==0?"COMMIT":"ROLLBACK"); return rc;
 }
@@ -20677,7 +25477,7 @@ static void nc_log_delivery_row_json(struct json_object *a, sqlite3_stmt *st)
 struct json_object *jmx_log_center_delivery_claim(struct json_object *cfg)
 {
     if(jmx_netconfig_db_init()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL); nc_log_delivery_db_init(); int limit=nc_json_int_def(cfg,"limit",20); if(limit<=0||limit>100)limit=20; int lease=nc_json_int_def(cfg,"lease_sec",120); if(lease<30)lease=30; if(lease>3600)lease=3600; sqlite3_int64 now=(sqlite3_int64)nc_now_s(); sqlite3_stmt*st=NULL; struct json_object*a=json_object_new_array();
-    nc_exec("BEGIN IMMEDIATE");
+    if(nc_txn_begin()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);
     if(nc_prepare(&st,"SELECT id FROM notification_delivery WHERE (status='pending' OR (status='failed' AND next_retry_at<=?)) AND attempts<10 ORDER BY created_at LIMIT ?")==0){sqlite3_bind_int64(st,1,now);sqlite3_bind_int(st,2,limit);while(sqlite3_step(st)==SQLITE_ROW){const char*id=(const char*)sqlite3_column_text(st,0);sqlite3_stmt*up=NULL;if(id&&nc_prepare(&up,"UPDATE notification_delivery SET status='leased',updated_at=?,next_retry_at=? WHERE id=? AND (status='pending' OR status='failed')")==0){sqlite3_bind_int64(up,1,now);sqlite3_bind_int64(up,2,now+lease);sqlite3_bind_text(up,3,id,-1,SQLITE_TRANSIENT);sqlite3_step(up);sqlite3_finalize(up);}}sqlite3_finalize(st);} nc_exec("COMMIT");
     if(nc_prepare(&st,"SELECT id,alarm_id,event_id,channel_id,channel_type,status,title,detail,target,attempts,last_error,created_at,updated_at,next_retry_at FROM notification_delivery WHERE status='leased' AND updated_at=? ORDER BY created_at LIMIT ?")==0){sqlite3_bind_int64(st,1,now);sqlite3_bind_int(st,2,limit);while(sqlite3_step(st)==SQLITE_ROW)nc_log_delivery_row_json(a,st);sqlite3_finalize(st);} struct json_object*d=json_object_new_object();json_object_object_add(d,"lease_sec",json_object_new_int(lease));json_object_object_add(d,"deliveries",a);return jmx_gen_api_response_data(API_CODE_SUCCESS,d);
 }
@@ -21276,39 +26076,394 @@ static int nc_sys_service_is_critical(const char *name)
     if (!name) return 0;
     return !strcmp(name, "network") || !strcmp(name, "firewall") || !strcmp(name, "rpcd") ||
            !strcmp(name, "uhttpd") || !strcmp(name, "dropbear") || !strcmp(name, "dnsmasq") ||
-           !strcmp(name, "jmxd");
+           !strcmp(name, "jmxd") || !strcmp(name, "dreamingwrt-init");
+}
+
+#define NC_SYS_SERVICE_NAME_MAX 127
+#define NC_SYS_SERVICE_SCAN_MAX 1024
+#define NC_SYS_SERVICE_RETURN_MAX 200
+#define NC_SYS_SERVICE_LIST_BUDGET_MS 8000
+#define NC_SYS_SERVICE_LIST_ITEM_TIMEOUT_MS 500
+#define NC_SYS_SERVICE_ACTION_TIMEOUT_MS 15000
+#define NC_SYS_SERVICE_STATUS_TIMEOUT_MS 3000
+#define NC_SYS_SERVICE_SCRIPT_SCAN_MAX (128U * 1024U)
+
+struct nc_sys_service_handle {
+    int dirfd;
+    int fd;
+    char name[NC_SYS_SERVICE_NAME_MAX + 1];
+    char path[sizeof("/etc/init.d/") + NC_SYS_SERVICE_NAME_MAX];
+    struct stat dir_st;
+    struct stat file_st;
+};
+
+struct nc_sys_service_name {
+    char value[NC_SYS_SERVICE_NAME_MAX + 1];
+};
+
+static int64_t nc_sys_monotonic_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return -1;
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int nc_sys_service_token_ok(const char *name)
+{
+    const unsigned char *p;
+    size_t len;
+
+    if (!name || !name[0])
+        return 0;
+    len = strlen(name);
+    if (len > NC_SYS_SERVICE_NAME_MAX)
+        return 0;
+    for (p = (const unsigned char *)name; *p; p++) {
+        if (!isalnum(*p) && *p != '_' && *p != '-')
+            return 0;
+    }
+    return 1;
+}
+
+static void nc_sys_service_close(struct nc_sys_service_handle *handle)
+{
+    if (!handle)
+        return;
+    if (handle->fd >= 0)
+        close(handle->fd);
+    if (handle->dirfd >= 0)
+        close(handle->dirfd);
+    memset(handle, 0, sizeof(*handle));
+    handle->dirfd = -1;
+    handle->fd = -1;
+}
+
+static int nc_sys_service_open(const char *name,
+                               struct nc_sys_service_handle *handle)
+{
+    int n;
+
+    if (!handle || !nc_sys_service_token_ok(name))
+        return -1;
+    memset(handle, 0, sizeof(*handle));
+    handle->dirfd = -1;
+    handle->fd = -1;
+    handle->dirfd = open("/etc/init.d",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (handle->dirfd < 0 || fstat(handle->dirfd, &handle->dir_st) != 0 ||
+        !S_ISDIR(handle->dir_st.st_mode) || handle->dir_st.st_uid != 0 ||
+        (handle->dir_st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        goto failed;
+    handle->fd = openat(handle->dirfd, name,
+                        O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    if (handle->fd < 0 || fstat(handle->fd, &handle->file_st) != 0 ||
+        !S_ISREG(handle->file_st.st_mode) || handle->file_st.st_uid != 0 ||
+        (handle->file_st.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        (handle->file_st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0)
+        goto failed;
+    snprintf(handle->name, sizeof(handle->name), "%s", name);
+    n = snprintf(handle->path, sizeof(handle->path), "/etc/init.d/%s", name);
+    if (n < 0 || (size_t)n >= sizeof(handle->path))
+        goto failed;
+    return 0;
+
+failed:
+    nc_sys_service_close(handle);
+    return -1;
+}
+
+static int nc_sys_service_same_inode(const struct stat *a,
+                                     const struct stat *b)
+{
+    return a && b && a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+static int nc_sys_service_revalidate(const struct nc_sys_service_handle *handle)
+{
+    struct stat dir_st;
+    struct stat file_st;
+
+    if (!handle || handle->dirfd < 0 || handle->fd < 0 ||
+        fstat(handle->dirfd, &dir_st) != 0 ||
+        fstatat(handle->dirfd, handle->name, &file_st,
+                AT_SYMLINK_NOFOLLOW) != 0)
+        return -1;
+    if (!nc_sys_service_same_inode(&dir_st, &handle->dir_st) ||
+        !nc_sys_service_same_inode(&file_st, &handle->file_st) ||
+        !S_ISREG(file_st.st_mode) || file_st.st_uid != 0 ||
+        (file_st.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        (file_st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0)
+        return -1;
+    return 0;
+}
+
+static int nc_sys_service_exec(const struct nc_sys_service_handle *handle,
+                               const char *action, int timeout_ms,
+                               struct jmx_exec_result *result)
+{
+    char *argv[3];
+
+    if (!handle || !action || !result || timeout_ms < 1 ||
+        nc_sys_service_revalidate(handle) != 0)
+        return -1;
+    argv[0] = (char *)handle->path;
+    argv[1] = (char *)action;
+    argv[2] = NULL;
+    return jmx_exec_wait(handle->path, argv, timeout_ms, result);
+}
+
+static int nc_sys_service_exec_ok(int rc,
+                                  const struct jmx_exec_result *result)
+{
+    return rc == 0 && result && !result->timed_out && !result->truncated &&
+           result->term_signal == 0 && result->exit_code == 0;
+}
+
+static int nc_sys_service_action_ok(const char *action)
+{
+    return action && (!strcmp(action, "enable") ||
+                      !strcmp(action, "disable") ||
+                      !strcmp(action, "start") ||
+                      !strcmp(action, "stop") ||
+                      !strcmp(action, "restart") ||
+                      !strcmp(action, "reload") ||
+                      !strcmp(action, "status"));
+}
+
+static int nc_sys_service_enabled(const struct nc_sys_service_handle *handle,
+                                  int *enabled, int *priority)
+{
+    DIR *dir = NULL;
+    struct dirent *entry;
+    int rcfd = -1;
+    int found = 0;
+    int found_priority = 50;
+
+    if (!handle || !enabled || !priority)
+        return -1;
+    *enabled = 0;
+    *priority = 50;
+    rcfd = open("/etc/rc.d", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (rcfd < 0)
+        return -1;
+    dir = fdopendir(rcfd);
+    if (!dir) {
+        close(rcfd);
+        return -1;
+    }
+    rcfd = -1;
+    while ((entry = readdir(dir)) != NULL) {
+        struct stat target_st;
+        const char *entry_name = entry->d_name;
+
+        if (entry_name[0] != 'S' ||
+            !isdigit((unsigned char)entry_name[1]) ||
+            !isdigit((unsigned char)entry_name[2]) ||
+            strcmp(entry_name + 3, handle->name) != 0)
+            continue;
+        if (fstatat(dirfd(dir), entry_name, &target_st, 0) != 0 ||
+            !nc_sys_service_same_inode(&target_st, &handle->file_st))
+            continue;
+        found = 1;
+        found_priority = (entry_name[1] - '0') * 10 + entry_name[2] - '0';
+        break;
+    }
+    closedir(dir);
+    *enabled = found;
+    *priority = found_priority;
+    return 0;
+}
+
+static int nc_sys_service_running(const struct nc_sys_service_handle *handle,
+                                  int timeout_ms, int *running, int *known)
+{
+    struct jmx_exec_result result;
+    int rc;
+
+    if (!handle || !running || !known)
+        return -1;
+    *running = 0;
+    *known = 0;
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    rc = nc_sys_service_exec(handle, "running", timeout_ms, &result);
+    if (rc == 0 && !result.timed_out && !result.truncated &&
+        result.term_signal == 0 && result.exit_code >= 0 &&
+        result.exit_code < 126) {
+        *running = result.exit_code == 0;
+        *known = 1;
+    }
+    jmx_exec_result_free(&result);
+    return *known ? 0 : -1;
+}
+
+static int nc_sys_service_supports_reload(
+    const struct nc_sys_service_handle *handle)
+{
+    char *text;
+    ssize_t n;
+    int supported = 0;
+
+    if (!handle || handle->fd < 0)
+        return 0;
+    text = calloc(NC_SYS_SERVICE_SCRIPT_SCAN_MAX + 1, 1);
+    if (!text)
+        return 0;
+    n = pread(handle->fd, text, NC_SYS_SERVICE_SCRIPT_SCAN_MAX, 0);
+    if (n > 0) {
+        text[n] = '\0';
+        supported = strstr(text, "reload()") != NULL ||
+                    strstr(text, "reload ()") != NULL ||
+                    strstr(text, "reload_service()") != NULL ||
+                    strstr(text, "reload_service ()") != NULL ||
+                    (strstr(text, "EXTRA_COMMANDS") != NULL &&
+                     strstr(text, "reload") != NULL);
+    }
+    free(text);
+    return supported;
+}
+
+static int nc_sys_service_name_cmp(const void *a, const void *b)
+{
+    const struct nc_sys_service_name *left = a;
+    const struct nc_sys_service_name *right = b;
+
+    return strcmp(left->value, right->value);
 }
 
 static int nc_sys_service_name_ok(const char *name)
 {
-    if (!name || !name[0]) return 0;
-    for (const char *p = name; *p; p++) if (!(isalnum((unsigned char)*p) || *p == '_' || *p == '-')) return 0;
-    if (strlen(name) > 127) return 0;
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "[ -x /etc/init.d/%s ]", name);
-    return system(cmd) == 0;
+    struct nc_sys_service_handle handle;
+
+    if (nc_sys_service_open(name, &handle) != 0)
+        return 0;
+    nc_sys_service_close(&handle);
+    return 1;
 }
 
-static struct json_object *nc_sys_services_json(void)
+static struct json_object *nc_sys_services_json(int *truncated_out,
+                                                int *degraded_out)
 {
-    struct json_object *a = json_object_new_array();
-    FILE *fp = popen("for s in /etc/init.d/*; do [ -x \"$s\" ] || continue; n=${s##*/}; en=0; $s enabled >/dev/null 2>&1 && en=1; run=0; $s running >/dev/null 2>&1 && run=1; pri=50; [ -e /etc/rc.d/S??${n} ] && pri=20; supr=0; grep -q 'reload()' \"$s\" 2>/dev/null && supr=1; echo \"$n $en $run $pri $supr\"; done 2>/dev/null | head -200", "r");
-    char name[128]; int en, run, pri, supr;
-    if (fp) {
-        while (fscanf(fp, "%127s %d %d %d %d", name, &en, &run, &pri, &supr) == 5) {
-            struct json_object *o = json_object_new_object();
-            json_object_object_add(o, "name", json_object_new_string(name));
-            json_object_object_add(o, "enabled", json_object_new_boolean(en));
-            json_object_object_add(o, "running", json_object_new_boolean(run));
-            json_object_object_add(o, "priority", json_object_new_int(pri));
-            json_object_object_add(o, "supports_reload", json_object_new_boolean(supr));
-            json_object_object_add(o, "critical", json_object_new_boolean(nc_sys_service_is_critical(name)));
-            json_object_object_add(o, "desc", json_object_new_string(nc_sys_service_is_critical(name) ? "system service" : "OpenWrt service"));
-            json_object_array_add(a, o);
-        }
-        pclose(fp);
+    struct nc_sys_service_name *names = NULL;
+    struct json_object *services = json_object_new_array();
+    DIR *dir = NULL;
+    struct dirent *entry;
+    size_t count = 0;
+    size_t returned;
+    int truncated = 0;
+    int degraded = 0;
+    int64_t deadline;
+
+    if (truncated_out)
+        *truncated_out = 0;
+    if (degraded_out)
+        *degraded_out = 0;
+    if (!services)
+        return NULL;
+    names = calloc(NC_SYS_SERVICE_SCAN_MAX, sizeof(*names));
+    dir = opendir("/etc/init.d");
+    if (!names || !dir) {
+        free(names);
+        if (dir)
+            closedir(dir);
+        if (degraded_out)
+            *degraded_out = 1;
+        return services;
     }
-    return a;
+    while ((entry = readdir(dir)) != NULL) {
+        struct nc_sys_service_handle handle;
+
+        if (!nc_sys_service_token_ok(entry->d_name))
+            continue;
+        if (count >= NC_SYS_SERVICE_SCAN_MAX) {
+            truncated = 1;
+            continue;
+        }
+        if (nc_sys_service_open(entry->d_name, &handle) != 0)
+            continue;
+        snprintf(names[count].value, sizeof(names[count].value), "%s",
+                 entry->d_name);
+        count++;
+        nc_sys_service_close(&handle);
+    }
+    closedir(dir);
+    qsort(names, count, sizeof(*names), nc_sys_service_name_cmp);
+    returned = count > NC_SYS_SERVICE_RETURN_MAX ?
+               NC_SYS_SERVICE_RETURN_MAX : count;
+    if (count > returned)
+        truncated = 1;
+    deadline = nc_sys_monotonic_ms();
+    if (deadline >= 0)
+        deadline += NC_SYS_SERVICE_LIST_BUDGET_MS;
+    for (size_t i = 0; i < returned; i++) {
+        struct nc_sys_service_handle handle;
+        struct json_object *item;
+        int enabled = 0;
+        int enabled_known = 0;
+        int priority = 50;
+        int running = 0;
+        int running_known = 0;
+        int supports_reload = 0;
+        int timeout_ms = NC_SYS_SERVICE_LIST_ITEM_TIMEOUT_MS;
+        int64_t now;
+
+        if (nc_sys_service_open(names[i].value, &handle) != 0) {
+            degraded = 1;
+            continue;
+        }
+        enabled_known = nc_sys_service_enabled(&handle, &enabled, &priority) == 0;
+        supports_reload = nc_sys_service_supports_reload(&handle);
+        now = nc_sys_monotonic_ms();
+        if (deadline < 0 || now < 0 || now >= deadline) {
+            degraded = 1;
+        } else {
+            int64_t remaining = deadline - now;
+            if (remaining < timeout_ms)
+                timeout_ms = (int)remaining;
+            if (timeout_ms > 0)
+                (void)nc_sys_service_running(&handle, timeout_ms,
+                                             &running, &running_known);
+            if (!running_known)
+                degraded = 1;
+        }
+        item = json_object_new_object();
+        if (item) {
+            json_object_object_add(item, "name",
+                                   json_object_new_string(handle.name));
+            json_object_object_add(item, "enabled",
+                                   json_object_new_boolean(enabled));
+            json_object_object_add(item, "enabled_known",
+                                   json_object_new_boolean(enabled_known));
+            json_object_object_add(item, "running",
+                                   json_object_new_boolean(running));
+            json_object_object_add(item, "running_known",
+                                   json_object_new_boolean(running_known));
+            json_object_object_add(item, "runtime_state",
+                json_object_new_string(!running_known ? "unknown" :
+                                       (running ? "running" : "stopped")));
+            json_object_object_add(item, "priority",
+                                   json_object_new_int(priority));
+            json_object_object_add(item, "supports_reload",
+                                   json_object_new_boolean(supports_reload));
+            json_object_object_add(item, "critical",
+                json_object_new_boolean(nc_sys_service_is_critical(handle.name)));
+            json_object_object_add(item, "desc", json_object_new_string(
+                nc_sys_service_is_critical(handle.name) ?
+                "system service" : "OpenWrt service"));
+            json_object_array_add(services, item);
+        } else {
+            degraded = 1;
+        }
+        nc_sys_service_close(&handle);
+    }
+    free(names);
+    if (truncated_out)
+        *truncated_out = truncated;
+    if (degraded_out)
+        *degraded_out = degraded;
+    return services;
 }
 static struct json_object *nc_sys_cron_jobs_json(void)
 {struct json_object*a=json_object_new_array();sqlite3_stmt*st=NULL;if(nc_prepare(&st,"SELECT id,enabled,schedule,command,description FROM system_cron_job ORDER BY id")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();nc_add_text(o,"id",st,0);json_object_object_add(o,"enabled",json_object_new_boolean(sqlite3_column_int(st,1)));nc_add_text(o,"schedule",st,2);nc_add_text(o,"command",st,3);nc_add_text(o,"desc",st,4);json_object_array_add(a,o);}sqlite3_finalize(st);}FILE*fp=fopen("/etc/crontabs/root","r");if(fp){char line[512];int i=0;while(fgets(line,sizeof(line),fp)){line[strcspn(line,"\r\n")]=0;if(!line[0])continue;if(line[0]=='#'){struct json_object*o=json_object_new_object();char id[32];snprintf(id,sizeof(id),"root-%d",++i);json_object_object_add(o,"id",json_object_new_string(id));json_object_object_add(o,"enabled",json_object_new_boolean(1));json_object_object_add(o,"schedule",json_object_new_string("#"));json_object_object_add(o,"command",json_object_new_string(line));json_object_object_add(o,"desc",json_object_new_string("system crontab"));json_object_array_add(a,o);}else{struct json_object*o=json_object_new_object();char id[32];snprintf(id,sizeof(id),"root-%d",++i);json_object_object_add(o,"id",json_object_new_string(id));json_object_object_add(o,"enabled",json_object_new_boolean(1));json_object_object_add(o,"schedule",json_object_new_string(line));json_object_object_add(o,"command",json_object_new_string(line));json_object_object_add(o,"desc",json_object_new_string("system crontab"));json_object_array_add(a,o);}}fclose(fp);}return a;}
@@ -22392,11 +27547,38 @@ int jmx_system_time_sync_ntp(struct json_object *out)
 
 struct json_object *jmx_system_startup_service_action(struct json_object *req)
 {
-    if (!req) return NULL;
+    struct nc_sys_service_handle handle;
+    struct jmx_exec_result result;
+    struct jmx_exec_result rollback_result;
+    struct json_object *resp;
+    struct json_object *services;
+    const char *reason = "ok";
+    int previous_enabled = 0;
+    int previous_enabled_known = 0;
+    int previous_priority = 50;
+    int previous_running = 0;
+    int previous_running_known = 0;
+    int current_enabled = 0;
+    int current_enabled_known = 0;
+    int current_priority = 50;
+    int current_running = 0;
+    int current_running_known = 0;
+    int supports_reload;
+    int exec_rc = 0;
+    int exec_ok = 1;
+    int readback_ok = 0;
+    int rollback_attempted = 0;
+    int rollback_succeeded = 0;
+    int services_truncated = 0;
+    int services_degraded = 0;
+
+    if (!req)
+        return NULL;
     const char *service = nc_json_str_def(req, "service", "");
     const char *action = nc_json_str_def(req, "action", "");
-    if (!nc_sys_service_name_ok(service)) {
-        struct json_object *resp = json_object_new_object();
+    if (!nc_sys_service_name_ok(service) ||
+        nc_sys_service_open(service, &handle) != 0) {
+        resp = json_object_new_object();
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("invalid_service"));
         return resp;
@@ -22405,42 +27587,167 @@ struct json_object *jmx_system_startup_service_action(struct json_object *req)
     if (is_critical && nc_json_bool_def(req, "confirm_critical", 0) == 0 &&
         (strcmp(action, "enable") == 0 || strcmp(action, "disable") == 0 ||
          strcmp(action, "start") == 0 || strcmp(action, "stop") == 0 || strcmp(action, "restart") == 0 || strcmp(action, "reload") == 0)) {
-        struct json_object *resp = json_object_new_object();
+        resp = json_object_new_object();
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("critical_confirm_required"));
         json_object_object_add(resp, "service", json_object_new_string(service));
+        nc_sys_service_close(&handle);
         return resp;
     }
-    int allowed = (!strcmp(action, "enable") || !strcmp(action, "disable") ||
-                   !strcmp(action, "start") || !strcmp(action, "stop") ||
-                   !strcmp(action, "restart") || !strcmp(action, "reload") ||
-                   !strcmp(action, "status"));
-    if (!allowed) {
-        struct json_object *resp = json_object_new_object();
+    if (!nc_sys_service_action_ok(action)) {
+        resp = json_object_new_object();
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("unsupported_action"));
+        nc_sys_service_close(&handle);
         return resp;
     }
-    if (!strcmp(action, "reload")) {
-        char probe[256];
-        snprintf(probe, sizeof(probe), "grep -q 'reload()' /etc/init.d/%s 2>/dev/null", service);
-        if (system(probe) != 0) {
-            struct json_object *resp = json_object_new_object();
-            json_object_object_add(resp, "ok", json_object_new_boolean(0));
-            json_object_object_add(resp, "error", json_object_new_string("unsupported_action"));
-            json_object_object_add(resp, "service", json_object_new_string(service));
-            return resp;
+    previous_enabled_known = nc_sys_service_enabled(
+        &handle, &previous_enabled, &previous_priority) == 0;
+    previous_running_known = nc_sys_service_running(
+        &handle, NC_SYS_SERVICE_STATUS_TIMEOUT_MS,
+        &previous_running, &previous_running_known) == 0;
+    supports_reload = nc_sys_service_supports_reload(&handle);
+    if (!strcmp(action, "reload") && !supports_reload) {
+        resp = json_object_new_object();
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        json_object_object_add(resp, "error",
+                               json_object_new_string("unsupported_action"));
+        json_object_object_add(resp, "service", json_object_new_string(service));
+        nc_sys_service_close(&handle);
+        return resp;
+    }
+
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    exec_rc = nc_sys_service_exec(
+        &handle, action,
+        !strcmp(action, "status") ? NC_SYS_SERVICE_STATUS_TIMEOUT_MS :
+                                    NC_SYS_SERVICE_ACTION_TIMEOUT_MS,
+        &result);
+    exec_ok = nc_sys_service_exec_ok(exec_rc, &result);
+    current_enabled_known = nc_sys_service_enabled(
+        &handle, &current_enabled, &current_priority) == 0;
+    current_running_known = nc_sys_service_running(
+        &handle, NC_SYS_SERVICE_STATUS_TIMEOUT_MS,
+        &current_running, &current_running_known) == 0;
+
+    if (!strcmp(action, "enable"))
+        readback_ok = current_enabled_known && current_enabled;
+    else if (!strcmp(action, "disable"))
+        readback_ok = current_enabled_known && !current_enabled;
+    else if (!strcmp(action, "start") || !strcmp(action, "restart") ||
+             !strcmp(action, "reload"))
+        readback_ok = current_running_known && current_running;
+    else if (!strcmp(action, "stop"))
+        readback_ok = current_running_known && !current_running;
+    else
+        readback_ok = previous_enabled_known && previous_running_known &&
+                      current_enabled_known && current_running_known;
+
+    if ((!exec_ok || !readback_ok) && strcmp(action, "status")) {
+        const char *rollback_action = NULL;
+        int rollback_state_known = 0;
+        int rollback_state = 0;
+
+        if ((!strcmp(action, "enable") || !strcmp(action, "disable")) &&
+            previous_enabled_known && current_enabled_known &&
+            previous_enabled != current_enabled) {
+            rollback_action = previous_enabled ? "enable" : "disable";
+            rollback_state_known = 1;
+            rollback_state = previous_enabled;
+        } else if ((!strcmp(action, "start") || !strcmp(action, "stop") ||
+                    !strcmp(action, "restart") || !strcmp(action, "reload")) &&
+                   previous_running_known && current_running_known &&
+                   previous_running != current_running) {
+            rollback_action = previous_running ? "start" : "stop";
+            rollback_state_known = 1;
+            rollback_state = previous_running;
+        }
+        if (rollback_action) {
+            int rollback_exec_rc;
+            int rollback_exec_ok;
+
+            rollback_attempted = 1;
+            memset(&rollback_result, 0, sizeof(rollback_result));
+            rollback_result.exit_code = -1;
+            rollback_exec_rc = nc_sys_service_exec(
+                &handle, rollback_action, NC_SYS_SERVICE_ACTION_TIMEOUT_MS,
+                &rollback_result);
+            rollback_exec_ok = nc_sys_service_exec_ok(
+                rollback_exec_rc, &rollback_result);
+            if (!strcmp(action, "enable") || !strcmp(action, "disable")) {
+                current_enabled_known = nc_sys_service_enabled(
+                    &handle, &current_enabled, &current_priority) == 0;
+                rollback_succeeded = rollback_exec_ok &&
+                    rollback_state_known && current_enabled_known &&
+                    current_enabled == rollback_state;
+            } else {
+                current_running_known = nc_sys_service_running(
+                    &handle, NC_SYS_SERVICE_STATUS_TIMEOUT_MS,
+                    &current_running, &current_running_known) == 0;
+                rollback_succeeded = rollback_exec_ok &&
+                    rollback_state_known && current_running_known &&
+                    current_running == rollback_state;
+            }
+            jmx_exec_result_free(&rollback_result);
         }
     }
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "/etc/init.d/%s %s >/dev/null 2>&1", service, action);
-    int ok = system(cmd) == 0;
-    struct json_object *resp = json_object_new_object();
-    json_object_object_add(resp, "ok", json_object_new_boolean(ok));
+
+    if (!exec_ok)
+        reason = result.timed_out ? "command_timeout" :
+                 (result.term_signal ? "command_signaled" :
+                  (exec_rc != 0 || result.exit_code == 126 ||
+                   result.exit_code == 127 ? "exec_failed" :
+                   "command_failed"));
+    else if (!readback_ok)
+        reason = "readback_mismatch";
+    if (rollback_attempted && !rollback_succeeded)
+        reason = "rollback_failed";
+
+    services = nc_sys_services_json(&services_truncated, &services_degraded);
+    resp = json_object_new_object();
+    json_object_object_add(resp, "ok",
+                           json_object_new_boolean(exec_ok && readback_ok));
     json_object_object_add(resp, "service", json_object_new_string(service));
     json_object_object_add(resp, "action", json_object_new_string(action));
+    json_object_object_add(resp, "reason", json_object_new_string(reason));
+    json_object_object_add(resp, "previous_enabled",
+                           json_object_new_boolean(previous_enabled));
+    json_object_object_add(resp, "previous_enabled_known",
+                           json_object_new_boolean(previous_enabled_known));
+    json_object_object_add(resp, "current_enabled",
+                           json_object_new_boolean(current_enabled));
+    json_object_object_add(resp, "current_enabled_known",
+                           json_object_new_boolean(current_enabled_known));
+    json_object_object_add(resp, "previous_running",
+                           json_object_new_boolean(previous_running));
+    json_object_object_add(resp, "previous_running_known",
+                           json_object_new_boolean(previous_running_known));
+    json_object_object_add(resp, "current_running",
+                           json_object_new_boolean(current_running));
+    json_object_object_add(resp, "current_running_known",
+                           json_object_new_boolean(current_running_known));
+    json_object_object_add(resp, "supports_reload",
+                           json_object_new_boolean(supports_reload));
+    json_object_object_add(resp, "timed_out",
+                           json_object_new_boolean(result.timed_out));
+    json_object_object_add(resp, "term_signal",
+                           json_object_new_int(result.term_signal));
+    json_object_object_add(resp, "exit_code",
+                           json_object_new_int(result.exit_code));
+    json_object_object_add(resp, "rollback_attempted",
+                           json_object_new_boolean(rollback_attempted));
+    json_object_object_add(resp, "rollback_succeeded",
+                           json_object_new_boolean(rollback_succeeded));
     json_object_object_add(resp, "ts", json_object_new_int64(nc_now_s()));
-    json_object_object_add(resp, "services", nc_sys_services_json());
+    json_object_object_add(resp, "services",
+                           services ? services : json_object_new_array());
+    json_object_object_add(resp, "services_truncated",
+                           json_object_new_boolean(services_truncated));
+    json_object_object_add(resp, "services_degraded",
+                           json_object_new_boolean(services_degraded));
+    jmx_exec_result_free(&result);
+    nc_sys_service_close(&handle);
     return resp;
 }
 
@@ -23147,7 +28454,7 @@ struct json_object *jmx_system_settings_get(void)
         json_object_object_add(d, "ssh", ssh);
         if (auth_text) free(auth_text);
     }
-    struct json_object*startup=json_object_new_object();char*local_script=nc_sys_read_file_text("/etc/rc.local",1<<16);json_object_object_add(startup,"local_script_path",json_object_new_string("/etc/rc.local"));json_object_object_add(startup,"local_script",json_object_new_string(local_script?local_script:""));json_object_object_add(startup,"services",nc_sys_services_json());if(local_script)free(local_script);json_object_object_add(d,"startup",startup);struct json_object*cron=json_object_new_object();char*ctext=nc_sys_crontab_text();struct stat cron_st;int64_t cron_mtime=stat("/etc/crontabs/root",&cron_st)==0?(int64_t)cron_st.st_mtime:0;json_object_object_add(cron,"text",json_object_new_string(ctext?ctext:""));json_object_object_add(cron,"path",json_object_new_string("/etc/crontabs/root"));json_object_object_add(cron,"last_modified_at",json_object_new_int64(cron_mtime));json_object_object_add(cron,"last_reload_at",json_object_new_int64(0));json_object_object_add(cron,"reload_state",json_object_new_string("unknown"));json_object_object_add(cron,"apply",json_object_new_string("atomic_file_restart_readback_rollback"));json_object_object_add(cron,"special_times_supported",json_object_new_boolean(jmx_system_crontab_special_times_supported()));json_object_object_add(cron,"jobs",nc_sys_cron_jobs_json());if(ctext)free(ctext);json_object_object_add(d,"crontab",cron);struct json_object*mounts=jmx_system_mounts_read_json();json_object_object_add(d,"mounts",mounts);
+    struct json_object*startup=json_object_new_object();char*local_script=nc_sys_read_file_text("/etc/rc.local",1<<16);int services_truncated=0,services_degraded=0;struct json_object*startup_services=nc_sys_services_json(&services_truncated,&services_degraded);json_object_object_add(startup,"local_script_path",json_object_new_string("/etc/rc.local"));json_object_object_add(startup,"local_script",json_object_new_string(local_script?local_script:""));json_object_object_add(startup,"services",startup_services?startup_services:json_object_new_array());json_object_object_add(startup,"services_truncated",json_object_new_boolean(services_truncated));json_object_object_add(startup,"services_degraded",json_object_new_boolean(services_degraded));if(local_script)free(local_script);json_object_object_add(d,"startup",startup);struct json_object*cron=json_object_new_object();char*ctext=nc_sys_crontab_text();struct stat cron_st;int64_t cron_mtime=stat("/etc/crontabs/root",&cron_st)==0?(int64_t)cron_st.st_mtime:0;json_object_object_add(cron,"text",json_object_new_string(ctext?ctext:""));json_object_object_add(cron,"path",json_object_new_string("/etc/crontabs/root"));json_object_object_add(cron,"last_modified_at",json_object_new_int64(cron_mtime));json_object_object_add(cron,"last_reload_at",json_object_new_int64(0));json_object_object_add(cron,"reload_state",json_object_new_string("unknown"));json_object_object_add(cron,"apply",json_object_new_string("atomic_file_restart_readback_rollback"));json_object_object_add(cron,"special_times_supported",json_object_new_boolean(jmx_system_crontab_special_times_supported()));json_object_object_add(cron,"jobs",nc_sys_cron_jobs_json());if(ctext)free(ctext);json_object_object_add(d,"crontab",cron);struct json_object*mounts=jmx_system_mounts_read_json();json_object_object_add(d,"mounts",mounts);
     {
         char am[8]="1",as[8]="1",cf[8]="0";
         FILE*fp=popen("uci -q get fstab.@global[0].anon_swap 2>/dev/null","r");
@@ -24085,13 +29392,113 @@ struct json_object *jmx_system_settings_draft_apply(struct json_object *cfg)
 {
     return jmx_system_settings_apply_result(cfg);
 }
+/*
+ * Validates one stored cron job. `schedule` used to be checked only for being
+ * non-empty, so a malformed or multi-line value could be persisted and would
+ * corrupt the crontab if anything ever rendered this table into a real file.
+ * Rather than writing a second validator, the schedule and command are joined
+ * into the crontab line they represent and handed to the existing full-line
+ * checker, which also rejects control characters and embedded newlines.
+ */
+static int nc_sys_cron_job_valid(const char *id, const char *sch, const char *cmd)
+{
+    char line[4608];
+    char err[128];
+    size_t bad_line = 0;
+
+    if (!nc_valid_name(id) || !sch || !sch[0] || !cmd || !cmd[0])
+        return 0;
+    /* Commands are limited to the two managed prefixes. `..` is rejected so a
+     * relative path cannot climb out of them. */
+    if (strncmp(cmd, "/usr/libexec/dreamingwrt/", 25) != 0 &&
+        strncmp(cmd, "/etc/init.d/", 12) != 0)
+        return 0;
+    if (strstr(cmd, ".."))
+        return 0;
+    if (snprintf(line, sizeof(line), "%s %s", sch, cmd) >= (int)sizeof(line))
+        return 0;
+    return jmx_system_crontab_validate_text(line, &bad_line, err, sizeof(err)) ==
+           JMX_SYSTEM_MOUNT_OK;
+}
+
 int jmx_system_cron_set(struct json_object *cfg)
-{if(!cfg||jmx_netconfig_db_init()!=0)return -1;nc_sys_settings_db_init();struct json_object*jobs=NULL;if(!json_object_object_get_ex(cfg,"jobs",&jobs)||!json_object_is_type(jobs,json_type_array))return -1;sqlite3_int64 now=(sqlite3_int64)nc_now_s();nc_exec("BEGIN IMMEDIATE");nc_exec("DELETE FROM system_cron_job");int n=json_object_array_length(jobs);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(jobs,i);const char*id=nc_json_str_def(o,"id","");const char*sch=nc_json_str_def(o,"schedule","");const char*cmd=nc_json_str_def(o,"command","");if(!nc_valid_name(id)||!sch[0]||strncmp(cmd,"/usr/libexec/dreamingwrt/",25)&&strncmp(cmd,"/etc/init.d/",12)){nc_exec("ROLLBACK");return -1;}sqlite3_stmt*st=NULL;if(nc_prepare(&st,"INSERT INTO system_cron_job(id,enabled,schedule,command,description,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,2,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,3,sch,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,cmd,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"desc",nc_json_str_def(o,"description","")),-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,6,now);sqlite3_bind_int64(st,7,now);sqlite3_step(st);sqlite3_finalize(st);}}nc_exec("COMMIT");return 0;}
+{
+    struct json_object *jobs = NULL;
+    sqlite3_int64 now;
+    int i, n, rc = 0;
+
+    if (!cfg || jmx_netconfig_db_init() != 0) return -1;
+    nc_sys_settings_db_init();
+    if (!json_object_object_get_ex(cfg, "jobs", &jobs) ||
+        !json_object_is_type(jobs, json_type_array))
+        return -1;
+    now = (sqlite3_int64)nc_now_s();
+    if (nc_txn_begin() != 0) return -1;
+    if (nc_exec("DELETE FROM system_cron_job") != 0)
+        return nc_txn_end(-1);
+    n = json_object_array_length(jobs);
+    for (i = 0; i < n; i++) {
+        struct json_object *o = json_object_array_get_idx(jobs, i);
+        const char *id = nc_json_str_def(o, "id", "");
+        const char *sch = nc_json_str_def(o, "schedule", "");
+        const char *cmd = nc_json_str_def(o, "command", "");
+        sqlite3_stmt *st = NULL;
+
+        if (!nc_sys_cron_job_valid(id, sch, cmd))
+            return nc_txn_end(-1);
+        /* A failed prepare or step used to be skipped silently, so a partial
+         * job list was reported as a successful save. */
+        if (nc_prepare(&st, "INSERT INTO system_cron_job(id,enabled,schedule,command,description,created_at,updated_at) VALUES(?,?,?,?,?,?,?)") != 0)
+            return nc_txn_end(-1);
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, nc_json_bool_def(o, "enabled", 1));
+        sqlite3_bind_text(st, 3, sch, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, cmd, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 5, nc_json_str_def(o, "desc", nc_json_str_def(o, "description", "")), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 6, now);
+        sqlite3_bind_int64(st, 7, now);
+        if (nc_step_done(st) != 0)
+            rc = -1;
+        sqlite3_finalize(st);
+        if (rc != 0)
+            return nc_txn_end(rc);
+    }
+    return nc_txn_end(rc);
+}
+
+/*
+ * Services whose init script must not be driven from the API. `nc_valid_name()`
+ * already blocks command injection (no space, slash, or shell metacharacter can
+ * get through), so the remaining risk is denial of service: stopping the SSH
+ * daemon, the web server, DNS, or jmxd itself costs the operator their
+ * management path. A deny list of three names left all of those reachable.
+ */
+static int nc_sys_service_protected(const char *name)
+{
+    static const char *const protected_names[] = {
+        "network", "firewall", "rpcd",
+        "dropbear", "sshd", "uhttpd", "nginx",
+        "dnsmasq", "odhcpd",
+        "jmxd", "dreamingwrt-core", "dreamingwrt-webd", "dreamingwrt-init",
+        "dreamingwrt-authd", "dreamingwrt-apid", "ubus", "ubusd", "netifd",
+        /* Base system services: stopping these takes down logging, the boot
+         * pipeline, or the terminal the operator may be recovering through. */
+        "log", "system", "boot", "ttyd", "dbus", "sysntpd", "cron",
+        "dreamingwrt-persist", "dreamingwrt-installer",
+        NULL
+    };
+    int i;
+
+    for (i = 0; protected_names[i]; i++)
+        if (!strcmp(name, protected_names[i]))
+            return 1;
+    return 0;
+}
 
 struct json_object *jmx_system_service_set(struct json_object *cfg)
 {
     const char *name = nc_json_str_def(cfg, "name", "");
-    if(!nc_valid_name(name) || !strcmp(name,"network") || !strcmp(name,"firewall") || !strcmp(name,"rpcd"))
+    if (!nc_valid_name(name) || nc_sys_service_protected(name))
         return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
     const char *action = nc_json_str_def(cfg, "action", "");
     int ok = 0;
@@ -24125,10 +29532,10 @@ struct json_object *jmx_system_disabled_functions_get(void)
 {if(jmx_netconfig_db_init()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);nc_sys_settings_db_init();nc_sys_sync_disabled_from_file();nc_sys_hwprobe_disabled();struct json_object*d=json_object_new_object();json_object_object_add(d,"path",json_object_new_string("/etc/disabled_func"));json_object_object_add(d,"items",nc_sys_disabled_json());json_object_object_add(d,"status",json_object_new_string("synced_from_file"));return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
 
 struct json_object *jmx_system_disabled_functions_set(struct json_object *cfg)
-{if(!cfg||jmx_netconfig_db_init()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);nc_sys_settings_db_init();struct json_object*arr=NULL;if(!json_object_object_get_ex(cfg,"items",&arr)&&!json_object_object_get_ex(cfg,"disabled_functions",&arr))return jmx_gen_api_response_data(API_CODE_ERROR,NULL);if(!json_object_is_type(arr,json_type_array))return jmx_gen_api_response_data(API_CODE_ERROR,NULL);sqlite3_int64 now=(sqlite3_int64)nc_now_s();nc_exec("BEGIN IMMEDIATE");nc_exec("DELETE FROM disabled_function");int n=json_object_array_length(arr);for(int i=0;i<n;i++){const char*code=json_object_get_string(json_object_array_get_idx(arr,i));if(!nc_sys_disabled_code_ok(code)){nc_exec("ROLLBACK");return jmx_gen_api_response_data(API_CODE_ERROR,NULL);}sqlite3_stmt*st=NULL;if(nc_prepare(&st,"INSERT OR REPLACE INTO disabled_function(code,source,updated_at) VALUES(?,'user',?)")==0){sqlite3_bind_text(st,1,code,-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,2,now);sqlite3_step(st);sqlite3_finalize(st);}}nc_sys_write_disabled_file();nc_exec("COMMIT");return jmx_system_disabled_functions_get();}
+{if(!cfg||jmx_netconfig_db_init()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);nc_sys_settings_db_init();struct json_object*arr=NULL;if(!json_object_object_get_ex(cfg,"items",&arr)&&!json_object_object_get_ex(cfg,"disabled_functions",&arr))return jmx_gen_api_response_data(API_CODE_ERROR,NULL);if(!json_object_is_type(arr,json_type_array))return jmx_gen_api_response_data(API_CODE_ERROR,NULL);sqlite3_int64 now=(sqlite3_int64)nc_now_s();if(nc_txn_begin()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);if(nc_exec("DELETE FROM disabled_function")!=0){nc_txn_end(-1);return jmx_gen_api_response_data(API_CODE_ERROR,NULL);}int n=json_object_array_length(arr);for(int i=0;i<n;i++){const char*code=json_object_get_string(json_object_array_get_idx(arr,i));if(!nc_sys_disabled_code_ok(code)){nc_exec("ROLLBACK");return jmx_gen_api_response_data(API_CODE_ERROR,NULL);}sqlite3_stmt*st=NULL;if(nc_prepare(&st,"INSERT OR REPLACE INTO disabled_function(code,source,updated_at) VALUES(?,'user',?)")==0){sqlite3_bind_text(st,1,code,-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,2,now);sqlite3_step(st);sqlite3_finalize(st);}}nc_sys_write_disabled_file();nc_exec("COMMIT");return jmx_system_disabled_functions_get();}
 
 struct json_object *jmx_system_services_status(struct json_object *cfg)
-{(void)cfg;struct json_object*d=json_object_new_object();json_object_object_add(d,"services",nc_sys_services_json());json_object_object_add(d,"protected",json_object_new_string("network,firewall,rpcd"));json_object_object_add(d,"apply",json_object_new_string("implemented_uci_commit_and_reload"));return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
+{(void)cfg;int truncated=0,degraded=0;struct json_object*d=json_object_new_object();struct json_object*services=nc_sys_services_json(&truncated,&degraded);json_object_object_add(d,"services",services?services:json_object_new_array());json_object_object_add(d,"truncated",json_object_new_boolean(truncated));json_object_object_add(d,"degraded",json_object_new_boolean(degraded));json_object_object_add(d,"protected",json_object_new_string("network,firewall,rpcd,dreamingwrt-init"));json_object_object_add(d,"apply",json_object_new_string("trusted_argv_readback_rollback"));return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
 
 struct json_object *jmx_system_mounts_status(struct json_object *cfg)
 {(void)cfg;int gen=jmx_system_mount_runtime_capability(0);int mnt=jmx_system_mount_runtime_capability(1);struct json_object*d=jmx_system_mounts_read_json();struct json_object*cap=json_object_new_object();json_object_object_add(d,"edit",json_object_new_string("transactional_explicit_candidates"));json_object_object_add(d,"auto_mount",json_object_new_boolean(1));json_object_object_add(d,"auto_swap",json_object_new_boolean(0));json_object_object_add(d,"check_fs",json_object_new_boolean(0));json_object_object_add(cap,"mounts_read",json_object_new_boolean(1));json_object_object_add(cap,"mounts_runtime_split",json_object_new_boolean(1));json_object_object_add(cap,"mounts_fstype",json_object_new_boolean(1));json_object_object_add(cap,"mounts_discovery",json_object_new_boolean(gen));json_object_object_add(cap,"mounts_generate_config",json_object_new_boolean(gen));json_object_object_add(cap,"mounts_mount_connected",json_object_new_boolean(mnt));json_object_object_add(cap,"mounts_unmount",json_object_new_boolean(1));json_object_object_add(cap,"mounts_save_point",json_object_new_boolean(1));json_object_object_add(cap,"mounts_delete_point",json_object_new_boolean(1));json_object_object_add(d,"capabilities",cap);json_object_object_add(d,"stable_id_required",json_object_new_boolean(1));json_object_object_add(d,"implicit_mount",json_object_new_boolean(0));if(!gen)json_object_object_add(d,"reason",json_object_new_string("block_discovery_runtime_unavailable"));return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
@@ -24984,10 +30391,13 @@ int jmx_ai_conversation_save(struct json_object *cfg)
     id = nc_json_str_def(cfg, "id", "");
     title = nc_json_str_def(cfg, "title", "Untitled");
     model = nc_json_str_def(cfg, "model", "");
-    if (!id[0]) return -1;
+    /* The conversation id reaches a DELETE below and is echoed into other
+     * statements; constrain it to [A-Za-z0-9_.-] the way jmx_system_cron_set
+     * does rather than relying on parameter binding alone. */
+    if (!nc_valid_name(id)) return -1;
     if (jmx_netconfig_db_init() != 0) return -1;
     nc_ai_db_init();
-    nc_exec("BEGIN IMMEDIATE");
+    if (nc_txn_begin() != 0) return -1;
     if (nc_prepare(&st, "INSERT INTO ai_conversation(id,title,model,message_count,created_at,updated_at) VALUES(?,?,?,0,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,model=excluded.model,updated_at=excluded.updated_at") == 0) {
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, title, -1, SQLITE_TRANSIENT);
@@ -24998,9 +30408,16 @@ int jmx_ai_conversation_save(struct json_object *cfg)
         sqlite3_finalize(st);
     }
     if (rc == 0 && json_object_object_get_ex(cfg, "messages", &msgs) && json_object_is_type(msgs, json_type_array)) {
-        { char del_sql[256]; snprintf(del_sql, sizeof(del_sql), "DELETE FROM ai_message WHERE conversation_id='%s'", id); nc_exec(del_sql); }
+        if (nc_prepare(&st, "DELETE FROM ai_message WHERE conversation_id=?1") == 0) {
+            sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+            if (nc_step_done(st) != 0)
+                rc = -1;
+            sqlite3_finalize(st);
+        } else {
+            rc = -1;
+        }
         n = json_object_array_length(msgs);
-        for (i = 0; i < n; i++) {
+        for (i = 0; rc == 0 && i < n; i++) {
             struct json_object *m = json_object_array_get_idx(msgs, i);
             if (nc_prepare(&st, "INSERT INTO ai_message(conversation_id,role,content,ts,sort_order) VALUES(?,?,?,?,?)") == 0) {
                 sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
@@ -25008,39 +30425,47 @@ int jmx_ai_conversation_save(struct json_object *cfg)
                 sqlite3_bind_text(st, 3, nc_json_str_def(m, "content", ""), -1, SQLITE_TRANSIENT);
                 sqlite3_bind_int64(st, 4, (sqlite3_int64)nc_json_int_def(m, "ts", (int)nc_now_s()));
                 sqlite3_bind_int(st, 5, i);
-                nc_step_done(st);
+                if (nc_step_done(st) != 0)
+                    rc = -1;
                 sqlite3_finalize(st);
+            } else {
+                rc = -1;
             }
         }
-        if (nc_prepare(&st, "UPDATE ai_conversation SET message_count=?,updated_at=? WHERE id=?") == 0) {
+        if (rc == 0 && nc_prepare(&st, "UPDATE ai_conversation SET message_count=?,updated_at=? WHERE id=?") == 0) {
             sqlite3_bind_int(st, 1, n);
             sqlite3_bind_int64(st, 2, nc_now_s());
             sqlite3_bind_text(st, 3, id, -1, SQLITE_TRANSIENT);
-            nc_step_done(st);
+            if (nc_step_done(st) != 0)
+                rc = -1;
             sqlite3_finalize(st);
         }
     }
-    nc_exec(rc == 0 ? "COMMIT" : "ROLLBACK");
-    return rc;
+    return nc_txn_end(rc);
 }
 
 int jmx_ai_conversation_delete(const char *id)
 {
     sqlite3_stmt *st = NULL;
+    int rc = 0;
+
     if (!id || !id[0]) return -1;
     if (jmx_netconfig_db_init() != 0) return -1;
     nc_ai_db_init();
-    nc_exec("BEGIN IMMEDIATE");
+    if (nc_txn_begin() != 0) return -1;
     if (nc_prepare(&st, "DELETE FROM ai_message WHERE conversation_id=?") == 0) {
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
-        sqlite3_step(st); sqlite3_finalize(st);
+        if (nc_step_done(st) != 0) rc = -1;
+        sqlite3_finalize(st);
+    } else {
+        rc = -1;
     }
-    if (nc_prepare(&st, "DELETE FROM ai_conversation WHERE id=?") == 0) {
+    if (rc == 0 && nc_prepare(&st, "DELETE FROM ai_conversation WHERE id=?") == 0) {
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
-        sqlite3_step(st); sqlite3_finalize(st);
+        if (nc_step_done(st) != 0) rc = -1;
+        sqlite3_finalize(st);
     }
-    nc_exec("COMMIT");
-    return 0;
+    return nc_txn_end(rc);
 }
 
 /* forward decl moved to line 3701 */
@@ -25517,128 +30942,35 @@ static void nc_bulk_ip_db_init(void)
 
 struct json_object *jmx_bulk_ip_get_v2(void)
 {
-    struct json_object *data = json_object_new_object();
-    struct json_object *nets = json_object_new_array();
-    struct json_object *addrs = json_object_new_array();
-    sqlite3_stmt *st = NULL;
-    int used = 0, reserved = 0;
-
-    if (jmx_netconfig_db_init() != 0) goto done;
-    nc_bulk_ip_db_init();
-
-    struct json_object *lan_net = json_object_new_object();
-    json_object_object_add(lan_net, "id", json_object_new_string("lan"));
-    json_object_object_add(lan_net, "name", json_object_new_string("LAN"));
-    json_object_object_add(lan_net, "subnet", json_object_new_string("192.168.1.0/24"));
-    json_object_object_add(lan_net, "gateway", json_object_new_string(""));
-    json_object_object_add(lan_net, "dhcp_pool", json_object_new_string(""));
-    json_object_object_add(lan_net, "total", json_object_new_int(254));
-    json_object_object_add(lan_net, "used", json_object_new_int(0));
-    json_object_object_add(lan_net, "reserved", json_object_new_int(0));
-    json_object_object_add(lan_net, "conflicts", json_object_new_int(0));
-    json_object_array_add(nets, lan_net);
-
-    FILE *fp = popen("ip neigh show 2>/dev/null", "r");
-    if (fp) {
-        char line[512]; int idx = 0;
-        while (fgets(line, sizeof(line), fp)) {
-            char ip[64]="", dev[32]="", lladdr[32]="", state[16]="";
-            if (sscanf(line, "%63s %*s %31s %31s %15s", ip, dev, lladdr, state) >= 3) {
-                if (strncmp(dev, "br-", 3) != 0 && strncmp(dev, "lan", 3) != 0) continue;
-                if (strcmp(state, "REACHABLE") != 0 && strcmp(state, "STALE") != 0 && strcmp(state, "PERMANENT") != 0) continue;
-                struct json_object *a = json_object_new_object();
-                char aid[32]; snprintf(aid, sizeof(aid), "arp-%d", idx++);
-                json_object_object_add(a, "id", json_object_new_string(aid));
-                json_object_object_add(a, "ip", json_object_new_string(ip));
-                json_object_object_add(a, "mac", json_object_new_string(lladdr));
-                json_object_object_add(a, "hostname", json_object_new_string(""));
-                json_object_object_add(a, "owner", json_object_new_string(""));
-                json_object_object_add(a, "type", json_object_new_string("dynamic"));
-                json_object_object_add(a, "source", json_object_new_string("arp"));
-                json_object_object_add(a, "status", json_object_new_string(strcmp(state, "PERMANENT") == 0 ? "permanent" : "active"));
-                json_object_object_add(a, "note", json_object_new_string(""));
-                json_object_object_add(a, "last_seen", json_object_new_int64(nc_now_s()));
-                json_object_array_add(addrs, a);
-                used++;
-            }
-        }
-        pclose(fp);
-    }
-    if (nc_prepare(&st, "SELECT id,ip,mac,hostname,owner,note FROM bulk_ip_reservation WHERE network_id='lan' ORDER BY ip") == 0) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            struct json_object *a = json_object_new_object();
-            nc_add_text(a, "id", st, 0); nc_add_text(a, "ip", st, 1); nc_add_text(a, "mac", st, 2);
-            nc_add_text(a, "hostname", st, 3); nc_add_text(a, "owner", st, 4);
-            json_object_object_add(a, "type", json_object_new_string("reserved"));
-            json_object_object_add(a, "source", json_object_new_string("reservation"));
-            json_object_object_add(a, "status", json_object_new_string("reserved"));
-            nc_add_text(a, "note", st, 5);
-            json_object_object_add(a, "last_seen", json_object_new_int64(0));
-            json_object_array_add(addrs, a);
-            reserved++;
-        }
-        sqlite3_finalize(st);
-    }
-    json_object_object_add(lan_net, "used", json_object_new_int(used));
-    json_object_object_add(lan_net, "reserved", json_object_new_int(reserved));
-done:
-    json_object_object_add(data, "selected_network", json_object_new_string("lan"));
-    json_object_object_add(data, "networks", nets);
-    json_object_object_add(data, "addresses", addrs);
-    json_object_object_add(data, "ts", json_object_new_int64(nc_now_s()));
-    struct json_object *caps = json_object_new_object();
-    json_object_object_add(caps, "reserve", json_object_new_boolean(1));
-    json_object_object_add(caps, "free", json_object_new_boolean(1));
-    json_object_object_add(caps, "delete", json_object_new_boolean(1));
-    json_object_object_add(caps, "import", json_object_new_boolean(0));
-    json_object_object_add(caps, "export", json_object_new_boolean(0));
-    json_object_object_add(caps, "conflict_detection", json_object_new_boolean(1));
-    json_object_object_add(caps, "arp_scan", json_object_new_boolean(1));
-    json_object_object_add(caps, "dhcp_lease_import", json_object_new_boolean(0));
-    json_object_object_add(data, "capabilities", caps);
-    return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+    return jmx_bulk_ip_get();
 }
 
 int jmx_bulk_ip_reserve(struct json_object *cfg)
 {
-    if (!cfg) return -1;
-    const char *id = nc_json_str_def(cfg, "id", "");
-    const char *ip = nc_json_str_def(cfg, "ip", "");
-    if (!id[0] || !ip[0]) return -1;
-    if (jmx_netconfig_db_init() != 0) return -1;
-    nc_bulk_ip_db_init();
-    int64_t now = nc_now_s();
-    sqlite3_stmt *st = NULL;
-    if (nc_prepare(&st, "INSERT INTO bulk_ip_reservation(id,network_id,ip,mac,hostname,owner,note,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET ip=excluded.ip,mac=excluded.mac,hostname=excluded.hostname,owner=excluded.owner,note=excluded.note,updated_at=excluded.updated_at") == 0) {
-        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, nc_json_str_def(cfg, "network_id", "lan"), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 3, ip, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 4, nc_json_str_def(cfg, "mac", ""), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 5, nc_json_str_def(cfg, "hostname", ""), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 6, nc_json_str_def(cfg, "owner", ""), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 7, nc_json_str_def(cfg, "note", ""), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 8, now);
-        sqlite3_bind_int64(st, 9, now);
-        int rc = nc_step_done(st);
-        sqlite3_finalize(st);
-        return rc;
-    }
-    return -1;
+    struct json_object *request,*items,*response,*code=NULL; int ok=0;
+    if(!cfg||jmx_netconfig_db_init()!=0)return -1; nc_ipam_db_init();
+    request=json_object_new_object(); items=json_object_new_array();
+    json_object_object_add(request,"action",json_object_new_string("reserve"));
+    json_object_object_add(request,"network_id",json_object_new_string(nc_json_str_def(cfg,"network_id","lan")));
+    json_object_object_add(request,"expected_revision",json_object_new_int64(nc_ipam_revision()));
+    json_object_array_add(items,json_object_get(cfg));json_object_object_add(request,"items",items);
+    response=jmx_bulk_ip_transaction(request);json_object_put(request);
+    if(response&&json_object_object_get_ex(response,"code",&code))ok=json_object_get_int(code)==API_CODE_SUCCESS;
+    if(response)json_object_put(response);return ok?0:-1;
 }
 
 int jmx_bulk_ip_delete(const char *id)
 {
-    if (!id || !id[0]) return -1;
-    if (jmx_netconfig_db_init() != 0) return -1;
-    nc_bulk_ip_db_init();
-    sqlite3_stmt *st = NULL;
-    if (nc_prepare(&st, "DELETE FROM bulk_ip_reservation WHERE id=?1") == 0) {
-        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
-        int rc = nc_step_done(st);
-        sqlite3_finalize(st);
-        return rc;
-    }
-    return -1;
+    struct json_object *request,*items,*item,*response,*code=NULL;sqlite3_stmt *st=NULL;char nid[64]="";int ok=0;
+    if(!id||!id[0]||jmx_netconfig_db_init()!=0)return -1;nc_ipam_db_init();
+    if(nc_prepare(&st,"SELECT network_id FROM ipam_address WHERE id=?1")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);if(sqlite3_step(st)==SQLITE_ROW&&sqlite3_column_text(st,0))snprintf(nid,sizeof(nid),"%s",(const char*)sqlite3_column_text(st,0));sqlite3_finalize(st);}
+    if(!nid[0])return -1;
+    request=json_object_new_object();items=json_object_new_array();item=json_object_new_object();
+    json_object_object_add(request,"action",json_object_new_string("delete"));json_object_object_add(request,"network_id",json_object_new_string(nid));json_object_object_add(request,"expected_revision",json_object_new_int64(nc_ipam_revision()));
+    json_object_object_add(item,"id",json_object_new_string(id));json_object_array_add(items,item);json_object_object_add(request,"items",items);
+    response=jmx_bulk_ip_transaction(request);json_object_put(request);
+    if(response&&json_object_object_get_ex(response,"code",&code))ok=json_object_get_int(code)==API_CODE_SUCCESS;
+    if(response)json_object_put(response);return ok?0:-1;
 }
 
 /* ── Flow Control rules CRUD (new) ── */
@@ -28582,18 +33914,39 @@ struct json_object *jmx_lxc_container_logs(const char *name, struct json_object 
         json_object_object_add(d, "error", json_object_new_string("invalid_name"));
         return jmx_gen_api_response_data(API_CODE_ERROR, d);
     }
+    /* `tail` is bounded: an unbounded value makes tail walk the whole file and
+     * a negative one is platform-dependent. The output is capped anyway, so
+     * reading more than this is wasted work. */
     int tail = cfg ? nc_json_int_def(cfg, "tail", 100) : 100;
     char path[512];
+    char tail_arg[16];
+    struct nc_exec_result result;
+    const char *argv[] = { "/usr/bin/tail", "-n", tail_arg, path, NULL };
+
+    if (tail < 1)
+        tail = 1;
+    else if (tail > 5000)
+        tail = 5000;
     snprintf(path, sizeof(path), "/var/log/lxc/%s.log", name);
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "tail -n %d %s 2>/dev/null", tail, path);
-    char *logs = nc_cmd_output(cmd, 65536);
+    snprintf(tail_arg, sizeof(tail_arg), "%d", tail);
+    if (access(argv[0], X_OK) != 0)
+        argv[0] = "/bin/tail";
+
+    /* Was a bare popen() with no timeout: a log on slow or stalled storage
+     * would pin a webd child slot indefinitely. */
+    memset(&result, 0, sizeof(result));
+    nc_exec_argv_capture(argv, 10, 65536, &result);
     json_object_object_add(d, "ok", json_object_new_boolean(1));
-    json_object_object_add(d, "logs", json_object_new_string(logs ? logs : ""));
+    json_object_object_add(d, "logs",
+        json_object_new_string(result.output ? result.output : ""));
     json_object_object_add(d, "log_path", json_object_new_string(path));
     json_object_object_add(d, "tail", json_object_new_int(tail));
+    json_object_object_add(d, "truncated", json_object_new_boolean(result.truncated));
+    if (result.timed_out)
+        json_object_object_add(d, "reason",
+            json_object_new_string("log_read_timeout"));
     json_object_object_add(d, "ts", json_object_new_int64(nc_now_s()));
-    free(logs);
+    nc_exec_result_free(&result);
     return jmx_gen_api_response_data(API_CODE_SUCCESS, d);
 }
 
@@ -28608,14 +33961,116 @@ struct json_object *jmx_lxc_container_logs(const char *name, struct json_object 
 #define NC_RATE_LIMIT_PARENT_RATE "10000mbit"
 #define NC_RATE_LIMIT_INGRESS_PREF 9001
 #define NC_RATE_LIMIT_STATE_FILE "/var/run/dreamingwrt-client-rate-limit.state"
+#define NC_RATE_LIMIT_RUNTIME_DIR "/run/dreamingwrt"
+#define NC_RATE_LIMIT_APPLY_TIMEOUT_MS 30000
 #define NC_RATE_LIMIT_PROTO_ANY 0
 #define NC_RATE_LIMIT_PROTO_TCP 6
 #define NC_RATE_LIMIT_PROTO_UDP 17
 #define NC_RATE_LIMIT_PROTO_ICMP 1
 #define NC_RATE_LIMIT_PROTO_ICMPV6 58
+#define NC_RATE_LIMIT_IP_MAX 63
+#define NC_RATE_LIMIT_REMARK_MAX 127
+#define NC_RATE_LIMIT_PROTOCOL_MAX 63
+#define NC_RATE_LIMIT_KBPS_MAX 10000000
 
 static int nc_rate_limit_ensure_dir(void) {
     return mkdir(NC_RATE_LIMIT_DIR, 0755) == 0 || errno == EEXIST ? 0 : -1;
+}
+
+static FILE *nc_rate_limit_open_script(void)
+{
+    struct stat st;
+    int dirfd = -1;
+    int fd = -1;
+    int attempt;
+    char name[96];
+
+    if (mkdir(NC_RATE_LIMIT_RUNTIME_DIR, 0700) != 0 && errno != EEXIST)
+        return NULL;
+    dirfd = open(NC_RATE_LIMIT_RUNTIME_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0 || fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        goto out;
+
+    for (attempt = 0; attempt < 32; attempt++) {
+        snprintf(name, sizeof(name), ".client-rate-limit-%ld-%lld-%d",
+                 (long)getpid(), (long long)nc_now_s(), attempt);
+        fd = openat(dirfd, name,
+                    O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                    0600);
+        if (fd >= 0) {
+            if (unlinkat(dirfd, name, 0) != 0) {
+                close(fd);
+                fd = -1;
+                goto out;
+            }
+            break;
+        }
+        if (errno != EEXIST)
+            break;
+    }
+
+out:
+    if (dirfd >= 0)
+        close(dirfd);
+    if (fd < 0)
+        return NULL;
+    {
+        FILE *fp = fdopen(fd, "w+");
+        if (!fp)
+            close(fd);
+        return fp;
+    }
+}
+
+static int nc_rate_limit_run_script(FILE *fp)
+{
+    pid_t pid;
+    int fd;
+    int status = 0;
+    int64_t deadline;
+
+    if (!fp)
+        return -1;
+    fd = fileno(fp);
+    if (fd < 0 || fflush(fp) != 0 || fsync(fd) != 0 || lseek(fd, 0, SEEK_SET) < 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        fclose(fp);
+        return -1;
+    }
+    if (pid == 0) {
+        if (dup2(fd, STDIN_FILENO) < 0)
+            _exit(126);
+        fclose(fp);
+        clearenv();
+        setenv("PATH", "/sbin:/bin:/usr/sbin:/usr/bin", 1);
+        execl("/bin/sh", "sh", "-s", (char *)NULL);
+        _exit(127);
+    }
+
+    fclose(fp);
+    deadline = nc_container_monotonic_ms() + NC_RATE_LIMIT_APPLY_TIMEOUT_MS;
+    for (;;) {
+        pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid)
+            break;
+        if (waited < 0 && errno != EINTR)
+            return -1;
+        if (nc_container_monotonic_ms() >= deadline) {
+            (void)kill(pid, SIGTERM);
+            usleep(200000);
+            (void)kill(pid, SIGKILL);
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            return -1;
+        }
+        usleep(20000);
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 static int nc_rate_limit_mac_ok(const char *mac)
@@ -28648,6 +34103,90 @@ static int nc_rate_limit_protocol_id(const char *proto)
     if (!strcasecmp(proto, "udp")) return NC_RATE_LIMIT_PROTO_UDP;
     if (!strcasecmp(proto, "icmp")) return NC_RATE_LIMIT_PROTO_ICMP;
     if (!strcasecmp(proto, "icmpv6") || !strcasecmp(proto, "ipv6-icmp")) return NC_RATE_LIMIT_PROTO_ICMPV6;
+    return -1;
+}
+
+static int nc_rate_limit_ip_ok(const char *ip)
+{
+    struct in_addr v4;
+    struct in6_addr v6;
+
+    if (!ip || !ip[0])
+        return 1;
+    return inet_pton(AF_INET, ip, &v4) == 1 || inet_pton(AF_INET6, ip, &v6) == 1;
+}
+
+static int nc_rate_limit_json_string(struct json_object *cfg, const char *name,
+                                     int required, size_t max_len,
+                                     const char *missing_default, const char **value,
+                                     const char **reason, const char **field)
+{
+    struct json_object *item = NULL;
+    const char *text;
+    size_t text_len;
+
+    if (!json_object_object_get_ex(cfg, name, &item)) {
+        if (required) {
+            *reason = "missing_required_field";
+            *field = name;
+            return -1;
+        }
+        *value = missing_default;
+        return 0;
+    }
+    if (!item || !json_object_is_type(item, json_type_string)) {
+        *reason = "invalid_field_type";
+        *field = name;
+        return -1;
+    }
+    text = json_object_get_string(item);
+    text_len = (size_t)json_object_get_string_len(item);
+    if (!text || text_len > max_len) {
+        *reason = "field_too_long";
+        *field = name;
+        return -1;
+    }
+    if (strlen(text) != text_len) {
+        *reason = "invalid_field_value";
+        *field = name;
+        return -1;
+    }
+    *value = text;
+    return 0;
+}
+
+static int nc_rate_limit_json_kbps(struct json_object *cfg, const char *name,
+                                   int *value, const char **reason, const char **field)
+{
+    struct json_object *item = NULL;
+    int64_t number;
+
+    if (!json_object_object_get_ex(cfg, name, &item)) {
+        *value = 0;
+        return 0;
+    }
+    if (!item || !json_object_is_type(item, json_type_int)) {
+        *reason = "invalid_field_type";
+        *field = name;
+        return -1;
+    }
+    number = json_object_get_int64(item);
+    if (number < 0 || number > NC_RATE_LIMIT_KBPS_MAX) {
+        *reason = "field_out_of_range";
+        *field = name;
+        return -1;
+    }
+    *value = (int)number;
+    return 0;
+}
+
+static int nc_rate_limit_json_object(struct json_object *cfg,
+                                     const char **reason, const char **field)
+{
+    if (cfg && json_object_is_type(cfg, json_type_object))
+        return 0;
+    *reason = "invalid_field_type";
+    *field = "data";
     return -1;
 }
 
@@ -28710,7 +34249,7 @@ static void nc_rate_limit_emit_runtime_cleanup(FILE *fp)
 }
 
 static int nc_rate_limit_apply_all(void) {
-    FILE *fp = fopen("/tmp/dw-client-rate-limits.sh", "w");
+    FILE *fp = nc_rate_limit_open_script();
     if (!fp) return -1;
     int count = 0;
     int emitted_header = 0;
@@ -28730,9 +34269,7 @@ static int nc_rate_limit_apply_all(void) {
     if (!dir) {
         nc_rate_limit_emit_runtime_cleanup(fp);
         fprintf(fp, "exit 0\n");
-        fclose(fp);
-        chmod("/tmp/dw-client-rate-limits.sh", 0755);
-        return nc_run_quiet("/tmp/dw-client-rate-limits.sh");
+        return nc_rate_limit_run_script(fp);
     }
     while ((ent = readdir(dir)) != NULL) {
         if (ent->d_name[0] == '.') continue;
@@ -28821,9 +34358,7 @@ static int nc_rate_limit_apply_all(void) {
         nc_rate_limit_emit_runtime_cleanup(fp);
     }
     fprintf(fp, "exit 0\n");
-    fclose(fp);
-    chmod("/tmp/dw-client-rate-limits.sh", 0755);
-    return nc_run_quiet("/tmp/dw-client-rate-limits.sh");
+    return nc_rate_limit_run_script(fp);
 }
 
 int nc_client_rate_limit_set_ex(const char *mac, const char *ip,
@@ -28831,7 +34366,15 @@ int nc_client_rate_limit_set_ex(const char *mac, const char *ip,
                                  const char *protocol, const char *remark) {
     int rc;
     int had_previous = 0;
-    if (!nc_rate_limit_mac_ok(mac) || nc_rate_limit_protocol_id(protocol) < 0) return -1;
+    if (!nc_rate_limit_mac_ok(mac) || nc_rate_limit_protocol_id(protocol) < 0 ||
+        !nc_rate_limit_ip_ok(ip) ||
+        (ip && strlen(ip) > NC_RATE_LIMIT_IP_MAX) ||
+        (protocol && strlen(protocol) > NC_RATE_LIMIT_PROTOCOL_MAX) ||
+        (remark && strlen(remark) > NC_RATE_LIMIT_REMARK_MAX) ||
+        upload_kbps < 0 || upload_kbps > NC_RATE_LIMIT_KBPS_MAX ||
+        download_kbps < 0 || download_kbps > NC_RATE_LIMIT_KBPS_MAX ||
+        (remark && (strchr(remark, '\r') || strchr(remark, '\n'))))
+        return -1;
     if (nc_rate_limit_ensure_dir() != 0) return -1;
     char safe[64];
     snprintf(safe, sizeof(safe), "%s", mac);
@@ -28907,6 +34450,86 @@ int nc_client_rate_limit_delete(const char *mac) {
     } else if (had_previous)
         unlink(rollback_path);
     return apply_rc;
+}
+
+int nc_client_rate_limit_set_json(struct json_object *cfg,
+                                  const char **reason, const char **field)
+{
+    const char *mac = NULL;
+    const char *ip = "";
+    const char *remark = "app rate limit";
+    const char *local_reason = "operation_failed";
+    const char *local_field = "";
+    int upload_kbps = 0;
+    int download_kbps = 0;
+    int rc;
+
+    if (!reason)
+        reason = &local_reason;
+    if (!field)
+        field = &local_field;
+    *reason = "";
+    *field = "";
+    if (nc_rate_limit_json_object(cfg, reason, field) != 0 ||
+        nc_rate_limit_json_string(cfg, "mac", 1, 17, NULL, &mac, reason, field) != 0 ||
+        nc_rate_limit_json_string(cfg, "ip", 0, NC_RATE_LIMIT_IP_MAX, "", &ip,
+                                  reason, field) != 0 ||
+        nc_rate_limit_json_string(cfg, "remark", 0, NC_RATE_LIMIT_REMARK_MAX,
+                                  "app rate limit", &remark, reason, field) != 0 ||
+        nc_rate_limit_json_kbps(cfg, "upload_kbps", &upload_kbps, reason, field) != 0 ||
+        nc_rate_limit_json_kbps(cfg, "download_kbps", &download_kbps, reason, field) != 0)
+        return -1;
+    if (!nc_rate_limit_mac_ok(mac)) {
+        *reason = "invalid_field_value";
+        *field = "mac";
+        return -1;
+    }
+    if (!nc_rate_limit_ip_ok(ip)) {
+        *reason = "invalid_field_value";
+        *field = "ip";
+        return -1;
+    }
+    if (strchr(remark, '\r') || strchr(remark, '\n')) {
+        *reason = "invalid_field_value";
+        *field = "remark";
+        return -1;
+    }
+    rc = nc_client_rate_limit_set(mac, ip, upload_kbps, download_kbps, remark);
+    if (rc != 0) {
+        *reason = "runtime_apply_failed";
+        *field = "runtime";
+    }
+    return rc;
+}
+
+int nc_client_rate_limit_delete_json(struct json_object *cfg,
+                                     const char **reason, const char **field)
+{
+    const char *mac = NULL;
+    const char *local_reason = "operation_failed";
+    const char *local_field = "";
+    int rc;
+
+    if (!reason)
+        reason = &local_reason;
+    if (!field)
+        field = &local_field;
+    *reason = "";
+    *field = "";
+    if (nc_rate_limit_json_object(cfg, reason, field) != 0 ||
+        nc_rate_limit_json_string(cfg, "mac", 1, 17, NULL, &mac, reason, field) != 0)
+        return -1;
+    if (!nc_rate_limit_mac_ok(mac)) {
+        *reason = "invalid_field_value";
+        *field = "mac";
+        return -1;
+    }
+    rc = nc_client_rate_limit_delete(mac);
+    if (rc != 0) {
+        *reason = "runtime_apply_failed";
+        *field = "runtime";
+    }
+    return rc;
 }
 
 /* ═══ Client Control Rule Schedule Runtime ═══ */
@@ -29282,13 +34905,608 @@ int jmx_client_control_schedule_tick(void)
 
 /* ═══ Flash / Firmware Operations ═══ */
 
+#define NC_FACTORY_RESET_PATH "/sbin/factoryreset"
+#define NC_FACTORY_RESET_REBOOT_PATH "/sbin/reboot"
+#define NC_FACTORY_RESET_STATUS_NAME "factory-reset-status.json"
+#define NC_FACTORY_RESET_DISPATCH_DELAY_SECONDS 2
+#define NC_FACTORY_RESET_HANDSHAKE_TIMEOUT_MS 2000
+
+struct nc_factory_reset_executable {
+    int fd;
+    dev_t device;
+    ino_t inode;
+};
+
+struct nc_factory_reset_dispatch_result {
+    pid_t executor_pid;
+    int release_fd;
+    int lock_fd;
+};
+
+static int nc_factory_reset_status_write(const char *state, const char *stage,
+                                         const char *reason, pid_t executor_pid)
+{
+    const char *stage_key = "stage";
+    const char *reason_key = "reason";
+    const char *timestamp_key = "timestamp";
+    char temporary[96] = "";
+    char payload[768];
+    struct stat dir_st;
+    int dirfd = -1, fd = -1, rc = -1;
+    size_t length, offset = 0;
+    ssize_t written;
+
+    if (!state || !stage || !reason)
+        return -1;
+    if (mkdir("/etc/dreamingwrt/", 0700) != 0 && errno != EEXIST)
+        return -1;
+    dirfd = open("/etc/dreamingwrt/",
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0)
+        return -1;
+    if (fstat(dirfd, &dir_st) != 0 || !S_ISDIR(dir_st.st_mode) ||
+        dir_st.st_uid != 0 || (dir_st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        goto out;
+    if (fchmod(dirfd, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) != 0)
+        goto out;
+    if (snprintf(temporary, sizeof(temporary), ".factory-reset-status.%ld.%lld.tmp",
+                 (long)getpid(), (long long)nc_now_s()) >= (int)sizeof(temporary))
+        goto out;
+    fd = openat(dirfd, temporary,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        goto out;
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0 || fchown(fd, 0, 0) != 0)
+        goto out;
+    if (snprintf(payload, sizeof(payload),
+                 "{\"state\":\"%s\",\"%s\":\"%s\",\"%s\":\"%s\","
+                 "\"%s\":%lld,\"executor_pid\":%ld}\n",
+                 state, stage_key, stage, reason_key, reason, timestamp_key,
+                 (long long)nc_now_s(),
+                 (long)executor_pid) >= (int)sizeof(payload))
+        goto out;
+    length = strlen(payload);
+    while (offset < length) {
+        written = write(fd, payload + offset, length - offset);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            goto out;
+        offset += (size_t)written;
+    }
+    if (fsync(fd) != 0 || close(fd) != 0) {
+        fd = -1;
+        goto out;
+    }
+    fd = -1;
+    if (renameat(dirfd, temporary, dirfd, NC_FACTORY_RESET_STATUS_NAME) != 0 ||
+        fsync(dirfd) != 0)
+        goto out;
+    rc = 0;
+out:
+    if (fd >= 0)
+        close(fd);
+    if (rc != 0 && temporary[0])
+        (void)unlinkat(dirfd, temporary, 0);
+    close(dirfd);
+    return rc;
+}
+
+static int nc_factory_reset_validate_executable(
+    const char *path, struct nc_factory_reset_executable *trusted)
+{
+    char resolved[PATH_MAX];
+    struct stat link_st, path_st, fd_st;
+    int fd = -1;
+
+    if (!path || !trusted || path[0] != '/')
+        return -1;
+    memset(trusted, 0, sizeof(*trusted));
+    trusted->fd = -1;
+    if (lstat(path, &link_st) != 0 || link_st.st_uid != 0)
+        return -1;
+    if (S_ISLNK(link_st.st_mode)) {
+        if (!realpath(path, resolved) || resolved[0] != '/')
+            return -1;
+        fd = open(resolved, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    } else {
+        fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    }
+    if (fd < 0 || fstat(fd, &fd_st) != 0 || stat(path, &path_st) != 0)
+        goto fail;
+    if (!S_ISREG(fd_st.st_mode) || fd_st.st_uid != 0 ||
+        (fd_st.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        (fd_st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0 ||
+        path_st.st_dev != fd_st.st_dev || path_st.st_ino != fd_st.st_ino)
+        goto fail;
+    trusted->fd = fd;
+    trusted->device = fd_st.st_dev;
+    trusted->inode = fd_st.st_ino;
+    return 0;
+fail:
+    if (fd >= 0)
+        close(fd);
+    return -1;
+}
+
+static int nc_factory_reset_revalidate_executable(
+    const char *path, const struct nc_factory_reset_executable *trusted)
+{
+    struct stat path_st, fd_st;
+
+    if (!path || !trusted || trusted->fd < 0 ||
+        fstat(trusted->fd, &fd_st) != 0 || stat(path, &path_st) != 0)
+        return -1;
+    if (!S_ISREG(fd_st.st_mode) || fd_st.st_uid != 0 ||
+        (fd_st.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        (fd_st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0 ||
+        fd_st.st_dev != trusted->device || fd_st.st_ino != trusted->inode ||
+        path_st.st_dev != trusted->device || path_st.st_ino != trusted->inode)
+        return -1;
+    return 0;
+}
+
+static int64_t nc_factory_reset_now_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return -1;
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void nc_factory_reset_record_failure(const char *stage,
+                                            const char *reason,
+                                            pid_t executor_pid)
+{
+    char message[384];
+    int fd;
+    int length;
+
+    if (nc_factory_reset_status_write("failed", stage, reason, executor_pid) == 0)
+        return;
+    length = snprintf(message, sizeof(message),
+                      "dreamingwrt factory reset failure: stage=%s reason=%s pid=%ld\n",
+                      stage ? stage : "unknown", reason ? reason : "unknown",
+                      (long)executor_pid);
+    if (length <= 0)
+        return;
+    if (length >= (int)sizeof(message))
+        length = (int)sizeof(message) - 1;
+    fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd >= 0) {
+        (void)write(fd, message, (size_t)length);
+        close(fd);
+    }
+}
+
+static int nc_factory_reset_exec_wait_fd(int executable_fd,
+                                         char *const argv[], int timeout_ms,
+                                         int *status_out)
+{
+    static char *const clean_envp[] = {
+        (char *)"PATH=/sbin:/bin:/usr/sbin:/usr/bin",
+        (char *)"HOME=/root", (char *)"LANG=C", (char *)"LC_ALL=C", NULL
+    };
+    struct timespec pause_time = { .tv_sec = 0, .tv_nsec = 20000000L };
+    pid_t child;
+    int64_t deadline;
+    int status = 0;
+
+    if (executable_fd < 0 || !argv || !argv[0] || timeout_ms < 1 || !status_out)
+        return -1;
+    child = fork();
+    if (child < 0)
+        return -1;
+    if (child == 0) {
+        sigset_t empty;
+        int nullfd;
+        int fd;
+
+        (void)setpgid(0, 0);
+        sigemptyset(&empty);
+        (void)sigprocmask(SIG_SETMASK, &empty, NULL);
+        nullfd = open("/dev/null", O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        if (nullfd < 0 || dup2(nullfd, STDIN_FILENO) < 0 ||
+            dup2(nullfd, STDOUT_FILENO) < 0 || dup2(nullfd, STDERR_FILENO) < 0)
+            _exit(126);
+        if (nullfd > STDERR_FILENO)
+            close(nullfd);
+        for (fd = 3; fd < 65536; fd++)
+            if (fd != executable_fd)
+                close(fd);
+        fexecve(executable_fd, argv, clean_envp);
+        _exit(127);
+    }
+    (void)setpgid(child, child);
+    deadline = nc_factory_reset_now_ms();
+    if (deadline < 0)
+        goto kill_child;
+    deadline += timeout_ms;
+    for (;;) {
+        pid_t waited = waitpid(child, &status, WNOHANG);
+        int64_t now;
+
+        if (waited == child) {
+            *status_out = status;
+            return 0;
+        }
+        if (waited < 0 && errno != EINTR)
+            goto kill_child;
+        now = nc_factory_reset_now_ms();
+        if (now < 0 || now >= deadline)
+            break;
+        while (nanosleep(&pause_time, &pause_time) != 0 && errno == EINTR) {}
+        pause_time.tv_sec = 0;
+        pause_time.tv_nsec = 20000000L;
+    }
+    (void)kill(-child, SIGTERM);
+    pause_time.tv_sec = 0;
+    pause_time.tv_nsec = 200000000L;
+    while (nanosleep(&pause_time, &pause_time) != 0 && errno == EINTR) {}
+kill_child:
+    (void)kill(-child, SIGKILL);
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    *status_out = status;
+    return -2;
+}
+
+static int nc_factory_reset_worker(void)
+{
+    struct nc_factory_reset_executable reset_exec = { .fd = -1 };
+    struct nc_factory_reset_executable reboot_exec = { .fd = -1 };
+    char *reset_argv[] = { (char *)"/sbin/factoryreset", (char *)"-y", NULL };
+    char *reboot_argv[] = { (char *)"/sbin/reboot", NULL };
+    pid_t executor_pid = getpid();
+    int status = 0;
+    int rc = 1;
+
+    {
+        sigset_t empty;
+        sigemptyset(&empty);
+        (void)sigprocmask(SIG_SETMASK, &empty, NULL);
+    }
+    umask(077);
+    sleep(NC_FACTORY_RESET_DISPATCH_DELAY_SECONDS);
+
+    if (nc_factory_reset_validate_executable(NC_FACTORY_RESET_PATH, &reset_exec) != 0 ||
+        nc_factory_reset_validate_executable(NC_FACTORY_RESET_REBOOT_PATH,
+                                              &reboot_exec) != 0) {
+        nc_factory_reset_record_failure("dispatch", "trusted_executable_invalid",
+                                        executor_pid);
+        goto out;
+    }
+    if (nc_factory_reset_status_write("running", "factoryreset", "started",
+                                      executor_pid) != 0) {
+        nc_factory_reset_record_failure("factoryreset", "status_publish_failed",
+                                        executor_pid);
+        goto out;
+    }
+    if (nc_factory_reset_revalidate_executable(NC_FACTORY_RESET_PATH,
+                                                &reset_exec) != 0) {
+        nc_factory_reset_record_failure("factoryreset", "trusted_executable_changed",
+                                        executor_pid);
+        goto out;
+    }
+    if (nc_factory_reset_exec_wait_fd(reset_exec.fd, reset_argv, 120000,
+                                      &status) != 0) {
+        nc_factory_reset_record_failure("factoryreset", "timeout_or_wait_failed",
+                                        executor_pid);
+        goto out;
+    }
+    if (WIFSIGNALED(status)) {
+        nc_factory_reset_record_failure("factoryreset", "terminated_by_signal",
+                                        executor_pid);
+        goto out;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        nc_factory_reset_record_failure("factoryreset", "nonzero_exit", executor_pid);
+        goto out;
+    }
+    if (nc_factory_reset_revalidate_executable(NC_FACTORY_RESET_REBOOT_PATH,
+                                                &reboot_exec) != 0) {
+        nc_factory_reset_record_failure("reboot", "trusted_executable_changed",
+                                        executor_pid);
+        goto out;
+    }
+    if (nc_factory_reset_exec_wait_fd(reboot_exec.fd, reboot_argv, 30000,
+                                      &status) != 0) {
+        nc_factory_reset_record_failure("reboot", "timeout_or_wait_failed",
+                                        executor_pid);
+        goto out;
+    }
+    if (WIFSIGNALED(status)) {
+        nc_factory_reset_record_failure("reboot", "terminated_by_signal", executor_pid);
+        goto out;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        nc_factory_reset_record_failure("reboot", "nonzero_exit", executor_pid);
+        goto out;
+    }
+    sleep(30);
+    nc_factory_reset_record_failure("reboot", "returned_without_system_restart",
+                                    executor_pid);
+out:
+    if (reset_exec.fd >= 0)
+        close(reset_exec.fd);
+    if (reboot_exec.fd >= 0)
+        close(reboot_exec.fd);
+    return rc;
+}
+
+int jmx_flash_factory_reset_worker_main(void)
+{
+    return nc_factory_reset_worker();
+}
+
+static int nc_factory_reset_lock_open(void)
+{
+    struct stat dir_st;
+    int dirfd = -1, lockfd = -1;
+
+    if (mkdir("/run/dreamingwrt", 0700) != 0 && errno != EEXIST)
+        return -1;
+    dirfd = open("/run/dreamingwrt",
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0 || fstat(dirfd, &dir_st) != 0 || !S_ISDIR(dir_st.st_mode) ||
+        dir_st.st_uid != 0 || (dir_st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        goto out;
+    lockfd = openat(dirfd, "factory-reset.lock",
+                    O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lockfd < 0 || fchmod(lockfd, 0600) != 0 || fchown(lockfd, 0, 0) != 0)
+        goto out;
+    if (flock(lockfd, LOCK_EX | LOCK_NB) != 0) {
+        int busy = errno == EWOULDBLOCK || errno == EAGAIN;
+        close(lockfd);
+        close(dirfd);
+        return busy ? -2 : -1;
+    }
+    close(dirfd);
+    return lockfd;
+out:
+    if (lockfd >= 0)
+        close(lockfd);
+    if (dirfd >= 0)
+        close(dirfd);
+    return -1;
+}
+
+static int nc_factory_reset_open_self(void)
+{
+    struct stat st;
+    int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0) {
+        if (fd >= 0)
+            close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int nc_factory_reset_dispatch(struct nc_factory_reset_dispatch_result *result)
+{
+    struct nc_factory_reset_executable reset_exec = { .fd = -1 };
+    struct nc_factory_reset_executable reboot_exec = { .fd = -1 };
+    static char *const clean_envp[] = {
+        (char *)"PATH=/sbin:/bin:/usr/sbin:/usr/bin",
+        (char *)"HOME=/root", (char *)"LANG=C", (char *)"LC_ALL=C", NULL
+    };
+    char *worker_argv[] = {
+        (char *)"/usr/bin/dreamingwrt-core", (char *)"--factory-reset-worker", NULL
+    };
+    int handshake[2] = {-1, -1};
+    int release_gate[2] = {-1, -1};
+    int lockfd = -1, self_fd = -1;
+    long open_max;
+    pid_t parent_pid, dispatcher = -1, detached = -1;
+    struct pollfd pfd;
+    ssize_t got;
+    pid_t waited;
+    int status = 0;
+
+    if (!result)
+        return -1;
+    memset(result, 0, sizeof(*result));
+    result->release_fd = -1;
+    result->lock_fd = -1;
+    lockfd = nc_factory_reset_lock_open();
+    if (lockfd < 0)
+        return lockfd;
+    if (nc_factory_reset_validate_executable(NC_FACTORY_RESET_PATH, &reset_exec) != 0 ||
+        nc_factory_reset_validate_executable(NC_FACTORY_RESET_REBOOT_PATH, &reboot_exec) != 0)
+        goto fail;
+    self_fd = nc_factory_reset_open_self();
+    if (self_fd < 0)
+        goto fail;
+    open_max = sysconf(_SC_OPEN_MAX);
+    if (open_max < 0 || open_max > 65536)
+        open_max = 65536;
+    if (pipe(handshake) != 0 ||
+        fcntl(handshake[0], F_SETFD, FD_CLOEXEC) != 0 ||
+        fcntl(handshake[1], F_SETFD, FD_CLOEXEC) != 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, release_gate) != 0)
+        goto fail;
+    parent_pid = getpid();
+    dispatcher = fork();
+    if (dispatcher < 0)
+        goto fail;
+    if (dispatcher == 0) {
+        int fd;
+        char release = '\0';
+
+        (void)prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (getppid() != parent_pid)
+            _exit(126);
+
+        close(handshake[0]);
+        close(release_gate[1]);
+        if (setsid() < 0) {
+            detached = -1;
+            (void)write(handshake[1], &detached, sizeof(detached));
+            _exit(126);
+        }
+        detached = fork();
+        if (detached != 0) {
+            close(release_gate[0]);
+            close(reset_exec.fd);
+            close(reboot_exec.fd);
+            close(self_fd);
+            close(lockfd);
+            (void)write(handshake[1], &detached, sizeof(detached));
+            _exit(detached > 0 ? 0 : 126);
+        }
+        close(handshake[1]);
+        for (fd = 3; fd < open_max; fd++)
+            if (fd != release_gate[0] && fd != self_fd && fd != lockfd)
+                close(fd);
+        if (fcntl(lockfd, F_SETFD, 0) != 0)
+            _exit(126);
+        do {
+            got = read(release_gate[0], &release, 1);
+        } while (got < 0 && errno == EINTR);
+        close(release_gate[0]);
+        if (got != 1 || release != '1')
+            _exit(125);
+        fexecve(self_fd, worker_argv, clean_envp);
+        _exit(127);
+    }
+    close(release_gate[0]); release_gate[0] = -1;
+    close(handshake[1]); handshake[1] = -1;
+    close(reset_exec.fd); reset_exec.fd = -1;
+    close(reboot_exec.fd); reboot_exec.fd = -1;
+    close(self_fd); self_fd = -1;
+    pfd.fd = handshake[0];
+    pfd.events = POLLIN | POLLHUP;
+    if (poll(&pfd, 1, NC_FACTORY_RESET_HANDSHAKE_TIMEOUT_MS) <= 0)
+        goto parent_fail;
+    do {
+        got = read(handshake[0], &detached, sizeof(detached));
+    } while (got < 0 && errno == EINTR);
+    close(handshake[0]); handshake[0] = -1;
+    do {
+        waited = waitpid(dispatcher, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (got != (ssize_t)sizeof(detached) || detached <= 0 ||
+        waited != dispatcher ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        goto parent_fail;
+    result->executor_pid = detached;
+    result->release_fd = release_gate[1];
+    result->lock_fd = lockfd;
+    return 0;
+parent_fail:
+    if (handshake[0] >= 0)
+        close(handshake[0]);
+    if (release_gate[1] >= 0)
+        close(release_gate[1]);
+    if (lockfd >= 0)
+        close(lockfd);
+    if (dispatcher > 0) {
+        (void)kill(dispatcher, SIGKILL);
+        while (waitpid(dispatcher, &status, 0) < 0 && errno == EINTR) {}
+    }
+    return -1;
+fail:
+    if (reset_exec.fd >= 0) close(reset_exec.fd);
+    if (reboot_exec.fd >= 0) close(reboot_exec.fd);
+    if (self_fd >= 0) close(self_fd);
+    if (lockfd >= 0) close(lockfd);
+    if (handshake[0] >= 0) close(handshake[0]);
+    if (handshake[1] >= 0) close(handshake[1]);
+    if (release_gate[0] >= 0) close(release_gate[0]);
+    if (release_gate[1] >= 0) close(release_gate[1]);
+    return -1;
+}
+
+static int nc_factory_reset_release(struct nc_factory_reset_dispatch_result *result)
+{
+    char release = '1';
+    ssize_t written;
+
+    if (!result || result->release_fd < 0)
+        return -1;
+    do {
+        written = send(result->release_fd, &release, 1, MSG_NOSIGNAL);
+    } while (written < 0 && errno == EINTR);
+    close(result->release_fd);
+    result->release_fd = -1;
+    if (result->lock_fd >= 0) {
+        close(result->lock_fd);
+        result->lock_fd = -1;
+    }
+    return written == 1 ? 0 : -1;
+}
+
+static void nc_factory_reset_cancel(struct nc_factory_reset_dispatch_result *result)
+{
+    if (result && result->release_fd >= 0) {
+        close(result->release_fd);
+        result->release_fd = -1;
+    }
+    if (result && result->lock_fd >= 0) {
+        close(result->lock_fd);
+        result->lock_fd = -1;
+    }
+}
+
 struct json_object *jmx_flash_factory_reset(struct json_object *cfg) {
-    (void)cfg;
+    struct nc_factory_reset_dispatch_result dispatch;
+    struct json_object *confirm = NULL;
     struct json_object *d = json_object_new_object();
-    LOG_ERROR("flash_factory_reset: initiating factory reset\n");
-    int rc = nc_run_quiet("firstboot -y && reboot &");
+    int confirmed = 0;
+
+    if (cfg && json_object_object_get_ex(cfg, "confirm", &confirm) &&
+        json_object_is_type(confirm, json_type_boolean))
+        confirmed = json_object_get_boolean(confirm);
+    if (!confirmed) {
+        json_object_object_add(d, "ok", json_object_new_boolean(0));
+        json_object_object_add(d, "error", json_object_new_string("confirmation_required"));
+        json_object_object_add(d, "reason", json_object_new_string("confirm_true_boolean_required"));
+        return jmx_gen_api_response_data(API_CODE_ERROR, d);
+    }
+    {
+        int dispatch_rc;
+        if ((dispatch_rc = nc_factory_reset_dispatch(&dispatch)) != 0) {
+        json_object_object_add(d, "ok", json_object_new_boolean(0));
+        json_object_object_add(d, "accepted", json_object_new_boolean(0));
+        json_object_object_add(d, "dispatched", json_object_new_boolean(0));
+        json_object_object_add(d, "error",
+            json_object_new_string(dispatch_rc == -2 ? "factory_reset_in_progress" :
+                                                      "dispatch_failed"));
+        return jmx_gen_api_response_data(API_CODE_ERROR, d);
+        }
+    }
+    if (nc_factory_reset_status_write("accepted", "dispatch", "accepted",
+                                      dispatch.executor_pid) != 0) {
+        nc_factory_reset_cancel(&dispatch);
+        json_object_object_add(d, "ok", json_object_new_boolean(0));
+        json_object_object_add(d, "accepted", json_object_new_boolean(0));
+        json_object_object_add(d, "dispatched", json_object_new_boolean(0));
+        json_object_object_add(d, "error", json_object_new_string("status_publish_failed"));
+        return jmx_gen_api_response_data(API_CODE_ERROR, d);
+    }
+    if (nc_factory_reset_release(&dispatch) != 0) {
+        (void)nc_factory_reset_status_write("failed", "dispatch", "release_failed",
+                                            dispatch.executor_pid);
+        json_object_object_add(d, "ok", json_object_new_boolean(0));
+        json_object_object_add(d, "accepted", json_object_new_boolean(0));
+        json_object_object_add(d, "dispatched", json_object_new_boolean(0));
+        json_object_object_add(d, "error", json_object_new_string("release_failed"));
+        return jmx_gen_api_response_data(API_CODE_ERROR, d);
+    }
+    LOG_ERROR("flash_factory_reset: accepted detached reset executor pid=%ld\n",
+              (long)dispatch.executor_pid);
     json_object_object_add(d, "ok", json_object_new_boolean(1));
-    json_object_object_add(d, "message", json_object_new_string("factory reset initiated, device will reboot"));
+    json_object_object_add(d, "accepted", json_object_new_boolean(1));
+    json_object_object_add(d, "dispatched", json_object_new_boolean(1));
+    json_object_object_add(d, "state", json_object_new_string("dispatched"));
+    json_object_object_add(d, "executor_pid", json_object_new_int((int)dispatch.executor_pid));
+    json_object_object_add(d, "dispatch_delay_seconds",
+                           json_object_new_int(NC_FACTORY_RESET_DISPATCH_DELAY_SECONDS));
+    json_object_object_add(d, "message", json_object_new_string("factory reset dispatched; completion is not yet known"));
     json_object_object_add(d, "ts", json_object_new_int64(nc_now_s()));
     return jmx_gen_api_response_data(API_CODE_SUCCESS, d);
 }
@@ -29342,63 +35560,734 @@ struct json_object *jmx_flash_preserve_config_set(struct json_object *cfg) {
 }
 
 /* ═══ System Kernel Restore Defaults ═══ */
-struct json_object *jmx_system_kernel_restore_defaults(struct json_object *cfg) {
-    (void)cfg;
-    struct json_object *d = json_object_new_object();
-    int actions = 0;
+#define NC_KERNEL_RESTORE_SYSCTL_TIMEOUT_MS 3000
+#define NC_KERNEL_RESTORE_SYSCTL_OUTPUT_MAX 4096
+#define NC_KERNEL_RESTORE_VALUE_MAX 127
 
-    const char *sysctl_resets[] = {
-        "sysctl -w net.ipv4.tcp_congestion_control=cubic",
-        "sysctl -w net.core.default_qdisc=fq_codel",
-        "sysctl -w net.ipv4.tcp_fastopen=3",
-        "sysctl -w net.ipv4.tcp_tw_reuse=1",
-        "sysctl -w net.core.somaxconn=128",
-        "sysctl -w net.ipv4.ip_forward=1",
-        "sysctl -w net.ipv6.conf.all.forwarding=1",
-        NULL
-    };
-    for (int i = 0; sysctl_resets[i]; i++) {
-        if (nc_run_quiet(sysctl_resets[i]) == 0) actions++;
+struct nc_kernel_restore_item {
+    const char *key;
+    const char *value;
+    char old_value[NC_KERNEL_RESTORE_VALUE_MAX + 1];
+    int old_captured;
+    int applied;
+};
+
+struct nc_kernel_restore_uci_snapshot {
+    char section[96];
+    char value[64];
+    int present;
+};
+
+struct nc_kernel_restore_file_snapshot {
+    char *data;
+    size_t len;
+    mode_t mode;
+    uid_t uid;
+    gid_t gid;
+    int existed;
+};
+
+static int nc_kernel_restore_exec_ok(int rc,
+                                     const struct jmx_exec_result *result)
+{
+    if (rc != 0 || !result || result->timed_out || result->truncated ||
+        result->term_signal != 0 || result->exit_code != 0)
+        return -1;
+    return 0;
+}
+
+static int nc_kernel_restore_value_ok(const char *value)
+{
+    const unsigned char *p;
+    size_t len;
+
+    if (!value || !value[0])
+        return 0;
+    len = strlen(value);
+    if (len > NC_KERNEL_RESTORE_VALUE_MAX)
+        return 0;
+    for (p = (const unsigned char *)value; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f)
+            return 0;
     }
+    return 1;
+}
 
-    const char *ct_resets[] = {
-        "sysctl -w net.netfilter.nf_conntrack_tcp_timeout_established=432000",
-        "sysctl -w net.netfilter.nf_conntrack_tcp_timeout_time_wait=120",
-        "sysctl -w net.netfilter.nf_conntrack_tcp_timeout_close_wait=60",
-        "sysctl -w net.netfilter.nf_conntrack_tcp_timeout_fin_wait=120",
-        "sysctl -w net.netfilter.nf_conntrack_tcp_timeout_syn_sent=120",
-        "sysctl -w net.netfilter.nf_conntrack_tcp_timeout_syn_recv=60",
-        "sysctl -w net.netfilter.nf_conntrack_tcp_timeout_last_ack=30",
-        "sysctl -w net.netfilter.nf_conntrack_udp_timeout=30",
-        "sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=120",
-        "sysctl -w net.netfilter.nf_conntrack_icmp_timeout=30",
-        "sysctl -w net.netfilter.nf_conntrack_generic_timeout=120",
-        NULL
-    };
-    for (int i = 0; ct_resets[i]; i++) {
-        if (nc_run_quiet(ct_resets[i]) == 0) actions++;
+static int nc_kernel_restore_sysctl_read(const char *key,
+                                         char *value, size_t value_len)
+{
+    struct jmx_exec_result result;
+    char *argv[] = { "/sbin/sysctl", "-n", (char *)key, NULL };
+    char *start;
+    char *end;
+    int rc;
+
+    if (!key || !value || value_len < 2)
+        return -1;
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    rc = jmx_exec_capture("/sbin/sysctl", argv,
+                          NC_KERNEL_RESTORE_SYSCTL_OUTPUT_MAX,
+                          NC_KERNEL_RESTORE_SYSCTL_TIMEOUT_MS, &result);
+    if (nc_kernel_restore_exec_ok(rc, &result) != 0 || !result.output)
+        goto failed;
+    start = result.output;
+    while (*start && isspace((unsigned char)*start))
+        start++;
+    end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1]))
+        *--end = '\0';
+    if (!nc_kernel_restore_value_ok(start) || strlen(start) >= value_len)
+        goto failed;
+    snprintf(value, value_len, "%s", start);
+    jmx_exec_result_free(&result);
+    return 0;
+
+failed:
+    jmx_exec_result_free(&result);
+    return -1;
+}
+
+static int nc_kernel_restore_sysctl_write(const char *key,
+                                          const char *value)
+{
+    struct jmx_exec_result result;
+    char assignment[256];
+    char observed[NC_KERNEL_RESTORE_VALUE_MAX + 1];
+    char *argv[] = { "/sbin/sysctl", "-w", assignment, NULL };
+    int n;
+    int rc;
+
+    if (!key || !key[0] || !nc_kernel_restore_value_ok(value))
+        return -1;
+    n = snprintf(assignment, sizeof(assignment), "%s=%s", key, value);
+    if (n < 0 || (size_t)n >= sizeof(assignment))
+        return -1;
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    rc = jmx_exec_wait("/sbin/sysctl", argv,
+                       NC_KERNEL_RESTORE_SYSCTL_TIMEOUT_MS, &result);
+    if (nc_kernel_restore_exec_ok(rc, &result) != 0)
+        return -1;
+    if (nc_kernel_restore_sysctl_read(key, observed, sizeof(observed)) != 0)
+        return -1;
+    return strcmp(observed, value) == 0 ? 0 : -1;
+}
+
+static int nc_kernel_restore_sysctl_rollback(struct nc_kernel_restore_item *items,
+                                             int count)
+{
+    int i;
+    int ok = 1;
+
+    if (!items || count < 0)
+        return -1;
+    for (i = count - 1; i >= 0; i--) {
+        if (!items[i].applied || !items[i].old_captured)
+            continue;
+        if (nc_kernel_restore_sysctl_write(items[i].key,
+                                           items[i].old_value) != 0)
+            ok = 0;
+        else
+            items[i].applied = 0;
     }
+    return ok ? 0 : -1;
+}
 
-    nc_run_quiet("rm -f /etc/sysctl.d/99-dreamingwrt-tuning.conf 2>/dev/null");
-    nc_run_quiet("sysctl --system 2>/dev/null");
-    nc_run_quiet("uci set system.@system[0].packet_steering='1' 2>/dev/null");
-    nc_run_quiet("uci commit system 2>/dev/null");
+static struct uci_section *nc_kernel_restore_uci_system_section(
+    struct uci_package *pkg, const char *name)
+{
+    struct uci_element *element;
 
-    if (jmx_netconfig_db_init() == 0) {
-        nc_sys_settings_db_init();
-        sqlite3_stmt *ust = NULL;
-        if (nc_prepare(&ust, "UPDATE system_settings SET packet_steering=1, irq_balance=1, flow_offloading='', updated_at=? WHERE id=1") == 0) {
-            sqlite3_bind_int64(ust, 1, nc_now_s());
-            nc_step_done(ust);
-            sqlite3_finalize(ust);
+    if (!pkg)
+        return NULL;
+    uci_foreach_element(&pkg->sections, element) {
+        struct uci_section *section = uci_to_section(element);
+
+        if (!section || strcmp(section->type, "system"))
+            continue;
+        if (!name || (section->e.name && !strcmp(section->e.name, name)))
+            return section;
+    }
+    return NULL;
+}
+
+static int nc_kernel_restore_uci_snapshot(
+    struct nc_kernel_restore_uci_snapshot *snapshot)
+{
+    struct uci_context *ctx = NULL;
+    struct uci_package *pkg = NULL;
+    struct uci_section *section;
+    const char *value;
+    int rc = -1;
+
+    if (!snapshot)
+        return -1;
+    memset(snapshot, 0, sizeof(*snapshot));
+    ctx = uci_alloc_context();
+    if (!ctx || uci_load(ctx, "system", &pkg) != UCI_OK || !pkg)
+        goto done;
+    section = nc_kernel_restore_uci_system_section(pkg, NULL);
+    if (!section || !section->e.name)
+        goto done;
+    snprintf(snapshot->section, sizeof(snapshot->section), "%s",
+             section->e.name);
+    value = uci_lookup_option_string(ctx, section, "packet_steering");
+    if (value) {
+        if (strlen(value) >= sizeof(snapshot->value))
+            goto done;
+        snprintf(snapshot->value, sizeof(snapshot->value), "%s", value);
+        snapshot->present = 1;
+    }
+    rc = 0;
+
+done:
+    if (ctx)
+        uci_free_context(ctx);
+    return rc;
+}
+
+static int nc_kernel_restore_uci_verify(
+    const struct nc_kernel_restore_uci_snapshot *snapshot,
+    const char *expected, int expected_present)
+{
+    struct uci_context *ctx = NULL;
+    struct uci_package *pkg = NULL;
+    struct uci_section *section;
+    const char *value;
+    int matched = 0;
+
+    if (!snapshot || !snapshot->section[0])
+        return -1;
+    ctx = uci_alloc_context();
+    if (!ctx || uci_load(ctx, "system", &pkg) != UCI_OK || !pkg)
+        goto done;
+    section = nc_kernel_restore_uci_system_section(pkg, snapshot->section);
+    if (!section)
+        goto done;
+    value = uci_lookup_option_string(ctx, section, "packet_steering");
+    matched = expected_present ? (value && expected && !strcmp(value, expected))
+                               : (value == NULL);
+
+done:
+    if (ctx)
+        uci_free_context(ctx);
+    return matched ? 0 : -1;
+}
+
+static int nc_kernel_restore_uci_apply(
+    const struct nc_kernel_restore_uci_snapshot *snapshot)
+{
+    struct uci_context *ctx = NULL;
+    struct uci_package *pkg = NULL;
+    struct uci_section *section;
+    int rc = -1;
+
+    if (!snapshot || !snapshot->section[0])
+        return -1;
+    ctx = uci_alloc_context();
+    if (!ctx || uci_load(ctx, "system", &pkg) != UCI_OK || !pkg)
+        goto done;
+    section = nc_kernel_restore_uci_system_section(pkg, snapshot->section);
+    if (!section || nc_uci_set_pkg(ctx, "system", section->e.name,
+                                   "packet_steering", "1") != UCI_OK ||
+        jmx_uci_commit(ctx, "system") != UCI_OK)
+        goto done;
+    rc = nc_kernel_restore_uci_verify(snapshot, "1", 1);
+
+done:
+    if (ctx)
+        uci_free_context(ctx);
+    return rc;
+}
+
+static int nc_kernel_restore_uci_rollback(
+    const struct nc_kernel_restore_uci_snapshot *snapshot)
+{
+    struct uci_context *ctx = NULL;
+    struct uci_package *pkg = NULL;
+    struct uci_section *section;
+    int rc = -1;
+
+    if (!snapshot || !snapshot->section[0])
+        return -1;
+    ctx = uci_alloc_context();
+    if (!ctx || uci_load(ctx, "system", &pkg) != UCI_OK || !pkg)
+        goto done;
+    section = nc_kernel_restore_uci_system_section(pkg, snapshot->section);
+    if (!section)
+        goto done;
+    if (snapshot->present) {
+        if (nc_uci_set_pkg(ctx, "system", section->e.name,
+                           "packet_steering", snapshot->value) != UCI_OK)
+            goto done;
+    } else if (nc_uci_delete_pkg(ctx, "system", section->e.name,
+                                 "packet_steering") != UCI_OK) {
+        goto done;
+    }
+    if (jmx_uci_commit(ctx, "system") != UCI_OK)
+        goto done;
+    rc = nc_kernel_restore_uci_verify(snapshot, snapshot->value,
+                                      snapshot->present);
+
+done:
+    if (ctx)
+        uci_free_context(ctx);
+    return rc;
+}
+
+static void nc_kernel_restore_file_snapshot_free(
+    struct nc_kernel_restore_file_snapshot *snapshot)
+{
+    if (!snapshot)
+        return;
+    free(snapshot->data);
+    memset(snapshot, 0, sizeof(*snapshot));
+}
+
+static int nc_kernel_restore_tuning_snapshot(
+    struct nc_kernel_restore_file_snapshot *snapshot)
+{
+    const char *path = "/etc/sysctl.d/99-dreamingwrt-tuning.conf";
+    struct stat before;
+    struct stat opened;
+    ssize_t got;
+    size_t offset = 0;
+    int fd = -1;
+
+    if (!snapshot)
+        return -1;
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (lstat(path, &before) != 0)
+        return errno == ENOENT ? 0 : -1;
+    if (!S_ISREG(before.st_mode) || before.st_size < 0 ||
+        before.st_size > 65536)
+        return -1;
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        opened.st_dev != before.st_dev || opened.st_ino != before.st_ino ||
+        !S_ISREG(opened.st_mode))
+        goto failed;
+    snapshot->data = calloc(1, (size_t)opened.st_size + 1);
+    if (!snapshot->data)
+        goto failed;
+    while (offset < (size_t)opened.st_size) {
+        got = read(fd, snapshot->data + offset,
+                   (size_t)opened.st_size - offset);
+        if (got > 0) {
+            offset += (size_t)got;
+            continue;
         }
+        if (got < 0 && errno == EINTR)
+            continue;
+        goto failed;
     }
+    snapshot->len = offset;
+    snapshot->mode = opened.st_mode & 07777;
+    snapshot->uid = opened.st_uid;
+    snapshot->gid = opened.st_gid;
+    snapshot->existed = 1;
+    close(fd);
+    return 0;
 
-    json_object_object_add(d, "ok", json_object_new_boolean(1));
-    json_object_object_add(d, "actions_applied", json_object_new_int(actions));
-    json_object_object_add(d, "message", json_object_new_string("kernel parameters restored to defaults"));
-    json_object_object_add(d, "ts", json_object_new_int64(nc_now_s()));
-    return jmx_gen_api_response_data(API_CODE_SUCCESS, d);
+failed:
+    if (fd >= 0)
+        close(fd);
+    nc_kernel_restore_file_snapshot_free(snapshot);
+    return -1;
+}
+
+static int nc_kernel_restore_tuning_remove(int *removed_out)
+{
+    int dirfd;
+
+    if (removed_out)
+        *removed_out = 0;
+    if (unlink("/etc/sysctl.d/99-dreamingwrt-tuning.conf") != 0)
+        return errno == ENOENT ? 0 : -1;
+    if (removed_out)
+        *removed_out = 1;
+    dirfd = open("/etc/sysctl.d", O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                                   O_NOFOLLOW);
+    if (dirfd < 0)
+        return -1;
+    if (fsync(dirfd) == 0) {
+        close(dirfd);
+        return 0;
+    }
+    close(dirfd);
+    return -1;
+}
+
+static int nc_kernel_restore_tuning_write(const char *data, size_t len,
+                                          mode_t mode, uid_t uid, gid_t gid)
+{
+    char temporary[128];
+    ssize_t written;
+    size_t offset = 0;
+    int fd = -1;
+    int dirfd = -1;
+    int attempt;
+
+    if ((!data && len) || len > 65536)
+        return -1;
+    dirfd = open("/etc/sysctl.d", O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                                   O_NOFOLLOW);
+    if (dirfd < 0)
+        return -1;
+    for (attempt = 0; attempt < 16; attempt++) {
+        snprintf(temporary, sizeof(temporary),
+                 ".99-dreamingwrt-tuning.conf.restore-%ld-%d",
+                 (long)getpid(), attempt);
+        fd = openat(dirfd, temporary,
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                    0600);
+        if (fd >= 0 || errno != EEXIST)
+            break;
+    }
+    if (fd < 0)
+        goto failed;
+    while (offset < len) {
+        written = write(fd, data + offset, len - offset);
+        if (written > 0) {
+            offset += (size_t)written;
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        goto failed;
+    }
+    if (fchmod(fd, mode) != 0 || fchown(fd, uid, gid) != 0 || fsync(fd) != 0)
+        goto failed;
+    if (close(fd) != 0) {
+        fd = -1;
+        goto failed_closed;
+    }
+    fd = -1;
+    if (renameat(dirfd, temporary, dirfd,
+                 "99-dreamingwrt-tuning.conf") != 0 || fsync(dirfd) != 0)
+        goto failed_closed;
+    close(dirfd);
+    return 0;
+
+failed:
+    if (fd >= 0)
+        close(fd);
+failed_closed:
+    if (temporary[0])
+        unlinkat(dirfd, temporary, 0);
+    close(dirfd);
+    return -1;
+}
+
+static int nc_kernel_restore_tuning_verify(const char *expected,
+                                           size_t expected_len)
+{
+    const char *path = "/etc/sysctl.d/99-dreamingwrt-tuning.conf";
+    struct stat st;
+    char *actual;
+    int matched;
+
+    if ((!expected && expected_len) || lstat(path, &st) != 0 ||
+        !S_ISREG(st.st_mode) || st.st_uid != 0 ||
+        (st.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        st.st_size < 0 || (size_t)st.st_size != expected_len)
+        return -1;
+    actual = nc_sys_read_file_alloc(path, 65536, NULL);
+    if (!actual)
+        return -1;
+    matched = !memcmp(actual, expected, expected_len) &&
+              actual[expected_len] == '\0';
+    free(actual);
+    return matched ? 0 : -1;
+}
+
+static int nc_kernel_restore_tuning_publish(
+    const struct nc_kernel_restore_item *items, int count)
+{
+    char *content;
+    size_t capacity;
+    size_t length = 0;
+    int i;
+    int n;
+    int rc = -1;
+
+    if (!items || count < 1 || count > 64)
+        return -1;
+    capacity = 256 + (size_t)count * 256;
+    content = calloc(1, capacity);
+    if (!content)
+        return -1;
+    n = snprintf(content, capacity,
+                 "# Managed by DreamingWrt kernel restore-defaults; "
+                 "do not edit by hand\n");
+    if (n < 0 || (size_t)n >= capacity)
+        goto done;
+    length = (size_t)n;
+    for (i = 0; i < count; i++) {
+        if (!items[i].key || !items[i].key[0] ||
+            !nc_kernel_restore_value_ok(items[i].value))
+            goto done;
+        n = snprintf(content + length, capacity - length, "%s=%s\n",
+                     items[i].key, items[i].value);
+        if (n < 0 || (size_t)n >= capacity - length)
+            goto done;
+        length += (size_t)n;
+    }
+    if (nc_kernel_restore_tuning_write(content, length, 0644, 0, 0) != 0 ||
+        nc_kernel_restore_tuning_verify(content, length) != 0)
+        goto done;
+    rc = 0;
+
+done:
+    free(content);
+    return rc;
+}
+
+static int nc_kernel_restore_tuning_rollback(
+    const struct nc_kernel_restore_file_snapshot *snapshot)
+{
+    if (!snapshot)
+        return -1;
+    if (!snapshot->existed)
+        return nc_kernel_restore_tuning_remove(NULL);
+    if (nc_kernel_restore_tuning_write(snapshot->data, snapshot->len,
+                                       snapshot->mode, snapshot->uid,
+                                       snapshot->gid) != 0)
+        return -1;
+    return nc_kernel_restore_tuning_verify(snapshot->data, snapshot->len);
+}
+
+static int nc_kernel_restore_db_commit(void)
+{
+    sqlite3_stmt *statement = NULL;
+    char *error = NULL;
+    int transaction_started = 0;
+    int rc = -1;
+
+    if (jmx_netconfig_db_init() != 0)
+        return -1;
+    nc_sys_settings_db_init();
+    if (sqlite3_exec(g_netconfig_db, "BEGIN IMMEDIATE", NULL, NULL,
+                     &error) != SQLITE_OK)
+        goto done;
+    transaction_started = 1;
+    if (nc_prepare(&statement,
+        "UPDATE system_settings SET packet_steering=1,updated_at=?1 "
+        "WHERE id=1") != 0)
+        goto rollback;
+    sqlite3_bind_int64(statement, 1, nc_now_s());
+    if (nc_step_done(statement) != 0 || sqlite3_changes(g_netconfig_db) != 1)
+        goto rollback;
+    sqlite3_finalize(statement);
+    statement = NULL;
+    if (sqlite3_exec(g_netconfig_db, "COMMIT", NULL, NULL,
+                     &error) != SQLITE_OK)
+        goto rollback;
+    transaction_started = 0;
+    rc = 0;
+    goto done;
+
+rollback:
+    if (statement) {
+        sqlite3_finalize(statement);
+        statement = NULL;
+    }
+    if (transaction_started)
+        (void)sqlite3_exec(g_netconfig_db, "ROLLBACK", NULL, NULL, NULL);
+done:
+    if (statement)
+        sqlite3_finalize(statement);
+    if (error)
+        sqlite3_free(error);
+    return rc;
+}
+
+static struct json_object *nc_kernel_restore_response(
+    int ok, const char *failed_stage, const char *reason,
+    int actions_attempted, int actions_applied, int readback_verified,
+    int rollback_attempted, int rollback_succeeded)
+{
+    struct json_object *data = json_object_new_object();
+
+    if (ok)
+        json_object_object_add(data, "ok", json_object_new_boolean(1));
+    else
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+    json_object_object_add(data, "failed_stage",
+                           json_object_new_string(failed_stage ? failed_stage : ""));
+    json_object_object_add(data, "reason",
+                           json_object_new_string(reason ? reason : ""));
+    json_object_object_add(data, "actions_attempted",
+                           json_object_new_int(actions_attempted));
+    json_object_object_add(data, "actions_applied",
+                           json_object_new_int(actions_applied));
+    json_object_object_add(data, "readback_verified",
+                           json_object_new_boolean(readback_verified));
+    json_object_object_add(data, "rollback_attempted",
+                           json_object_new_boolean(rollback_attempted));
+    json_object_object_add(data, "rollback_succeeded",
+                           json_object_new_boolean(rollback_succeeded));
+    json_object_object_add(data, "message", json_object_new_string(
+        ok ? "kernel parameters restored to defaults" :
+             "kernel parameter restore failed"));
+    json_object_object_add(data, "ts", json_object_new_int64(nc_now_s()));
+    return jmx_gen_api_response_data(ok ? API_CODE_SUCCESS : API_CODE_ERROR,
+                                     data);
+}
+
+struct json_object *jmx_system_kernel_restore_defaults(struct json_object *cfg)
+{
+    struct nc_kernel_restore_item items[] = {
+        { "net.ipv4.tcp_congestion_control", "cubic", "", 0, 0 },
+        { "net.core.default_qdisc", "fq_codel", "", 0, 0 },
+        { "net.ipv4.tcp_fastopen", "3", "", 0, 0 },
+        { "net.ipv4.tcp_tw_reuse", "1", "", 0, 0 },
+        { "net.core.somaxconn", "128", "", 0, 0 },
+        { "net.ipv4.ip_forward", "1", "", 0, 0 },
+        { "net.ipv6.conf.all.forwarding", "1", "", 0, 0 },
+        { "net.netfilter.nf_conntrack_tcp_timeout_established", "1800", "", 0, 0 },
+        { "net.netfilter.nf_conntrack_tcp_timeout_time_wait", "10", "", 0, 0 },
+        { "net.netfilter.nf_conntrack_tcp_timeout_close_wait", "10", "", 0, 0 },
+        { "net.netfilter.nf_conntrack_tcp_timeout_fin_wait", "10", "", 0, 0 },
+        { "net.netfilter.nf_conntrack_tcp_timeout_syn_sent", "5", "", 0, 0 },
+        { "net.netfilter.nf_conntrack_tcp_timeout_syn_recv", "5", "", 0, 0 },
+        { "net.netfilter.nf_conntrack_tcp_timeout_last_ack", "10", "", 0, 0 },
+        { "net.netfilter.nf_conntrack_tcp_timeout_close", "5", "", 0, 0 },
+        { "net.netfilter.nf_conntrack_udp_timeout", "10", "", 0, 0 },
+        { "net.netfilter.nf_conntrack_udp_timeout_stream", "60", "", 0, 0 },
+        { "net.netfilter.nf_conntrack_icmp_timeout", "5", "", 0, 0 },
+        { "net.netfilter.nf_conntrack_generic_timeout", "120", "", 0, 0 }
+    };
+    struct nc_kernel_restore_uci_snapshot uci_snapshot;
+    struct nc_kernel_restore_file_snapshot tuning_snapshot;
+    struct json_object *confirm = NULL;
+    const char *failed_stage = "";
+    const char *reason = "applied";
+    int item_count = (int)(sizeof(items) / sizeof(items[0]));
+    int actions_attempted = 0;
+    int actions_applied = 0;
+    int readback_verified = 0;
+    int sysctl_apply_attempted = 0;
+    int uci_apply_attempted = 0;
+    int uci_applied = 0;
+    int tuning_removed = 0;
+    int tuning_mutation_attempted = 0;
+    int tuning_published = 0;
+    int rollback_attempted = 0;
+    int rollback_succeeded = 0;
+    int i;
+
+    memset(&uci_snapshot, 0, sizeof(uci_snapshot));
+    memset(&tuning_snapshot, 0, sizeof(tuning_snapshot));
+    if (!cfg || !json_object_object_get_ex(cfg, "confirm", &confirm) ||
+        !confirm || !json_object_is_type(confirm, json_type_boolean) ||
+        !json_object_get_boolean(confirm)) {
+        return nc_kernel_restore_response(0, "validation", "confirm_required",
+                                          0, 0, 0, 0, 0);
+    }
+    if (jmx_netconfig_db_init() != 0) {
+        return nc_kernel_restore_response(0, "preflight", "database_unavailable",
+                                          0, 0, 0, 0, 0);
+    }
+    nc_sys_settings_db_init();
+    if (nc_kernel_restore_tuning_snapshot(&tuning_snapshot) != 0) {
+        return nc_kernel_restore_response(0, "snapshot", "tuning_snapshot_failed",
+                                          0, 0, 0, 0, 0);
+    }
+    if (nc_kernel_restore_uci_snapshot(&uci_snapshot) != 0) {
+        failed_stage = "snapshot";
+        reason = "uci_snapshot_failed";
+        goto failed;
+    }
+    for (i = 0; i < item_count; i++) {
+        if (nc_kernel_restore_sysctl_read(items[i].key, items[i].old_value,
+                                          sizeof(items[i].old_value)) != 0) {
+            failed_stage = "snapshot";
+            reason = "sysctl_snapshot_failed";
+            goto failed;
+        }
+        items[i].old_captured = 1;
+    }
+    for (i = 0; i < item_count; i++) {
+        actions_attempted++;
+        sysctl_apply_attempted = 1;
+        items[i].applied = 1;
+        if (nc_kernel_restore_sysctl_write(items[i].key, items[i].value) != 0) {
+            failed_stage = "runtime_apply";
+            reason = "sysctl_write_or_readback_failed";
+            goto failed;
+        }
+        actions_applied++;
+    }
+    readback_verified = 1;
+
+    actions_attempted++;
+    tuning_mutation_attempted = 1;
+    if (nc_kernel_restore_tuning_remove(&tuning_removed) != 0) {
+        failed_stage = "persistent_cleanup";
+        reason = "tuning_unlink_failed";
+        goto failed;
+    }
+    if (nc_kernel_restore_tuning_publish(items, item_count) != 0) {
+        failed_stage = "persistent_publish";
+        reason = "tuning_publish_or_readback_failed";
+        goto failed;
+    }
+    tuning_published = 1;
+    actions_applied++;
+
+    actions_attempted++;
+    uci_apply_attempted = 1;
+    if (nc_kernel_restore_uci_apply(&uci_snapshot) != 0) {
+        failed_stage = "uci_apply";
+        reason = "uci_commit_or_readback_failed";
+        goto failed;
+    }
+    uci_applied = 1;
+    actions_applied++;
+
+    if (!readback_verified || !uci_applied) {
+        failed_stage = "readback";
+        reason = "runtime_or_uci_not_verified";
+        goto failed;
+    }
+    actions_attempted++;
+    if (nc_kernel_restore_db_commit() != 0) {
+        failed_stage = "database_commit";
+        reason = "sqlite_transaction_failed";
+        goto failed;
+    }
+    actions_applied++;
+    nc_kernel_restore_file_snapshot_free(&tuning_snapshot);
+    return nc_kernel_restore_response(1, "", "applied", actions_attempted,
+                                      actions_applied, readback_verified, 0, 0);
+
+failed:
+    rollback_attempted = sysctl_apply_attempted || actions_applied > 0 ||
+                         uci_apply_attempted ||
+                         tuning_removed || tuning_mutation_attempted ||
+                         tuning_published;
+    if (rollback_attempted) {
+        int rollback_ok = 1;
+
+        if (uci_apply_attempted &&
+            nc_kernel_restore_uci_rollback(&uci_snapshot) != 0)
+            rollback_ok = 0;
+        if (tuning_mutation_attempted &&
+            nc_kernel_restore_tuning_rollback(&tuning_snapshot) != 0)
+            rollback_ok = 0;
+        if (nc_kernel_restore_sysctl_rollback(items, item_count) != 0)
+            rollback_ok = 0;
+        rollback_succeeded = rollback_ok;
+        if (!rollback_ok)
+            reason = "rollback_incomplete";
+    }
+    nc_kernel_restore_file_snapshot_free(&tuning_snapshot);
+    return nc_kernel_restore_response(0, failed_stage, reason,
+                                      actions_attempted, actions_applied,
+                                      readback_verified, rollback_attempted,
+                                      rollback_succeeded);
 }
 
 /* ═══ AI Tool Call ═══ */
@@ -29519,7 +36408,7 @@ static struct json_object *nc_ai_tool_dispatch(const char *tool_name,
                                                 struct json_object *params)
 {
     if (!strcmp(tool_name, "get_system_status")) return jmx_system_settings_get();
-    if (!strcmp(tool_name, "network_overview")) return jmx_bulk_ip_get_v2();
+    if (!strcmp(tool_name, "network_overview")) return jmx_bulk_ip_get();
     if (!strcmp(tool_name, "wan_list")) return jmx_netconfig_wan_list();
     if (!strcmp(tool_name, "lan_list")) return jmx_netconfig_lan_list();
     if (!strcmp(tool_name, "dns_service_get")) return jmx_dns_service_get();

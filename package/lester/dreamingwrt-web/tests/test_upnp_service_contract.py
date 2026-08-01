@@ -141,7 +141,7 @@ def test_design_system_and_dhcp_aligned_settings_contract() -> None:
     assert "floatingSavebarMarkup" in MODULE
     assert "statusBadgeMarkup" in MODULE
     assert "dwrt-kit-table-wrap" in MODULE
-    assert "dwrt-kit-glass-surface" in MODULE  # Copilot editors remain glass Sheets.
+    assert "dwrt-kit-sheet dwrt-kit-glass-surface upnp-sheet" in MODULE  # Copilot editors remain glass Sheets.
     assert "aria-expanded" in MODULE
     assert "可用性说明" in MODULE
     assert 'data-dwrt-component="tabs"' in MODULE
@@ -151,8 +151,10 @@ def test_design_system_and_dhcp_aligned_settings_contract() -> None:
     assert "@media (prefers-reduced-motion: reduce)" in STYLE
     assert "backdrop-filter" not in STYLE
     assert "letter-spacing: 0" in STYLE
-    assert 'class="upnp-settings-surface dwrt-kit-glass-surface"' in MODULE
-    assert 'data-dwrt-surface="dense-surface"' not in MODULE
+    # The settings surface uses the shared Kit surface contract, not a private glass class,
+    # so wallpaper sampling and the 8px surface radius stay identical to other pages.
+    assert 'class="upnp-settings-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass"' in MODULE
+    assert 'data-dwrt-surface="dense-surface" data-adaptive-sample' in MODULE
     assert 'class="upnp-service-primary"' in MODULE
     assert "switchControl('enabled', state.draft.enabled" in MODULE
     protocol = MODULE[MODULE.index('const protocolBody') : MODULE.index('const boundaryBody')]
@@ -162,9 +164,10 @@ def test_design_system_and_dhcp_aligned_settings_contract() -> None:
 
 
 def test_dhcp_aligned_fixed_header_and_workbench_scroll_contract() -> None:
-    assert "20260730-upnp-dhcp-unify-05" in MODULE
+    assert "20260801-upnp-overview-cards-02" in MODULE
     assert ".console-stage.is-upnp-service" in STYLE
-    assert "grid-template-rows: auto minmax(0, 1fr)" in STYLE
+    # toolbar / overview cards / workbench
+    assert "grid-template-rows: auto auto minmax(0, 1fr)" in STYLE
     assert ".upnp-page-toolbar" in STYLE and "min-height: 52px" in STYLE
     assert ".upnp-service-workbench" in STYLE
     assert "overscroll-behavior: contain" in STYLE
@@ -174,6 +177,26 @@ def test_dhcp_aligned_fixed_header_and_workbench_scroll_contract() -> None:
     assert "height: max-content" in STYLE
     assert "align-self: start" in STYLE
     assert "width: min(460px" in STYLE
+    # mountExpandSearch() bails out when the flag is already set, which left the search box
+    # as an empty circle. Markup must not pre-stamp it.
+    assert 'data-dwrt-expand-search' not in MODULE
+    # five-up only fits wide screens; narrower layouts step down so detail lines stay whole
+    assert "@media (max-width: 1180px)" in STYLE
+
+
+def test_readability_regions_are_registered_for_wallpaper_sampling() -> None:
+    # Sampling only reaches elements the shell can discover; the scheduler alone is not enough.
+    for region in (
+        'class="upnp-settings-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass" data-adaptive-sample',
+        'class="upnp-capability-banner" data-adaptive-sample',
+        'class="upnp-notice ${tone}" role="status" data-adaptive-sample',
+    ):
+        assert region in MODULE, region
+    assert MODULE.count("data-adaptive-sample") >= 4
+    assert "ui.scheduleAdaptiveForegroundSample?.(20, root)" in MODULE
+    # Neutral foreground must come from sampled semantic tokens, never per-page literals.
+    for escape in ("color: #", "color: rgb(", "color: rgba("):
+        assert escape not in STYLE, escape
 
 
 def test_no_fake_runtime_values_or_browser_persistence() -> None:
@@ -202,6 +225,27 @@ def test_browser_fixture_is_packaged_with_the_contract() -> None:
     assert "static/css/upnp-service.css" in fixture
     assert "writes" in fixture
     assert "1440" in browser_test and "1024" in browser_test and "390" in browser_test
+
+
+# Runtime status used to sit inside the settings card as a <dl>. It now reads as a row
+# of shared overview cards above the workbench, matching DHCP and DNS.
+def test_runtime_status_uses_shared_overview_cards_above_the_workbench() -> None:
+    assert "overviewCardsMarkup" in MODULE
+    assert "function overviewMarkup" in MODULE
+    assert "className: 'upnp-overview'" in MODULE
+    for key in ("service", "mappings", "requests", "security", "boundary"):
+        assert f"key: '{key}'" in MODULE, key
+    # the card row is rendered between the toolbar and the workbench
+    shell = MODULE[MODULE.index("upnp-service-shell") : MODULE.index("upnp-service-workbench")]
+    assert "overviewMarkup()" in shell
+    # the superseded inline summary and its styles are gone
+    assert "upnp-runtime-summary" not in MODULE and "upnp-runtime-summary" not in STYLE
+    assert "upnp-active-count" not in MODULE and "upnp-active-count" not in STYLE
+    # geometry only: the page must not repaint the shared card material
+    assert ".upnp-overview.dwrt-kit-overview-grid" in STYLE
+    grid = STYLE[STYLE.index(".upnp-overview.dwrt-kit-overview-grid") :][:220]
+    for repainted in ("backdrop-filter", "background:", "box-shadow"):
+        assert repainted not in grid, repainted
 
 
 if __name__ == "__main__":

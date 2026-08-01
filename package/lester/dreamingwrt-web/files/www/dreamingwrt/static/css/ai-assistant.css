@@ -452,7 +452,65 @@
 
 .ai-assistant-shell.ai-settings-route-shell {
   height: auto;
-  grid-template-rows: auto;
+  grid-template-rows: auto auto;
+}
+
+.ai-settings-route-header {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.ai-settings-route-header::-webkit-scrollbar { display: none; }
+
+.ai-settings-tabs { flex: 0 0 auto; }
+
+.ai-settings-overview {
+  display: grid;
+  gap: 18px;
+}
+
+.ai-settings-facts {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--app-radius-card, 8px);
+  overflow: hidden;
+}
+
+.ai-settings-facts > div {
+  min-width: 0;
+  padding: 13px 15px;
+  display: grid;
+  gap: 4px;
+  outline: 1px solid var(--color-border-subtle);
+}
+
+.ai-settings-facts dt {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.ai-settings-facts dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-settings-hint {
+  margin: 0;
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .ai-assistant-shell {

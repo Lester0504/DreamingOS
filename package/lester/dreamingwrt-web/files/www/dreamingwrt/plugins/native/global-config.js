@@ -18,6 +18,7 @@ export function mount(context = {}) {
     preferences: '/api/v1/network/ports/preferences',
     topologyPorts: '/api/v1/topology/node/ports',
     profiles: '/api/v1/topology/port-profiles',
+    radius: '/api/v1/services/radius',
     preview: '/api/v1/topology/node/ports/preview',
     apply: '/api/v1/topology/node/ports/apply',
     gatewayApply: '/api/v1/network/gateway-ports/apply'
@@ -62,7 +63,8 @@ export function mount(context = {}) {
   const DEFAULT_COLUMNS = ['select', 'port', 'name', 'anomaly', 'stp', 'connection', 'actions', 'speed', 'mac', 'ip', 'profile', 'vlan', 'activity', 'tx_total', 'rx_total', 'tx_rate', 'rx_rate'];
   const state = {
     mounted: true, loading: true, refreshing: false, seq: 0, error: '', source: '',
-    overview: {}, settingsOverview: {}, capabilities: {}, global: {}, globalDraft: {}, ports: [], profiles: [], lans: [], wans: [],
+    overview: {}, settingsOverview: {}, capabilities: {}, capabilitiesKnown: false, capabilitiesError: '', global: {}, globalDraft: {}, ports: [], profiles: [], lans: [], wans: [],
+    radius: [], radiusKnown: false, radiusError: '',
     query: '', status: 'all', kind: 'all', speed: 'all', poe: 'all', vlan: 'all', anomalyMin: 0, anomalyMax: 100, statistics: true,
     visibleColumns: new Set(DEFAULT_COLUMNS), sortKey: 'port', sortDirection: 'asc',
     pageTab: 'global', drawer: '', selectedId: '', selectedPorts: new Set(), portDraft: {}, portInitial: {}, portPreview: null,
@@ -461,6 +463,56 @@ export function mount(context = {}) {
     });
     return normalized;
   }
+  // Write capabilities for gateway port assignment ride on the
+  // /api/v1/topology/node/ports response. When that request fails we must not
+  // report "the backend does not implement it": the capability is simply unknown.
+  function capabilityProbeError(result) {
+    if (result?.status === 'fulfilled') return '';
+    const status = Number(result?.reason?.status) || 0;
+    if (status === 404 || status === 405 || status === 501) return `端口能力接口未实现（HTTP ${status}）`;
+    if (status === 401) return '会话已失效，请重新登录后读取端口写入能力';
+    if (status === 403) return '当前账号没有读取端口写入能力的权限';
+    if (status >= 500) return `端口能力读取失败：后端错误 HTTP ${status}`;
+    if (status) return `端口能力读取失败：HTTP ${status}`;
+    return `端口能力读取失败：${firstText(result?.reason?.message, '网络不可用')}`;
+  }
+  // The RADIUS list endpoint is the authority for both the rows and its own
+  // availability. Secrets stay server-side: the backend returns `secret_ref`, never a
+  // plaintext secret, and the UI only ever displays that reference.
+  function applyRadius(result) {
+    if (result?.status === 'fulfilled') {
+      const payload = result.value || {};
+      state.radius = asArray(payload.servers || payload.items || payload).map(normalizeRadiusServer);
+      state.radiusKnown = true;
+      state.radiusError = '';
+      return;
+    }
+    const status = Number(result?.reason?.status) || 0;
+    state.radius = [];
+    state.radiusKnown = false;
+    if (status === 404 || status === 405 || status === 501) state.radiusError = `RADIUS 接口未实现（HTTP ${status}）`;
+    else if (status === 401) state.radiusError = '会话已失效，请重新登录后查看 RADIUS 服务器';
+    else if (status === 403) state.radiusError = '当前账号没有查看 RADIUS 服务器的权限';
+    else if (status >= 500) state.radiusError = `RADIUS 读取失败：后端错误 HTTP ${status}`;
+    else if (status) state.radiusError = `RADIUS 读取失败：HTTP ${status}`;
+    else state.radiusError = `RADIUS 读取失败：${firstText(result?.reason?.message, '网络不可用')}`;
+  }
+
+  function normalizeRadiusServer(item = {}, index = 0) {
+    const authPort = Number(item.auth_port);
+    const acctPort = Number(item.accounting_port);
+    return {
+      id: firstText(item.id, item.uuid, `radius-${index + 1}`),
+      name: firstText(item.name, item.label, `RADIUS ${index + 1}`),
+      authAddr: firstText(item.auth_addr, item.address, item.host),
+      authPort: Number.isFinite(authPort) && authPort > 0 ? authPort : null,
+      acctAddr: firstText(item.accounting_addr, item.acct_addr),
+      acctPort: Number.isFinite(acctPort) && acctPort > 0 ? acctPort : null,
+      secretRef: firstText(item.secret_ref),
+      enabled: item.enabled !== false && item.enabled !== 0
+    };
+  }
+
   function mergeData(overview, settingsOverview, globalData, lansData, wansData, portsData, detailData, profileData, preferencesData) {
     const lanRows = listRows(lansData, ['lans', 'networks']);
     const wanRows = listRows(wansData, ['wans', 'interfaces']);
@@ -475,6 +527,7 @@ export function mount(context = {}) {
     state.overview = overview;
     state.settingsOverview = settingsOverview;
     state.capabilities = { ...(overview.capabilities || {}), ...(globalData.capabilities || {}), ...(globalData.global?.capabilities || {}), ...(detailData.capabilities || {}) };
+    state.capabilitiesKnown = Object.keys(state.capabilities).length > 0;
     state.global = clone(globalData.global || globalData || overview.global?.global || overview.global || {});
     if (!preserveGlobalDraft) state.globalDraft = clone(state.global);
     state.ports = ports;
@@ -519,12 +572,15 @@ export function mount(context = {}) {
       fetchResource('global-ports', ENDPOINTS.ports),
       fetchResource('global-topology-ports', ENDPOINTS.topologyPorts),
       fetchResource('global-port-profiles', ENDPOINTS.profiles),
-      fetchResource('global-port-preferences', `${ENDPOINTS.preferences}?view=network.global.ports`)
+      fetchResource('global-port-preferences', `${ENDPOINTS.preferences}?view=network.global.ports`),
+      fetchResource('global-radius', ENDPOINTS.radius)
     ]);
     if (!state.mounted || seq !== state.seq) return;
     const value = (index) => results[index].status === 'fulfilled' ? results[index].value : {};
     mergeData(value(0), value(1), value(2), value(3), value(4), value(5), value(6), value(7), value(8));
-    const failed = results.map((result, index) => result.status === 'rejected' && ![1,3,4,8].includes(index) ? ['网络概览', '设置摘要', '全局设置', '网络列表', '互联网列表', '端口状态', '端口邻居', '配置文件', '列偏好'][index] : '').filter(Boolean);
+    state.capabilitiesError = capabilityProbeError(results[6]);
+    applyRadius(results[9]);
+    const failed = results.map((result, index) => result.status === 'rejected' && ![1,3,4,8,9].includes(index) ? ['网络概览', '设置摘要', '全局设置', '网络列表', '互联网列表', '端口状态', '端口邻居', '配置文件', '列偏好', 'RADIUS'][index] : '').filter(Boolean);
     state.error = failed.length ? `${failed.join('、')}读取失败` : '';
     state.loading = false;
     state.refreshing = false;
@@ -825,12 +881,27 @@ export function mount(context = {}) {
   function gatewayPreviewMarkup() {
     if (!state.gatewayPreview) return '';
     const changes = gatewayChangeSummary();
-    const applySupported = strictCap('gateway_port_assignment_atomic_apply') && state.gatewayPreview.failed === 0;
-    return `<section class="gateway-change-preview" role="status"><header><div><strong>待应用变更</strong><span>${changes.length} 条角色分配 · ${state.gatewayPreview.ok}/${state.gatewayPreview.total} 个迁移步骤通过预检</span></div><span class="${applySupported ? 'is-ready' : 'is-blocked'}">${applySupported ? '可应用' : '仅可预览'}</span></header><div>${changes.map(({ wan, from, to }) => `<article><strong>${escapeHtml(wanAssignmentLabel(wan.id))}</strong><span>${escapeHtml(from ? `${gatewayPortName(from)} → ` : '未分配 → ')}${escapeHtml(to ? gatewayPortName(to) : '未分配（原端口回归 LAN）')}</span></article>`).join('')}</div><p>${applySupported ? '提交时由后端作为一个原子事务执行，并在管理可达性异常时自动回滚。' : '后端尚未提供多端口 WAN 分配原子事务；当前只展示真实预检结果，不会伪造保存。'}</p></section>`;
+    const atomicApply = strictCap('gateway_port_assignment_atomic_apply');
+    const applySupported = atomicApply && state.gatewayPreview.failed === 0;
+    const requiresConfirm = strictCap('gateway_port_assignment_requires_confirm');
+    return `<section class="gateway-change-preview" role="status"><header><div><strong>待应用变更</strong><span>${changes.length} 条角色分配 · ${state.gatewayPreview.ok}/${state.gatewayPreview.total} 个迁移步骤通过预检</span></div><span class="${applySupported ? 'is-ready' : 'is-blocked'}">${applySupported ? '可应用' : '仅可预览'}</span></header><div>${changes.map(({ wan, from, to }) => `<article><strong>${escapeHtml(wanAssignmentLabel(wan.id))}</strong><span>${escapeHtml(from ? `${gatewayPortName(from)} → ` : '未分配 → ')}${escapeHtml(to ? gatewayPortName(to) : '未分配（原端口回归 LAN）')}</span></article>`).join('')}</div><p>${escapeHtml(gatewayApplyExplanation(atomicApply, requiresConfirm, state.gatewayPreview.failed))}</p></section>`;
+  }
+  // Three distinct outcomes: capability true, capability explicitly false, and
+  // capability unknown because its source request failed. They must never share copy.
+  function gatewayApplyExplanation(atomicApply, requiresConfirm, failed) {
+    if (atomicApply) {
+      if (failed) return '部分迁移步骤预检未通过，请先解决失败项再提交；应用时后端会作为一个原子事务执行。';
+      return requiresConfirm
+        ? '提交需二次确认，由后端作为一个原子事务执行，并在管理可达性异常时自动回滚。'
+        : '提交时由后端作为一个原子事务执行，并在管理可达性异常时自动回滚。';
+    }
+    if (!state.capabilitiesKnown) return `${firstText(state.capabilitiesError, '端口写入能力未知')}；能力未确认前只展示真实预检结果，不会伪造保存。`;
+    return '当前设备报告不支持 Gateway 端口分配的原子应用；只展示真实预检结果，不会伪造保存。';
   }
   function renderGatewayPorts() {
     const canApply = state.gatewayPreview && state.gatewayPreview.failed === 0 && strictCap('gateway_port_assignment_atomic_apply');
-    return `<section class="gateway-ports-card dwrt-kit-glass-surface" data-global-gateway><header><div><strong>Gateway 端口</strong><span>查看链路状态并分配 WAN 角色</span></div><button class="policy-secondary" type="button" data-global-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '刷新中' : '刷新'}</span></button></header><div class="gateway-ports-body"><div class="gateway-port-map">${gatewayDiagramMarkup()}${gatewayLegendMarkup()}</div>${gatewayTableMarkup()}${gatewayPreviewMarkup()}${state.gatewayNotice ? `<div class="global-notice ${/失败|不支持|尚未/.test(state.gatewayNotice) ? 'is-error' : ''}">${escapeHtml(state.gatewayNotice)}</div>` : ''}</div>${gatewayDirty() ? `<footer><button class="policy-secondary" type="button" data-gateway-reset>取消</button>${canApply ? `<button class="policy-primary" type="button" data-gateway-apply ${state.saving ? 'disabled' : ''}>${state.saving ? '正在应用' : '确认应用'}</button>` : `<button class="policy-primary" type="button" data-gateway-preview ${state.saving ? 'disabled' : ''}>${state.saving ? '正在检查' : state.gatewayPreview ? '重新检查' : '应用更改'}</button>`}</footer>` : ''}</section>`;
+    const noticeError = /失败|不支持|未实现|未知|无法|必须/.test(state.gatewayNotice);
+    return `<section class="gateway-ports-card dwrt-kit-glass-surface" data-global-gateway><header><div><strong>Gateway 端口</strong><span>查看链路状态并分配 WAN 角色</span></div><button class="policy-secondary" type="button" data-global-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '刷新中' : '刷新'}</span></button></header><div class="gateway-ports-body"><div class="gateway-port-map">${gatewayDiagramMarkup()}${gatewayLegendMarkup()}</div>${gatewayTableMarkup()}${gatewayPreviewMarkup()}${state.gatewayNotice ? `<div class="global-notice ${noticeError ? 'is-error' : ''}">${escapeHtml(state.gatewayNotice)}</div>` : ''}</div>${gatewayDirty() ? `<footer><button class="policy-secondary" type="button" data-gateway-reset>取消</button>${canApply ? `<button class="policy-primary" type="button" data-gateway-apply ${state.saving ? 'disabled' : ''}>${state.saving ? '正在应用' : '确认应用'}</button>` : `<button class="policy-primary" type="button" data-gateway-preview ${state.saving ? 'disabled' : ''}>${state.saving ? '正在检查' : state.gatewayPreview ? '重新检查' : '应用更改'}</button>`}</footer>` : ''}</section>`;
   }
   function radio(name, value, label, count, checked) { return `<label class="policy-filter-row"><input type="radio" name="${name}" value="${value}" ${checked ? 'checked' : ''}><span class="policy-control-dot"></span><span class="policy-filter-label">${escapeHtml(label)}</span><span class="policy-filter-count">${count}</span></label>`; }
   function renderFilterDrawer() {
@@ -879,7 +950,7 @@ export function mount(context = {}) {
     const g = state.globalDraft;
     return `<section class="global-settings-section"><h3>网络行为</h3>${globalField('默认安全策略',globalSelect('default_posture',g.default_posture||'allow',[['allow','允许全部'],['deny','全部阻止']]),'未命中显式策略时的默认处理')}${globalField('Gateway mDNS 代理',globalSelect('mdns_proxy',g.mdns_proxy||'auto',[['auto','自动'],['enabled','自定义'],['disabled','关']],cap('mdns_proxy')),'跨网段发现 Bonjour / mDNS 服务')}${globalField('IGMP 监听',globalSwitch('igmp_snooping',Boolean(g.igmp_snooping),cap('igmp_snooping')),'优化网络内组播转发')}${globalField('流量控制',globalSwitch('flow_control',Boolean(g.flow_control),cap('flow_control')),'以太网 PAUSE 帧')}</section>
       <section class="global-settings-section"><h3>全局 Switch 设置</h3>${globalField('生成树',globalSwitch('bridge_stp',g.bridge_stp!==false,cap('stp')),'防止二层环路')}${globalField('生成树协议',globalSelect('stp_mode',g.stp_mode||'rstp',[['rstp','RSTP'],['stp','STP'],['disabled','已禁用']],cap('stp_mode')))}${globalField('转发延迟',`<input type="number" min="1" max="30" data-global-setting="bridge_forward_delay" value="${escapeHtml(g.bridge_forward_delay ?? 2)}" ${cap('stp')?'':'disabled'}>`, '秒')}${globalField('恶意 DHCP 服务器检测',globalSwitch('rogue_dhcp_detection',Boolean(g.rogue_dhcp_detection),cap('rogue_dhcp_detection')),'发现非授权 DHCP 服务')}${globalField('巨型帧',globalSwitch('jumbo_frames',Boolean(g.jumbo_frames),cap('jumbo_frames')),'使用大于 1500 字节的帧')}${globalField('802.1X 控制',globalSwitch('dot1x',Boolean(g.dot1x),cap('dot1x')),'端口级身份认证')}</section>
-      <section class="global-settings-section"><div class="global-section-heading"><div><h3>RADIUS 服务器</h3><small>本地凭据与外部认证服务器</small></div><button class="global-inline-action" type="button" ${strictCap('radius_write') ? '' : 'disabled'}>${icon('plus')}新建</button></div><div class="global-contract-note">后端仅声明 RADIUS 能力，尚未提供 secret 脱敏的完整列表与 CRUD 合同。</div></section>
+      <section class="global-settings-section"><div class="global-section-heading"><div><h3>RADIUS 服务器</h3><small>本地凭据与外部认证服务器</small></div></div>${radiusListMarkup()}</section>
       <section class="global-settings-section"><div class="global-section-heading"><div><h3>端口配置文件</h3><small>复用 VLAN、PoE 和链路设置</small></div><button class="global-inline-action" type="button" ${strictCap('port_profile_write') ? '' : 'disabled'}>${icon('plus')}新建</button></div><div class="global-profile-list">${state.profiles.length ? state.profiles.slice(0, 8).map((profile) => `<article><strong>${escapeHtml(firstText(profile.name, profile.label, profile.id))}</strong><small>${escapeHtml(firstText(profile.description, profile.native_vlan ? `原生 VLAN ${profile.native_vlan}` : '端口配置文件'))}</small></article>`).join('') : '<div class="dwrt-kit-table-empty">暂无端口配置文件</div>'}</div></section>`;
   }
   function advancedAvailabilityNote(message) {
@@ -924,7 +995,7 @@ export function mount(context = {}) {
       ${globalField('自动速度测试', globalSwitch('wan_auto_speed_test', Boolean(state.globalDraft.wan_auto_speed_test), strictCap('wan_auto_speed_test_write')), '定期校准线路可用带宽')}
       ${advancedActionRow('Gateway 端口分配', '重新分配物理网口的 WAN 角色', '管理端口')}
       ${advancedActionRow('WAN SLA', '设置延迟、丢包与可用性目标', '新建', strictCap('wan_sla_write'))}
-    </div>${advancedAvailabilityNote('Gateway 端口分配需要受保护事务；WAN SLA 尚未提供完整列表与 CRUD 合同。')}`;
+    </div>${advancedAvailabilityNote('Gateway 端口分配为受保护事务，提交前需通过预检并二次确认；WAN SLA 尚未提供完整列表与 CRUD 合同。')}`;
   }
   function advancedNetworkBehaviorMarkup() {
     const g = state.globalDraft;
@@ -950,7 +1021,18 @@ export function mount(context = {}) {
     </div>`;
   }
   function advancedRadiusMarkup() {
-    return `<div class="global-advanced-fields">${advancedActionRow('RADIUS 服务器', '本地凭据与外部认证服务器', '新建', strictCap('radius_write'))}</div>${advancedAvailabilityNote('后端仅声明 RADIUS 能力，尚未提供 secret 脱敏的完整列表与 CRUD 合同。')}`;
+    return `<div class="global-advanced-fields">${radiusListMarkup()}</div>${advancedAvailabilityNote('本页当前支持查看 RADIUS 服务器。凭据以后端 secret_ref 引用形式返回，页面不收集也不展示明文 secret。')}`;
+  }
+
+  function radiusListMarkup() {
+    if (!state.radiusKnown) return `<div class="global-contract-note">${escapeHtml(firstText(state.radiusError, 'RADIUS 读取失败'))}</div>`;
+    if (!state.radius.length) return '<div class="dwrt-kit-table-empty">暂无 RADIUS 服务器</div>';
+    return `<div class="global-profile-list global-radius-list">${state.radius.map((server) => {
+      const auth = server.authAddr ? `${server.authAddr}${server.authPort ? `:${server.authPort}` : ''}` : '未配置认证地址';
+      const acct = server.acctAddr ? `${server.acctAddr}${server.acctPort ? `:${server.acctPort}` : ''}` : '';
+      const detail = [auth, acct ? `计费 ${acct}` : '', server.secretRef ? `凭据 ${server.secretRef}` : '未绑定凭据', server.enabled ? '已启用' : '已停用'].filter(Boolean).join(' · ');
+      return `<article><strong>${escapeHtml(server.name)}</strong><small>${escapeHtml(detail)}</small></article>`;
+    }).join('')}</div>`;
   }
   function advancedProfilesMarkup() {
     return `<div class="global-advanced-fields">${advancedActionRow('端口配置文件', '复用 VLAN、PoE 和链路设置', '新建', strictCap('port_profile_write'))}</div><div class="global-profile-list global-advanced-profile-list">${state.profiles.length ? state.profiles.slice(0, 8).map((profile) => `<article><strong>${escapeHtml(firstText(profile.name, profile.label, profile.id))}</strong><small>${escapeHtml(firstText(profile.description, profile.native_vlan ? `原生 VLAN ${profile.native_vlan}` : '端口配置文件'))}</small></article>`).join('') : '<div class="dwrt-kit-table-empty">暂无端口配置文件</div>'}</div>`;
@@ -1200,7 +1282,14 @@ export function mount(context = {}) {
     const ok = results.filter((result) => result.status === 'fulfilled').length;
     state.saving = false;
     state.gatewayPreview = { total: steps.length, ok, failed: results.length - ok, results };
-    if (!strictCap('gateway_port_assignment_atomic_apply')) state.gatewayNotice = '预检已完成；后端尚未提供 Gateway 端口分配的原子应用合同。';
+    if (strictCap('gateway_port_assignment_atomic_apply')) {
+      if (state.gatewayPreview.failed) state.gatewayNotice = `预检完成：${state.gatewayPreview.failed}/${state.gatewayPreview.total} 个迁移步骤未通过，暂不能应用。`;
+      else if (strictCap('gateway_port_assignment_requires_confirm')) state.gatewayNotice = '预检全部通过；再次点击确认应用即提交原子事务，管理可达性异常时后端会自动回滚。';
+    } else if (!state.capabilitiesKnown) {
+      state.gatewayNotice = `预检已完成；${firstText(state.capabilitiesError, '端口写入能力未知')}，无法确认能否应用。`;
+    } else {
+      state.gatewayNotice = '预检已完成；当前设备报告不支持 Gateway 端口分配的原子应用。';
+    }
     render();
   }
   async function applyGatewayAssignments() {

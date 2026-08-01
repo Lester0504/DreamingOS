@@ -1,0 +1,546 @@
+.console-stage.is-ip-address-management {
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
+  height: 100dvh;
+  min-height: 0;
+  padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
+  overflow: hidden;
+}
+
+.console-stage.is-ip-address-management .stage-header {
+  display: none;
+}
+
+.console-stage .route-preview.ip-address-management-route-host {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.ip-address-management-route-host,
+.ip-address-management-route-host * {
+  box-sizing: border-box;
+}
+
+.ipam-page-host,
+.ipam-workbench {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.ipam-overlay-host:empty {
+  display: none;
+}
+
+.ipam-workbench {
+  display: grid;
+  grid-template-rows: 52px minmax(0, 1fr);
+  gap: 12px;
+  padding-bottom: max(24px, env(safe-area-inset-bottom));
+  background: transparent;
+  overflow: hidden;
+}
+
+.ipam-page-toolbar {
+  min-width: 0;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ipam-network-control {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The kit paints control material through .dwrt-kit-field descendants, so each
+   select needs a field wrapper. Keep the wrapper inline so the toolbar stays a row. */
+.ipam-network-control.dwrt-kit-field,
+.ipam-filter-field.dwrt-kit-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ipam-filter-field {
+  min-width: 0;
+  flex: 0 0 auto;
+}
+
+.ipam-network-control > span {
+  flex: 0 0 auto;
+  color: var(--color-text-secondary, var(--app-text-secondary));
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.ipam-network-control .ipam-select {
+  width: min(252px, 34vw);
+  min-width: 180px;
+  flex: 0 0 auto;
+}
+
+.ipam-read-state {
+  min-width: 0;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 12px;
+}
+
+.ipam-read-state > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ipam-read-state.is-warning {
+  color: var(--color-warning, var(--app-text-secondary));
+}
+
+.ipam-read-state.is-error {
+  color: var(--color-danger, var(--app-text-secondary));
+}
+
+.ipam-page-toolbar .dwrt-kit-icon-button {
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+}
+
+.ipam-table.dwrt-kit-table-wrap {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  border-radius: var(--app-radius-card, 24px);
+  overflow: hidden;
+}
+
+.ipam-inventory-toolbar {
+  min-width: 0;
+}
+
+.ipam-inventory-actions {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.ipam-inventory-actions .ipam-select {
+  width: 144px;
+  min-width: 124px;
+  flex: 0 0 auto;
+}
+
+.ipam-search {
+  --dwrt-search-expanded-width: min(360px, 32vw);
+}
+
+.ipam-inventory-head {
+  min-width: 0;
+  display: block;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--color-border-subtle, var(--dwrt-glass-edge));
+}
+
+.ipam-summary {
+  min-width: 0;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 0;
+}
+
+/* Each metric hugs its own label and value so the strip reads as pairs instead of
+   five stretched columns with the number pinned far from its label. */
+.ipam-summary > div {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  flex: 0 1 auto;
+  gap: 6px;
+  padding: 2px 12px;
+  border-right: 1px solid var(--color-border-subtle, var(--dwrt-glass-edge));
+}
+
+.ipam-summary > div:first-child {
+  padding-left: 0;
+}
+
+.ipam-summary > div:last-child {
+  border-right: 0;
+}
+
+.ipam-summary dt {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ipam-summary dd {
+  margin: 0;
+  color: var(--color-text-primary, var(--app-text));
+  font-size: 15px;
+  font-weight: 760;
+  font-variant-numeric: tabular-nums;
+}
+
+.ipam-summary .is-alert dd {
+  color: var(--color-danger, var(--app-text));
+}
+
+.ipam-table-scroll {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.ipam-table .dwrt-kit-table {
+  min-width: 720px;
+  table-layout: fixed;
+  font-variant-numeric: tabular-nums;
+}
+
+.ipam-table th:nth-child(1),
+.ipam-table td:nth-child(1) {
+  width: 152px;
+}
+
+.ipam-table th:nth-child(2),
+.ipam-table td:nth-child(2) {
+  width: 96px;
+}
+
+.ipam-table th:nth-child(3),
+.ipam-table td:nth-child(3) {
+  width: auto;
+}
+
+.ipam-table th:nth-child(4),
+.ipam-table td:nth-child(4) {
+  width: 152px;
+}
+
+.ipam-table th:nth-child(5),
+.ipam-table td:nth-child(5) {
+  width: 116px;
+}
+
+.ipam-table th:nth-child(6),
+.ipam-table td:nth-child(6) {
+  width: 124px;
+}
+
+.ipam-address-row {
+  cursor: pointer;
+}
+
+.ipam-address-row:focus-visible {
+  outline: 2px solid var(--color-accent, var(--app-accent));
+  outline-offset: -3px;
+}
+
+.ipam-address-row td strong,
+.ipam-address-row td small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ipam-address-row td small {
+  margin-top: 2px;
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+}
+
+.ipam-address-row.is-conflict td:first-child {
+  box-shadow: inset 3px 0 0 var(--color-danger, currentColor);
+}
+
+.ipam-monospace {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+
+.ipam-detail-sheet {
+  --dwrt-kit-sheet-width: min(460px, calc(100vw - 20px));
+  --dwrt-kit-sheet-max-width: min(460px, calc(100vw - 20px));
+}
+
+.ipam-detail-body {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+}
+
+.ipam-detail-status {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ipam-detail-status > span:last-child {
+  overflow: hidden;
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ipam-detail-list {
+  margin: 0;
+  display: grid;
+}
+
+.ipam-detail-list > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(112px, .42fr) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--color-border-subtle, var(--dwrt-glass-edge));
+}
+
+.ipam-detail-list dt {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+}
+
+.ipam-detail-list dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--color-text-primary, var(--app-text));
+  font-size: 13px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.ipam-readonly-note {
+  display: grid;
+  gap: 4px;
+}
+
+.ipam-readonly-note span {
+  color: var(--color-text-secondary, var(--app-text-secondary));
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ipam-fallback-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  border: 1px solid currentColor;
+  border-radius: var(--app-radius-small, 4px);
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+@media (max-width: 760px) {
+  .console-stage.is-ip-address-management {
+    padding: 8px;
+  }
+
+  .ipam-workbench {
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 8px;
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+  }
+
+  .ipam-page-toolbar {
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 44px;
+    gap: 8px;
+  }
+
+  .ipam-network-control {
+    min-width: 0;
+  }
+
+  .ipam-network-control > span {
+    display: none;
+  }
+
+  .ipam-network-control .ipam-select {
+    width: 100%;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .ipam-read-state {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    margin: 0;
+    justify-content: flex-start;
+  }
+
+  .ipam-page-toolbar .dwrt-kit-icon-button {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .ipam-inventory-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .ipam-inventory-actions {
+    width: 100%;
+  }
+
+  /* A fixed narrow width clipped option text once the kit added the chevron gutter.
+     Let the two filters share the leftover row space instead. */
+  .ipam-inventory-actions .ipam-filter-field {
+    min-width: 0;
+    flex: 1 1 0;
+  }
+
+  .ipam-inventory-actions .ipam-select {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .ipam-search {
+    --dwrt-search-expanded-width: 100%;
+  }
+
+  .ipam-inventory-head {
+    gap: 10px;
+    padding: 10px;
+  }
+
+  .ipam-summary {
+    gap: 6px 10px;
+  }
+
+  /* Wrapping is content-driven here, so a fixed "last in row" separator would land
+     on an arbitrary item. Use spacing instead of dividers on narrow layouts. */
+  .ipam-summary > div {
+    padding: 2px 0;
+    border-right: 0;
+  }
+
+  .ipam-table-scroll {
+    padding: 0 10px 10px;
+    overflow-x: hidden;
+  }
+
+  .ipam-table .dwrt-kit-table {
+    min-width: 0;
+    display: block;
+  }
+
+  .ipam-table thead {
+    display: none;
+  }
+
+  .ipam-table tbody {
+    display: grid;
+    gap: 8px;
+  }
+
+  .ipam-table tbody tr.ipam-address-row {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px 12px;
+    padding: 12px;
+    border: 1px solid var(--color-border-subtle, var(--dwrt-glass-edge));
+    border-radius: var(--app-radius-control, 6px);
+  }
+
+  .ipam-table tbody tr.ipam-address-row.is-conflict {
+    box-shadow: inset 3px 0 0 var(--color-danger, currentColor);
+  }
+
+  .ipam-table tbody tr.ipam-address-row td {
+    width: auto;
+    height: auto;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    white-space: normal;
+  }
+
+  .ipam-address-cell {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .ipam-status-cell {
+    grid-column: 2;
+    grid-row: 1;
+    align-self: start;
+  }
+
+  .ipam-identity-cell {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .ipam-mac-cell {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    color: var(--color-text-secondary, var(--app-text-secondary));
+  }
+
+  .ipam-source-cell {
+    grid-column: 1;
+    grid-row: 4;
+  }
+
+  .ipam-seen-cell {
+    grid-column: 2;
+    grid-row: 4;
+    align-self: end;
+    color: var(--color-text-muted, var(--app-text-muted));
+    font-size: 11px;
+    text-align: right;
+  }
+
+  .ipam-table tbody tr:not(.ipam-address-row) {
+    display: table-row;
+  }
+
+  .ipam-table tbody tr:not(.ipam-address-row) td {
+    white-space: normal;
+  }
+
+  .ipam-detail-list > div {
+    grid-template-columns: minmax(92px, .38fr) minmax(0, 1fr);
+  }
+}
