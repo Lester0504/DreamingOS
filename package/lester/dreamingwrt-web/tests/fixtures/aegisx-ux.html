@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/aegisx.css">
+  <style>
+    :root { --app-page-gutter-block:14px; --app-page-gutter-inline:14px; --app-page-gap:14px; --app-radius-card:14px; --app-radius-control:10px; --app-radius-compact:8px; --app-text:#f7faff; --app-text-secondary:#d8e2ee; --app-text-muted:#96a5b7; --app-accent:#4a9dff; --app-danger:#ff6b8a; --lg-highlight:.34; --lg-effective-opacity:.42; --lg-blur-radius:24px; }
+    * { box-sizing:border-box; }
+    html, body { width:100%; height:100%; margin:0; overflow:hidden; }
+    body { background:linear-gradient(135deg,#17324a,#47334e 56%,#234845); font:14px system-ui;color:var(--app-text); }
+    .console-main { width:100%; height:100dvh; overflow-x:hidden; overflow-y:auto; }
+  </style>
+</head>
+<body>
+  <main class="console-main"><section class="console-stage is-policy-table"><div id="routePreview" class="route-preview"></div></section></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    const regionRule = { id:'aegisx-region-default', name:'区域拦截', action:'block', direction:'both', src_zone:'wan', dst_zone:'', enabled:true };
+    const countries = [
+      { id:'CN', code:'CN', name:'China', continent:'Asia', enabled:false },
+      { id:'US', code:'US', name:'United States', continent:'North America', enabled:false },
+      { id:'RU', code:'RU', name:'Russia', continent:'Europe', enabled:false }
+    ];
+    const events = Array.from({ length:18 }, (_, index) => ({ id:index + 1, ts:1784463140 - index * 60, event_type:index % 2 ? 'dns_block' : 'honeypot_hit', action:'block', policy_name:'家庭保护', source_ip:`192.168.30.${80 + index}`, destination_host:'tracker.example', source:'aegisxd', production_event:true }));
+    const responses = {
+      '/api/v1/aegis/status':{ ok:true, capabilities:{ honeypot_config_supported:true }, runtime:{} },
+      '/api/v1/aegis/runtime':{}, '/api/v1/aegis/stats':{ events:18, blocks:12 }, '/api/v1/aegis/health':{ ok:true },
+      '/api/v1/aegis/events/recent':{ events },
+      '/api/v1/firewall/geo-block':{ countries, rules:[regionRule], feeds:[], events:[] },
+      '/api/v1/aegis/honeypot':{ items:[], runtime:{}, capabilities:{ config:true } },
+      '/api/v1/aegis/honeypot/events?limit=50&offset=0':{ items:[] },
+      '/api/v1/aegis/content-policy':{ items:[{ id:'family', name:'家庭保护', enabled:true, mode:'basic', scope:{ type:'all' }, safe_search:{}, categories:[], schedule:{ type:'always' } }], capabilities:{ content_policy_supported:true } },
+      '/api/v1/aegis/domain-overrides':{ items:[] }, '/api/v1/aegis/identification':{ mode:'disabled', capabilities:{} },
+      '/api/v1/aegis/app-blocks':{ items:[], capabilities:{ supported:true, schedule_modes:['always','weekday_time_ranges'], source_modes:['any','mac'] } },
+      '/api/v1/policy-engine/catalog?app_limit=500':{ applications:[{ app_id:1001, label:'YouTube', category:'Video' },{ app_id:1002, label:'TikTok', category:'Social' }] },
+      '/api/v1/aegis/content-policy/pcdn':{}, '/api/v1/logs/settings':{ settings:{} }, '/api/v1/network/lans':{ lans:[] }
+      ,'/api/v1/clients':{ clients:[{ display_name:'客厅电视', mac:'AA:BB:CC:DD:EE:01', ip:'192.168.30.21' }] }
+    };
+    window.fetch = async (url, options = {}) => {
+      if (String(url).includes('/api/v1/firewall/geo-block') && (options.method || 'GET') === 'PUT') {
+        const body = JSON.parse(options.body || '{}');
+        Object.assign(regionRule, body.rules?.[0] || {});
+        return { ok:true, status:200, json:async () => ({ ok:true }), text:async () => '{"ok":true}' };
+      }
+      return { ok:true, status:200, json:async () => responses[String(url)] || {}, text:async () => '{}' };
+    };
+    const kit = window.DWRT_UI_KIT || {};
+    const { mount } = await import('../../files/www/dreamingwrt/plugins/native/aegisx.js');
+    window.fixtureController = mount({
+      root:document.getElementById('routePreview'),
+      api:{ fetch:async (_name, url) => ({ ok:true, data:responses[url] || {} }) },
+      ui:{ mountAll:kit.mountAll, statusBadgeMarkup:kit.statusBadgeMarkup, scheduleAdaptiveForegroundSample:() => {} },
+      utils:{}
+    });
+  </script>
+</body>
+</html>

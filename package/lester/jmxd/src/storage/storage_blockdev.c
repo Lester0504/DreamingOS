@@ -25,6 +25,7 @@
 #define BLKDEV_EXEC_OUTPUT_MAX (256U * 1024U)
 #define BLKDEV_EXEC_KILL_GRACE_MS 200
 #define BLKDEV_LSBLK_TIMEOUT_MS 2500
+#define BLKDEV_SFDISK_TIMEOUT_MS 2500
 #define BLKDEV_MDADM_TIMEOUT_MS 2500
 
 /* ------------------------------------------------------------------ *
@@ -185,9 +186,24 @@ static const char *blkdev_tool_path(const char *name,
 
 static const char *blkdev_lsblk_path(void)
 {
+#ifdef STORAGE_BLOCKDEV_LSBLK_PATH
+    return STORAGE_BLOCKDEV_LSBLK_PATH;
+#else
     static const char *c[] = { "/usr/bin/lsblk", "/bin/lsblk",
                                "/sbin/lsblk", NULL };
     return blkdev_tool_path("lsblk", c);
+#endif
+}
+
+static const char *blkdev_sfdisk_path(void)
+{
+#ifdef STORAGE_BLOCKDEV_SFDISK_PATH
+    return STORAGE_BLOCKDEV_SFDISK_PATH;
+#else
+    static const char *c[] = { "/usr/sbin/sfdisk", "/sbin/sfdisk",
+                               "/usr/bin/sfdisk", "/bin/sfdisk", NULL };
+    return blkdev_tool_path("sfdisk", c);
+#endif
 }
 
 static const char *blkdev_mdadm_path(void)
@@ -344,6 +360,134 @@ static void blkdev_add_i64(struct json_object *o, const char *key, int64_t v)
         json_object_object_add(o, key, NULL);
 }
 
+static int blkdev_u64_add_ok(uint64_t a, uint64_t b, uint64_t *out)
+{
+    if (!out || b > UINT64_MAX - a)
+        return 0;
+    *out = a + b;
+    return 1;
+}
+
+/* sfdisk computes the usable ranges from the on-disk partition table. This is
+ * intentionally not reconstructed as disk-size minus partition sizes: GPT/MBR
+ * metadata and alignment gaps are not necessarily allocatable. */
+int jmx_storage_unallocated_extents(const char *device, uint64_t disk_bytes,
+                                    uint64_t fallback_sector_size,
+                                    struct json_object **extents_out,
+                                    uint64_t *bytes_out,
+                                    const char **reason_out)
+{
+    const char *sfdisk = blkdev_sfdisk_path();
+    struct blkdev_exec_result res;
+    struct json_object *parsed = NULL, *table = NULL, *parts = NULL;
+    struct json_object *extents = NULL;
+    uint64_t sector_size = fallback_sector_size, total = 0, previous_end = 0;
+    size_t i, count;
+    int rc = -1;
+
+    if (extents_out)
+        *extents_out = NULL;
+    if (bytes_out)
+        *bytes_out = 0;
+    if (reason_out)
+        *reason_out = "sfdisk_not_installed";
+    if (!device || !device[0] || !extents_out || !bytes_out || !reason_out ||
+        !sfdisk)
+        return -1;
+    {
+        char *argv[] = { (char *)sfdisk, "--json", "--list-free",
+                         (char *)device, NULL };
+        if (blkdev_exec(argv, BLKDEV_SFDISK_TIMEOUT_MS, &res) != 0) {
+            *reason_out = "sfdisk_exec_failed";
+            return -1;
+        }
+    }
+    if (res.timed_out) {
+        *reason_out = "sfdisk_timed_out";
+        goto out;
+    }
+    if (res.truncated) {
+        *reason_out = "sfdisk_output_truncated";
+        goto out;
+    }
+    if (res.exit_code != 0 || !res.output || !res.output_len) {
+        *reason_out = "sfdisk_list_free_failed";
+        goto out;
+    }
+    parsed = json_tokener_parse(res.output);
+    if (!parsed || !json_object_object_get_ex(parsed, "partitiontable", &table) ||
+        !json_object_is_type(table, json_type_object) ||
+        !json_object_object_get_ex(table, "partitions", &parts) ||
+        !json_object_is_type(parts, json_type_array)) {
+        *reason_out = "sfdisk_list_free_invalid_json";
+        goto out;
+    }
+    {
+        int64_t reported = blkdev_json_i64(table, "sectorsize");
+        if (reported > 0)
+            sector_size = (uint64_t)reported;
+    }
+    if (!sector_size || sector_size > (1024U * 1024U)) {
+        *reason_out = "sfdisk_invalid_sector_size";
+        goto out;
+    }
+    extents = json_object_new_array();
+    count = json_object_array_length(parts);
+    for (i = 0; i < count; i++) {
+        struct json_object *row = json_object_array_get_idx(parts, i);
+        int64_t start_i = blkdev_json_i64(row, "start");
+        int64_t size_i = blkdev_json_i64(row, "size");
+        uint64_t start, sectors, end_exclusive, capacity;
+        struct json_object *extent;
+
+        if (start_i < 0 || size_i <= 0) {
+            *reason_out = "sfdisk_invalid_free_extent";
+            goto out;
+        }
+        start = (uint64_t)start_i;
+        sectors = (uint64_t)size_i;
+        if (!blkdev_u64_add_ok(start, sectors, &end_exclusive) ||
+            start < previous_end || sectors > UINT64_MAX / sector_size) {
+            *reason_out = "sfdisk_invalid_free_extent";
+            goto out;
+        }
+        capacity = sectors * sector_size;
+        if (start > INT64_MAX || sectors > INT64_MAX ||
+            end_exclusive - 1 > INT64_MAX || capacity > INT64_MAX ||
+            (disk_bytes && (start > disk_bytes / sector_size ||
+                            end_exclusive > disk_bytes / sector_size ||
+                            capacity > disk_bytes - start * sector_size)) ||
+            total > UINT64_MAX - capacity) {
+            *reason_out = "sfdisk_free_extent_out_of_bounds";
+            goto out;
+        }
+        extent = json_object_new_object();
+        json_object_object_add(extent, "start_sector",
+                               json_object_new_int64((int64_t)start));
+        json_object_object_add(extent, "end_sector",
+                               json_object_new_int64((int64_t)(end_exclusive - 1)));
+        json_object_object_add(extent, "sector_count",
+                               json_object_new_int64((int64_t)sectors));
+        json_object_object_add(extent, "capacity_bytes",
+                               json_object_new_int64((int64_t)capacity));
+        json_object_array_add(extents, extent);
+        total += capacity;
+        previous_end = end_exclusive;
+    }
+    *extents_out = extents;
+    *bytes_out = total;
+    *reason_out = "sfdisk_partition_table_free_regions";
+    extents = NULL;
+    rc = 0;
+out:
+    if (extents)
+        json_object_put(extents);
+    if (parsed)
+        json_object_put(parsed);
+    blkdev_exec_free(&res);
+    return rc;
+}
+
 /* Build one partition object from an lsblk child node. */
 static struct json_object *blkdev_partition_from_lsblk(struct json_object *node,
                                                        int *protected_out)
@@ -420,6 +564,11 @@ static struct json_object *blkdev_disk_from_lsblk(struct json_object *node)
     const char *path = blkdev_json_str(node, "path");
     char sys_stable[512] = "";
     int any_protected = 0;
+    struct json_object *free_extents = NULL;
+    const char *free_reason = NULL;
+    int64_t total_bytes_i = blkdev_json_i64(node, "size");
+    int64_t sector_size_i = blkdev_json_i64(node, "log-sec");
+    uint64_t free_bytes = 0;
 
     blkdev_add_str(disk, "name", name);
     blkdev_add_str(disk, "device", path);
@@ -459,6 +608,24 @@ static struct json_object *blkdev_disk_from_lsblk(struct json_object *node)
     json_object_object_add(disk, "partitions", parts);
     json_object_object_add(disk, "system",
                            json_object_new_boolean(any_protected));
+    if (jmx_storage_unallocated_extents(
+            path, total_bytes_i > 0 ? (uint64_t)total_bytes_i : 0,
+            sector_size_i > 0 ? (uint64_t)sector_size_i : 512,
+            &free_extents, &free_bytes, &free_reason) == 0) {
+        json_object_object_add(disk, "unallocated_space_supported",
+                               json_object_new_boolean(1));
+        json_object_object_add(disk, "unallocated_bytes",
+                               json_object_new_int64((int64_t)free_bytes));
+        json_object_object_add(disk, "unallocated_extents", free_extents);
+        blkdev_add_str(disk, "unallocated_source", free_reason);
+    } else {
+        json_object_object_add(disk, "unallocated_space_supported",
+                               json_object_new_boolean(0));
+        json_object_object_add(disk, "unallocated_bytes", NULL);
+        json_object_object_add(disk, "unallocated_extents",
+                               json_object_new_array());
+        blkdev_add_str(disk, "unallocated_reason", free_reason);
+    }
     return disk;
 }
 
@@ -543,6 +710,10 @@ struct json_object *jmx_storage_partitions_get(void)
     }
 
     json_object_object_add(storage, "disks", disks);
+    json_object_object_add(storage, "contract_version",
+                           json_object_new_string("storage-partitions.v1"));
+    json_object_object_add(storage, "observed_at",
+                           json_object_new_int64((int64_t)time(NULL)));
     json_object_object_add(storage, "capabilities",
                            blkdev_partition_capabilities(have_inventory));
     if (!lsblk)

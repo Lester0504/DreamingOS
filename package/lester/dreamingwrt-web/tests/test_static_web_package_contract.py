@@ -8,6 +8,7 @@ PACKAGES = ROOT.parent
 WEB_MAKEFILE = (ROOT / "Makefile").read_text(encoding="utf-8")
 JMXD_MAKEFILE = (PACKAGES / "jmxd" / "Makefile").read_text(encoding="utf-8")
 WWW = ROOT / "files" / "www" / "dreamingwrt"
+SHELL = (WWW / "static/js/menu-shell.js").read_text(encoding="utf-8")
 
 
 for relative in (
@@ -57,7 +58,6 @@ assert authentication["label"] == "认证与管控"
 assert authentication["override_runtime_label"] is True
 authentication_children = {item.get("id"): item for item in authentication["children"]}
 for child_id in (
-    "authentication-client-speed-limit",
     "authentication-web-access-control",
     "authentication-app-filter",
     "authentication-client-network-control",
@@ -65,6 +65,27 @@ for child_id in (
     assert authentication_children[child_id]["availability"] == "unavailable"
     assert authentication_children[child_id]["capability"]
     assert authentication_children[child_id]["unavailable_reason"]
+client_speed_limit = authentication_children["authentication-client-speed-limit"]
+assert client_speed_limit["availability"] == "available"
+assert client_speed_limit["frontend_owned"] is True
+assert client_speed_limit["module"] == "native/client-speed-limit.js"
+assert client_speed_limit["style"] == "/static/css/user-authentication.css"
+assert (WWW / "plugins/native/client-speed-limit.js").is_file()
+network_children = {item.get("id"): item for item in network["children"]}
+assert network_children["bulk-ip"]["label"] == "IP 地址管理"
+assert network_children["bulk-ip"]["availability"] == "available"
+assert network_children["bulk-ip"]["frontend_owned"] is True
+assert network_children["bulk-ip"]["module"] == "native/ip-address-management.js"
+assert network_children["bulk-ip"]["style"] == "/static/css/ip-address-management.css"
+assert (WWW / "plugins/native/ip-address-management.js").is_file()
+assert not {"flow-control", "advanced-routing", "custom-config", "firewall"} & set(network_children)
+for old_route, new_route in {
+    "#/network/firewall": "#/policy-engine/table",
+    "#/network/custom-config": "#/policy-engine/objects",
+    "#/network/advanced-routing": "#/policy-engine/routes",
+    "#/network/flow-control": "#/policy-engine/flow-engine",
+}.items():
+    assert old_route in SHELL and new_route in SHELL
 native_plugins = next(item for item in menu["items"] if item.get("id") == "native-plugins")
 native_children = {item.get("id"): item for item in native_plugins["children"]}
 assert "native-plugins-index" not in native_children
@@ -251,14 +272,14 @@ assert "/plugins/native/ai-assistant.js" not in prewarm
 assert "/static/css/ai-assistant.css" not in prewarm
 assert "/static/js/dwrt-session-gate.js?v=20260720-01" in prewarm
 assert "/static/js/dwrt-data-registry.js?v=20260721-02" in prewarm
-assert "/static/js/menu-shell.js?v=20260730-session-recovery-clip-06" in prewarm
+assert "/static/js/menu-shell.js?v=20260731-policy-runtime-evidence-01" in prewarm
 assert "/static/ui-kit/dwrt-ui-kit.js?v=20260723-airview-radio-sheet-01" in prewarm
 assert "/static/js/device-images.js?v=20260723-airview-radio-sheet-01" in prewarm
-assert "const VERSION = '20260730-session-recovery-clip-06'" in prewarm
+assert "const VERSION = '20260731-policy-runtime-evidence-01'" in prewarm
 assert "/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260730-safari-glass-lite-06" in prewarm
 assert '/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260730-safari-glass-lite-06' in app_html
-assert '/static/js/menu-shell.js?v=20260730-session-recovery-clip-06' in app_html
-assert '/static/js/shell-prewarm.js?v=20260730-session-recovery-clip-06' in app_html
+assert '/static/js/menu-shell.js?v=20260731-policy-runtime-evidence-01' in app_html
+assert '/static/js/shell-prewarm.js?v=20260731-policy-runtime-evidence-01' in app_html
 assert '/static/js/device-images.js?v=20260723-airview-radio-sheet-01' in app_html
 assert "/static/js/menu-icons.js?v=20260722-auth-control-01" in prewarm
 assert "/static/css/dwrt-theme.css?v=20260722-03" in prewarm

@@ -3,6 +3,13 @@
 
 #include <stddef.h>
 
+/*
+ * U-15: hard ceiling the primitive accepts for a capture budget. It is
+ * exported so callers can bound their own budget against it at compile time
+ * instead of discovering the rejection as a permanent runtime failure.
+ */
+#define JMX_EXEC_OUTPUT_LIMIT_MAX (1024U * 1024U)
+
 struct jmx_exec_result {
     char *output;
     size_t output_len;

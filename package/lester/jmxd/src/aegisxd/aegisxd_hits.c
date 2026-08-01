@@ -3,6 +3,8 @@
 
 #include <fcntl.h>
 
+#include "jmx_exec.h"
+
 #define AEGISXD_HIT_TICK_MS 1000
 #define AEGISXD_HIT_READ_BUDGET 65536
 #define AEGISXD_HIT_MAX_LINE 2048
@@ -346,20 +348,97 @@ static int aegisxd_hits_lookup_arp(const char *ip, char *mac, size_t mac_len,
     return 0;
 }
 
+/*
+ * U-15: aegisxd used to reach external tools through popen(), so an operator
+ * or feed supplied address landed in a root shell command line. These helpers
+ * run fixed argv with a hard output and time budget, and treat timeout,
+ * truncation, signals and non-zero exits as failure instead of empty output.
+ */
+#define AEGISXD_EXEC_TIMEOUT_MS 5000
+#define AEGISXD_EXEC_IP_OUTPUT_MAX (64U * 1024U)
+#define AEGISXD_EXEC_NFT_OUTPUT_MAX (256U * 1024U)
+#define AEGISXD_IP_PATH "/sbin/ip"
+#define AEGISXD_NFT_PATH "/usr/sbin/nft"
+
+/*
+ * A budget above the primitive ceiling is rejected by jmx_exec_capture()
+ * before the fork, so the caller would fail every single time instead of
+ * capturing anything. Keep that a build error, not a silent dead path.
+ */
+_Static_assert(AEGISXD_EXEC_IP_OUTPUT_MAX <= JMX_EXEC_OUTPUT_LIMIT_MAX,
+               "aegisxd ip capture budget exceeds jmx_exec ceiling");
+_Static_assert(AEGISXD_EXEC_NFT_OUTPUT_MAX <= JMX_EXEC_OUTPUT_LIMIT_MAX,
+               "aegisxd nft capture budget exceeds jmx_exec ceiling");
+
+static int aegisxd_exec_capture_text(const char *path, char *const argv[],
+                                     size_t output_limit, char **out)
+{
+    struct jmx_exec_result result;
+
+    if (!out)
+        return -1;
+    *out = NULL;
+    if (jmx_exec_capture(path, argv, output_limit, AEGISXD_EXEC_TIMEOUT_MS,
+                         &result) != 0)
+        return -1;
+    if (result.timed_out || result.truncated || result.term_signal != 0 ||
+        result.exit_code != 0 || !result.output) {
+        jmx_exec_result_free(&result);
+        return -1;
+    }
+    *out = result.output;
+    result.output = NULL;
+    jmx_exec_result_free(&result);
+    return 0;
+}
+
+/*
+ * Same bounded contract, but a non-zero exit is reported to the caller instead
+ * of being folded into a generic failure. "nft list table" exits non-zero when
+ * the table simply does not exist, which is a normal disabled state and must
+ * stay distinguishable from a broken or hung nft.
+ */
+static int aegisxd_exec_capture_text_allow_exit(const char *path,
+                                                char *const argv[],
+                                                size_t output_limit,
+                                                char **out)
+{
+    struct jmx_exec_result result;
+
+    if (!out)
+        return -1;
+    *out = NULL;
+    if (jmx_exec_capture(path, argv, output_limit, AEGISXD_EXEC_TIMEOUT_MS,
+                         &result) != 0)
+        return -1;
+    if (result.timed_out || result.truncated || result.term_signal != 0 ||
+        !result.output) {
+        jmx_exec_result_free(&result);
+        return -1;
+    }
+    *out = result.output;
+    result.output = NULL;
+    jmx_exec_result_free(&result);
+    return 0;
+}
+
 static int aegisxd_hits_lookup_ip_neigh(const char *ip, char *mac, size_t mac_len,
                                         char *ifname, size_t ifname_len)
 {
-    FILE *fp;
-    char cmd[192];
-    char line[512];
+    char *argv[] = { (char *)AEGISXD_IP_PATH, "neigh", "show", "to",
+                     (char *)ip, NULL };
+    char *output = NULL;
+    char *line;
+    char *line_save = NULL;
+    int rc = 0;
 
     if (!aegisxd_hits_source_ip_safe(ip))
         return 0;
-    snprintf(cmd, sizeof(cmd), "ip neigh show %s 2>/dev/null", ip);
-    fp = popen(cmd, "r");
-    if (!fp)
+    if (aegisxd_exec_capture_text(AEGISXD_IP_PATH, argv,
+                                  AEGISXD_EXEC_IP_OUTPUT_MAX, &output) != 0)
         return 0;
-    while (fgets(line, sizeof(line), fp)) {
+    for (line = strtok_r(output, "\r\n", &line_save); line;
+         line = strtok_r(NULL, "\r\n", &line_save)) {
         char work[512];
         char *save = NULL;
         char *tok;
@@ -383,12 +462,12 @@ static int aegisxd_hits_lookup_ip_neigh(const char *ip, char *mac, size_t mac_le
         if (found_mac[0]) {
             snprintf(mac, mac_len, "%s", found_mac);
             snprintf(ifname, ifname_len, "%s", found_if);
-            pclose(fp);
-            return 1;
+            rc = 1;
+            break;
         }
     }
-    pclose(fp);
-    return 0;
+    free(output);
+    return rc;
 }
 
 static int aegisxd_hits_lookup_client_identity(const char *source_ip,
@@ -2154,8 +2233,11 @@ static int aegisxd_nft_parse_counter_line(const char *line, char *rule_id,
 
 static void aegisxd_nft_poll_counters(void)
 {
-    FILE *fp;
-    char line[4096];
+    char *argv[] = { (char *)AEGISXD_NFT_PATH, "list", "table", "inet",
+                     (char *)AEGISXD_NFT_TABLE, NULL };
+    char *output = NULL;
+    char *line;
+    char *line_save = NULL;
     int found = 0;
 
     if (!aegisxd_nft_active_state_present()) {
@@ -2163,13 +2245,15 @@ static void aegisxd_nft_poll_counters(void)
         snprintf(g_nft_last_error, sizeof(g_nft_last_error), "%s", "inactive_state_missing");
         return;
     }
-    fp = popen("nft list table inet " AEGISXD_NFT_TABLE " 2>/dev/null", "r");
-    if (!fp) {
+    if (aegisxd_exec_capture_text_allow_exit(AEGISXD_NFT_PATH, argv,
+                                             AEGISXD_EXEC_NFT_OUTPUT_MAX,
+                                             &output) != 0) {
         g_nft_table_present = 0;
         snprintf(g_nft_last_error, sizeof(g_nft_last_error), "%s", "nft_command_failed");
         return;
     }
-    while (fgets(line, sizeof(line), fp)) {
+    for (line = strtok_r(output, "\r\n", &line_save); line;
+         line = strtok_r(NULL, "\r\n", &line_save)) {
         char rule_id[96];
         char rule_name[160];
         uint64_t packets = 0;
@@ -2193,7 +2277,7 @@ static void aegisxd_nft_poll_counters(void)
         seen->bytes = bytes;
         seen->initialized = 1;
     }
-    (void)pclose(fp);
+    free(output);
     g_nft_counters_seen = found;
     g_nft_table_present = found > 0;
     snprintf(g_nft_last_error, sizeof(g_nft_last_error), "%s",

@@ -20,14 +20,24 @@ struct json_object *jmx_gen_api_response_data(int code,
 int main(int argc, char **argv)
 {
     struct json_object *response;
+    int mutate_mode = argc > 1 && !strcmp(argv[1], "mutate");
     int content_mode = argc > 1 && !strcmp(argv[1], "content");
-    int offset = content_mode ? 1 : 0;
+    int offset = (content_mode || mutate_mode) ? 1 : 0;
     const char *root_id = argc > 1 + offset ? argv[1 + offset] : "";
     const char *path = argc > 2 + offset ? argv[2 + offset] : "/";
     const char *search = argc > 3 + offset ? argv[3 + offset] : "";
 
-    response = content_mode ? jmx_storage_files_content(root_id, path) :
-                              jmx_storage_files_list(root_id, path, search);
+    if (mutate_mode) {
+        struct json_object *payload = json_tokener_parse(
+            argc > 2 ? argv[2] : "{}");
+
+        response = jmx_storage_files_mutate(payload);
+        if (payload)
+            json_object_put(payload);
+    } else {
+        response = content_mode ? jmx_storage_files_content(root_id, path) :
+                                  jmx_storage_files_list(root_id, path, search);
+    }
     if (!response)
         return 2;
     puts(json_object_to_json_string_ext(response, JSON_C_TO_STRING_PLAIN));

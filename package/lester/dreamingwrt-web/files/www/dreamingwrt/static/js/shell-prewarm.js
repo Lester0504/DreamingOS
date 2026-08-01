@@ -1,7 +1,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '20260730-session-recovery-clip-06';
+  const VERSION = '20260731-policy-runtime-evidence-01';
   const STORAGE = Object.freeze({
     menu: 'dreamingwrt.shellWarm.menu.v4',
     theme: 'dreamingwrt.shellWarm.theme.v2'
@@ -21,7 +21,7 @@
     '/static/ui-kit/dwrt-ui-kit.js?v=20260723-airview-radio-sheet-01',
     '/static/js/dwrt-session-gate.js?v=20260720-01',
     '/static/js/dwrt-data-registry.js?v=20260721-02',
-    '/static/js/menu-shell.js?v=20260730-session-recovery-clip-06'
+    '/static/js/menu-shell.js?v=20260731-policy-runtime-evidence-01'
   ]);
 
   function write(key, value) {

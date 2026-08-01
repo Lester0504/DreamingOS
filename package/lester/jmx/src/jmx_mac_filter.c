@@ -14,7 +14,7 @@
 #include "jmx_mac.h"
 #include "jmx_mac_filter.h"
 
-DEFINE_RWLOCK(mac_filter_lock);
+static DEFINE_RWLOCK(mac_filter_lock);
 
 #define mac_filter_read_lock() read_lock_bh(&mac_filter_lock);
 #define mac_filter_read_unlock() read_unlock_bh(&mac_filter_lock);
@@ -48,7 +48,7 @@ void jmx_mac_filter_exit(void) {
 	mac_filter_write_unlock();
 }
 
-mac_filter_rule_t *jmx_find_mac_filter_rule(int rule_id) {
+static mac_filter_rule_t *jmx_find_mac_filter_rule(int rule_id) {
 	mac_filter_rule_t *rule;
 	list_for_each_entry(rule, &mac_filter_rule_list, list) {
 		if (rule->rule_id == rule_id) {
@@ -58,7 +58,7 @@ mac_filter_rule_t *jmx_find_mac_filter_rule(int rule_id) {
 	return NULL;
 }
 
-int jmx_add_mac_filter_rule(int rule_id) {
+static int jmx_add_mac_filter_rule(int rule_id) {
 	mac_filter_rule_t *rule;
 
 	if (g_mac_rule_count >= MAX_MAC_FILTER_RULE_NUM) {
@@ -87,7 +87,7 @@ int jmx_add_mac_filter_rule(int rule_id) {
 	return 0;
 }
 
-int jmx_del_mac_filter_rule(int rule_id) {
+static int jmx_del_mac_filter_rule(int rule_id) {
 	mac_filter_rule_t *rule;
 	
 	mac_filter_write_lock();
@@ -105,22 +105,7 @@ int jmx_del_mac_filter_rule(int rule_id) {
 	return -1;
 }
 
-int jmx_add_mac_to_rule(int rule_id, const unsigned char *mac) {
-	mac_filter_rule_t *rule;
-	
-	mac_filter_write_lock();
-	rule = jmx_find_mac_filter_rule(rule_id);
-	if (rule) {
-		jmx_add_mac_node(&rule->mac_list, mac);
-		mac_filter_write_unlock();
-		return 0;
-	}
-	mac_filter_write_unlock();
-	
-	return -1;
-}
-
-int jmx_del_mac_from_rule(int rule_id, const unsigned char *mac) {
+static int jmx_del_mac_from_rule(int rule_id, const unsigned char *mac) {
 	mac_filter_rule_t *rule;
 	struct mac_node *node;
 	
@@ -180,9 +165,7 @@ mac_filter_rule_t *jmx_match_mac_filter_rule(const unsigned char *mac) {
 }
 
 int jmx_api_add_mac_filter_rule(cJSON *data_obj) {
-	int i;
 	cJSON *rule_id_obj;
-	cJSON *mac_array;
 	
 	if (!data_obj) {
 		return -1;
@@ -205,7 +188,6 @@ int jmx_api_mod_mac_filter_rule(cJSON *data_obj) {
 	int i;
 	cJSON *rule_id_obj;
 	cJSON *mac_array;
-	int mac_type = 0;
 	cJSON *mac_obj;
 	cJSON *action_obj;
 	mac_filter_rule_t *rule = NULL;
@@ -538,4 +520,3 @@ int jmx_api_flush_mac_filter_whitelist(cJSON *data_obj) {
 	mac_filter_write_unlock();
 	return 0;
 }
-

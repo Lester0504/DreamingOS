@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN" data-theme-resolved="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>flow-engine-runtime-fixture-01</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/flow-engine.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-control-material.css">
+  <style>
+    :root {
+      --app-page-gutter-block: 14px; --app-page-gutter-inline: 14px; --app-radius-card: 24px;
+      --app-text: rgb(239 245 252); --app-text-secondary: rgb(211 224 239); --app-text-muted: rgb(167 187 210);
+      --app-accent: rgb(46 139 255); --color-accent: var(--app-accent); --color-danger: rgb(239 86 99);
+      --color-warning: rgb(238 177 52); --color-border-subtle: rgb(255 255 255 / .12);
+      --dwrt-glass-neutral-color: 10 16 25; --dwrt-glass-neutral-density: .08; --dwrt-glass-saturation: 140%;
+      --lg-material-blur-soft: .5px; --dwrt-kit-text: var(--app-text); --dwrt-kit-muted: var(--app-text-muted);
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body.dwrt-app { display: block; color: var(--app-text); background: linear-gradient(145deg, rgb(22 55 86), rgb(35 72 61)); font-family: Lato, "PingFang SC", system-ui, sans-serif; }
+    .console-stage, #routePreview { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+  </style>
+</head>
+<body class="dwrt-app">
+  <main class="console-stage"><div id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script src="../../files/www/dreamingwrt/static/js/dwrt-data-registry.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/flow-engine.js';
+
+    const oldStatus = {
+      service: 'dreamingwrt-flowd', version: '1.0', schema_version: 1,
+      migration_state: 'not_tracked', settings_available: true, enabled: true,
+      apply_mode: 'plan-only', geoip_dir: '/etc/dreamingwrt/geoip', runtime_dir: '/etc/dreamingwrt/geoip/runtime',
+      sources: 2, enabled_sources: 2, qos_classes: 4, enabled_qos_classes: 4, apply_jobs: 2,
+      split_rules: 0, enabled_split_rules: 0, domain_rules: 0, enabled_domain_rules: 0,
+      app_rules: 0, enabled_app_rules: 0, country_policies: 0, enabled_country_policies: 0,
+      route_groups: 0, enabled_route_groups: 0, objects: 0, enabled_objects: 0,
+      custom_protocols: 0, enabled_custom_protocols: 0, qos_rules: 0, enabled_qos_rules: 0,
+      smart_qos_categories: 0, enabled_smart_qos_categories: 0, quota_rules: 0, enabled_quota_rules: 0,
+      conn_limit_rules: 0, enabled_conn_limit_rules: 0,
+      geoip: { configured_mmdb_present: true, configured_mmdb_valid: true, default_source: 'fixture', runtime_dir_present: false }
+    };
+    const modernStatus = {
+      ...oldStatus,
+      configured_enabled: true,
+      configured_apply_mode: 'plan-only',
+      runtime_contract_version: 'flow-engine-runtime-v1',
+      runtime_applied: false,
+      runtime_reason: 'dataplane_apply_executor_missing',
+      capabilities: {
+        flow_engine_read: true,
+        flow_engine_config_write: true,
+        flow_engine_apply: false,
+        flow_engine_runtime_readback: false,
+        nft_revision_readback: true,
+        nft_revision_sentinel_only: true,
+        reasons: { flow_engine_apply: 'dataplane_apply_executor_missing' }
+      }
+    };
+    const oldRuntime = {
+      worker_available: false, degraded: true, source: 'dreamingwrt.core_runtime',
+      message: 'flowd worker is not registered; using core runtime read-only sources', summary: {}
+    };
+    const modernRuntime = {
+      worker_available: true, degraded: true, source: 'dreamingwrt.flowd',
+      runtime_contract_version: 'flow-engine-runtime-v1', runtime_applied: false,
+      runtime_reason: 'dataplane_apply_executor_missing', summary: {}
+    };
+    const payloads = {
+      '/api/v1/flowd/settings': { enabled: true, apply_mode: 'plan-only' },
+      '/api/v1/flowd/qos/settings': { enabled: false, scheduler: 'htb', default_class: 'normal', unknown_class: 'normal', headroom_pct: 95 },
+      '/api/v1/flowd/qos/classes': { classes: [{ id: 'normal', name: 'Normal', enabled: true, priority: 300, guarantee_pct: 10, ceiling_pct: 100 }] },
+      '/api/v1/flowd/apply-jobs': { jobs: [{ id: 'compile-1', kind: 'compile', state: 'compiled', dry_run: true, requested_by: 'fixture', created_at: 1785502000 }] },
+      '/api/v1/flowd/wan-capacity': { entries: [] },
+      '/api/v1/flowd/wan-health': { worker_available: false, degraded: true, source: 'fixture', wans: [] },
+      '/api/v1/flow-control': { global: { apply_state: 'draft', last_apply_at: 0, engine: 'tc cake' }, qos: { enabled: true, scheduler: 'cake', ack_filter: true }, smart: { mode: 'smart', priorities: {} }, wans: [] },
+      '/api/v1/flowd/nft-revision': {
+        available: true, present: true, ownership_verified: true, sentinel_only: true,
+        revision: 'fixture-revision-1', contains_policy_rules: false, runtime_applied: false,
+        runtime_reason: 'dataplane_apply_executor_missing', source: 'nft-json-readback',
+        table_family: 'inet', table_name: 'dreamingwrt_flowd', observed_at: 1785502361
+      }
+    };
+
+    const root = document.getElementById('routePreview');
+    const registry = window.DWRT_DATA_REGISTRY;
+    const requests = [];
+    let scenario = 'legacy';
+    let controller = null;
+    let instance = null;
+    const resources = {
+      'flow.engineStatus': '/api/v1/flowd/status', 'flow.engineRuntime': '/api/v1/flowd/runtime',
+      'flow.nftRevision': '/api/v1/flowd/nft-revision', 'flow.engineSettings': '/api/v1/flowd/settings',
+      'flow.qosSettings': '/api/v1/flowd/qos/settings', 'flow.qosClasses': '/api/v1/flowd/qos/classes',
+      'flow.applyJobs': '/api/v1/flowd/apply-jobs', 'flow.wanCapacity': '/api/v1/flowd/wan-capacity',
+      'flow.wanHealth': '/api/v1/flowd/wan-health', 'flow.smartControl': '/api/v1/flow-control'
+    };
+    const clone = value => structuredClone(value);
+    Object.entries(resources).forEach(([key, url]) => registry.define(key, { url, owner: 'fixture', ttlMs: 0 }));
+    registry.fetcher = async (url, request = {}) => {
+      requests.push({ method: String(request.method || 'GET').toUpperCase(), url: String(url) });
+      if (url === '/api/v1/flowd/status') return new Response(JSON.stringify(clone(scenario === 'modern' ? modernStatus : oldStatus)), { status: 200 });
+      if (url === '/api/v1/flowd/runtime') return new Response(JSON.stringify(clone(scenario === 'modern' ? modernRuntime : oldRuntime)), { status: 200 });
+      if (url === '/api/v1/flowd/nft-revision' && scenario !== 'modern') throw new Error('legacy firmware must not request nft revision');
+      return new Response(JSON.stringify(clone(payloads[url] || {})), { status: 200 });
+    };
+
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+    async function waitFor(predicate) {
+      for (let index = 0; index < 160; index += 1) {
+        if (predicate()) return true;
+        await new Promise(resolve => setTimeout(resolve, 16));
+      }
+      throw new Error(`fixture timeout: ${scenario}`);
+    }
+    async function remount(nextScenario) {
+      instance?.unmount?.();
+      controller?.abort();
+      Object.keys(resources).forEach(key => registry.clear(key));
+      Object.entries(resources).forEach(([key, url]) => registry.define(key, { url, owner: 'fixture', ttlMs: 0 }));
+      scenario = nextScenario;
+      requests.length = 0;
+      controller = new AbortController();
+      instance = mount({
+        root, registry, signal: controller.signal,
+        capabilities: { flow_engine_config_write: true, flow_engine_apply: false },
+        ui: {
+          mountAll: node => window.DWRT_UI_KIT.mountAll(node),
+          statusBadgeMarkup: (...args) => window.DWRT_UI_KIT.statusBadgeMarkup(...args),
+          overviewCardsMarkup: (...args) => window.DWRT_UI_KIT.overviewCardsMarkup(...args)
+        },
+        utils: { escapeHtml, formatInteger: value => String(Number(value) || 0), formatRate: value => `${Number(value) || 0} B/s` }
+      });
+      await waitFor(() => root.innerText.includes('NFT 运行证据') && root.innerText.includes(nextScenario === 'modern' ? '仅所有权 sentinel' : '未读取 NFT revision'));
+      return contract();
+    }
+    function contract() {
+      const workbench = root.querySelector('.flow-engine-workbench');
+      return {
+        scenario,
+        text: root.innerText,
+        requests: clone(requests),
+        nftRequests: requests.filter(item => item.url === '/api/v1/flowd/nft-revision').length,
+        writes: requests.filter(item => item.method !== 'GET').length,
+        pageOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+        rootOverflow: root.scrollWidth > root.clientWidth + 1,
+        workbenchScrollable: Boolean(workbench && workbench.scrollHeight >= workbench.clientHeight),
+        transparentRoot: getComputedStyle(root).backgroundColor === 'rgba(0, 0, 0, 0)'
+      };
+    }
+    window.FLOW_ENGINE_FIXTURE = { remount, contract };
+    await remount('legacy');
+  </script>
+</body>
+</html>

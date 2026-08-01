@@ -16,16 +16,10 @@
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include "jmx_v2_rules.h"
-#include "jmx_v3_nl_handler.h"
+#include "jmx_v2_nl_handler.h"
 #include "jmx_conntrack.h"
 #include "jmx_log.h"
 #include "jmx_client.h"
-extern void jmx_v2_update_active_app(uint32_t appid, uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port, uint8_t proto);
-extern void jmx_v2_update_active_app6_ex(uint32_t appid,
-						 const uint8_t *src_ip6, const uint8_t *dst_ip6,
-						 uint16_t src_port, uint16_t dst_port, uint8_t proto,
-						 uint8_t app_proto, const char *host, uint8_t host_len);
-extern int g_record_enable;
 
 #define JMX_NL_ACT_RULE_FLUSH      10
 #define JMX_NL_ACT_RULE_ADD        11
@@ -187,8 +181,8 @@ static int v2_copy_rule(const struct v2_nl_rule *nr, jmx_v2_rule_t *kr)
  * Handle a v2 netlink message.
  * Returns 1 if handled, 0 if not.
  */
-int jmx_v2_nl_handle(const char *data, int len, uint32_t portid,
-		     uint32_t nlmsg_seq,
+int jmx_v2_nl_handle(const char *data, int len, u32 portid,
+		     u32 nlmsg_seq,
 		     jmx_v3_nl_reply_fn reply)
 {
 	int32_t action;

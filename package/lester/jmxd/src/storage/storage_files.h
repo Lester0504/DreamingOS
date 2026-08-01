@@ -9,5 +9,6 @@ struct json_object *jmx_storage_files_list(const char *root_id,
                                            const char *search);
 struct json_object *jmx_storage_files_content(const char *root_id,
                                               const char *path);
+struct json_object *jmx_storage_files_mutate(struct json_object *payload);
 
 #endif

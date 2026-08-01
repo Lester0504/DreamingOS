@@ -19,7 +19,7 @@
 #include "jmx_mac.h"
 #include "jmx_log.h"
 
-DEFINE_RWLOCK(app_filter_lock);
+static DEFINE_RWLOCK(app_filter_lock);
 
 #define app_filter_read_lock() read_lock_bh(&app_filter_lock);
 #define app_filter_read_unlock() read_unlock_bh(&app_filter_lock);
@@ -230,13 +230,13 @@ static app_filter_rule_t *jmx_find_app_filter_rule(int rule_id) {
     return NULL;
 }
 
-void jmx_update_appfilter_jiffies(void){
+static void jmx_update_appfilter_jiffies(void){
     g_appfilter_update_jiffies = jiffies;
 }
 
 
 
-int jmx_add_app_filter_rule(int rule_id) {
+static int jmx_add_app_filter_rule(int rule_id) {
     app_filter_rule_t *rule;
     
     if (g_app_rule_count >= MAX_APP_FILTER_RULE_NUM) {
@@ -272,7 +272,7 @@ int jmx_add_app_filter_rule(int rule_id) {
     return 0;
 }
 
-int jmx_del_app_filter_rule(int rule_id) {
+static int jmx_del_app_filter_rule(int rule_id) {
     app_filter_rule_t *rule;
     
     app_filter_write_lock();
@@ -293,23 +293,7 @@ int jmx_del_app_filter_rule(int rule_id) {
     return -1;
 }
 
-int jmx_add_app_id_to_rule(int rule_id, int app_id) {
-    app_filter_rule_t *rule;
-    
-    app_filter_write_lock();
-    rule = jmx_find_app_filter_rule(rule_id);
-    if (rule) {
-        add_app_id_node(&rule->app_id_list, app_id);
-        app_filter_write_unlock();
-        return 0;
-    }
-    app_filter_write_unlock();
-    
-    AF_ERROR("app filter rule %d not found\n", rule_id);
-    return -1;
-}
-
-int jmx_del_app_id_from_rule(int rule_id, int app_id) {
+static int jmx_del_app_id_from_rule(int rule_id, int app_id) {
     app_filter_rule_t *rule;
     app_id_node_t *node;
     int hash;

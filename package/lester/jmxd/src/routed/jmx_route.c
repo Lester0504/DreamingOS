@@ -1736,6 +1736,152 @@ static const char *route_obj_str(struct json_object *o, const char *k, const cha
     return def;
 }
 
+struct route_runtime_identity {
+    char runtime_id[160];
+    char source[64];
+    char reason[96];
+    int stable;
+};
+
+static uint64_t route_runtime_hash(const char *value)
+{
+    const unsigned char *p = (const unsigned char *)(value ? value : "");
+    uint64_t hash = UINT64_C(1469598103934665603);
+
+    while (*p) {
+        hash ^= (uint64_t)*p++;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t route_runtime_hash_alt(const char *value)
+{
+    const unsigned char *p = (const unsigned char *)(value ? value : "");
+    uint64_t hash = UINT64_C(5381);
+
+    while (*p)
+        hash = ((hash << 5) + hash) ^ (uint64_t)*p++;
+    return hash;
+}
+
+static int route_runtime_semantic_key(struct json_object *rule,
+                                      char *out, size_t out_len)
+{
+    unsigned wan_ids[JMX_ROUTE_MAX_WAN_IFACES];
+    char wan_key[64] = "";
+    char wan_input[128];
+    char *save = NULL;
+    char *token;
+    size_t wan_count = 0;
+    size_t i;
+    int written;
+
+    if (!rule || !out || out_len == 0)
+        return -1;
+    snprintf(wan_input, sizeof(wan_input), "%s",
+             route_obj_str(rule, "wan_ids", ""));
+    for (token = strtok_r(wan_input, ",", &save); token &&
+         wan_count < JMX_ROUTE_MAX_WAN_IFACES;
+         token = strtok_r(NULL, ",", &save)) {
+        char *end = NULL;
+        unsigned long value;
+
+        while (*token == ' ' || *token == '\t')
+            token++;
+        errno = 0;
+        value = strtoul(token, &end, 10);
+        while (end && (*end == ' ' || *end == '\t'))
+            end++;
+        if (errno || end == token || (end && *end) || value > UINT8_MAX)
+            return -1;
+        wan_ids[wan_count++] = (unsigned)value;
+    }
+    if (token)
+        return -1;
+    for (i = 0; i < wan_count; i++) {
+        size_t used = strlen(wan_key);
+        int n = snprintf(wan_key + used, sizeof(wan_key) - used,
+                         "%s%u", i ? "," : "", wan_ids[i]);
+
+        if (n < 0 || (size_t)n >= sizeof(wan_key) - used)
+            return -1;
+    }
+    written = snprintf(out, out_len,
+        "en=%d|proto=%d|appid=%d|carrier=%d|src=%s|dst=%s|dport=%d|mode=%d|wans=%s",
+        route_obj_int(rule, "enabled", 0),
+        route_obj_int(rule, "proto", 0),
+        route_obj_int(rule, "appid", 0),
+        route_obj_int(rule, "carrier_id", 0),
+        route_obj_str(rule, "src", ""),
+        route_obj_str(rule, "dst", ""),
+        route_obj_int(rule, "dst_port", 0),
+        route_obj_int(rule, "sticky_mode", 0),
+        wan_key);
+    return written >= 0 && (size_t)written < out_len ? 0 : -1;
+}
+
+static int route_runtime_semantic_duplicates(struct json_object *rules,
+                                             size_t current,
+                                             const char *semantic_key)
+{
+    size_t i;
+    int matches = 0;
+
+    if (!rules || !json_object_is_type(rules, json_type_array) ||
+        !semantic_key || !semantic_key[0])
+        return 0;
+    for (i = 0; i < json_object_array_length(rules); i++) {
+        struct json_object *candidate = json_object_array_get_idx(rules, i);
+        char candidate_key[512];
+
+        if (i == current)
+            continue;
+        if (route_runtime_semantic_key(candidate, candidate_key,
+                                       sizeof(candidate_key)) == 0 &&
+            !strcmp(candidate_key, semantic_key))
+            matches++;
+    }
+    return matches;
+}
+
+static void route_runtime_identity_resolve(struct json_object *rules,
+                                           size_t index,
+                                           struct json_object *rule,
+                                           struct route_runtime_identity *identity)
+{
+    char semantic_key[512];
+    uint64_t semantic_hash;
+    uint64_t semantic_hash_alt;
+
+    if (!identity)
+        return;
+    memset(identity, 0, sizeof(*identity));
+    snprintf(identity->source, sizeof(identity->source), "%s", "unavailable");
+    snprintf(identity->reason, sizeof(identity->reason), "%s", "identity_unavailable");
+    if (!rule || route_runtime_semantic_key(rule, semantic_key,
+                                            sizeof(semantic_key)) != 0) {
+        snprintf(identity->reason, sizeof(identity->reason), "%s",
+                 "runtime_semantics_invalid");
+        return;
+    }
+    if (route_runtime_semantic_duplicates(rules, index, semantic_key) > 0) {
+        snprintf(identity->reason, sizeof(identity->reason), "%s",
+                 "duplicate_runtime_semantics");
+        return;
+    }
+    semantic_hash = route_runtime_hash(semantic_key);
+    semantic_hash_alt = route_runtime_hash_alt(semantic_key);
+    snprintf(identity->runtime_id, sizeof(identity->runtime_id),
+             "runtime-route:%016llx%016llx",
+             (unsigned long long)semantic_hash,
+             (unsigned long long)semantic_hash_alt);
+    snprintf(identity->source, sizeof(identity->source), "%s",
+             "runtime_semantic_fingerprint_v1");
+    snprintf(identity->reason, sizeof(identity->reason), "%s", "ok");
+    identity->stable = 1;
+}
+
 static int route_state_db_init(sqlite3 **out_db)
 {
     sqlite3 *db = NULL;
@@ -1770,6 +1916,26 @@ static int route_state_db_init(sqlite3 **out_db)
         "last_hit INTEGER DEFAULT 0,"
         "updated_at INTEGER NOT NULL"
         ");"
+        "CREATE TABLE IF NOT EXISTS route_rule_counter_v2 ("
+        "runtime_id TEXT PRIMARY KEY,"
+        "configured_id TEXT DEFAULT '',"
+        "configured_type TEXT DEFAULT '',"
+        "kernel_prio INTEGER NOT NULL,"
+        "name TEXT DEFAULT '',"
+        "action TEXT NOT NULL,"
+        "target TEXT DEFAULT '',"
+        "hit_count INTEGER NOT NULL DEFAULT 0,"
+        "byte_count INTEGER,"
+        "byte_counter_supported INTEGER NOT NULL DEFAULT 0,"
+        "last_hit INTEGER DEFAULT 0,"
+        "observed_at INTEGER NOT NULL,"
+        "reset_generation INTEGER NOT NULL DEFAULT 0,"
+        "counter_source TEXT NOT NULL DEFAULT 'jmx_route_kernel',"
+        "identity_source TEXT NOT NULL,"
+        "updated_at INTEGER NOT NULL"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_route_rule_counter_v2_configured "
+        "ON route_rule_counter_v2(configured_id, updated_at);"
         "CREATE TABLE IF NOT EXISTS route_decision_sample ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "ts INTEGER NOT NULL,"
@@ -1809,12 +1975,19 @@ static int route_rule_counter_upsert(sqlite3 *db, struct json_object *rule, time
 {
     sqlite3_stmt *st = NULL;
     char rule_id[64];
+    const char *runtime_id;
+    const char *configured_id;
+    const char *configured_type;
+    const char *identity_source;
     const char *name;
     const char *action;
     const char *target;
     int prio;
     int64_t hits;
     int64_t last_hit;
+    int64_t previous_hits = 0;
+    int reset_generation = 0;
+    int reset_detected = 0;
     int rc = -1;
 
     if (!db || !rule)
@@ -1867,6 +2040,74 @@ static int route_rule_counter_upsert(sqlite3 *db, struct json_object *rule, time
     if (sqlite3_step(st) == SQLITE_DONE)
         rc = 0;
     sqlite3_finalize(st);
+    if (rc != 0)
+        return rc;
+
+    runtime_id = route_obj_str(rule, "runtime_id", NULL);
+    configured_id = route_obj_str(rule, "configured_id", "");
+    configured_type = route_obj_str(rule, "configured_type", "");
+    identity_source = route_obj_str(rule, "runtime_identity_source", "unavailable");
+    if (!runtime_id || !runtime_id[0] ||
+        !route_obj_int(rule, "runtime_identity_stable", 0))
+        return 0;
+    if (sqlite3_prepare_v2(db,
+        "SELECT hit_count,reset_generation FROM route_rule_counter_v2 "
+        "WHERE runtime_id=?1", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, runtime_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            previous_hits = sqlite3_column_int64(st, 0);
+            reset_generation = sqlite3_column_int(st, 1);
+            if (hits < previous_hits) {
+                reset_generation++;
+                reset_detected = 1;
+            }
+        }
+        sqlite3_finalize(st);
+        st = NULL;
+    } else {
+        return -1;
+    }
+    if (sqlite3_prepare_v2(db,
+        "INSERT INTO route_rule_counter_v2("
+        "runtime_id,configured_id,configured_type,kernel_prio,name,action,target,hit_count,byte_count,"
+        "byte_counter_supported,last_hit,observed_at,reset_generation,counter_source,"
+        "identity_source,updated_at) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL,0,?9,?10,?11,'jmx_route_kernel',?12,?13) "
+        "ON CONFLICT(runtime_id) DO UPDATE SET "
+        "configured_id=excluded.configured_id,configured_type=excluded.configured_type,"
+        "kernel_prio=excluded.kernel_prio,"
+        "name=excluded.name,action=excluded.action,target=excluded.target,"
+        "hit_count=excluded.hit_count,byte_count=NULL,byte_counter_supported=0,"
+        "last_hit=excluded.last_hit,observed_at=excluded.observed_at,"
+        "reset_generation=excluded.reset_generation,counter_source=excluded.counter_source,"
+        "identity_source=excluded.identity_source,updated_at=excluded.updated_at",
+        -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(st, 1, runtime_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, configured_id ? configured_id : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, configured_type ? configured_type : "", -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 4, prio);
+    sqlite3_bind_text(st, 5, name ? name : rule_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, action ? action : "route", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, target ? target : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 8, hits);
+    sqlite3_bind_int64(st, 9, last_hit);
+    sqlite3_bind_int64(st, 10, (int64_t)now);
+    sqlite3_bind_int(st, 11, reset_generation);
+    sqlite3_bind_text(st, 12, identity_source ? identity_source : "unavailable",
+                      -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 13, (int64_t)now);
+    rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
+    sqlite3_finalize(st);
+    if (rc != 0)
+        return rc;
+    json_object_object_add(rule, "counter_reset_generation",
+                           json_object_new_int(reset_generation));
+    json_object_object_add(rule, "counter_reset_detected",
+                           json_object_new_boolean(reset_detected));
+    json_object_object_add(rule, "observed_at",
+                           json_object_new_int64((int64_t)now));
     return rc;
 }
 
@@ -1876,20 +2117,52 @@ static int route_state_persist_rule_counters(struct json_object *data)
     struct json_object *rules = NULL;
     time_t now = time(NULL);
     int persisted = 0;
-    int i;
+    size_t i;
+
+#define ROUTE_COUNTER_STATE_CLEAR() do { \
+    for (i = 0; i < json_object_array_length(rules); i++) { \
+        struct json_object *state_rule = json_object_array_get_idx(rules, i); \
+        json_object_object_del(state_rule, "counter_reset_generation"); \
+        json_object_object_del(state_rule, "counter_reset_detected"); \
+    } \
+} while (0)
 
     if (!data || !json_object_object_get_ex(data, "rules", &rules) ||
         !json_object_is_type(rules, json_type_array))
         return 0;
     if (route_state_db_init(&db) != 0 || !db)
         return -1;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
     for (i = 0; i < json_object_array_length(rules); i++) {
-        if (route_rule_counter_upsert(db, json_object_array_get_idx(rules, i), now) == 0)
-            persisted++;
+        if (route_rule_counter_upsert(db, json_object_array_get_idx(rules, i), now) != 0) {
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            sqlite3_close(db);
+            ROUTE_COUNTER_STATE_CLEAR();
+            json_object_object_add(data, "route_rule_counter_persisted",
+                                   json_object_new_int(0));
+            json_object_object_add(data, "route_rule_counter_persist_error",
+                                   json_object_new_string("counter_state_transaction_failed"));
+            return -1;
+        }
+        persisted++;
+    }
+    if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        sqlite3_close(db);
+        ROUTE_COUNTER_STATE_CLEAR();
+        json_object_object_add(data, "route_rule_counter_persisted",
+                               json_object_new_int(0));
+        json_object_object_add(data, "route_rule_counter_persist_error",
+                               json_object_new_string("counter_state_commit_failed"));
+        return -1;
     }
     sqlite3_close(db);
     json_object_object_add(data, "route_rule_counter_persisted", json_object_new_int(persisted));
     json_object_object_add(data, "route_rule_counter_db", json_object_new_string(JMX_ROUTE_STATE_DB_PATH));
+#undef ROUTE_COUNTER_STATE_CLEAR
     return persisted;
 }
 
@@ -2036,7 +2309,7 @@ static void route_enrich_wan_runtime(struct json_object *w, const char *name)
 static void route_enrich_wans(struct json_object *data)
 {
     struct json_object *wans = NULL;
-    int i;
+    size_t i;
     if (!json_object_object_get_ex(data, "wans", &wans) || !json_object_is_type(wans, json_type_array)) return;
     for (i = 0; i < json_object_array_length(wans); i++) {
         struct json_object *w = json_object_array_get_idx(wans, i);
@@ -2080,6 +2353,7 @@ static void route_enrich_rules(struct json_object *data)
         int appid = route_obj_int(r, "appid", 0);
         int64_t hits = route_obj_i64(r, "hit_count", 0);
         int64_t last_hit_s = route_obj_i64(r, "last_hit_seconds_ago", -1);
+        struct route_runtime_identity identity;
         char id[64], name[128], match[256], target[128];
         snprintf(id, sizeof(id), "rule-%d", prio);
         snprintf(name, sizeof(name), "%s%s%d", appid > 0 ? route_app_name(appid) : "规则 ", appid > 0 ? " " : "", prio);
@@ -2095,6 +2369,27 @@ static void route_enrich_rules(struct json_object *data)
         if (!json_has_key(r, "active_flows")) json_object_object_add(r, "active_flows", json_object_new_int(0));
         if (!json_has_key(r, "down_rate")) json_object_object_add(r, "down_rate", json_object_new_int64(0));
         if (!json_has_key(r, "up_rate")) json_object_object_add(r, "up_rate", json_object_new_int64(0));
+        route_runtime_identity_resolve(rules, i, r, &identity);
+        json_object_object_add(r, "kernel_priority", json_object_new_int(prio));
+        json_object_object_add(r, "runtime_identity_stable",
+                               json_object_new_boolean(identity.stable));
+        json_object_object_add(r, "runtime_identity_source",
+                               json_object_new_string(identity.source));
+        json_object_object_add(r, "runtime_identity_reason",
+                               json_object_new_string(identity.reason));
+        json_object_object_add(r, "runtime_id",
+                               identity.stable ? json_object_new_string(identity.runtime_id) :
+                               json_object_new_null());
+        json_object_object_add(r, "configured_id", json_object_new_null());
+        json_object_object_add(r, "configured_id_source",
+                               json_object_new_string("not_carried_by_kernel_route_rule_v1"));
+        json_object_object_add(r, "byte_count", json_object_new_null());
+        json_object_object_add(r, "byte_counter_supported",
+                               json_object_new_boolean(0));
+        json_object_object_add(r, "byte_counter_reason",
+                               json_object_new_string("jmx_route_kernel_exposes_packet_hits_only"));
+        json_object_object_add(r, "observed_at",
+                               json_object_new_int64((int64_t)time(NULL)));
         if (!json_has_key(r, "last_hit")) {
             if (hits > 0 && last_hit_s >= 0)
                 json_object_object_add(r, "last_hit", json_object_new_int64((int64_t)time(NULL) - last_hit_s));
@@ -2118,6 +2413,78 @@ static void route_enrich_rules(struct json_object *data)
         if (!json_has_key(r, "remark"))
             json_object_object_add(r, "remark", json_object_new_string("内核 jmx_route 聚合命中计数；Aegis 只在 hit_count 增量时生成 verified policy_route 事件"));
     }
+}
+
+static struct json_object *route_rule_counters_batch(struct json_object *rules,
+                                                     int state_ready)
+{
+    struct json_object *items = json_object_new_array();
+    int i;
+
+    if (!items)
+        return NULL;
+    if (!rules || !json_object_is_type(rules, json_type_array))
+        return items;
+    for (i = 0; i < json_object_array_length(rules); i++) {
+        struct json_object *rule = json_object_array_get_idx(rules, i);
+        struct json_object *item = json_object_new_object();
+        struct json_object *runtime_id = NULL;
+        struct json_object *configured_id = NULL;
+
+        if (!item) {
+            json_object_put(items);
+            return NULL;
+        }
+        json_object_object_get_ex(rule, "runtime_id", &runtime_id);
+        json_object_object_get_ex(rule, "configured_id", &configured_id);
+        json_object_object_add(item, "runtime_id",
+            runtime_id ? json_object_get(runtime_id) : json_object_new_null());
+        json_object_object_add(item, "configured_id",
+            configured_id ? json_object_get(configured_id) : json_object_new_null());
+        json_object_object_add(item, "kernel_priority",
+                               json_object_new_int(route_obj_int(rule, "prio", 0)));
+        json_object_object_add(item, "hit_count",
+                               json_object_new_int64(route_obj_i64(rule, "hit_count", 0)));
+        json_object_object_add(item, "byte_count", json_object_new_null());
+        json_object_object_add(item, "last_hit",
+            route_obj_i64(rule, "last_hit", 0) > 0 ?
+            json_object_new_int64(route_obj_i64(rule, "last_hit", 0)) :
+            json_object_new_null());
+        json_object_object_add(item, "counter_source",
+                               json_object_new_string("jmx_route_kernel"));
+        json_object_object_add(item, "counter_precision",
+                               json_object_new_string("aggregate_rule_packet_counter"));
+        json_object_object_add(item, "counter_ready", json_object_new_boolean(1));
+        json_object_object_add(item, "byte_counter_supported",
+                               json_object_new_boolean(0));
+        json_object_object_add(item, "byte_counter_reason",
+                               json_object_new_string("jmx_route_kernel_exposes_packet_hits_only"));
+        json_object_object_add(item, "observed_at",
+                               json_object_new_int64(route_obj_i64(rule, "observed_at", 0)));
+        if (!route_obj_int(rule, "runtime_identity_stable", 0)) {
+            json_object_object_add(item, "reset_generation", json_object_new_null());
+            json_object_object_add(item, "reset_detected", json_object_new_null());
+            json_object_object_add(item, "state_ready", json_object_new_boolean(0));
+            json_object_object_add(item, "state_reason",
+                                   json_object_new_string(route_obj_str(
+                                       rule, "runtime_identity_reason",
+                                       "runtime_identity_unavailable")));
+        } else if (state_ready) {
+            json_object_object_add(item, "reset_generation",
+                json_object_new_int(route_obj_int(rule, "counter_reset_generation", 0)));
+            json_object_object_add(item, "reset_detected",
+                json_object_new_boolean(route_obj_int(rule, "counter_reset_detected", 0)));
+            json_object_object_add(item, "state_ready", json_object_new_boolean(1));
+        } else {
+            json_object_object_add(item, "reset_generation", json_object_new_null());
+            json_object_object_add(item, "reset_detected", json_object_new_null());
+            json_object_object_add(item, "state_ready", json_object_new_boolean(0));
+            json_object_object_add(item, "state_reason",
+                                   json_object_new_string("counter_state_persistence_failed"));
+        }
+        json_object_array_add(items, item);
+    }
+    return items;
 }
 
 static struct json_object *route_build_policy_groups(struct json_object *data)
@@ -2226,6 +2593,7 @@ static void route_enrich_status(struct json_object *data)
     const char *counter_reason;
     int main_nondefault_count;
     int main_nondefault_ready;
+    int counter_state_ready = 0;
     int i;
     if (!data) return;
     (void)route_state_db_init(NULL);
@@ -2310,7 +2678,26 @@ static void route_enrich_status(struct json_object *data)
     if (!json_has_key(data, "wan_count")) json_object_object_add(data, "wan_count", json_object_new_int(wc));
     if (!json_has_key(data, "rule_count")) json_object_object_add(data, "rule_count", json_object_new_int(rc));
     if (available)
-        route_state_persist_rule_counters(data);
+        counter_state_ready = route_state_persist_rule_counters(data) >= 0;
+    json_object_object_add(data, "rule_counter_batch_supported",
+                           json_object_new_boolean(available != 0));
+    json_object_object_add(data, "rule_counter_batch_source",
+                           json_object_new_string(available ? "jmx_route_kernel_snapshot" :
+                                                  "unavailable"));
+    json_object_object_add(data, "rule_counter_identity_version",
+                           json_object_new_string("runtime_semantic_fingerprint_v1"));
+    json_object_object_add(data, "configured_id_supported",
+                           json_object_new_boolean(0));
+    json_object_object_add(data, "configured_id_reason",
+                           json_object_new_string("kernel_route_rule_v1_does_not_carry_configured_id"));
+    json_object_object_add(data, "rule_counters",
+                           route_rule_counters_batch(rules, counter_state_ready));
+    json_object_object_add(policy, "rule_counter_batch_supported",
+                           json_object_new_boolean(available != 0));
+    json_object_object_add(policy, "runtime_identity_supported",
+                           json_object_new_boolean(available != 0));
+    json_object_object_add(policy, "configured_id_supported",
+                           json_object_new_boolean(0));
     adv_fp = fopen(JMX_ROUTE_ADV_SYNC_STATE, "r");
     if (adv_fp) {
         char buf[2048];

@@ -10,6 +10,17 @@ EXEC_HEADER = ROOT / "src/jmx_exec.h"
 WORK_MODE = (ROOT / "src/jmx_dreamingwrt_work_mode.c").read_text(encoding="utf-8")
 CORE_HEADER = (ROOT / "src/jmx.h").read_text(encoding="utf-8")
 MAKEFILE = (ROOT / "src/Makefile").read_text(encoding="utf-8")
+ACTIVE_C_SOURCES = list((ROOT / "src").rglob("*.c"))
+ACTIVE_HEADERS = list((ROOT / "src").rglob("*.h"))
+
+
+def test_legacy_shell_primitive_is_absent() -> None:
+    for path in ACTIVE_C_SOURCES + ACTIVE_HEADERS:
+        source = path.read_text(encoding="utf-8", errors="strict")
+        assert "exec_with_result_line" not in source, path
+    utils = (ROOT / "src/jmx_utils.c").read_text(encoding="utf-8")
+    for token in ("popen(", "pclose("):
+        assert token not in utils, token
 
 
 def test_work_mode_has_no_shell_execution() -> None:
@@ -82,6 +93,7 @@ int main(void) {
 
 
 if __name__ == "__main__":
+    test_legacy_shell_primitive_is_absent()
     test_work_mode_has_no_shell_execution()
     test_work_mode_translation_unit_is_warning_clean()
     test_exec_primitive_runtime()

@@ -3,36 +3,40 @@ export function mount(context = {}) {
   const api = context.api || {};
   const utils = context.utils || {};
   const ui = context.ui || {};
-  const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
+  const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character])));
   const fetchApi = api.fetch || (async (name, url) => {
     const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store', headers: authHeaders() });
     const json = await response.json().catch(() => ({}));
     return { name, ok: response.ok && json?.ok !== false, data: json?.data ?? json, raw: json };
   });
 
-  const VERSION = '20260722-overlay-01';
-  const ENDPOINT = '/api/v1/policy-engine/policy-table';
-  const CATALOG_ENDPOINT = '/api/v1/policy-engine/catalog';
+  const VERSION = '20260731-routing-phase-a-02';
+  const POLICY_ENDPOINT = '/api/v1/policy-engine/policy-table';
   const ROUTING_ENDPOINT = '/api/v1/routing';
+  const RESOURCE_ENDPOINTS = {
+    tables: '/api/v1/routing/tables',
+    objects: '/api/v1/routing/objects',
+    cross: '/api/v1/routing/cross-services',
+    runtime: '/api/v1/routing/runtime-resolve',
+    external: '/api/v1/routing/external-policies'
+  };
   const MODULE_CLASS = 'routing-table-route-host';
-  const COLUMNS = [
-    { key: 'status', label: '状态', width: 86 },
-    { key: 'type', label: '类型', width: 126 },
-    { key: 'name', label: '名称', width: 210 },
-    { key: 'source', label: '源', width: 154 },
-    { key: 'destination', label: '目标网络', width: 170 },
-    { key: 'target', label: '下一跳 / 目标', width: 164 },
-    { key: 'interface', label: '接口', width: 112 },
-    { key: 'table', label: '路由表', width: 108 },
-    { key: 'priority', label: '跃点 / 优先级', width: 126 },
-    { key: 'hits', label: '命中', width: 92 },
-    { key: 'lastHit', label: '最后命中', width: 136 },
-    { key: 'actions', label: '操作', width: 92, fixed: true }
+  const TABS = [
+    ['policies', '路由策略'],
+    ['tables', '路由表'],
+    ['objects', '路由对象'],
+    ['cross', '跨三层服务'],
+    ['runtime', '运行解析']
   ];
   const state = {
-    rows: [], tables: [], interfaces: [], wans: [], capabilities: {}, source: '', loading: true, error: '', query: '', type: 'all', status: 'all',
-    drawer: '', selected: null, draft: {}, saving: false, notice: '', confirmDelete: false,
-    visibleColumns: new Set(COLUMNS.map((column) => column.key)), sortKey: 'type', sortDirection: 'asc', seq: 0, mounted: true
+    tab: 'policies',
+    policies: [], tables: [], objects: [], crossServices: [], externalPolicies: [],
+    capabilities: {}, source: '', revision: null,
+    loading: true, errors: {}, notice: '', query: '',
+    drawer: '', editorKind: '', editorMode: '', editor: {}, selected: null,
+    confirmDelete: false, saving: false, resolving: false,
+    resolveMode: 'table', resolveValue: '', resolution: null,
+    mounted: true, seq: 0
   };
   let searchTimer = 0;
 
@@ -45,7 +49,7 @@ export function mount(context = {}) {
         continue;
       }
       if (typeof value === 'object') {
-        const text = firstText(value.label, value.name, value.value, value.address, value.id);
+        const text = firstText(value.message, value.error, value.label, value.name, value.value, value.id);
         if (text) return text;
         continue;
       }
@@ -61,12 +65,14 @@ export function mount(context = {}) {
     }
     return 0;
   }
-  function normalizeKey(value) { return String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_'); }
-  function asArray(value) {
+  function asArray(value, keys = ['items', 'rows', 'data']) {
     if (Array.isArray(value)) return value;
-    for (const key of ['rows', 'items', 'policies', 'data']) if (Array.isArray(value?.[key])) return value[key];
+    for (const key of keys) if (Array.isArray(value?.[key])) return value[key];
     return [];
   }
+  function unwrapResult(result) { return result?.data ?? result?.raw?.data ?? result?.raw ?? result ?? {}; }
+  function normalizeKey(value) { return String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_'); }
+  function cap(name) { return state.capabilities?.[name] === true; }
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -74,18 +80,42 @@ export function mount(context = {}) {
   }
   async function requestJson(url, options = {}) {
     const response = await fetch(url, {
-      credentials: 'same-origin', cache: 'no-store', ...options,
+      credentials: 'same-origin', cache: 'no-store', signal: context.signal, ...options,
       headers: authHeaders({ ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) })
     });
     const text = await response.text();
     let json = {};
-    if (text) try { json = JSON.parse(text); } catch (_) { throw new Error('后端返回了无效 JSON'); }
+    if (text) {
+      try { json = JSON.parse(text); } catch (_) { throw Object.assign(new Error('后端返回了无效 JSON'), { status: response.status }); }
+    }
     const payload = json?.data ?? json;
-    if (!response.ok || json?.ok === false || payload?.ok === false) throw new Error(firstText(payload?.message, payload?.error, json?.message, json?.error, response.status));
+    if (!response.ok || json?.ok === false || payload?.ok === false) {
+      throw Object.assign(new Error(firstText(payload?.message, payload?.error, json?.message, json?.error, `HTTP ${response.status}`)), { status: response.status, payload });
+    }
     return payload;
   }
+  function errorText(error, prefix = '') {
+    const payload = error?.payload || {};
+    const references = asArray(payload.references).map((item) => firstText(item.name, item.id, item.type)).filter(Boolean);
+    const base = firstText(error?.message, payload.message, payload.error, 'unknown');
+    return `${prefix}${base}${references.length ? `；仍被 ${references.join('、')} 引用` : ''}`;
+  }
+  function icon(name) {
+    const paths = {
+      search: '<circle cx="11" cy="11" r="7"></circle><path d="m16.5 16.5 4 4"></path>',
+      plus: '<path d="M12 5v14M5 12h14"></path>',
+      refresh: '<path d="M20 11a8 8 0 1 0 1 4"></path><path d="M20 4v7h-7"></path>',
+      edit: '<path d="m4 20 4.2-1 10.9-10.9a2 2 0 0 0-2.8-2.8L5.4 16.2 4 20Z"></path>',
+      eye: '<path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"></path><circle cx="12" cy="12" r="2.5"></circle>',
+      route: '<circle cx="6" cy="19" r="2"></circle><circle cx="18" cy="5" r="2"></circle><path d="M8 19h3a4 4 0 0 0 4-4V9m0 0-3 3m3-3 3 3"></path>'
+    };
+    return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.edit}</svg>`;
+  }
+  function statusBadge(label, tone) {
+    return ui.statusBadgeMarkup?.(label, tone) || window.DWRT_UI_KIT?.statusBadgeMarkup?.(label, tone) || `<span class="routing-fallback-status is-${escapeHtml(tone)}">${escapeHtml(label)}</span>`;
+  }
   function routeType(row = {}) {
-    const key = normalizeKey(row.policy_type || row.type_key || row.kind || row.type);
+    const key = normalizeKey(row.policy_type || row.type_key || row.kind || row.type || row.section_type);
     if (key === 'static_route' || key === 'route' || key === 'route6' || key.includes('static_route')) return 'static_route';
     if (key === 'pbr' || key.includes('policy_route') || key.includes('traffic_route') || key.includes('mwan')) return 'pbr';
     return '';
@@ -99,311 +129,316 @@ export function mount(context = {}) {
     }
     return '';
   }
-  function ipv4Prefix(mask) {
-    if (!/^\d+\.\d+\.\d+\.\d+$/.test(String(mask || ''))) return '';
-    const bits = String(mask).split('.').map(Number).map((octet) => Math.max(0, Math.min(255, octet)).toString(2).padStart(8, '0')).join('');
-    if (!/^1*0*$/.test(bits)) return '';
-    return String(bits.indexOf('0') < 0 ? 32 : bits.indexOf('0'));
-  }
-  function staticDestination(raw = {}, fallback = '') {
-    const target = firstText(raw.target, raw.destination, raw.dest_addr);
-    if (!target) return firstText(fallback, '任意');
-    if (target.includes('/')) return target;
-    const prefix = ipv4Prefix(raw.netmask);
-    return prefix ? `${target}/${prefix}` : target;
-  }
-  function normalizeRow(row = {}, index = 0) {
+  function normalizePolicy(row = {}, index = 0) {
     const type = routeType(row);
     if (!type) return null;
     const rawBase = row.raw && typeof row.raw === 'object' ? row.raw : row;
     const raw = { ...rawBase, ...(rawBase.options && typeof rawBase.options === 'object' ? rawBase.options : {}) };
-    const destination = type === 'static_route'
-      ? staticDestination(raw, firstText(row.destination_label, row.destination_name, row.destination))
-      : (firstText(row.destination_label, row.destination_name, row.destination, raw.dest_object, raw.dest_ip) || '任意');
-    const source = type === 'pbr'
-      ? (firstText(row.source_label, row.source, raw.source_object, raw.src_ip) || '全部终端')
-      : (firstText(rawBase.options?.source, raw.source_prefix) || '--');
+    const destination = firstText(row.destination_label, row.destination, raw.destination, raw.target, raw.dest_object, raw.dest_ip) || '任意';
+    const source = type === 'pbr' ? (firstText(row.source_label, row.source, raw.source_object, raw.src_ip) || '全部终端') : '--';
     const target = type === 'pbr'
-      ? (firstText(raw.target, raw.wan, raw.route_table, raw.table, row.interface) || '--')
-      : (firstText(raw.gateway, raw.gw, raw.next_hop) || (firstText(row.interface, raw.interface) ? '直连' : '--'));
-    const routeTable = firstText(raw.route_table, raw.table, raw.routing_table) || (type === 'static_route' ? 'main' : target);
-    const priority = firstNumber(raw.priority, raw.metric, row.priority, row.metric, row.index);
-    const hitCount = firstNumber(raw.hit_count, raw.hits, row.hit_count, row.hits);
-    const lastHit = firstNumber(raw.last_hit, raw.last_hit_at, row.last_hit);
-    const actionKey = normalizeKey(firstText(raw.action, row.action_key, row.action));
-    const routeAction = ['main', 'drop', 'mark', 'route_group'].includes(actionKey) ? actionKey : 'route_table';
-    const id = firstText(row.id, row._id, row.uuid, raw.id, raw.section) || `route-${index}`;
+      ? firstText(raw.target, raw.wan, raw.route_table, raw.table, row.interface, '--')
+      : firstText(raw.gateway, raw.gw, raw.next_hop, firstText(row.interface, raw.interface) ? '直连' : '--');
     return {
-      id, type, typeLabel: type === 'pbr' ? '策略路由' : '静态路由',
+      id: firstText(row.id, row._id, row.uuid, raw.id, raw.section) || `route-${index}`,
+      type, typeLabel: type === 'pbr' ? '策略路由' : '静态路由',
       name: firstText(row.name, row.label, raw.name, raw.comment, destination) || `路由 ${index + 1}`,
-      source, destination, target, interface: firstText(row.interface, raw.interface, raw.iface, raw.network) || '--',
-      table: routeTable, priority, hits: hitCount, lastHit, enabled: row.enabled !== false && raw.enabled !== false && raw.disabled !== '1',
-      routeTarget: firstText(raw.target, raw.destination, raw.dest_addr), netmask: firstText(raw.netmask),
-      protocol: firstText(row.protocol, raw.proto, raw.protocol) || 'all', ports: firstText(row.destination_port, raw.ports, raw.dest_port) || 'any',
-      family: firstText(raw.family, raw.ip_version) || (raw.section_type === 'route6' || /[:]/.test(destination) ? 'ipv6' : 'ipv4'),
-      schedule: firstText(raw.schedule) || 'always', routeAction, comment: firstText(raw.comment, raw.remark, row.description), raw: { ...raw, ...row }
+      source, destination, target,
+      interface: firstText(row.interface, raw.interface, raw.iface, raw.network, '--'),
+      table: firstText(raw.route_table, raw.table, raw.routing_table, type === 'static_route' ? 'main' : target, '--'),
+      priority: firstNumber(raw.priority, raw.metric, row.priority, row.metric),
+      hits: firstNumber(raw.hit_count, raw.hits, row.hit_count, row.hits),
+      lastHit: firstNumber(raw.last_hit, raw.last_hit_at, row.last_hit),
+      enabled: row.enabled !== false && raw.enabled !== false && raw.disabled !== '1',
+      comment: firstText(raw.comment, raw.remark, row.description), raw: { ...raw, ...row }
     };
   }
-  function capabilityFor(type, action) {
-    const prefix = type === 'pbr' ? 'pbr' : 'static_route';
-    const explicit = state.capabilities[`${prefix}_${action}`];
-    if (typeof explicit === 'boolean') return explicit;
-    const supported = asArray(state.capabilities.write_supported_policy_types).map(normalizeKey);
-    return supported.includes(type) && state.capabilities[action] !== false;
+  function normalizeTable(item = {}) {
+    return { ...item, id: firstText(item.id), name: firstText(item.name, item.id), table_id: firstNumber(item.table_id), metric: firstNumber(item.metric), enabled: item.enabled === true, references: asArray(item.references), ref_count: firstNumber(item.ref_count) };
   }
-  function formatNumber(value) { return new Intl.NumberFormat('zh-CN').format(Number(value) || 0); }
+  function normalizeObject(item = {}) {
+    return { ...item, id: firstText(item.id), name: firstText(item.name, item.id), type: firstText(item.type, item.object_type, 'ip_group'), family: firstText(item.family, 'mixed'), enabled: item.enabled === true, members: asArray(item.members), references: asArray(item.references), ref_count: firstNumber(item.ref_count) };
+  }
+  function normalizeCross(item = {}) {
+    return { ...item, id: firstText(item.id), name: firstText(item.name, item.id), service_type: firstText(item.service_type, 'snmp'), enabled: item.enabled === true, runtime_supported: item.runtime_supported === true };
+  }
+  function applyPayload(key, payload) {
+    const data = unwrapResult(payload);
+    if (data.capabilities && typeof data.capabilities === 'object') state.capabilities = { ...state.capabilities, ...data.capabilities };
+    if (data.revision !== undefined) state.revision = data.revision;
+    if (key === 'snapshot') {
+      state.source = firstText(data.source, payload?.raw?.meta?.source);
+      state.capabilities = data.capabilities && typeof data.capabilities === 'object' ? data.capabilities : {};
+      state.revision = data.revision ?? null;
+    } else if (key === 'policies') {
+      state.policies = asArray(data, ['rows', 'items', 'policies', 'data']).map(normalizePolicy).filter(Boolean);
+    } else if (key === 'tables') state.tables = asArray(data).map(normalizeTable).filter((item) => item.id);
+    else if (key === 'objects') state.objects = asArray(data).map(normalizeObject).filter((item) => item.id);
+    else if (key === 'cross') state.crossServices = asArray(data).map(normalizeCross).filter((item) => item.id);
+    else if (key === 'external') state.externalPolicies = asArray(data).map((item) => ({ ...item, read_only: true }));
+  }
+  async function load() {
+    const seq = ++state.seq;
+    state.loading = true;
+    state.errors = {};
+    render();
+    const requests = {
+      snapshot: fetchApi('routing-snapshot', ROUTING_ENDPOINT),
+      policies: fetchApi('routing-policy-table', `${POLICY_ENDPOINT}?include_default=0`),
+      tables: fetchApi('routing-tables', RESOURCE_ENDPOINTS.tables),
+      objects: fetchApi('routing-objects', RESOURCE_ENDPOINTS.objects),
+      cross: fetchApi('routing-cross-services', RESOURCE_ENDPOINTS.cross),
+      external: fetchApi('routing-external-policies', RESOURCE_ENDPOINTS.external)
+    };
+    const entries = Object.entries(requests);
+    const results = await Promise.allSettled(entries.map(([, request]) => request));
+    if (!state.mounted || seq !== state.seq) return;
+    results.forEach((result, index) => {
+      const key = entries[index][0];
+      if (result.status === 'fulfilled' && result.value?.ok !== false) applyPayload(key, result.value);
+      else state.errors[key] = result.status === 'rejected' ? firstText(result.reason?.message, '读取失败') : firstText(result.value?.raw?.message, result.value?.raw?.error, '读取失败');
+    });
+    state.loading = false;
+    render();
+  }
   function formatTime(value) {
     const raw = Number(value) || 0;
     if (!raw) return '--';
     const timestamp = raw < 100000000000 ? raw * 1000 : raw;
     return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(timestamp);
   }
-  function icon(name) {
-    const paths = {
-      search: '<circle cx="11" cy="11" r="7"></circle><path d="m16.5 16.5 4 4"></path>',
-      filter: '<path d="M4 5h16l-6.2 7.1V18l-3.6 1v-6.9L4 5Z"></path>',
-      plus: '<path d="M12 5v14M5 12h14"></path>',
-      columns: '<path d="M4 5h16v14H4zM10 5v14m5-14v14"></path>',
-      refresh: '<path d="M20 11a8 8 0 1 0 1 4"></path><path d="M20 4v7h-7"></path>',
-      edit: '<path d="m4 20 4.2-1 10.9-10.9a2 2 0 0 0-2.8-2.8L5.4 16.2 4 20Z"></path>',
-      chevron: '<path d="m8 10 4 4 4-4"></path>'
-    };
-    return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.edit}</svg>`;
-  }
-  function unwrapResult(result) { return result?.data ?? result?.raw?.data ?? result?.raw ?? result ?? {}; }
-  async function load() {
-    const seq = ++state.seq;
-    state.loading = true;
-    state.error = '';
-    patchTable();
-    const [policyResult, routingResult, catalogResult] = await Promise.allSettled([
-      fetchApi('routing-policy-table', `${ENDPOINT}?include_default=0`),
-      fetchApi('advanced-routing-catalog', ROUTING_ENDPOINT),
-      fetchApi('policy-engine-catalog', CATALOG_ENDPOINT)
-    ]);
-    if (!state.mounted || seq !== state.seq) return;
-    if (policyResult.status === 'fulfilled' && policyResult.value?.ok !== false) {
-      const data = unwrapResult(policyResult.value);
-      state.rows = asArray(data.rows || data.items || data.policies || data).map(normalizeRow).filter(Boolean);
-      state.capabilities = data.capabilities || policyResult.value?.raw?.data?.capabilities || {};
-      state.source = firstText(data.source, policyResult.value?.raw?.meta?.source, 'policy-engine');
-    } else {
-      state.rows = [];
-      state.error = '路由数据读取失败；当前不展示演示数据。';
-    }
-    if (routingResult.status === 'fulfilled' && routingResult.value?.ok !== false) {
-      const data = unwrapResult(routingResult.value);
-      state.tables = asArray(data.tables).map((item) => ({ id: firstText(item.id, item.name), name: firstText(item.name, item.id), tableId: firstNumber(item.table_id), enabled: item.enabled !== false })).filter((item) => item.id);
-    }
-    if (catalogResult.status === 'fulfilled' && catalogResult.value?.ok !== false) {
-      const data = unwrapResult(catalogResult.value);
-      const normalizeOption = (item) => ({ value: firstText(item.value, item.id, item.name), label: firstText(item.label, item.name, item.value, item.id) });
-      state.interfaces = asArray(data.interfaces).map(normalizeOption).filter((item) => item.value);
-      state.wans = asArray(data.wans).map(normalizeOption).filter((item) => item.value);
-    }
-    state.loading = false;
-    patchView();
-  }
-  function filteredRows() {
+  function matchesQuery(values) {
     const query = state.query.trim().toLowerCase();
-    const rows = state.rows.filter((row) => {
-      if (state.type !== 'all' && row.type !== state.type) return false;
-      if (state.status === 'enabled' && !row.enabled) return false;
-      if (state.status === 'disabled' && row.enabled) return false;
-      return !query || [row.name, row.typeLabel, row.source, row.destination, row.target, row.interface, row.table, row.protocol, row.ports].join(' ').toLowerCase().includes(query);
+    return !query || values.join(' ').toLowerCase().includes(query);
+  }
+  function tabsMarkup() {
+    return `<nav class="routing-page-tabs dwrt-kit-tabs" data-dwrt-component="tabs" aria-label="路由管理视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${TABS.map(([id, label]) => `<button class="dwrt-kit-tab ${state.tab === id ? 'is-active' : ''}" type="button" data-routing-tab="${id}" aria-selected="${state.tab === id}">${label}</button>`).join('')}</nav>`;
+  }
+  function toolbarMarkup() {
+    const creatable = ['tables', 'objects', 'cross'].includes(state.tab);
+    const labels = { tables: '新建路由表', objects: '新建路由对象', cross: '新建服务' };
+    const capability = { tables: 'table_crud', objects: 'object_crud', cross: 'cross_service_config_crud' }[state.tab];
+    return `<header class="routing-page-toolbar"><div class="routing-page-heading"><strong>路由表</strong><span>${state.revision === null ? '路由配置与解析' : `配置版本 ${escapeHtml(state.revision)}`}</span></div>${tabsMarkup()}<div class="routing-page-actions"><label class="routing-search" data-dwrt-component="expand-search">${icon('search')}<input type="search" data-routing-search value="${escapeHtml(state.query)}" placeholder="搜索当前视图" aria-label="搜索当前视图"></label><button class="routing-icon-button" type="button" data-routing-refresh aria-label="刷新" title="刷新">${icon('refresh')}</button>${creatable ? `<button class="dwrt-kit-button routing-create-button" data-dwrt-component="button" data-variant="primary" type="button" data-routing-create="${state.tab}" ${cap(capability) ? '' : 'disabled'}>${icon('plus')}<span>${labels[state.tab]}</span></button>` : ''}</div></header>`;
+  }
+  function noticeMarkup(message = state.notice, tone = 'warning') {
+    if (!message) return '';
+    return `<div class="routing-notice is-${tone}" role="status">${escapeHtml(message)}</div>`;
+  }
+  function capabilityBanner(message, tone = 'warning') {
+    return `<section class="routing-capability-banner is-${tone}" data-dwrt-component="state-panel"><strong>${tone === 'danger' ? '功能不可用' : '能力说明'}</strong><span>${escapeHtml(message)}</span></section>`;
+  }
+  function tableShell(title, meta, headings, rows, empty, className = '') {
+    return `<section class="routing-resource-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface ${className}" data-dwrt-component="data-table"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(meta)}</span></div></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr>${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody>${state.loading ? `<tr><td class="dwrt-kit-table-empty" colspan="${headings.length}">正在读取真实配置</td></tr>` : rows.length ? rows.join('') : `<tr><td class="dwrt-kit-table-empty" colspan="${headings.length}">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
+  }
+  function actionButton(kind, item, readOnly = false) {
+    return `<button class="routing-row-action" type="button" data-routing-open="${escapeHtml(kind)}" data-routing-id="${escapeHtml(item.id)}" aria-label="${readOnly ? '查看' : '编辑'} ${escapeHtml(item.name)}">${icon(readOnly ? 'eye' : 'edit')}</button>`;
+  }
+  function policiesMarkup() {
+    const rows = state.policies.filter((item) => matchesQuery([item.name, item.typeLabel, item.source, item.destination, item.target, item.interface, item.table])).map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><span class="routing-kind is-${item.type}">${escapeHtml(item.typeLabel)}</span></td><td><strong>${escapeHtml(item.name)}</strong>${item.comment ? `<small>${escapeHtml(item.comment)}</small>` : ''}</td><td>${escapeHtml(item.source)}</td><td>${escapeHtml(item.destination)}</td><td>${escapeHtml(item.target)}</td><td>${escapeHtml(item.interface)}</td><td><span class="routing-table-pill">${escapeHtml(item.table)}</span></td><td>${item.priority || '--'}</td><td>${item.type === 'pbr' ? item.hits : '--'}</td><td>${item.type === 'pbr' ? escapeHtml(formatTime(item.lastHit)) : '--'}</td><td>${actionButton('policy', item, true)}</td></tr>`);
+    return `${capabilityBanner('静态路由与 PBR 在此仅作统一索引；创建、修改和删除继续由“策略表”作为唯一写入口。', 'info')}${state.errors.policies ? capabilityBanner(`路由策略读取失败：${state.errors.policies}`, 'danger') : ''}${tableShell('路由策略', `${rows.length} 条 · 只读索引`, ['状态', '类型', '名称', '源', '目标网络', '下一跳 / 目标', '接口', '路由表', '跃点 / 优先级', '命中', '最后命中', '详情'], rows, state.errors.policies || '没有路由策略', 'is-policy-table')}`;
+  }
+  function tablesMarkup() {
+    const writable = cap('table_crud');
+    const items = state.tables.filter((item) => matchesQuery([item.id, item.name, item.role, item.gateway, item.table_id]));
+    const rows = items.map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></td><td>${item.table_id}</td><td>${escapeHtml(item.role || '--')}</td><td>${escapeHtml(item.gateway || '--')}</td><td>${item.metric}</td><td>${item.ref_count}</td><td>${actionButton('table', item, !writable)}</td></tr>`);
+    return `${!writable ? capabilityBanner('后端未明确声明 table_crud，路由表保持只读。', 'danger') : ''}${state.errors.tables ? capabilityBanner(`路由表读取失败：${state.errors.tables}`, 'danger') : ''}${tableShell('自定义路由表', `${items.length} 个 · ${writable ? '真实 CRUD' : '只读'}`, ['状态', '名称 / ID', 'Table ID', '角色', '网关', 'Metric', '引用', '操作'], rows, state.errors.tables || '没有自定义路由表')}`;
+  }
+  function objectsMarkup() {
+    const writable = cap('object_crud');
+    const items = state.objects.filter((item) => matchesQuery([item.id, item.name, item.type, item.family, item.value, item.comment, ...item.members.map((member) => firstText(member.value, member.label))]));
+    const rows = items.map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></td><td>${escapeHtml(item.type)}</td><td>${escapeHtml(item.family)}</td><td><span class="routing-cell-ellipsis" title="${escapeHtml(item.value || '')}">${escapeHtml(item.value || '--')}</span></td><td>${item.members.length}</td><td>${item.ref_count}</td><td>${actionButton('object', item, !writable)}</td></tr>`);
+    return `${capabilityBanner('这里的对象只属于路由子系统，不冒充跨防火墙、SQM 与 flowd 的通用策略对象。', 'info')}${!writable ? capabilityBanner('后端未明确声明 object_crud，路由对象保持只读。', 'danger') : ''}${state.errors.objects ? capabilityBanner(`路由对象读取失败：${state.errors.objects}`, 'danger') : ''}${tableShell('路由对象', `${items.length} 个 · ${writable ? '真实 CRUD' : '只读'}`, ['状态', '名称 / ID', '类型', '地址族', '值', '成员', '引用', '操作'], rows, state.errors.objects || '没有路由对象')}`;
+  }
+  function crossMarkup() {
+    const writable = cap('cross_service_config_crud');
+    const runtime = cap('cross_service_runtime');
+    const reason = firstText(state.capabilities.cross_service_runtime_reason, 'runtime_consumer_not_implemented');
+    const items = state.crossServices.filter((item) => matchesQuery([item.id, item.name, item.service_type, item.server_ip, item.scope, item.listen_port, item.version, item.remark]));
+    const rows = items.map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></td><td>${escapeHtml(item.service_type)}</td><td>${escapeHtml(item.server_ip || '--')}</td><td>${escapeHtml(item.scope || '--')}</td><td>${escapeHtml(item.listen_port || '--')}</td><td>${runtime && item.runtime_supported ? statusBadge('运行已接入', 'success') : statusBadge('仅配置', 'warning')}</td><td>${actionButton('cross', item, !writable)}</td></tr>`);
+    return `${!runtime ? capabilityBanner(`配置可以保存，但运行消费者尚未实现（${reason}）；页面不会把“保存成功”显示为服务已生效。`, 'warning') : ''}${!writable ? capabilityBanner('后端未明确声明 cross_service_config_crud，跨三层服务保持只读。', 'danger') : ''}${state.errors.cross ? capabilityBanner(`跨三层服务读取失败：${state.errors.cross}`, 'danger') : ''}${tableShell('跨三层服务', `${items.length} 项 · ${runtime ? '配置与运行' : '配置态'}`, ['状态', '名称 / ID', '服务类型', '服务器', '作用域', '监听端口', '运行态', '操作'], rows, state.errors.cross || '没有跨三层服务')}`;
+  }
+  function resolutionMarkup() {
+    if (!state.resolution) return '<div class="routing-runtime-empty">选择路由表或策略规则后执行解析。</div>';
+    const item = state.resolution;
+    return `<dl class="routing-resolution-grid"><div><dt>解析结果</dt><dd>${statusBadge(item.resolved ? '已解析' : '未解析', item.resolved ? 'success' : 'error')}</dd></div><div><dt>动作</dt><dd>${escapeHtml(item.action || '--')}</dd></div><div><dt>路由表</dt><dd>${escapeHtml(item.route_table || '--')}</dd></div><div><dt>Table ID</dt><dd>${item.table_id || '--'}</dd></div><div><dt>网关</dt><dd>${escapeHtml(item.gateway || '--')}</dd></div><div><dt>接口</dt><dd>${escapeHtml(item.interface || '--')}</dd></div><div class="is-wide"><dt>解析原因</dt><dd>${escapeHtml(item.reason || '--')}</dd></div><div class="is-wide"><dt>验证边界</dt><dd>${escapeHtml(item.runtime_validation || '--')}</dd></div></dl>`;
+  }
+  function runtimeMarkup() {
+    const canResolve = cap('runtime_resolve');
+    const pbr = state.policies.filter((item) => item.type === 'pbr');
+    const options = state.resolveMode === 'rule' ? pbr.map((item) => [item.id, item.name]) : [['main', 'main (254)'], ...state.tables.map((item) => [item.id, `${item.name} (${item.table_id})`])];
+    const external = state.externalPolicies.filter((item) => matchesQuery([item.id, item.name, item.source, item.section_type, item.path]));
+    const rows = external.map((item) => `<tr><td><strong>${escapeHtml(item.name || item.id)}</strong><small>${escapeHtml(item.id)}</small></td><td>${escapeHtml(item.source || '--')}</td><td>${escapeHtml(item.section_type || '--')}</td><td><span class="routing-cell-ellipsis" title="${escapeHtml(item.path || '')}">${escapeHtml(item.path || '--')}</span></td><td>${statusBadge('只读', 'muted')}</td></tr>`);
+    return `<section class="routing-runtime-layout"><section class="routing-runtime-panel" data-dwrt-component="surface"><header><div><strong>运行解析</strong><span>验证配置如何解析到路由表</span></div>${statusBadge(canResolve ? '可用' : '不可用', canResolve ? 'success' : 'error')}</header>${!canResolve ? capabilityBanner('后端未明确声明 runtime_resolve，解析入口已关闭。', 'danger') : ''}<div class="routing-resolve-controls"><label><span>解析方式</span><select data-routing-resolve-mode ${canResolve ? '' : 'disabled'}><option value="table" ${state.resolveMode === 'table' ? 'selected' : ''}>按路由表</option><option value="rule" ${state.resolveMode === 'rule' ? 'selected' : ''}>按策略规则</option></select></label><label><span>${state.resolveMode === 'rule' ? '策略规则' : '路由表'}</span><select data-routing-resolve-value ${canResolve ? '' : 'disabled'}><option value="">请选择</option>${options.map(([value, label]) => `<option value="${escapeHtml(value)}" ${state.resolveValue === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label><button class="dwrt-kit-button" data-dwrt-component="async-button" data-variant="primary" type="button" data-routing-resolve ${canResolve && state.resolveValue && !state.resolving ? '' : 'disabled'}>${state.resolving ? '正在解析' : '执行解析'}</button></div>${resolutionMarkup()}${capabilityBanner('解析结果是配置级解析，不代表逐 flow 的 conntrack 命中或实际选路证明。', 'info')}</section>${state.errors.external ? capabilityBanner(`外部策略读取失败：${state.errors.external}`, 'danger') : ''}${tableShell('外部策略', `${external.length} 条 · pbr / mwan3 只读发现`, ['名称 / ID', '来源', '类型', '配置路径', '权限'], rows, state.errors.external || '没有发现外部策略', 'is-external-table')}</section>`;
+  }
+  function contentMarkup() {
+    if (state.tab === 'tables') return tablesMarkup();
+    if (state.tab === 'objects') return objectsMarkup();
+    if (state.tab === 'cross') return crossMarkup();
+    if (state.tab === 'runtime') return runtimeMarkup();
+    return policiesMarkup();
+  }
+  function field(label, name, value, options = {}) {
+    const attributes = `${options.disabled ? 'disabled' : ''} ${options.required ? 'required' : ''}`;
+    let control;
+    if (options.type === 'select') control = `<select data-routing-field="${name}" ${attributes}>${options.options.map(([key, text]) => `<option value="${escapeHtml(key)}" ${String(value) === String(key) ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select>`;
+    else if (options.type === 'textarea') control = `<textarea data-routing-field="${name}" rows="${options.rows || 5}" placeholder="${escapeHtml(options.placeholder || '')}" ${attributes}>${escapeHtml(value ?? '')}</textarea>`;
+    else control = `<input type="${options.type || 'text'}" data-routing-field="${name}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(options.placeholder || '')}" ${options.min !== undefined ? `min="${options.min}"` : ''} ${options.max !== undefined ? `max="${options.max}"` : ''} ${attributes}>`;
+    return `<label class="routing-field ${options.wide ? 'is-wide' : ''}"><span>${escapeHtml(label)}</span>${control}</label>`;
+  }
+  function switchField(label, description, checked, disabled = false) {
+    return `<label class="routing-switch" data-dwrt-component="switch"><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(description)}</small></span><input type="checkbox" data-routing-field-check="enabled" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}><i></i></label>`;
+  }
+  function editorFieldsMarkup() {
+    const editor = state.editor;
+    const editing = state.editorMode === 'edit';
+    if (state.editorKind === 'table') return `${switchField('启用路由表', '保存后触发 route_reload，并回读事务结果', editor.enabled)}<div class="routing-form">${field('资源 ID', 'id', editor.id, { required: true, disabled: editing, placeholder: '例如 wan2_table' })}${field('显示名称', 'name', editor.name, { required: true })}${field('Table ID', 'table_id', editor.table_id, { type: 'number', min: 1, max: 32767, required: true })}${field('角色', 'role', editor.role, { placeholder: 'wan / vpn / custom' })}${field('默认网关', 'gateway', editor.gateway, { placeholder: '可留空' })}${field('Metric', 'metric', editor.metric, { type: 'number' })}</div>`;
+    if (state.editorKind === 'object') return `${switchField('启用路由对象', '对象仅供 routed 子系统引用', editor.enabled)}<div class="routing-form">${field('资源 ID', 'id', editor.id, { required: true, disabled: editing, placeholder: '例如 office_targets' })}${field('显示名称', 'name', editor.name, { required: true })}${field('类型', 'type', editor.type, { type: 'select', options: [['ip_group', 'IP / CIDR 组'], ['domain_group', '域名组'], ['interface_group', '接口组'], ['custom', '自定义']] })}${field('地址族', 'family', editor.family, { type: 'select', options: [['ipv4', 'IPv4'], ['ipv6', 'IPv6'], ['mixed', '混合']] })}${field('主值', 'value', editor.value, { wide: true, placeholder: '单个值或摘要，可留空' })}${field('成员（每行一个）', 'membersText', editor.membersText, { type: 'textarea', rows: 7, wide: true, placeholder: '192.0.2.0/24\n198.51.100.10' })}${field('备注', 'comment', editor.comment, { wide: true })}</div>`;
+    const multicast = ['mdns', 'ssdp'].includes(normalizeKey(editor.service_type));
+    return `${switchField('启用配置', '保存配置不等于运行服务已生效', editor.enabled)}${!cap('cross_service_runtime') ? capabilityBanner('运行消费者未实现；本编辑器只维护配置。', 'warning') : ''}${multicast ? capabilityBanner('mDNS / SSDP 的实际组播运行配置由“组播服务”拥有，此处仅保存跨三层引用配置。', 'info') : ''}<div class="routing-form">${field('资源 ID', 'id', editor.id, { required: true, disabled: editing, placeholder: '例如 office_snmp' })}${field('显示名称', 'name', editor.name, { required: true })}${field('服务类型', 'service_type', editor.service_type, { type: 'select', options: [['snmp', 'SNMP'], ['mdns', 'mDNS 引用'], ['ssdp', 'SSDP 引用'], ['custom', '自定义']] })}${field('服务器 IP', 'server_ip', editor.server_ip, { placeholder: '可按服务类型留空' })}${field('作用域', 'scope', editor.scope, { wide: true, placeholder: '网段、区域或接口范围' })}${field('监听端口', 'listen_port', editor.listen_port)}${field('版本', 'version', editor.version)}${field('访问频率', 'access_rate', editor.access_rate)}${field('备注', 'remark', editor.remark, { wide: true })}</div>`;
+  }
+  function drawerTitle() {
+    const labels = { table: '路由表', object: '路由对象', cross: '跨三层服务', policy: '路由策略详情' };
+    return `${state.editorMode === 'create' ? '新建' : state.editorKind === 'policy' ? '' : '编辑'}${labels[state.editorKind] || ''}`;
+  }
+  function drawerMarkup() {
+    if (!state.drawer) return '';
+    const readOnly = state.editorKind === 'policy' || !editorWritable();
+    return `${drawerBackdrop('关闭编辑器')}<aside class="routing-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" aria-label="${escapeHtml(drawerTitle())}"><header class="dwrt-kit-sheet-header"><div><span>ROUTING</span><strong>${escapeHtml(drawerTitle())}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-routing-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body routing-drawer-body">${state.editorKind === 'policy' ? policyDetailMarkup() : editorFieldsMarkup()}${state.notice ? noticeMarkup(state.notice, /失败|冲突|引用|错误/.test(state.notice) ? 'danger' : 'warning') : ''}${readOnly && state.editorKind !== 'policy' ? capabilityBanner('写能力未由后端明确开放，当前详情保持只读。', 'danger') : ''}</div><footer class="dwrt-kit-sheet-footer routing-sheet-footer">${state.editorMode === 'edit' && state.editorKind !== 'policy' && !readOnly ? `<button class="dwrt-kit-button routing-danger-button" data-dwrt-component="button" data-variant="danger" type="button" data-routing-delete ${state.saving ? 'disabled' : ''}>删除</button>` : '<span></span>'}<div><button class="dwrt-kit-button" data-dwrt-component="button" data-variant="ghost" type="button" data-routing-close>${readOnly ? '关闭' : '取消'}</button>${!readOnly ? `<button class="dwrt-kit-button" data-dwrt-component="async-button" data-variant="primary" type="button" data-routing-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存'}</button>` : ''}</div></footer></aside>`;
+  }
+  function policyDetailMarkup() {
+    const item = state.selected || {};
+    return `${capabilityBanner('此处仅展示统一路由索引。请在“策略表”中修改或删除该路由，避免双写。', 'info')}<dl class="routing-detail-list"><div><dt>名称</dt><dd>${escapeHtml(item.name || '--')}</dd></div><div><dt>类型</dt><dd>${escapeHtml(item.typeLabel || '--')}</dd></div><div><dt>状态</dt><dd>${item.enabled ? '启用' : '停用'}</dd></div><div><dt>源</dt><dd>${escapeHtml(item.source || '--')}</dd></div><div><dt>目标</dt><dd>${escapeHtml(item.destination || '--')}</dd></div><div><dt>下一跳 / 目标</dt><dd>${escapeHtml(item.target || '--')}</dd></div><div><dt>接口</dt><dd>${escapeHtml(item.interface || '--')}</dd></div><div><dt>路由表</dt><dd>${escapeHtml(item.table || '--')}</dd></div></dl>`;
+  }
+  function drawerBackdrop(label) { return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-routing-close aria-label="${escapeHtml(label)}"></button>`; }
+  function editorWritable() {
+    return (state.editorKind === 'table' && cap('table_crud')) || (state.editorKind === 'object' && cap('object_crud')) || (state.editorKind === 'cross' && cap('cross_service_config_crud'));
+  }
+  function confirmationMarkup() {
+    if (!state.confirmDelete || !state.selected) return '';
+    const renderer = ui.confirmationMarkup || window.DWRT_UI_KIT?.confirmationMarkup;
+    if (typeof renderer !== 'function') return '';
+    const references = asArray(state.selected.references);
+    const label = { table: '路由表', object: '路由对象', cross: '跨三层服务' }[state.editorKind] || '资源';
+    return renderer({
+      id: 'routing-delete-confirmation', action: 'delete-routing-resource', tone: 'danger',
+      title: `删除${label}`,
+      description: references.length ? `${label}“${state.selected.name}”仍有 ${references.length} 个已知引用；后端将执行最终冲突校验。` : `${label}“${state.selected.name}”将被永久删除。`,
+      cancelLabel: '取消', confirmLabel: state.saving ? '正在删除' : '确认删除', disabled: state.saving
     });
-    const direction = state.sortDirection === 'desc' ? -1 : 1;
-    return rows.sort((a, b) => {
-      const av = a[state.sortKey];
-      const bv = b[state.sortKey];
-      if (typeof av === 'number' || typeof bv === 'number') return (Number(av) - Number(bv)) * direction;
-      return String(av ?? '').localeCompare(String(bv ?? ''), 'zh-CN', { numeric: true }) * direction;
-    });
-  }
-  function filterCount() { return (state.type !== 'all' ? 1 : 0) + (state.status !== 'all' ? 1 : 0); }
-  function renderToolbar() {
-    return `<header class="policy-toolbar routing-toolbar">
-      <label class="policy-search policy-search-main" data-dwrt-component="expand-search">${icon('search')}<input type="search" data-route-search placeholder="搜索路由名称、IP、接口或路由表" value="${escapeHtml(state.query)}"></label>
-      <div class="policy-toolbar-actions routing-toolbar-actions">
-        <button class="policy-filter-button" type="button" data-route-filter>${icon('filter')}<span>筛选</span>${filterCount() ? `<span class="policy-count-badge">${filterCount()}</span>` : ''}</button>
-        <button class="policy-filter-button routing-columns-button" type="button" data-route-columns>${icon('columns')}<span>列</span></button>
-        <button class="policy-create-button" type="button" data-route-create>${icon('plus')}<span>创建路由</span></button>
-      </div>
-    </header>`;
-  }
-  function sortIndicator(key) { return state.sortKey === key ? `<span class="routing-sort is-${state.sortDirection}">${icon('chevron')}</span>` : ''; }
-  function cellMarkup(row, key) {
-    if (key === 'status') return ui.statusBadgeMarkup?.(row.enabled ? '启用' : '停用', row.enabled ? 'success' : 'error') || `<span>${row.enabled ? '启用' : '停用'}</span>`;
-    if (key === 'type') return `<span class="routing-type is-${row.type}">${escapeHtml(row.typeLabel)}</span>`;
-    if (key === 'name') return `<button class="routing-name" type="button" data-route-open="${escapeHtml(row.id)}"><strong>${escapeHtml(row.name)}</strong>${row.comment ? `<small>${escapeHtml(row.comment)}</small>` : ''}</button>`;
-    if (key === 'source') return `<span class="routing-cell-ellipsis" title="${escapeHtml(row.source)}">${escapeHtml(row.source)}</span>`;
-    if (key === 'destination') return `<span class="routing-cell-ellipsis" title="${escapeHtml(row.destination)}">${escapeHtml(row.destination)}</span>`;
-    if (key === 'target') return `<span class="routing-cell-ellipsis" title="${escapeHtml(row.target)}">${escapeHtml(row.target)}</span>`;
-    if (key === 'interface') return escapeHtml(row.interface);
-    if (key === 'table') return `<span class="routing-table-pill">${escapeHtml(row.table)}</span>`;
-    if (key === 'priority') return row.priority ? formatNumber(row.priority) : '--';
-    if (key === 'hits') return `<span class="routing-number">${formatNumber(row.hits)}</span>`;
-    if (key === 'lastHit') return `<time>${escapeHtml(formatTime(row.lastHit))}</time>`;
-    if (key === 'actions') return `<button class="routing-row-action" type="button" data-route-open="${escapeHtml(row.id)}" aria-label="编辑 ${escapeHtml(row.name)}">${icon('edit')}</button>`;
-    return '--';
-  }
-  function renderTable() {
-    const rows = filteredRows();
-    const columns = COLUMNS.filter((column) => column.fixed || state.visibleColumns.has(column.key));
-    const subtitle = state.error || (state.source ? `真实配置 · ${rows.length} 条路由` : `${rows.length} 条路由`);
-    return `<section class="routing-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface">
-      <div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>路由</strong><span class="${state.error ? 'is-warning' : ''}">${escapeHtml(subtitle)}</span></div><div class="routing-table-meta"><span class="dwrt-kit-table-count">静态 ${state.rows.filter((row) => row.type === 'static_route').length} · 策略 ${state.rows.filter((row) => row.type === 'pbr').length}</span><button type="button" data-route-refresh title="刷新" aria-label="刷新路由">${icon('refresh')}</button></div></div>
-      <div class="dwrt-kit-table-scroll routing-table-scroll" data-routing-scroll><table class="dwrt-kit-table dwrt-kit-ikuai-table routing-table"><thead><tr>${columns.map((column) => `<th style="width:${column.width}px;min-width:${column.width}px"><button type="button" data-route-sort="${column.key}" ${column.key === 'actions' ? 'disabled' : ''}>${escapeHtml(column.label)}${sortIndicator(column.key)}</button></th>`).join('')}</tr></thead><tbody>${state.loading ? `<tr><td colspan="${columns.length}" class="dwrt-kit-table-empty">正在读取路由</td></tr>` : rows.length ? rows.map((row) => `<tr class="${row.enabled ? '' : 'is-disabled'}" data-route-id="${escapeHtml(row.id)}">${columns.map((column) => `<td class="is-${column.key}">${cellMarkup(row, column.key)}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${columns.length}" class="dwrt-kit-table-empty">${escapeHtml(state.error || '没有匹配的路由')}</td></tr>`}</tbody></table></div>
-    </section>`;
-  }
-  function renderFilterDrawer() {
-    if (state.drawer !== 'filter') return '';
-    const typeCount = (type) => state.rows.filter((row) => type === 'all' || row.type === type).length;
-    const statusCount = (status) => state.rows.filter((row) => status === 'all' || row.enabled === (status === 'enabled')).length;
-    const radio = (name, value, label, count, checked) => `<label class="policy-filter-row"><input type="radio" name="${name}" value="${value}" ${checked ? 'checked' : ''}><span class="policy-control-dot"></span><span class="policy-filter-label">${label}</span><span class="policy-filter-count">${count}</span></label>`;
-    return `${drawerBackdrop('关闭筛选')}<aside class="routing-drawer routing-filter-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open"><header class="dwrt-kit-sheet-header"><div><span>FILTER</span><strong>筛选路由</strong></div><button class="dwrt-kit-sheet-close" type="button" data-route-close>×</button></header><div class="dwrt-kit-sheet-body routing-drawer-body">
-      <section class="policy-filter-section"><button class="policy-filter-section-head" type="button"><span>路由类型</span></button><div class="policy-filter-section-body">${radio('route-type', 'all', '所有路由', typeCount('all'), state.type === 'all')}${radio('route-type', 'static_route', '静态路由', typeCount('static_route'), state.type === 'static_route')}${radio('route-type', 'pbr', '策略路由', typeCount('pbr'), state.type === 'pbr')}</div></section>
-      <section class="policy-filter-section"><button class="policy-filter-section-head" type="button"><span>状态</span></button><div class="policy-filter-section-body">${radio('route-status', 'all', '所有状态', statusCount('all'), state.status === 'all')}${radio('route-status', 'enabled', '启用', statusCount('enabled'), state.status === 'enabled')}${radio('route-status', 'disabled', '停用', statusCount('disabled'), state.status === 'disabled')}</div></section>
-    </div><footer class="dwrt-kit-sheet-footer"><button class="policy-text-button" type="button" data-route-clear-filter ${filterCount() ? '' : 'disabled'}>清除筛选条件</button><button class="policy-primary" type="button" data-route-close>完成</button></footer></aside>`;
-  }
-  function renderColumnsDrawer() {
-    if (state.drawer !== 'columns') return '';
-    return `${drawerBackdrop('关闭列设置')}<aside class="routing-drawer routing-columns-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open"><header class="dwrt-kit-sheet-header"><div><span>COLUMNS</span><strong>自定义列</strong></div><button class="dwrt-kit-sheet-close" type="button" data-route-close>×</button></header><div class="dwrt-kit-sheet-body routing-drawer-body"><div class="routing-column-list">${COLUMNS.filter((column) => !column.fixed).map((column) => `<label><input type="checkbox" data-route-column="${column.key}" ${state.visibleColumns.has(column.key) ? 'checked' : ''}><span></span><strong>${escapeHtml(column.label)}</strong></label>`).join('')}</div></div><footer class="dwrt-kit-sheet-footer"><button class="policy-text-button" type="button" data-route-columns-reset>恢复默认</button><button class="policy-primary" type="button" data-route-close>完成</button></footer></aside>`;
-  }
-  function drawerBackdrop(label) { return `<button class="policy-drawer-backdrop dwrt-kit-sheet-overlay is-open" type="button" data-route-close aria-label="${label}"></button>`; }
-  function newDraft(type = 'static_route') {
-    return type === 'pbr'
-      ? { type, enabled: true, name: '', source: 'any', destination: 'any', protocol: 'all', ports: 'any', action: 'route_table', target: '', table: '', priority: 1000, schedule: 'always', comment: '' }
-      : { type, enabled: true, name: '', family: 'ipv4', destination: '', gateway: '', interface: '', table: 'main', metric: 0, mtu: 1500, routeKind: 'unicast', source: '', comment: '' };
-  }
-  function draftFromRow(row) {
-    if (row.type === 'pbr') return { type: row.type, enabled: row.enabled, name: row.name, source: row.source === '全部终端' ? 'any' : row.source, destination: row.destination === '任意' ? 'any' : row.destination, protocol: row.protocol, ports: row.ports, action: row.routeAction || 'route_table', target: row.target === '--' ? '' : row.target, table: row.table === '--' ? '' : row.table, priority: row.priority || 1000, schedule: row.schedule, comment: row.comment };
-    return { type: row.type, enabled: row.enabled, name: row.name, family: row.family, destination: row.routeTarget || (row.destination === '任意' ? '' : row.destination), netmask: row.netmask, gateway: row.target === '直连' || row.target === '--' ? '' : row.target, interface: row.interface === '--' ? '' : row.interface, table: row.table || 'main', metric: row.priority || 0, mtu: firstNumber(rawValue(row, 'mtu')) || 1500, routeKind: firstText(rawValue(row, 'route_kind', 'route_type', 'type'), 'unicast'), source: firstText(rawValue(row, 'source', 'source_prefix')) };
-  }
-  function field(label, control, wide = false) { return `<label class="routing-field ${wide ? 'is-wide' : ''}"><span>${label}</span>${control}</label>`; }
-  function input(name, value, placeholder = '', type = 'text') { return `<input type="${type}" data-route-draft="${name}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(placeholder)}">`; }
-  function select(name, value, options) { return `<select data-route-draft="${name}">${options.map(([key, label]) => `<option value="${escapeHtml(key)}" ${String(value) === String(key) ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select>`; }
-  function tableOptions(value) {
-    const values = new Map([['main', 'main']]);
-    state.tables.filter((item) => item.enabled).forEach((item) => values.set(item.id, item.tableId ? `${item.name} (${item.tableId})` : item.name));
-    if (value && !values.has(value)) values.set(value, value);
-    return [...values.entries()];
-  }
-  function datalist(id, options) {
-    const values = new Map();
-    options.forEach((item) => values.set(item.value, item.label));
-    return `<datalist id="${id}">${[...values.entries()].map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`).join('')}</datalist>`;
-  }
-  function listInput(name, value, list, placeholder = '') {
-    return `<input type="text" data-route-draft="${name}" value="${escapeHtml(value ?? '')}" list="${list}" placeholder="${escapeHtml(placeholder)}">`;
-  }
-  function renderEditorFields() {
-    const draft = state.draft;
-    if (draft.type === 'pbr') return `${field('名称', input('name', draft.name, '例如 办公设备走 WAN2'), true)}${field('源对象 / 网段', input('source', draft.source, 'any 或 192.168.1.0/24'))}${field('目标对象 / 网段', input('destination', draft.destination, 'any 或目标网段'))}${field('协议', select('protocol', draft.protocol, [['all','全部'],['tcp','TCP'],['udp','UDP'],['icmp','ICMP']]))}${field('目标端口', input('ports', draft.ports, 'any、443 或 80,443'))}${field('动作', select('action', draft.action, [['route_table','指定路由表'],['route_group','出口策略组'],['main','主路由表'],['drop','丢弃'],['mark','标记']]))}${field('目标出口', listInput('target', draft.target, 'routing-wan-options', 'WAN、接口或策略组'))}${field('路由表', select('table', draft.table, [['', '跟随目标'], ...tableOptions(draft.table)]))}${field('优先级', input('priority', draft.priority, '', 'number'))}${field('计划', input('schedule', draft.schedule, 'always'))}${field('备注', input('comment', draft.comment, '可选'), true)}${datalist('routing-wan-options', [...state.wans, ...state.interfaces])}`;
-    return `${field('地址族', select('family', draft.family, [['ipv4','IPv4'],['ipv6','IPv6']]))}${field('目标网络', input('destination', draft.destination, draft.family === 'ipv6' ? '2001:db8::/32' : '192.0.2.0/24'))}${draft.family === 'ipv4' && draft.netmask ? field('子网掩码', input('netmask', draft.netmask, '255.255.255.0')) : ''}${field('下一跳', input('gateway', draft.gateway, '可留空使用接口直连'))}${field('接口', listInput('interface', draft.interface, 'routing-interface-options', '例如 wan'))}${field('路由表', select('table', draft.table, tableOptions(draft.table)))}${field('跃点数', input('metric', draft.metric, '', 'number'))}${field('MTU', input('mtu', draft.mtu, '', 'number'))}${field('路由类型', select('routeKind', draft.routeKind, [['unicast','单播'],['blackhole','黑洞'],['unreachable','不可达'],['prohibit','禁止']]))}${field('源地址（可选）', input('source', draft.source, '源地址或前缀'))}${datalist('routing-interface-options', state.interfaces)}`;
-  }
-  function renderEditorDrawer() {
-    if (!['create', 'edit'].includes(state.drawer)) return '';
-    const editing = state.drawer === 'edit' && state.selected;
-    const type = state.draft.type || 'static_route';
-    const canSave = capabilityFor(type, editing ? 'update' : 'create');
-    const canDelete = editing && capabilityFor(type, 'delete');
-    return `${drawerBackdrop('关闭路由编辑')}<aside class="routing-drawer routing-editor-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open"><header class="dwrt-kit-sheet-header"><div><span>${editing ? 'ROUTE DETAILS' : 'CREATE ROUTE'}</span><strong>${editing ? escapeHtml(state.selected.name) : '创建路由'}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-route-close>×</button></header><div class="dwrt-kit-sheet-body routing-drawer-body">
-      ${editing ? '' : `<nav class="dwrt-kit-tabs routing-editor-tabs" aria-label="路由类型"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span><button class="dwrt-kit-tab ${type === 'static_route' ? 'is-active' : ''}" type="button" data-route-draft-type="static_route">静态路由</button><button class="dwrt-kit-tab ${type === 'pbr' ? 'is-active' : ''}" type="button" data-route-draft-type="pbr">策略路由</button></nav>`}
-      <label class="routing-enabled-field"><span><strong>启用路由</strong><small>保存后写入真实配置</small></span><input type="checkbox" data-route-draft-check="enabled" ${state.draft.enabled ? 'checked' : ''}><i></i></label>
-      <div class="routing-form">${renderEditorFields()}</div>
-      ${state.notice ? `<div class="routing-notice ${/失败|错误|不支持/.test(state.notice) ? 'is-error' : ''}">${escapeHtml(state.notice)}</div>` : ''}
-    </div><footer class="dwrt-kit-sheet-footer routing-editor-footer">${editing ? `<button class="policy-secondary danger" type="button" data-route-delete ${canDelete && !state.saving ? '' : 'disabled'}>${state.confirmDelete ? '再次点击删除' : '删除'}</button>` : '<span></span>'}<div><button class="policy-secondary" type="button" data-route-close>取消</button><button class="policy-primary" type="button" data-route-save ${canSave && !state.saving ? '' : 'disabled'}>${state.saving ? '正在保存' : canSave ? '保存' : '后端未开放写入'}</button></div></footer></aside>`;
   }
   function render() {
     if (!root) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
-    root.classList.add('route-workspace', 'policy-table-route-host', MODULE_CLASS);
-    root.innerHTML = `<section class="policy-table-shell routing-table-shell">${renderToolbar()}${renderTable()}${renderFilterDrawer()}${renderColumnsDrawer()}${renderEditorDrawer()}</section>`;
+    root.classList.add('route-workspace', MODULE_CLASS);
+    root.innerHTML = `<section class="routing-table-shell" data-routing-version="${VERSION}">${toolbarMarkup()}<main class="routing-workbench">${state.notice && !state.drawer ? noticeMarkup() : ''}${contentMarkup()}</main>${drawerMarkup()}${confirmationMarkup()}</section>`;
     bindEvents();
     ui.mountAll?.(root);
   }
-  function patchTable() {
-    const card = root?.querySelector('.routing-table-card');
-    if (!card) return;
-    const scroll = card.querySelector('[data-routing-scroll]');
-    const top = scroll?.scrollTop || 0;
-    const left = scroll?.scrollLeft || 0;
-    card.outerHTML = renderTable();
-    const next = root.querySelector('[data-routing-scroll]');
-    if (next) { next.scrollTop = top; next.scrollLeft = left; }
-    bindTableEvents();
+  function defaultEditor(kind) {
+    if (kind === 'table') return { id: '', name: '', table_id: '', role: '', gateway: '', metric: 0, enabled: true };
+    if (kind === 'object') return { id: '', name: '', type: 'ip_group', family: 'mixed', value: '', membersText: '', comment: '', enabled: true };
+    return { id: '', name: '', service_type: 'snmp', server_ip: '', scope: '', listen_port: '161', version: 'V2', access_rate: '', remark: '', enabled: true };
   }
-  function patchView() {
-    if (!root?.querySelector('.routing-table-shell') || state.drawer) render();
-    else patchTable();
+  function editorFromItem(kind, item) {
+    if (kind === 'object') return { ...item, membersText: item.members.map((member) => firstText(member.value, member.label)).join('\n') };
+    return { ...item };
   }
-  function openCreate() { state.selected = null; state.draft = newDraft('static_route'); state.notice = ''; state.confirmDelete = false; state.drawer = 'create'; render(); }
-  function openRow(id) { const row = state.rows.find((item) => item.id === id); if (!row) return; state.selected = row; state.draft = draftFromRow(row); state.notice = ''; state.confirmDelete = false; state.drawer = 'edit'; render(); }
-  function closeDrawer() { state.drawer = ''; state.selected = null; state.notice = ''; state.confirmDelete = false; render(); }
-  function payloadFromDraft() {
-    const draft = state.draft;
-    if (draft.type === 'pbr') return { policy_type: 'pbr', name: draft.name, enabled: Boolean(draft.enabled), source_object: draft.source || 'any', dest_object: draft.destination || 'any', protocol: draft.protocol || 'all', ports: draft.ports || 'any', action: draft.action || 'route_table', target: draft.target, route_table: draft.table, priority: Number(draft.priority) || 1000, schedule: draft.schedule || 'always', comment: draft.comment || '', apply: true, reload_route: true };
-    return { policy_type: 'static_route', enabled: Boolean(draft.enabled), family: draft.family || 'ipv4', target: draft.destination, destination: draft.destination, netmask: draft.netmask || '', gateway: draft.gateway, interface: draft.interface, table: draft.table || 'main', metric: Number(draft.metric) || 0, mtu: Number(draft.mtu) || 1500, route_kind: draft.routeKind || 'unicast', source: draft.source, apply: true, reload_network: false };
+  function openCreate(kind) {
+    const map = { tables: 'table', objects: 'object', cross: 'cross' };
+    const editorKind = map[kind];
+    if (!editorKind) return;
+    state.drawer = 'editor'; state.editorKind = editorKind; state.editorMode = 'create'; state.selected = null; state.editor = defaultEditor(editorKind); state.notice = ''; render();
   }
-  async function saveRoute() {
-    const payload = payloadFromDraft();
-    if (state.draft.type === 'pbr' && !state.draft.name.trim()) { state.notice = '请填写策略路由名称。'; render(); return; }
-    if (state.draft.type === 'static_route' && !state.draft.destination.trim()) { state.notice = '请填写目标网络。'; render(); return; }
-    if (state.draft.type === 'static_route' && !state.draft.gateway.trim() && !state.draft.interface.trim()) { state.notice = '下一跳和接口至少填写一项。'; render(); return; }
-    if (state.draft.type === 'pbr' && state.draft.action !== 'main' && !state.draft.target.trim() && !state.draft.table.trim()) { state.notice = '请填写策略路由的目标出口或路由表。'; render(); return; }
+  function openItem(kind, id) {
+    const source = kind === 'policy' ? state.policies : kind === 'table' ? state.tables : kind === 'object' ? state.objects : state.crossServices;
+    const item = source.find((entry) => entry.id === id);
+    if (!item) return;
+    state.drawer = 'editor'; state.editorKind = kind; state.editorMode = 'edit'; state.selected = item; state.editor = editorFromItem(kind, item); state.notice = ''; render();
+  }
+  function closeDrawer() {
+    state.drawer = ''; state.editorKind = ''; state.editorMode = ''; state.editor = {}; state.selected = null; state.confirmDelete = false; state.notice = ''; render();
+  }
+  function validateEditor() {
+    const editor = state.editor;
+    if (!String(editor.id || '').trim() || !String(editor.name || '').trim()) return '资源 ID 和显示名称不能为空。';
+    if (state.editorKind === 'table') {
+      const tableId = Number(editor.table_id);
+      if (!Number.isInteger(tableId) || tableId < 1 || tableId > 32767 || [253, 254, 255].includes(tableId)) return 'Table ID 必须为 1..32767 的自定义编号，且不能使用 253、254、255。';
+    }
+    if (state.editorKind === 'object' && !['ipv4', 'ipv6', 'mixed'].includes(editor.family)) return '请选择有效的地址族。';
+    return '';
+  }
+  function editorPayload() {
+    const editor = state.editor;
+    if (state.editorKind === 'table') return { id: String(editor.id).trim(), name: String(editor.name).trim(), table_id: Number(editor.table_id), role: String(editor.role || '').trim(), gateway: String(editor.gateway || '').trim(), metric: Number(editor.metric) || 0, enabled: Boolean(editor.enabled) };
+    if (state.editorKind === 'object') return { id: String(editor.id).trim(), name: String(editor.name).trim(), type: editor.type || 'ip_group', family: editor.family || 'mixed', value: String(editor.value || '').trim(), members: String(editor.membersText || '').split(/\r?\n/).map((value) => value.trim()).filter(Boolean).map((value) => ({ value, label: value })), comment: String(editor.comment || '').trim(), enabled: Boolean(editor.enabled) };
+    return { id: String(editor.id).trim(), name: String(editor.name).trim(), service_type: editor.service_type || 'snmp', server_ip: String(editor.server_ip || '').trim(), scope: String(editor.scope || '').trim(), listen_port: String(editor.listen_port || '').trim(), version: String(editor.version || '').trim(), access_rate: String(editor.access_rate || '').trim(), remark: String(editor.remark || '').trim(), enabled: Boolean(editor.enabled) };
+  }
+  async function saveEditor() {
+    if (!editorWritable() || state.saving) return;
+    const validation = validateEditor();
+    if (validation) { state.notice = validation; render(); return; }
+    const endpoint = state.editorKind === 'table' ? RESOURCE_ENDPOINTS.tables : state.editorKind === 'object' ? RESOURCE_ENDPOINTS.objects : RESOURCE_ENDPOINTS.cross;
     state.saving = true; state.notice = ''; render();
     try {
-      if (state.selected) await requestJson(`${ENDPOINT}/${encodeURIComponent(state.selected.id)}?apply=true`, { method: 'PATCH', body: JSON.stringify(payload) });
-      else await requestJson(`${ENDPOINT}?apply=true`, { method: 'POST', body: JSON.stringify(payload) });
-      state.saving = false; state.drawer = ''; state.selected = null; await load();
-    } catch (error) { state.saving = false; state.notice = `保存失败：${firstText(error.message, 'unknown')}`; render(); }
+      await requestJson(endpoint, { method: state.editorMode === 'create' ? 'POST' : 'PUT', body: JSON.stringify(editorPayload()) });
+      state.saving = false; state.drawer = ''; state.editorKind = ''; state.selected = null; state.notice = '配置已保存，并以后端返回的事务结果为准。';
+      await load();
+    } catch (error) {
+      state.saving = false; state.notice = errorText(error, '保存失败：'); render();
+    }
   }
-  async function deleteRoute() {
-    if (!state.selected) return;
-    if (!state.confirmDelete) { state.confirmDelete = true; render(); return; }
+  async function deleteEditor() {
+    if (!state.selected || !editorWritable() || state.saving || !state.confirmDelete) return;
+    const endpoint = state.editorKind === 'table' ? RESOURCE_ENDPOINTS.tables : state.editorKind === 'object' ? RESOURCE_ENDPOINTS.objects : RESOURCE_ENDPOINTS.cross;
     state.saving = true; render();
     try {
-      await requestJson(`${ENDPOINT}/${encodeURIComponent(state.selected.id)}?apply=true`, { method: 'DELETE', body: JSON.stringify({ policy_type: state.selected.type, apply: true, reload_route: state.selected.type === 'pbr', reload_network: false }) });
-      state.saving = false; state.drawer = ''; state.selected = null; await load();
-    } catch (error) { state.saving = false; state.confirmDelete = false; state.notice = `删除失败：${firstText(error.message, 'unknown')}`; render(); }
+      await requestJson(`${endpoint}/${encodeURIComponent(state.selected.id)}`, { method: 'DELETE' });
+      state.saving = false; state.confirmDelete = false; state.drawer = ''; state.editorKind = ''; state.selected = null; state.notice = '资源已删除。';
+      await load();
+    } catch (error) {
+      state.saving = false; state.confirmDelete = false; state.notice = errorText(error, '删除失败：'); render();
+    }
   }
-  function bindTableEvents() {
-    root.querySelectorAll('[data-route-open]').forEach((button) => button.addEventListener('click', () => openRow(button.dataset.routeOpen)));
-    root.querySelectorAll('[data-route-sort]').forEach((button) => button.addEventListener('click', () => {
-      const key = button.dataset.routeSort;
-      if (!key || key === 'actions') return;
-      if (state.sortKey === key) state.sortDirection = state.sortDirection === 'asc' ? 'desc' : 'asc';
-      else { state.sortKey = key; state.sortDirection = 'asc'; }
-      patchTable();
-    }));
+  async function resolveRuntime() {
+    if (!cap('runtime_resolve') || !state.resolveValue || state.resolving) return;
+    state.resolving = true; state.notice = ''; render();
+    try {
+      state.resolution = await requestJson(RESOURCE_ENDPOINTS.runtime, { method: 'POST', body: JSON.stringify(state.resolveMode === 'rule' ? { rule_id: state.resolveValue } : { route_table: state.resolveValue }) });
+      state.resolving = false; render();
+    } catch (error) {
+      state.resolving = false; state.resolution = null; state.notice = errorText(error, '解析失败：'); render();
+    }
   }
   function bindEvents() {
-    bindTableEvents();
-    root.querySelectorAll('[data-route-refresh]').forEach((button) => button.addEventListener('click', load));
-    root.querySelectorAll('[data-route-filter]').forEach((button) => button.addEventListener('click', () => { state.drawer = 'filter'; render(); }));
-    root.querySelectorAll('[data-route-create]').forEach((button) => button.addEventListener('click', openCreate));
-    root.querySelectorAll('[data-route-close]').forEach((button) => button.addEventListener('click', closeDrawer));
-    root.querySelectorAll('[data-route-columns]').forEach((button) => button.addEventListener('click', () => { state.drawer = 'columns'; render(); }));
-    root.querySelectorAll('[data-route-column]').forEach((input) => input.addEventListener('change', () => { if (input.checked) state.visibleColumns.add(input.dataset.routeColumn); else state.visibleColumns.delete(input.dataset.routeColumn); render(); }));
-    root.querySelectorAll('[data-route-columns-reset]').forEach((button) => button.addEventListener('click', () => { state.visibleColumns = new Set(COLUMNS.map((column) => column.key)); render(); }));
-    root.querySelectorAll('input[name="route-type"]').forEach((input) => input.addEventListener('change', () => { state.type = input.value; render(); }));
-    root.querySelectorAll('input[name="route-status"]').forEach((input) => input.addEventListener('change', () => { state.status = input.value; render(); }));
-    root.querySelectorAll('[data-route-clear-filter]').forEach((button) => button.addEventListener('click', () => { state.type = 'all'; state.status = 'all'; render(); }));
-    root.querySelectorAll('[data-route-draft-type]').forEach((button) => button.addEventListener('click', () => { state.draft = newDraft(button.dataset.routeDraftType); render(); }));
-    root.querySelectorAll('[data-route-draft]').forEach((input) => input.addEventListener('input', () => { state.draft[input.dataset.routeDraft] = input.type === 'number' ? Number(input.value) : input.value; state.notice = ''; }));
-    root.querySelectorAll('[data-route-draft-check]').forEach((input) => input.addEventListener('change', () => { state.draft[input.dataset.routeDraftCheck] = input.checked; }));
-    root.querySelectorAll('[data-route-save]').forEach((button) => button.addEventListener('click', saveRoute));
-    root.querySelectorAll('[data-route-delete]').forEach((button) => button.addEventListener('click', deleteRoute));
-    root.querySelectorAll('[data-route-search]').forEach((input) => input.addEventListener('input', () => {
+    root.querySelectorAll('[data-routing-tab]').forEach((button) => button.addEventListener('click', () => { state.tab = button.dataset.routingTab; state.query = ''; state.notice = ''; render(); }));
+    root.querySelectorAll('[data-routing-refresh]').forEach((button) => button.addEventListener('click', load));
+    root.querySelectorAll('[data-routing-create]').forEach((button) => button.addEventListener('click', () => openCreate(button.dataset.routingCreate)));
+    root.querySelectorAll('[data-routing-open]').forEach((button) => button.addEventListener('click', () => openItem(button.dataset.routingOpen, button.dataset.routingId)));
+    root.querySelectorAll('[data-routing-close]').forEach((button) => button.addEventListener('click', closeDrawer));
+    root.querySelectorAll('[data-routing-field]').forEach((input) => input.addEventListener('input', () => { state.editor[input.dataset.routingField] = input.type === 'number' ? Number(input.value) : input.value; state.notice = ''; }));
+    root.querySelectorAll('[data-routing-field-check]').forEach((input) => input.addEventListener('change', () => { state.editor[input.dataset.routingFieldCheck] = input.checked; }));
+    root.querySelectorAll('[data-routing-save]').forEach((button) => button.addEventListener('click', saveEditor));
+    root.querySelectorAll('[data-routing-delete]').forEach((button) => button.addEventListener('click', () => { state.confirmDelete = true; render(); }));
+    root.querySelectorAll('[data-dwrt-confirm-cancel]').forEach((button) => button.addEventListener('click', () => { state.confirmDelete = false; render(); }));
+    root.querySelectorAll('[data-dwrt-confirm-accept]').forEach((button) => button.addEventListener('click', deleteEditor));
+    root.querySelectorAll('[data-routing-resolve-mode]').forEach((select) => select.addEventListener('change', () => { state.resolveMode = select.value; state.resolveValue = ''; state.resolution = null; render(); }));
+    root.querySelectorAll('[data-routing-resolve-value]').forEach((select) => select.addEventListener('change', () => { state.resolveValue = select.value; state.resolution = null; render(); }));
+    root.querySelectorAll('[data-routing-resolve]').forEach((button) => button.addEventListener('click', resolveRuntime));
+    root.querySelectorAll('[data-routing-search]').forEach((input) => input.addEventListener('input', () => {
       window.clearTimeout(searchTimer);
       const value = input.value;
-      searchTimer = window.setTimeout(() => { state.query = value; patchTable(); }, 100);
+      searchTimer = window.setTimeout(() => { state.query = value; render(); root.querySelector('[data-routing-search]')?.focus(); }, 100);
     }));
   }
 
   render();
   load();
-  return { unmount() { state.mounted = false; state.seq += 1; window.clearTimeout(searchTimer); root?.replaceChildren(); root?.classList.remove(MODULE_CLASS, 'policy-table-route-host', 'route-workspace'); } };
+  return {
+    unmount() {
+      state.mounted = false; state.seq += 1; window.clearTimeout(searchTimer);
+      root?.replaceChildren(); root?.classList.remove(MODULE_CLASS, 'route-workspace');
+    }
+  };
 }

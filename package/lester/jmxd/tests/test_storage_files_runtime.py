@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from typing import List
 
@@ -24,6 +25,10 @@ def run(binary: Path, *args: str) -> dict:
 
 def content(binary: Path, root_id: str, path: Path) -> dict:
     return data(run(binary, "content", root_id, str(path)))
+
+
+def mutate(binary: Path, payload: dict) -> dict:
+    return data(run(binary, "mutate", json.dumps(payload, separators=(",", ":"))))
 
 
 def data(response: dict) -> dict:
@@ -78,7 +83,7 @@ def json_c_flags() -> tuple[List[str], List[str]]:
 
 
 def main() -> None:
-    compiler = shutil.which("cc") or shutil.which("clang")
+    compiler = os.environ.get("CC") or shutil.which("cc") or shutil.which("clang")
     assert compiler, "host C compiler unavailable"
     json_c_cflags, json_c_libs = json_c_flags()
     with tempfile.TemporaryDirectory(prefix="storage-files-runtime-") as temporary:
@@ -149,6 +154,85 @@ def main() -> None:
         assert alpha["read_only"] is True
         assert alpha["truncated"] is False
         assert alpha["etag"].startswith('W/"')
+
+        denied = mutate(binary, {
+            "action": "mkdir", "root_id": root_id, "path": str(mount),
+            "name": "denied",
+        })
+        assert denied["error"] == "confirmation_required"
+        assert not (mount / "denied").exists()
+
+        made = mutate(binary, {
+            "action": "mkdir", "root_id": root_id, "path": str(mount),
+            "name": "created", "confirm": True,
+        })
+        assert made["persisted"] is True and made["applied"] is True
+        assert made["readback_verified"] is True
+        assert (mount / "created").is_dir()
+
+        created = mutate(binary, {
+            "action": "create", "root_id": root_id,
+            "path": str(mount / "created"), "name": "note.txt",
+            "content": "first\n", "confirm": True,
+        })
+        note = mount / "created" / "note.txt"
+        if sys.platform.startswith("linux"):
+            assert created["persisted"] is True
+            assert note.read_text(encoding="utf-8") == "first\n"
+        else:
+            assert created["error"] == "filesystem_transaction_failed"
+            assert not note.exists()
+            note.write_text("first\n", encoding="utf-8")
+        first = content(binary, root_id, note)
+
+        stale = mutate(binary, {
+            "action": "write", "root_id": root_id, "path": str(note),
+            "content": "bad\n", "expected_etag": 'W/"stale"',
+            "confirm": True,
+        })
+        assert stale["error"] == "revision_conflict"
+        assert note.read_text(encoding="utf-8") == "first\n"
+
+        replaced = mutate(binary, {
+            "action": "write", "root_id": root_id, "path": str(note),
+            "content": "second\n", "expected_etag": first["etag"],
+            "confirm": True,
+        })
+        if sys.platform.startswith("linux"):
+            assert replaced["persisted"] is True
+            assert replaced["readback_verified"] is True
+            assert note.read_text(encoding="utf-8") == "second\n"
+        else:
+            assert replaced["error"] == "filesystem_transaction_failed"
+            assert replaced["persisted"] is False
+            assert note.read_text(encoding="utf-8") == "first\n"
+        assert not list(note.parent.glob(".dreamingwrt-tx-*"))
+
+        old_inode = note.stat().st_ino
+        renamed = mutate(binary, {
+            "action": "rename", "root_id": root_id, "path": str(note),
+            "new_name": "renamed.txt", "confirm": True,
+        })
+        renamed_path = note.parent / "renamed.txt"
+        if sys.platform.startswith("linux"):
+            assert renamed["persisted"] is True
+            assert not note.exists() and renamed_path.stat().st_ino == old_inode
+        else:
+            assert renamed["error"] == "filesystem_transaction_failed"
+            assert note.exists() and note.stat().st_ino == old_inode
+            assert not renamed_path.exists()
+
+        escaped = mutate(binary, {
+            "action": "create", "root_id": root_id, "path": str(mount),
+            "name": "../escape.txt", "content": "x", "confirm": True,
+        })
+        assert escaped["error"] == "invalid_name"
+        symlink_parent = mutate(binary, {
+            "action": "create", "root_id": root_id,
+            "path": str(mount / "escape"), "name": "escape.txt",
+            "content": "x", "confirm": True,
+        })
+        assert symlink_parent["error"] == "directory_unavailable"
         unicode_text = content(binary, root_id, mount / "unicode.txt")
         assert unicode_text["content"].endswith("second\r\n")
         assert unicode_text["newline"] == "crlf"
@@ -188,6 +272,12 @@ def main() -> None:
         )
         read_only = data(run(binary))
         assert read_only["roots"][0]["read_only"] is True
+        rejected_write = mutate(binary, {
+            "action": "mkdir", "root_id": root_id, "path": str(mount),
+            "name": "read-only", "confirm": True,
+        })
+        assert rejected_write["error"] == "storage_root_read_only"
+        assert not (mount / "read-only").exists()
 
     print("ok: storage-files descriptor walk and bounded UTF-8 text read")
 

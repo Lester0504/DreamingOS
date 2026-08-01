@@ -7,7 +7,7 @@ export function mount(context = {}) {
   const formatBytes = utils.formatBytes || ((value) => `${Math.max(0, Number(value) || 0)} B`);
   const formatRate = utils.formatRate || ((value) => `${Math.max(0, Number(value) || 0)} B/s`);
   const formatInteger = utils.formatInteger || ((value) => Math.round(Number(value) || 0).toLocaleString());
-  const VERSION = '20260718-11';
+  const VERSION = '20260731-policy-runtime-evidence-01';
   const REFRESH_MS = 5000;
   const WS_RECONCILE_MS = 30000;
   const ROUTE_STATUS_TOPIC = 'route.status';
@@ -69,6 +69,15 @@ export function mount(context = {}) {
 
   function number(...values) {
     return optionalNumber(...values) ?? 0;
+  }
+
+  function optionalBoolean(...values) {
+    for (const value of values) {
+      if (typeof value === 'boolean') return value;
+      if (value === 1 || value === '1' || value === 'true') return true;
+      if (value === 0 || value === '0' || value === 'false') return false;
+    }
+    return null;
   }
 
   function array(value, keys = []) {
@@ -217,6 +226,7 @@ export function mount(context = {}) {
       const wanIds = firstText(value.wan_ids, value.wans);
       const target = firstText(value.target, value.path, value.interface, value.wan, wanIds, '--');
       const outlet = outlets.find((item) => item.id === target || item.ifname === target);
+      const counterReady = optionalBoolean(value.counter_ready, value.counter_available);
       return {
         id: firstText(value.id, value.rule_id, value.name, `rule-${index}`),
         prio: optionalNumber(value.prio, value.priority),
@@ -227,7 +237,12 @@ export function mount(context = {}) {
         action: normalizeAction(firstText(value.action, value.target_type, value.mode)),
         target: outlet?.name || target,
         active_flows: optionalNumber(value.active_flows, value.steered_flows, value.connections, value.conn_count, value.flow_count),
-        hit_count: optionalNumber(value.hit_count, value.hits, value.hit),
+        hit_count: counterReady === false ? null : optionalNumber(value.hit_count, value.hits, value.hit),
+        last_hit: optionalNumber(value.last_hit, value.last_hit_at),
+        counter_source: firstText(value.counter_source),
+        counter_precision: firstText(value.counter_precision),
+        counter_ready: counterReady,
+        counter_verified: value.verified === true && value.policy_hit === true,
         up_rate: optionalNumber(value.up_rate, value.tx_rate),
         down_rate: optionalNumber(value.down_rate, value.rx_rate),
         remark: firstText(value.remark, value.comment),
@@ -278,9 +293,18 @@ export function mount(context = {}) {
       route.steered_flows,
       flowPolicyEvidence ? verifiedFlows : null
     );
-    const hitTotal = optionalNumber(status.hit_total, route.hit_total, rules.some((item) => item.hit_count !== null)
-      ? rules.reduce((sum, item) => sum + number(item.hit_count), 0)
-      : null);
+    const ruleCounterEvidence = rules.some((item) => item.hit_count !== null && item.counter_source);
+    const counterSupported = optionalBoolean(status.counter_supported, route.counter_supported) ?? ruleCounterEvidence;
+    const counterReady = optionalBoolean(status.counter_ready, route.counter_ready) ?? ruleCounterEvidence;
+    const counterAvailable = counterSupported === true && counterReady === true;
+    const runtimeRules = rules.map((item) => ({ ...item, hit_count: counterAvailable && item.counter_ready !== false ? item.hit_count : null }));
+    const hitTotal = counterAvailable ? optionalNumber(status.hit_total, route.hit_total, runtimeRules.some((item) => item.hit_count !== null)
+      ? runtimeRules.reduce((sum, item) => sum + number(item.hit_count), 0)
+      : null) : null;
+    const decisions = array(route.route_decisions, ['decisions']);
+    const candidateDecisions = decisions.filter((item) => item.candidate === true && item.verified !== true && item.policy_hit !== true).length;
+    const verifiedDecisions = decisions.filter((item) => item.verified === true && item.policy_hit === true).length;
+    const lastHit = optionalNumber(status.last_hit_at, route.last_hit_at, ...runtimeRules.map((item) => item.last_hit));
     const unsteeredFlows = activeFlows === null || steeredFlows === null
       ? null
       : Math.max(0, activeFlows - steeredFlows);
@@ -293,14 +317,23 @@ export function mount(context = {}) {
       activeRules: optionalNumber(
         status.active_rules,
         route.rule_count,
-        state.sourceReady.policies || fullRuntime ? rules.filter((item) => item.enabled).length : null
+        state.sourceReady.policies || fullRuntime ? runtimeRules.filter((item) => item.enabled).length : null
       ),
       bypassFlows: optionalNumber(status.bypass_flows, status.bypass_connections, route.bypass_flows),
       fallbackFlows: optionalNumber(status.fallback_flows, status.fallback_connections, route.fallback_flows),
       hitTotal,
+      counterAvailable,
+      counterSupported,
+      counterReady,
+      counterSource: firstText(status.counter_source, route.counter_source, ...runtimeRules.map((item) => item.counter_source)),
+      counterPrecision: firstText(status.counter_precision, route.counter_precision, ...runtimeRules.map((item) => item.counter_precision)),
+      counterReason: firstText(status.counter_reason, route.counter_reason, counterSupported === false ? 'counter_not_supported' : counterReady === false ? 'counter_not_ready' : ''),
+      lastHit,
+      candidateDecisions,
+      verifiedDecisions,
       outlets,
       groups,
-      rules,
+      rules: runtimeRules,
       fullRuntime
     };
   }
@@ -311,6 +344,36 @@ export function mount(context = {}) {
 
   function displayPercent(value) {
     return value === null || value === undefined ? '--' : `${Number(value).toFixed(1)}%`;
+  }
+
+  function formatTimestamp(value) {
+    const raw = Number(value) || 0;
+    if (!raw) return '尚无命中';
+    const timestamp = raw < 100000000000 ? raw * 1000 : raw;
+    return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(timestamp);
+  }
+
+  function counterSourceLabel(value) {
+    if (value === 'jmx_route_kernel') return 'jmx_route 内核计数';
+    return value || '未声明来源';
+  }
+
+  function counterPrecisionLabel(value) {
+    if (value === 'aggregate_rule_counter') return '规则级聚合计数';
+    return value || '未声明精度';
+  }
+
+  function counterReasonLabel(value) {
+    const labels = {
+      no_route_rules: '当前没有可计数的路由规则',
+      counter_not_supported: '当前固件不支持规则计数',
+      counter_not_ready: '规则计数器尚未就绪'
+    };
+    return labels[value] || value || '后端未提供可验证的计数来源';
+  }
+
+  function statusBadge(label, tone = 'muted') {
+    return ui.statusBadgeMarkup?.(label, tone) || window.DWRT_UI_KIT?.statusBadgeMarkup?.(label, tone) || `<span class="policy-status-evidence-badge is-${escapeHtml(tone)}">${escapeHtml(label)}</span>`;
   }
 
   function icon(name) {
@@ -329,7 +392,7 @@ export function mount(context = {}) {
       : `${displayInteger(data.bypassFlows)} / ${displayInteger(data.fallbackFlows)}`;
     const items = [
       { key: 'active', label: '活跃连接', value: displayInteger(data.activeFlows), detail: data.available ? '当前连接总数' : '未启用', tone: 'info', icon: icon('connections') },
-      { key: 'policy', label: '策略分流', value: displayPercent(data.steerPercent), detail: `${displayInteger(data.activeRules)} 条规则 · 当前 ${displayInteger(data.steeredFlows)} 条 · 累计 ${displayInteger(data.hitTotal)} 次`, tone: 'ok', icon: icon('target') },
+      { key: 'policy', label: '策略分流', value: displayPercent(data.steerPercent), detail: `${displayInteger(data.activeRules)} 条规则 · 当前 ${displayInteger(data.steeredFlows)} 条 · ${data.counterAvailable ? `内核聚合 ${displayInteger(data.hitTotal)} 次` : '命中未采集'}`, tone: data.counterAvailable ? 'ok' : 'warn', icon: icon('target') },
       { key: 'unsteered', label: '未分流连接', value: displayInteger(data.unsteeredFlows), detail: '当前未匹配显式分流', tone: 'neutral', icon: icon('rules') },
       { key: 'fallback', label: '旁路回退', value: fallbackValue, detail: data.fullRuntime ? '实时运行态' : '等待完整运行态', tone: 'warn', icon: icon('fallback') }
     ];
@@ -427,6 +490,16 @@ export function mount(context = {}) {
     return `<button type="button" data-policy-status-sort="${key}" class="${active ? 'is-active' : ''}">${escapeHtml(label)}<span>${active ? (state.sort.direction === 'asc' ? '↑' : '↓') : '↕'}</span></button>`;
   }
 
+  function runtimeEvidenceMarkup(data = state.data || {}) {
+    const candidateNote = data.candidateDecisions
+      ? `当前另有 ${formatInteger(data.candidateDecisions)} 条未验证候选，不计入命中。`
+      : '未验证候选不会计入命中。';
+    if (!data.counterAvailable) {
+      return `<div class="policy-status-runtime-evidence is-warning" data-policy-runtime-evidence role="status"><div>${statusBadge('命中未采集', 'warning')}<strong>${escapeHtml(counterReasonLabel(data.counterReason))}</strong></div><span>${escapeHtml(candidateNote)}</span></div>`;
+    }
+    return `<div class="policy-status-runtime-evidence" data-policy-runtime-evidence role="status"><div>${statusBadge('聚合计数', 'success')}<strong>${escapeHtml(counterSourceLabel(data.counterSource))}</strong></div><span>${escapeHtml(counterPrecisionLabel(data.counterPrecision))} · 最近命中 ${escapeHtml(formatTimestamp(data.lastHit))} · ${escapeHtml(candidateNote)}</span></div>`;
+  }
+
   function ruleRows() {
     const rows = filteredRules();
     if (!rows.length) return '<tr><td colspan="6" class="dwrt-kit-table-empty">没有匹配的分流规则</td></tr>';
@@ -436,7 +509,7 @@ export function mount(context = {}) {
       <td class="policy-status-matcher">${escapeHtml(rule.match)}</td>
       <td><span class="policy-status-action is-${escapeHtml(rule.action)}">${escapeHtml(actionLabel(rule.action))}</span><small>${escapeHtml(rule.target)}</small></td>
       <td><span class="policy-status-rule-rate"><strong data-rule-rate>${rule.down_rate === null && rule.up_rate === null ? '--' : escapeHtml(formatRate(number(rule.down_rate) + number(rule.up_rate)))}</strong><small data-rule-flows>${displayInteger(rule.active_flows)} 分流连接</small></span></td>
-      <td><span class="policy-status-hit" data-rule-hits>${displayInteger(rule.hit_count)}</span></td>
+      <td><span class="policy-status-rule-hit"><strong class="policy-status-hit" data-rule-hits>${displayInteger(rule.hit_count)}</strong><small data-rule-last-hit>${rule.hit_count === null ? '未采集' : formatTimestamp(rule.last_hit)}</small></span></td>
     </tr>`).join('');
   }
 
@@ -449,7 +522,8 @@ export function mount(context = {}) {
         <select data-policy-status-filter="action" aria-label="筛选动作"><option value="">全部动作</option>${['route', 'balance', 'vpn', 'direct', 'reject', 'fallback'].map((action) => `<option value="${action}" ${state.action === action ? 'selected' : ''}>${actionLabel(action)}</option>`).join('')}</select>
         <select data-policy-status-filter="path" aria-label="筛选出口"><option value="">全部出口</option>${paths.map((path) => `<option value="${escapeHtml(path)}" ${state.path === path ? 'selected' : ''}>${escapeHtml(path)}</option>`).join('')}</select>
       </div>
-      <div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr><th>${sortButton('prio', '优先级')}</th><th>${sortButton('name', '分流规则')}</th><th>匹配对象</th><th>出口通道</th><th>${sortButton('active_flows', '状态速率')}</th><th>${sortButton('hit_count', '命中样本')}</th></tr></thead><tbody>${ruleRows()}</tbody></table></div>
+      ${runtimeEvidenceMarkup()}
+      <div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr><th>${sortButton('prio', '优先级')}</th><th>${sortButton('name', '分流规则')}</th><th>匹配对象</th><th>出口通道</th><th>${sortButton('active_flows', '状态速率')}</th><th>${sortButton('hit_count', '聚合命中')}</th></tr></thead><tbody>${ruleRows()}</tbody></table></div>
     </section>`;
   }
 
@@ -500,7 +574,7 @@ export function mount(context = {}) {
     const fallback = data.bypassFlows === null && data.fallbackFlows === null ? '--' : `${displayInteger(data.bypassFlows)} / ${displayInteger(data.fallbackFlows)}`;
     const values = {
       active: [displayInteger(data.activeFlows), data.available ? '当前连接总数' : '未启用'],
-      policy: [displayPercent(data.steerPercent), `${displayInteger(data.activeRules)} 条规则 · 当前 ${displayInteger(data.steeredFlows)} 条 · 累计 ${displayInteger(data.hitTotal)} 次`],
+      policy: [displayPercent(data.steerPercent), `${displayInteger(data.activeRules)} 条规则 · 当前 ${displayInteger(data.steeredFlows)} 条 · ${data.counterAvailable ? `内核聚合 ${displayInteger(data.hitTotal)} 次` : '命中未采集'}`],
       unsteered: [displayInteger(data.unsteeredFlows), '当前未匹配显式分流'],
       fallback: [fallback, data.fullRuntime ? '实时运行态' : '等待完整运行态']
     };
@@ -514,12 +588,18 @@ export function mount(context = {}) {
 
   function patchDynamic(options = {}) {
     patchOverview();
+    patchRuntimeEvidence();
     if (outletStructureKey() !== state.outletKey) renderOutlets();
     else patchOutlets();
     if (groupStructureKey() !== state.groupKey) renderGroups();
     else patchGroups();
     if (ruleStructureKey() !== state.ruleKey) renderRulesTable();
     else patchRuleRows();
+  }
+
+  function patchRuntimeEvidence() {
+    const current = root.querySelector('[data-policy-runtime-evidence]');
+    if (current) current.outerHTML = runtimeEvidenceMarkup();
   }
 
   function patchOutlets() {
@@ -599,9 +679,11 @@ export function mount(context = {}) {
       const rate = row.querySelector('[data-rule-rate]');
       const flows = row.querySelector('[data-rule-flows]');
       const hits = row.querySelector('[data-rule-hits]');
+      const lastHit = row.querySelector('[data-rule-last-hit]');
       if (rate) rate.textContent = rule.down_rate === null && rule.up_rate === null ? '--' : formatRate(number(rule.down_rate) + number(rule.up_rate));
       if (flows) flows.textContent = `${displayInteger(rule.active_flows)} 分流连接`;
       if (hits) hits.textContent = displayInteger(rule.hit_count);
+      if (lastHit) lastHit.textContent = rule.hit_count === null ? '未采集' : formatTimestamp(rule.last_hit);
     });
     const count = root.querySelector('[data-policy-rule-count]');
     if (count) count.textContent = `${filteredRules().length} / ${state.data.rules.length} 条`;

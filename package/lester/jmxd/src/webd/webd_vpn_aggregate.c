@@ -610,3 +610,181 @@ struct json_object *webd_vpn_resource_view(struct json_object *snapshot,
     vpn_copy(view, snapshot, "capability_reasons");
     return view;
 }
+
+static int vpn_result_boolean(struct json_object *result, const char *key)
+{
+    struct json_object *value = NULL;
+
+    if (!result || !json_object_object_get_ex(result, key, &value) || !value)
+        return 0;
+    return json_object_get_boolean(value);
+}
+
+static struct json_object *vpn_transaction_response(
+    const char *transaction_id, const char *state, int saved, int applied,
+    int readback_verified, int rollback_attempted, int rollback_succeeded,
+    const char *error, const char *reason)
+{
+    struct json_object *response = json_object_new_object();
+
+    json_object_object_add(response, "contract_version",
+                           json_object_new_string("vpn-transaction.v1"));
+    json_object_object_add(response, "transaction_id",
+                           json_object_new_string(transaction_id));
+    json_object_object_add(response, "state", json_object_new_string(state));
+    json_object_object_add(response, "saved", json_object_new_boolean(saved));
+    json_object_object_add(response, "persisted",
+                           json_object_new_boolean(saved &&
+                               !strcmp(state, "committed")));
+    json_object_object_add(response, "applied", json_object_new_boolean(applied));
+    json_object_object_add(response, "readback_verified",
+                           json_object_new_boolean(readback_verified));
+    json_object_object_add(response, "rollback_attempted",
+                           json_object_new_boolean(rollback_attempted));
+    json_object_object_add(response, "rollback_succeeded",
+                           json_object_new_boolean(rollback_succeeded));
+    json_object_object_add(response, "rollback_available",
+                           json_object_new_boolean(saved && !rollback_succeeded));
+    json_object_object_add(response, "error",
+                           error ? json_object_new_string(error) :
+                                   json_object_new_null());
+    json_object_object_add(response, "reason",
+                           reason ? json_object_new_string(reason) :
+                                    json_object_new_null());
+    return response;
+}
+
+static int vpn_json_equal(struct json_object *left, struct json_object *right)
+{
+    if (!left || !right)
+        return 0;
+    return json_object_equal(left, right);
+}
+
+static int vpn_runtime_apply_verified(struct json_object *apply,
+                                      struct json_object *runtime)
+{
+    struct json_object *generation = NULL, *runtime_generation = NULL;
+
+    if (!vpn_result_boolean(apply, "applied") ||
+        !vpn_result_boolean(apply, "health_checked") ||
+        !vpn_result_boolean(apply, "healthy") || !runtime)
+        return 0;
+    if (!json_object_object_get_ex(apply, "generation", &generation) ||
+        !generation || !json_object_object_get_ex(runtime, "generation",
+                                                   &runtime_generation) ||
+        !runtime_generation)
+        return 0;
+    return json_object_equal(generation, runtime_generation);
+}
+
+static int vpn_transaction_rollback(
+    struct json_object *snapshot, const struct webd_vpn_transaction_ops *ops,
+    void *opaque)
+{
+    struct json_object *save = NULL, *apply = NULL, *readback = NULL;
+    struct json_object *runtime = NULL;
+    int ok = 0;
+
+    save = ops->config_save(snapshot, opaque);
+    if (!vpn_result_boolean(save, "saved"))
+        goto out;
+    apply = ops->config_apply(snapshot, opaque);
+    if (!vpn_result_boolean(apply, "applied"))
+        goto out;
+    readback = ops->config_get(opaque);
+    runtime = ops->runtime_get(opaque);
+    ok = vpn_json_equal(snapshot, readback) &&
+         vpn_runtime_apply_verified(apply, runtime);
+out:
+    if (runtime) json_object_put(runtime);
+    if (readback) json_object_put(readback);
+    if (apply) json_object_put(apply);
+    if (save) json_object_put(save);
+    return ok;
+}
+
+struct json_object *webd_vpn_transaction_execute(
+    struct json_object *candidate, const struct webd_vpn_transaction_ops *ops,
+    void *opaque)
+{
+    struct json_object *snapshot = NULL, *save = NULL, *apply = NULL;
+    struct json_object *readback = NULL, *runtime = NULL, *response;
+    char transaction_id[96];
+    int saved = 0, applied = 0;
+    int rollback_attempted = 0, rollback_succeeded = 0;
+    const char *error = NULL, *reason = NULL;
+
+    snprintf(transaction_id, sizeof(transaction_id), "vpn-%lld-%ld",
+             (long long)time(NULL), (long)getpid());
+    if (!candidate || !json_object_is_type(candidate, json_type_object) ||
+        !ops || !ops->config_get || !ops->config_save ||
+        !ops->config_apply || !ops->runtime_get)
+        return vpn_transaction_response(transaction_id, "rejected", 0, 0, 0,
+                                        0, 0, "invalid_transaction",
+                                        "transaction callbacks and candidate are required");
+    snapshot = ops->config_get(opaque);
+    if (!snapshot || !json_object_is_type(snapshot, json_type_object)) {
+        error = "snapshot_unavailable";
+        reason = "authoritative configuration snapshot is unavailable";
+        goto failed;
+    }
+    save = ops->config_save(candidate, opaque);
+    saved = vpn_result_boolean(save, "saved");
+    if (!saved) {
+        error = "save_failed";
+        reason = "candidate configuration was not persisted";
+        goto failed;
+    }
+    readback = ops->config_get(opaque);
+    if (!vpn_json_equal(candidate, readback)) {
+        error = "save_readback_mismatch";
+        reason = "persisted configuration does not match the candidate";
+        goto rollback;
+    }
+    json_object_put(readback);
+    readback = NULL;
+    apply = ops->config_apply(candidate, opaque);
+    applied = vpn_result_boolean(apply, "applied");
+    if (!applied) {
+        error = "apply_failed";
+        reason = "runtime application did not report success";
+        goto rollback;
+    }
+    runtime = ops->runtime_get(opaque);
+    if (!vpn_runtime_apply_verified(apply, runtime)) {
+        error = "runtime_readback_failed";
+        reason = "runtime generation or health check did not verify";
+        goto rollback;
+    }
+    readback = ops->config_get(opaque);
+    if (!vpn_json_equal(candidate, readback)) {
+        error = "post_apply_readback_mismatch";
+        reason = "configuration changed during runtime application";
+        goto rollback;
+    }
+    response = vpn_transaction_response(transaction_id, "committed", 1, 1, 1,
+                                        0, 0, NULL, NULL);
+    goto out;
+
+rollback:
+    rollback_attempted = 1;
+    rollback_succeeded = vpn_transaction_rollback(snapshot, ops, opaque);
+    if (!rollback_succeeded) {
+        error = "rollback_failed";
+        reason = "candidate failed and authoritative rollback could not be verified";
+    }
+failed:
+    response = vpn_transaction_response(
+        transaction_id,
+        rollback_attempted ? (rollback_succeeded ? "rolled_back" :
+                                                   "rollback_failed") : "failed",
+        saved, 0, 0, rollback_attempted, rollback_succeeded, error, reason);
+out:
+    if (runtime) json_object_put(runtime);
+    if (readback) json_object_put(readback);
+    if (apply) json_object_put(apply);
+    if (save) json_object_put(save);
+    if (snapshot) json_object_put(snapshot);
+    return response;
+}

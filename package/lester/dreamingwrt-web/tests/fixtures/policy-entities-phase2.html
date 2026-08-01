@@ -88,6 +88,28 @@
       source: 'policy-engine', read_only: true,
       capabilities: { objects_list: true, objects_crud: false, objects_atomic_apply: false, objects_write_blocked_reason: 'cross_component_firewall_pbr_sqm_flowd_transaction_pending' }
     };
+    const routingObjectPayload = {
+      ok: true, source: 'dreamingwrt.routed', contract_version: 'routing.v1', revision: 19,
+      items: [
+        { id: 'office-nets', name: '办公网段', type: 'ip_group', family: 'ipv4', value: '10.20.0.0/16', enabled: true, members: [{ value: '10.20.0.0/16', label: '办公' }], ref_count: 2, references: [{ type: 'policy_route_rule', id: 'office-pbr' }] },
+        { id: 'vpn-targets', name: 'VPN 目标', type: 'domain_group', family: 'mixed', enabled: false, members: [{ value: 'example.net' }], ref_count: 0, references: [] }
+      ],
+      capabilities: { object_crud: true }
+    };
+    const flowdProtocolPayload = {
+      ok: true, total: 2,
+      protocols: [
+        { id: 'quic-lab', name: '实验 QUIC', enabled: true, priority: 120, kind: 'l7', proto: 'udp', src_port: '', dst_port: '443', match: { sni: 'lab.example' }, tags: ['lab'], remark: '测试流量', updated_at: 1785427596 },
+        { id: 'tcp-admin', name: '管理 TCP', enabled: false, priority: 200, kind: 'l4', proto: 'tcp', src_port: '', dst_port: '8443', match: {}, tags: [], remark: '', updated_at: 1785427596 }
+      ]
+    };
+    const flowdObjectPayload = {
+      ok: true, total: 2,
+      objects: [
+        { id: 'office-dns', name: '办公 DNS', type: 'ipv4', enabled: true, value: ['10.20.0.53', '10.20.0.54'], value_count: 2, runtime_kind: 'nft_set', remark: '内部解析器', updated_at: 1785427596, reference_count: 2, delete_locked: true, referenced_by: [{ kind: 'split_rule', id: 'office-route', name: '办公分流', field: 'dst_object', enabled: true }, { kind: 'qos_rule', id: 'office-qos', name: '办公优先', field: 'dst_object', enabled: false }] },
+        { id: 'stream-apps', name: '流媒体应用', type: 'app_set', enabled: false, value: ['netflix', 'youtube'], value_count: 2, runtime_kind: 'app_set', remark: '', updated_at: 1785427596, reference_count: 0, delete_locked: false, referenced_by: [] }
+      ]
+    };
 
     const stateScenario = (name, value) => ({
       status: name === 'ready' || name === 'stale' || name === 'empty' || name === 'large' ? 'ready' : name,
@@ -143,6 +165,7 @@
     let registry = null;
     let apiCalls = [];
     let conflict = false;
+    let objectSourceFailure = {};
     const root = document.getElementById('routePreview');
     const mount = async (kind, scenario = 'ready') => {
       instance?.unmount?.();
@@ -154,6 +177,16 @@
         ui: { mountAll: (node) => window.DWRT_UI_KIT.mountAll(node) },
         api: { request: async (name, url, init = {}) => {
           apiCalls.push({ name, url, method: init.method || 'GET', body: init.body || null });
+          if (url === '/api/v1/routing/objects' || url === '/api/v1/flowd/objects' || url === '/api/v1/flowd/custom-protocols') {
+            const key = url.includes('/routing/') ? 'routing' : url.endsWith('/flowd/objects') ? 'flowObjects' : 'flowd';
+            const status = objectSourceFailure[key];
+            if (status) {
+              const error = new Error(`fixture ${key} ${status}`);
+              error.status = status;
+              throw error;
+            }
+            return structuredClone(key === 'routing' ? routingObjectPayload : key === 'flowObjects' ? flowdObjectPayload : flowdProtocolPayload);
+          }
           if (conflict) {
             const error = new Error('network already belongs to zone');
             error.status = 409;
@@ -172,6 +205,7 @@
     window.POLICY_ENTITIES_FIXTURE = {
       mount,
       setConflict(value) { conflict = Boolean(value); },
+      setObjectSourceFailure(key, status) { objectSourceFailure[key] = Number(status) || 0; },
       contract() { return { requests: { ...registry.requests }, subscriptions: registry.activeSubscriptions(), invalidations: [...registry.invalidations], apiCalls: structuredClone(apiCalls) }; },
       unmount() { instance?.unmount?.(); return { subscriptions: registry?.activeSubscriptions() || 0, children: root.childElementCount }; }
     };

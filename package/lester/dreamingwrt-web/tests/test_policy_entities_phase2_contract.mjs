@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { normalizePolicyObjects } from '../files/www/dreamingwrt/plugins/native/policy-objects.js';
+import { normalizeFlowdCustomProtocols, normalizeFlowdObjects, normalizePolicyObjects, normalizeRoutingObjects } from '../files/www/dreamingwrt/plugins/native/policy-objects.js';
 import { normalizePolicyRegions, normalizeZoneMatrix } from '../files/www/dreamingwrt/plugins/native/policy-regions.js';
 
 const objectsSource = readFileSync(new URL('../files/www/dreamingwrt/plugins/native/policy-objects.js', import.meta.url), 'utf8');
@@ -18,6 +18,45 @@ const objects = normalizePolicyObjects({
 assert.equal(objects.items[0].name, '服务器');
 assert.equal(objects.legacy[0].legacy, true);
 assert.equal(objects.readOnly, true);
+
+const routingObjects = normalizeRoutingObjects({
+  ok: true,
+  source: 'dreamingwrt.routed',
+  revision: 19,
+  items: [{ id: 'office-nets', name: '办公网段', type: 'ip_group', family: 'ipv4', members: [{ value: '10.20.0.0/16', label: '办公' }], ref_count: 2 }],
+  capabilities: { object_crud: true }
+});
+assert.equal(routingObjects.items[0].members[0].value, '10.20.0.0/16');
+assert.equal(routingObjects.items[0].refCount, 2);
+assert.equal(routingObjects.source, 'dreamingwrt.routed');
+assert.equal(routingObjects.readOnly, true);
+
+const flowdProtocols = normalizeFlowdCustomProtocols({
+  ok: true,
+  total: 1,
+  protocols: [{ id: 'quic-lab', name: '实验 QUIC', kind: 'l7', proto: 'udp', dst_port: '443', match: { sni: 'lab.example' }, tags: ['lab'], priority: 120 }]
+});
+assert.equal(flowdProtocols.items[0].dstPort, '443');
+assert.equal(flowdProtocols.items[0].kind, 'l7');
+assert.deepEqual(flowdProtocols.items[0].tags, ['lab']);
+assert.equal(flowdProtocols.readOnly, true);
+
+const flowdObjects = normalizeFlowdObjects({
+  ok: true,
+  total: 1,
+  objects: [{
+    id: 'office-dns', name: '办公 DNS', type: 'ipv4', enabled: true,
+    value: ['10.20.0.53', '10.20.0.54'], value_count: 2, runtime_kind: 'nft_set',
+    reference_count: 1, delete_locked: true,
+    referenced_by: [{ kind: 'split_rule', id: 'office-route', name: '办公分流', field: 'dst_object', enabled: true }]
+  }]
+});
+assert.equal(flowdObjects.items[0].valueCount, 2);
+assert.equal(flowdObjects.items[0].runtimeKind, 'nft_set');
+assert.equal(flowdObjects.items[0].refCount, 1);
+assert.equal(flowdObjects.items[0].references[0].field, 'dst_object');
+assert.equal(flowdObjects.items[0].deleteLocked, true);
+assert.equal(flowdObjects.readOnly, true);
 
 const regions = normalizePolicyRegions({
   zones: [{ id: 'lan', name: 'lan', display_name: 'LAN', members: ['lan'], reference_count: 3 }],
@@ -39,12 +78,25 @@ assert.equal(matrix.pairs[0].action, 'allow');
 assert.equal(matrix.pairs[0].policyCount, 2);
 
 for (const key of ['policy.objects']) assert.match(objectsSource, new RegExp(`registry\\.request\\('${key}'`));
+for (const endpoint of ['/api/v1/routing/objects', '/api/v1/flowd/objects', '/api/v1/flowd/custom-protocols']) {
+  assert.ok(objectsSource.includes(endpoint), endpoint);
+}
 for (const forbidden of ['clients.inventory', 'network.lans', 'network.wans', '/api/v1/clients', '/catalog']) {
   assert.doesNotMatch(objectsSource, new RegExp(forbidden.replaceAll('.', '\\.')));
 }
 assert.match(objectsSource, /objects_atomic_apply/);
 assert.match(objectsSource, /页面不会展示无法提交的名称、成员或模块开关/);
 assert.doesNotMatch(objectsSource, /data-object-create|data-object-save|disabled[^\n]*添加对象/);
+assert.doesNotMatch(objectsSource, /method:\s*['"](?:POST|PUT|PATCH|DELETE)['"]/);
+assert.match(objectsSource, /data-object-tab="\$\{id\}"/);
+assert.match(objectsSource, /不包含系统 catalog、内置应用签名或协议目录/);
+assert.match(objectsSource, /引用关系仅覆盖 flowd 内部规则/);
+assert.match(objectsSource, /runtime_kind 表示计划产物类型，不代表已经应用到数据面/);
+assert.match(objectsSource, /referenced_by/);
+assert.match(objectsSource, /数据面仍为 plan-only，未提供运行态应用证明/);
+assert.match(objectsSource, /新增、编辑与删除归“策略引擎 → 路由表”所有/);
+assert.match(objectsSource, /source\.status = error\?\.status === 403 \? 'forbidden' : error\?\.status === 404 \? 'unavailable' : 'error'/);
+assert.match(objectsSource, /返回的列表合同无效/);
 assert.match(objectsSource, /policy-entity-page-host/);
 assert.match(objectsSource, /policy-entity-overlay-host/);
 
@@ -64,13 +116,13 @@ assert.doesNotMatch(objectsSource + regionsSource, /\.innerHTML\s*=/);
 const policy = menu.items.find((item) => item.id === 'policy-engine');
 const objectMenu = policy.children.find((item) => item.id === 'policy-object');
 const regionMenu = policy.children.find((item) => item.id === 'policy-region');
-const SHARED_STYLE_VERSION = '20260730-policy-workbench-unify-14';
+const SHARED_STYLE_VERSION = '20260731-policy-object-sources-18';
 for (const item of [objectMenu, regionMenu]) {
   assert.equal(item.style, '/static/css/policy-entities.css');
   // the two pages share one stylesheet, so the style version must stay in lockstep
   assert.equal(item.style_version, SHARED_STYLE_VERSION);
 }
-assert.equal(objectMenu.module_version, '20260730-policy-objects-unify-03');
+assert.equal(objectMenu.module_version, '20260731-policy-object-sources-05');
 assert.equal(regionMenu.module_version, '20260730-policy-regions-unify-10');
 assert.equal(objectMenu.module, 'native/policy-objects.js');
 assert.equal(regionMenu.module, 'native/policy-regions.js');
@@ -141,11 +193,19 @@ assert.match(regionsSource, /policy_count/);
 assert.doesNotMatch(objectsSource, /data-dwrt-component="page-shell"|data-dwrt-page-shell=|data-dwrt-surface="stable-glass"|data-dwrt-surface="dense-surface"/);
 assert.match(objectsSource, /class="policy-object-toolbar"/);
 assert.match(objectsSource, /class="policy-object-workbench"/);
+assert.match(objectsSource, /dwrt-kit-tabs dwrt-kit-page-tabs policy-object-tabs/);
 assert.match(objectsSource, /overviewCardsMarkup/);
-assert.match(objectsSource, /policy-object-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface/);
+assert.match(objectsSource, /policy-object-table policy-object-table-\$\{kind\} dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface/);
 assert.equal((objectsSource.match(/data-dwrt-sheet-variant="copilot"/g) || []).length, 1);
+assert.match(objectsSource, /\['flowObjects', '流量对象'\]/);
+assert.match(objectsSource, /policy-object-reference-list/);
+assert.match(objectsSource, /scrollIntoView\?\.\(\{ block: 'nearest', inline: 'center' \}\)/);
+assert.match(css, /\.policy-object-source-view\s*\{[^}]*display:\s*grid/);
 assert.match(css, /.console-stage:has\(\.policy-objects-route-host\)[^{]*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\)/);
 assert.match(css, /\.policy-object-workbench\s*\{[^}]*gap:\s*12px[^}]*overflow:\s*auto/);
 assert.match(css, /\.policy-entity-table\.dwrt-kit-table-wrap\s*\{[^}]*border-radius:\s*var\(--app-radius-card/);
+assert.match(css, /@media \(max-width: 760px\)[^]*\.policy-object-tabs\s*\{[^}]*width:\s*0[^}]*flex:\s*1 1 0[^}]*overflow:\s*auto hidden/);
+assert.match(css, /\.policy-object-toolbar \.policy-entity-header-actions\s*\{[^}]*width:\s*44px[^}]*flex:\s*0 0 44px/);
+assert.match(css, /\.policy-object-toolbar \.policy-object-readonly-status\s*\{[^}]*display:\s*none/);
 
 console.log('ok: policy entity contracts enforce read-only object capabilities, real zone CRUD/matrix data, scoped Registry use, stable overlays, and shared Kit ownership');

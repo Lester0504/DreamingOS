@@ -10,7 +10,6 @@
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
-#include <signal.h>
 #include <time.h>
 #include <ctype.h>
 #include <sys/socket.h>
@@ -28,6 +27,7 @@
 #include <pcre2.h>
 
 #include "jmx_regex.h"
+#include "jmx_exec.h"
 #include "jmx_rule.h"
 #include "jmx_netlink.h"
 #include "jmx_proto_decode.h"
@@ -39,12 +39,18 @@
 
 /* ── Constants ── */
 
-#define JMX_MARK_REGEX_NEEDED  0x1F000001
 #define JMX_NFQUEUE_NUM        0
 #define JMX_MAX_REGEX_RULES    16384
 #define JMX_REGEX_MATCH_LIMIT  100000
 #define JMX_REGEX_OVECTOR_SIZE 30
 #define JMX_DNS_CACHE_DEBUG    0
+#define JMX_REGEX_NFT_PATH     "/usr/sbin/nft"
+#define JMX_REGEX_NFT_TIMEOUT_MS 5000
+#define JMX_REGEX_NFT_OUTPUT_MAX (256U * 1024U)
+#define JMX_REGEX_NFT_MAX_HANDLES 64
+#define JMX_REGEX_NFT_FORWARD_COMMENT "dreamingwrt-regex-forward"
+#define JMX_REGEX_NFT_MARK_COMMENT "dreamingwrt-regex-output-mark"
+#define JMX_REGEX_NFT_QUEUE_COMMENT "dreamingwrt-regex-output-queue"
 
 /* ── Compiled regex rule ── */
 
@@ -355,110 +361,191 @@ static int cmp_regex_prio(const void *a, const void *b)
 }
 
 /* ── nftables rule management ── */
-static void remove_nftables_rule(void);
+static int remove_nftables_rule(void);
+
+static int regex_nft_result_ok(const struct jmx_exec_result *result)
+{
+	return result && !result->timed_out && !result->truncated &&
+	       result->term_signal == 0 && result->exit_code == 0;
+}
+
+static int regex_nft_wait(char *const argv[])
+{
+	struct jmx_exec_result result;
+	int ok;
+
+	if (jmx_exec_wait(argv[0], argv, JMX_REGEX_NFT_TIMEOUT_MS, &result) != 0)
+		return -1;
+	ok = regex_nft_result_ok(&result);
+	jmx_exec_result_free(&result);
+	return ok ? 0 : -1;
+}
+
+static int regex_nft_capture_chain(const char *chain,
+				   struct jmx_exec_result *result)
+{
+	char *argv[] = { JMX_REGEX_NFT_PATH, "-a", "list", "chain",
+			 "inet", "fw4", (char *)chain, NULL };
+
+	if (!chain || !result ||
+	    (strcmp(chain, "forward") && strcmp(chain, "mangle_output")))
+		return -1;
+	if (jmx_exec_capture(argv[0], argv, JMX_REGEX_NFT_OUTPUT_MAX,
+			     JMX_REGEX_NFT_TIMEOUT_MS, result) != 0)
+		return -1;
+	if (!regex_nft_result_ok(result)) {
+		jmx_exec_result_free(result);
+		return -1;
+	}
+	return 0;
+}
+
+static int regex_nft_line_owned(const char *chain, const char *line)
+{
+	if (!chain || !line)
+		return 0;
+	if (strstr(line, JMX_REGEX_NFT_FORWARD_COMMENT) ||
+	    strstr(line, JMX_REGEX_NFT_MARK_COMMENT) ||
+	    strstr(line, JMX_REGEX_NFT_QUEUE_COMMENT))
+		return 1;
+	if (!strstr(line, "udp sport 53") ||
+	    !strstr(line, "0x1f000001"))
+		return 0;
+	if (!strcmp(chain, "forward"))
+		return strstr(line, "queue") &&
+		       (strstr(line, "num 0") || strstr(line, "to 0"));
+	if (!strcmp(chain, "mangle_output"))
+		return strstr(line, "meta mark set") ||
+		       (strstr(line, "queue") &&
+		        (strstr(line, "num 0") || strstr(line, "to 0")));
+	return 0;
+}
+
+static int regex_nft_line_handle(const char *line, char *handle,
+				 size_t handle_len)
+{
+	const char *tag;
+	const char *end;
+	char *parse_end = NULL;
+	unsigned long long value;
+	size_t len;
+
+	if (!line || !handle || handle_len == 0)
+		return -1;
+	tag = strstr(line, "handle " );
+	if (!tag)
+		return -1;
+	tag += strlen("handle " );
+	if (!isdigit((unsigned char)*tag))
+		return -1;
+	errno = 0;
+	value = strtoull(tag, &parse_end, 10);
+	if (errno != 0 || parse_end == tag || value == 0)
+		return -1;
+	end = parse_end;
+	while (*end && isspace((unsigned char)*end))
+		end++;
+	if (*end != '\0')
+		return -1;
+	len = (size_t)(parse_end - tag);
+	if (len >= handle_len)
+		return -1;
+	memcpy(handle, tag, len);
+	handle[len] = '\0';
+	return 0;
+}
+
+static int regex_nft_delete_chain_rules(const char *chain)
+{
+	struct jmx_exec_result result;
+	char *line;
+	char *saveptr = NULL;
+	unsigned int deleted = 0;
+	int rc = 0;
+
+	if (regex_nft_capture_chain(chain, &result) != 0)
+		return -1;
+	for (line = strtok_r(result.output, "\n", &saveptr); line;
+	     line = strtok_r(NULL, "\n", &saveptr)) {
+		char handle[32];
+		char *argv[] = { JMX_REGEX_NFT_PATH, "delete", "rule", "inet",
+				 "fw4", (char *)chain, "handle", handle, NULL };
+
+		if (!regex_nft_line_owned(chain, line))
+			continue;
+		if (deleted >= JMX_REGEX_NFT_MAX_HANDLES ||
+		    regex_nft_line_handle(line, handle, sizeof(handle)) != 0 ||
+		    regex_nft_wait(argv) != 0) {
+			rc = -1;
+			break;
+		}
+		deleted++;
+	}
+	jmx_exec_result_free(&result);
+	return rc;
+}
+
+static int regex_nft_chain_has_comment(const char *chain, const char *comment)
+{
+	struct jmx_exec_result result;
+	int found;
+
+	if (regex_nft_capture_chain(chain, &result) != 0)
+		return 0;
+	found = result.output && strstr(result.output, comment) != NULL;
+	jmx_exec_result_free(&result);
+	return found;
+}
 
 static int setup_nftables_rule(void)
 {
-	/* Insert queue rules at the beginning of forward chain (before ct state).
-	 * nft insert (no position) inserts at top of chain.
-	 * Note: main.c sets SIGCHLD=SIG_IGN which breaks system()/popen().
-	 * We temporarily restore default SIGCHLD handler for our subprocesses. */
-	char cmd[256];
-	int ret;
-	void (*old_sigchld)(int) = signal(SIGCHLD, SIG_DFL);
+	char *forward_argv[] = {
+		JMX_REGEX_NFT_PATH, "insert", "rule", "inet", "fw4", "forward",
+		"udp", "sport", "53", "meta", "mark", "0x1f000001",
+		"queue", "num", "0", "bypass", "comment",
+		JMX_REGEX_NFT_FORWARD_COMMENT, NULL
+	};
+	char *mark_argv[] = {
+		JMX_REGEX_NFT_PATH, "insert", "rule", "inet", "fw4",
+		"mangle_output", "udp", "sport", "53", "meta", "mark",
+		"set", "0x1f000001", "comment", JMX_REGEX_NFT_MARK_COMMENT, NULL
+	};
+	char *queue_argv[] = {
+		JMX_REGEX_NFT_PATH, "insert", "rule", "inet", "fw4",
+		"mangle_output", "udp", "sport", "53", "meta", "mark",
+		"0x1f000001", "queue", "num", "0", "bypass", "comment",
+		JMX_REGEX_NFT_QUEUE_COMMENT, NULL
+	};
 
 	/* First clean any stale queue rules from previous runs */
-	remove_nftables_rule();
+	if (remove_nftables_rule() != 0) {
+		fprintf(stderr, "jmx_regex: stale nftables rule cleanup failed\n");
+		return -1;
+	}
 
 	/* Queue only forwarded DNS responses for best-effort DNS->IP learning.
 	 * Do not queue every regex mark in FORWARD: TLS ClientHello packets can
 	 * otherwise wait on jmxd and make upstream HTTPS appear hung. */
-	snprintf(cmd, sizeof(cmd),
-		 "nft insert rule inet fw4 forward "
-		 "udp sport 53 meta mark 0x%x queue num %d bypass 2>&1",
-		 JMX_MARK_REGEX_NEEDED, JMX_NFQUEUE_NUM);
-	FILE *fp = popen(cmd, "r");
-	if (fp) {
-		char out[256] = {0};
-		if (fgets(out, sizeof(out), fp))
-			fprintf(stderr, "jmx_regex: nft meta output: %s", out);
-		ret = pclose(fp);
-		fprintf(stderr, "jmx_regex: nft meta mark insert ret=%d (WEXITSTATUS=%d)\n",
-			ret, WEXITSTATUS(ret));
-	} else {
-		fprintf(stderr, "jmx_regex: nft meta popen failed: %s\n", strerror(errno));
-		ret = -1;
-	}
-
-	/* Also add LOCAL_OUT DNS queue rule for dnsmasq responses.
-	 * Without this, DNS responses from dnsmasq (to LAN clients) are never
-	 * seen by jmxd, so DNS-based app identification only works for FORWARD. */
-	snprintf(cmd, sizeof(cmd),
-		 "nft insert rule inet fw4 mangle_output "
-		 "udp sport 53 meta mark set 0x%x 2>&1",
-		 JMX_MARK_REGEX_NEEDED);
-	fp = popen(cmd, "r");
-	if (fp) {
-		char out[256] = {0};
-		if (fgets(out, sizeof(out), fp))
-			fprintf(stderr, "jmx_regex: nft mangle_output mark: %s", out);
-		pclose(fp);
-	}
-
-	snprintf(cmd, sizeof(cmd),
-		 "nft insert rule inet fw4 mangle_output "
-		 "udp sport 53 meta mark 0x%x queue num %d bypass 2>&1",
-		 JMX_MARK_REGEX_NEEDED, JMX_NFQUEUE_NUM);
-	fp = popen(cmd, "r");
-	if (fp) {
-		char out[256] = {0};
-		if (fgets(out, sizeof(out), fp))
-			fprintf(stderr, "jmx_regex: nft mangle_output queue: %s", out);
-		pclose(fp);
-	}
-
-	/* Verify */
-	ret = system("nft list chain inet fw4 forward 2>/dev/null | grep -q 'udp sport 53.*queue'");
-
-	/* Restore original SIGCHLD handler */
-	signal(SIGCHLD, old_sigchld);
-
-	if (ret == 0) {
+	if (regex_nft_wait(forward_argv) == 0 &&
+	    regex_nft_wait(queue_argv) == 0 &&
+	    regex_nft_wait(mark_argv) == 0 &&
+	    regex_nft_chain_has_comment("forward", JMX_REGEX_NFT_FORWARD_COMMENT) &&
+	    regex_nft_chain_has_comment("mangle_output", JMX_REGEX_NFT_MARK_COMMENT) &&
+	    regex_nft_chain_has_comment("mangle_output", JMX_REGEX_NFT_QUEUE_COMMENT)) {
 		fprintf(stderr, "jmx_regex: nftables NFQUEUE rules verified OK\n");
 		return 0;
 	}
+	(void)remove_nftables_rule();
 	fprintf(stderr, "jmx_regex: nftables rule verification failed\n");
 	return -1;
 }
 
-static void remove_nftables_rule(void)
+static int remove_nftables_rule(void)
 {
-	/* Only delete OUR queue rules (matching our specific mark),
-	 * not any other queue rules in the chain.
-	 * Use grep -oE for BusyBox compatibility (no -P support). */
-	char cmd[512];
-	snprintf(cmd, sizeof(cmd),
-		 "nft -a list chain inet fw4 forward 2>/dev/null | "
-		 "grep -E '0x%x.*queue.*(num %d|to %d)' | "
-		 "grep -oE 'handle [0-9]+' | "
-		 "sed 's/handle //' | "
-		 "while read h; do "
-		 "nft delete rule inet fw4 forward handle $h 2>/dev/null; "
-		 "done",
-		 JMX_MARK_REGEX_NEEDED, JMX_NFQUEUE_NUM, JMX_NFQUEUE_NUM);
-	system(cmd);
+	int forward_rc = regex_nft_delete_chain_rules("forward");
+	int output_rc = regex_nft_delete_chain_rules("mangle_output");
 
-	/* Also clean mangle_output DNS queue rules */
-	snprintf(cmd, sizeof(cmd),
-		 "nft -a list chain inet fw4 mangle_output 2>/dev/null | "
-		 "grep '0x%x' | "
-		 "grep -oE 'handle [0-9]+' | "
-		 "sed 's/handle //' | "
-		 "while read h; do "
-		 "nft delete rule inet fw4 mangle_output handle $h 2>/dev/null; "
-		 "done",
-		 JMX_MARK_REGEX_NEEDED);
-	system(cmd);
+	return forward_rc == 0 && output_rc == 0 ? 0 : -1;
 }
 
 /* ── Packet callback ── */
@@ -1295,17 +1382,27 @@ int jmx_regex_start(void)
 		perror("jmx_regex: nfq_set_mode");
 
 	g_nl_fd = nfq_fd(g_nfq_h);
-	g_running = 1;
-
-	if (pthread_create(&g_thread, NULL, nfqueue_thread, NULL) != 0) {
-		perror("jmx_regex: pthread_create");
-		g_running = 0;
+	if (setup_nftables_rule() != 0) {
 		nfq_destroy_queue(g_qh);
 		nfq_close(g_nfq_h);
+		g_qh = NULL;
+		g_nfq_h = NULL;
+		g_nl_fd = -1;
 		return -1;
 	}
 
-	setup_nftables_rule();
+	g_running = 1;
+	if (pthread_create(&g_thread, NULL, nfqueue_thread, NULL) != 0) {
+		perror("jmx_regex: pthread_create");
+		g_running = 0;
+		(void)remove_nftables_rule();
+		nfq_destroy_queue(g_qh);
+		nfq_close(g_nfq_h);
+		g_qh = NULL;
+		g_nfq_h = NULL;
+		g_nl_fd = -1;
+		return -1;
+	}
 
 	fprintf(stderr, "jmx_regex: NFQUEUE started on queue %d with %d rules\n",
 		JMX_NFQUEUE_NUM, g_rule_count);
@@ -1321,7 +1418,7 @@ void jmx_regex_stop(void)
 	if (g_nfq_h) nfq_close(g_nfq_h);
 	g_qh = NULL;
 	g_nfq_h = NULL;
-	remove_nftables_rule();
+	(void)remove_nftables_rule();
 	fprintf(stderr, "jmx_regex: stopped (pkts=%llu matched=%llu miss=%llu)\n",
 		(unsigned long long)g_stat_packets,
 		(unsigned long long)g_stat_matched,

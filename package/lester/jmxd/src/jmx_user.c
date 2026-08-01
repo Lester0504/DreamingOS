@@ -20,6 +20,7 @@
 #include <sys/types.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <uci.h>
 #include <ctype.h>
 #include "jmx_config.h"
@@ -28,6 +29,7 @@
 #include "jmx_utils.h"
 #include "jmx_netconfig_db.h"
 #include "jmx_storage_guard.h"
+#include "jmx_exec.h"
 
 
 LIST_HEAD(client_list);
@@ -60,16 +62,78 @@ static void cleanup_old_record_files(void);
 static u_int32_t parse_date_string(const char *date_str);
 static int extract_date_from_filename(const char *filename, char *date_str, size_t len);
 
+static void copy_string_truncated(char *dst, size_t dst_len, const char *src)
+{
+    size_t copy_len;
+
+    if (!dst || dst_len == 0)
+        return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    copy_len = strnlen(src, dst_len - 1);
+    memcpy(dst, src, copy_len);
+    dst[copy_len] = '\0';
+}
+
+static int copy_string_exact(char *dst, size_t dst_len, const char *src)
+{
+    size_t src_len;
+
+    if (!dst || dst_len == 0 || !src)
+        return -1;
+    src_len = strlen(src);
+    if (src_len >= dst_len)
+        return -1;
+    memcpy(dst, src, src_len + 1);
+    return 0;
+}
+
+static int copy_visit_filename_date(const char *filename, char *date_str,
+                                    size_t date_len)
+{
+    size_t name_len;
+
+    if (!filename || !date_str || date_len == 0)
+        return -1;
+    name_len = strlen(filename);
+    if (name_len > 4 && !strcmp(filename + name_len - 4, ".txt"))
+        name_len -= 4;
+    if (name_len == 0 || name_len >= date_len)
+        return -1;
+    memcpy(date_str, filename, name_len);
+    date_str[name_len] = '\0';
+    return 0;
+}
+
+#define JMX_NEIGH_OUTPUT_MAX (256U * 1024U)
+#define JMX_NEIGH_TIMEOUT_MS 5000
+#define JMX_DU_OUTPUT_MAX (64U * 1024U)
+#define JMX_DU_TIMEOUT_MS 5000
+
 const char *get_client_data_base_dir(void) {
     if (!g_client_data_base_dir_initialized) {
         jmx_legacy_settings_t settings;
         if (jmx_legacy_settings_get(&settings) == 0 && settings.history_data_path[0]) {
-            snprintf(g_client_data_base_dir, sizeof(g_client_data_base_dir),
-                     "%s/client_data", settings.history_data_path);
+            static const char suffix[] = "/client_data";
+            size_t base_len = strlen(settings.history_data_path);
+
+            if (base_len <= sizeof(g_client_data_base_dir) - sizeof(suffix)) {
+                memcpy(g_client_data_base_dir, settings.history_data_path, base_len);
+                memcpy(g_client_data_base_dir + base_len, suffix, sizeof(suffix));
+            } else {
+                LOG_ERROR("history_data_path is too long; using %s\n",
+                          CLIENT_DATA_BASE_DIR_DEFAULT);
+                copy_string_truncated(g_client_data_base_dir,
+                                      sizeof(g_client_data_base_dir),
+                                      CLIENT_DATA_BASE_DIR_DEFAULT);
+            }
         } else {
-            strncpy(g_client_data_base_dir, CLIENT_DATA_BASE_DIR_DEFAULT, sizeof(g_client_data_base_dir) - 1);
+            copy_string_truncated(g_client_data_base_dir,
+                                  sizeof(g_client_data_base_dir),
+                                  CLIENT_DATA_BASE_DIR_DEFAULT);
         }
-        g_client_data_base_dir[sizeof(g_client_data_base_dir) - 1] = '\0';
         g_client_data_base_dir_initialized = 1;
     }
     return g_client_data_base_dir;
@@ -129,7 +193,7 @@ static int find_oldest_date_in_dir(const char *dir_path, char *oldest_date, size
                 char date_str[32] = {0};
                 if (extract_date_from_filename(file_entry->d_name, date_str, sizeof(date_str)) == 0) {
                     if (!found || strcmp(date_str, oldest) < 0) {
-                        strncpy(oldest, date_str, sizeof(oldest) - 1);
+                        copy_string_truncated(oldest, sizeof(oldest), date_str);
                         found = 1;
                     }
                 }
@@ -148,17 +212,13 @@ static int find_oldest_date_in_dir(const char *dir_path, char *oldest_date, size
                     continue;
                 
                 char date_str[32] = {0};
-                if (strlen(file_entry->d_name) > 4 && 
-                    strcmp(file_entry->d_name + strlen(file_entry->d_name) - 4, ".txt") == 0) {
-                    strncpy(date_str, file_entry->d_name, strlen(file_entry->d_name) - 4);
-                    date_str[strlen(file_entry->d_name) - 4] = '\0';
-                } else {
-                    strncpy(date_str, file_entry->d_name, sizeof(date_str) - 1);
-                }
+                if (copy_visit_filename_date(file_entry->d_name, date_str,
+                                             sizeof(date_str)) != 0)
+                    continue;
                 
                 if (strlen(date_str) > 0) {
                     if (!found || strcmp(date_str, oldest) < 0) {
-                        strncpy(oldest, date_str, sizeof(oldest) - 1);
+                        copy_string_truncated(oldest, sizeof(oldest), date_str);
                         found = 1;
                     }
                 }
@@ -182,7 +242,7 @@ static int find_oldest_date_in_dir(const char *dir_path, char *oldest_date, size
             char date_str[32] = {0};
             if (extract_date_from_filename(file_entry->d_name, date_str, sizeof(date_str)) == 0) {
                 if (!found || strcmp(date_str, oldest) < 0) {
-                    strncpy(oldest, date_str, sizeof(oldest) - 1);
+                    copy_string_truncated(oldest, sizeof(oldest), date_str);
                     found = 1;
                 }
             }
@@ -191,9 +251,7 @@ static int find_oldest_date_in_dir(const char *dir_path, char *oldest_date, size
     }
     
     if (found) {
-        strncpy(oldest_date, oldest, date_len - 1);
-        oldest_date[date_len - 1] = '\0';
-        return 0;
+        return copy_string_exact(oldest_date, date_len, oldest);
     }
     
     return -1;
@@ -252,13 +310,9 @@ static void delete_date_files(const char *date_str) {
                 continue;
             
             char file_date[32] = {0};
-            if (strlen(file_entry->d_name) > 4 && 
-                strcmp(file_entry->d_name + strlen(file_entry->d_name) - 4, ".txt") == 0) {
-                strncpy(file_date, file_entry->d_name, strlen(file_entry->d_name) - 4);
-                file_date[strlen(file_entry->d_name) - 4] = '\0';
-            } else {
-                strncpy(file_date, file_entry->d_name, sizeof(file_date) - 1);
-            }
+            if (copy_visit_filename_date(file_entry->d_name, file_date,
+                                         sizeof(file_date)) != 0)
+                continue;
             
             if (strcmp(file_date, date_str) == 0) {
                 char file_path[512] = {0};
@@ -340,13 +394,9 @@ static void cleanup_expired_files_by_days(void) {
                     continue;
                 
                 char file_date[32] = {0};
-                if (strlen(file_entry->d_name) > 4 && 
-                    strcmp(file_entry->d_name + strlen(file_entry->d_name) - 4, ".txt") == 0) {
-                    strncpy(file_date, file_entry->d_name, strlen(file_entry->d_name) - 4);
-                    file_date[strlen(file_entry->d_name) - 4] = '\0';
-                } else {
-                    strncpy(file_date, file_entry->d_name, sizeof(file_date) - 1);
-                }
+                if (copy_visit_filename_date(file_entry->d_name, file_date,
+                                             sizeof(file_date)) != 0)
+                    continue;
                 
                 u_int32_t file_date_ts = parse_date_string(file_date);
                 if (file_date_ts > 0 && file_date_ts < expire_timestamp) {
@@ -394,6 +444,10 @@ static void cleanup_expired_files_by_days(void) {
 }
 
 void check_and_cleanup_history_data_by_size(void) {
+    struct jmx_exec_result result;
+    char *endptr = NULL;
+    unsigned long long current_size_mb;
+
     LOG_INFO("check_and_cleanup_history_data_by_size: start\n");
     cleanup_expired_files_by_days();
     
@@ -401,33 +455,36 @@ void check_and_cleanup_history_data_by_size(void) {
     if (jmx_legacy_settings_get(&settings) != 0)
         return;
     const char *history_data_size = settings.history_data_size;
-    const char *history_data_path = settings.history_data_path;
     
     if (strlen(history_data_size) == 0) {
         return;
     }
     
-    char *endptr = NULL;
     long max_size_mb = strtol(history_data_size, &endptr, 10);
     if (*endptr != '\0' || max_size_mb <= 0) {
         return;
     }
     
-    char data_dir[512] = {0};
-    if (strlen(history_data_path) > 0) {
-        snprintf(data_dir, sizeof(data_dir), "%s/client_data", history_data_path);
-    } else {
-        strncpy(data_dir, CLIENT_DATA_BASE_DIR_DEFAULT, sizeof(data_dir) - 1);
-    }
-    
-    char cmd[1024] = {0};
-    char result[256] = {0};
-    snprintf(cmd, sizeof(cmd), "du -sm %s 2>/dev/null | awk '{print $1}'", data_dir);
-    if (exec_with_result_line(cmd, result, sizeof(result)) != 0 || strlen(result) == 0) {
+    const char *data_dir = get_client_data_base_dir();
+    char *argv[] = { "/usr/bin/du", "-sm", "--", (char *)data_dir, NULL };
+
+    if (jmx_exec_capture(argv[0], argv, JMX_DU_OUTPUT_MAX,
+                         JMX_DU_TIMEOUT_MS, &result) != 0)
+        return;
+    if (result.timed_out || result.truncated || result.term_signal != 0 ||
+        result.exit_code != 0 || !result.output || !result.output[0]) {
+        jmx_exec_result_free(&result);
         return;
     }
-    
-    unsigned long long current_size_mb = strtoull(result, NULL, 10);
+    errno = 0;
+    endptr = NULL;
+    current_size_mb = strtoull(result.output, &endptr, 10);
+    if (errno != 0 || endptr == result.output ||
+        (*endptr != '\t' && *endptr != ' ' && *endptr != '\n')) {
+        jmx_exec_result_free(&result);
+        return;
+    }
+    jmx_exec_result_free(&result);
     
     if (current_size_mb <= (unsigned long long)max_size_mb) {
         return;
@@ -551,13 +608,22 @@ static int client_network_section_is_lan(const char *name, const char *role,
 
 static void client_iface_add_bridge_members(const char *bridge)
 {
+    static const char prefix[] = "/sys/class/net/";
+    static const char suffix[] = "/brif";
     char path[160];
+    size_t bridge_len;
     DIR *dir;
     struct dirent *de;
 
     if (!bridge || !bridge[0])
         return;
-    snprintf(path, sizeof(path), "/sys/class/net/%s/brif", bridge);
+    bridge_len = strnlen(bridge, sizeof(g_client_lan_ifaces[0]));
+    if (bridge_len == sizeof(g_client_lan_ifaces[0]) ||
+        sizeof(prefix) - 1 + bridge_len + sizeof(suffix) > sizeof(path))
+        return;
+    memcpy(path, prefix, sizeof(prefix) - 1);
+    memcpy(path + sizeof(prefix) - 1, bridge, bridge_len);
+    memcpy(path + sizeof(prefix) - 1 + bridge_len, suffix, sizeof(suffix));
     dir = opendir(path);
     if (!dir)
         return;
@@ -787,7 +853,7 @@ client_node_t *add_client_node(const char *mac)
     client_node_t *node = (client_node_t *)calloc(1, sizeof(client_node_t));
     if (!node)
         return NULL;
-    strncpy(node->mac, mac, sizeof(node->mac));
+    copy_string_truncated(node->mac, sizeof(node->mac), mac);
     node->online = 1;
     node->online_time = get_timestamp();
     node->last_seen_ts = node->online_time;
@@ -903,14 +969,15 @@ void update_client_hostname(void)
         if (!node)
         {
             node = add_client_node(mac_buf);
-            strncpy(node->ip, ip_buf, sizeof(node->ip));
+            copy_string_truncated(node->ip, sizeof(node->ip), ip_buf);
             node->online = 0;
             node->offline_time = get_timestamp();
         }
 
         if (strlen(hostname_buf) > 0 && hostname_buf[0] != '*')
         {
-            strncpy(node->hostname, hostname_buf, sizeof(node->hostname));
+            copy_string_truncated(node->hostname, sizeof(node->hostname),
+                                  hostname_buf);
         }
     }
     fclose(fp);
@@ -918,6 +985,7 @@ void update_client_hostname(void)
 
 void clean_client_nickname_iter(void *arg, client_node_t *client)
 {
+    (void)arg;
     client->nickname[0] = '\0';
 }
 
@@ -967,6 +1035,71 @@ void clean_client_online_status(void)
             node->online = 0;
         }
     }
+}
+
+static void client_collect_ip_neigh(int family)
+{
+    struct jmx_exec_result result;
+    char *argv[] = {
+        "/bin/ip", family == AF_INET6 ? "-6" : "-4",
+        "neigh", "show", NULL
+    };
+    char *line;
+    char *saveptr = NULL;
+
+    if (family != AF_INET && family != AF_INET6)
+        return;
+    if (jmx_exec_capture(argv[0], argv, JMX_NEIGH_OUTPUT_MAX,
+                         JMX_NEIGH_TIMEOUT_MS, &result) != 0)
+        return;
+    if (result.timed_out || result.truncated || result.term_signal != 0 ||
+        result.exit_code != 0) {
+        jmx_exec_result_free(&result);
+        return;
+    }
+
+    for (line = strtok_r(result.output, "\n", &saveptr); line;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        char addr[128] = {0};
+        char dev[32] = {0};
+        char mac_raw[64] = {0};
+        char mac_l[MAX_MAC_LEN] = {0};
+        char state[32] = {0};
+        char *p;
+        client_node_t *node;
+
+        if (sscanf(line, "%127s dev %31s", addr, dev) < 2 ||
+            !client_iface_is_lan(dev))
+            continue;
+        p = strstr(line, " lladdr ");
+        if (!p || sscanf(p + 8, "%63s", mac_raw) != 1)
+            continue;
+        client_lower_mac(mac_raw, mac_l, sizeof(mac_l));
+        if (!mac_l[0])
+            continue;
+        client_last_token(line, state, sizeof(state));
+        if (!state[0])
+            snprintf(state, sizeof(state), "%s", "unknown");
+        if (!client_neigh_state_observed(state))
+            continue;
+        node = find_client_node(mac_l);
+        if (!node) {
+            if (!client_neigh_state_marks_online(state))
+                continue;
+            node = add_client_node(mac_l);
+            if (!node)
+                continue;
+            if (family == AF_INET6)
+                node->ip[0] = '\0';
+        }
+        if (family == AF_INET6)
+            client_set_ipv6_evidence(node, addr, state);
+        else
+            client_set_ipv4_evidence(node, addr, state);
+        if (client_neigh_state_marks_online(state))
+            client_mark_online(node, family == AF_INET6 ? "ip6_neigh" : "ip4_neigh");
+    }
+    jmx_exec_result_free(&result);
 }
 
 
@@ -1044,94 +1177,8 @@ void update_client_from_kernel(void)
     fclose(fp);
 
 ipv6_neigh:
-    fp = popen("ip -6 neigh show 2>/dev/null", "r");
-    if (!fp)
-        goto ipv4_neigh;
-    while (fgets(line_buf, sizeof(line_buf), fp)) {
-        char addr[128] = {0};
-        char dev[32] = {0};
-        char mac_raw[64] = {0};
-        char mac_l[MAX_MAC_LEN] = {0};
-        char state[32] = {0};
-        char *p;
-        client_node_t *node;
-
-        if (sscanf(line_buf, "%127s dev %31s", addr, dev) < 2)
-            continue;
-        if (!client_iface_is_lan(dev))
-            continue;
-        p = strstr(line_buf, " lladdr ");
-        if (!p)
-            continue;
-        if (sscanf(p + 8, "%63s", mac_raw) != 1)
-            continue;
-        client_lower_mac(mac_raw, mac_l, sizeof(mac_l));
-        if (!mac_l[0])
-            continue;
-        state[0] = '\0';
-        client_last_token(line_buf, state, sizeof(state));
-        if (!state[0])
-            snprintf(state, sizeof(state), "%s", "unknown");
-        if (!client_neigh_state_observed(state))
-            continue;
-        node = find_client_node(mac_l);
-        if (!node) {
-            if (!client_neigh_state_marks_online(state))
-                continue;
-            node = add_client_node(mac_l);
-            if (!node)
-                continue;
-            node->ip[0] = '\0';
-        }
-        client_set_ipv6_evidence(node, addr, state);
-        if (client_neigh_state_marks_online(state))
-            client_mark_online(node, "ip6_neigh");
-    }
-    pclose(fp);
-
-ipv4_neigh:
-    fp = popen("ip -4 neigh show 2>/dev/null", "r");
-    if (fp) {
-        while (fgets(line_buf, sizeof(line_buf), fp)) {
-            char addr[64] = {0};
-            char dev[32] = {0};
-            char mac_raw[64] = {0};
-            char mac_l[MAX_MAC_LEN] = {0};
-            char state[32] = {0};
-            char *p;
-            client_node_t *node;
-
-            if (sscanf(line_buf, "%63s dev %31s", addr, dev) < 2)
-                continue;
-            if (!client_iface_is_lan(dev))
-                continue;
-            p = strstr(line_buf, " lladdr ");
-            if (!p)
-                continue;
-            if (sscanf(p + 8, "%63s", mac_raw) != 1)
-                continue;
-            client_lower_mac(mac_raw, mac_l, sizeof(mac_l));
-            if (!mac_l[0])
-                continue;
-            client_last_token(line_buf, state, sizeof(state));
-            if (!state[0])
-                snprintf(state, sizeof(state), "%s", "unknown");
-            if (!client_neigh_state_observed(state))
-                continue;
-            node = find_client_node(mac_l);
-            if (!node) {
-                if (!client_neigh_state_marks_online(state))
-                    continue;
-                node = add_client_node(mac_l);
-                if (!node)
-                    continue;
-            }
-            client_set_ipv4_evidence(node, addr, state);
-            if (client_neigh_state_marks_online(state))
-                client_mark_online(node, "ip4_neigh");
-        }
-        pclose(fp);
-    }
+    client_collect_ip_neigh(AF_INET6);
+    client_collect_ip_neigh(AF_INET);
 
     fp = fopen("/proc/net/arp", "r");
     if (!fp)
@@ -1176,7 +1223,6 @@ void update_client_online_status(void)
 
 int check_client_expire(void)
 {
-    int count = 0;
     int cur_time = get_timestamp();
     int offline_time = 0;
     int expire_count = 0;
@@ -1206,7 +1252,6 @@ int check_client_expire(void)
 
 void flush_expire_client_node(void)
 {
-    int count = 0;
     client_node_t *node = NULL, *tmp = NULL;
     visit_info_t *p_info = NULL, *tmp_info = NULL;
     visit_stat_t *stat_node = NULL, *tmp_stat_node = NULL;
@@ -1230,7 +1275,6 @@ void flush_expire_client_node(void)
             }
             list_del(&node->client);
             free(node);
-            count++;
             g_cur_user_num--;
         }
     }
@@ -1298,7 +1342,8 @@ void update_client_visiting_info(void)
         if (url_buf[0] == '\0' || strcmp(url_buf, "none") == 0)
             node->visiting_url[0] = '\0';
         else
-            strncpy(node->visiting_url, url_buf, sizeof(node->visiting_url) - 1);
+            copy_string_truncated(node->visiting_url,
+                                  sizeof(node->visiting_url), url_buf);
 
         node->visiting_app = atoi(app_buf);
     }
@@ -1386,7 +1431,6 @@ EXIT:
 
 void check_client_visit_info_expire(void)
 {
-    int count = 0;
     int cur_time = get_timestamp();
     client_node_t *node = NULL;
     visit_info_t *p_info = NULL, *tmp_info = NULL;
@@ -1411,7 +1455,6 @@ void check_client_visit_info_expire(void)
 
 void flush_expire_visit_info(void)
 {
-    int count = 0;
     client_node_t *node = NULL;
     visit_info_t *p_info = NULL, *tmp_info = NULL;
 
@@ -1422,7 +1465,6 @@ void flush_expire_visit_info(void)
             {
                 list_del(&p_info->visit);
                 free(p_info);
-                count++;
             }
         }
     }
@@ -1554,6 +1596,7 @@ daily_hourly_stat_t *get_today_stat(client_node_t *client) {
 daily_hourly_stat_t *load_history_stat_from_file(client_node_t *client, u_int32_t date) {
     if (!client)
         return NULL;
+    (void)date;
     
     
     
@@ -2215,6 +2258,7 @@ daily_top_apps_stat_t *get_today_top_apps_stat(client_node_t *client) {
 daily_top_apps_stat_t *load_history_top_apps_stat_from_file(client_node_t *client, u_int32_t date) {
     if (!client)
         return NULL;
+    (void)date;
     
     
     
@@ -2416,10 +2460,49 @@ static void mac_to_dirname(const char *mac, char *dirname, size_t len) {
 
 
 static int ensure_dir_exists(const char *path) {
-    char cmd[512] = {0};
-    snprintf(cmd, sizeof(cmd), "mkdir -p %s", path);
-    system(cmd);
-    
+    char copy[PATH_MAX];
+    char *cursor;
+    int dirfd;
+
+    if (!path || path[0] != '/' || strlen(path) >= sizeof(copy))
+        return -1;
+    memcpy(copy, path, strlen(path) + 1);
+    dirfd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0)
+        return -1;
+    cursor = copy + 1;
+    while (*cursor) {
+        char *slash = strchr(cursor, '/');
+        int nextfd;
+
+        if (slash)
+            *slash = '\0';
+        if (cursor[0] && strcmp(cursor, ".") && strcmp(cursor, "..")) {
+            nextfd = openat(dirfd, cursor,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (nextfd < 0 && errno == ENOENT) {
+                if (mkdirat(dirfd, cursor, 0755) != 0 && errno != EEXIST) {
+                    close(dirfd);
+                    return -1;
+                }
+                nextfd = openat(dirfd, cursor,
+                                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            }
+            if (nextfd < 0) {
+                close(dirfd);
+                return -1;
+            }
+            close(dirfd);
+            dirfd = nextfd;
+        } else if (!cursor[0] || !strcmp(cursor, ".") || !strcmp(cursor, "..")) {
+            close(dirfd);
+            return -1;
+        }
+        if (!slash)
+            break;
+        cursor = slash + 1;
+    }
+    close(dirfd);
     return 0;
 }
 
@@ -2883,7 +2966,7 @@ void delete_client_record_files(const char *mac, const char *start_date, const c
                         if (file_date > 0 && file_date >= start_timestamp && file_date <= end_timestamp) {
                             char file_path[768] = {0};  
                             int path_len = snprintf(file_path, sizeof(file_path), "%s/%s", stats_dir, file_entry->d_name);
-                            if (path_len >= 0 && path_len < sizeof(file_path)) {
+                            if (path_len >= 0 && (size_t)path_len < sizeof(file_path)) {
                                 if (unlink(file_path) == 0) {
                                     deleted_count++;
                                     LOG_DEBUG("Deleted stats file: %s (date: %s)\n", file_path, date_str);

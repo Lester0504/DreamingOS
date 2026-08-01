@@ -9,6 +9,8 @@ export function normalizeFlowEngineStatus(payload = {}) {
   const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
   const text = (...values) => values.map((value) => String(value ?? '').trim()).find(Boolean) || '';
   const geoip = data.geoip && typeof data.geoip === 'object' ? data.geoip : {};
+  const capabilities = data.capabilities && typeof data.capabilities === 'object' ? data.capabilities : {};
+  const reasons = capabilities.reasons && typeof capabilities.reasons === 'object' ? capabilities.reasons : {};
   const counters = [
     ['split_rules', '分流规则'],
     ['domain_rules', '域名规则'],
@@ -34,9 +36,18 @@ export function normalizeFlowEngineStatus(payload = {}) {
     schemaSource: text(data.schema_source),
     migrationState: text(data.migration_state),
     settingsAvailable: data.settings_available === true,
-    enabled: data.enabled === true,
+    configuredEnabled: typeof data.configured_enabled === 'boolean' ? data.configured_enabled : data.enabled === true,
+    configuredApplyMode: text(data.configured_apply_mode, data.apply_mode),
     applyMode: text(data.apply_mode),
     planOnly: text(data.apply_mode).toLowerCase() === 'plan-only',
+    runtimeContractVersion: text(data.runtime_contract_version),
+    runtimeApplied: typeof data.runtime_applied === 'boolean' ? data.runtime_applied : null,
+    runtimeReason: text(data.runtime_reason),
+    capabilities: {
+      nftRevisionReadback: capabilities.nft_revision_readback === true,
+      nftRevisionSentinelOnly: capabilities.nft_revision_sentinel_only === true,
+      nftRevisionReason: text(reasons.nft_revision_readback)
+    },
     geoipDir: text(data.geoip_dir),
     runtimeDir: text(data.runtime_dir),
     sources: number(data.sources),
@@ -64,7 +75,31 @@ export function normalizeFlowEngineRuntime(payload = {}) {
     degraded: data.degraded === true,
     source: text(data.source),
     message: text(data.message),
+    runtimeContractVersion: text(data.runtime_contract_version),
+    runtimeApplied: typeof data.runtime_applied === 'boolean' ? data.runtime_applied : null,
+    runtimeReason: text(data.runtime_reason),
     summary: data.summary && typeof data.summary === 'object' ? data.summary : null
+  };
+}
+
+export function normalizeFlowNftRevision(payload = {}) {
+  const data = payload && typeof payload.data === 'object' && payload.data !== null ? payload.data : payload;
+  const text = (...values) => values.map((value) => String(value ?? '').trim()).find(Boolean) || '';
+  const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+  return {
+    available: data.available === true,
+    present: data.present === true,
+    ownershipVerified: data.ownership_verified === true,
+    sentinelOnly: data.sentinel_only === true,
+    revision: text(data.revision),
+    containsPolicyRules: data.contains_policy_rules === true,
+    runtimeApplied: typeof data.runtime_applied === 'boolean' ? data.runtime_applied : null,
+    runtimeReason: text(data.runtime_reason),
+    source: text(data.source),
+    tableFamily: text(data.table_family),
+    tableName: text(data.table_name),
+    observedAt: number(data.observed_at),
+    error: text(data.error)
   };
 }
 
@@ -238,7 +273,8 @@ export function mount(context = {}) {
     tab: flowEngineTabFromLocation(window.location.hash),
     snapshots: {
       status: null, runtime: null, settings: null, qosSettings: null,
-      qosClasses: null, applyJobs: null, wanCapacity: null, wanHealth: null, smart: null
+      qosClasses: null, applyJobs: null, wanCapacity: null, wanHealth: null, smart: null,
+      nftRevision: null
     },
     status: null,
     runtime: null,
@@ -248,6 +284,7 @@ export function mount(context = {}) {
     wanCapacity: [],
     wanHealth: null,
     smart: null,
+    nftRevision: null,
     refreshing: false,
     refreshQueued: false,
     refreshPromise: null,
@@ -265,7 +302,7 @@ export function mount(context = {}) {
   const statePanel = (name, title, detail) => `<section data-dwrt-component="state-panel" data-dwrt-state="${name}"><strong>${escapeHtml(title)}</strong><p>${escapeHtml(detail)}</p></section>`;
   const button = (label, attributes = '', variant = 'secondary', iconName = '') => `<button type="button" data-dwrt-component="button" data-variant="${variant}" ${attributes}>${iconName ? icon(iconName) : ''}<span>${escapeHtml(label)}</span></button>`;
 
-  const REGISTRY_SLOTS = [
+  const BASE_REGISTRY_SLOTS = [
     ['flow.engineStatus', 'status'],
     ['flow.engineRuntime', 'runtime'],
     ['flow.engineSettings', 'settings'],
@@ -276,6 +313,8 @@ export function mount(context = {}) {
     ['flow.wanHealth', 'wanHealth'],
     ['flow.smartControl', 'smart']
   ];
+  const NFT_REGISTRY_SLOT = ['flow.nftRevision', 'nftRevision'];
+  const REGISTRY_SLOTS = [...BASE_REGISTRY_SLOTS, NFT_REGISTRY_SLOT];
 
   function hydrate() {
     const value = (slot) => state.snapshots[slot]?.value;
@@ -287,6 +326,11 @@ export function mount(context = {}) {
     if (value('wanCapacity') !== undefined) state.wanCapacity = normalizeFlowWanCapacity(value('wanCapacity'));
     if (value('wanHealth') !== undefined) state.wanHealth = normalizeFlowWanHealth(value('wanHealth'));
     if (value('smart') !== undefined) state.smart = normalizeFlowSmartControl(value('smart'));
+    if (value('nftRevision') !== undefined) state.nftRevision = normalizeFlowNftRevision(value('nftRevision'));
+  }
+
+  function supportsNftRevisionReadback() {
+    return state.status?.capabilities?.nftRevisionReadback === true;
   }
 
   function pageState() {
@@ -332,10 +376,12 @@ export function mount(context = {}) {
     if (!state.status && !state.runtime) return '';
     const planOnly = state.status?.planOnly === true;
     const workerDown = state.runtime?.workerAvailable === false;
-    if (!planOnly && !workerDown) return '';
+    const runtimeApplied = state.status?.runtimeApplied ?? state.runtime?.runtimeApplied;
+    if (!planOnly && !workerDown && runtimeApplied !== false) return '';
     const reasons = [];
     if (workerDown) reasons.push(state.runtime?.message || 'flowd worker 未注册');
     if (planOnly) reasons.push(`应用模式为 ${state.status?.applyMode || 'plan-only'}，规则只会编译成计划，不会下发到内核`);
+    if (runtimeApplied === false) reasons.push(state.status?.runtimeReason || state.runtime?.runtimeReason || '运行态尚未应用');
     return `<div class="policy-entity-alert is-warning" role="status"><strong>流量引擎当前为只读</strong><span>${escapeHtml(reasons.join('；'))}。配置写入已按合同关闭，等后端注册 worker 并打通 apply 后开放。</span></div>`;
   }
 
@@ -348,13 +394,15 @@ export function mount(context = {}) {
 
   function summaryMarkup() {
     const status = state.status;
+    const runtimeApplied = status.runtimeApplied ?? state.runtime?.runtimeApplied;
+    const runtimeValue = runtimeApplied === true ? '已应用' : runtimeApplied === false ? '未应用' : '未证实';
     const cards = [
-      { key: 'engine', label: '引擎', value: status.enabled ? '已启用' : '已停用', detail: status.service || 'dreamingwrt-flowd', tone: status.enabled ? 'ok' : 'neutral', icon: icon('activity') },
+      { key: 'configured', label: '配置状态', value: status.configuredEnabled ? '已启用' : '已停用', detail: status.configuredApplyMode || status.service || 'dreamingwrt-flowd', tone: status.configuredEnabled ? 'info' : 'neutral', icon: icon('sliders-horizontal') },
+      { key: 'runtime', label: '运行应用', value: runtimeValue, detail: status.runtimeReason || state.runtime?.runtimeReason || '当前固件未提供运行态真值', tone: runtimeApplied === true ? 'ok' : runtimeApplied === false ? 'bad' : 'warn', icon: icon('circle-gauge') },
       { key: 'apply-mode', label: '应用模式', value: status.applyMode || '--', detail: status.planOnly ? '仅生成计划，不下发内核' : '允许进入应用阶段', tone: status.planOnly ? 'warn' : 'ok', icon: icon('git-compare-arrows') },
       { key: 'worker', label: 'Worker', value: state.runtime?.workerAvailable ? '已注册' : '未注册', detail: state.runtime?.source || '等待运行时来源', tone: state.runtime?.workerAvailable ? 'ok' : 'bad', icon: icon('cpu') },
-      { key: 'qos', label: 'QoS 类别', value: `${formatInteger(status.enabledQosClasses)} / ${formatInteger(status.qosClasses)}`, detail: '启用 / 总数', tone: 'info', icon: icon('gauge') },
-      { key: 'geoip', label: 'GeoIP 源', value: `${formatInteger(status.enabledSources)} / ${formatInteger(status.sources)}`, detail: status.geoip.mmdbValid ? 'MMDB 有效' : 'MMDB 尚未就绪', tone: status.geoip.mmdbValid ? 'ok' : 'warn', icon: icon('globe-2') },
-      { key: 'jobs', label: '应用作业', value: formatInteger(status.applyJobs), detail: '编译与应用历史', tone: 'neutral', icon: icon('list-checks') }
+      { key: 'qos', label: 'QoS 配置', value: `${formatInteger(status.enabledQosClasses)} / ${formatInteger(status.qosClasses)}`, detail: '配置启用 / 总数，不代表内核已应用', tone: 'info', icon: icon('gauge') },
+      { key: 'jobs', label: '作业记录', value: formatInteger(status.applyJobs), detail: '编译、演练与应用历史', tone: 'neutral', icon: icon('list-checks') }
     ];
     const renderer = ui.overviewCardsMarkup || window.DWRT_UI_KIT?.overviewCardsMarkup;
     const overview = typeof renderer === 'function'
@@ -399,6 +447,7 @@ export function mount(context = {}) {
       ['版本', status.version || '--'],
       ['Schema 版本', `${status.schemaVersion || '--'}${status.schemaSource ? `（${status.schemaSource}）` : ''}`],
       ['迁移状态', status.migrationState || '--'],
+      ['运行时合同', status.runtimeContractVersion || runtime?.runtimeContractVersion || '当前固件未提供'],
       ['运行时来源', runtime?.source || '--'],
       ['GeoIP 目录', status.geoipDir || '--'],
       ['计划产物目录', `${status.runtimeDir || '--'}${status.geoip.runtimeDirPresent ? '' : '（目录不存在）'}`],
@@ -407,6 +456,41 @@ export function mount(context = {}) {
     ];
     return `<section class="policy-entity-section"><header><div><h2>引擎详情</h2><p>只读元数据，用于定位后端与固件状态。</p></div></header>
       <dl class="policy-entity-detail-list flow-engine-detail-list">${rows.map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(String(value))}</dd></div>`).join('')}</dl>
+    </section>`;
+  }
+
+  function nftRevisionMarkup() {
+    if (!supportsNftRevisionReadback()) {
+      const reason = state.status?.capabilities?.nftRevisionReason || '当前固件未提供 NFT revision 探针';
+      return `<section class="policy-entity-section"><header><div><h2>NFT 运行证据</h2><p>只有后端声明 readback capability 后才会读取探针。</p></div>${statusBadge('未提供', 'muted')}</header>
+        <div class="policy-entity-alert is-warning" role="status"><strong>未读取 NFT revision</strong><span>${escapeHtml(reason)}；页面没有请求未声明的接口，也不会把配置计数当成运行态。</span></div>
+      </section>`;
+    }
+    const snapshot = state.snapshots.nftRevision;
+    if (!snapshot || (snapshot.status === 'loading' && snapshot.value === undefined))
+      return statePanel('loading', '正在读取 NFT revision', '等待 flowd 所有权与 revision readback。');
+    if (['forbidden', 'error', 'unavailable'].includes(snapshot.status) && snapshot.value === undefined)
+      return statePanel(snapshot.status, 'NFT revision 探针不可用', snapshot.error?.message || '后端已声明能力，但本次 readback 失败。');
+    const nft = state.nftRevision;
+    if (!nft)
+      return statePanel('empty', '没有 NFT revision 数据', '后端没有返回可解析的 readback。');
+    const rows = [
+      ['NFT 表', [nft.tableFamily, nft.tableName].filter(Boolean).join(' ') || '--'],
+      ['探针来源', nft.source || '--'],
+      ['表是否存在', nft.present ? '是' : '否'],
+      ['所有权已验证', nft.ownershipVerified ? '是' : '否'],
+      ['Revision', nft.revision || '--'],
+      ['包含策略规则', nft.containsPolicyRules ? '是' : '否'],
+      ['运行态已应用', nft.runtimeApplied === true ? '是' : nft.runtimeApplied === false ? '否' : '未证实'],
+      ['观测时间', formatTimestamp(nft.observedAt)]
+    ];
+    const note = nft.sentinelOnly
+      ? `<div class="policy-entity-alert is-warning" role="status"><strong>仅所有权 sentinel</strong><span>该表只证明 flowd 对 NFT 表的所有权和 revision；不包含分流、QoS、路由、配额或应用策略规则。</span></div>`
+      : nft.error
+        ? `<div class="policy-entity-alert is-warning" role="status"><strong>Readback 不完整</strong><span>${escapeHtml(nft.error)}</span></div>`
+        : '';
+    return `<section class="policy-entity-section"><header><div><h2>NFT 运行证据</h2><p>来自 <code>flowd/nft-revision</code>，不等同于完整数据面 readback。</p></div>${statusBadge(nft.ownershipVerified ? '所有权已验证' : '未验证', nft.ownershipVerified ? 'success' : 'warning')}</header>
+      ${note}<dl class="policy-entity-detail-list flow-engine-detail-list">${rows.map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(String(value))}</dd></div>`).join('')}</dl>
     </section>`;
   }
 
@@ -499,7 +583,7 @@ export function mount(context = {}) {
   function tabContentMarkup() {
     if (state.tab === 'qos') return `${qosConflictMarkup()}${qosSettingsMarkup()}${qosClassesMarkup()}${smartPrioritiesMarkup()}`;
     if (state.tab === 'capacity') return `${wanHealthMarkup()}${wanCapacityMarkup()}`;
-    return `${summaryMarkup()}${engineDetailMarkup()}${countersMarkup()}${applyJobsMarkup()}`;
+    return `${summaryMarkup()}${engineDetailMarkup()}${nftRevisionMarkup()}${countersMarkup()}${applyJobsMarkup()}`;
   }
 
   function workbenchMarkup() {
@@ -552,8 +636,15 @@ export function mount(context = {}) {
         state.refreshing = true;
         renderPage();
         state.suppressRegistryRender = true;
-        await Promise.allSettled(REGISTRY_SLOTS.map(([key]) => registry.request(key, { signal, force: nextForce })));
+        await Promise.allSettled(BASE_REGISTRY_SLOTS.map(([key]) => registry.request(key, { signal, force: nextForce })));
         hydrate();
+        if (supportsNftRevisionReadback()) {
+          await registry.request(NFT_REGISTRY_SLOT[0], { signal, force: nextForce }).catch(() => {});
+          hydrate();
+        } else {
+          state.snapshots.nftRevision = null;
+          state.nftRevision = null;
+        }
         nextForce = state.refreshQueued;
       } while (state.mounted && state.refreshQueued);
       if (!state.mounted) return;
@@ -601,10 +692,15 @@ export function mount(context = {}) {
   root.addEventListener('click', onClick);
   const unsubscribers = REGISTRY_SLOTS.map(([key, slot]) => subscribe(key, slot)).filter(Boolean);
   render();
-  if (registry) Promise.allSettled(REGISTRY_SLOTS.map(([key]) => registry.request(key, { signal })))
-    .then(() => {
+  if (registry) Promise.allSettled(BASE_REGISTRY_SLOTS.map(([key]) => registry.request(key, { signal })))
+    .then(async () => {
       if (!state.mounted) return;
       hydrate();
+      if (supportsNftRevisionReadback()) {
+        await registry.request(NFT_REGISTRY_SLOT[0], { signal }).catch(() => {});
+        if (!state.mounted) return;
+        hydrate();
+      }
       state.suppressRegistryRender = false;
       renderPage();
     });

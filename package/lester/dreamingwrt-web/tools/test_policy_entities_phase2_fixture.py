@@ -33,7 +33,7 @@ try:
         raise RuntimeError(opened.stdout + opened.stderr)
     function = r"""async page => {
       await page.waitForFunction(() => window.POLICY_ENTITIES_FIXTURE_READY === true);
-      const result = { states: { objects: {}, regions: {} }, requests: {}, keyboard: {}, write: {}, viewports: [], lifecycle: {} };
+      const result = { states: { objects: {}, regions: {} }, requests: {}, objectSources: {}, keyboard: {}, write: {}, viewports: [], lifecycle: {} };
       const mount = async (kind, scenario) => {
         const contract = await page.evaluate(({ kind, scenario }) => window.POLICY_ENTITIES_FIXTURE.mount(kind, scenario), { kind, scenario });
         await page.waitForTimeout(100);
@@ -55,6 +55,77 @@ try:
           }), { ...contract, kind });
         }
       }
+
+      await mount('objects', 'ready');
+      result.objectSources.initial = await page.evaluate(() => ({
+        tabs: [...document.querySelectorAll('[data-object-tab]')].map(node => ({ id: node.dataset.objectTab, selected: node.getAttribute('aria-selected') })),
+        apiCalls: window.POLICY_ENTITIES_FIXTURE.contract().apiCalls,
+        inputs: document.querySelectorAll('.policy-objects-page input, .policy-objects-page select, .policy-objects-page textarea').length,
+        writeButtons: [...document.querySelectorAll('.policy-objects-page button')].filter(node => /新增|创建|编辑|保存|删除/.test(node.innerText)).length,
+        catalogText: document.querySelector('.policy-objects-page')?.innerText.includes('系统 catalog') || false
+      }));
+      await page.locator('[data-object-tab="routing"]').click();
+      result.objectSources.routing = await page.evaluate(() => ({
+        text: document.querySelector('[data-object-source-view]')?.innerText || '',
+        rows: document.querySelectorAll('.policy-object-table-routing tbody tr').length,
+        source: document.querySelector('[data-object-source-view]')?.dataset.objectSourceView
+      }));
+      await page.locator('.policy-object-table-routing [data-object-detail]').first().click();
+      result.objectSources.routingSheet = await page.locator('.policy-entity-sheet').innerText();
+      await page.locator('[data-object-detail-close]').last().click();
+      await page.locator('[data-object-tab="flowObjects"]').click();
+      result.objectSources.flowObjects = await page.evaluate(() => ({
+        text: document.querySelector('[data-object-source-view]')?.innerText || '',
+        rows: document.querySelectorAll('.policy-object-table-flowObjects tbody tr').length,
+        source: document.querySelector('[data-object-source-view]')?.dataset.objectSourceView,
+        selectedTabVisible: (() => {
+          const tabs = document.querySelector('.policy-object-tabs');
+          const selected = document.querySelector('[data-object-tab="flowObjects"]');
+          if (!tabs || !selected) return false;
+          const outer = tabs.getBoundingClientRect();
+          const inner = selected.getBoundingClientRect();
+          return inner.left >= outer.left - 1 && inner.right <= outer.right + 1;
+        })()
+      }));
+      await page.locator('.policy-object-table-flowObjects [data-object-detail]').first().click();
+      result.objectSources.flowObjectsSheet = await page.locator('.policy-entity-sheet').innerText();
+      await page.locator('[data-object-detail-close]').last().click();
+      await page.locator('[data-object-tab="flowd"]').click();
+      result.objectSources.flowd = await page.evaluate(() => ({
+        text: document.querySelector('[data-object-source-view]')?.innerText || '',
+        rows: document.querySelectorAll('.policy-object-table-flowd tbody tr').length,
+        source: document.querySelector('[data-object-source-view]')?.dataset.objectSourceView
+      }));
+      await page.locator('.policy-object-table-flowd [data-object-detail]').first().click();
+      result.objectSources.flowdSheet = await page.locator('.policy-entity-sheet').innerText();
+      await page.locator('[data-object-detail-close]').last().click();
+      await page.evaluate(() => window.POLICY_ENTITIES_FIXTURE.setObjectSourceFailure('routing', 403));
+      await page.locator('[data-object-refresh]').click();
+      await page.waitForTimeout(180);
+      await page.locator('[data-object-tab="routing"]').click();
+      result.objectSources.routingFailure = await page.evaluate(() => ({
+        text: document.querySelector('[data-object-source-view]')?.innerText || '',
+        rows: document.querySelectorAll('.policy-object-table-routing tbody tr').length,
+        states: [...document.querySelectorAll('[data-object-source-view] [data-dwrt-state]')].map(node => node.dataset.dwrtState)
+      }));
+      await page.evaluate(() => window.POLICY_ENTITIES_FIXTURE.setObjectSourceFailure('flowObjects', 403));
+      await page.locator('[data-object-refresh]').click();
+      await page.waitForTimeout(180);
+      await page.locator('[data-object-tab="flowObjects"]').click();
+      result.objectSources.flowObjectsFailure = await page.evaluate(() => ({
+        text: document.querySelector('[data-object-source-view]')?.innerText || '',
+        rows: document.querySelectorAll('.policy-object-table-flowObjects tbody tr').length,
+        states: [...document.querySelectorAll('[data-object-source-view] [data-dwrt-state]')].map(node => node.dataset.dwrtState)
+      }));
+      await page.evaluate(() => window.POLICY_ENTITIES_FIXTURE.setObjectSourceFailure('flowd', 404));
+      await page.locator('[data-object-refresh]').click();
+      await page.waitForTimeout(180);
+      await page.locator('[data-object-tab="flowd"]').click();
+      result.objectSources.flowdFailure = await page.evaluate(() => ({
+        text: document.querySelector('[data-object-source-view]')?.innerText || '',
+        rows: document.querySelectorAll('.policy-object-table-flowd tbody tr').length,
+        states: [...document.querySelectorAll('[data-object-source-view] [data-dwrt-state]')].map(node => node.dataset.dwrtState)
+      }));
 
       await mount('objects', 'ready');
       const objectTrigger = page.locator('[data-object-detail]').first();
@@ -154,13 +225,38 @@ try:
         assert state["inputs"] == 0 and state["disabledAdd"] == 0, (name, state)
     for name, state in data["states"]["regions"].items():
         assert state["requests"] == region_requests and state["subscriptions"] == 5, (name, state)
-    assert data["states"]["objects"]["ready"]["rows"] == 3
+    assert data["states"]["objects"]["ready"]["rows"] == 2
     assert data["states"]["objects"]["stale"]["stale"] is True
-    assert "尚未创建复合对象" in data["states"]["objects"]["empty"]["text"]
+    assert "尚未创建复合策略对象" in data["states"]["objects"]["empty"]["text"]
     assert "loading" in data["states"]["objects"]["loading"]["states"]
     for name in ("error", "forbidden", "unavailable"):
         assert name in data["states"]["objects"][name]["states"], data["states"]["objects"][name]
         assert name in data["states"]["regions"][name]["states"], data["states"]["regions"][name]
+
+    sources = data["objectSources"]
+    assert [item["id"] for item in sources["initial"]["tabs"]] == ["composite", "routing", "flowObjects", "flowd"], sources
+    assert sources["initial"]["inputs"] == 0 and sources["initial"]["writeButtons"] == 0, sources
+    assert sources["initial"]["catalogText"] is False, sources
+    initial_calls = sources["initial"]["apiCalls"]
+    assert [(call["url"], call["method"]) for call in initial_calls] == [
+        ("/api/v1/routing/objects", "GET"),
+        ("/api/v1/flowd/objects", "GET"),
+        ("/api/v1/flowd/custom-protocols", "GET"),
+    ], initial_calls
+    assert sources["routing"]["rows"] == 2 and sources["routing"]["source"] == "routing", sources
+    assert "新增、编辑与删除归“策略引擎 → 路由表”所有" in sources["routing"]["text"], sources
+    assert "策略引擎 → 路由表" in sources["routingSheet"], sources
+    assert sources["flowObjects"]["rows"] == 2 and sources["flowObjects"]["source"] == "flowObjects", sources
+    assert sources["flowObjects"]["selectedTabVisible"] is True, sources
+    assert "引用关系仅覆盖 flowd 内部规则" in sources["flowObjects"]["text"], sources
+    assert "办公分流" in sources["flowObjectsSheet"] and "办公优先" in sources["flowObjectsSheet"], sources
+    assert "数据面仍为 plan-only" in sources["flowObjectsSheet"], sources
+    assert sources["flowd"]["rows"] == 2 and sources["flowd"]["source"] == "flowd", sources
+    assert "不包含系统 catalog" in sources["flowd"]["text"], sources
+    assert "dreamingwrt.flowd" in sources["flowdSheet"], sources
+    assert sources["routingFailure"]["rows"] == 2 and "上次可用快照" in sources["routingFailure"]["text"], sources
+    assert sources["flowObjectsFailure"]["rows"] == 2 and "上次可用快照" in sources["flowObjectsFailure"]["text"], sources
+    assert sources["flowdFailure"]["rows"] == 2 and "上次可用快照" in sources["flowdFailure"]["text"], sources
     assert data["states"]["regions"]["ready"]["rows"] == 5
     assert data["states"]["regions"]["ready"]["cells"] == 25
     assert data["states"]["regions"]["stale"]["stale"] is True

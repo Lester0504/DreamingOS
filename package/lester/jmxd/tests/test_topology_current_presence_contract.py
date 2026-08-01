@@ -30,12 +30,15 @@ def body(source: str, symbol: str) -> str:
 def test_stale_neighbor_is_observed_but_cannot_create_online_presence() -> None:
     observed = body(USER, "client_neigh_state_observed")
     online = body(USER, "client_neigh_state_marks_online")
-    collector = body(USER, "update_client_from_kernel")
+    collector = body(USER, "client_collect_ip_neigh")
+    update = body(USER, "update_client_from_kernel")
 
     assert '"STALE"' in observed
     assert '"STALE"' not in online
-    assert collector.count("if (!client_neigh_state_marks_online(state))") >= 2
-    assert collector.count("if (client_neigh_state_marks_online(state))") >= 2
+    assert "if (!client_neigh_state_marks_online(state))" in collector
+    assert "if (client_neigh_state_marks_online(state))" in collector
+    assert "client_collect_ip_neigh(AF_INET6);" in update
+    assert "client_collect_ip_neigh(AF_INET);" in update
 
 
 def test_expired_network_sample_cannot_keep_connections_or_rates_live() -> None:

@@ -15,15 +15,9 @@ def walk(items):
 
 
 expected = {
-    "#/network/flow-control",
-    "#/network/bulk-ip",
-    "#/network/advanced-routing",
-    "#/network/custom-config",
-    "#/authentication/client-speed-limit",
     "#/authentication/web-access-control",
     "#/authentication/app-filter",
     "#/authentication/client-network-control",
-    "#/network/firewall",
     "#/network/qwrt-modules",
     "#/plugins/native",
     "#/plugins/market",
@@ -38,6 +32,14 @@ for item in walk(MENU["items"]):
 assert set(gated) == expected
 assert all(item.get("capability") for item in gated.values())
 assert all(item.get("unavailable_reason") for item in gated.values())
+
+for old_route, new_route in {
+    "#/network/firewall": "#/policy-engine/table",
+    "#/network/custom-config": "#/policy-engine/objects",
+    "#/network/advanced-routing": "#/policy-engine/routes",
+    "#/network/flow-control": "#/policy-engine/flow-engine",
+}.items():
+    assert old_route in SHELL and new_route in SHELL
 
 assert "item.availability === 'unavailable'" in SHELL
 assert "renderUnavailableRoute(current, currentPath)" in SHELL
@@ -72,4 +74,11 @@ assert partitions["frontend_owned"] is True
 assert partitions["module"] == "native/storage-partitions.js"
 assert partitions["style"] == "/static/css/storage-partitions.css"
 
-print("ok: placeholder routes use one capability gate; VPN, multicast, UPnP and partitions use real frontend routes")
+bulk_ip = next(item for item in walk(MENU["items"]) if item.get("id") == "bulk-ip")
+assert bulk_ip["label"] == "IP 地址管理"
+assert bulk_ip["availability"] == "available"
+assert bulk_ip["frontend_owned"] is True
+assert bulk_ip["module"] == "native/ip-address-management.js"
+assert bulk_ip["style"] == "/static/css/ip-address-management.css"
+
+print("ok: placeholder routes use one capability gate; IPAM, VPN, multicast, UPnP and partitions use real frontend routes")

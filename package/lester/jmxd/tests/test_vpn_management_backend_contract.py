@@ -17,7 +17,7 @@ def between(text: str, start: str, end: str) -> str:
 
 
 def test_read_routes_and_single_aggregation_source() -> None:
-    routes = between(WEB, "/* ── VPN management v1", "/* ── WAN DNS policy")
+    routes = between(WEB, "/* ── VPN config ── */", "/* ── WAN DNS policy")
     for path in (
         "/api/v1/vpn",
         "/api/v1/vpn/servers",
@@ -59,7 +59,7 @@ def test_runtime_unknowns_are_null_and_legacy_fake_zero_fields_are_not_copied() 
 
 
 def test_all_rest_writes_fail_closed_without_ubus_side_effects() -> None:
-    routes = between(WEB, "/* ── VPN management v1", "/* ── WAN DNS policy")
+    routes = between(WEB, "/* ── VPN config ── */", "/* ── WAN DNS policy")
     rejection = between(WEB, "static struct json_object *webd_vpn_write_disabled_response",
                         "static int webd_port_preference_column_allowed")
     assert "capability_disabled" in rejection
@@ -71,6 +71,18 @@ def test_all_rest_writes_fail_closed_without_ubus_side_effects() -> None:
     assert '"transaction", json_object_new_boolean(0)' in AGGREGATE
     assert '"readback", json_object_new_boolean(0)' in AGGREGATE
     assert '"rollback", json_object_new_boolean(0)' in AGGREGATE
+
+
+def test_independent_transaction_orchestrator_requires_apply_health_and_readback() -> None:
+    for token in (
+        "webd_vpn_transaction_execute", "config_get", "config_save",
+        "config_apply", "runtime_get", '"health_checked"', '"healthy"',
+        '"generation"', "vpn_transaction_rollback", '"rollback_failed"',
+        '"save_readback_mismatch"', '"runtime_readback_failed"',
+    ):
+        assert token in AGGREGATE
+    routes = between(WEB, "/* ── VPN config ── */", "/* ── WAN DNS policy")
+    assert "webd_vpn_transaction_execute" not in routes
 
 
 def test_permissions_are_executable_and_cookie_writes_are_csrf_guarded() -> None:

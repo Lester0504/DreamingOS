@@ -37,11 +37,9 @@
 #include <linux/string.h>
 #include <linux/netfilter/nf_conntrack_common.h>
 #include "jmx_v2_rules.h"
+#include "jmx_v2_nl_handler.h"
 #include "jmx_v3_nl_handler.h"
 #include "jmx_v3_rules.h"
-extern int jmx_v2_nl_handle(const char *data, int len, uint32_t portid,
-			    uint32_t nlmsg_seq,
-			    jmx_v3_nl_reply_fn reply);
 #include "jmx.h"
 #include "jmx_utils.h"
 #include "jmx_log.h"

@@ -18,6 +18,7 @@
 #include <time.h>
 #include <signal.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <netinet/in.h>
 #include "jmx.h"
 #include "jmx_rule.h"
@@ -44,10 +45,9 @@
 #include "jmx_storage_guard.h"
 #include "jmx_core_watchdog.h"
 #include "jmx_system_data_path.h"
+#include "jmx_exec.h"
 
 int current_log_level = LOG_LEVEL_WARN;
-#define CMD_GET_LAN_IP_FMT   "ifconfig %s | grep 'inet addr' | awk '{print $2}' | awk -F: '{print $2}'"
-#define CMD_GET_LAN_MASK_FMT "ifconfig %s | grep 'inet addr' | awk '{print $4}' | awk -F: '{print $2}'"
 #define JMX_CORE_HEALTH_STATUS_PATH "/tmp/dreamingwrt-health.status"
 #define JMX_CORE_HEALTH_STATUS_STALE_SEC 120
 int g_jmx_config_chage = 1;
@@ -74,6 +74,17 @@ static int jmx_core_legacy_netlink_enabled(void)
 
     return v && (!strcmp(v, "1") || !strcasecmp(v, "true") ||
                  !strcasecmp(v, "yes") || !strcasecmp(v, "on"));
+}
+
+static void jmx_stop_legacy_rule_manager(void)
+{
+    struct jmx_exec_result result;
+    char *argv[] = {
+        "/usr/bin/killall", "-9", "rule_manager", NULL
+    };
+
+    if (jmx_exec_wait(argv[0], argv, 5000, &result) == 0)
+        jmx_exec_result_free(&result);
 }
 
 typedef enum {
@@ -108,7 +119,7 @@ typedef struct {
     int ubus_ready;
     int last_error_code;
     char last_error[128];
-    char signature_path[256];
+    char signature_path[512];
     time_t started_at;
     time_t ready_at;
     time_t updated_at;
@@ -778,48 +789,40 @@ static void jmx_deferred_startup_cb(struct uloop_timeout *t)
 }
 
 void update_lan_ip(void){
-    char ip_str[32] = {0};
-	char mask_str[32] = {0};
-    struct in_addr addr;
-	struct in_addr mask_addr;
-    char cmd_buf[128] = {0};
+    struct ifaddrs *ifaddr = NULL;
+    struct ifaddrs *ifa;
     u_int32_t lan_ip = 0;
-	u_int32_t lan_mask = 0;
+    u_int32_t lan_mask = 0;
     char lan_ifname[32] = {0};
-    char ip_cmd_buf[128] = {0};
-    char mask_cmd_buf[128] = {0};
     struct uci_context *ctx = uci_alloc_context();
     if (!ctx)
         return;
-	
+
     int ret = jmx_uci_get_value(ctx, "appfilter.global.lan_ifname", lan_ifname, sizeof(lan_ifname) - 1);
-    if (ret != 0){
-        strcpy(lan_ifname, "br-lan");
-    }
-    sprintf(ip_cmd_buf, CMD_GET_LAN_IP_FMT, lan_ifname);
-    sprintf(mask_cmd_buf, CMD_GET_LAN_MASK_FMT , lan_ifname);
+    if (ret != 0)
+        snprintf(lan_ifname, sizeof(lan_ifname), "%s", "br-lan");
 
-    exec_with_result_line(ip_cmd_buf, ip_str, sizeof(ip_str));
-    if (strlen(ip_str) < MIN_INET_ADDR_LEN){
-        update_jmx_proc_u32_value("lan_ip", 0);
-    }
-    else{
-        inet_aton(ip_str, &addr);
-        lan_ip = addr.s_addr;
-        update_jmx_proc_u32_value("lan_ip", lan_ip);
+    if (getifaddrs(&ifaddr) == 0) {
+        for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+            const struct sockaddr_in *address;
+            const struct sockaddr_in *netmask;
+
+            if (!ifa->ifa_name || strcmp(ifa->ifa_name, lan_ifname) ||
+                !ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+                continue;
+            address = (const struct sockaddr_in *)ifa->ifa_addr;
+            netmask = (const struct sockaddr_in *)ifa->ifa_netmask;
+            lan_ip = address->sin_addr.s_addr;
+            if (netmask)
+                lan_mask = netmask->sin_addr.s_addr;
+            break;
+        }
+        freeifaddrs(ifaddr);
     }
 
-    exec_with_result_line(mask_cmd_buf, mask_str, sizeof(mask_str));
-
-    if (strlen(mask_str) < MIN_INET_ADDR_LEN){
-        update_jmx_proc_u32_value("lan_mask", 0);
-    }
-    else{
-        inet_aton(mask_str, &mask_addr);
-        lan_mask = mask_addr.s_addr;
-        update_jmx_proc_u32_value("lan_mask", lan_mask);
-    }
-	uci_free_context(ctx);
+    update_jmx_proc_u32_value("lan_ip", lan_ip);
+    update_jmx_proc_u32_value("lan_mask", lan_mask);
+    uci_free_context(ctx);
 }
 
 
@@ -925,7 +928,7 @@ void jmx_timeout_handler(struct uloop_timeout *t)
         if (jmx_nl_fd.fd > 0){
             uloop_fd_add(&jmx_nl_fd, ULOOP_READ);
 
-            system("killall -9 rule_manager");
+            jmx_stop_legacy_rule_manager();
             LOG_INFO("netlink connect success\n");
         }
     }
@@ -963,11 +966,13 @@ void init_system_config_to_proc(void) {
 }
 
 void jmx_handle_sigusr1(int sig) {
+    (void)sig;
     LOG_INFO("Received SIGUSR1 signal\n");
     g_feature_update = 1;
 }
 
 void jmx_handle_sigusr2(int sig) {
+    (void)sig;
     LOG_INFO("Received SIGUSR2 signal\n");
 	if (current_log_level < LOG_LEVEL_DEBUG)
    		current_log_level++;
@@ -1011,7 +1016,8 @@ void jmx_handle_sigsegv(int sig) {
 
 int main(int argc, char **argv)
 {
-    int ret = 0;
+if (argc == 2 && !strcmp(argv[1], "--factory-reset-worker"))
+    return jmx_flash_factory_reset_worker_main();
 if (argc == 3 && !strcmp(argv[1], "--container-job-worker"))
     return jmx_docker_job_worker(argv[2]);
 LOG_INFO("jmx start");

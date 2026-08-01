@@ -3,6 +3,7 @@
 #define DREAMINGWRT_STORAGE_BLOCKDEV_H
 
 #include <json-c/json.h>
+#include <stdint.h>
 
 /*
  * Read-only block-device inventory for the Web storage manager.
@@ -25,5 +26,10 @@
 struct json_object *jmx_storage_partitions_get(void);
 struct json_object *jmx_storage_raid_get(void);
 struct json_object *jmx_storage_raid_scan(void);
+int jmx_storage_unallocated_extents(const char *device, uint64_t disk_bytes,
+                                    uint64_t sector_size,
+                                    struct json_object **extents_out,
+                                    uint64_t *bytes_out,
+                                    const char **reason_out);
 
 #endif /* DREAMINGWRT_STORAGE_BLOCKDEV_H */

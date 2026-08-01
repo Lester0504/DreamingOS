@@ -4,6 +4,7 @@
  */
 #include "jmx_netconfig_db.h"
 #include "jmx.h"
+#include "jmx_exec.h"
 #include "jmx_isp.h"
 
 #include <sqlite3.h>
@@ -39,6 +40,10 @@
 #define NC_SETUP_AI_OAUTH_NONCE_LEN 12
 #define NC_SETUP_AI_OAUTH_TAG_LEN  16
 #define NC_SETUP_AI_OAUTH_MAX_SECRET (256U * 1024U)
+#define NC_SETUP_COMMAND_OUTPUT_MAX (16U * 1024U)
+#define NC_SETUP_COMMAND_TIMEOUT_MS 5000
+#define NC_SETUP_UCI_PATH           "/sbin/uci"
+#define NC_SETUP_PPPOE_DISCOVERY_PATH "/usr/sbin/pppoe-discovery"
 
 /* ══════════════════════════════════════════════════════════════════════
  * First-run setup wizard state
@@ -618,34 +623,33 @@ static void nc_setup_twofa_policy_load(struct nc_setup_twofa_policy *p)
     if (!nc_setup_totp_window_ok(p->window)) p->window = NC_SETUP_TOTP_WINDOW;
 }
 
-static int nc_setup_cmd_first_line(const char *cmd, char *buf, size_t len)
-{
-    FILE *fp;
-
-    if (!buf || len == 0)
-        return -1;
-    buf[0] = '\0';
-    if (!cmd || !cmd[0])
-        return -1;
-    fp = popen(cmd, "r");
-    if (!fp)
-        return -1;
-    if (!fgets(buf, len, fp)) {
-        pclose(fp);
-        return -1;
-    }
-    buf[strcspn(buf, "\r\n")] = '\0';
-    return pclose(fp) == 0 ? 0 : -1;
-}
-
 static int nc_setup_ssh_port(void)
 {
+    char *const argv[] = {
+        NC_SETUP_UCI_PATH, "-q", "get", "dropbear.@dropbear[0].Port", NULL
+    };
+    struct jmx_exec_result result;
     char buf[32] = "";
+    size_t line_len;
     long port;
     char *endp = NULL;
 
-    if (nc_setup_cmd_first_line("uci -q get dropbear.@dropbear[0].Port 2>/dev/null", buf, sizeof(buf)) != 0 || !buf[0])
+    if (jmx_exec_capture(argv[0], argv, sizeof(buf) - 1,
+                         NC_SETUP_COMMAND_TIMEOUT_MS, &result) != 0)
         return 22;
+    if (result.timed_out || result.term_signal != 0 || result.truncated ||
+        result.exit_code != 0 || !result.output || result.output_len == 0) {
+        jmx_exec_result_free(&result);
+        return 22;
+    }
+    line_len = strcspn(result.output, "\r\n");
+    if (line_len == 0 || line_len >= sizeof(buf)) {
+        jmx_exec_result_free(&result);
+        return 22;
+    }
+    memcpy(buf, result.output, line_len);
+    buf[line_len] = '\0';
+    jmx_exec_result_free(&result);
     port = strtol(buf, &endp, 10);
     if (!endp || *endp || port < 1 || port > 65535)
         return 22;
@@ -1731,47 +1735,58 @@ static int nc_setup_store_wan_detect(struct json_object *result, const char *sta
 
 static int nc_setup_probe_pppoe(const char *ifname, struct json_object *evidence)
 {
-    char cmd[256];
-    char line[512] = "";
+    char *argv[] = {
+        NC_SETUP_PPPOE_DISCOVERY_PATH, "-I", (char *)ifname, "-t", "2", NULL
+    };
+    struct jmx_exec_result result;
+    char *line;
+    char *saveptr = NULL;
     char detail[1024] = "";
-    FILE *fp;
     int ok = 0;
     int detail_lines = 0;
 
-    if (!ifname || !nc_iface_name_ok(ifname) || !nc_cmd_exists("pppoe-discovery"))
+    if (!ifname || !nc_iface_name_ok(ifname) ||
+        access(NC_SETUP_PPPOE_DISCOVERY_PATH, X_OK) != 0)
         return 0;
-    snprintf(cmd, sizeof(cmd), "pppoe-discovery -I %s -t 2 2>/dev/null", ifname);
-    fp = popen(cmd, "r");
-    if (!fp)
+    if (jmx_exec_capture(argv[0], argv, NC_SETUP_COMMAND_OUTPUT_MAX,
+                         NC_SETUP_COMMAND_TIMEOUT_MS, &result) != 0)
         return 0;
-    while (fgets(line, sizeof(line), fp)) {
+    if (result.timed_out || result.term_signal != 0 || result.truncated ||
+        result.exit_code != 0 || !result.output) {
+        jmx_exec_result_free(&result);
+        return 0;
+    }
+    for (line = strtok_r(result.output, "\r\n", &saveptr); line;
+         line = strtok_r(NULL, "\r\n", &saveptr)) {
         if (strstr(line, "Access-Concentrator") || strstr(line, "AC-Name") ||
             strstr(line, "Service-Name") || strstr(line, "PADO")) {
-            size_t used, left, line_len;
+            size_t used;
+            size_t separator_len;
+            size_t line_len;
+            size_t available;
 
             ok = 1;
-            line[strcspn(line, "\r\n")] = 0;
             if (!line[0] || detail_lines >= 4)
                 continue;
             used = strlen(detail);
-            left = used < sizeof(detail) ? sizeof(detail) - used : 0;
-            if (left <= 1)
+            separator_len = used > 0 ? 2U : 0U;
+            available = sizeof(detail) - used - 1;
+            if (available <= separator_len)
                 continue;
-            if (used > 0) {
-                strncat(detail, "; ", left - 1);
-                used = strlen(detail);
-                left = used < sizeof(detail) ? sizeof(detail) - used : 0;
-                if (left <= 1)
-                    continue;
+            if (separator_len) {
+                memcpy(detail + used, "; ", separator_len);
+                used += separator_len;
+                available -= separator_len;
             }
             line_len = strlen(line);
-            if (line_len >= left)
-                line[left - 1] = 0;
-            strncat(detail, line, left - 1);
+            if (line_len > available)
+                line_len = available;
+            memcpy(detail + used, line, line_len);
+            detail[used + line_len] = '\0';
             detail_lines++;
         }
     }
-    pclose(fp);
+    jmx_exec_result_free(&result);
     if (ok) {
         struct json_object *e = json_object_new_object();
         json_object_object_add(e, "type", json_object_new_string("pppoe_pado"));

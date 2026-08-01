@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/ai-assistant.css">
+  <style>
+    :root {
+      --app-page-gutter-block:14px; --app-page-gutter-inline:14px; --app-page-gap:16px;
+      --app-radius-card:20px; --app-radius-panel:18px; --app-radius-control:12px; --app-radius-compact:8px;
+      --dwrt-kit-radius:20px; --dwrt-kit-text:#172033; --dwrt-kit-muted:#667085;
+      --ai-ink:#0f1726; --ai-text:#243044; --ai-muted:#667085; --ai-border:rgba(0,0,0,0.12);
+    }
+    * { box-sizing:border-box; }
+    html, body, .console-stage { width:100%; height:100%; margin:0; }
+    body { color:#172033; background:linear-gradient(135deg,#b9d4e5,#e6c3a0); font:13px/1.45 system-ui,sans-serif; }
+    .console-stage { display:grid; }
+    .route-preview { height:100%; }
+  </style>
+</head>
+<body>
+  <div class="console-stage"><main id="routePreview" class="route-preview"></main></div>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    // Capability block mirrors the real 30.1 GET /api/v1/ai/config contract, with
+    // streaming_ready flipped true (provider assumed connected) so the SSE path and
+    // the agentic tool loop can be exercised end to end without a live provider.
+    const config = {
+      ok: true,
+      provider: 'openai',
+      api_base: 'https://api.openai.com/v1',
+      api_key_set: true,
+      model: 'gpt-4o',
+      enabled: true,
+      auth_mode: 'api_key',
+      temperature: 0.7,
+      max_tokens: 4096,
+      tool_policy: 'confirm_medium',
+      reasoning_effort: 'auto',
+      capabilities: {
+        chat_runtime: true,
+        chat_runtime_endpoint: '/api/v1/ai/chat',
+        streaming: true,
+        streaming_ready: false,
+        streaming_endpoint: '/api/v1/ai/chat/stream',
+        stream_replay: false,
+        response_cancel: true,
+        response_cancel_endpoint_template: '/api/v1/ai/responses/{response_id}',
+        provider_test: true,
+        provider_models_sync: false,
+        tool_execution_loop: true,
+        tool_execution_loop_streaming: true,
+        tool_authorization: true,
+        tool_authorization_resume: true,
+        tool_authorization_resume_streaming: true,
+        tool_resume_endpoint: '/api/v1/ai/tool-resume',
+        tool_resume_stream_endpoint: '/api/v1/ai/tool-resume/stream',
+        tool_result_feedback: true,
+        max_tool_rounds: 4,
+        max_tool_calls_per_round: 8,
+        attachments: true,
+        attachment_ids: false,
+        reasoning_effort_supported: true,
+        reasoning_effort_values: ['auto', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+      }
+    };
+    const tools = { ok: true, tools: [
+      { id: 'get_system_status', label: '读取系统状态', description: '读取路由器运行状态摘要。', risk_level: 'low', category: 'system', enabled: true },
+      { id: 'restart_service', label: '重启服务', description: '重启指定的系统服务。', risk_level: 'medium', category: 'system', enabled: true }
+    ] };
+
+    window.__aiCalls = [];
+    const sse = (frames) => {
+      const chunks = frames.map(([event, payload], index) =>
+        'id: resp-1:' + (index + 1) + '\nevent: ' + event + '\ndata: ' + JSON.stringify(payload) + '\n\n');
+      let i = 0;
+      const encoder = new TextEncoder();
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (name) => (String(name).toLowerCase() === 'content-type' ? 'text/event-stream' : null) },
+        body: {
+          getReader: () => ({
+            read: async () => (i < chunks.length
+              ? { value: encoder.encode(chunks[i++]), done: false }
+              : { value: undefined, done: true })
+          })
+        },
+        text: async () => ''
+      };
+    };
+    const json = (data) => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => data,
+      text: async () => JSON.stringify(data)
+    });
+
+    const base = { conversation_id: 'conv-1', response_id: 'resp-1', ts: Date.now() };
+
+    window.fetch = async (url, options = {}) => {
+      const u = String(url);
+      const method = (options.method || 'GET').toUpperCase();
+      const body = options.body ? JSON.parse(options.body) : null;
+      window.__aiCalls.push({ url: u.split('?')[0], method, body });
+
+      if (u.endsWith('/api/v1/ai/chat') || u.includes('/api/v1/ai/chat?')) {
+        return json({ ok: true, data: { conversation_id: 'conv-1', reply: '',
+          pending_authorizations: [{ tool_call_id: 'tc-1', tool: 'restart_service', parameters: { service: 'dnsmasq' },
+            execution: { status: 'pending_authorization', auth_id: 42, tool: 'restart_service', tool_call_id: 'tc-1', risk_level: 'medium', required_role: 'admin_or_owner' } }],
+          tool_executions: [], resume_token: 'rt-token-1', resume_endpoint: '/api/v1/ai/tool-resume',
+          resume_stream_endpoint: '/api/v1/ai/tool-resume/stream', tool_loop_complete: false } });
+      }
+      if (u.includes('/api/v1/ai/tool-resume') && !u.includes('/stream')) {
+        return json({ ok: true, data: { conversation_id: 'conv-1', reply: 'dnsmasq 已重启。',
+          conversation_title: '重启 DNS 服务', usage: { total_tokens: 150 },
+          tool_executions: [{ tool_call_id: 'tc-1', tool: 'restart_service', execution: { status: 'completed' } }],
+          pending_authorizations: [], tool_loop_complete: true } });
+      }
+      if (u.includes('/ai/chat/stream')) {
+        // Round 1: text deltas, then a medium-risk tool call that needs authorization.
+        return sse([
+          ['conversation.created', { ...base }],
+          ['response.started', { ...base }],
+          ['response.delta', { ...base, delta: '正在检查' }],
+          ['response.delta', { ...base, delta: '系统状态…' }],
+          ['tool.call.started', { ...base, tool_call: { tool_call_id: 'tc-1', tool: 'restart_service', parameters: { service: 'dnsmasq' } } }],
+          ['response.requires_action', { ...base,
+            status: 'requires_action',
+            resume_token: 'rt-token-1',
+            resume_expires_at: Date.now() + 300000,
+            resume_endpoint: '/api/v1/ai/tool-resume',
+            resume_stream_endpoint: '/api/v1/ai/tool-resume/stream',
+            pending_authorizations: [{
+              tool_call_id: 'tc-1',
+              tool: 'restart_service',
+              parameters: { service: 'dnsmasq' },
+              execution: { status: 'pending_authorization', auth_id: 42, tool: 'restart_service', tool_call_id: 'tc-1', risk_level: 'medium', required_role: 'admin_or_owner' }
+            }],
+            tool_executions: [],
+            tool_loop_complete: false
+          }]
+        ]);
+      }
+      if (u.includes('/ai/tool-authorize')) {
+        return json({ ok: true, data: {
+          authorization: { auth_id: body && body.id, status: body && body.approve ? 'approved' : 'denied', conversation_id: 'conv-1' },
+          continuation: { ok: true, status: 'completed', conversation_id: 'conv-1', reply: 'dnsmasq 已重启。',
+            conversation_title: '重启 DNS 服务', usage: { total_tokens: 150 },
+            tool_executions: [{ tool_call_id: 'tc-1', tool: 'restart_service', execution: { status: 'completed' } }],
+            pending_authorizations: [] },
+          continuation_http_status: 202
+        } });
+      }
+      if (u.includes('/ai/tool-resume/stream')) {
+        // Round 2 after approval: tool result, then the final answer.
+        return sse([
+          ['response.started', { ...base }],
+          ['tool.call.completed', { ...base, tool_call: { tool_call_id: 'tc-1', tool: 'restart_service', execution: { status: 'completed' } } }],
+          ['response.delta', { ...base, delta: 'dnsmasq 已重启。' }],
+          ['response.completed', { ...base,
+            reply: 'dnsmasq 已重启。',
+            model: 'gpt-4o',
+            conversation_title: '重启 DNS 服务',
+            usage: { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150 },
+            tool_executions: [{ tool_call_id: 'tc-1', tool: 'restart_service', execution: { status: 'completed' } }],
+            pending_authorizations: [],
+            tool_loop_complete: true,
+            history_saved: true
+          }]
+        ]);
+      }
+      if (u.includes('/ai/tools')) return json(tools);
+      if (u.includes('/ai/config')) return json(config);
+      if (u.includes('/ai/models')) return json({ ok: true, models: ['gpt-4o', 'gpt-4o-mini'] });
+      if (u.includes('/ai/history')) return json({ ok: true, items: [] });
+      if (u.includes('/ai/provider/test')) return json({ ok: true, data: { ok: true, model: 'gpt-4o', latency_ms: 143 } });
+      return json({ ok: true });
+    };
+
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    const kit = window.DWRT_UI_KIT || {};
+    const { mount } = await import('../../files/www/dreamingwrt/plugins/native/ai-assistant.js');
+    window.fixtureController = mount({
+      root: document.getElementById('routePreview'),
+      mode: 'global-drawer',
+      utils: { escapeHtml },
+      ui: { statusBadgeMarkup: kit.statusBadgeMarkup, scheduleAdaptiveForegroundSample: () => {}, scheduleGlassCardsRender: () => {}, mountAll: () => {} }
+    });
+    window.fixtureController.open({});
+  </script>
+</body>
+</html>

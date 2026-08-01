@@ -47,18 +47,6 @@ int jmx_app_filter_init(void);
 void jmx_app_filter_exit(void);
 
 
-int jmx_add_app_filter_rule(int rule_id);
-
-
-int jmx_del_app_filter_rule(int rule_id);
-
-
-int jmx_add_app_id_to_rule(int rule_id, int app_id);
-
-
-int jmx_del_app_id_from_rule(int rule_id, int app_id);
-
-
 int jmx_match_app_filter_rule_record(int app_id, const unsigned char *mac,
                                      int *rule_id);
 

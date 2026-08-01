@@ -284,6 +284,7 @@ int flowd_db_init(void)
         " fail_count INTEGER NOT NULL DEFAULT 3,"
         " recover_count INTEGER NOT NULL DEFAULT 2,"
         " remark TEXT NOT NULL DEFAULT '',"
+        " revision INTEGER NOT NULL DEFAULT 1,"
         " created_at INTEGER NOT NULL DEFAULT 0,"
         " updated_at INTEGER NOT NULL DEFAULT 0)") != 0)
         return flowd_db_init_fail();
@@ -291,6 +292,19 @@ int flowd_db_init(void)
         "CREATE INDEX IF NOT EXISTS idx_flowd_wan_health_wan "
         "ON flowd_wan_health(enabled,wan,id)") != 0)
         return flowd_db_init_fail();
+    {
+        char *err = NULL;
+        int rc = sqlite3_exec(g_flowd_config_db,
+            "ALTER TABLE flowd_wan_health ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+            NULL, NULL, &err);
+        if (rc != SQLITE_OK && (!err || !strstr(err, "duplicate column name"))) {
+            fprintf(stderr, "[dreamingwrt-flowd] add wan-health revision failed: %s\n",
+                    err ? err : sqlite3_errmsg(g_flowd_config_db));
+            sqlite3_free(err);
+            return flowd_db_init_fail();
+        }
+        sqlite3_free(err);
+    }
 
     if (flowd_exec(g_flowd_config_db,
         "CREATE TABLE IF NOT EXISTS flowd_split_rules ("
@@ -3817,6 +3831,22 @@ static int flowd_wan_health_targets_present(struct json_object *body)
             json_object_object_get_ex(body, "targets_json", &v));
 }
 
+static int flowd_wan_health_wan_exists(const char *wan)
+{
+    sqlite3_stmt *st;
+    int found = 0;
+
+    if (!wan || !wan[0])
+        return 0;
+    st = flowd_config_prepare("SELECT 1 FROM wan WHERE id=?1 LIMIT 1");
+    if (!st)
+        return 0;
+    sqlite3_bind_text(st, 1, wan, -1, SQLITE_TRANSIENT);
+    found = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return found;
+}
+
 static void flowd_wan_health_row_json(struct json_object *arr, sqlite3_stmt *st)
 {
     const char *targets_s = (const char *)sqlite3_column_text(st, 5);
@@ -3835,7 +3865,8 @@ static void flowd_wan_health_row_json(struct json_object *arr, sqlite3_stmt *st)
     json_object_object_add(o, "fail_count", json_object_new_int(sqlite3_column_int(st, 10)));
     json_object_object_add(o, "recover_count", json_object_new_int(sqlite3_column_int(st, 11)));
     json_object_object_add(o, "remark", flowd_sqlite_text_json(st, 12));
-    json_object_object_add(o, "updated_at", json_object_new_int64(sqlite3_column_int64(st, 13)));
+    json_object_object_add(o, "revision", json_object_new_int64(sqlite3_column_int64(st, 13)));
+    json_object_object_add(o, "updated_at", json_object_new_int64(sqlite3_column_int64(st, 14)));
     json_object_array_add(arr, o);
 }
 
@@ -3857,14 +3888,14 @@ struct json_object *flowd_wan_health_json(struct json_object *body)
     if (id && id[0]) {
         st = flowd_config_prepare(
             "SELECT id,name,enabled,wan,method,targets_json,interval_s,timeout_ms,"
-            "loss_threshold_pct,latency_threshold_ms,fail_count,recover_count,remark,updated_at "
+            "loss_threshold_pct,latency_threshold_ms,fail_count,recover_count,remark,revision,updated_at "
             "FROM flowd_wan_health WHERE id=?1");
         if (st)
             sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
     } else if (wan && wan[0]) {
         st = flowd_config_prepare(
             "SELECT id,name,enabled,wan,method,targets_json,interval_s,timeout_ms,"
-            "loss_threshold_pct,latency_threshold_ms,fail_count,recover_count,remark,updated_at "
+            "loss_threshold_pct,latency_threshold_ms,fail_count,recover_count,remark,revision,updated_at "
             "FROM flowd_wan_health WHERE wan=?1 AND (?2 OR enabled=1) ORDER BY id");
         if (st) {
             sqlite3_bind_text(st, 1, wan, -1, SQLITE_TRANSIENT);
@@ -3873,7 +3904,7 @@ struct json_object *flowd_wan_health_json(struct json_object *body)
     } else {
         st = flowd_config_prepare(
             "SELECT id,name,enabled,wan,method,targets_json,interval_s,timeout_ms,"
-            "loss_threshold_pct,latency_threshold_ms,fail_count,recover_count,remark,updated_at "
+            "loss_threshold_pct,latency_threshold_ms,fail_count,recover_count,remark,revision,updated_at "
             "FROM flowd_wan_health WHERE (?1 OR enabled=1) ORDER BY wan,id");
         if (st)
             sqlite3_bind_int(st, 1, include_disabled ? 1 : 0);
@@ -3904,7 +3935,8 @@ static int flowd_wan_health_load_existing(const char *id, char *name, size_t nam
                                           int *loss_threshold_pct,
                                           int *latency_threshold_ms,
                                           int *fail_count, int *recover_count,
-                                          char *remark, size_t remark_len)
+                                          char *remark, size_t remark_len,
+                                          int64_t *revision)
 {
     sqlite3_stmt *st;
     int rc;
@@ -3913,7 +3945,7 @@ static int flowd_wan_health_load_existing(const char *id, char *name, size_t nam
         return -1;
     st = flowd_config_prepare(
         "SELECT name,enabled,wan,method,targets_json,interval_s,timeout_ms,"
-        "loss_threshold_pct,latency_threshold_ms,fail_count,recover_count,remark "
+        "loss_threshold_pct,latency_threshold_ms,fail_count,recover_count,remark,revision "
         "FROM flowd_wan_health WHERE id=?1");
     if (!st)
         return -1;
@@ -3944,6 +3976,8 @@ static int flowd_wan_health_load_existing(const char *id, char *name, size_t nam
             *recover_count = sqlite3_column_int(st, 10);
         snprintf(remark, remark_len, "%s",
                  sqlite3_column_text(st, 11) ? (const char *)sqlite3_column_text(st, 11) : "");
+        if (revision)
+            *revision = sqlite3_column_int64(st, 12);
         sqlite3_finalize(st);
         return 1;
     }
@@ -3963,6 +3997,10 @@ static int flowd_wan_health_save_one(struct json_object *body)
     const char *id, *name, *wan, *method, *targets_s, *remark;
     int enabled, interval_s, timeout_ms, loss_threshold_pct;
     int latency_threshold_ms, fail_count, recover_count, ok = 0;
+    int existing = 0;
+    int require_existing = flowd_json_bool(body, "require_existing", 0);
+    int64_t revision = 0, expected_revision = 0;
+    struct json_object *expected = NULL;
     int64_t now = flowd_now_s();
 
     if (!body || !json_object_is_type(body, json_type_object))
@@ -3971,6 +4009,7 @@ static int flowd_wan_health_save_one(struct json_object *body)
     if (!id[0]) {
         flowd_make_id("wan-health", generated_id, sizeof(generated_id));
         id = generated_id;
+        json_object_object_add(body, "id", json_object_new_string(id));
     }
     enabled = 1;
     interval_s = 5;
@@ -3980,15 +4019,24 @@ static int flowd_wan_health_save_one(struct json_object *body)
     fail_count = 3;
     recover_count = 2;
     if (body && flowd_json_str(body, "id", "")[0]) {
-        int existing = flowd_wan_health_load_existing(id, name_buf, sizeof(name_buf),
-                                                      &enabled, wan_buf, sizeof(wan_buf),
-                                                      method_buf, sizeof(method_buf),
-                                                      &targets, &interval_s, &timeout_ms,
-                                                      &loss_threshold_pct, &latency_threshold_ms,
-                                                      &fail_count, &recover_count,
-                                                      remark_buf, sizeof(remark_buf));
+        existing = flowd_wan_health_load_existing(id, name_buf, sizeof(name_buf),
+                                                  &enabled, wan_buf, sizeof(wan_buf),
+                                                  method_buf, sizeof(method_buf),
+                                                  &targets, &interval_s, &timeout_ms,
+                                                  &loss_threshold_pct, &latency_threshold_ms,
+                                                  &fail_count, &recover_count,
+                                                  remark_buf, sizeof(remark_buf), &revision);
         if (existing < 0)
             return -1;
+        if (require_existing && existing == 0)
+            return -3;
+        if (existing > 0) {
+            if (!json_object_object_get_ex(body, "expected_revision", &expected) || !expected)
+                return -2;
+            expected_revision = json_object_get_int64(expected);
+            if (expected_revision < 1 || expected_revision != revision)
+                return -2;
+        }
     }
     name = flowd_json_str(body, "name", name_buf);
     enabled = flowd_json_bool(body, "enabled", enabled);
@@ -4009,6 +4057,7 @@ static int flowd_wan_health_save_one(struct json_object *body)
     recover_count = flowd_json_int(body, "recover_count", recover_count);
     remark = flowd_json_str(body, "remark", remark_buf);
     if (!flowd_id_ok(id) || !flowd_text_ok(name, 128) || !flowd_token_ok(wan, 128) ||
+        !flowd_wan_health_wan_exists(wan) ||
         !flowd_wan_health_method_ok(method) || !flowd_wan_health_targets_ok(targets) ||
         interval_s < 1 || interval_s > 3600 || timeout_ms < 100 || timeout_ms > 60000 ||
         loss_threshold_pct < 0 || loss_threshold_pct > 100 ||
@@ -4024,16 +4073,15 @@ static int flowd_wan_health_save_one(struct json_object *body)
         json_object_put(targets);
         return -1;
     }
-    st = flowd_config_prepare(
+    st = flowd_config_prepare(existing > 0 ?
+        "UPDATE flowd_wan_health SET name=?2,enabled=?3,wan=?4,method=?5,targets_json=?6,"
+        "interval_s=?7,timeout_ms=?8,loss_threshold_pct=?9,latency_threshold_ms=?10,"
+        "fail_count=?11,recover_count=?12,remark=?13,revision=revision+1,updated_at=?14 "
+        "WHERE id=?1 AND revision=?15" :
         "INSERT INTO flowd_wan_health"
         "(id,name,enabled,wan,method,targets_json,interval_s,timeout_ms,loss_threshold_pct,"
-        "latency_threshold_ms,fail_count,recover_count,remark,created_at,updated_at) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14) "
-        "ON CONFLICT(id) DO UPDATE SET name=excluded.name,enabled=excluded.enabled,wan=excluded.wan,"
-        "method=excluded.method,targets_json=excluded.targets_json,interval_s=excluded.interval_s,"
-        "timeout_ms=excluded.timeout_ms,loss_threshold_pct=excluded.loss_threshold_pct,"
-        "latency_threshold_ms=excluded.latency_threshold_ms,fail_count=excluded.fail_count,"
-        "recover_count=excluded.recover_count,remark=excluded.remark,updated_at=excluded.updated_at");
+        "latency_threshold_ms,fail_count,recover_count,remark,revision,created_at,updated_at) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,1,?14,?14)");
     if (st) {
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
@@ -4049,7 +4097,9 @@ static int flowd_wan_health_save_one(struct json_object *body)
         sqlite3_bind_int(st, 12, recover_count);
         sqlite3_bind_text(st, 13, remark, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 14, now);
-        ok = sqlite3_step(st) == SQLITE_DONE;
+        if (existing > 0)
+            sqlite3_bind_int64(st, 15, expected_revision);
+        ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(g_flowd_config_db) == 1;
         sqlite3_finalize(st);
     }
     json_object_put(targets);
@@ -4059,29 +4109,47 @@ static int flowd_wan_health_save_one(struct json_object *body)
 struct json_object *flowd_wan_health_update(struct json_object *body)
 {
     struct json_object *arr = NULL;
-    int ok = 1, saved = 0, i, n;
+    int ok = 1, saved = 0, conflict = 0, not_found = 0, i, n, rc;
     struct json_object *resp;
 
     if (!body || !json_object_is_type(body, json_type_object))
         return flowd_error("invalid_request", "wan health body must be an object");
+    if (flowd_exec(g_flowd_config_db, "BEGIN IMMEDIATE") != 0)
+        return flowd_error("transaction_busy", "wan SLA transaction could not start");
     if (json_object_object_get_ex(body, "checks", &arr) && arr &&
         json_object_is_type(arr, json_type_array)) {
         n = json_object_array_length(arr);
         for (i = 0; i < n; i++) {
-            if (flowd_wan_health_save_one(json_object_array_get_idx(arr, i)) == 0)
+            rc = flowd_wan_health_save_one(json_object_array_get_idx(arr, i));
+            if (rc == 0)
                 saved++;
-            else
+            else {
                 ok = 0;
+                conflict |= rc == -2;
+                not_found |= rc == -3;
+            }
         }
     } else {
-        ok = flowd_wan_health_save_one(body) == 0;
+        rc = flowd_wan_health_save_one(body);
+        ok = rc == 0;
+        conflict = rc == -2;
+        not_found = rc == -3;
         saved = ok ? 1 : 0;
     }
+    if (flowd_exec(g_flowd_config_db, ok ? "COMMIT" : "ROLLBACK") != 0)
+        ok = 0;
+    if (!ok)
+        saved = 0;
     resp = flowd_wan_health_json(NULL);
     flowd_response_set_ok(resp, ok);
     json_object_object_add(resp, "saved", json_object_new_int(saved));
+    if (ok && !arr)
+        json_object_object_add(resp, "resource_id",
+                               json_object_new_string(flowd_json_str(body, "id", "")));
     if (!ok)
-        json_object_object_add(resp, "error", json_object_new_string("partial_or_failed_save"));
+        json_object_object_add(resp, "error", json_object_new_string(
+            conflict ? "revision_conflict" :
+            not_found ? "not_found" : "invalid_or_failed_save"));
     return resp;
 }
 
@@ -4089,22 +4157,43 @@ struct json_object *flowd_wan_health_delete(struct json_object *body)
 {
     sqlite3_stmt *st;
     const char *id = flowd_json_str(body, "id", "");
-    int ok = 0;
+    struct json_object *expected = NULL;
+    int64_t expected_revision;
+    int ok = 0, conflict = 0;
     struct json_object *resp;
 
     if (!flowd_id_ok(id))
         return flowd_error("invalid_id", "invalid wan health id");
-    st = flowd_config_prepare("DELETE FROM flowd_wan_health WHERE id=?1");
+    if (!body || !json_object_object_get_ex(body, "expected_revision", &expected) ||
+        !expected || (expected_revision = json_object_get_int64(expected)) < 1)
+        return flowd_error("expected_revision_required",
+                           "expected_revision is required for WAN SLA deletion");
+    if (flowd_exec(g_flowd_config_db, "BEGIN IMMEDIATE") != 0)
+        return flowd_error("transaction_busy", "wan SLA transaction could not start");
+    st = flowd_config_prepare(
+        "DELETE FROM flowd_wan_health WHERE id=?1 AND revision=?2");
     if (st) {
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, expected_revision);
         ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(g_flowd_config_db) > 0;
         sqlite3_finalize(st);
     }
+    if (!ok) {
+        st = flowd_config_prepare("SELECT 1 FROM flowd_wan_health WHERE id=?1");
+        if (st) {
+            sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+            conflict = sqlite3_step(st) == SQLITE_ROW;
+            sqlite3_finalize(st);
+        }
+    }
+    if (flowd_exec(g_flowd_config_db, ok ? "COMMIT" : "ROLLBACK") != 0)
+        ok = 0;
     resp = flowd_wan_health_json(NULL);
     flowd_response_set_ok(resp, ok);
     json_object_object_add(resp, "deleted", json_object_new_boolean(ok));
     if (!ok)
-        json_object_object_add(resp, "error", json_object_new_string("not_found"));
+        json_object_object_add(resp, "error", json_object_new_string(
+            conflict ? "revision_conflict" : "not_found"));
     return resp;
 }
 

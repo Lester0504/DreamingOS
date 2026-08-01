@@ -51,20 +51,6 @@ char *str_trim(char *s) {
     return s;
 }
 
-int exec_with_result_line(char *cmd, char *result, int len)
-{
-    FILE *fp = NULL;
-	if (!cmd || !result || !len)
-		return -1;
-    fp = popen(cmd, "r");
-    if (!fp) 
-        return -1;
-    fgets(result, len, fp);   
-    str_trim(result);
-    pclose(fp);
-	return 0;
-}
-
 int jmx_send_msg_to_kernel(char *buf){
 
     if (access("/dev/jmx", F_OK) != 0) {

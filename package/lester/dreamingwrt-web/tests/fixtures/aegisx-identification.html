@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/aegisx.css">
+  <style>
+    :root {
+      --app-page-gutter-block:14px; --app-page-gutter-inline:14px; --app-page-gap:16px;
+      --app-radius-card:20px; --app-radius-panel:18px; --app-radius-control:12px; --app-radius-compact:8px;
+      --dwrt-kit-radius:20px; --dwrt-kit-text:#172033; --dwrt-kit-muted:#667085;
+    }
+    * { box-sizing:border-box; }
+    html, body, .console-stage { width:100%; height:100%; margin:0; }
+    body { color:#172033; background:linear-gradient(135deg,#b9d4e5,#e6c3a0); font:13px/1.45 system-ui,sans-serif; }
+    .console-stage { display:grid; }
+    .route-preview { height:100%; }
+  </style>
+</head>
+<body>
+  <div class="console-stage"><main id="routePreview" class="route-preview"></main></div>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    // Real 30.1 aegis/identification payload (device_and_traffic, all caps true, pending readback).
+    const identification = {
+      ok:true, mode:'device_and_traffic',
+      device_identification_enabled:true, traffic_identification_enabled:true, traffic_record_enabled:true,
+      kernel_record_readback_available:true, kernel_record_enabled:true,
+      runtime_available:false, applied:false, apply_state:'pending_readback',
+      capabilities:{ identification_mode:true, device_identification:true, traffic_identification:true, runtime_readback:true, policy_dpi_independent:true, supported_modes:'disabled,device_and_traffic,traffic_only' },
+      ts:1785152065
+    };
+    // Minimal payloads for the other GETs so load() resolves without noise.
+    const empty = { ok:true, items:[] };
+    const geo = { ok:true, countries:[], rules:[], feeds:[], events:[] };
+    const status = { ok:true, capabilities:{}, runtime:{} };
+
+    window.__aegisPosts = [];
+    window.fetch = async (url, options = {}) => {
+      const u = String(url);
+      const method = (options.method || 'GET').toUpperCase();
+      if (u.includes('/aegis/identification')) {
+        if (method === 'POST' || method === 'PUT') {
+          const body = options.body ? JSON.parse(options.body) : {};
+          window.__aegisPosts.push(body);
+          const requested = body.mode === 'device_traffic' ? 'device_and_traffic' : body.mode === 'traffic' ? 'traffic_only' : body.mode;
+          const next = { ...identification, mode:requested,
+            device_identification_enabled: requested === 'device_and_traffic',
+            traffic_identification_enabled: requested !== 'disabled',
+            traffic_record_enabled: requested !== 'disabled',
+            applied:false, apply_state: requested === 'disabled' ? 'unavailable' : 'pending_readback', ok:true, changed:true };
+          return { ok:true, status:200, json:async () => next, text:async () => JSON.stringify(next) };
+        }
+        return { ok:true, status:200, json:async () => identification, text:async () => JSON.stringify(identification) };
+      }
+      let data = empty;
+      if (u.includes('/aegis/status')) data = status;
+      else if (u.includes('/geo-block')) data = geo;
+      return { ok:true, status:200, json:async () => data, text:async () => JSON.stringify(data) };
+    };
+
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    const kit = window.DWRT_UI_KIT || {};
+    const { mount } = await import('../../files/www/dreamingwrt/plugins/native/aegisx.js');
+    window.fixtureController = mount({
+      root: document.getElementById('routePreview'),
+      item: { id: 'policy-aegisx' },
+      utils: { escapeHtml },
+      ui: { statusBadgeMarkup: kit.statusBadgeMarkup, scheduleAdaptiveForegroundSample: () => {} }
+    });
+  </script>
+</body>
+</html>

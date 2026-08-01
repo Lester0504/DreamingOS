@@ -310,6 +310,17 @@
   min-width: 0;
 }
 
+.policy-object-tabs {
+  min-width: 0;
+  width: fit-content;
+  max-width: 100%;
+  flex: 0 1 auto;
+}
+
+.policy-object-tabs .dwrt-kit-tab {
+  min-width: 112px;
+}
+
 .policy-object-workbench {
   min-width: 0;
   min-height: 0;
@@ -326,6 +337,13 @@
 .policy-object-overview,
 .policy-object-table .dwrt-kit-table-scroll {
   min-width: 0;
+}
+
+.policy-object-source-view {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 12px;
 }
 
 .policy-object-overview .dwrt-kit-overview-card {
@@ -461,6 +479,14 @@
   min-width: 660px;
 }
 
+.policy-object-table .dwrt-kit-table {
+  min-width: 720px;
+}
+
+.policy-object-table-flowd .dwrt-kit-table {
+  min-width: 760px;
+}
+
 .policy-entity-table td:first-child {
   min-width: 190px;
 }
@@ -503,6 +529,55 @@
   display: grid;
   align-content: start;
   gap: 16px;
+}
+
+.policy-object-reference-list {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.policy-object-reference-list h3 {
+  margin: 0;
+  color: var(--app-text, var(--dwrt-kit-text));
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.policy-object-reference-list article {
+  min-width: 0;
+  min-height: 54px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border-subtle, var(--dwrt-glass-edge));
+  border-radius: var(--app-radius-compact, 8px);
+  background: var(--color-surface-control, transparent);
+}
+
+.policy-object-reference-list article > span:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.policy-object-reference-list article strong,
+.policy-object-reference-list article small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.policy-object-reference-list article strong {
+  color: var(--app-text, var(--dwrt-kit-text));
+  font-size: 12px;
+}
+
+.policy-object-reference-list article small {
+  color: var(--app-text-muted, var(--dwrt-kit-muted));
+  font-size: 10px;
 }
 
 .policy-entity-detail-list,
@@ -877,8 +952,35 @@
 
   .policy-object-toolbar .dwrt-kit-table-title span { display: none; }
 
+  .policy-object-toolbar {
+    gap: 8px;
+  }
+
+  .policy-object-tabs {
+    width: 0;
+    max-width: none;
+    flex: 1 1 0;
+    justify-content: flex-start;
+    overflow: auto hidden;
+    overscroll-behavior-inline: contain;
+    scrollbar-width: none;
+  }
+
+  .policy-object-tabs::-webkit-scrollbar { display: none; }
+
+  .policy-object-toolbar .policy-entity-header-actions {
+    width: 44px;
+    flex: 0 0 44px;
+  }
+
+  .policy-object-toolbar .policy-object-readonly-status {
+    display: none;
+  }
+
   .policy-object-toolbar [data-object-refresh] {
-    width: 40px;
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
     padding: 0;
   }
 

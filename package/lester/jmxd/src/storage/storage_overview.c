@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "storage_overview.h"
+#include "storage_blockdev.h"
 
 #include "../jmx.h"
 #include "../jmx_db.h"
@@ -1200,13 +1201,51 @@ static struct json_object *storage_smart_json(const struct storage_disk *disk)
     return object;
 }
 
+static uint64_t storage_partitioned_bytes(const struct storage_disk *disk,
+                                          const struct storage_mount *mounts,
+                                          int mount_count)
+{
+    uint64_t partitioned = 0;
+    int i;
+
+    if (!disk)
+        return 0;
+    for (i = 0; i < disk->partition_count; i++) {
+        uint64_t size = disk->partitions[i].capacity_bytes;
+
+        if (partitioned >= disk->capacity_bytes ||
+            size > disk->capacity_bytes - partitioned) {
+            partitioned = disk->capacity_bytes;
+            break;
+        }
+        partitioned += size;
+    }
+    /* A filesystem may live directly on a whole block device without a
+     * partition table. Its capacity is allocated even with no child nodes. */
+    if (partitioned == 0) {
+        for (i = 0; i < mount_count; i++) {
+            if (mounts[i].major == disk->major &&
+                mounts[i].minor == disk->minor && mounts[i].stat_ok) {
+                partitioned = disk->capacity_bytes;
+                break;
+            }
+        }
+    }
+    return partitioned > disk->capacity_bytes ? disk->capacity_bytes : partitioned;
+}
+
 static struct json_object *storage_disk_json(const struct storage_disk *disk,
                                              const struct storage_mount *mounts,
-                                             int mount_count)
+                                             int mount_count,
+                                             struct json_object *free_extents,
+                                             uint64_t unallocated_bytes,
+                                             const char *unallocated_reason,
+                                             int unallocated_supported)
 {
     struct json_object *object = json_object_new_object();
     struct json_object *partitions = json_object_new_array();
     struct json_object *mount_array = json_object_new_array();
+    uint64_t partitioned_bytes = storage_partitioned_bytes(disk, mounts, mount_count);
     int i;
 
     json_object_object_add(object, "id", json_object_new_string(disk->id));
@@ -1218,6 +1257,22 @@ static struct json_object *storage_disk_json(const struct storage_disk *disk,
     json_object_object_add(object, "transport", json_object_new_string(disk->transport));
     json_object_object_add(object, "type", json_object_new_string("physical"));
     json_object_object_add(object, "total_bytes", json_object_new_int64((int64_t)disk->capacity_bytes));
+    json_object_object_add(object, "partitioned_bytes", json_object_new_int64((int64_t)partitioned_bytes));
+    json_object_object_add(object, "unallocated_bytes",
+                           unallocated_supported ?
+                           json_object_new_int64((int64_t)unallocated_bytes) :
+                           json_object_new_null());
+    json_object_object_add(object, "unallocated_extents",
+                           free_extents ? json_object_get(free_extents) :
+                                          json_object_new_array());
+    json_object_object_add(object, "unallocated_space_supported",
+                           json_object_new_boolean(unallocated_supported));
+    json_object_object_add(object,
+                           unallocated_supported ? "unallocated_source" :
+                                                   "unallocated_reason",
+                           json_object_new_string(unallocated_reason ?
+                                                  unallocated_reason :
+                                                  "authoritative_extent_unavailable"));
     json_object_object_add(object, "filesystem_bytes", json_object_new_int64((int64_t)disk->filesystem_bytes));
     json_object_object_add(object, "used_bytes", json_object_new_int64((int64_t)disk->used_bytes));
     json_object_object_add(object, "available_bytes", json_object_new_int64((int64_t)disk->available_bytes));
@@ -1337,7 +1392,10 @@ struct json_object *jmx_storage_overview_get(const char *range)
     int64_t range_seconds, now = (int64_t)time(NULL);
     int64_t request_deadline_ms = storage_now_ms() + STORAGE_REQUEST_BUDGET_MS;
     uint64_t total = 0, used = 0, available = 0;
+    uint64_t partitioned = 0, unallocated = 0;
     int disk_count, mount_count, bucket, i, persist_ok;
+    int unallocated_supported = 1;
+    const char *unallocated_reason = NULL;
 
     storage_range(requested_range, &normalized_range, &range_seconds, &bucket);
     (void)range_seconds;
@@ -1374,16 +1432,56 @@ struct json_object *jmx_storage_overview_get(const char *range)
     smart_array = json_object_new_array();
     caps = json_object_new_object();
     for (i = 0; i < disk_count; i++) {
+        uint64_t disk_partitioned = storage_partitioned_bytes(&disks[i], mounts, mount_count);
+        uint64_t disk_unallocated = 0;
+        struct json_object *free_extents = NULL;
+        const char *disk_unallocated_reason = NULL;
+        int disk_unallocated_supported =
+            jmx_storage_unallocated_extents(disks[i].device,
+                                            disks[i].capacity_bytes, 512,
+                                            &free_extents,
+                                            &disk_unallocated,
+                                            &disk_unallocated_reason) == 0;
+
         total += disks[i].capacity_bytes;
         used += disks[i].used_bytes;
         available += disks[i].available_bytes;
-        json_object_array_add(disk_array, storage_disk_json(&disks[i], mounts, mount_count));
+        partitioned += disk_partitioned;
+        if (disk_unallocated_supported) {
+            unallocated += disk_unallocated;
+        } else {
+            unallocated_supported = 0;
+            if (!unallocated_reason)
+                unallocated_reason = disk_unallocated_reason;
+        }
+        json_object_array_add(disk_array,
+            storage_disk_json(&disks[i], mounts, mount_count, free_extents,
+                              disk_unallocated, disk_unallocated_reason,
+                              disk_unallocated_supported));
+        if (free_extents)
+            json_object_put(free_extents);
         json_object_array_add(smart_array, storage_smart_json(&disks[i]));
     }
     json_object_object_add(summary, "disk_count", json_object_new_int(disk_count));
     json_object_object_add(summary, "total_bytes", json_object_new_int64((int64_t)total));
     json_object_object_add(summary, "used_bytes", json_object_new_int64((int64_t)used));
     json_object_object_add(summary, "available_bytes", json_object_new_int64((int64_t)available));
+    json_object_object_add(summary, "partitioned_bytes", json_object_new_int64((int64_t)partitioned));
+    if (disk_count == 0)
+        unallocated_supported = 0;
+    json_object_object_add(summary, "unallocated_bytes",
+                           unallocated_supported ?
+                           json_object_new_int64((int64_t)unallocated) :
+                           json_object_new_null());
+    json_object_object_add(summary, "unallocated_space_supported",
+                           json_object_new_boolean(unallocated_supported));
+    json_object_object_add(summary,
+                           unallocated_supported ? "unallocated_source" :
+                                                   "unallocated_reason",
+                           json_object_new_string(unallocated_supported ?
+                               "sfdisk_partition_table_free_regions" :
+                               (unallocated_reason ? unallocated_reason :
+                                "no_physical_disks")));
     json_object_object_add(data, "contract_version",
                            json_object_new_string("storage-overview.v1"));
     json_object_object_add(data, "range", json_object_new_string(normalized_range));
@@ -1396,6 +1494,8 @@ struct json_object *jmx_storage_overview_get(const char *range)
     json_object_object_add(data, "smart", smart_array);
     json_object_object_add(caps, "physical_disk_inventory", json_object_new_boolean(1));
     json_object_object_add(caps, "partition_mount_usage", json_object_new_boolean(1));
+    json_object_object_add(caps, "unallocated_space",
+                           json_object_new_boolean(unallocated_supported));
     json_object_object_add(caps, "diskstats_rate", json_object_new_boolean(1));
     json_object_object_add(caps, "diskstats_latency", json_object_new_boolean(1));
     json_object_object_add(caps, "smart", json_object_new_boolean(storage_smartctl_path() != NULL));

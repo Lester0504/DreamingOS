@@ -34,21 +34,6 @@ int jmx_mac_filter_init(void);
 void jmx_mac_filter_exit(void);
 
 
-int jmx_add_mac_filter_rule(int rule_id);
-
-
-int jmx_del_mac_filter_rule(int rule_id);
-
-
-mac_filter_rule_t *jmx_find_mac_filter_rule(int rule_id);
-
-
-int jmx_add_mac_to_rule(int rule_id, const unsigned char *mac);
-
-
-int jmx_del_mac_from_rule(int rule_id, const unsigned char *mac);
-
-
 mac_filter_rule_t *jmx_match_mac_filter_rule(const unsigned char *mac);
 
 

@@ -420,6 +420,53 @@ static int normalize_bridge_port_no(const char *raw, char *out, size_t out_len)
     return out[0] ? 0 : -1;
 }
 
+/* struct __fdb_entry record size exposed by /sys/class/net/<br>/brforward. */
+#define JMX_FDB_ENTRY_SIZE 16
+#define JMX_FDB_MAC_LEN 6
+
+/* Reject anything that cannot be a kernel interface name before it reaches a
+ * /sys path, so a caller can never walk outside /sys/class/net/<name>/. */
+static int jmx_bridge_name_ok(const char *name)
+{
+    size_t i;
+
+    if (!name || !name[0])
+        return 0;
+    if (strlen(name) >= IFNAMSIZ)
+        return 0;
+    if (!strcmp(name, ".") || !strcmp(name, ".."))
+        return 0;
+    for (i = 0; name[i]; i++) {
+        unsigned char c = (unsigned char)name[i];
+
+        if (c == '/' || c == '\\' || isspace(c) || !isprint(c))
+            return 0;
+    }
+    return 1;
+}
+
+/* Strict aa:bb:cc:dd:ee:ff parse into raw bytes; no truncation, no partials. */
+static int jmx_parse_mac_bytes(const char *mac, unsigned char out[JMX_FDB_MAC_LEN])
+{
+    unsigned int v[JMX_FDB_MAC_LEN];
+    char tail = '\0';
+    int n;
+    int i;
+
+    if (!mac || !out)
+        return -1;
+    n = sscanf(mac, "%2x:%2x:%2x:%2x:%2x:%2x%c",
+               &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &tail);
+    if (n != JMX_FDB_MAC_LEN)
+        return -1;
+    for (i = 0; i < JMX_FDB_MAC_LEN; i++) {
+        if (v[i] > 0xff)
+            return -1;
+        out[i] = (unsigned char)v[i];
+    }
+    return 0;
+}
+
 static int load_bridge_links(const char *bridge, bridge_link_t *links, int max_links,
                              char *bridge_mac, size_t bridge_mac_len)
 {
@@ -489,34 +536,75 @@ static const bridge_link_t *find_bridge_link_by_port_no(const bridge_link_t *lin
 
 static int lookup_bridge_fdb_port(const char *bridge, const char *mac, char *port_no, size_t port_len)
 {
-    FILE *fp;
-    char cmd[128];
-    char line[256];
-    char mac_l[32];
+    /*
+     * U-15: read the kernel bridge forwarding database directly instead of
+     * shelling out to "brctl showmacs". /sys/class/net/<bridge>/brforward is
+     * the exact source brctl parses, so this removes a root shell hop plus a
+     * runtime dependency on BusyBox brctl without changing semantics.
+     *
+     * Each record is a struct __fdb_entry (16 bytes):
+     *   [0..5]  mac_addr
+     *   [6]     port_no
+     *   [7]     is_local
+     *   [8..11] ageing_timer_value
+     *   [12]    port_hi
+     *   [13]    pad0
+     *   [14..15] unused
+     */
+    unsigned char entry[JMX_FDB_ENTRY_SIZE];
+    char path[128];
+    unsigned char want[JMX_FDB_MAC_LEN];
+    int fd;
+    int rc = -1;
 
     if (!bridge || !mac || !port_no || port_len == 0)
         return -1;
     port_no[0] = '\0';
-    lowercase_copy(mac_l, sizeof(mac_l), mac);
-    snprintf(cmd, sizeof(cmd), "brctl showmacs %s 2>/dev/null", bridge);
-    fp = popen(cmd, "r");
-    if (!fp)
+    if (!jmx_bridge_name_ok(bridge))
         return -1;
-    while (fgets(line, sizeof(line), fp)) {
-        char port[32], fdb_mac[32], local[16];
-        char fdb_mac_l[32];
+    if (jmx_parse_mac_bytes(mac, want) != 0)
+        return -1;
+    if ((size_t)snprintf(path, sizeof(path), "/sys/class/net/%s/brforward",
+                         bridge) >= sizeof(path))
+        return -1;
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    for (;;) {
+        size_t got = 0;
+        unsigned int port;
 
-        if (sscanf(line, "%31s %31s %15s", port, fdb_mac, local) < 3)
-            continue;
-        lowercase_copy(fdb_mac_l, sizeof(fdb_mac_l), fdb_mac);
-        if (!strcmp(fdb_mac_l, mac_l) && strcmp(local, "yes")) {
-            snprintf(port_no, port_len, "%s", port);
-            pclose(fp);
-            return 0;
+        while (got < sizeof(entry)) {
+            ssize_t n = read(fd, entry + got, sizeof(entry) - got);
+
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                close(fd);
+                return -1;
+            }
+            if (n == 0)
+                break;
+            got += (size_t)n;
         }
+        if (got == 0)
+            break;
+        if (got < sizeof(entry))
+            break;
+        if (entry[7])
+            continue;
+        if (memcmp(entry, want, JMX_FDB_MAC_LEN))
+            continue;
+        port = (unsigned int)entry[6] | ((unsigned int)entry[12] << 8);
+        if ((size_t)snprintf(port_no, port_len, "%u", port) >= port_len) {
+            port_no[0] = '\0';
+            break;
+        }
+        rc = 0;
+        break;
     }
-    pclose(fp);
-    return -1;
+    close(fd);
+    return rc;
 }
 
 static void observe_lan_bridge_state(const char *mac, const char *ip, const char *fallback_iface)

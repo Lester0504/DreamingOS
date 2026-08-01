@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* ISP/carrier detection by public IPv4 and signature DB CIDR matching. */
 #include "jmx_isp.h"
+#include "jmx_exec.h"
 #include "jmx_signature_db.h"
 #include "jmx_system_data_path.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <json-c/json.h>
+#include <limits.h>
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define JMX_ISP_CACHE_TTL_OK_S 300
 #define JMX_ISP_CACHE_TTL_FAIL_S 60
+#define JMX_ISP_EXEC_TIMEOUT_MS 5000
+#define JMX_ISP_IFSTATUS_OUTPUT_MAX (64U * 1024U)
 
 struct jmx_isp_cache_entry {
     char key[32];
@@ -115,63 +119,107 @@ static void jmx_isp_trim(char *s)
         *--e = '\0';
 }
 
-static int jmx_isp_read_cmd_line(const char *cmd, char *out, size_t out_len)
+static int jmx_isp_exec_ok(const struct jmx_exec_result *result)
 {
-    FILE *fp;
-    int status;
-
-    if (!cmd || !out || out_len == 0)
-        return -1;
-    out[0] = '\0';
-    fp = popen(cmd, "r");
-    if (!fp)
-        return -1;
-    if (!fgets(out, out_len, fp))
-        out[0] = '\0';
-    status = pclose(fp);
-    jmx_isp_trim(out);
-    if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || !out[0])
-        return -1;
-    return 0;
+    return result && !result->timed_out && !result->truncated &&
+           result->term_signal == 0 && result->exit_code == 0 &&
+           result->output;
 }
 
 static int jmx_isp_l3_device_from_ifstatus(const char *wan_id, char *out, size_t out_len)
 {
-    char cmd[192];
+    char object[64];
+    char *argv[] = { "/bin/ubus", "call", object, "status", NULL };
+    struct jmx_exec_result result;
+    struct json_tokener *tokener = NULL;
+    struct json_object *root = NULL;
+    struct json_object *value = NULL;
+    size_t parsed;
+    size_t len;
+    int rc = -1;
 
     if (!out || out_len == 0)
         return -1;
     out[0] = '\0';
     if (!jmx_isp_ifname_ok(wan_id))
         return -1;
-    snprintf(cmd, sizeof(cmd),
-             "ifstatus '%s' 2>/dev/null | jsonfilter -e '@[\"l3_device\"]' 2>/dev/null",
-             wan_id);
-    if (jmx_isp_read_cmd_line(cmd, out, out_len) != 0)
+    if (snprintf(object, sizeof(object), "network.interface.%s", wan_id) >=
+        (int)sizeof(object))
         return -1;
-    return jmx_isp_ifname_ok(out) ? 0 : -1;
+    if (jmx_exec_capture(argv[0], argv, JMX_ISP_IFSTATUS_OUTPUT_MAX,
+                         JMX_ISP_EXEC_TIMEOUT_MS, &result) != 0)
+        return -1;
+    if (!jmx_isp_exec_ok(&result) || result.output_len == 0 ||
+        result.output_len > INT_MAX)
+        goto done;
+    tokener = json_tokener_new_ex(16);
+    if (!tokener)
+        goto done;
+    json_tokener_set_flags(tokener, JSON_TOKENER_STRICT);
+    root = json_tokener_parse_ex(tokener, result.output,
+                                 (int)result.output_len);
+    if (!root || json_tokener_get_error(tokener) != json_tokener_success ||
+        !json_object_is_type(root, json_type_object))
+        goto done;
+    parsed = json_tokener_get_parse_end(tokener);
+    while (parsed < result.output_len &&
+           isspace((unsigned char)result.output[parsed]))
+        parsed++;
+    if (parsed != result.output_len ||
+        !json_object_object_get_ex(root, "l3_device", &value) ||
+        !json_object_is_type(value, json_type_string))
+        goto done;
+    len = json_object_get_string_len(value);
+    if (len == 0 || len >= out_len ||
+        !jmx_isp_ifname_ok(json_object_get_string(value)))
+        goto done;
+    memcpy(out, json_object_get_string(value), len + 1);
+    rc = 0;
+
+done:
+    if (root)
+        json_object_put(root);
+    if (tokener)
+        json_tokener_free(tokener);
+    jmx_exec_result_free(&result);
+    return rc;
 }
 
 static int jmx_isp_fetch_public_ip_one(const char *iface, const char *url,
                                        char *ip, size_t ip_len)
 {
-    char cmd[512];
+    char *argv_with_iface[] = {
+        "/usr/bin/curl", "-4", "-fsS", "--interface", (char *)iface,
+        "--connect-timeout", "1", "--max-time", "3", (char *)url, NULL
+    };
+    char *argv_default[] = {
+        "/usr/bin/curl", "-4", "-fsS", "--connect-timeout", "1",
+        "--max-time", "3", (char *)url, NULL
+    };
+    char **argv = iface && iface[0] ? argv_with_iface : argv_default;
+    struct jmx_exec_result result;
+    size_t len;
 
-    if (!url || !ip || ip_len == 0)
+    if (!url || !ip || ip_len < 2)
         return -1;
-    if (iface && iface[0]) {
-        if (!jmx_isp_ifname_ok(iface))
-            return -1;
-        snprintf(cmd, sizeof(cmd),
-                 "curl -4 -fsS --interface '%s' --connect-timeout 1 --max-time 3 '%s' 2>/dev/null",
-                 iface, url);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-                 "curl -4 -fsS --connect-timeout 1 --max-time 3 '%s' 2>/dev/null",
-                 url);
+    ip[0] = '\0';
+    if (iface && iface[0] && !jmx_isp_ifname_ok(iface))
+        return -1;
+    if (jmx_exec_capture(argv[0], argv, ip_len - 1,
+                         JMX_ISP_EXEC_TIMEOUT_MS, &result) != 0)
+        return -1;
+    if (!jmx_isp_exec_ok(&result) || result.output_len == 0) {
+        jmx_exec_result_free(&result);
+        return -1;
     }
-    if (jmx_isp_read_cmd_line(cmd, ip, ip_len) != 0)
+    jmx_isp_trim(result.output);
+    len = strlen(result.output);
+    if (len == 0 || len >= ip_len) {
+        jmx_exec_result_free(&result);
         return -1;
+    }
+    memcpy(ip, result.output, len + 1);
+    jmx_exec_result_free(&result);
     return jmx_isp_public_ipv4_ok(ip, NULL) ? 0 : -1;
 }
 

@@ -140,6 +140,25 @@ def test_runtime_db_schema_and_history_semantics():
     assert "DELETE FROM storage_disk_sample WHERE ts < ?1" in SOURCE
 
 
+def test_unallocated_space_uses_authoritative_partition_table_extents():
+    helper = function_body("static uint64_t storage_partitioned_bytes(")
+    disk_json = function_body("static struct json_object *storage_disk_json(")
+    api = function_body("struct json_object *jmx_storage_overview_get(")
+    assert "disk->partitions[i].capacity_bytes" in helper
+    assert "mounts[i].major == disk->major" in helper
+    assert "mounts[i].minor == disk->minor" in helper
+    assert "partitioned = disk->capacity_bytes" in helper
+    assert "jmx_storage_unallocated_extents" in api
+    assert "disk->capacity_bytes - partitioned_bytes" not in disk_json
+    assert "disk->capacity_bytes - disk_partitioned" not in api
+    assert '"partitioned_bytes"' in disk_json
+    assert '"unallocated_bytes"' in disk_json
+    assert '"unallocated_extents"' in disk_json
+    assert '"unallocated_space_supported"' in disk_json
+    assert '"sfdisk_partition_table_free_regions"' in api
+    assert '"unallocated_space"' in api
+
+
 def test_forbidden_integration_files_are_not_referenced_by_test_scope():
     # This phase intentionally exposes a data-layer function only. Ubus, webd,
     # netconfig, file-service, and build wiring are separate integration work.

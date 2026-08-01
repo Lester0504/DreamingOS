@@ -31,7 +31,7 @@ unsigned int jmx_lan_mask = 0;
 char g_lan_ifname[64] = "br-lan";
 int g_tcp_rst = 1;
 int g_feature_init = 0;
-char g_jmx_version[64] = JMX_VERSION;
+static char g_jmx_version[64] = JMX_VERSION;
 int g_feature_count = 0;
 
 static struct ctl_table jmx_table[] = {
@@ -164,6 +164,7 @@ static struct ctl_table jmx_table[] = {
 };
 #define JMX_SYS_PROC_DIR "dreamingwrt/jmx"
 
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0))
 static struct ctl_table jmx_drt_table[] = {
 	{
 		.procname	= "jmx",
@@ -185,6 +186,7 @@ static struct ctl_table jmx_root_table[] = {
 	},
 	{}
 };
+#endif
 static struct ctl_table_header *jmx_table_header;
 
 int jmx_debug_level(void)

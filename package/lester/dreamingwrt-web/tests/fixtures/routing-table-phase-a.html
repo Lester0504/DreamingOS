@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>routing-table-phase-a-01</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/routing-table.css">
+  <style>
+    :root {
+      --app-page-gutter-block: 16px; --app-page-gutter-inline: 18px; --app-page-gap: 14px;
+      --app-radius-card: 24px; --app-radius-control: 12px;
+      --app-text: rgb(239 245 252); --app-text-secondary: rgb(211 224 239); --app-text-muted: rgb(167 187 210);
+      --color-surface-control: rgb(255 255 255 / .055); --color-surface-stable: rgb(13 23 38 / .78);
+      --color-border-subtle: rgb(255 255 255 / .12); --color-border-control: rgb(255 255 255 / .18);
+      --dwrt-interactive-hover-bg: rgb(255 255 255 / .09);
+    }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; color: var(--app-text); background: linear-gradient(145deg, #193653, #18443f); font-family: Lato, "PingFang SC", system-ui, sans-serif; }
+    .console-stage, #routePreview { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+  </style>
+</head>
+<body>
+  <main class="console-stage"><div id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/routing-table.js';
+
+    const capabilities = {
+      source_of_truth: 'policy_table', table_crud: true, object_crud: true,
+      cross_service_config_crud: true, cross_service_runtime: false,
+      cross_service_runtime_reason: 'runtime_consumer_not_implemented',
+      reference_conflict: true, external_policies_read_only: true, runtime_resolve: true
+    };
+    const payloads = {
+      '/api/v1/routing': { ok: true, source: 'dreamingwrt.routed', revision: 19, capabilities },
+      '/api/v1/policy-engine/policy-table?include_default=0': { rows: [
+        { id: 'route-wan2', policy_type: 'static_route', enabled: true, name: '办公网段', destination: '10.20.0.0/16', interface: 'wan2', raw: { table: 'wan2', metric: 10 } },
+        { id: 'pbr-office', policy_type: 'pbr', enabled: true, name: '办公出口', source: 'office', destination: 'any', raw: { route_table: 'wan2', priority: 1000, hit_count: 42, last_hit: 1785411000 } }
+      ]},
+      '/api/v1/routing/tables': { items: [{ id: 'wan2', name: 'WAN2', table_id: 102, role: 'wan', gateway: '192.0.2.1', metric: 10, enabled: true, ref_count: 1, references: [{ id: 'pbr-office', name: '办公出口' }] }], capabilities },
+      '/api/v1/routing/objects': { items: [{ id: 'office', name: '办公网段', type: 'ip_group', family: 'ipv4', value: '10.20.0.0/16', members: [{ value: '10.20.0.0/16', label: '办公' }], enabled: true, ref_count: 1, references: [{ id: 'pbr-office', name: '办公出口' }] }], capabilities },
+      '/api/v1/routing/cross-services': { items: [{ id: 'office-snmp', name: '办公 SNMP', service_type: 'snmp', server_ip: '10.20.0.10', scope: 'office', listen_port: '161', version: 'V2', access_rate: '', remark: '', enabled: true, runtime_supported: false }], capabilities },
+      '/api/v1/routing/external-policies': { items: [{ id: 'mwan3:wan2:1', name: 'wan2', source: 'mwan3', section_type: 'member', path: '/etc/config/mwan3', read_only: true }], capabilities }
+    };
+    const requests = [];
+    let scenario = 'ready';
+    let instance;
+
+    const fixtureFetch = async (name, url) => {
+      if (scenario === 'fail-closed' && url === '/api/v1/routing') throw new Error('routing source unavailable');
+      const data = structuredClone(payloads[url] || {});
+      if (scenario === 'runtime-missing' && data.capabilities) {
+        data.capabilities.table_crud = false;
+        data.capabilities.object_crud = false;
+        data.capabilities.cross_service_config_crud = false;
+        data.capabilities.runtime_resolve = false;
+      }
+      return { name, ok: true, data, raw: data };
+    };
+    window.fetch = async (url, options = {}) => {
+      const method = options.method || 'GET';
+      const body = options.body ? JSON.parse(options.body) : null;
+      requests.push({ url: String(url), method, body });
+      if (scenario === 'reference-conflict' && method === 'DELETE') return new Response(JSON.stringify({ ok: false, error: 'reference_conflict', message: 'route table is still referenced', references: [{ id: 'pbr-office', name: '办公出口' }] }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+      if (String(url).endsWith('/runtime-resolve')) return new Response(JSON.stringify({ ok: true, route_table: body.route_table || 'wan2', table_id: 102, gateway: '192.0.2.1', interface: 'wan2', action: 'route_table', resolved: true, reason: 'explicit_route_table_selected', runtime_validation: 'configured_resolution_not_per_flow_conntrack_decision' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ ok: true, id: body?.id || 'deleted' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+
+    async function remount(nextScenario = 'ready') {
+      instance?.unmount?.();
+      scenario = nextScenario;
+      requests.length = 0;
+      instance = mount({
+        root: document.getElementById('routePreview'), api: { fetch: fixtureFetch }, utils: { escapeHtml },
+        ui: window.DWRT_UI_KIT || {}
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return contract();
+    }
+    function contract() {
+      const root = document.getElementById('routePreview');
+      return {
+        scenario,
+        activeTab: root.querySelector('[data-routing-tab].is-active')?.textContent.trim() || '',
+        tabs: [...root.querySelectorAll('[data-routing-tab]')].map((item) => item.textContent.trim()),
+        tables: root.querySelectorAll('[data-dwrt-component="data-table"]').length,
+        sheet: Boolean(root.querySelector('[data-dwrt-component="sheet"]')),
+        confirmation: Boolean(root.querySelector('[data-dwrt-confirmation]')),
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth,
+        requests: [...requests]
+      };
+    }
+    window.ROUTING_FIXTURE = { remount, contract, requests, scenarios: ['ready', 'fail-closed', 'reference-conflict', 'runtime-missing'] };
+    await remount('ready');
+  </script>
+</body>
+</html>

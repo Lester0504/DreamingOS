@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 #define JMX_EXEC_KILL_GRACE_MS 200
-#define JMX_EXEC_MAX_OUTPUT (1024U * 1024U)
+#define JMX_EXEC_MAX_OUTPUT JMX_EXEC_OUTPUT_LIMIT_MAX
 
 static int64_t jmx_exec_now_ms(void)
 {

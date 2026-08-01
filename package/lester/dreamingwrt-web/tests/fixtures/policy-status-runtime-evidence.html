@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-CN" data-theme-resolved="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>policy-status-runtime-evidence-fixture-01</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/policy-status.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-control-material.css">
+  <style>
+    :root {
+      --app-page-gutter-block: 14px; --app-page-gutter-inline: 14px; --app-page-gap: 18px; --app-radius-card: 24px;
+      --app-text: rgb(239 245 252); --app-text-secondary: rgb(211 224 239); --app-text-muted: rgb(167 187 210);
+      --app-accent: rgb(46 139 255); --color-accent: var(--app-accent); --color-danger: rgb(239 86 99);
+      --color-warning: rgb(238 177 52); --color-border-subtle: rgb(255 255 255 / .12);
+      --dwrt-glass-surface: rgb(10 16 25 / .24); --dwrt-glass-edge: rgb(255 255 255 / .12);
+      --dwrt-glass-shadow: 0 12px 32px rgb(0 0 0 / .18); --dwrt-glass-backdrop: blur(12px) saturate(130%);
+      --dwrt-kit-text: var(--app-text); --dwrt-kit-muted: var(--app-text-muted);
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body.dwrt-app { display: block; color: var(--app-text); background: linear-gradient(145deg, rgb(22 55 86), rgb(35 72 61)); font-family: Lato, "PingFang SC", system-ui, sans-serif; }
+    .console-stage, #routePreview { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+  </style>
+</head>
+<body class="dwrt-app">
+  <main class="console-stage"><div id="routePreview" class="route-preview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/policy-status.js';
+
+    const now = 1785504067;
+    const base = {
+      available: true,
+      wans: [
+        { wan_id: 'wan', ifname: 'wan', carrier: 'unicom', public_ip: '110.18.155.183', health: true, connections: 103, up_rate: 12000, down_rate: 250000, up_bytes: 2000000, down_bytes: 9000000 },
+        { wan_id: 'wan2', ifname: 'wan2', carrier: 'mobile', public_ip: '39.154.0.61', health: true, connections: 123, up_rate: 18000, down_rate: 310000, up_bytes: 3000000, down_bytes: 12000000 }
+      ],
+      policy_groups: [],
+      route_decisions: [
+        { id: 'candidate-1', candidate: true, verified: false, policy_hit: false, sample_source: 'runtime_candidate', reason_code: 'runtime_candidate_unverified' }
+      ]
+    };
+    const scenarios = {
+      aggregate: {
+        ...base,
+        counter_source: 'jmx_route_kernel', counter_supported: true, counter_ready: true,
+        counter_precision: 'aggregate_rule_counter', counter_reason: 'ok', hit_total: 18,
+        policy_status: {
+          enabled: true, active_flows: 226, steered_flows: 0, active_rules: 2, bypass_flows: 0, fallback_flows: 0,
+          hit_total: 18, last_hit_at: now, counter_source: 'jmx_route_kernel', counter_supported: true,
+          counter_ready: true, counter_precision: 'aggregate_rule_counter', counter_reason: 'ok'
+        },
+        rules: [
+          { id: 'rule-100', prio: 100, enabled: true, name: '规则 100', type: 'route', match: 'any / default', action: 'route', target: 'wan', hit_count: 12, last_hit: now - 3, counter_source: 'jmx_route_kernel', counter_ready: true, counter_precision: 'aggregate_rule_counter', verified: true, policy_hit: true },
+          { id: 'rule-110', prio: 110, enabled: true, name: '规则 110', type: 'route', match: 'any / default', action: 'route', target: 'wan2', hit_count: 6, last_hit: now - 16, counter_source: 'jmx_route_kernel', counter_ready: true, counter_precision: 'aggregate_rule_counter', verified: true, policy_hit: true }
+        ]
+      },
+      unavailable: {
+        ...base,
+        counter_source: '', counter_supported: false, counter_ready: false,
+        counter_precision: '', counter_reason: 'collector_unavailable', hit_total: 0,
+        policy_status: {
+          enabled: true, active_flows: 226, steered_flows: 0, active_rules: 2, bypass_flows: 0, fallback_flows: 0,
+          hit_total: 0, counter_supported: false, counter_ready: false, counter_reason: 'collector_unavailable'
+        },
+        rules: [
+          { id: 'rule-100', prio: 100, enabled: true, name: '规则 100', action: 'route', target: 'wan', hit_count: 0, counter_ready: false },
+          { id: 'rule-110', prio: 110, enabled: true, name: '规则 110', action: 'route', target: 'wan2', hit_count: 0, counter_ready: false }
+        ]
+      },
+      legacy: {
+        ...base,
+        policy_status: { enabled: true, active_flows: 226, steered_flows: 0, active_rules: 2, bypass_flows: 0, fallback_flows: 0 },
+        rules: [
+          { id: 'rule-100', prio: 100, enabled: true, name: '规则 100', action: 'route', target: 'wan' },
+          { id: 'rule-110', prio: 110, enabled: true, name: '规则 110', action: 'route', target: 'wan2' }
+        ]
+      }
+    };
+
+    const root = document.getElementById('routePreview');
+    const requests = [];
+    const subscriptions = new Set();
+    let scenario = 'aggregate';
+    let instance = null;
+    let activeTimers = 0;
+    const realSetTimeout = window.setTimeout.bind(window);
+    const realClearTimeout = window.clearTimeout.bind(window);
+    const timers = new Set();
+    window.setTimeout = (callback, delay, ...args) => {
+      const id = realSetTimeout(() => { timers.delete(id); activeTimers = timers.size; callback(...args); }, delay);
+      timers.add(id); activeTimers = timers.size;
+      return id;
+    };
+    window.clearTimeout = id => { timers.delete(id); activeTimers = timers.size; return realClearTimeout(id); };
+
+    const clone = value => structuredClone(value);
+    window.fetch = async input => {
+      const url = new URL(String(input), location.href);
+      requests.push({ method: 'GET', url: url.pathname });
+      if (url.pathname === '/api/v1/route_status') return new Response(JSON.stringify({ ok: true, data: clone(scenarios[scenario]) }), { status: 200 });
+      throw new Error(`unexpected request: ${url.pathname}`);
+    };
+    const realtime = {
+      subscribe(topic) {
+        const token = { topic };
+        subscriptions.add(token);
+        return () => subscriptions.delete(token);
+      }
+    };
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+    async function waitFor(predicate) {
+      for (let index = 0; index < 160; index += 1) {
+        if (predicate()) return true;
+        await new Promise(resolve => realSetTimeout(resolve, 16));
+      }
+      throw new Error(`fixture timeout: ${scenario}`);
+    }
+    async function remount(nextScenario) {
+      instance?.unmount?.();
+      scenario = nextScenario;
+      requests.length = 0;
+      instance = mount({
+        root, realtime,
+        ui: {
+          mountAll: node => window.DWRT_UI_KIT.mountAll(node),
+          overviewCardsMarkup: (...args) => window.DWRT_UI_KIT.overviewCardsMarkup(...args),
+          statusBadgeMarkup: (...args) => window.DWRT_UI_KIT.statusBadgeMarkup(...args)
+        },
+        utils: {
+          escapeHtml,
+          formatInteger: value => Math.round(Number(value) || 0).toLocaleString('en-US'),
+          formatBytes: value => `${Number(value) || 0} B`,
+          formatRate: value => `${Number(value) || 0} B/s`
+        }
+      });
+      await waitFor(() => root.querySelector('[data-policy-runtime-evidence]') && !root.innerText.includes('正在读取分流状态'));
+      return contract();
+    }
+    function contract() {
+      const evidence = root.querySelector('[data-policy-runtime-evidence]');
+      const tableScroll = root.querySelector('.dwrt-kit-table-scroll');
+      const rootRect = root.getBoundingClientRect();
+      const visible = node => Boolean(node?.getClientRects().length && getComputedStyle(node).visibility !== 'hidden');
+      const offenders = [...root.querySelectorAll('*')].filter(visible).filter(node => {
+        if (node.closest('.dwrt-kit-table-scroll')) return false;
+        const rect = node.getBoundingClientRect();
+        return rect.left < rootRect.left - 1 || rect.right > rootRect.right + 1;
+      }).map(node => ({ tag: node.tagName, className: node.className, left: node.getBoundingClientRect().left, right: node.getBoundingClientRect().right })).slice(0, 12);
+      return {
+        scenario,
+        text: root.innerText,
+        evidence: evidence?.innerText || '',
+        hits: [...root.querySelectorAll('[data-rule-hits]')].map(node => node.textContent.trim()),
+        lastHits: [...root.querySelectorAll('[data-rule-last-hit]')].map(node => node.textContent.trim()),
+        requests: clone(requests),
+        writes: requests.filter(item => item.method !== 'GET').length,
+        subscriptions: subscriptions.size,
+        activeTimers,
+        pageOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+        rootOverflow: root.scrollWidth > root.clientWidth + 1,
+        rootWidth: { client: root.clientWidth, scroll: root.scrollWidth, rect: rootRect.width },
+        offenders,
+        tableScrollable: Boolean(tableScroll && tableScroll.scrollWidth >= tableScroll.clientWidth),
+        transparentRoot: getComputedStyle(root).backgroundColor === 'rgba(0, 0, 0, 0)'
+      };
+    }
+    function unmount() {
+      instance?.unmount?.();
+      instance = null;
+      return { subscriptions: subscriptions.size, activeTimers, children: root.childElementCount };
+    }
+    window.POLICY_STATUS_RUNTIME_FIXTURE = { remount, contract, unmount };
+    await remount('aggregate');
+  </script>
+</body>
+</html>
