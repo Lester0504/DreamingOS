@@ -1,4 +1,4 @@
-const VERSION = '20260725-wifi-environment-02';
+const VERSION = '20260802-sheet-portal-scope-01';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -92,6 +92,17 @@ export function mount(context = {}) {
       if (text) return text;
     }
     return '';
+  }
+
+  // One shared cap for every device/AP label in this route. CSS ellipsis alone
+  // cannot bound a flex row whose text node has no element of its own, and a
+  // per-name special case would drift the moment a longer model ships.
+  const LABEL_MAX_CHARS = 22;
+
+  function clipLabel(value, max = LABEL_MAX_CHARS) {
+    const text = String(value ?? '').trim();
+    if (Array.from(text).length <= max) return text;
+    return `${Array.from(text).slice(0, max - 1).join('').trimEnd()}…`;
   }
 
   function firstNumber(...values) {
@@ -207,11 +218,18 @@ export function mount(context = {}) {
       tx_power: txPower,
       tx_power_mode: firstText(radio.tx_power_mode, radio.power_mode, runtime.tx_power_mode),
       clients: optionalNumber(radio.clients, radio.station_count, runtime.clients, runtime.station_count),
-      utilization: firstNumber(radio.utilization, radio.channel_utilization, radio.airtime, runtime.utilization),
+      // 后端发的是 channel_utilization / channel_utilization_pct（同为 0..100 百分数），
+      // 以及 noise_dbm。此前只读 utilization / noise，两项在真机上恒为空。
+      utilization: optionalNumber(radio.utilization, radio.channel_utilization, radio.channel_utilization_pct, radio.airtime, runtime.utilization, runtime.channel_utilization, runtime.channel_utilization_pct),
+      utilization_reason: firstText(radio.channel_utilization_reason, radio.utilization_reason, runtime.channel_utilization_reason, ''),
+      utilization_source: firstText(radio.channel_utilization_source, runtime.channel_utilization_source, ''),
       interference: firstNumber(radio.interference, radio.external_interference, runtime.interference),
       avg_interference: optionalNumber(radio.avg_interference, radio.average_interference, runtime.avg_interference, runtime.average_interference),
       retry_rate: firstNumber(radio.retry_rate, radio.tx_retry, runtime.retry_rate),
-      noise: firstNumber(radio.noise, radio.noise_floor, runtime.noise, runtime.noise_floor),
+      noise: optionalNumber(radio.noise_dbm, radio.noise, radio.noise_floor, runtime.noise_dbm, runtime.noise, runtime.noise_floor),
+      noise_reason: firstText(radio.noise_reason, runtime.noise_reason, ''),
+      noise_source: firstText(radio.noise_source, runtime.noise_source, ''),
+      tx_power_mode_reason: firstText(radio.tx_power_mode_reason, runtime.tx_power_mode_reason, ''),
       avg_signal: firstText(radio.avg_signal, radio.average_signal, radio.signal, runtime.avg_signal, runtime.average_signal),
       past_24h: firstText(radio.past_24h, radio.last_24h, radio.history_24h, runtime.past_24h, runtime.last_24h),
       mimo: firstText(radio.mimo, radio.spatial_streams, runtime.mimo, ''),
@@ -457,6 +475,15 @@ export function mount(context = {}) {
     if (state.statusView === 'connectivity') render();
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -467,7 +494,7 @@ export function mount(context = {}) {
     const cacheVersion = options.cacheVersion !== false;
     const fetchOptions = { ...options };
     delete fetchOptions.cacheVersion;
-    const response = await fetch(cacheVersion ? `${url}${url.includes('?') ? '&' : '?'}v=${VERSION}` : url, {
+    const response = await sessionFetch(cacheVersion ? `${url}${url.includes('?') ? '&' : '?'}v=${VERSION}` : url, {
       credentials: 'same-origin', cache: 'no-store', ...fetchOptions,
       headers: authHeaders({ ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) })
     });
@@ -732,7 +759,10 @@ export function mount(context = {}) {
   }
 
   function filterCheckbox(group, value, label, checked = false, extra = '', disabled = false) {
-    return `<label class="airview-check ${disabled ? 'is-disabled' : ''}"><input type="checkbox" data-airview-filter="${escapeHtml(group)}" value="${escapeHtml(value)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}><i></i><span>${extra}${escapeHtml(label)}</span></label>`;
+    const text = String(label ?? '');
+    const clipped = clipLabel(text);
+    const title = clipped === text ? '' : ` title="${escapeHtml(text)}"`;
+    return `<label class="airview-check ${disabled ? 'is-disabled' : ''}"${title}><input type="checkbox" data-airview-filter="${escapeHtml(group)}" value="${escapeHtml(value)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}><i></i><span>${extra}<span class="airview-check-label">${escapeHtml(clipped)}</span></span></label>`;
   }
 
   function miniChannelPlan() {
@@ -1228,11 +1258,30 @@ export function mount(context = {}) {
       groups.get(radio.band).push(radio);
     });
     const reason = firstText(state.status.capabilities.reasons?.radio_update, '无线电写入事务与 readback 尚未开放');
-    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-airview-radio-sheet-close aria-label="关闭无线电设置"></button><aside class="dwrt-kit-sheet airview-radio-sheet policy-stable-glass is-open" data-dwrt-sheet-variant="copilot" data-dwrt-sheet-motion="settled" aria-label="无线电设置"><header class="dwrt-kit-sheet-header"><div><strong>无线电设置</strong><span>${radios.length} 个 Radio</span></div><button class="dwrt-kit-sheet-close wifi-icon-button" type="button" data-airview-radio-sheet-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-sheet-body airview-radio-sheet-body">${canRadioWrite() ? '' : `<div class="wifi-inline-warning">${icon('info')}<span>${escapeHtml(reason)}。当前展示真实运行值，修改与保存保持禁用。</span></div>`}${Array.from(groups.entries()).sort((left, right) => ({'2g':0,'5g':1,'6g':2}[left[0]] ?? 9) - ({'2g':0,'5g':1,'6g':2}[right[0]] ?? 9)).map(([band, entries]) => radioBandSheet(band, entries)).join('')}</div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-airview-radio-sheet-close>取消</button><button class="policy-primary" type="button" data-airview-radio-save ${canRadioWrite() && state.radioDirty ? '' : 'disabled'}>应用更改</button></footer></aside>`;
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-airview-radio-sheet-close aria-label="关闭无线电设置"></button><aside class="dwrt-kit-sheet airview-radio-sheet policy-stable-glass is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" data-dwrt-sheet-motion="settled" aria-label="无线电设置"><header class="dwrt-kit-sheet-header"><div><strong>无线电设置</strong><span>${radios.length} 个 Radio</span></div><button class="dwrt-kit-sheet-close wifi-icon-button" type="button" data-airview-radio-sheet-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-sheet-body airview-radio-sheet-body">${canRadioWrite() ? '' : `<div class="wifi-inline-warning">${icon('info')}<span>${escapeHtml(reason)}。当前展示真实运行值，修改与保存保持禁用。</span></div>`}${Array.from(groups.entries()).sort((left, right) => ({'2g':0,'5g':1,'6g':2}[left[0]] ?? 9) - ({'2g':0,'5g':1,'6g':2}[right[0]] ?? 9)).map(([band, entries]) => radioBandSheet(band, entries)).join('')}</div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-airview-radio-sheet-close>取消</button><button class="policy-primary" type="button" data-airview-radio-save ${canRadioWrite() && state.radioDirty ? '' : 'disabled'}>应用更改</button></footer></aside>`;
   }
 
-  function apSheetMetric(label, value) {
-    return `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(firstText(value, '--'))}</strong></div>`;
+  function apSheetMetric(label, value, note = '') {
+    return `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(firstText(value, '--'))}</strong>${note ? `<small class="airview-kpi-note">${escapeHtml(note)}</small>` : ''}</div>`;
+  }
+
+  /* 驱动没暴露某项时后端会原样透出自己的 reason。这些是正常状态，不是错误，
+     所以只在数值缺失时以浅色附注呈现，不走警示样式。 */
+  const RADIO_METRIC_REASONS = {
+    iw_survey_unsupported: '驱动不支持信道调查',
+    iw_survey_failed_or_unsupported: '驱动未响应信道调查',
+    iw_survey_current_frequency_unavailable: '驱动未上报当前频点',
+    iw_survey_unavailable: '本次未取得信道调查',
+    channel_survey_not_reported: 'AP 未上报信道调查',
+    channel_utilization_not_sampled: '未采样信道利用率',
+    noise_floor_not_reported_by_driver: '驱动未上报噪声底',
+    tx_power_mode_not_exposed_by_driver_or_uci: '驱动与配置均未提供功率模式'
+  };
+
+  function radioMetricNote(reason) {
+    const key = String(reason || '').trim();
+    if (!key) return '';
+    return RADIO_METRIC_REASONS[key] || key;
   }
 
   function apRadioStandard(radio) {
@@ -1253,7 +1302,7 @@ export function mount(context = {}) {
   }
 
   function apInsights(ap, radios) {
-    return `<div class="airview-ap-sheet-stack">${radios.map((radio) => `<section class="airview-ap-insight-card"><header><div>${deviceImage(ap, 'airview-metric-device-image')}<span><strong>${escapeHtml(bandLabel(radio.band))}</strong><small>信道 ${radio.channel || '--'} · ${radio.width ? `${radio.width} MHz` : '--'}</small></span></div><b>${radio.clients === null ? '--' : radio.clients} 客户端</b></header><h4>关键指标</h4><div class="airview-ap-kpis">${apSheetMetric('发射功率', radio.tx_power ? `${radio.tx_power} dBm` : '--')}${apSheetMetric('平均信号', radio.avg_signal)}${apSheetMetric('利用率', radio.utilization ? `${radio.utilization}%` : '--')}${apSheetMetric('重试率', radio.retry_rate ? `${radio.retry_rate}%` : '--')}</div><h4>历史</h4>${radioHistory(radio)}<h4>活动客户端 RSSI 分布</h4>${signalDistribution(radio)}<h4>统计</h4><div class="airview-ap-kpis">${apSheetMetric('噪声', radio.noise ? `${radio.noise} dBm` : '--')}${apSheetMetric('平均干扰', radio.avg_interference === null ? '--' : `${radio.avg_interference}%`)}${apSheetMetric('Wi-Fi 标准', apRadioStandard(radio))}${apSheetMetric('MIMO', radio.mimo)}</div></section>`).join('')}</div>`;
+    return `<div class="airview-ap-sheet-stack">${radios.map((radio) => `<section class="airview-ap-insight-card"><header><div>${deviceImage(ap, 'airview-metric-device-image')}<span><strong>${escapeHtml(bandLabel(radio.band))}</strong><small>信道 ${radio.channel || '--'} · ${radio.width ? `${radio.width} MHz` : '--'}</small></span></div><b>${radio.clients === null ? '--' : radio.clients} 客户端</b></header><h4>关键指标</h4><div class="airview-ap-kpis">${apSheetMetric('发射功率', radio.tx_power ? `${radio.tx_power} dBm` : '--')}${apSheetMetric('平均信号', radio.avg_signal)}${apSheetMetric('利用率', radio.utilization === null ? '--' : `${radio.utilization}%`, radio.utilization === null ? radioMetricNote(radio.utilization_reason) : '')}${apSheetMetric('重试率', radio.retry_rate ? `${radio.retry_rate}%` : '--')}</div><h4>历史</h4>${radioHistory(radio)}<h4>活动客户端 RSSI 分布</h4>${signalDistribution(radio)}<h4>统计</h4><div class="airview-ap-kpis">${apSheetMetric('噪声', radio.noise === null ? '--' : `${radio.noise} dBm`, radio.noise === null ? radioMetricNote(radio.noise_reason) : '')}${apSheetMetric('平均干扰', radio.avg_interference === null ? '--' : `${radio.avg_interference}%`)}${apSheetMetric('Wi-Fi 标准', apRadioStandard(radio))}${apSheetMetric('MIMO', radio.mimo)}</div></section>`).join('')}</div>`;
   }
 
   function apSettings(ap, radios) {
@@ -1281,7 +1330,7 @@ export function mount(context = {}) {
       return `<div class="airview-empty"><span>${icon('radio')}</span><strong>${noHardware ? '未检测到无线 Radio' : '未找到匹配项'}</strong><small>${noHardware ? `后端运行态：${reason}。页面不会生成模拟 AP、客户端或频谱数据。` : '调整左侧显示选项，或清除筛选条件查看全部 AP。'}</small>${noHardware ? '' : '<button type="button" class="wifi-link-button" data-airview-clear>重置筛选</button>'}</div>`;
     }
     const selectedVisible = radios.filter((radio) => state.selectedRadios.has(radio.id));
-    return `<div class="airview-radio-table policy-stable-glass" data-dwrt-component="data-table"><div class="wifi-table-scroll"><table><thead><tr><th class="airview-select-column"><input type="checkbox" data-airview-radio-select-all ${selectedVisible.length === radios.length ? 'checked' : ''} aria-label="选择全部射频"></th><th>名称</th><th>频段</th><th>信道</th><th>信道宽度</th><th>Tx 功率</th><th>客户端</th><th>平均信号</th><th>过去 24 小时</th><th>平均干扰</th></tr></thead><tbody>${radios.map((radio) => `<tr data-airview-radio-row="${escapeHtml(radio.id)}" class="${state.selectedRadios.has(radio.id) ? 'is-selected' : ''}" tabindex="0"><td class="airview-select-column"><input type="checkbox" data-airview-radio-select="${escapeHtml(radio.id)}" ${state.selectedRadios.has(radio.id) ? 'checked' : ''} aria-label="选择 ${escapeHtml(radio.ap)} ${escapeHtml(bandLabel(radio.band))}"></td><td><span class="airview-ap-cell">${deviceImage(radio)}<span><strong>${escapeHtml(radio.ap)}</strong>${radio.model && radio.model !== radio.ap ? `<small>${escapeHtml(radio.model)}</small>` : ''}</span></span></td><td>${escapeHtml(bandLabel(radio.band))}</td><td>${radio.channel || '--'}</td><td>${radio.width || '--'}</td><td>${radio.tx_power_mode ? escapeHtml(radio.tx_power_mode) : radio.tx_power ? `${radio.tx_power} dBm` : '--'}</td><td>${radio.clients === null ? '--' : radio.clients}</td><td>${radio.avg_signal || '--'}</td><td>${radio.past_24h || '--'}</td><td>${radio.avg_interference === null ? '--' : `${radio.avg_interference}%`}</td></tr>`).join('')}</tbody></table></div></div>`;
+    return `<div class="airview-radio-table policy-stable-glass" data-dwrt-component="data-table"><div class="wifi-table-scroll"><table><thead><tr><th class="airview-select-column"><input type="checkbox" data-airview-radio-select-all ${selectedVisible.length === radios.length ? 'checked' : ''} aria-label="选择全部射频"></th><th>名称</th><th>频段</th><th>信道</th><th>信道宽度</th><th>Tx 功率</th><th>客户端</th><th>平均信号</th><th>过去 24 小时</th><th>平均干扰</th></tr></thead><tbody>${radios.map((radio) => `<tr data-airview-radio-row="${escapeHtml(radio.id)}" class="${state.selectedRadios.has(radio.id) ? 'is-selected' : ''}" tabindex="0"><td class="airview-select-column"><input type="checkbox" data-airview-radio-select="${escapeHtml(radio.id)}" ${state.selectedRadios.has(radio.id) ? 'checked' : ''} aria-label="选择 ${escapeHtml(radio.ap)} ${escapeHtml(bandLabel(radio.band))}"></td><td><span class="airview-ap-cell">${deviceImage(radio)}<span><strong${radio.ap !== clipLabel(radio.ap) ? ` title="${escapeHtml(radio.ap)}"` : ''}>${escapeHtml(clipLabel(radio.ap))}</strong>${radio.model && radio.model !== radio.ap ? `<small${radio.model !== clipLabel(radio.model) ? ` title="${escapeHtml(radio.model)}"` : ''}>${escapeHtml(clipLabel(radio.model))}</small>` : ''}</span></span></td><td>${escapeHtml(bandLabel(radio.band))}</td><td>${radio.channel || '--'}</td><td>${radio.width || '--'}</td><td>${radio.tx_power_mode ? escapeHtml(radio.tx_power_mode) : radio.tx_power ? `${radio.tx_power} dBm` : '--'}</td><td>${radio.clients === null ? '--' : radio.clients}</td><td>${radio.avg_signal || '--'}</td><td>${radio.past_24h || '--'}</td><td>${radio.avg_interference === null ? '--' : `${radio.avg_interference}%`}</td></tr>`).join('')}</tbody></table></div></div>`;
   }
 
   function statusPage() {
@@ -1296,13 +1345,69 @@ export function mount(context = {}) {
     else window.DWRT_UI_KIT?.mountAll?.(root);
   }
 
+  // Scroll containers are keyed by their DOM path inside the results region so
+  // the offsets survive an innerHTML swap that replaces every node identity.
+  function scrollAnchorKey(node, boundary) {
+    if (!node || node === boundary || !boundary.contains(node)) return '';
+    const parts = [];
+    let current = node;
+    while (current && current !== boundary) {
+      const parent = current.parentElement;
+      if (!parent) return '';
+      parts.push(String(Array.prototype.indexOf.call(parent.children, current)));
+      current = parent;
+    }
+    return parts.reverse().join('.');
+  }
+
+  function nodeFromAnchorKey(key, boundary) {
+    if (!key) return null;
+    let current = boundary;
+    for (const part of key.split('.')) {
+      const index = Number(part);
+      if (!current || !Number.isFinite(index)) return null;
+      current = current.children[index];
+    }
+    return current || null;
+  }
+
+  function captureScrollOffsets(boundary) {
+    const offsets = [];
+    boundary.querySelectorAll('.wifi-table-scroll, [data-airview-scroll]').forEach((node) => {
+      if (!node.scrollLeft && !node.scrollTop) return;
+      const key = scrollAnchorKey(node, boundary);
+      if (key) offsets.push({ key, left: node.scrollLeft, top: node.scrollTop });
+    });
+    if (boundary.scrollLeft || boundary.scrollTop) offsets.push({ key: '', left: boundary.scrollLeft, top: boundary.scrollTop });
+    return offsets;
+  }
+
+  function restoreScrollOffsets(boundary, offsets) {
+    offsets.forEach(({ key, left, top }) => {
+      const node = key ? nodeFromAnchorKey(key, boundary) : boundary;
+      if (!node) return;
+      if (left) node.scrollLeft = left;
+      if (top) node.scrollTop = top;
+    });
+  }
+
   function patchLiveRegion() {
     if (!root || !state.mounted) return;
     if (isStatus) {
       const results = root.querySelector('[data-airview-results]');
-      if (results && root.querySelector(`[data-airview-view="${state.statusView}"][aria-selected="true"]`)) results.innerHTML = radioResults(); else render();
-      const refresh = root.querySelector('[data-wifi-refresh]');
-      if (refresh) refresh.disabled = state.refreshing;
+      if (results && root.querySelector(`[data-airview-view="${state.statusView}"][aria-selected="true"]`)) {
+        // The 5s live refresh rebuilds this subtree, which resets every scroll
+        // offset inside it. Carry the offsets across the swap so a horizontal
+        // scroll in the AP or radio table is not yanked back on the next tick.
+        const offsets = captureScrollOffsets(results);
+        const activeKey = scrollAnchorKey(document.activeElement, results);
+        results.innerHTML = radioResults();
+        restoreScrollOffsets(results, offsets);
+        if (activeKey) {
+          const next = nodeFromAnchorKey(activeKey, results);
+          if (next && typeof next.focus === 'function') next.focus({ preventScroll: true });
+        }
+      } else render();
       return;
     }
     const body = root.querySelector('[data-wifi-table-body]');
@@ -1489,7 +1594,6 @@ export function mount(context = {}) {
       render();
       return;
     }
-    if (target.matches('[data-wifi-refresh]')) { load(true); return; }
     if (target.matches('[data-wifi-create]')) { openSsid(); return; }
     if (target.matches('[data-wifi-edit]')) { openSsid(target.dataset.wifiEdit); return; }
     if (target.matches('[data-wifi-speed-create]')) { openSpeed(); return; }
@@ -1749,7 +1853,11 @@ export function mount(context = {}) {
   stage?.classList.add('is-wifi-management');
   render();
   load();
-  if (isStatus) state.refreshTimer = window.setInterval(() => { if (!document.hidden && !state.refreshing && !state.scanning) load(true); }, 5000);
+  state.refreshTimer = window.setInterval(() => {
+    if (!state.mounted || document.hidden || state.refreshing || state.scanning) return;
+    if (state.dirty || state.radioDirty || state.saving || state.sheet) return;
+    load(true);
+  }, isStatus ? 5000 : 20000);
 
   return {
     refresh() { return load(true); },

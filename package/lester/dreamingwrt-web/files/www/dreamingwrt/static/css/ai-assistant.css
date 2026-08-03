@@ -2,7 +2,7 @@
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
   height: auto;
-  min-height: 100dvh;
+  min-height: var(--app-stage-height);
   padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
   overflow: visible;
 }
@@ -472,46 +472,94 @@
   gap: 18px;
 }
 
-.ai-settings-facts {
-  margin: 0;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 1px;
-  border: 1px solid var(--color-border-subtle);
+/* 总开关主控卡。和其他页面的开关卡片同一族：一行标题 + 说明 + 右侧开关，
+   不叠在配置主体里，所以「启用/停用」这个决定在视觉上先于所有字段。 */
+.ai-master-card {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 16px clamp(16px, 1.6vw, 22px);
   border-radius: var(--app-radius-card, 8px);
-  overflow: hidden;
 }
 
-.ai-settings-facts > div {
+.ai-master-copy { min-width: 0; display: grid; gap: 4px; }
+.ai-master-copy strong { min-width: 0; display: flex; align-items: center; gap: 10px; color: var(--ai-ink); font-size: 15px; font-weight: 820; }
+.ai-master-copy small { color: var(--ai-muted); font-size: 11px; line-height: 1.5; font-weight: 650; }
+
+.ai-master-badge {
+  flex: 0 0 auto;
+  min-height: 20px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0 9px;
+  color: var(--ai-muted);
+  background: color-mix(in srgb, var(--ai-ink) 8%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ai-ink) 16%, transparent);
+  font-size: 10px;
+  font-weight: 760;
+}
+
+.ai-master-badge.is-ok { color: var(--app-success, rgb(50, 201, 111)); background: color-mix(in srgb, var(--app-success, rgb(50,201,111)) 12%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-success, rgb(50,201,111)) 28%, transparent); }
+.ai-master-badge.is-warn { color: var(--app-warning, rgb(255, 196, 64)); background: color-mix(in srgb, var(--app-warning, rgb(255,196,64)) 12%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-warning, rgb(255,196,64)) 28%, transparent); }
+
+/* 概览页主体：三条运行态，不重复上面四张卡已给的值。 */
+.ai-overview-rows {
   min-width: 0;
-  padding: 13px 15px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+}
+
+.ai-overview-rows > article {
+  min-width: 0;
   display: grid;
   gap: 4px;
-  outline: 1px solid var(--color-border-subtle);
+  padding: 13px 15px;
+  border-radius: var(--app-radius-control, 10px);
+  background: color-mix(in srgb, var(--ai-ink) 4%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ai-ink) 11%, transparent);
 }
 
-.ai-settings-facts dt {
-  color: var(--color-text-muted, var(--app-text-muted));
-  font-size: 11px;
-  font-weight: 650;
-}
+.ai-overview-rows span { color: var(--ai-muted); font-size: 10px; font-weight: 720; }
+.ai-overview-rows strong { min-width: 0; overflow: hidden; color: var(--ai-ink); font-size: 15px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+.ai-overview-rows small { color: var(--ai-muted); font-size: 10px; line-height: 1.45; font-weight: 640; }
 
-.ai-settings-facts dd {
+/* 高级设置的三个舱位。每个舱位是主卡片内部的一个下沉分区，
+   不是独立卡片，避免卡里套卡。 */
+.ai-settings-chamber {
   min-width: 0;
-  margin: 0;
-  overflow: hidden;
-  font-size: 13px;
-  font-weight: 700;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: grid;
+  gap: 13px;
+  padding: 16px 17px;
+  border-radius: var(--app-radius-control, 10px);
+  background: color-mix(in srgb, var(--ai-ink) 3.5%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ai-ink) 10%, transparent);
 }
 
-.ai-settings-hint {
-  margin: 0;
-  color: var(--color-text-muted, var(--app-text-muted));
-  font-size: 12px;
-  line-height: 1.5;
+.ai-settings-chamber + .ai-settings-chamber { margin-top: 14px; }
+.ai-settings-chamber > h3 { margin: 0; color: var(--ai-ink); font-size: 13px; font-weight: 820; }
+.ai-chamber-body { min-width: 0; display: grid; gap: 14px; }
+.ai-chamber-grid { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 14px 18px; }
+
+.ai-field-tag {
+  margin-left: 7px;
+  border-radius: 6px;
+  padding: 1px 6px;
+  color: var(--ai-muted);
+  background: color-mix(in srgb, var(--ai-ink) 8%, transparent);
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 720;
 }
+
+@media (max-width: 760px) {
+  .ai-master-card { align-items: flex-start; flex-direction: column; gap: 14px; }
+  .ai-chamber-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
 
 .ai-assistant-shell {
   width: min(100%, 1500px);
@@ -1370,19 +1418,6 @@
   padding: clamp(20px, 2vw, 30px);
 }
 
-.ai-settings-heading {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 20px;
-  padding-bottom: 18px;
-}
-
-.ai-settings-heading > div,
-.ai-section-title { display: grid; gap: 3px; min-width: 0; }
-.ai-settings-heading strong { color: var(--ai-ink); font-size: 17px; font-weight: 820; }
-.ai-settings-heading span { color: var(--ai-muted); font-size: 11px; font-weight: 680; }
 
 .ai-switch {
   position: relative;
@@ -1407,9 +1442,6 @@
 
 .ai-settings-section + .ai-settings-section { padding-top: 24px; }
 
-.ai-section-title { grid-template-columns: auto 1fr; align-items: baseline; gap: 9px; }
-.ai-section-title strong { color: var(--ai-text); font-size: 13px; font-weight: 820; }
-.ai-section-title span { color: var(--ai-muted); font-size: 10px; font-weight: 720; text-transform: uppercase; }
 
 .ai-provider-grid {
   min-width: 0;

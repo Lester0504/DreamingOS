@@ -4,7 +4,7 @@
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
   width: 100%;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block) var(--app-page-gutter-inline);
   overflow: hidden;
@@ -312,7 +312,7 @@
 
 .file-service-drawer {
   --dwrt-kit-sheet-z: 76;
-  --dwrt-kit-sheet-width: min(92vw, 660px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form);
 }
 
 .file-service-drawer.dwrt-kit-sheet {

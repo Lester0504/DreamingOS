@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260716-20';
+  const VERSION = '20260802-ui-batch-01';
   const MODULE_CLASS = 'storage-raid-route-host';
   const stage = root?.closest('.console-stage');
   const ENDPOINT = '/api/v1/storage/raid';
@@ -21,6 +21,7 @@ export function mount(context = {}) {
   const state = {
     mounted: true,
     seq: 0,
+    pollTimer: 0,
     loading: true,
     refreshing: false,
     saving: false,
@@ -83,6 +84,15 @@ export function mount(context = {}) {
     try { return structuredClone(value); } catch (_) { return JSON.parse(JSON.stringify(value || {})); }
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -95,7 +105,7 @@ export function mount(context = {}) {
   }
 
   async function requestJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
       credentials: 'same-origin', cache: 'no-store', ...options,
       headers: authHeaders({ ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) })
     });
@@ -288,7 +298,7 @@ export function mount(context = {}) {
   }
 
   function toolbarMarkup() {
-    return `<header class="policy-toolbar raid-toolbar"><label class="policy-search policy-search-main raid-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-raid-search value="${escapeHtml(state.query)}" placeholder="搜索名称、设备、成员或挂载点"></label><div class="policy-toolbar-actions"><button class="policy-filter-button" type="button" data-raid-scan>${icon('scan')}<span>扫描恢复 RAID</span></button><button class="policy-filter-button" type="button" data-raid-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '正在刷新' : '刷新'}</span></button><button class="policy-create-button" type="button" data-raid-create>${icon('plus')}<span>创建 RAID</span></button></div></header>`;
+    return `<header class="policy-toolbar raid-toolbar"><label class="policy-search policy-search-main raid-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-raid-search value="${escapeHtml(state.query)}" placeholder="搜索名称、设备、成员或挂载点"></label><div class="policy-toolbar-actions"><button class="policy-filter-button" type="button" data-raid-scan>${icon('scan')}<span>扫描恢复 RAID</span></button><button class="policy-create-button" type="button" data-raid-create>${icon('plus')}<span>创建 RAID</span></button></div></header>`;
   }
 
   function emptyText() {
@@ -578,7 +588,6 @@ export function mount(context = {}) {
 
   function onClick(event) {
     if (event.target.closest('[data-raid-close]')) { closeDrawer(); return; }
-    if (event.target.closest('[data-raid-refresh]')) { load(true); return; }
     if (event.target.closest('[data-raid-create]')) { openCreate(); return; }
     if (event.target.closest('[data-raid-scan]')) { openRecovery(); return; }
     if (event.target.closest('[data-raid-save]')) { createRaid(); return; }
@@ -632,11 +641,23 @@ export function mount(context = {}) {
   render();
   load();
 
+  /*
+   * 手动刷新按钮按用户第 9 条删除，补一条可见性受控的轮询代替；
+   * 抽屉打开、正在保存或有未提交草稿时跳过，避免刷掉用户填的内容。
+   */
+  state.pollTimer = window.setInterval(() => {
+    if (!state.mounted || document.hidden) return;
+    if (state.loading || state.refreshing || state.saving) return;
+    if (state.drawer) return;
+    load(true);
+  }, 15000);
+
   return {
     refresh() { return load(true); },
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      window.clearInterval(state.pollTimer);
       root?.removeEventListener('click', onClick);
       root?.removeEventListener('input', onInput);
       root?.removeEventListener('change', onChange);

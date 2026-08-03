@@ -1,4 +1,4 @@
-const VERSION = '20260801-upnp-overview-cards-02';
+const VERSION = '20260802-ui-batch-01';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -41,8 +41,30 @@ export function mount(context = {}) {
     dirty: false,
     drawer: '',
     editor: {},
-    confirmDelete: false
+    confirmDelete: false,
+    pollTimer: 0
   };
+
+  /*
+   * 手动刷新按钮按用户第 9 条删除。映射表与 ACL 都是运行态数据，
+   * 所以补一条可见性受控的轮询；有未保存草稿、抽屉或删除确认时跳过。
+   */
+  function startPolling() {
+    stopPolling();
+    state.pollTimer = window.setInterval(() => {
+      if (!state.mounted) return;
+      if (document.hidden) return;
+      if (state.loading || state.refreshing || state.saving) return;
+      if (state.dirty || state.drawer || state.confirmDelete) return;
+      load(true);
+    }, 15000);
+  }
+
+  function stopPolling() {
+    if (!state.pollTimer) return;
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = 0;
+  }
 
   function defaultData() {
     return {
@@ -123,6 +145,15 @@ export function mount(context = {}) {
     return [];
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -135,7 +166,7 @@ export function mount(context = {}) {
   }
 
   async function requestJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
       credentials: 'same-origin',
       cache: 'no-store',
       signal: context.signal,
@@ -216,7 +247,6 @@ export function mount(context = {}) {
     state.mappingsError = '';
     if (background) state.refreshing = true;
     else state.loading = true;
-    patchRefreshButton();
     if (!background) render();
     try {
       const [serviceResult, mappingsResult] = await Promise.allSettled([
@@ -337,7 +367,7 @@ export function mount(context = {}) {
     const listTab = state.tab !== 'settings';
     const createLabel = state.tab === 'acl' ? '添加规则' : state.tab === 'static' ? '添加映射' : '';
     const placeholder = state.tab === 'acl' ? '搜索动作、端口、网段或备注' : state.tab === 'dynamic' ? '搜索协议、终端、地址或描述' : '搜索协议、地址、客户端或描述';
-    return `<header class="upnp-page-toolbar"><div class="upnp-page-toolbar-main">${tabsMarkup()}</div><div class="upnp-page-actions">${listTab ? searchMarkup(placeholder) : ''}<button class="dwrt-kit-button upnp-icon-action" data-dwrt-component="button" data-variant="ghost" type="button" data-upnp-refresh aria-label="刷新 UPnP 数据" title="刷新">${icon('refresh')}<span>${state.refreshing ? '正在刷新' : '刷新'}</span></button>${createLabel ? `<button class="dwrt-kit-button upnp-primary-action" data-dwrt-component="button" data-variant="primary" type="button" data-upnp-create ${canCreateCurrent() ? '' : 'disabled'}>${icon('plus')}<span>${createLabel}</span></button>` : ''}</div></header>`;
+    return `<header class="upnp-page-toolbar"><div class="upnp-page-toolbar-main">${tabsMarkup()}</div><div class="upnp-page-actions">${listTab ? searchMarkup(placeholder) : ''}${createLabel ? `<button class="dwrt-kit-button upnp-primary-action" data-dwrt-component="button" data-variant="primary" type="button" data-upnp-create ${canCreateCurrent() ? '' : 'disabled'}>${icon('plus')}<span>${createLabel}</span></button>` : ''}</div></header>`;
   }
 
   function noticeMarkup() {
@@ -565,14 +595,6 @@ export function mount(context = {}) {
     else if (markup) root?.querySelector('.upnp-service-workbench')?.insertAdjacentHTML('beforeend', markup);
   }
 
-  function patchRefreshButton() {
-    const button = root?.querySelector('[data-upnp-refresh]');
-    if (!button) return;
-    button.disabled = state.refreshing;
-    const label = button.querySelector('span');
-    if (label) label.textContent = state.refreshing ? '正在刷新' : '刷新';
-  }
-
   function patchTable() {
     const oldCard = root?.querySelector('.upnp-table-card');
     if (!oldCard) return;
@@ -786,7 +808,6 @@ export function mount(context = {}) {
       });
       return;
     }
-    if (event.target.closest('[data-upnp-refresh]')) { load(true); return; }
     if (event.target.closest('[data-dwrt-confirm-cancel], [data-dwrt-modal-close]')) { state.confirmDelete = false; render(); return; }
     if (event.target.closest('[data-dwrt-confirm-accept]')) {
       const target = state.confirmDelete;
@@ -867,12 +888,14 @@ export function mount(context = {}) {
   stage?.classList.add('is-upnp-service');
   render();
   load();
+  startPolling();
 
   return {
     refresh() { return load(true); },
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      stopPolling();
       root?.removeEventListener('click', onClick);
       root?.removeEventListener('input', onInput);
       root?.removeEventListener('change', onChange);

@@ -41,11 +41,15 @@ def test_each_tab_renders_only_its_own_section() -> None:
 
 
 def test_overview_uses_shared_kit_cards_and_no_secrets() -> None:
+    # 四张概览卡按用户第 17 条提到主卡片之外，所以卡片渲染在 settingsOverviewCards()，
+    # settingsOverviewSection() 只留 provider 侧的额外运行态行。
+    cards = MODULE[MODULE.index("function settingsOverviewCards"):MODULE.index("function settingsOverviewSection")]
+    assert "overviewCardsMarkup" in cards
+    assert "dwrt-kit-overview-grid" in cards
     overview = MODULE[MODULE.index("function settingsOverviewSection"):MODULE.index("function toolPolicyLabel")]
-    assert "overviewCardsMarkup" in overview
-    assert "dwrt-kit-overview-grid" in overview
     assert "api_key_input" not in overview
     assert "api_key_hint" not in overview
+    assert "settingsOverviewCards()" in MODULE[MODULE.index("function settingsView"):MODULE.index("function settingsMasterCard")]
 
 
 def test_save_bar_stays_available_on_every_tab() -> None:
@@ -56,8 +60,12 @@ def test_save_bar_stays_available_on_every_tab() -> None:
 
 
 def test_style_supports_tab_header_and_overview() -> None:
-    for selector in (".ai-settings-route-header", ".ai-settings-tabs", ".ai-settings-facts", ".ai-settings-hint"):
+    # 用户第 17/18 条要求删掉重复说明与区块标题，所以 facts / hint / heading 三类样式已移除，
+    # 概览改为主卡片外的 Kit 卡片带，高级设置切成三个 chamber。
+    for selector in (".ai-settings-route-header", ".ai-settings-tabs", ".ai-settings-overview", ".ai-settings-chamber"):
         assert selector in STYLE
+    for removed in (".ai-settings-facts", ".ai-settings-hint", ".ai-settings-heading", ".ai-section-title"):
+        assert removed not in STYLE
     assert "grid-template-rows: auto auto;" in STYLE
 
 
@@ -100,8 +108,8 @@ def test_cache_version_reflects_the_tab_refactor() -> None:
     assert len(found) == 1
     item = found[0]
     assert item["module"] == "native/ai-assistant.js"
-    assert item["module_version"] == "20260801-llm-settings-tabs-01"
-    assert item["style_version"] == "20260801-llm-settings-tabs-01"
+    assert item["module_version"] == "20260802-ui-batch-01"
+    assert item["style_version"] == "20260802-ui-batch-01"
     shell = (WWW / "static/js/menu-shell.js").read_text()
     assert "/plugins/native/ai-assistant.js" not in shell.split("shellVersioned")[1][:600]
 

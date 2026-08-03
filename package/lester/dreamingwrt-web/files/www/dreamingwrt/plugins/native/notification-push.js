@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
-  const VERSION = '20260722-overlay-01';
+  const VERSION = '20260802-ui-batch-01';
   const MODULE_CLASS = 'notification-push-route-host';
   const ENDPOINTS = {
     status: '/api/v1/notifyd/status',
@@ -160,6 +160,15 @@ export function mount(context = {}) {
     return current || {};
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -167,7 +176,7 @@ export function mount(context = {}) {
   }
 
   async function requestJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
       credentials: 'same-origin',
       cache: 'no-store',
       ...options,
@@ -331,7 +340,9 @@ export function mount(context = {}) {
       channels: '<path d="M4 7a3 3 0 1 1 3 3H4V7Z"></path><path d="M20 17a3 3 0 1 0-3-3h3v3Z"></path><path d="M7 7h10v7"></path>',
       delivered: '<path d="M4 12.5 9 17l11-12"></path>',
       failed: '<path d="M12 9v4"></path><path d="M12 17h.01"></path><path d="M10.3 3.7 2.5 17.2A2 2 0 0 0 4.2 20h15.6a2 2 0 0 0 1.7-2.8L13.7 3.7a2 2 0 0 0-3.4 0Z"></path>',
-      mail: '<rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m3 7 9 6 9-6"></path>'
+      mail: '<rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m3 7 9 6 9-6"></path>',
+      /* 兜底图形，此前 paths.bell 未定义，任何未知名称都会把字符串 undefined 画进 svg。 */
+      bell: '<path d="M18 9a6 6 0 1 0-12 0c0 5-2 6-2 6h16s-2-1-2-6"></path><path d="M10.3 20a2 2 0 0 0 3.4 0"></path>'
     };
     return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.bell}</svg>`;
   }
@@ -408,27 +419,48 @@ export function mount(context = {}) {
     return types.includes('email');
   }
 
-  function renderToolbar() {
-    if (state.tab === 'overview' || state.tab === 'settings') {
-      return `<div class="policy-toolbar notification-push-toolbar is-compact"><div class="policy-toolbar-actions notification-push-actions"><button class="policy-filter-button" type="button" data-notify-refresh>${icon('refresh')}<span>刷新</span></button></div></div>`;
-    }
+  /*
+   * 表格控件全部收进 dwrt-kit-table-toolbar（用户第 9 条）：页头不再摆散落的搜索框与
+   * 按钮，手动刷新按钮删除，数据由 10 秒轮询（见 mount 里的 state.timer）维持。
+   */
+  function tableToolbarActions() {
     const createLabel = state.tab === 'channels' ? '新建通道' : state.tab === 'routes' ? '新建规则' : '';
-    return `<div class="policy-toolbar notification-push-toolbar"><label class="policy-search policy-search-main" data-dwrt-component="expand-search">${icon('search')}<input type="search" data-notify-search placeholder="搜索当前视图" value="${escapeHtml(state.query)}"></label><div class="policy-toolbar-actions notification-push-actions">${state.tab === 'outbox' ? `<label class="notification-push-filter"><span>状态</span><select data-notify-state><option value="all">全部</option>${['pending','retry','failed','delivered'].map((value) => `<option value="${value}" ${state.outboxState === value ? 'selected' : ''}>${stateLabel(value)}</option>`).join('')}</select></label>` : ''}<button class="policy-filter-button" type="button" data-notify-refresh>${icon('refresh')}<span>刷新</span></button>${createLabel ? `<button class="policy-create-button" type="button" data-notify-create="${escapeHtml(state.tab)}">${icon('plus')}<span>${createLabel}</span></button>` : ''}</div></div>`;
+    const stateFilter = state.tab === 'outbox'
+      ? `<label class="notification-push-filter" data-dwrt-component="field"><select class="dwrt-kit-select" data-dwrt-component="select" data-notify-state aria-label="筛选投递状态"><option value="all">全部状态</option>${['pending','retry','failed','delivered'].map((value) => `<option value="${value}" ${state.outboxState === value ? 'selected' : ''}>${stateLabel(value)}</option>`).join('')}</select></label>`
+      : '';
+    return `<div class="notification-toolbar-actions">${stateFilter}<label class="dwrt-kit-expand-search notification-push-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-notify-search placeholder="搜索当前视图" value="${escapeHtml(state.query)}" aria-label="搜索当前视图"></label>${createLabel ? `<button class="dwrt-kit-button is-primary notification-create-button" type="button" data-notify-create="${escapeHtml(state.tab)}">${icon('plus')}<span>${escapeHtml(createLabel)}</span></button>` : ''}</div>`;
+  }
+
+  function tableCountText(count) {
+    const unit = state.tab === 'channels' ? '个通道' : state.tab === 'routes' ? '条规则' : '条记录';
+    return `${count} ${unit}`;
+  }
+
+  function channelRowsMarkup(rows) {
+    return `${rows.length ? rows.map((item) => `<tr><td><button class="notification-name-button" type="button" data-notify-edit-channel="${escapeHtml(item.id)}"><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></button></td><td>${escapeHtml(channelTypeLabel(item.type))}</td><td>${ui.statusBadgeMarkup?.(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'error') || ''}</td><td><span class="notification-target">${escapeHtml(channelTarget(item))}</span></td><td><time>${escapeHtml(formatTime(item.updatedAt))}</time></td><td><div class="notification-row-actions"><button type="button" data-notify-test="${escapeHtml(item.id)}" aria-label="测试发送">${icon('send')}</button><button type="button" data-notify-edit-channel="${escapeHtml(item.id)}" aria-label="编辑">${icon('edit')}</button></div></td></tr>`).join('') : '<tr><td colspan="6" class="dwrt-kit-table-empty">暂无推送通道</td></tr>'}`;
+  }
+
+  function routeRowsMarkup(rows) {
+    return `${rows.length ? rows.map((item) => `<tr><td><button class="notification-name-button" type="button" data-notify-edit-route="${escapeHtml(item.id)}"><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></button></td><td>${ui.statusBadgeMarkup?.(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'error') || ''}</td><td>${escapeHtml(channelLabel(item.channelId))}</td><td><span class="notification-severity is-${escapeHtml(item.minSeverity)}">${escapeHtml(severityLabel(item.minSeverity))}</span></td><td>${escapeHtml(categoryLabel(item.category))}</td><td>${escapeHtml(eventLabel(item.event))}</td><td>${escapeHtml(item.source || '全部来源')}</td><td><div class="notification-row-actions"><button type="button" data-notify-edit-route="${escapeHtml(item.id)}" aria-label="编辑">${icon('edit')}</button></div></td></tr>`).join('') : '<tr><td colspan="8" class="dwrt-kit-table-empty">暂无路由规则</td></tr>'}`;
+  }
+
+  function outboxRowsMarkup(rows) {
+    return `${rows.length ? rows.map((item) => { const tone = item.state === 'delivered' ? 'success' : item.state === 'failed' ? 'error' : item.state === 'retry' ? 'warning' : 'info'; return `<tr><td><time>${escapeHtml(formatTime(item.createdAt))}</time></td><td><span class="notification-outbox-title"><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml([item.severity, item.category, item.event].filter(Boolean).join(' · '))}</small></span></td><td>${ui.statusBadgeMarkup?.(stateLabel(item.state), tone) || ''}</td><td>${escapeHtml([item.channelId, item.routeId].filter(Boolean).join(' · ') || '--')}</td><td>${item.attempts} / ${item.maxAttempts || '--'}${item.count > 1 ? ` · ×${item.count}` : ''}</td><td>${item.httpStatus || '--'}</td><td><span class="notification-target">${escapeHtml(item.lastError || '--')}</span></td><td><div class="notification-row-actions"><button type="button" data-notify-retry="${escapeHtml(item.id)}" ${['failed','retry'].includes(item.state) && state.workingId !== item.id ? '' : 'disabled'} aria-label="重试">${icon('retry')}</button></div></td></tr>`; }).join('') : '<tr><td colspan="8" class="dwrt-kit-table-empty">暂无投递记录</td></tr>'}`;
   }
 
   function channelTable() {
     const rows = filteredChannels();
-    return `<section class="notification-push-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>推送通道</strong><span>本地队列、Webhook 与邮件投递</span></div><span class="dwrt-kit-table-count">${rows.length} 个通道</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table notification-channel-table"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>目标</th><th>更新时间</th><th>操作</th></tr></thead><tbody>${rows.length ? rows.map((item) => `<tr><td><button class="notification-name-button" type="button" data-notify-edit-channel="${escapeHtml(item.id)}"><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></button></td><td>${escapeHtml(channelTypeLabel(item.type))}</td><td>${ui.statusBadgeMarkup?.(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'error') || ''}</td><td><span class="notification-target">${escapeHtml(channelTarget(item))}</span></td><td><time>${escapeHtml(formatTime(item.updatedAt))}</time></td><td><div class="notification-row-actions"><button type="button" data-notify-test="${escapeHtml(item.id)}" aria-label="测试发送">${icon('send')}</button><button type="button" data-notify-edit-channel="${escapeHtml(item.id)}" aria-label="编辑">${icon('edit')}</button></div></td></tr>`).join('') : '<tr><td colspan="6" class="dwrt-kit-table-empty">暂无推送通道</td></tr>'}</tbody></table></div></section>`;
+    return `<section class="notification-push-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar notification-push-table-toolbar" data-dwrt-component="toolbar"><div class="dwrt-kit-table-title"><strong>推送通道</strong><span>本地队列、Webhook 与邮件投递 · <em data-notify-table-count>${tableCountText(rows.length)}</em></span></div>${tableToolbarActions()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table notification-channel-table"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>目标</th><th>更新时间</th><th>操作</th></tr></thead><tbody data-notify-rows>${channelRowsMarkup(rows)}</tbody></table></div></section>`;
   }
 
   function routeTable() {
     const rows = filteredRoutes();
-    return `<section class="notification-push-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>路由规则</strong><span>按事件类型和严重级别将通知送往指定通道</span></div><span class="dwrt-kit-table-count">${rows.length} 条规则</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table notification-route-table"><thead><tr><th>名称</th><th>状态</th><th>通道</th><th>最低级别</th><th>分类</th><th>事件</th><th>来源</th><th>操作</th></tr></thead><tbody>${rows.length ? rows.map((item) => `<tr><td><button class="notification-name-button" type="button" data-notify-edit-route="${escapeHtml(item.id)}"><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></button></td><td>${ui.statusBadgeMarkup?.(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'error') || ''}</td><td>${escapeHtml(channelLabel(item.channelId))}</td><td><span class="notification-severity is-${escapeHtml(item.minSeverity)}">${escapeHtml(severityLabel(item.minSeverity))}</span></td><td>${escapeHtml(categoryLabel(item.category))}</td><td>${escapeHtml(eventLabel(item.event))}</td><td>${escapeHtml(item.source || '全部来源')}</td><td><div class="notification-row-actions"><button type="button" data-notify-edit-route="${escapeHtml(item.id)}" aria-label="编辑">${icon('edit')}</button></div></td></tr>`).join('') : '<tr><td colspan="8" class="dwrt-kit-table-empty">暂无路由规则</td></tr>'}</tbody></table></div></section>`;
+    return `<section class="notification-push-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar notification-push-table-toolbar" data-dwrt-component="toolbar"><div class="dwrt-kit-table-title"><strong>路由规则</strong><span>按事件类型和严重级别将通知送往指定通道 · <em data-notify-table-count>${tableCountText(rows.length)}</em></span></div>${tableToolbarActions()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table notification-route-table"><thead><tr><th>名称</th><th>状态</th><th>通道</th><th>最低级别</th><th>分类</th><th>事件</th><th>来源</th><th>操作</th></tr></thead><tbody data-notify-rows>${routeRowsMarkup(rows)}</tbody></table></div></section>`;
   }
 
   function outboxTable() {
     const rows = filteredOutbox();
-    return `<section class="notification-push-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>投递记录</strong><span>失败记录可重新进入投递队列</span></div><span class="dwrt-kit-table-count">${rows.length} 条记录</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table notification-outbox-table"><thead><tr><th>时间</th><th>通知</th><th>状态</th><th>通道 / 规则</th><th>尝试</th><th>HTTP</th><th>错误</th><th>操作</th></tr></thead><tbody>${rows.length ? rows.map((item) => { const tone = item.state === 'delivered' ? 'success' : item.state === 'failed' ? 'error' : item.state === 'retry' ? 'warning' : 'info'; return `<tr><td><time>${escapeHtml(formatTime(item.createdAt))}</time></td><td><span class="notification-outbox-title"><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml([item.severity, item.category, item.event].filter(Boolean).join(' · '))}</small></span></td><td>${ui.statusBadgeMarkup?.(stateLabel(item.state), tone) || ''}</td><td>${escapeHtml([item.channelId, item.routeId].filter(Boolean).join(' · ') || '--')}</td><td>${item.attempts} / ${item.maxAttempts || '--'}${item.count > 1 ? ` · ×${item.count}` : ''}</td><td>${item.httpStatus || '--'}</td><td><span class="notification-target">${escapeHtml(item.lastError || '--')}</span></td><td><div class="notification-row-actions"><button type="button" data-notify-retry="${escapeHtml(item.id)}" ${['failed','retry'].includes(item.state) && state.workingId !== item.id ? '' : 'disabled'} aria-label="重试">${icon('retry')}</button></div></td></tr>`; }).join('') : '<tr><td colspan="8" class="dwrt-kit-table-empty">暂无投递记录</td></tr>'}</tbody></table></div></section>`;
+    return `<section class="notification-push-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar notification-push-table-toolbar" data-dwrt-component="toolbar"><div class="dwrt-kit-table-title"><strong>投递记录</strong><span>失败记录可重新进入投递队列 · <em data-notify-table-count>${tableCountText(rows.length)}</em></span></div>${tableToolbarActions()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table notification-outbox-table"><thead><tr><th>时间</th><th>通知</th><th>状态</th><th>通道 / 规则</th><th>尝试</th><th>HTTP</th><th>错误</th><th>操作</th></tr></thead><tbody data-notify-rows>${outboxRowsMarkup(rows)}</tbody></table></div></section>`;
   }
 
   function settingsPanel() {
@@ -436,7 +468,7 @@ export function mount(context = {}) {
     const smtp = settings.smtp && typeof settings.smtp === 'object' ? settings.smtp : {};
     const canEmail = emailSupported();
     return `<form class="notification-settings-stack" data-notify-settings-form>
-      <section class="notification-settings-panel dwrt-kit-glass-surface"><header><div><strong>投递设置</strong><span>控制通知服务与失败重试节奏</span></div>${ui.statusBadgeMarkup?.(settings.enabled !== false ? '启用' : '停用', settings.enabled !== false ? 'success' : 'error') || ''}</header><div class="notification-settings-grid"><label class="notification-switch-field"><span><strong>启用通知推送</strong><small>关闭后保留配置，但不再分发新通知</small></span><input type="checkbox" data-notify-setting="enabled" ${settings.enabled !== false ? 'checked' : ''}><i></i></label><label><span>默认通道</span><select data-notify-setting="default_channel_id">${state.channels.map((channel) => `<option value="${escapeHtml(channel.id)}" ${settings.default_channel_id === channel.id ? 'selected' : ''}>${escapeHtml(channel.name)}</option>`).join('')}</select></label><label><span>最大尝试次数</span><input type="number" min="1" max="20" data-notify-setting="max_attempts" value="${escapeHtml(firstNumber(settings.max_attempts, 3))}"></label><label><span>首次重试间隔（秒）</span><input type="number" min="1" max="86400" data-notify-setting="retry_base_s" value="${escapeHtml(firstNumber(settings.retry_base_s, 60))}"></label><label><span>最大重试间隔（秒）</span><input type="number" min="1" max="86400" data-notify-setting="retry_max_s" value="${escapeHtml(firstNumber(settings.retry_max_s, 3600))}"></label></div></section>
+      <section class="notification-settings-panel dwrt-kit-glass-surface"><header><div><strong>投递设置</strong><span>控制通知服务与失败重试节奏</span></div>${ui.statusBadgeMarkup?.(settings.enabled !== false ? '启用' : '停用', settings.enabled !== false ? 'success' : 'error') || ''}</header><div class="notification-settings-body"><label class="notification-master-card ${settings.enabled !== false ? 'is-active' : ''}"><input type="checkbox" data-notify-setting="enabled" ${settings.enabled !== false ? 'checked' : ''}><span class="notification-master-icon" aria-hidden="true">${icon('bell')}</span><strong>启用通知推送</strong><em>关闭后保留配置，但不再分发新通知</em></label><div class="notification-settings-grid"><label><span>默认通道</span><select data-notify-setting="default_channel_id">${state.channels.map((channel) => `<option value="${escapeHtml(channel.id)}" ${settings.default_channel_id === channel.id ? 'selected' : ''}>${escapeHtml(channel.name)}</option>`).join('')}</select></label><label><span>最大尝试次数</span><input type="number" min="1" max="20" data-notify-setting="max_attempts" value="${escapeHtml(firstNumber(settings.max_attempts, 3))}"></label><label><span>首次重试间隔（秒）</span><input type="number" min="1" max="86400" data-notify-setting="retry_base_s" value="${escapeHtml(firstNumber(settings.retry_base_s, 60))}"></label><label><span>最大重试间隔（秒）</span><input type="number" min="1" max="86400" data-notify-setting="retry_max_s" value="${escapeHtml(firstNumber(settings.retry_max_s, 3600))}"></label></div></div></section>
       <section class="notification-settings-panel notification-mail-settings dwrt-kit-glass-surface"><header><div><strong>邮件发件</strong><span>向用户资料中的邮箱或额外收件地址投递</span></div><span class="notification-capability ${canEmail ? 'is-ready' : ''}">${canEmail ? '可用' : '后端待接入'}</span></header><div class="notification-settings-grid"><label><span>SMTP 服务器</span><input type="text" data-notify-setting="smtp_host" value="${escapeHtml(firstText(smtp.host))}" placeholder="smtp.example.com" ${canEmail ? '' : 'disabled'}></label><label><span>端口</span><input type="number" min="1" max="65535" data-notify-setting="smtp_port" value="${escapeHtml(firstNumber(smtp.port, 465))}" ${canEmail ? '' : 'disabled'}></label><label><span>加密方式</span><select data-notify-setting="smtp_security" ${canEmail ? '' : 'disabled'}>${['ssl','starttls','none'].map((value) => `<option value="${value}" ${firstText(smtp.security, 'ssl') === value ? 'selected' : ''}>${value === 'ssl' ? 'SSL/TLS' : value === 'starttls' ? 'STARTTLS' : '无'}</option>`).join('')}</select></label><label><span>发件地址</span><input type="email" data-notify-setting="smtp_from" value="${escapeHtml(firstText(smtp.from))}" placeholder="router@example.com" ${canEmail ? '' : 'disabled'}></label><label><span>用户名</span><input type="text" data-notify-setting="smtp_username" value="${escapeHtml(firstText(smtp.username))}" autocomplete="off" ${canEmail ? '' : 'disabled'}></label><label><span>密码</span><input type="password" data-notify-setting="smtp_password" value="" placeholder="${smtp.password_present ? '已保存，留空保持不变' : 'SMTP 密码'}" autocomplete="new-password" ${canEmail ? '' : 'disabled'}></label></div><div class="notification-mail-note">邮件通道以用户 ID 绑定收件人，实际地址由后端读取用户目录；Outbox 与日志不得保存 SMTP 密码或完整邮件正文。</div></section>
       <footer class="notification-settings-actions"><span>${escapeHtml(state.notice || '')}</span><button class="policy-primary" type="button" data-notify-save-settings ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存设置'}</button></footer>
     </form>`;
@@ -446,9 +478,25 @@ export function mount(context = {}) {
     const status = state.status || {};
     const recent = state.outbox.slice().sort((left, right) => right.createdAt - left.createdAt).slice(0, 6);
     const defaultChannel = state.channels.find((item) => item.id === state.settings.default_channel_id);
+    /*
+     * 「最近投递」与「当前策略」合并为单张卡：两者都是同一件事的两端（队列里发生了什么、
+     * 队列按什么规则运转），分成两张并排面板会让同一主题被卡片边界割开（用户第 7 条）。
+     * 上方四张状态卡不变。
+     */
     return `<div class="notification-overview">${renderSummary(true)}<div class="notification-overview-lower">
-      <section class="notification-overview-panel dwrt-kit-glass-surface"><header><div><strong>最近投递</strong><span>最新六条通知状态</span></div><button type="button" data-notify-jump="outbox">查看全部</button></header><div class="notification-recent-list" data-notify-recent-signature="${escapeHtml(recent.map((item) => `${item.id}:${item.state}:${item.updatedAt}`).join('|'))}">${recentMarkup(recent)}</div></section>
-      <section class="notification-overview-panel dwrt-kit-glass-surface"><header><div><strong>当前策略</strong><span>通知进入队列后的默认行为</span></div><button type="button" data-notify-jump="settings">管理</button></header><dl class="notification-policy-summary"><div><dt>默认通道</dt><dd>${escapeHtml(firstText(defaultChannel?.name, state.settings.default_channel_id, '--'))}</dd></div><div><dt>有效规则</dt><dd>${escapeHtml(firstNumber(status.active_routes, state.routes.filter((item) => item.enabled).length))} 条</dd></div><div><dt>最大尝试</dt><dd>${escapeHtml(firstNumber(state.settings.max_attempts, 3))} 次</dd></div><div><dt>重试间隔</dt><dd>${escapeHtml(firstNumber(state.settings.retry_base_s, 60))} - ${escapeHtml(firstNumber(state.settings.retry_max_s, 3600))} 秒</dd></div><div><dt>邮件投递</dt><dd>${emailSupported() ? '可用' : '后端待接入'}</dd></div></dl></section>
+      <section class="notification-overview-panel notification-overview-combined dwrt-kit-glass-surface">
+        <header><div><strong>投递概览</strong><span>最近的队列动态与当前生效的分发规则</span></div><button type="button" data-notify-jump="settings">管理</button></header>
+        <div class="notification-overview-split">
+          <div class="notification-overview-column">
+            <div class="notification-overview-column-head"><span>最近投递</span><button type="button" data-notify-jump="outbox">查看全部</button></div>
+            <div class="notification-recent-list" data-notify-recent-signature="${escapeHtml(recent.map((item) => `${item.id}:${item.state}:${item.updatedAt}`).join('|'))}">${recentMarkup(recent)}</div>
+          </div>
+          <div class="notification-overview-column">
+            <div class="notification-overview-column-head"><span>当前策略</span></div>
+            <dl class="notification-policy-summary"><div><dt>默认通道</dt><dd>${escapeHtml(firstText(defaultChannel?.name, state.settings.default_channel_id, '--'))}</dd></div><div><dt>有效规则</dt><dd>${escapeHtml(firstNumber(status.active_routes, state.routes.filter((item) => item.enabled).length))} 条</dd></div><div><dt>最大尝试</dt><dd>${escapeHtml(firstNumber(state.settings.max_attempts, 3))} 次</dd></div><div><dt>重试间隔</dt><dd>${escapeHtml(firstNumber(state.settings.retry_base_s, 60))} - ${escapeHtml(firstNumber(state.settings.retry_max_s, 3600))} 秒</dd></div><div><dt>邮件投递</dt><dd>${emailSupported() ? '可用' : '后端待接入'}</dd></div></dl>
+          </div>
+        </div>
+      </section>
     </div></div>`;
   }
 
@@ -531,7 +579,7 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', MODULE_CLASS);
-    root.innerHTML = `<section class="policy-table-shell notification-push-shell"><header class="notification-push-page-header"><nav class="dwrt-kit-tabs dwrt-kit-page-tabs notification-push-tabs" role="tablist" aria-label="通知推送视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${TABS.map((tab) => `<button class="dwrt-kit-tab ${state.tab === tab.id ? 'is-active' : ''}" type="button" role="tab" data-value="${tab.id}" data-notify-tab="${tab.id}" aria-selected="${state.tab === tab.id ? 'true' : 'false'}">${escapeHtml(tab.label)}</button>`).join('')}</nav>${renderToolbar()}</header><div class="notification-push-view">${state.error ? `<div class="notification-form-notice is-error">${escapeHtml(state.error)}</div>` : ''}${contentMarkup()}</div>${renderDrawer()}</section>`;
+    root.innerHTML = `<section class="policy-table-shell notification-push-shell"><header class="notification-push-page-header"><nav class="dwrt-kit-tabs dwrt-kit-page-tabs notification-push-tabs" role="tablist" aria-label="通知推送视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${TABS.map((tab) => `<button class="dwrt-kit-tab ${state.tab === tab.id ? 'is-active' : ''}" type="button" role="tab" data-value="${tab.id}" data-notify-tab="${tab.id}" aria-selected="${state.tab === tab.id ? 'true' : 'false'}">${escapeHtml(tab.label)}</button>`).join('')}</nav></header><div class="notification-push-view">${state.error ? `<div class="notification-form-notice is-error">${escapeHtml(state.error)}</div>` : ''}${contentMarkup()}</div>${renderDrawer()}</section>`;
     enhanceChannelDrawer();
     enhanceRouteDrawer();
     bindEvents();
@@ -611,13 +659,26 @@ export function mount(context = {}) {
     bindRowActions();
   }
 
+  /*
+   * 搜索与筛选只重绘 tbody。搜索框现在在表格工具栏里，整卡 outerHTML 替换会连同
+   * 正在输入的 input 一起销毁，光标随第一个字符丢失。
+   */
+  function syncTableRows() {
+    const tbody = root.querySelector('.notification-push-table-card [data-notify-rows]');
+    if (!tbody) return;
+    const rows = state.tab === 'routes' ? filteredRoutes() : state.tab === 'outbox' ? filteredOutbox() : filteredChannels();
+    tbody.innerHTML = state.tab === 'routes' ? routeRowsMarkup(rows) : state.tab === 'outbox' ? outboxRowsMarkup(rows) : channelRowsMarkup(rows);
+    const count = root.querySelector('.notification-push-table-card [data-notify-table-count]');
+    if (count) count.textContent = tableCountText(rows.length);
+    bindRowActions();
+  }
+
   function bindEvents() {
     root.querySelector('[data-notify-settings-form]')?.addEventListener('submit', (event) => event.preventDefault());
     root.querySelectorAll('[data-notify-tab]').forEach((button) => button.addEventListener('click', () => { setTab(button.dataset.notifyTab); state.query = ''; render(); }));
     root.querySelectorAll('[data-notify-jump]').forEach((button) => button.addEventListener('click', () => { setTab(button.dataset.notifyJump); state.query = ''; render(); }));
-    root.querySelector('[data-notify-search]')?.addEventListener('input', (event) => { state.query = event.target.value || ''; const card = root.querySelector('.notification-push-table-card'); if (card) card.outerHTML = state.tab === 'routes' ? routeTable() : state.tab === 'outbox' ? outboxTable() : channelTable(); bindRowActions(); });
-    root.querySelector('[data-notify-state]')?.addEventListener('change', (event) => { state.outboxState = event.target.value || 'all'; const card = root.querySelector('.notification-push-table-card'); if (card) card.outerHTML = outboxTable(); bindRowActions(); });
-    root.querySelector('[data-notify-refresh]')?.addEventListener('click', () => load());
+    root.querySelector('[data-notify-search]')?.addEventListener('input', (event) => { state.query = event.target.value || ''; syncTableRows(); });
+    root.querySelector('[data-notify-state]')?.addEventListener('change', (event) => { state.outboxState = event.target.value || 'all'; syncTableRows(); });
     root.querySelector('[data-notify-create="channels"]')?.addEventListener('click', () => openChannel());
     root.querySelector('[data-notify-create="routes"]')?.addEventListener('click', () => openRoute());
     root.querySelectorAll('[data-notify-close]').forEach((button) => button.addEventListener('click', closeDrawer));

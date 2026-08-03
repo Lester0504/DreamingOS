@@ -12,7 +12,7 @@
 .console-stage.is-log-center {
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   overflow: hidden;
   padding: 0;
@@ -61,31 +61,11 @@
   display: block;
 }
 
-.log-center-search-row {
-  height: 36px;
-  display: grid;
-  grid-template-columns: 31px minmax(0, 1fr) 36px;
-  gap: 6px;
-  align-items: center;
-  margin-bottom: 12px;
-}
-
-.log-center-search {
-  grid-column: 1 / 3;
-  height: 36px;
+/* 搜索改由 kit 的 expand-search 承载，位置在表格工具条内。 */
+.log-center-search.dwrt-kit-expand-search {
+  flex: 0 1 auto;
   min-width: 0;
-  display: grid;
-  grid-template-columns: 31px minmax(0, 1fr);
-  align-items: center;
-  border-radius: var(--app-radius-control, 9px);
-  background: rgba(255,255,255,0.075);
-  color: var(--dwrt-muted, rgba(218, 229, 244, 0.76));
-}
-
-.log-center-search svg {
-  width: 20px;
-  height: 20px;
-  margin: auto;
+  --dwrt-search-expanded-width: min(300px, 28vw);
 }
 
 .log-center-search input,
@@ -104,33 +84,6 @@
 .log-center-search input::placeholder,
 .log-filter-local-search input::placeholder {
   color: var(--dwrt-muted, rgba(218, 229, 244, 0.68));
-}
-
-.log-center-icon-button {
-  width: 36px;
-  height: 36px;
-  display: inline-grid;
-  place-items: center;
-  border: 1px solid rgba(255,255,255,0.11);
-  border-radius: var(--app-radius-control, 9px);
-  color: var(--dwrt-text, var(--app-text));
-  background: rgba(255,255,255,0.045);
-  cursor: pointer;
-  transition: transform 180ms var(--app-spring), color 180ms ease, background 180ms ease;
-}
-
-.log-center-icon-button:hover {
-  color: var(--dwrt-selected, var(--app-text));
-  background: rgba(255,255,255,0.085);
-}
-
-.log-center-icon-button:active {
-  transform: scale(0.96);
-}
-
-.log-center-icon-button svg {
-  width: 19px;
-  height: 19px;
 }
 
 .log-center-mode-tabs.dwrt-kit-tabs {
@@ -685,6 +638,7 @@
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .log-ai-button {
@@ -906,7 +860,7 @@ html[data-theme-resolved="light"] .log-table-desc-toggle {
 
 /* 与 AI 抽屉同宽同材质：宽度交给 kit 的 copilot sheet 变量。 */
 .log-center-drawer {
-  --dwrt-kit-sheet-width: min(100vw, 460px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   color: var(--dwrt-ink, var(--app-text));
 }
 
@@ -1049,7 +1003,6 @@ html[data-theme-resolved="light"] .log-detail-section {
 }
 
 html[data-theme-resolved="light"] .log-center-severity-strip button,
-html[data-theme-resolved="light"] .log-center-icon-button,
 html[data-theme-resolved="light"] .log-center-pagination select,
 html[data-theme-resolved="light"] .log-center-pagination button {
   background: rgba(255,255,255,0.50);
@@ -1079,7 +1032,7 @@ html[data-theme-resolved="light"] .log-detail-raw pre {
   .console-stage.is-log-center {
     padding: var(--app-page-gutter-block, 12px) var(--app-page-gutter-inline, 12px);
     height: auto;
-    min-height: 100dvh;
+    min-height: var(--app-stage-height);
     overflow: auto;
   }
 

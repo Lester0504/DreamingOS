@@ -71,6 +71,7 @@
 #include "ai_local_rpc.h"
 #include "ai_oauth.h"
 #include "../jmx_config_schema.h"
+#include "../proc_path.h"
 
 #define APP_API_CODE_SUCCESS 2000
 #define APP_API_CODE_ERROR 4000
@@ -1493,6 +1494,10 @@ static struct json_object *ai_envelope(struct json_object *resp, int default_cod
 #define REFRESH_TTL_S         2592000 /* 30 days */
 #define PAIR_TTL_S            300
 #define APP_API_EVENT_SOCKET  "/tmp/dreamingwrt-webd-events.sock"
+#define APP_API_EVENT_SOCKET_LOCK APP_API_EVENT_SOCKET ".lock"
+/* Bounded wait so a restart can outlast the predecessor's shutdown. */
+#define APP_API_EVENT_LOCK_RETRY_MS 100
+#define APP_API_EVENT_LOCK_WAIT_MS  3000
 #define APP_API_DB_PATH       "/etc/dreamingwrt/apid.db"
 #define APP_CONFIG_DB_PATH    "/etc/dreamingwrt/config.db"
 #define WEBD_AEGIS_DB_PATH    "/etc/dreamingwrt/aegis.db"
@@ -4371,6 +4376,347 @@ static void app_attach_relay_identity(struct json_object *resp)
     json_object_put(reply);
 }
 
+/* ═══ Cloud relay administration under /api/v1/cloud ═══
+ *
+ * The router half of remote access lives in dreamingos-cloud, which owns the key
+ * material and speaks to the relay. webd is the only authenticated surface, so
+ * these routes exist to let an admin see and change that state without handing
+ * out shell or ubus access.
+ *
+ * Division of labour: settings live in UCI so they go through the normal config
+ * authority, and the tunnel credential is obtained by the daemon at runtime
+ * because it is a secret the router earns rather than one an operator types.
+ */
+#define WEBD_CLOUD_UBUS_OBJECT "dreamingos.cloud"
+#define WEBD_CLOUD_UCI_PACKAGE "relay"
+#define WEBD_CLOUD_UCI_SECTION "service"
+
+/* Defined further down with the policy-engine UCI helpers; reused here so relay
+ * settings go through the same validation and delete-if-empty semantics. */
+static int webd_policy_uci_set_pkg_option(struct uci_context *ctx,
+                                          const char *package,
+                                          const char *section,
+                                          const char *option,
+                                          const char *value,
+                                          int delete_if_empty,
+                                          char *err, size_t err_len);
+
+/*
+ * Unwraps a dreamingos-cloud reply into a webd envelope.
+ *
+ * The component is optional, so an absent ubus object is reported as a
+ * capability gap rather than a server fault: the UI needs to say "remote access
+ * is not installed" instead of showing an error.
+ */
+static struct json_object *webd_cloud_component_response(const char *method,
+                                                         struct json_object *args,
+                                                         int *status)
+{
+    struct json_object *reply;
+    struct json_object *data = NULL;
+    struct json_object *ok = NULL;
+
+    reply = app_ubus_invoke_object_timeout(WEBD_CLOUD_UBUS_OBJECT, method, args,
+                                          3000);
+    if (!reply) {
+        if (status)
+            *status = 503;
+        return webd_error("cloud_component_unavailable",
+                          "the dreamingos-cloud component is not running",
+                          "dreamingos-cloud", "webd.cloud");
+    }
+    if (json_object_object_get_ex(reply, "ok", &ok) && ok &&
+        !json_object_get_boolean(ok)) {
+        struct json_object *code = NULL;
+        struct json_object *message = NULL;
+        struct json_object *error;
+
+        /*
+         * The component's own code is passed through unchanged. The relay's
+         * documented codes distinguish cases the UI renders differently, such as
+         * statically_configured, and reinterpreting them here would erase that.
+         */
+        json_object_object_get_ex(reply, "code", &code);
+        json_object_object_get_ex(reply, "message", &message);
+        error = webd_error(code && json_object_is_type(code, json_type_string) ?
+                               json_object_get_string(code) : "cloud_request_failed",
+                           message && json_object_is_type(message, json_type_string) ?
+                               json_object_get_string(message) :
+                               "the cloud component refused the request",
+                           "", "webd.cloud");
+        if (json_object_object_get_ex(reply, "data", &data) && data)
+            json_object_object_add(error, "data", json_object_get(data));
+        json_object_put(reply);
+        if (status)
+            *status = 409;
+        return error;
+    }
+    if (!json_object_object_get_ex(reply, "data", &data) || !data) {
+        json_object_put(reply);
+        if (status)
+            *status = 502;
+        return webd_error("cloud_response_malformed",
+                          "the cloud component returned no data block",
+                          "data", "webd.cloud");
+    }
+    data = json_object_get(data);
+    json_object_put(reply);
+    if (status)
+        *status = 200;
+    return webd_envelope(data, "webd.cloud");
+}
+
+/*
+ * Hostname or IP literal, matching cloud_config.c's own check.
+ *
+ * The value ends up in DNS resolution and TLS name verification, so anything
+ * that could smuggle a scheme, path, port or whitespace past those is refused at
+ * the edge instead of being stored and failing later.
+ */
+static int webd_cloud_host_valid(const char *value)
+{
+    size_t length = value ? strlen(value) : 0;
+    size_t i;
+
+    if (!length || length > 253)
+        return 0;
+    if (value[0] == '.' || value[0] == '-')
+        return 0;
+    for (i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)value[i];
+
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '-' || c == ':')
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+static struct json_object *webd_cloud_field_error(const char *field,
+                                                  const char *message)
+{
+    struct json_object *error = webd_error("cloud_config_invalid", message,
+                                           field, "webd.cloud");
+    struct json_object *detail = NULL;
+
+    /* Field-level detail so the form can mark the offending input rather than
+     * showing one generic banner. */
+    if (json_object_object_get_ex(error, "error", &detail) && detail)
+        json_object_object_add(detail, "field", json_object_new_string(field));
+    return error;
+}
+
+/*
+ * Writes the relay settings to UCI.
+ *
+ * Only fields present in the request are touched, so a form that submits one
+ * value cannot blank the rest. auth_token is accepted for the static-registration
+ * path but never echoed back anywhere.
+ */
+static struct json_object *webd_cloud_config_write(struct json_object *body,
+                                                   int *status)
+{
+    struct uci_context *ctx;
+    struct uci_package *package = NULL;
+    struct json_object *value = NULL;
+    struct json_object *error = NULL;
+    char err[128] = "";
+    int has_enabled, has_host, has_port, has_tls, has_token, has_ca;
+    int enabled = 0, tls_verify = 1;
+    const char *host = NULL;
+    const char *token = NULL;
+    const char *ca_path = NULL;
+    int port = 0;
+
+    if (status)
+        *status = 400;
+
+    has_enabled = json_object_object_get_ex(body, "enabled", &value) && value;
+    if (has_enabled)
+        enabled = json_object_get_boolean(value);
+
+    has_host = json_object_object_get_ex(body, "host", &value) && value &&
+               json_object_is_type(value, json_type_string);
+    if (has_host) {
+        host = json_object_get_string(value);
+        if (!webd_cloud_host_valid(host))
+            return webd_cloud_field_error("host",
+                "host must be a hostname or IP literal without scheme or path");
+    }
+
+    has_port = json_object_object_get_ex(body, "port", &value) && value;
+    if (has_port) {
+        port = json_object_get_int(value);
+        if (port < 1 || port > 65535)
+            return webd_cloud_field_error("port", "port must be 1-65535");
+    }
+
+    has_tls = json_object_object_get_ex(body, "tls_verify", &value) && value;
+    if (has_tls) {
+        tls_verify = json_object_get_boolean(value);
+        /*
+         * Turning verification off makes the tunnel trivially interceptable.
+         * Allowed, because a lab relay may use a private CA, but never silently:
+         * the status surface reports it and this refuses the shorthand of
+         * disabling it without saying so.
+         */
+        if (!tls_verify) {
+            struct json_object *ack = NULL;
+
+            if (!json_object_object_get_ex(body, "accept_insecure_tls", &ack) ||
+                !ack || !json_object_get_boolean(ack))
+                return webd_cloud_field_error("tls_verify",
+                    "disabling TLS verification requires accept_insecure_tls");
+        }
+    }
+
+    has_token = json_object_object_get_ex(body, "auth_token", &value) && value &&
+                json_object_is_type(value, json_type_string);
+    if (has_token) {
+        size_t i;
+
+        token = json_object_get_string(value);
+        /* Empty clears it; otherwise the relay's own floor applies. */
+        if (token[0] && (strlen(token) < 32 || strlen(token) > 255))
+            return webd_cloud_field_error("auth_token",
+                "auth_token must be 32-255 characters");
+        for (i = 0; token[i]; i++) {
+            unsigned char c = (unsigned char)token[i];
+
+            if (c <= 0x20 || c == 0x7f || c == '"' || c == '\\')
+                return webd_cloud_field_error("auth_token",
+                    "auth_token contains characters that cannot be sent to the relay");
+        }
+    }
+
+    has_ca = json_object_object_get_ex(body, "ca_path", &value) && value &&
+             json_object_is_type(value, json_type_string);
+    if (has_ca) {
+        ca_path = json_object_get_string(value);
+        if (ca_path[0] && (ca_path[0] != '/' || strstr(ca_path, "..") ||
+                           strlen(ca_path) > 255))
+            return webd_cloud_field_error("ca_path",
+                "ca_path must be an absolute path without ..");
+    }
+
+    /*
+     * Enabling without any way to reach the relay would leave the component
+     * spinning in a failure state; refuse with a specific code instead.
+     */
+    if (has_enabled && enabled && !has_host) {
+        struct uci_context *probe = uci_alloc_context();
+        struct uci_package *probe_pkg = NULL;
+        const char *existing = NULL;
+
+        if (probe && uci_load(probe, WEBD_CLOUD_UCI_PACKAGE, &probe_pkg) == UCI_OK &&
+            probe_pkg) {
+            struct uci_section *section =
+                uci_lookup_section(probe, probe_pkg, WEBD_CLOUD_UCI_SECTION);
+
+            if (section)
+                existing = uci_lookup_option_string(probe, section, "host");
+        }
+        if (!existing || !existing[0])
+            error = webd_cloud_field_error("host",
+                "a relay host is required before remote access can be enabled");
+        if (probe)
+            uci_free_context(probe);
+        if (error)
+            return error;
+    }
+
+    ctx = uci_alloc_context();
+    if (!ctx) {
+        if (status)
+            *status = 500;
+        return webd_error("uci_context_failed", "uci context could not be created",
+                          "", "webd.cloud");
+    }
+    if (uci_load(ctx, WEBD_CLOUD_UCI_PACKAGE, &package) != UCI_OK || !package) {
+        uci_free_context(ctx);
+        if (status)
+            *status = 500;
+        return webd_error("relay_config_missing",
+                          "/etc/config/relay could not be loaded",
+                          "/etc/config/relay", "webd.cloud");
+    }
+
+    if (has_enabled &&
+        webd_policy_uci_set_pkg_option(ctx, WEBD_CLOUD_UCI_PACKAGE,
+                                       WEBD_CLOUD_UCI_SECTION, "enabled",
+                                       enabled ? "1" : "0", 0,
+                                       err, sizeof(err)) != 0)
+        goto fail;
+    if (has_host &&
+        webd_policy_uci_set_pkg_option(ctx, WEBD_CLOUD_UCI_PACKAGE,
+                                       WEBD_CLOUD_UCI_SECTION, "host", host, 0,
+                                       err, sizeof(err)) != 0)
+        goto fail;
+    if (has_port) {
+        char text[8];
+
+        snprintf(text, sizeof(text), "%d", port);
+        if (webd_policy_uci_set_pkg_option(ctx, WEBD_CLOUD_UCI_PACKAGE,
+                                           WEBD_CLOUD_UCI_SECTION, "port", text,
+                                           0, err, sizeof(err)) != 0)
+            goto fail;
+    }
+    if (has_tls &&
+        webd_policy_uci_set_pkg_option(ctx, WEBD_CLOUD_UCI_PACKAGE,
+                                       WEBD_CLOUD_UCI_SECTION, "tls_verify",
+                                       tls_verify ? "1" : "0", 0,
+                                       err, sizeof(err)) != 0)
+        goto fail;
+    if (has_token &&
+        webd_policy_uci_set_pkg_option(ctx, WEBD_CLOUD_UCI_PACKAGE,
+                                       WEBD_CLOUD_UCI_SECTION, "auth_token",
+                                       token, 1, err, sizeof(err)) != 0)
+        goto fail;
+    if (has_ca &&
+        webd_policy_uci_set_pkg_option(ctx, WEBD_CLOUD_UCI_PACKAGE,
+                                       WEBD_CLOUD_UCI_SECTION, "ca_path",
+                                       ca_path, 1, err, sizeof(err)) != 0)
+        goto fail;
+
+    if (uci_commit(ctx, &package, 0) != UCI_OK) {
+        uci_free_context(ctx);
+        if (status)
+            *status = 500;
+        return webd_error("relay_config_commit_failed",
+                          "the relay configuration could not be committed",
+                          "/etc/config/relay", "webd.cloud");
+    }
+    uci_free_context(ctx);
+
+    {
+        struct json_object *data = json_object_new_object();
+
+        /*
+         * The daemon reads UCI at startup, so a settings change needs a restart
+         * to take effect. Said plainly rather than implied, so the UI does not
+         * poll for a state change that will never come on its own.
+         */
+        json_object_object_add(data, "committed", json_object_new_boolean(1));
+        json_object_object_add(data, "restart_required",
+                               json_object_new_boolean(1));
+        json_object_object_add(data, "restart_hint",
+                               json_object_new_string(
+                                   "dreamingwrt-init restart dreamingos-cloud"));
+        if (status)
+            *status = 200;
+        return webd_envelope(data, "webd.cloud");
+    }
+
+fail:
+    uci_free_context(ctx);
+    if (status)
+        *status = 500;
+    return webd_error("relay_config_write_failed",
+                      err[0] ? err : "the relay configuration could not be written",
+                      "", "webd.cloud");
+}
+
 static struct json_object *jmx_app_pair_init_ex(struct json_object *req,
                                                 const char *client_ip,
                                                 int *http_status)
@@ -6891,6 +7237,10 @@ static int g_sse_fds[MAX_SSE_CLIENTS];
 static char g_sse_tokens[MAX_SSE_CLIENTS][TOKEN_LEN + 1];
 static int g_sse_count = 0;
 static struct uloop_fd g_event_fd = { .fd = -1 };
+/* Held only by the instance that owns APP_API_EVENT_SOCKET; see
+ * app_event_socket_init(). Guards the unlink in jmx_app_api_done(). */
+static int g_event_lock_fd = -1;
+static int g_event_socket_owned;
 static struct uloop_timeout g_sse_auth_timer;
 
 static int app_api_set_nonblock(int fd)
@@ -7016,24 +7366,52 @@ static void app_event_fd_cb(struct uloop_fd *ufd, unsigned int events)
 static int app_event_socket_init(void)
 {
     int fd;
+    int lock_fd;
+    int waited_ms = 0;
     struct sockaddr_un addr;
 
-    fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (fd < 0)
+    /* Single-instance guard. This path is shared with every jmx_events_emit()
+     * caller, and the unlink below used to be unconditional: a second webd,
+     * even on another port or bound only to loopback, would steal the running
+     * instance's event channel and then delete the path on exit, silently
+     * killing SSE delivery for the live process. Whoever holds this lock owns
+     * the socket; everyone else must leave the path untouched. */
+    lock_fd = open(APP_API_EVENT_SOCKET_LOCK, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock_fd < 0)
         return -1;
+    /* A restart can overlap the predecessor's shutdown, so wait briefly rather
+     * than giving up: failing outright would leave a legitimately restarted
+     * webd permanently without an event channel. */
+    while (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        if (errno != EWOULDBLOCK || waited_ms >= APP_API_EVENT_LOCK_WAIT_MS) {
+            close(lock_fd);
+            return -1;
+        }
+        usleep(APP_API_EVENT_LOCK_RETRY_MS * 1000);
+        waited_ms += APP_API_EVENT_LOCK_RETRY_MS;
+    }
+    fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        close(lock_fd);
+        return -1;
+    }
     unlink(APP_API_EVENT_SOCKET);
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", APP_API_EVENT_SOCKET);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(fd);
+        close(lock_fd);
         return -1;
     }
     if (app_api_set_nonblock(fd) != 0) {
         close(fd);
+        close(lock_fd);
         return -1;
     }
 
+    g_event_lock_fd = lock_fd;
+    g_event_socket_owned = 1;
     g_event_fd.fd = fd;
     g_event_fd.cb = app_event_fd_cb;
     uloop_fd_add(&g_event_fd, ULOOP_READ);
@@ -7214,6 +7592,18 @@ static void jmx_app_audit_log_ex(const char *actor, const char *app_device_id,
 {
     jmx_app_audit_log_full(actor, app_device_id, action, risk, target, "", "",
                            source_ip, result, failure_reason);
+}
+
+/* A dry-run preflight must stay distinguishable from a real device change:
+ * without the `result` marker a security review cannot tell whether a client
+ * was actually blocked. `applied` is recorded explicitly rather than left
+ * empty so old blank rows are not silently reinterpreted. */
+static void jmx_app_audit_log_dry_run(const char *action, const char *risk,
+                                      const char *target, int dry_run)
+{
+    jmx_app_audit_log_ex("app", "", action, risk, target,
+                         g_webd_audit_source_ip,
+                         dry_run ? "dry_run" : "applied", "");
 }
 
 static void webd_audit_login_result(struct json_object *request,
@@ -8221,7 +8611,21 @@ static int parse_http_request(const char *raw, int raw_len, struct http_req *out
                 out->websocket = 1;
         }
         out->body = hdr_end + 4;
-        out->body_len = raw_len - (int)(out->body - raw);
+        /* Trust Content-Length over "everything after the header" so bytes of a
+         * pipelined next request cannot leak into this body and trip the strict
+         * trailing-garbage check in parse_body_json(). */
+        {
+            int available = raw_len - (int)(out->body - raw);
+            int declared = 0;
+
+            if (available < 0)
+                available = 0;
+            if (http_content_length_from_raw(raw, raw_len, &declared) == 0 &&
+                declared >= 0 && declared < available)
+                out->body_len = declared;
+            else
+                out->body_len = available;
+        }
     }
     return 0;
 }
@@ -8238,7 +8642,9 @@ static int http_content_length_from_raw(const char *raw, int raw_len, int *out_l
         *out_len = 0;
     if (!raw || raw_len <= 0 || !out_len)
         return -1;
-    hdr_end = strstr(raw, "\r\n\r\n");
+    /* Callers may hand us a buffer whose byte at raw_len is a live body byte,
+     * so every scan here stays inside raw_len instead of trusting a NUL. */
+    hdr_end = memmem(raw, (size_t)raw_len, "\r\n\r\n", 4);
     if (!hdr_end)
         return 0;
 
@@ -8251,12 +8657,12 @@ static int http_content_length_from_raw(const char *raw, int raw_len, int *out_l
             return -1;
     }
 
-    line = strstr(raw, "\r\n");
+    line = memmem(raw, (size_t)raw_len, "\r\n", 2);
     if (!line || line >= hdr_end)
         return -1;
     line += 2;
     while (line < hdr_end) {
-        const char *line_end = strstr(line, "\r\n");
+        const char *line_end = memmem(line, (size_t)(hdr_end + 4 - line), "\r\n", 2);
         const char *colon;
         const char *value;
         const char *value_end;
@@ -11536,6 +11942,16 @@ static int webd_insights_app_lookup(int app_id,
                                     char *family, size_t family_len,
                                     int *canonical_app_id);
 
+/* Same lookup, additionally returning the app's public icon URL. Split from the
+ * plain form so the six existing callers that do not render icons stay
+ * unchanged. */
+static int webd_insights_app_lookup_ex(int app_id,
+                                       char *name, size_t name_len,
+                                       char *category, size_t category_len,
+                                       char *family, size_t family_len,
+                                       char *icon_url, size_t icon_url_len,
+                                       int *canonical_app_id);
+
 static void webd_protocol_make_id(const char *category_key,
                                   const char *name,
                                   const char *proto,
@@ -12597,6 +13013,13 @@ static void webd_client_control_add_capabilities(struct json_object *cap)
     json_object_object_add(cap, "client_control_fail_closed", json_object_new_boolean(store_ready));
     json_object_object_add(cap, "client_control_rate_limit",
                            json_object_new_boolean(rate_limit_ready));
+    /* `kick` only flushes conntrack. A wireless station keeps its association
+     * and resumes immediately, so the client must be told that a real
+     * disconnect is unavailable instead of inferring it from the per-action
+     * `partially_applied` status. */
+    json_object_object_add(cap, "client_deauth", json_object_new_boolean(0));
+    webd_obj_add_str(cap, "client_deauth_reason",
+                     "ieee80211_deauth_dispatch_not_implemented");
     if (!store_ready)
         webd_obj_add_str(cap, "client_control_unavailable_reason",
                          "client_control_rules_store_unavailable");
@@ -15307,6 +15730,16 @@ struct webd_insights_app_cache_entry {
     char name[128];
     char category[96];
     char family[64];
+    /* Public icon URL under WEBD_LOGO_URL_PREFIX, or empty when the signature
+     * DB has no icon row for this app. Cached alongside the name because both
+     * come from the same join. */
+    char icon_url[384];
+    /*
+     * Whether this entry was produced by a caller that asked for the icon.
+     * Without it, a name-only lookup would poison the cache and every later
+     * icon request for the same app would see an empty URL for the whole TTL.
+     */
+    int icon_resolved;
     int canonical_app_id;
     int found;
     time_t ts;
@@ -17796,17 +18229,19 @@ static int webd_insights_append_aegis_event_items(const struct webd_insights_que
     return emitted;
 }
 
-static int webd_insights_app_lookup(int app_id,
-                                    char *name, size_t name_len,
-                                    char *category, size_t category_len,
-                                    char *family, size_t family_len,
-                                    int *canonical_app_id)
+static int webd_insights_app_lookup_ex(int app_id,
+                                       char *name, size_t name_len,
+                                       char *category, size_t category_len,
+                                       char *family, size_t family_len,
+                                       char *icon_url, size_t icon_url_len,
+                                       int *canonical_app_id)
 {
     sqlite3 *db = NULL;
     sqlite3_stmt *st = NULL;
     time_t now = time(NULL);
     char sig_path[512];
     char source_error[64];
+    char icon_file[256] = "";
     enum jmx_system_db_source db_source;
     int i, found = 0;
     int canon = app_id;
@@ -17817,6 +18252,8 @@ static int webd_insights_app_lookup(int app_id,
         category[0] = '\0';
     if (family && family_len)
         family[0] = '\0';
+    if (icon_url && icon_url_len)
+        icon_url[0] = '\0';
     if (canonical_app_id)
         *canonical_app_id = app_id;
     if (app_id <= 0)
@@ -17826,12 +18263,18 @@ static int webd_insights_app_lookup(int app_id,
 
         if (e->app_id != app_id || now - e->ts > WEBD_INSIGHTS_APP_CACHE_TTL_S)
             continue;
+        /* An entry cached without the icon join cannot answer an icon request;
+         * fall through to the DB rather than returning a false "no icon". */
+        if (icon_url && icon_url_len && !e->icon_resolved)
+            break;
         if (name && name_len)
             snprintf(name, name_len, "%s", e->name);
         if (category && category_len)
             snprintf(category, category_len, "%s", e->category);
         if (family && family_len)
             snprintf(family, family_len, "%s", e->family);
+        if (icon_url && icon_url_len)
+            snprintf(icon_url, icon_url_len, "%s", e->icon_url);
         if (canonical_app_id)
             *canonical_app_id = e->canonical_app_id;
         return e->found;
@@ -17842,8 +18285,11 @@ static int webd_insights_app_lookup(int app_id,
         goto out;
     sqlite3_busy_timeout(db, 50);
     if (sqlite3_prepare_v2(db,
-            "SELECT a.app_id,a.name,COALESCE(c.name,''),COALESCE(a.family,'') "
+            "SELECT a.app_id,a.name,COALESCE(c.name,''),COALESCE(a.family,''),"
+            "COALESCE(ia.icon_file,'') "
             "FROM app a LEFT JOIN app_category c ON a.category_id=c.category_id "
+            "LEFT JOIN app_icon ai ON ai.app_id=a.app_id "
+            "LEFT JOIN icon_asset ia ON ia.icon_key=ai.icon_key "
             "WHERE a.app_id=?1 LIMIT 1",
             -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_int(st, 1, app_id);
@@ -17855,6 +18301,8 @@ static int webd_insights_app_lookup(int app_id,
                 snprintf(category, category_len, "%s", sqlite3_column_text(st, 2) ? (const char *)sqlite3_column_text(st, 2) : "");
             if (family && family_len)
                 snprintf(family, family_len, "%s", sqlite3_column_text(st, 3) ? (const char *)sqlite3_column_text(st, 3) : "");
+            snprintf(icon_file, sizeof(icon_file), "%s",
+                     sqlite3_column_text(st, 4) ? (const char *)sqlite3_column_text(st, 4) : "");
             found = name && name[0];
         }
     }
@@ -17862,9 +18310,12 @@ static int webd_insights_app_lookup(int app_id,
         sqlite3_finalize(st);
     st = NULL;
     if (!found && sqlite3_prepare_v2(db,
-            "SELECT a.app_id,a.name,COALESCE(c.name,''),COALESCE(a.family,'') "
+            "SELECT a.app_id,a.name,COALESCE(c.name,''),COALESCE(a.family,''),"
+            "COALESCE(ia.icon_file,'') "
             "FROM app_id_map m JOIN app a ON a.app_id=m.app_id "
             "LEFT JOIN app_category c ON a.category_id=c.category_id "
+            "LEFT JOIN app_icon ai ON ai.app_id=a.app_id "
+            "LEFT JOIN icon_asset ia ON ia.icon_key=ai.icon_key "
             "WHERE m.source_app_id=?1 ORDER BY m.confidence DESC LIMIT 1",
             -1, &st, NULL) == SQLITE_OK) {
         char idbuf[32];
@@ -17879,6 +18330,8 @@ static int webd_insights_app_lookup(int app_id,
                 snprintf(category, category_len, "%s", sqlite3_column_text(st, 2) ? (const char *)sqlite3_column_text(st, 2) : "");
             if (family && family_len)
                 snprintf(family, family_len, "%s", sqlite3_column_text(st, 3) ? (const char *)sqlite3_column_text(st, 3) : "");
+            snprintf(icon_file, sizeof(icon_file), "%s",
+                     sqlite3_column_text(st, 4) ? (const char *)sqlite3_column_text(st, 4) : "");
             found = name && name[0];
         }
     }
@@ -17887,6 +18340,21 @@ out:
         sqlite3_finalize(st);
     if (db)
         sqlite3_close(db);
+    /*
+     * icon_asset stores paths like "icons/kuaishou.svg"; the public route serves
+     * the bare filename under WEBD_LOGO_URL_PREFIX. Same normalisation the
+     * single-icon endpoint does, kept identical so the two never disagree.
+     */
+    if (icon_url && icon_url_len && icon_file[0]) {
+        const char *public_file = !strncmp(icon_file, "icons/", 6) ?
+                                      icon_file + 6 : icon_file;
+
+        /* A path separator here would escape the logo directory; such a row is
+         * treated as having no icon rather than emitted. */
+        if (!strchr(public_file, '/') && !strstr(public_file, ".."))
+            snprintf(icon_url, icon_url_len, "%s%s", WEBD_LOGO_URL_PREFIX,
+                     public_file);
+    }
     {
         struct webd_insights_app_cache_entry *e =
             &g_webd_insights_app_cache[g_webd_insights_app_cache_cursor++ % WEBD_INSIGHTS_APP_CACHE_MAX];
@@ -17902,10 +18370,25 @@ out:
             snprintf(e->category, sizeof(e->category), "%s", category);
         if (family && family_len)
             snprintf(e->family, sizeof(e->family), "%s", family);
+        if (icon_url && icon_url_len)
+            snprintf(e->icon_url, sizeof(e->icon_url), "%s", icon_url);
+        e->icon_resolved = (icon_url && icon_url_len) ? 1 : 0;
     }
     if (canonical_app_id)
         *canonical_app_id = canon;
     return found;
+}
+
+static int webd_insights_app_lookup(int app_id,
+                                    char *name, size_t name_len,
+                                    char *category, size_t category_len,
+                                    char *family, size_t family_len,
+                                    int *canonical_app_id)
+{
+    return webd_insights_app_lookup_ex(app_id, name, name_len,
+                                       category, category_len,
+                                       family, family_len, NULL, 0,
+                                       canonical_app_id);
 }
 
 static void webd_insights_read_query(const struct http_req *req, struct json_object *body,
@@ -28840,6 +29323,57 @@ static struct json_object *app_ubus_object_or_error(const char *object, const ch
     snprintf(dependency, sizeof(dependency), "%s %s", object ? object : "", method ? method : "");
     snprintf(source, sizeof(source), "webd.%s", object ? object : "ubus");
     return webd_error("source_unavailable", "ubus source is not available", dependency, source);
+}
+
+/* Same call, but a method the daemon never registered is reported as such
+ * instead of as an unavailable source. The two need different HTTP statuses:
+ * a 503 tells the client to retry, while a route wired to a method that does
+ * not exist will never succeed and must read as "not implemented" so the UI
+ * can say so rather than blaming the network. */
+static struct json_object *app_ubus_route_or_error(const char *object,
+                                                   const char *method,
+                                                   struct json_object *params,
+                                                   int timeout_ms,
+                                                   int *http_status)
+{
+    struct app_ubus_call_diag diag = { .rc = -1, .stage = NULL };
+    struct json_object *resp;
+    char dependency[128];
+    char source[128];
+
+    resp = app_ubus_invoke_object_diag(object, method, params,
+                                       timeout_ms > 0 ? timeout_ms : 2000,
+                                       &diag);
+    if (resp) {
+        if (http_status)
+            *http_status = app_jmx_response_http_status(resp, *http_status);
+        return resp;
+    }
+    snprintf(dependency, sizeof(dependency), "%s %s",
+             object ? object : "", method ? method : "");
+    snprintf(source, sizeof(source), "webd.%s", object ? object : "ubus");
+
+    /* ubus reports both a missing object and a missing method as NOT_FOUND at
+     * the invoke stage; the object resolved here, so the method is missing. */
+    if (diag.stage && !strcmp(diag.stage, "invoke") &&
+        diag.rc == UBUS_STATUS_METHOD_NOT_FOUND) {
+        if (http_status)
+            *http_status = 501;
+        return webd_error("method_not_registered",
+                          "backend method is not registered on this build",
+                          dependency, source);
+    }
+    if (diag.stage && !strcmp(diag.stage, "lookup")) {
+        if (http_status)
+            *http_status = 503;
+        return webd_error("source_unavailable",
+                          "backend daemon is not registered on ubus",
+                          dependency, source);
+    }
+    if (http_status)
+        *http_status = 503;
+    return webd_error("source_unavailable", "ubus source is not available",
+                      dependency, source);
 }
 
 static struct json_object *webd_wifi_aggregate_response(int runtime_status)
@@ -47996,7 +48530,374 @@ static void webd_clients_mark_stale(struct json_object *resp, int age_ms)
     }
 }
 
-static struct json_object *webd_clients_response(int *http_status)
+/*
+ * Per-client active application rollup for /api/v1/clients?with_apps=1.
+ *
+ * The same af_active_app rows already feed dashboard/snapshot, but there they
+ * arrive as one flat connection list that every caller has to bucket by MAC
+ * itself. The App was doing exactly that: two requests per device-list refresh
+ * plus a client-side join. Aggregating here removes the second request without
+ * inventing a new data source.
+ */
+/*
+ * Emitted per client, and tracked per client. Tracking more than is emitted
+ * keeps active_app_count truthful: reporting the capped figure would tell the
+ * App a device has 8 apps when it has 20, and the App shows that count.
+ */
+#define WEBD_CLIENT_APPS_MAX 8
+#define WEBD_CLIENT_APPS_TRACK 64
+#define WEBD_CLIENT_APPS_ACTIVE_WINDOW_S 180
+
+/* Rows are grouped by MAC into this table, then attached to the client array. */
+struct webd_client_app_row {
+    unsigned int app_id;
+    unsigned int flows;
+    unsigned int last_update;
+    /*
+     * Destination host of the most recent flow for this app, from the Host
+     * column of af_active_app. One app can talk to several hosts, so the newest
+     * one is kept: that is what "what is it talking to right now" means, and
+     * keeping them all would need an unbounded per-app list.
+     */
+    char host[256];
+};
+
+struct webd_client_app_bucket {
+    char mac[32];
+    struct webd_client_app_row apps[WEBD_CLIENT_APPS_TRACK];
+    int app_count;
+    unsigned int flows;
+    /* Distinct apps seen beyond the tracking array; only reachable on a device
+     * with more than WEBD_CLIENT_APPS_TRACK concurrent applications. */
+    unsigned int untracked_rows;
+};
+
+static void webd_client_apps_note(struct webd_client_app_bucket *bucket,
+                                  unsigned int app_id, unsigned int last_update,
+                                  const char *host)
+{
+    int i;
+    /* af_active_app writes "-" for an unresolved host; that is a placeholder,
+     * not a hostname, so it is normalised away here rather than shipped. */
+    int host_usable = host && host[0] && strcmp(host, "-");
+
+    bucket->flows++;
+    for (i = 0; i < bucket->app_count; i++) {
+        if (bucket->apps[i].app_id == app_id) {
+            bucket->apps[i].flows++;
+            if (last_update > bucket->apps[i].last_update) {
+                bucket->apps[i].last_update = last_update;
+                if (host_usable)
+                    snprintf(bucket->apps[i].host,
+                             sizeof(bucket->apps[i].host), "%s", host);
+            } else if (host_usable && !bucket->apps[i].host[0]) {
+                /* Keep the first real host seen when later rows have none, so a
+                 * placeholder row does not erase a known destination. */
+                snprintf(bucket->apps[i].host, sizeof(bucket->apps[i].host),
+                         "%s", host);
+            }
+            return;
+        }
+    }
+    if (bucket->app_count >= WEBD_CLIENT_APPS_TRACK) {
+        bucket->untracked_rows++;
+        return;
+    }
+    bucket->apps[bucket->app_count].app_id = app_id;
+    bucket->apps[bucket->app_count].flows = 1;
+    bucket->apps[bucket->app_count].last_update = last_update;
+    bucket->apps[bucket->app_count].host[0] = '\0';
+    if (host_usable)
+        snprintf(bucket->apps[bucket->app_count].host,
+                 sizeof(bucket->apps[bucket->app_count].host), "%s", host);
+    bucket->app_count++;
+}
+
+/*
+ * Reads af_active_app once and buckets it by MAC.
+ *
+ * Returns a JSON object keyed by lowercase MAC so the merge below is a lookup
+ * rather than a scan per client. NULL means the source was unavailable, which
+ * the caller reports rather than passing off as "no apps".
+ */
+static struct json_object *webd_client_apps_index(int *out_rows)
+{
+    FILE *fp = jmx_fopen_af("af_active_app", "r");
+    struct webd_client_app_bucket *buckets = NULL;
+    struct json_object *index = NULL;
+    int bucket_count = 0;
+    int bucket_capacity = 0;
+    int rows = 0;
+    char line[1024];
+    int header = 1;
+    int i, j;
+    time_t now = time(NULL);
+
+    if (out_rows)
+        *out_rows = 0;
+    if (!fp)
+        return NULL;
+
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned int app_id, src_port, dst_port, app_proto, drop, last_update;
+        char mac[32] = {0};
+        char src_ip[64] = {0};
+        char dst_ip[64] = {0};
+        char proto[8] = {0};
+        char host[256] = {0};
+        struct webd_client_app_bucket *bucket = NULL;
+        int parsed;
+
+        if (header) {
+            header = 0;
+            continue;
+        }
+        parsed = sscanf(line, "%u %31s %63s %u %63s %u %7s %u %u %255s %u",
+                        &app_id, mac, src_ip, &src_port, dst_ip, &dst_port,
+                        proto, &app_proto, &drop, host, &last_update);
+        if (parsed < 11)
+            continue;
+        /* Same staleness cut as get_dashboard_active_app, so both views agree. */
+        if ((unsigned int)now > last_update &&
+            ((unsigned int)now - last_update) > WEBD_CLIENT_APPS_ACTIVE_WINDOW_S)
+            continue;
+        for (char *p = mac; *p; p++)
+            *p = (char)tolower((unsigned char)*p);
+
+        for (i = 0; i < bucket_count; i++) {
+            if (!strcmp(buckets[i].mac, mac)) {
+                bucket = &buckets[i];
+                break;
+            }
+        }
+        if (!bucket) {
+            if (bucket_count == bucket_capacity) {
+                int next = bucket_capacity ? bucket_capacity * 2 : 32;
+                struct webd_client_app_bucket *grown =
+                    realloc(buckets, (size_t)next * sizeof(*grown));
+
+                if (!grown)
+                    break;
+                buckets = grown;
+                bucket_capacity = next;
+            }
+            bucket = &buckets[bucket_count++];
+            memset(bucket, 0, sizeof(*bucket));
+            snprintf(bucket->mac, sizeof(bucket->mac), "%s", mac);
+        }
+        webd_client_apps_note(bucket, app_id, last_update, host);
+        rows++;
+    }
+    fclose(fp);
+
+    index = json_object_new_object();
+    for (i = 0; i < bucket_count; i++) {
+        struct json_object *entry = json_object_new_object();
+        struct json_object *apps = json_object_new_array();
+
+        /* Busiest app first: the App shows a short summary line per device. */
+        for (j = 1; j < buckets[i].app_count; j++) {
+            struct webd_client_app_row key = buckets[i].apps[j];
+            int k = j - 1;
+
+            while (k >= 0 && buckets[i].apps[k].flows < key.flows) {
+                buckets[i].apps[k + 1] = buckets[i].apps[k];
+                k--;
+            }
+            buckets[i].apps[k + 1] = key;
+        }
+        /* Emit only the busiest WEBD_CLIENT_APPS_MAX, but count all of them. */
+        int emit = buckets[i].app_count < WEBD_CLIENT_APPS_MAX ?
+                   buckets[i].app_count : WEBD_CLIENT_APPS_MAX;
+
+        for (j = 0; j < emit; j++) {
+            struct json_object *app = json_object_new_object();
+            char name[256] = "";
+            char category[128] = "";
+            char family[128] = "";
+            char icon_url[384] = "";
+            int canonical = 0;
+            int resolved = webd_insights_app_lookup_ex((int)buckets[i].apps[j].app_id,
+                                                       name, sizeof(name),
+                                                       category, sizeof(category),
+                                                       family, sizeof(family),
+                                                       icon_url, sizeof(icon_url),
+                                                       &canonical);
+
+            json_object_object_add(app, "id",
+                                   json_object_new_int((int)buckets[i].apps[j].app_id));
+            /* Name comes from the signature DB. When it has no row, say so
+             * rather than printing "unknown" as if it were the app's name. */
+            webd_obj_add_str(app, "name", (resolved && name[0]) ? name : "");
+            webd_obj_add_str(app, "name_source",
+                             (resolved && name[0]) ? "signature_db" : "app_id_only");
+            if (category[0])
+                webd_obj_add_str(app, "category", category);
+            if (family[0])
+                webd_obj_add_str(app, "family", family);
+            /*
+             * Always present so the App can tell "no icon in the signature DB"
+             * from "this build does not send icons". Empty means no mapping; a
+             * placeholder path is never invented.
+             */
+            webd_obj_add_str(app, "icon_url", icon_url);
+            /* Destination host of the newest flow, "" when af_active_app had no
+             * resolved name for it. */
+            webd_obj_add_str(app, "host", buckets[i].apps[j].host);
+            if (canonical > 0 && canonical != (int)buckets[i].apps[j].app_id)
+                json_object_object_add(app, "canonical_app_id",
+                                       json_object_new_int(canonical));
+            json_object_object_add(app, "flows",
+                                   json_object_new_int((int)buckets[i].apps[j].flows));
+            json_object_object_add(app, "last_seen",
+                                   json_object_new_int64((int64_t)buckets[i].apps[j].last_update));
+            json_object_array_add(apps, app);
+        }
+        json_object_object_add(entry, "apps", apps);
+        /* Distinct apps for this client, not the number emitted: the App shows
+         * this figure, and capping it would understate the device's activity. */
+        json_object_object_add(entry, "app_count",
+                               json_object_new_int(buckets[i].app_count));
+        json_object_object_add(entry, "apps_returned", json_object_new_int(emit));
+        json_object_object_add(entry, "flow_count",
+                               json_object_new_int((int)buckets[i].flows));
+        if (buckets[i].app_count > emit)
+            json_object_object_add(entry, "apps_truncated",
+                                   json_object_new_int(buckets[i].app_count - emit));
+        /* Only set on a device busy enough to overflow the tracking array, in
+         * which case app_count itself is a floor rather than an exact figure. */
+        if (buckets[i].untracked_rows)
+            json_object_object_add(entry, "app_count_is_floor",
+                                   json_object_new_boolean(1));
+        json_object_object_add(index, buckets[i].mac, entry);
+    }
+    free(buckets);
+
+    if (out_rows)
+        *out_rows = rows;
+    return index;
+}
+
+/*
+ * Attaches active_apps to every client in a clients response.
+ *
+ * A client with no rows gets an empty array, not a missing field: the App would
+ * otherwise have to tell "idle" apart from "not supported" by guessing.
+ */
+static void webd_clients_attach_apps(struct json_object *resp)
+{
+    struct json_object *data = NULL;
+    struct json_object *clients = NULL;
+    struct json_object *index = NULL;
+    struct json_object *meta = NULL;
+    int rows = 0;
+    int matched = 0;
+    int i, n;
+
+    if (!resp || !json_object_object_get_ex(resp, "data", &data) || !data ||
+        !json_object_is_type(data, json_type_object))
+        return;
+    if (!json_object_object_get_ex(data, "clients", &clients) || !clients ||
+        !json_object_is_type(clients, json_type_array))
+        return;
+
+    index = webd_client_apps_index(&rows);
+    n = (int)json_object_array_length(clients);
+    for (i = 0; i < n; i++) {
+        struct json_object *client = json_object_array_get_idx(clients, i);
+        struct json_object *entry = NULL;
+        struct json_object *apps = NULL;
+        char mac[32] = {0};
+        const char *raw;
+
+        if (!client || !json_object_is_type(client, json_type_object))
+            continue;
+        raw = app_nc_json_str(client, "mac", "");
+        snprintf(mac, sizeof(mac), "%s", raw);
+        for (char *p = mac; *p; p++)
+            *p = (char)tolower((unsigned char)*p);
+
+        if (!index) {
+            /* Source unavailable: say so per client rather than implying idle. */
+            json_object_object_add(client, "active_apps", NULL);
+            webd_obj_add_str(client, "active_apps_reason", "af_active_app_unavailable");
+            continue;
+        }
+        if (mac[0] && json_object_object_get_ex(index, mac, &entry) && entry &&
+            json_object_object_get_ex(entry, "apps", &apps) && apps) {
+            struct json_object *field = NULL;
+
+            json_object_object_add(client, "active_apps", json_object_get(apps));
+            json_object_object_add(client, "active_app_count",
+                                   json_object_get(json_object_object_get(entry, "app_count")));
+            json_object_object_add(client, "active_apps_returned",
+                                   json_object_get(json_object_object_get(entry, "apps_returned")));
+            json_object_object_add(client, "active_flow_count",
+                                   json_object_get(json_object_object_get(entry, "flow_count")));
+            if (json_object_object_get_ex(entry, "apps_truncated", &field) && field)
+                json_object_object_add(client, "active_apps_truncated",
+                                       json_object_get(field));
+            if (json_object_object_get_ex(entry, "app_count_is_floor", &field) && field)
+                json_object_object_add(client, "active_app_count_is_floor",
+                                       json_object_get(field));
+            matched++;
+        } else {
+            json_object_object_add(client, "active_apps", json_object_new_array());
+            json_object_object_add(client, "active_app_count", json_object_new_int(0));
+            json_object_object_add(client, "active_apps_returned", json_object_new_int(0));
+            json_object_object_add(client, "active_flow_count", json_object_new_int(0));
+        }
+    }
+
+    if (!json_object_object_get_ex(resp, "meta", &meta) || !meta ||
+        !json_object_is_type(meta, json_type_object)) {
+        meta = webd_meta("webd.clients");
+        json_object_object_add(resp, "meta", meta);
+    }
+    json_object_object_add(meta, "with_apps", json_object_new_boolean(1));
+    json_object_object_add(meta, "active_apps_available",
+                           json_object_new_boolean(index != NULL));
+    if (index) {
+        json_object_object_add(meta, "active_apps_rows", json_object_new_int(rows));
+        json_object_object_add(meta, "active_apps_matched_clients",
+                               json_object_new_int(matched));
+        webd_obj_add_str(meta, "active_apps_source", "af_active_app");
+        json_object_put(index);
+    } else {
+        webd_obj_add_str(meta, "active_apps_source", "unavailable");
+        webd_obj_add_str(meta, "active_apps_reason", "af_active_app_unavailable");
+    }
+}
+
+/*
+ * Applies with_apps to a clients response.
+ *
+ * The cache holds the plain inventory and hands out shared references, so the
+ * merge has to happen on a private copy. Writing into the cached object would
+ * leak active_apps into every later request, including the ones that did not
+ * ask for it.
+ */
+static struct json_object *webd_clients_finish(struct json_object *resp, int with_apps)
+{
+    struct json_object *own;
+
+    if (!resp || !with_apps)
+        return resp;
+
+    own = webd_json_clone(resp);
+    if (!own) {
+        /* Clone failed. resp may be the shared cached object, so nothing is
+         * written into it: annotating it here would leak the note into later
+         * requests that never asked for with_apps. The caller gets the plain
+         * inventory, which is a correct client list without the rollup. */
+        return resp;
+    }
+    json_object_put(resp);
+    webd_clients_attach_apps(own);
+    return own;
+}
+
+static struct json_object *webd_clients_response(int *http_status, int with_apps)
 {
     int cache_age_ms = 0;
     int cache_stale = 0;
@@ -48007,7 +48908,7 @@ static struct json_object *webd_clients_response(int *http_status)
     struct json_object *clients = NULL;
 
     if (cached && !cache_stale)
-        return cached;
+        return webd_clients_finish(cached, with_apps);
     upstream = app_ubus_invoke_timeout("clients", NULL, 2500);
     data = webd_data_from_jmx_response(upstream);
     if (data && json_object_object_get_ex(data, "clients", &clients) && clients &&
@@ -48016,7 +48917,7 @@ static struct json_object *webd_clients_response(int *http_status)
         json_object_put(data);
         if (cached)
             json_object_put(cached);
-        return upstream;
+        return webd_clients_finish(upstream, with_apps);
     }
     if (data)
         json_object_put(data);
@@ -48028,7 +48929,7 @@ static struct json_object *webd_clients_response(int *http_status)
         json_object_put(cached);
         if (response) {
             webd_clients_mark_stale(response, cache_age_ms);
-            return response;
+            return webd_clients_finish(response, with_apps);
         }
     }
     if (http_status)
@@ -53479,6 +54380,11 @@ static void handle_client(int fd)
           strcmp(req.method, "GET") && strcmp(req.method, "HEAD")) ||
          (!strncmp(req.path, "/api/v1/ac/aps", 14) &&
           strcmp(req.method, "GET") && strcmp(req.method, "HEAD")) ||
+         /* Relay settings and enrollment change how the router is reachable from
+          * outside, so they get the same same-origin requirement as other
+          * privileged writes. */
+         (!strncmp(req.path, "/api/v1/cloud/", 14) &&
+          strcmp(req.method, "GET") && strcmp(req.method, "HEAD")) ||
          !strcmp(req.path, "/api/v1/auth/pair/approve")) &&
         !webd_cookie_write_csrf_ok(&req)) {
         struct json_object *err = webd_error("csrf_rejected",
@@ -57468,7 +58374,17 @@ static void handle_client(int fd)
     }
     /* ── Clients ── */
     else if (!strcmp(req.path, "/api/v1/clients")) {
-        resp = webd_clients_response(&status);
+        char with_apps[8] = {0};
+        int merge_apps = 0;
+
+        /* ?with_apps=1 folds each device's active applications into the same
+         * response, so the App does not need a second dashboard/snapshot call
+         * plus a client-side join by MAC. */
+        if (webd_query_get(req.query, "with_apps", with_apps, sizeof(with_apps)) &&
+            with_apps[0])
+            merge_apps = !strcmp(with_apps, "1") || !strcasecmp(with_apps, "true") ||
+                         !strcasecmp(with_apps, "yes");
+        resp = webd_clients_response(&status, merge_apps);
     }
     else if (!strcmp(req.path, "/api/v1/client_profile") && !strcmp(req.method, "GET")) {
         resp = webd_client_profile_response(&req);
@@ -57593,7 +58509,7 @@ static void handle_client(int fd)
             json_object_object_add(resp, "mac", json_object_new_string(mac_buf));
             json_object_object_add(resp, "action", json_object_new_string("block"));
             json_object_object_add(resp, "status", json_object_new_string(dry_run ? "dry_run" : (ok ? "applied" : "failed")));
-            jmx_app_audit_log("app", "", "client.block", "high", mac_buf, "", "");
+            jmx_app_audit_log_dry_run("client.block", "high", mac_buf, dry_run);
         } else if (!strcmp(action, "unblock")) {
             struct json_object *mac_rule = json_object_new_object();
             json_object_object_add(mac_rule, "mac", json_object_new_string(mac_buf));
@@ -57612,7 +58528,7 @@ static void handle_client(int fd)
             json_object_object_add(resp, "mac", json_object_new_string(mac_buf));
             json_object_object_add(resp, "action", json_object_new_string("unblock"));
             json_object_object_add(resp, "status", json_object_new_string(dry_run ? "dry_run" : (ok ? "applied" : "failed")));
-            jmx_app_audit_log("app", "", "client.unblock", "high", mac_buf, "", "");
+            jmx_app_audit_log_dry_run("client.unblock", "high", mac_buf, dry_run);
         } else if (!strcmp(action, "rate_limit")) {
             struct json_object *args = NULL;
             json_object_object_get_ex(body_json, "args", &args);
@@ -57653,7 +58569,7 @@ static void handle_client(int fd)
                 json_object_object_add(resp, "mac", json_object_new_string(mac_buf));
                 json_object_object_add(resp, "action", json_object_new_string("rate_limit"));
                 json_object_object_add(resp, "status", json_object_new_string(rc == 0 ? "applied" : "failed"));
-                jmx_app_audit_log("app", "", "client.rate_limit", "medium", mac_buf, "", "");
+                jmx_app_audit_log_dry_run("client.rate_limit", "medium", mac_buf, dry_run);
             }
         } else if (!strcmp(action, "rate_limit_remove")) {
             if (!dry_run) {
@@ -57673,7 +58589,7 @@ static void handle_client(int fd)
             }
             json_object_object_add(resp, "mac", json_object_new_string(mac_buf));
             json_object_object_add(resp, "action", json_object_new_string("rate_limit_remove"));
-            jmx_app_audit_log("app", "", "client.rate_limit_remove", "medium", mac_buf, "", "");
+            jmx_app_audit_log_dry_run("client.rate_limit_remove", "medium", mac_buf, dry_run);
         } else if (!strcmp(action, "dhcp_reserve")) {
             struct json_object *args = NULL;
             json_object_object_get_ex(body_json, "args", &args);
@@ -57710,7 +58626,7 @@ static void handle_client(int fd)
                 json_object_object_add(resp, "mac", json_object_new_string(mac_buf));
                 json_object_object_add(resp, "lan_id", json_object_new_string(lan_id));
                 json_object_object_add(resp, "action", json_object_new_string("dhcp_reserve"));
-                jmx_app_audit_log("app", "", "client.dhcp_reserve", "medium", mac_buf, "", "");
+                jmx_app_audit_log_dry_run("client.dhcp_reserve", "medium", mac_buf, dry_run);
             }
         } else if (!strcmp(action, "dhcp_release")) {
             struct json_object *args = NULL;
@@ -57735,9 +58651,12 @@ static void handle_client(int fd)
             json_object_object_add(resp, "mac", json_object_new_string(mac_buf));
             if (lan_id[0]) json_object_object_add(resp, "lan_id", json_object_new_string(lan_id));
             json_object_object_add(resp, "action", json_object_new_string("dhcp_release"));
-            jmx_app_audit_log("app", "", "client.dhcp_release", "medium", mac_buf, "", "");
+            jmx_app_audit_log_dry_run("client.dhcp_release", "medium", mac_buf, dry_run);
         } else if (!strcmp(action, "kick")) {
             char ip_buf[64] = {0};
+            char link_type[32] = {0};
+            char ssid_buf[64] = {0};
+            char port_buf[64] = {0};
             struct json_object *cp = json_object_new_object();
             json_object_object_add(cp, "mac", json_object_new_string(mac_buf));
             struct json_object *cr = app_ubus_invoke("client_get", cp);
@@ -57747,9 +58666,40 @@ static void handle_client(int fd)
                 json_object_object_get_ex(cr, "data", &cd);
                 struct json_object *co = NULL;
                 if (cd) json_object_object_get_ex(cd, "client", &co);
-                if (co) { const char *ip = app_nc_json_str(co, "ip", ""); if (ip[0]) snprintf(ip_buf, sizeof(ip_buf), "%s", ip); }
+                if (co) {
+                    const char *ip = app_nc_json_str(co, "ip", "");
+                    const char *link = app_nc_json_str(co, "link_type", "");
+                    const char *ssid = app_nc_json_str(co, "ssid", "");
+                    const char *port = app_nc_json_str(co, "port", "");
+
+                    if (ip[0]) snprintf(ip_buf, sizeof(ip_buf), "%s", ip);
+                    if (link[0]) snprintf(link_type, sizeof(link_type), "%s", link);
+                    if (ssid[0]) snprintf(ssid_buf, sizeof(ssid_buf), "%s", ssid);
+                    if (port[0]) snprintf(port_buf, sizeof(port_buf), "%s", port);
+                }
                 json_object_put(cr);
             }
+            /*
+             * A conntrack flush cannot end a wireless association: only the AP
+             * holding it can deauthenticate, and there is no AP action channel
+             * yet (dreamingwrt.ac reports ap_actions:false). So the claim
+             * "applied" is only defensible for a link this router itself owns.
+             *
+             * Deliberately not using is_wired: it is a persisted identity column
+             * that identityd never populates, so it reads false for every client
+             * on 30.1 including ones on eth0. link_type comes from the live
+             * network_state instead.
+             *
+             * link_type also defaults to "wired" when its collector has no
+             * evidence, so "wired" alone is not enough. A port name is the
+             * corroboration: a real switch port means this router forwards the
+             * frames. Anything else, including "unknown", is treated as
+             * not-provably-wired, which keeps the response honest by default
+             * rather than by luck.
+             */
+            int wired_link = link_type[0] && !strcmp(link_type, "wired") &&
+                             port_buf[0] && !ssid_buf[0];
+            int wireless = !wired_link;
             if (!ip_buf[0]) {
                 json_object_object_add(resp, "ok", json_object_new_boolean(0));
                 json_object_object_add(resp, "error", json_object_new_string("client_not_online"));
@@ -57759,16 +58709,68 @@ static void handle_client(int fd)
                 json_object_object_add(resp, "mac", json_object_new_string(mac_buf));
                 json_object_object_add(resp, "action", json_object_new_string("kick"));
                 json_object_object_add(resp, "status", json_object_new_string("dry_run"));
+                json_object_object_add(resp, "effect", json_object_new_string(
+                    wireless ? "conntrack_only" : "conntrack_flush"));
+                json_object_object_add(resp, "disconnected", json_object_new_boolean(0));
             } else {
                 int src_rc = app_run_conntrack_delete("-s", ip_buf);
                 int dst_rc = app_run_conntrack_delete("-d", ip_buf);
+                int cleared = (src_rc == 0 || dst_rc == 0);
 
                 json_object_object_add(resp, "ok", json_object_new_boolean(1));
                 json_object_object_add(resp, "mac", json_object_new_string(mac_buf));
                 json_object_object_add(resp, "action", json_object_new_string("kick"));
-                json_object_object_add(resp, "status", json_object_new_string("applied"));
-                json_object_object_add(resp, "note", json_object_new_string((src_rc == 0 || dst_rc == 0) ? "conntrack flushed" : "conntrack entries not found"));
-                jmx_app_audit_log("app", "", "client.kick", "medium", mac_buf, "", "");
+                json_object_object_add(resp, "cleared", json_object_new_boolean(cleared));
+                json_object_object_add(resp, "effect", json_object_new_string(
+                    wireless ? "conntrack_only" : "conntrack_flush"));
+                /* Report what actually happened. Claiming "applied" for a
+                 * client whose link this router does not own overstates the
+                 * result: the device keeps its link and resumes at once. */
+                if (wireless) {
+                    int known_wireless = link_type[0] && strcmp(link_type, "wired") != 0;
+
+                    json_object_object_add(resp, "status",
+                                           json_object_new_string("partially_applied"));
+                    json_object_object_add(resp, "disconnected", json_object_new_boolean(0));
+                    /* Two different situations, and the operator can act on the
+                     * difference: a known wireless station needs AP support,
+                     * while an unclassifiable link means the inventory itself is
+                     * incomplete. */
+                    json_object_object_add(resp, "reason", json_object_new_string(
+                        known_wireless ? "deauth_unsupported" : "link_ownership_unknown"));
+                    json_object_object_add(resp, "note", json_object_new_string(
+                        known_wireless
+                        ? (cleared
+                           ? "active connections were flushed, but the station stays associated to its AP; DreamingWrt cannot deauthenticate yet"
+                           : "no active connections to flush, and the station stays associated to its AP; DreamingWrt cannot deauthenticate yet")
+                        : (cleared
+                           ? "active connections were flushed; this router could not confirm it owns the client's link, so the client may stay connected"
+                           : "no active connections to flush, and this router could not confirm it owns the client's link, so the client may stay connected")));
+                } else {
+                    json_object_object_add(resp, "status",
+                                           json_object_new_string("applied"));
+                    json_object_object_add(resp, "disconnected", json_object_new_boolean(0));
+                    json_object_object_add(resp, "note", json_object_new_string(
+                        cleared
+                        ? "active connections were flushed; the wired link itself stays up"
+                        : "no active connections to flush; the wired link itself stays up"));
+                }
+                if (link_type[0])
+                    json_object_object_add(resp, "link_type", json_object_new_string(link_type));
+                /* The evidence behind the wired/wireless call, so a wrong answer
+                 * is diagnosable from the response instead of needing a device. */
+                webd_obj_add_str(resp, "link_evidence",
+                                 wired_link ? "link_type_and_port" :
+                                 (link_type[0] ? "link_type_only" : "none"));
+                if (port_buf[0])
+                    json_object_object_add(resp, "port", json_object_new_string(port_buf));
+                /* Keeps the existing before_hash note (which flush path ran)
+                 * while marking preflights so they cannot be read as real
+                 * disconnects. */
+                jmx_app_audit_log_full("app", "", "client.kick", "medium", mac_buf,
+                                       wireless ? "conntrack_only" : "conntrack_flush",
+                                       "", g_webd_audit_source_ip,
+                                       dry_run ? "dry_run" : "applied", "");
             }
         } else {
             json_object_object_add(resp, "ok", json_object_new_boolean(0));
@@ -57988,17 +58990,20 @@ static void handle_client(int fd)
         resp = webd_toolkit_exec("throughput-stop", body_json, device_id, 3000, &status);
     }
     /* ── Network Diagnostics ── */
+    /* These use app_ubus_route_or_error so a method the build never registered
+     * comes back as 501 method_not_registered instead of a generic failure the
+     * UI would show as "execution failed". */
     else if (!strcmp(req.path, "/api/v1/diagnostics/ping") && (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
-        resp = app_ubus_invoke("ping", body_json);
+        resp = app_ubus_route_or_error("dreamingwrt", "ping", body_json, 4000, &status);
     }
     else if (!strcmp(req.path, "/api/v1/diagnostics/traceroute") && (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
-        resp = app_ubus_invoke("traceroute", body_json);
+        resp = app_ubus_route_or_error("dreamingwrt", "traceroute", body_json, 30000, &status);
     }
     else if (!strcmp(req.path, "/api/v1/diagnostics/nslookup") && (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
-        resp = app_ubus_invoke("nslookup", body_json);
+        resp = app_ubus_route_or_error("dreamingwrt", "nslookup", body_json, 10000, &status);
     }
     else if (!strcmp(req.path, "/api/v1/diagnostics/speedtest") && (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
-        resp = app_ubus_invoke("speedtest", body_json);
+        resp = app_ubus_route_or_error("dreamingwrt", "speedtest", body_json, 5000, &status);
     }
     /* ── WiFi ── */
     else if (!strcmp(req.path, "/api/v1/wifi/config") && !strcmp(req.method, "GET")) {
@@ -58465,6 +59470,69 @@ static void handle_client(int fd)
     }
     else if (!strcmp(req.path, "/api/v1/logs/channels") && (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
         resp = app_ubus_ok_only("log_center_channels_set", body_json);
+    }
+    /* ── Cloud relay (remote access) ── */
+    else if (!strcmp(req.path, "/api/v1/cloud/status") && !strcmp(req.method, "GET")) {
+        resp = webd_cloud_component_response("status", NULL, &status);
+    }
+    else if (!strcmp(req.path, "/api/v1/cloud/identity") && !strcmp(req.method, "GET")) {
+        resp = webd_cloud_component_response("identity", NULL, &status);
+    }
+    else if (!strcmp(req.path, "/api/v1/cloud/config") &&
+             (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
+        resp = webd_cloud_config_write(body_json, &status);
+        jmx_app_audit_log(device_id[0] ? device_id : "http", device_id,
+            "cloud.config", status == 200 ? "high" : "medium", "", "", "");
+    }
+    else if (!strcmp(req.path, "/api/v1/cloud/enroll") && !strcmp(req.method, "POST")) {
+        struct json_object *args = json_object_new_object();
+        struct json_object *force = NULL;
+
+        /*
+         * force is opt-in: re-enrolling revokes the current token immediately, so
+         * an accidental call would drop a working tunnel. The component answers
+         * already_enrolled instead when force is absent.
+         */
+        if (args && json_object_object_get_ex(body_json, "force", &force) && force)
+            json_object_object_add(args, "force",
+                                   json_object_new_boolean(json_object_get_boolean(force)));
+        resp = webd_cloud_component_response("enroll", args, &status);
+        if (args)
+            json_object_put(args);
+        jmx_app_audit_log(device_id[0] ? device_id : "http", device_id,
+            "cloud.enroll", status == 200 ? "high" : "medium", "", "", "");
+    }
+    else if (!strcmp(req.path, "/api/v1/cloud/disable") && !strcmp(req.method, "POST")) {
+        struct json_object *confirm = NULL;
+
+        /*
+         * Disabling the relay makes every paired App lose remote access, so the
+         * caller has to confirm. The impact is stated in the refusal so the UI can
+         * show it without hardcoding a count it cannot see.
+         */
+        if (!json_object_object_get_ex(body_json, "confirm", &confirm) ||
+            !confirm || !json_object_get_boolean(confirm)) {
+            struct json_object *detail = NULL;
+
+            status = 409;
+            resp = webd_error("requires_confirm",
+                              "disabling remote access will cut off every paired App "
+                              "outside the LAN",
+                              "confirm", "webd.cloud");
+            if (json_object_object_get_ex(resp, "error", &detail) && detail)
+                json_object_object_add(detail, "impact",
+                                       json_object_new_string("remote_access_lost"));
+        } else {
+            struct json_object *args = json_object_new_object();
+
+            if (args)
+                json_object_object_add(args, "enabled", json_object_new_boolean(0));
+            resp = webd_cloud_config_write(args, &status);
+            if (args)
+                json_object_put(args);
+        }
+        jmx_app_audit_log(device_id[0] ? device_id : "http", device_id,
+            "cloud.disable", status == 200 ? "high" : "medium", "", "", "");
     }
     else if (!strcmp(req.path, "/api/v1/logs/delivery/stats") && !strcmp(req.method, "GET")) {
         resp = app_ubus_invoke("log_center_delivery_stats", NULL);
@@ -59320,6 +60388,14 @@ static void app_api_dispatch_ready(int fd, const char *method, const char *path,
             close(g_listen_fd.fd);
         if (g_event_fd.fd >= 0 && g_event_fd.fd != fd)
             close(g_event_fd.fd);
+        /* The child never owns the shared event socket: it exits through
+         * _exit(), so it cannot unlink the path, and dropping the inherited
+         * lock fd keeps a long-lived request from pinning the lock. */
+        g_event_socket_owned = 0;
+        if (g_event_lock_fd >= 0) {
+            close(g_event_lock_fd);
+            g_event_lock_fd = -1;
+        }
         if (g_app_db) {
             sqlite3_close(g_app_db);
             g_app_db = NULL;
@@ -59399,7 +60475,9 @@ static void app_api_pending_fd_cb(struct uloop_fd *ufd, unsigned int events)
         app_api_pending_error(fd, 400, "malformed request headers");
         return;
     }
-    pending->header[header_len] = '\0';
+    /* header_len is the offset of the body's first byte, and a single recv()
+     * commonly carries header and body together, so writing a terminator here
+     * would destroy body[0]. Framing is parsed with an explicit length. */
     if (http_content_length_from_raw(pending->header, (int)header_len,
                                      &content_len) != 0) {
         app_api_pending_error(fd, 400, "invalid HTTP message framing");
@@ -59478,6 +60556,13 @@ static void webd_ai_local_worker_prepare(void)
         close(g_listen_fd.fd);
     if (g_event_fd.fd >= 0)
         close(g_event_fd.fd);
+    /* Same rule as the request child: an AI worker never owns the shared
+     * event socket and must not keep the single-instance lock open. */
+    g_event_socket_owned = 0;
+    if (g_event_lock_fd >= 0) {
+        close(g_event_lock_fd);
+        g_event_lock_fd = -1;
+    }
     if (g_app_db) {
         sqlite3_close(g_app_db);
         g_app_db = NULL;
@@ -59611,7 +60696,16 @@ void jmx_app_api_done(void)
         uloop_fd_delete(&g_event_fd);
         close(g_event_fd.fd);
         g_event_fd.fd = -1;
-        unlink(APP_API_EVENT_SOCKET);
+        /* Only the owning instance may remove the shared path. A process that
+         * failed to take the lock never bound it and must not delete it. */
+        if (g_event_socket_owned)
+            unlink(APP_API_EVENT_SOCKET);
+    }
+    g_event_socket_owned = 0;
+    if (g_event_lock_fd >= 0) {
+        flock(g_event_lock_fd, LOCK_UN);
+        close(g_event_lock_fd);
+        g_event_lock_fd = -1;
     }
     jmx_cache_done();
     if (g_app_db) { sqlite3_close(g_app_db); g_app_db = NULL; }

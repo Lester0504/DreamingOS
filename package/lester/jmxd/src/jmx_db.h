@@ -46,7 +46,67 @@ int jmx_db_update_daily_usage_counter(const char *wan_id,
                                       unsigned long long tx_bytes,
                                       int online);
 
+/* Lifetime per-WAN byte totals that survive PPPoE interface rebuilds and 32-bit
+ * counter wrap.  rx_bytes/tx_bytes are monotonic; reset_count/last_reset_ts let
+ * a caller state honestly whether the underlying counter ever restarted. */
+struct jmx_wan_lifetime_usage {
+    int64_t first_seen_ts;
+    int64_t last_ts;
+    int64_t rx_bytes;
+    int64_t tx_bytes;
+    int reset_count;
+    int64_t last_reset_ts;
+    int sample_count;
+};
+
+int jmx_db_update_wan_lifetime_usage(const char *wan_id,
+                                     unsigned long long rx_bytes,
+                                     unsigned long long tx_bytes,
+                                     int online);
+int jmx_db_read_wan_lifetime_usage(const char *wan_id,
+                                   struct jmx_wan_lifetime_usage *out);
+/* Single place that publishes a WAN's cumulative byte counters, so no response
+ * builder can reintroduce the raw-counter zeroing on PPPoE reconnect. */
+void jmx_db_add_wan_cumulative_bytes(struct json_object *out, const char *wan_id,
+                                     int64_t device_rx_bytes,
+                                     int64_t device_tx_bytes);
+
 int jmx_db_write_wan_health(const char *name, int latency_ms, int loss_pct);
+
+/* Client liveness evidence, gathered by the caller from the DB row and the
+ * runtime client node. Kept separate from the decision so the ghost-client
+ * rules can be tested directly instead of through a SQLite row. */
+struct jmx_db_client_evidence {
+    int db_online;                 /* clients.online as stored */
+    int runtime_online;            /* runtime node claims online */
+    int64_t tx_rate;
+    int64_t rx_rate;
+    int connections;
+    int64_t sample_age_ms;         /* <0 when unknown */
+    int64_t last_seen_age;         /* seconds, <0 when unknown */
+    int bridge_fdb_present;        /* 1 present, 0 absent, -1 unreadable */
+    char neigh_state[32];          /* legacy shared field */
+    char neigh_state_v4[32];
+    char neigh_state_v6[32];
+    const char *runtime_online_source;
+};
+
+struct jmx_db_client_verdict {
+    int online;
+    int sample_valid;
+    int neigh_failed;
+    int neigh_reachable;
+    int has_active_evidence;
+    int64_t tx_rate;               /* zeroed when the sample is stale */
+    int64_t rx_rate;
+    int connections;
+    const char *offline_reason;    /* NULL when no specific reason applies */
+    const char *online_source;
+    const char *zero_reason;
+};
+
+void jmx_db_client_online_verdict(const struct jmx_db_client_evidence *ev,
+                                  struct jmx_db_client_verdict *out);
 
 int jmx_db_write_traffic_bucket(int64_t bucket_ts, int bucket_sec,
                                 const char *iface_name,

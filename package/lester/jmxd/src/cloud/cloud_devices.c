@@ -115,6 +115,55 @@ int cloud_devices_signing_key_known(const unsigned char *signing_key,
     return found;
 }
 
+/*
+ * Base64 Ed25519 public keys of every paired, enabled App.
+ *
+ * The keys are re-encoded from the parsed 32 raw bytes rather than passed
+ * through from the stored JSON, so a row with odd padding or whitespace cannot
+ * produce a string the relay decodes differently than this daemon validated.
+ */
+struct json_object *cloud_devices_signing_keys(void)
+{
+    sqlite3 *db = cloud_devices_db();
+    struct json_object *array;
+    sqlite3_stmt *st = NULL;
+    int emitted = 0;
+
+    array = json_object_new_array();
+    if (!array)
+        return NULL;
+    if (!db)
+        return array;
+    if (sqlite3_prepare_v2(db,
+            "SELECT public_key FROM app_devices "
+            "WHERE enabled=1 AND paired_at>0 AND public_key<>''",
+            -1, &st, NULL) != SQLITE_OK)
+        return array;
+
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *stored = sqlite3_column_text(st, 0);
+        unsigned char raw[CLOUD_ED25519_KEY_LEN];
+        char *encoded = NULL;
+
+        /* Bounded so a large pairing table cannot inflate the hello frame past
+         * the 64 KiB wire limit; the relay caps its own side at 64 keys. */
+        if (emitted >= CLOUD_MAX_AUTHORIZED_APPS)
+            break;
+        if (!stored)
+            continue;
+        if (cloud_devices_parse_signing_key((const char *)stored, raw) != 0)
+            continue;
+        if (cloud_base64_encode(raw, sizeof(raw), &encoded) == 0 && encoded) {
+            json_object_array_add(array, json_object_new_string(encoded));
+            free(encoded);
+            emitted++;
+        }
+        OPENSSL_cleanse(raw, sizeof(raw));
+    }
+    sqlite3_finalize(st);
+    return array;
+}
+
 int cloud_devices_count(int *out)
 {
     sqlite3 *db = cloud_devices_db();

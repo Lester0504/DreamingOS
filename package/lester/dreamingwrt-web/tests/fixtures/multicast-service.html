@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN" data-theme-resolved="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>multicast-cards-fixture-01</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/multicast-service.css">
+  <style>
+    :root {
+      --app-menu-glass-width: 48px;
+      --app-radius-card: 24px;
+      --app-radius-panel: 18px;
+      --app-radius-control: 12px;
+      --app-page-gap: 16px;
+      --app-text: rgb(239 245 252);
+      --app-text-secondary: rgb(214 224 238);
+      --app-text-muted: rgb(177 193 213);
+      --app-accent: rgb(46 139 255);
+      --color-text-primary: var(--app-text);
+      --color-text-secondary: var(--app-text-secondary);
+      --color-text-muted: var(--app-text-muted);
+      --color-accent: var(--app-accent);
+      --color-on-accent: white;
+      --color-danger: rgb(239 86 99);
+      --color-warning: rgb(238 177 52);
+      --color-border-control: rgb(255 255 255 / .2);
+      --color-border-subtle: rgb(255 255 255 / .12);
+      --color-surface-control: rgb(255 255 255 / .06);
+      --color-surface-stable: rgb(12 20 32 / .55);
+      --color-surface-dense: rgb(10 16 25 / .78);
+      --dwrt-glass-ink: var(--app-text);
+      --dwrt-glass-text: var(--app-text-secondary);
+      --dwrt-glass-muted: var(--app-text-muted);
+      --dwrt-kit-text: var(--app-text);
+      --dwrt-kit-muted: var(--app-text-muted);
+    }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body { color: var(--app-text); background: linear-gradient(135deg, rgb(17 48 79), rgb(80 44 29)); font-family: system-ui, sans-serif; }
+    .console-stage { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; }
+  </style>
+</head>
+<body>
+  <main class="console-stage is-multicast-service"><div class="route-preview" id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/multicast-service.js';
+
+    const root = document.getElementById('routePreview');
+    const writes = [];
+    const service = {
+      igmp_proxy: { enabled: true, version: '3', quick_leave: true, upstream: 'wan', downstreams: ['lan'], alt_subnets: ['0.0.0.0/0'] },
+      iptv_passthrough: { enabled: false, wan_iface: '', lan_iface: '', vlan_id: '', stb_ports: [], mode: 'bridge', keep_internet: true },
+      udpxy: {
+        enabled: true, listen_iface: 'lan', listen_port: 4022, source_iface: 'wan',
+        clients: 3, buffer_kb: 2048, max_clients: 64, status: 'running',
+        instances: [
+          { id: 'udpxy-1', name: 'IPTV', enabled: true, source_iface: 'wan', listen_iface: 'lan', listen_port: 4022, subscribe_interval: 30, external_access: false, status: 'running' }
+        ]
+      },
+      discovery: { mdns_reflector: true, ssdp_relay: false, igmp_snooping: true, mld_snooping: false, querier: false, query_interval: 125, allowed_groups: [
+        { id: 'allow-1', enabled: true, group: '239.0.0.0/8', source: '0.0.0.0/0', downstream: 'lan', remark: '运营商组播' }
+      ] },
+      status: { groups: 12, subscribers: 34, rx_rate: 5200000, tx_rate: 4100000, dropped: 7 },
+      group_state: [
+        { group: '239.1.1.1', source: '10.0.0.9', upstream: 'wan', downstream: 'lan', subscribers: 4, rate: 1500000, last_seen: 1785000000, client: '192.168.30.44' }
+      ],
+      capabilities: { service_update: true, service_apply: true },
+      runtime: { verified: true, state: 'running' }
+    };
+    const wans = { interfaces: [{ id: 'wan', label: 'WAN', device: 'eth0' }] };
+    const lans = { interfaces: [{ id: 'lan', label: 'LAN', device: 'br-lan' }] };
+    const ports = { interfaces: [{ id: 'lan1', label: 'LAN1', device: 'lan1' }] };
+
+    let readonlyMode = false;
+    const originalFetch = window.fetch.bind(window);
+
+    function json(data) {
+      return new Response(JSON.stringify({ ok: true, code: 2000, data }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    window.fetch = async (url, init = {}) => {
+      const target = new URL(url, location.href).pathname;
+      const method = String(init.method || 'GET').toUpperCase();
+      if (method !== 'GET') writes.push({ target, method, body: init.body || '' });
+      if (target === '/api/v1/network/wans') return json(wans);
+      if (target === '/api/v1/network/lans') return json(lans);
+      if (target === '/api/v1/network/ports') return json(ports);
+      if (target.startsWith('/api/v1/services/multicast')) {
+        return json(readonlyMode ? { ...service, capabilities: {}, runtime: {} } : service);
+      }
+      return originalFetch(url, init);
+    };
+
+    const ui = {
+      mountAll: node => window.DWRT_UI_KIT.mountAll(node),
+      lucideIcon: (...args) => window.DWRT_UI_KIT.lucideIcon(...args),
+      statusBadgeMarkup: (...args) => window.DWRT_UI_KIT.statusBadgeMarkup(...args),
+      overviewCardsMarkup: (...args) => window.DWRT_UI_KIT.overviewCardsMarkup(...args),
+      floatingSavebarMarkup: (...args) => window.DWRT_UI_KIT.floatingSavebarMarkup(...args),
+      confirmationMarkup: (...args) => window.DWRT_UI_KIT.confirmationMarkup(...args),
+      // The shell injects this for real routes; mirroring it here makes a page that forgets
+      // to register sampled regions fail in the fixture instead of on the device.
+      scheduleAdaptiveForegroundSample: (delay = 0, scopeRoot = root) => {
+        setTimeout(() => {
+          const scope = scopeRoot || root;
+          if (!scope) return;
+          const nodes = [
+            ...(scope.matches?.('[data-adaptive-sample]') ? [scope] : []),
+            ...scope.querySelectorAll('[data-adaptive-sample]')
+          ];
+          nodes.forEach(node => node.setAttribute('data-adaptive-region', 'light'));
+        }, delay);
+      }
+    };
+    const utils = { escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]) };
+
+    let instance = mount({ root, item: { id: 'multicast-service' }, ui, utils });
+
+    window.MULTICAST_FIXTURE = {
+      writes,
+      async ready() {
+        for (let index = 0; index < 80; index += 1) {
+          if (root.querySelector('.multicast-settings-surface') && !root.textContent.includes('正在读取组播服务')) return true;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        return false;
+      },
+      async remount(mode = 'ready') {
+        instance?.unmount?.();
+        readonlyMode = mode === 'readonly';
+        root.innerHTML = '';
+        instance = mount({ root, item: { id: 'multicast-service' }, ui, utils });
+        await this.ready();
+        return root.innerText;
+      },
+      unmount() { instance?.unmount?.(); instance = null; }
+    };
+  </script>
+</body>
+</html>

@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN" data-theme-resolved="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>qwrt-modules-fixture-01</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-control-material.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/qwrt-modules.css">
+  <style>
+    :root {
+      --app-menu-glass-width: 48px;
+      --app-radius-card: 24px;
+      --app-radius-panel: 18px;
+      --app-radius-control: 12px;
+      --app-page-gap: 16px;
+      --app-text: rgb(239 245 252);
+      --app-text-secondary: rgb(214 224 238);
+      --app-text-muted: rgb(177 193 213);
+      --app-accent: rgb(46 139 255);
+      --color-text-primary: var(--app-text);
+      --color-text-secondary: var(--app-text-secondary);
+      --color-text-muted: var(--app-text-muted);
+      --color-accent: var(--app-accent);
+      --color-on-accent: white;
+      --color-danger: rgb(239 86 99);
+      --color-warning: rgb(238 177 52);
+      --color-border-control: rgb(255 255 255 / .2);
+      --color-border-subtle: rgb(255 255 255 / .12);
+      --color-surface-control: rgb(255 255 255 / .06);
+      --color-surface-stable: rgb(12 20 32 / .55);
+      --color-surface-dense: rgb(10 16 25 / .78);
+      --dwrt-glass-ink: var(--app-text);
+      --dwrt-glass-text: var(--app-text-secondary);
+      --dwrt-glass-muted: var(--app-text-muted);
+      --dwrt-kit-text: var(--app-text);
+      --dwrt-kit-muted: var(--app-text-muted);
+    }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body { color: var(--app-text); background: linear-gradient(135deg, rgb(17 48 79), rgb(80 44 29)); font-family: system-ui, sans-serif; }
+    .console-stage { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; }
+  </style>
+</head>
+<body>
+  <main class="console-stage is-qwrt-modules"><div class="route-preview" id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/qwrt-modules.js';
+
+    const root = document.getElementById('routePreview');
+    const writes = [];
+
+    // Shapes mirror jmx_cellular_service_get / jmx_cellular_runtime_status.
+    const populated = {
+      global: { enabled: true, default_slot: 'slot_1', failover_mode: 'probe', failover_threshold: 3, probe_interval: 60, probe_host: '8.8.8.8', updated_at: 1785000000 },
+      slots: [
+        { id: 'slot_1', name: '主卡 China Mobile 5G 模组', modem_path: '/org/freedesktop/ModemManager1/Modem/0', dev_type: 'pcie', enabled: true, sim_id: 'sim0', iccid: '89860000000000000001', imei: '350000000000001', operator: 'China Mobile Communications', signal: 72, apn: 'cmnet', auth_type: 'none', username: '', password: '', pincode: '', network_type: 'nr5g', roaming: false, mTU: 1500, dial_num: '*99#', remark: '楼上主用', sort_order: 0, updated_at: 1785000000 },
+        { id: 'slot_2', name: '备卡', modem_path: '', dev_type: 'usb', enabled: false, sim_id: '', iccid: '', imei: '', operator: '', signal: 0, apn: '3gnet', auth_type: 'chap', username: 'card', password: 'secret', pincode: '', network_type: 'lte', roaming: true, mTU: 1428, dial_num: '*99#', remark: '', sort_order: 1, updated_at: 0 }
+      ],
+      apn_profiles: [
+        { id: 'apn_1', name: '移动 cmnet', apn: 'cmnet', auth_type: 'none', username: '', password: '', dial_num: '*99#', network_type: 'auto', remark: '默认', updated_at: 1785000000 }
+      ],
+      sms: [
+        { id: 'sms_1', slot_id: 'slot_1', direction: 'inbox', phone: '10086', content: '您的本月流量已使用 82%，请注意查询余量。', timestamp: 1785000000, read_flag: false, updated_at: 1785000000 }
+      ]
+    };
+    const empty = { global: { ...populated.global, default_slot: '', failover_mode: 'none' }, slots: [], apn_profiles: [], sms: [] };
+    const runtimeMissing = { modemmanager: 'missing', mmcli: false, runtime: 'pending_modemmanager_integration', at_write: 'disabled_until_whitelist' };
+    const runtimeReady = { modemmanager: 'available', mmcli: true, runtime: 'probe_available', at_write: 'disabled_until_whitelist' };
+
+    let mode = 'populated';
+    const originalFetch = window.fetch.bind(window);
+
+    function json(data, status = 200, code = 2000) {
+      return new Response(JSON.stringify({ ok: true, code, data }), { status, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    window.fetch = async (url, init = {}) => {
+      const target = new URL(url, location.href).pathname;
+      const method = String(init.method || 'GET').toUpperCase();
+      if (method !== 'GET') writes.push({ target, method, body: init.body || '' });
+      if (target === '/api/v1/services/cellular/status') {
+        if (mode === 'runtime-error') return new Response('{}', { status: 500 });
+        return json(mode === 'ready' ? runtimeReady : runtimeMissing);
+      }
+      if (target === '/api/v1/services/cellular' && method === 'GET') {
+        if (mode === 'unimplemented') return new Response('{}', { status: 404 });
+        if (mode === 'expired') return new Response('{}', { status: 401 });
+        return json(mode === 'empty' ? empty : populated);
+      }
+      if (target.startsWith('/api/v1/services/cellular')) return json({ ok: true, saved: true, applied: true });
+      return originalFetch(url, init);
+    };
+
+    const ui = {
+      mountAll: node => window.DWRT_UI_KIT.mountAll(node),
+      lucideIcon: (...args) => window.DWRT_UI_KIT.lucideIcon(...args),
+      statusBadgeMarkup: (...args) => window.DWRT_UI_KIT.statusBadgeMarkup(...args),
+      overviewCardsMarkup: (...args) => window.DWRT_UI_KIT.overviewCardsMarkup(...args),
+      floatingSavebarMarkup: (...args) => window.DWRT_UI_KIT.floatingSavebarMarkup(...args),
+      confirmationMarkup: (...args) => window.DWRT_UI_KIT.confirmationMarkup(...args),
+      scheduleAdaptiveForegroundSample: (delay = 0, scopeRoot = root) => {
+        setTimeout(() => {
+          const scope = scopeRoot || root;
+          if (!scope) return;
+          const nodes = [
+            ...(scope.matches?.('[data-adaptive-sample]') ? [scope] : []),
+            ...scope.querySelectorAll('[data-adaptive-sample]')
+          ];
+          nodes.forEach(node => node.setAttribute('data-adaptive-region', 'light'));
+        }, delay);
+      }
+    };
+    const utils = { escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]) };
+
+    let instance = mount({ root, item: { id: 'qwrt-modules' }, ui, utils });
+
+    window.QWRT_FIXTURE = {
+      writes,
+      async ready() {
+        for (let index = 0; index < 80; index += 1) {
+          const settled = root.querySelector('.qwrt-settings-surface, .dwrt-kit-state-panel');
+          if (settled && !root.textContent.includes('正在读取蜂窝模组')) return true;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        return false;
+      },
+      async remount(next = 'populated') {
+        instance?.unmount?.();
+        mode = next;
+        root.innerHTML = '';
+        instance = mount({ root, item: { id: 'qwrt-modules' }, ui, utils });
+        await this.ready();
+        return root.innerText;
+      },
+      async selectTab(tab) {
+        root.querySelector(`[data-qwrt-tab="${tab}"]`)?.click();
+        await new Promise(resolve => setTimeout(resolve, 60));
+        return root.innerText;
+      },
+      async openSlotSheet(id) {
+        root.querySelector(`[data-qwrt-slot-edit="${id}"]`)?.click();
+        await new Promise(resolve => setTimeout(resolve, 60));
+        return Boolean(root.querySelector('.qwrt-sheet'));
+      },
+      unmount() { instance?.unmount?.(); instance = null; }
+    };
+  </script>
+</body>
+</html>

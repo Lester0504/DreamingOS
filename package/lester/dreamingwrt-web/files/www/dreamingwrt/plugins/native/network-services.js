@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260724-dns-01';
+  const VERSION = '20260802-ui-batch-01';
   const service = ({ 'dhcp-service': 'dhcp', 'dns-service': 'dns', 'upnp-service': 'upnp' })[context.item?.id] || 'dhcp';
   const MODULE_CLASS = `is-${service}`;
   const stage = root?.closest('.console-stage');
@@ -59,8 +59,30 @@ export function mount(context = {}) {
     editor: {},
     confirmDelete: false,
     policyReadback: false,
-    dnsGroup: 'core'
+    dnsGroup: 'core',
+    pollTimer: 0
   };
+
+  /*
+   * 手动刷新按钮按用户第 9 条删除。DHCP 租约与 DNS 运行态都会自己变，
+   * 所以补一条可见性受控的轮询；有未保存草稿、抽屉或删除确认时跳过。
+   */
+  function startPolling() {
+    stopPolling();
+    state.pollTimer = window.setInterval(() => {
+      if (!state.mounted) return;
+      if (document.hidden) return;
+      if (state.loading || state.refreshing || state.saving) return;
+      if (state.dirty || state.dirtyPolicies.size || state.drawer || state.confirmDelete) return;
+      load(true);
+    }, 15000);
+  }
+
+  function stopPolling() {
+    if (!state.pollTimer) return;
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = 0;
+  }
 
   function firstText(...values) {
     for (const value of values) {
@@ -116,6 +138,15 @@ export function mount(context = {}) {
     return [];
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -123,7 +154,7 @@ export function mount(context = {}) {
   }
 
   async function requestJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
       credentials: 'same-origin', cache: 'no-store', signal: context.signal, ...options,
       headers: authHeaders({ ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) })
     });
@@ -233,6 +264,8 @@ export function mount(context = {}) {
       domain: firstText(rawDhcp.domain),
       options: asArray(rawDhcp.options),
       reservations: asArray(rawDhcp.reservations || rawDhcp.static_leases).map((item, itemIndex) => ({ ...item, id: firstText(item.id, item.mac, `reservation-${itemIndex + 1}`) })),
+      access: asArray(rawDhcp.allow_deny_list || rawDhcp.access_list),
+      prefixes: asArray(rawDhcp.prefix_reservations || rawDhcp.prefixes),
       leases: asArray(rawDhcp.leases),
       raw: source
     };
@@ -320,7 +353,7 @@ export function mount(context = {}) {
     const seq = ++state.seq;
     state.error = '';
     if (background) state.refreshing = true; else state.loading = true;
-    if (!background) render(); else patchRefreshButton();
+    if (!background) render();
     try {
       if (service === 'dhcp') {
         let standaloneDhcp = true;
@@ -375,7 +408,7 @@ export function mount(context = {}) {
 
   function toolbarMarkup(options = {}) {
     const search = options.search !== false;
-    return `<div class="network-service-toolbar">${search ? `<label class="policy-search policy-search-main" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-network-service-search value="${escapeHtml(state.query)}" placeholder="${escapeHtml(options.placeholder || '搜索当前列表')}"></label>` : ''}<div class="policy-toolbar-actions"><button class="policy-filter-button network-service-refresh" type="button" data-network-service-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '正在刷新' : '刷新'}</span></button>${options.create ? `<button class="policy-create-button" type="button" data-network-service-create ${options.disabled ? 'disabled' : ''}>${icon('plus')}<span>${escapeHtml(options.create)}</span></button>` : ''}</div></div>`;
+    return `<div class="network-service-toolbar">${search ? `<label class="policy-search policy-search-main" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-network-service-search value="${escapeHtml(state.query)}" placeholder="${escapeHtml(options.placeholder || '搜索当前列表')}"></label>` : ''}<div class="policy-toolbar-actions">${options.create ? `<button class="policy-create-button" type="button" data-network-service-create ${options.disabled ? 'disabled' : ''}>${icon('plus')}<span>${escapeHtml(options.create)}</span></button>` : ''}</div></div>`;
   }
 
   function currentToolbarOptions() {
@@ -459,16 +492,16 @@ export function mount(context = {}) {
     }
     if (state.tab === 'access') {
       const source = [...(data.whitelist || []).map((item) => ({ ...item, kind: '白名单' })), ...(data.blacklist || []).map((item) => ({ ...item, kind: '黑名单' }))];
-      const rows = source.filter((item) => matchesQuery([item.kind, item.name, item.hostname, item.mac, item.note, item.reason])).map((item) => `<tr><td>${status(item.kind, item.kind === '白名单')}</td><td><strong>${escapeHtml(firstText(item.name, item.hostname, item.mac, '--'))}</strong></td><td>${escapeHtml(item.mac || '--')}</td><td>${escapeHtml(firstText(item.note, item.reason, '--'))}</td></tr>`);
-      return `${data.capabilities?.allow_deny_list === true ? '' : capabilityNotice('后端尚未返回 DHCP 黑白名单能力和数据契约。')}${tableShell('DHCP 黑白名单', '终端准入控制', ['类型', '名称', 'MAC', '备注'], rows, { empty: '后端尚未提供黑白名单数据' })}`;
+      const rows = source.filter((item) => matchesQuery([item.kind, item.name, item.hostname, item.mac, item.note, item.reason, item.scope, item.lan_id])).map((item) => `<tr><td>${status(item.kind, item.kind === '白名单')}</td><td><strong>${escapeHtml(firstText(item.name, item.hostname, item.mac, '--'))}</strong></td><td>${escapeHtml(item.mac || '--')}</td><td>${escapeHtml(firstText(item.scope, item.scope_id, item.lan_id, '--'))}</td><td>${escapeHtml(firstText(item.note, item.remark, item.reason, '--'))}</td><td>${status(item.enabled === false ? '停用' : '启用', item.enabled !== false)}</td><td><button class="network-service-icon-button" type="button" data-dhcp-access="${escapeHtml(item.id)}" aria-label="编辑 DHCP 准入规则">${icon('edit')}</button></td></tr>`);
+      return `${data.capabilities?.allow_deny_list === true ? '' : capabilityNotice('后端尚未返回 DHCP 黑白名单能力和数据契约。')}${tableShell('DHCP 黑白名单', '终端准入控制', ['类型', '名称', 'MAC', '作用域', '备注', '状态', '操作'], rows, { empty: '暂无 DHCP 黑白名单规则' })}`;
     }
     if (state.tab === 'clients') {
       const source = scopes.flatMap((scope) => scope.leases.map((item) => ({ ...item, scope })));
       const rows = source.filter((item) => matchesQuery([item.hostname, item.name, item.mac, item.ip, item.scope.name])).map((item) => `<tr><td><strong>${escapeHtml(firstText(item.hostname, item.name, '--'))}</strong></td><td>${escapeHtml(item.mac || '--')}</td><td>${escapeHtml(item.ip || '--')}</td><td>${escapeHtml(item.scope.name)}</td><td>${status(item.online === false ? '离线' : '在线', item.online !== false)}</td><td>${escapeHtml(formatTime(item.expires))}</td></tr>`);
       return `${!data.capabilities?.lease_read ? capabilityNotice('独立 DHCP 接口未开放，当前 LAN 接口不包含实时租约。') : ''}${tableShell('DHCP 客户端', data.capabilities?.lease_read ? 'dnsmasq 运行态租约' : '等待租约读取能力', ['终端', 'MAC', 'IP', '作用域', '状态', '到期'], rows, { empty: data.capabilities?.lease_read ? '暂无 DHCP 客户端' : '后端尚未提供运行态租约' })}`;
     }
-    const rows = (data.prefixes || []).filter((item) => matchesQuery([item.name, item.duid, item.prefix, item.scope, item.remark])).map((item) => `<tr><td><strong>${escapeHtml(firstText(item.name, '--'))}</strong></td><td>${escapeHtml(item.duid || '--')}</td><td>${escapeHtml(item.prefix || '--')}</td><td>${escapeHtml(firstText(item.scope, item.lan_id, '--'))}</td><td>${escapeHtml(item.remark || '--')}</td><td>${status(item.enabled === false ? '停用' : '启用', item.enabled !== false)}</td></tr>`);
-    return `${data.capabilities?.dhcpv6_static_prefix === true ? '' : capabilityNotice('后端尚未提供 DHCPv6 前缀静态分配的读取和写入契约。')}${tableShell('DHCPv6 前缀静态分配', '按 DUID 固定委派前缀', ['名称', 'DUID', 'IPv6 前缀', '作用域', '备注', '状态'], rows, { empty: '后端尚未提供 DHCPv6 前缀数据' })}`;
+    const rows = (data.prefixes || []).filter((item) => matchesQuery([item.name, item.duid, item.prefix, item.scope, item.remark])).map((item) => `<tr><td><strong>${escapeHtml(firstText(item.name, '--'))}</strong></td><td>${escapeHtml(item.duid || '--')}</td><td>${escapeHtml(item.prefix || '--')}</td><td>${escapeHtml(firstText(item.scope, item.scope_id, item.lan_id, '--'))}</td><td>${escapeHtml(item.remark || '--')}</td><td>${status(item.enabled === false ? '停用' : '启用', item.enabled !== false)}</td><td><button class="network-service-icon-button" type="button" data-dhcp-prefix="${escapeHtml(item.id)}" aria-label="编辑 DHCPv6 静态前缀">${icon('edit')}</button></td></tr>`);
+    return `${data.capabilities?.dhcpv6_static_prefix === true ? '' : capabilityNotice('后端尚未提供 DHCPv6 前缀静态分配的读取和写入契约。')}${tableShell('DHCPv6 前缀静态分配', '按 DUID 固定委派前缀', ['名称', 'DUID', 'IPv6 前缀', '作用域', '备注', '状态', '操作'], rows, { empty: '暂无 DHCPv6 静态前缀' })}`;
   }
 
   function dnsRuleTypeLabel(type) {
@@ -603,7 +636,7 @@ export function mount(context = {}) {
     const content = writable
       ? `<label class="network-service-setting-row is-editor"><span><strong>启用 DHCP</strong><small>关闭后停止在该作用域分配地址</small></span>${switchControl('editor.enabled', editor.enabled)}</label><div class="network-service-form">${fieldMarkup('接口', 'editor.interface', editor.interface, { wide: true, disabled: true })}${fieldMarkup('地址池', 'editor.pool', editor.pool, { wide: true, placeholder: '192.168.30.100-192.168.30.249' })}${fieldMarkup('排除地址', 'editor.excludePool', editor.excludePool, { wide: true, placeholder: '逗号分隔' })}${fieldMarkup('网关', 'editor.gateway', editor.gateway, { wide: true })}${fieldMarkup('子网掩码', 'editor.netmask', editor.netmask, { wide: true })}${fieldMarkup('首选 DNS', 'editor.dns1', editor.dns1, { wide: true })}${fieldMarkup('备用 DNS', 'editor.dns2', editor.dns2, { wide: true })}${fieldMarkup('租期（分钟）', 'editor.lease', editor.lease, { type: 'number' })}${fieldMarkup('本地域名', 'editor.domain', editor.domain, { wide: true })}</div>`
       : `<dl class="network-service-detail-list">${values.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value || '--')}</dd></div>`).join('')}</dl>${capabilityNotice('后端未开放 DHCP 作用域写入。')}`;
-    return `${drawerBackdrop('关闭 DHCP 详情')}<aside class="network-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open"><header class="dwrt-kit-sheet-header"><div><span>DHCP SCOPE</span><strong>${escapeHtml(scope.name)}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-network-service-close>×</button></header><div class="dwrt-kit-sheet-body network-service-drawer-body"><section class="network-service-drawer-hero"><span>${icon('network')}</span><div><strong>${escapeHtml(scope.pool || '地址池未配置')}</strong><small>${escapeHtml(scope.interface || scope.lanId)}</small></div>${status(scope.enabled ? '启用' : '关闭', scope.enabled)}</section>${content}${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-network-service-close>取消</button>${writable ? `<button class="policy-primary" type="button" data-dhcp-scope-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存并应用'}</button>` : ''}</footer></aside>`;
+    return `${drawerBackdrop('关闭 DHCP 详情')}<aside class="network-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot"><header class="dwrt-kit-sheet-header"><div><span>DHCP SCOPE</span><strong>${escapeHtml(scope.name)}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-network-service-close>×</button></header><div class="dwrt-kit-sheet-body network-service-drawer-body"><section class="network-service-drawer-hero"><span>${icon('network')}</span><div><strong>${escapeHtml(scope.pool || '地址池未配置')}</strong><small>${escapeHtml(scope.interface || scope.lanId)}</small></div>${status(scope.enabled ? '启用' : '关闭', scope.enabled)}</section>${content}${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-network-service-close>取消</button>${writable ? `<button class="policy-primary" type="button" data-dhcp-scope-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存并应用'}</button>` : ''}</footer></aside>`;
   }
 
   function dnsEditorDrawer() {
@@ -615,7 +648,7 @@ export function mount(context = {}) {
     const fields = upstream
       ? `${fieldMarkup('名称', 'editor.name', editor.name, { wide: true, placeholder: '例如 AliDNS', disabled: !writable, adaptive: true })}${fieldMarkup('地址', 'editor.address', editor.address, { wide: true, placeholder: '223.5.5.5 或 DoH URL', disabled: !writable, adaptive: true })}${fieldMarkup('协议', 'editor.protocol', editor.protocol, { type: 'select', options: protocols.map((item) => [item, item.toUpperCase()]), disabled: !writable, adaptive: true })}${fieldMarkup('端口', 'editor.port', editor.port, { type: 'number', disabled: !writable, adaptive: true })}${fieldMarkup('分组', 'editor.group', editor.group, { wide: true, placeholder: '默认', disabled: !writable, adaptive: true })}`
       : `${fieldMarkup('域名', 'editor.domain', editor.domain, { wide: true, placeholder: 'nas.lan 或 example.com', disabled: !writable, adaptive: true })}${fieldMarkup('类型', 'editor.type', editor.type, { type: 'select', options: [['host', '本地域名'], ['forward', '域名转发'], ['block', '拦截'], ['upstream', '指定上游']], disabled: !writable, adaptive: true })}${fieldMarkup('目标', 'editor.target', editor.target, { wide: true, placeholder: 'IP、DNS 服务器或上游 ID', disabled: !writable, adaptive: true })}${fieldMarkup('备注', 'editor.remark', editor.remark, { wide: true, disabled: !writable, adaptive: true })}`;
-    return `${drawerBackdrop('关闭 DNS 编辑')}<aside class="network-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open"><header class="dwrt-kit-sheet-header"><div><span>${upstream ? 'UPSTREAM DNS' : 'DNS RULE'}</span><strong>${escapeHtml(editor._new ? (upstream ? '添加上游 DNS' : '新建 DNS 规则') : (upstream ? '编辑上游 DNS' : '编辑 DNS 规则'))}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-network-service-close>×</button></header><div class="dwrt-kit-sheet-body network-service-drawer-body"><label class="network-service-setting-row is-editor" data-adaptive-region><span><strong>启用</strong><small>停用后保留配置但不参与解析</small></span>${switchControl('editor.enabled', editor.enabled, !writable)}</label><div class="network-service-form">${fields}</div>${!writable ? capabilityNotice('后端未声明 DNS 完整快照保存与应用能力。') : ''}${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer network-service-editor-footer">${editor._new || !writable ? '<span></span>' : '<button class="policy-secondary danger" type="button" data-network-service-delete>删除</button>'}<div><button class="policy-secondary" type="button" data-network-service-close>取消</button><button class="policy-primary" type="button" data-network-service-editor-save ${!writable ? 'disabled' : ''}>保存到草稿</button></div></footer></aside>`;
+    return `${drawerBackdrop('关闭 DNS 编辑')}<aside class="network-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot"><header class="dwrt-kit-sheet-header"><div><span>${upstream ? 'UPSTREAM DNS' : 'DNS RULE'}</span><strong>${escapeHtml(editor._new ? (upstream ? '添加上游 DNS' : '新建 DNS 规则') : (upstream ? '编辑上游 DNS' : '编辑 DNS 规则'))}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-network-service-close>×</button></header><div class="dwrt-kit-sheet-body network-service-drawer-body"><label class="network-service-setting-row is-editor" data-adaptive-region><span><strong>启用</strong><small>停用后保留配置但不参与解析</small></span>${switchControl('editor.enabled', editor.enabled, !writable)}</label><div class="network-service-form">${fields}</div>${!writable ? capabilityNotice('后端未声明 DNS 完整快照保存与应用能力。') : ''}${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer network-service-editor-footer">${editor._new || !writable ? '<span></span>' : '<button class="policy-secondary danger" type="button" data-network-service-delete>删除</button>'}<div><button class="policy-secondary" type="button" data-network-service-close>取消</button><button class="policy-primary" type="button" data-network-service-editor-save ${!writable ? 'disabled' : ''}>保存到草稿</button></div></footer></aside>`;
   }
 
   function dnsDeleteConfirmationMarkup() {
@@ -636,18 +669,29 @@ export function mount(context = {}) {
   function upnpMappingDrawer() {
     if (service !== 'upnp' || state.drawer !== 'upnp-mapping') return '';
     const editor = state.editor;
-    return `${drawerBackdrop('关闭端口映射')}<aside class="network-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open"><header class="dwrt-kit-sheet-header"><div><span>PORT MAPPING</span><strong>${escapeHtml(editor._new ? '新建端口映射' : '编辑端口映射')}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-network-service-close>×</button></header><div class="dwrt-kit-sheet-body network-service-drawer-body"><label class="network-service-setting-row is-editor"><span><strong>启用映射</strong><small>保存到静态 UPnP 映射表</small></span>${switchControl('editor.enabled', editor.enabled)}</label><div class="network-service-form">${fieldMarkup('协议', 'editor.protocol', editor.protocol, { type: 'select', options: [['tcp', 'TCP'], ['udp', 'UDP']] })}${fieldMarkup('外部端口', 'editor.external_port', editor.external_port, { type: 'number' })}${fieldMarkup('内部 IP', 'editor.internal_ip', editor.internal_ip, { wide: true, placeholder: '192.168.30.100' })}${fieldMarkup('内部端口', 'editor.internal_port', editor.internal_port, { type: 'number' })}${fieldMarkup('租期（秒）', 'editor.lease', editor.lease, { type: 'number' })}${fieldMarkup('客户端', 'editor.client', editor.client, { wide: true })}${fieldMarkup('描述', 'editor.description', editor.description, { wide: true })}</div>${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer network-service-editor-footer">${editor._new ? '<span></span>' : `<button class="policy-secondary danger" type="button" data-network-service-delete>${state.confirmDelete ? '再次点击删除' : '删除'}</button>`}<div><button class="policy-secondary" type="button" data-network-service-close>取消</button><button class="policy-primary" type="button" data-network-service-editor-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存映射'}</button></div></footer></aside>`;
+    return `${drawerBackdrop('关闭端口映射')}<aside class="network-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot"><header class="dwrt-kit-sheet-header"><div><span>PORT MAPPING</span><strong>${escapeHtml(editor._new ? '新建端口映射' : '编辑端口映射')}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-network-service-close>×</button></header><div class="dwrt-kit-sheet-body network-service-drawer-body"><label class="network-service-setting-row is-editor"><span><strong>启用映射</strong><small>保存到静态 UPnP 映射表</small></span>${switchControl('editor.enabled', editor.enabled)}</label><div class="network-service-form">${fieldMarkup('协议', 'editor.protocol', editor.protocol, { type: 'select', options: [['tcp', 'TCP'], ['udp', 'UDP']] })}${fieldMarkup('外部端口', 'editor.external_port', editor.external_port, { type: 'number' })}${fieldMarkup('内部 IP', 'editor.internal_ip', editor.internal_ip, { wide: true, placeholder: '192.168.30.100' })}${fieldMarkup('内部端口', 'editor.internal_port', editor.internal_port, { type: 'number' })}${fieldMarkup('租期（秒）', 'editor.lease', editor.lease, { type: 'number' })}${fieldMarkup('客户端', 'editor.client', editor.client, { wide: true })}${fieldMarkup('描述', 'editor.description', editor.description, { wide: true })}</div>${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer network-service-editor-footer">${editor._new ? '<span></span>' : `<button class="policy-secondary danger" type="button" data-network-service-delete>${state.confirmDelete ? '再次点击删除' : '删除'}</button>`}<div><button class="policy-secondary" type="button" data-network-service-close>取消</button><button class="policy-primary" type="button" data-network-service-editor-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存映射'}</button></div></footer></aside>`;
   }
 
   function serviceEditorDrawer() {
     if (state.drawer === 'dhcp-reservation') {
       const editor = state.editor;
       const scope = state.draft.scopes.find((item) => item.id === editor.scope_id) || state.draft.scopes[0];
-      return `${drawerBackdrop('关闭静态分配编辑')}<aside class="network-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open"><header class="dwrt-kit-sheet-header"><div><span>DHCP RESERVATION</span><strong>${escapeHtml(editor._new ? '添加静态分配' : '编辑静态分配')}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-network-service-close>×</button></header><div class="dwrt-kit-sheet-body network-service-drawer-body"><label class="network-service-setting-row is-editor"><span><strong>启用</strong><small>启用后由 dnsmasq 固定分配地址</small></span>${switchControl('editor.enabled', editor.enabled)}</label><div class="network-service-form">${fieldMarkup('名称', 'editor.name', editor.name, { wide: true })}${fieldMarkup('MAC', 'editor.mac', editor.mac, { wide: true, placeholder: 'aa:bb:cc:dd:ee:ff' })}${fieldMarkup('IP', 'editor.ip', editor.ip, { wide: true, placeholder: '192.168.30.100' })}${fieldMarkup('作用域', 'editor.scope_id', scope?.id || '', { type: 'select', options: state.draft.scopes.map((item) => [item.id, item.name]) })}${fieldMarkup('备注', 'editor.remark', editor.remark, { wide: true })}</div>${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer network-service-editor-footer">${editor._new || state.draft.capabilities?.reservation_delete !== true ? '<span></span>' : `<button class="policy-secondary danger" type="button" data-network-service-delete>${state.confirmDelete ? '再次点击删除' : '删除'}</button>`}<div><button class="policy-secondary" type="button" data-network-service-close>取消</button><button class="policy-primary" type="button" data-network-service-editor-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存并应用'}</button></div></footer></aside>`;
+      return `${drawerBackdrop('关闭静态分配编辑')}<aside class="network-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot"><header class="dwrt-kit-sheet-header"><div><span>DHCP RESERVATION</span><strong>${escapeHtml(editor._new ? '添加静态分配' : '编辑静态分配')}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-network-service-close>×</button></header><div class="dwrt-kit-sheet-body network-service-drawer-body"><label class="network-service-setting-row is-editor"><span><strong>启用</strong><small>启用后由 dnsmasq 固定分配地址</small></span>${switchControl('editor.enabled', editor.enabled)}</label><div class="network-service-form">${fieldMarkup('名称', 'editor.name', editor.name, { wide: true })}${fieldMarkup('MAC', 'editor.mac', editor.mac, { wide: true, placeholder: 'aa:bb:cc:dd:ee:ff' })}${fieldMarkup('IP', 'editor.ip', editor.ip, { wide: true, placeholder: '192.168.30.100' })}${fieldMarkup('作用域', 'editor.scope_id', scope?.id || '', { type: 'select', options: state.draft.scopes.map((item) => [item.id, item.name]), disabled: !editor._new })}${fieldMarkup('备注', 'editor.remark', editor.remark, { wide: true })}</div>${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer network-service-editor-footer">${editor._new || state.draft.capabilities?.reservation_delete !== true ? '<span></span>' : `<button class="policy-secondary danger" type="button" data-network-service-delete>${state.confirmDelete ? '再次点击删除' : '删除'}</button>`}<div><button class="policy-secondary" type="button" data-network-service-close>取消</button><button class="policy-primary" type="button" data-network-service-editor-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存并应用'}</button></div></footer></aside>`;
+    }
+    if (state.drawer === 'dhcp-access') {
+      const editor = state.editor;
+      const scope = state.draft.scopes.find((item) => item.id === editor.scope_id) || state.draft.scopes[0];
+      return `${drawerBackdrop('关闭 DHCP 准入规则')}<aside class="network-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot"><header class="dwrt-kit-sheet-header"><div><span>DHCP ACCESS</span><strong>${escapeHtml(editor._new ? '添加 DHCP 准入规则' : '编辑 DHCP 准入规则')}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-network-service-close>×</button></header><div class="dwrt-kit-sheet-body network-service-drawer-body"><label class="network-service-setting-row is-editor"><span><strong>启用规则</strong><small>启用后写入当前 DHCP 作用域的准入控制</small></span>${switchControl('editor.enabled', editor.enabled)}</label><div class="network-service-form">${fieldMarkup('动作', 'editor.action', editor.action, { type: 'select', options: [['allow', '允许'], ['deny', '阻止']] })}${fieldMarkup('作用域', 'editor.scope_id', scope?.id || '', { type: 'select', options: state.draft.scopes.map((item) => [item.id, item.name]), disabled: !editor._new })}${fieldMarkup('名称', 'editor.name', editor.name, { wide: true, placeholder: '例如 办公电脑' })}${fieldMarkup('MAC', 'editor.mac', editor.mac, { wide: true, placeholder: 'aa:bb:cc:dd:ee:ff' })}${fieldMarkup('排序', 'editor.sort_order', editor.sort_order, { type: 'number' })}${fieldMarkup('备注', 'editor.remark', firstText(editor.remark, editor.note), { wide: true })}</div>${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer network-service-editor-footer">${editor._new ? '<span></span>' : `<button class="policy-secondary danger" type="button" data-network-service-delete>${state.confirmDelete ? '再次点击删除' : '删除'}</button>`}<div><button class="policy-secondary" type="button" data-network-service-close>取消</button><button class="policy-primary" type="button" data-network-service-editor-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存并应用'}</button></div></footer></aside>`;
+    }
+    if (state.drawer === 'dhcp-prefix') {
+      const editor = state.editor;
+      const scope = state.draft.scopes.find((item) => item.id === editor.scope_id) || state.draft.scopes[0];
+      const duidParts = String(editor.duid || '').split('%');
+      return `${drawerBackdrop('关闭 DHCPv6 静态前缀')}<aside class="network-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot"><header class="dwrt-kit-sheet-header"><div><span>DHCPV6 PREFIX</span><strong>${escapeHtml(editor._new ? '添加 DHCPv6 静态前缀' : '编辑 DHCPv6 静态前缀')}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-network-service-close>×</button></header><div class="dwrt-kit-sheet-body network-service-drawer-body"><label class="network-service-setting-row is-editor"><span><strong>启用前缀</strong><small>启用后由 odhcpd 按 DUID 委派固定前缀</small></span>${switchControl('editor.enabled', editor.enabled)}</label><div class="network-service-form">${fieldMarkup('名称', 'editor.name', editor.name, { wide: true })}${fieldMarkup('作用域', 'editor.scope_id', scope?.id || '', { type: 'select', options: state.draft.scopes.map((item) => [item.id, item.name]), disabled: !editor._new })}${fieldMarkup('DUID', 'editor.duid', duidParts[0] || '', { wide: true, placeholder: '仅十六进制字符' })}${fieldMarkup('IAID', 'editor.iaid', firstText(editor.iaid, duidParts[1]), { placeholder: '可选，十六进制' })}${fieldMarkup('IPv6 前缀', 'editor.prefix', editor.prefix, { wide: true, placeholder: '2001:db8:1234:1::/64', help: '必须属于所选 LAN 的父前缀，长度为 /33 至 /64。' })}${fieldMarkup('Host ID', 'editor.hostid', editor.hostid, { placeholder: '父前缀不可探测时必填' })}${fieldMarkup('租期（分钟）', 'editor.lease_minutes', editor.lease_minutes, { type: 'number' })}${fieldMarkup('排序', 'editor.sort_order', editor.sort_order, { type: 'number' })}${fieldMarkup('备注', 'editor.remark', editor.remark, { wide: true })}</div>${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer network-service-editor-footer">${editor._new ? '<span></span>' : `<button class="policy-secondary danger" type="button" data-network-service-delete>${state.confirmDelete ? '再次点击删除' : '删除'}</button>`}<div><button class="policy-secondary" type="button" data-network-service-close>取消</button><button class="policy-primary" type="button" data-network-service-editor-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存并应用'}</button></div></footer></aside>`;
     }
     if (state.drawer === 'upnp-acl') {
       const editor = state.editor;
-      return `${drawerBackdrop('关闭 ACL 编辑')}<aside class="network-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open"><header class="dwrt-kit-sheet-header"><div><span>UPNP ACL</span><strong>${escapeHtml(editor._new ? '新建 ACL' : '编辑 ACL')}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-network-service-close>×</button></header><div class="dwrt-kit-sheet-body network-service-drawer-body"><label class="network-service-setting-row is-editor"><span><strong>启用</strong><small>停用后保留规则但不写入 miniupnpd</small></span>${switchControl('editor.enabled', editor.enabled)}</label><div class="network-service-form">${fieldMarkup('动作', 'editor.action', editor.action, { type: 'select', options: [['allow', '允许'], ['deny', '拒绝']] })}${fieldMarkup('外部端口', 'editor.external', editor.external, { wide: true, placeholder: '1024-65535' })}${fieldMarkup('内部网段', 'editor.internal', editor.internal, { wide: true, placeholder: '192.168.30.0/24' })}${fieldMarkup('内部端口', 'editor.internal_ports', editor.internal_ports, { wide: true, placeholder: '1024-65535' })}${fieldMarkup('排序', 'editor.sort_order', editor.sort_order, { type: 'number' })}${fieldMarkup('备注', 'editor.remark', editor.remark, { wide: true })}</div>${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer network-service-editor-footer">${editor._new || state.draft.capabilities?.acl_delete !== true ? '<span></span>' : `<button class="policy-secondary danger" type="button" data-network-service-delete>${state.confirmDelete ? '再次点击删除' : '删除'}</button>`}<div><button class="policy-secondary" type="button" data-network-service-close>取消</button><button class="policy-primary" type="button" data-network-service-editor-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存并应用'}</button></div></footer></aside>`;
+      return `${drawerBackdrop('关闭 ACL 编辑')}<aside class="network-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot"><header class="dwrt-kit-sheet-header"><div><span>UPNP ACL</span><strong>${escapeHtml(editor._new ? '新建 ACL' : '编辑 ACL')}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-network-service-close>×</button></header><div class="dwrt-kit-sheet-body network-service-drawer-body"><label class="network-service-setting-row is-editor"><span><strong>启用</strong><small>停用后保留规则但不写入 miniupnpd</small></span>${switchControl('editor.enabled', editor.enabled)}</label><div class="network-service-form">${fieldMarkup('动作', 'editor.action', editor.action, { type: 'select', options: [['allow', '允许'], ['deny', '拒绝']] })}${fieldMarkup('外部端口', 'editor.external', editor.external, { wide: true, placeholder: '1024-65535' })}${fieldMarkup('内部网段', 'editor.internal', editor.internal, { wide: true, placeholder: '192.168.30.0/24' })}${fieldMarkup('内部端口', 'editor.internal_ports', editor.internal_ports, { wide: true, placeholder: '1024-65535' })}${fieldMarkup('排序', 'editor.sort_order', editor.sort_order, { type: 'number' })}${fieldMarkup('备注', 'editor.remark', editor.remark, { wide: true })}</div>${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer network-service-editor-footer">${editor._new || state.draft.capabilities?.acl_delete !== true ? '<span></span>' : `<button class="policy-secondary danger" type="button" data-network-service-delete>${state.confirmDelete ? '再次点击删除' : '删除'}</button>`}<div><button class="policy-secondary" type="button" data-network-service-close>取消</button><button class="policy-primary" type="button" data-network-service-editor-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存并应用'}</button></div></footer></aside>`;
     }
     return '';
   }
@@ -675,14 +719,6 @@ export function mount(context = {}) {
     workbench.scrollTop = scrollTop;
     ui.mountAll?.(workbench);
     ui.scheduleAdaptiveForegroundSample?.(20, workbench);
-  }
-
-  function patchRefreshButton() {
-    const button = root?.querySelector('[data-network-service-refresh]');
-    if (!button) return;
-    button.disabled = state.refreshing;
-    const span = button.querySelector('span');
-    if (span) span.textContent = state.refreshing ? '正在刷新' : '刷新';
   }
 
   function patchList() {
@@ -798,6 +834,72 @@ export function mount(context = {}) {
     render();
   }
 
+  function dhcpScopePayload(scope, collection = {}) {
+    return {
+      lan_id: scope.lanId || scope.id,
+      dhcp: {
+        id: scope.id,
+        enabled: scope.enabled,
+        pool: scope.pool,
+        exclude_pool: scope.excludePool,
+        gateway: scope.gateway,
+        netmask: scope.netmask,
+        dns1: scope.dns1,
+        dns2: scope.dns2,
+        lease: scope.lease,
+        domain: scope.domain,
+        options: scope.options,
+        ...collection
+      }
+    };
+  }
+
+  function openDhcpAccess(id = '') {
+    const item = [...(state.draft.whitelist || []), ...(state.draft.blacklist || [])]
+      .find((entry) => String(entry.id) === String(id));
+    const scope = state.draft.scopes.find((entry) => entry.id === firstText(item?.scope_id, item?.scope, item?.lan_id)) || state.draft.scopes[0];
+    state.editor = clone(item || {
+      id: `access-${Date.now()}`,
+      action: 'allow',
+      name: '',
+      mac: '',
+      remark: '',
+      enabled: true,
+      sort_order: scope?.access?.length || 0
+    });
+    state.editor.scope_id = scope?.id || '';
+    state.editor._original_scope_id = scope?.id || '';
+    state.editor._new = !item;
+    state.drawer = 'dhcp-access';
+    state.confirmDelete = false;
+    state.notice = '';
+    render();
+  }
+
+  function openDhcpPrefix(id = '') {
+    const item = (state.draft.prefixes || []).find((entry) => String(entry.id) === String(id));
+    const scope = state.draft.scopes.find((entry) => entry.id === firstText(item?.scope_id, item?.scope, item?.lan_id)) || state.draft.scopes[0];
+    state.editor = clone(item || {
+      id: `prefix-${Date.now()}`,
+      name: '',
+      duid: '',
+      iaid: '',
+      prefix: '',
+      hostid: '',
+      remark: '',
+      enabled: true,
+      lease_minutes: scope?.lease || 120,
+      sort_order: scope?.prefixes?.length || 0
+    });
+    state.editor.scope_id = scope?.id || '';
+    state.editor._original_scope_id = scope?.id || '';
+    state.editor._new = !item;
+    state.drawer = 'dhcp-prefix';
+    state.confirmDelete = false;
+    state.notice = '';
+    render();
+  }
+
   async function saveDhcpScope() {
     const scope = state.selected;
     const editor = clone(state.editor);
@@ -840,7 +942,7 @@ export function mount(context = {}) {
     state.saving = true;
     render();
     try {
-      await requestJson(ENDPOINTS.dhcp, { method: 'PUT', body: JSON.stringify({ lan_id: scope.lanId || scope.id, dhcp: { ...scope.raw, id: scope.id, enabled: scope.enabled, pool: scope.pool, exclude_pool: scope.excludePool, gateway: scope.gateway, netmask: scope.netmask, dns1: scope.dns1, dns2: scope.dns2, lease: scope.lease, domain: scope.domain, options: scope.options, reservations } }) });
+      await requestJson(ENDPOINTS.dhcp, { method: 'PUT', body: JSON.stringify(dhcpScopePayload(scope, { reservations })) });
       state.saving = false;
       state.drawer = '';
       state.notice = '静态分配已保存并应用';
@@ -868,6 +970,122 @@ export function mount(context = {}) {
     } catch (error) {
       state.saving = false;
       state.notice = `删除失败：${firstText(error.message, '后端未接受操作')}`;
+      state.noticeTone = 'bad';
+      render();
+    }
+  }
+
+  async function saveDhcpAccess() {
+    const editor = clone(state.editor);
+    const scope = state.draft.scopes.find((item) => item.id === editor.scope_id);
+    if (!scope || !editor.mac || !['allow', 'deny'].includes(editor.action)) {
+      state.notice = '动作、MAC 和作用域不能为空';
+      state.noticeTone = 'bad';
+      render();
+      return;
+    }
+    delete editor._new;
+    delete editor._original_scope_id;
+    delete editor.scope;
+    delete editor.scope_id;
+    delete editor.lan_id;
+    const access = (scope.access || []).filter((item) => item.id !== editor.id);
+    access.push(editor);
+    state.saving = true;
+    render();
+    try {
+      await requestJson(ENDPOINTS.dhcp, { method: 'PUT', body: JSON.stringify(dhcpScopePayload(scope, { allow_deny_list: access })) });
+      state.saving = false;
+      state.drawer = '';
+      state.notice = 'DHCP 准入规则已保存并应用';
+      state.noticeTone = 'ok';
+      await load(true);
+    } catch (error) {
+      state.saving = false;
+      state.notice = `保存失败：${firstText(error.message, '后端未接受 DHCP 准入规则')}`;
+      state.noticeTone = 'bad';
+      render();
+    }
+  }
+
+  async function deleteDhcpAccess() {
+    if (!state.confirmDelete) { state.confirmDelete = true; render(); return; }
+    const scope = state.draft.scopes.find((item) => item.id === state.editor._original_scope_id);
+    if (!scope) return;
+    state.saving = true;
+    render();
+    try {
+      const access = (scope.access || []).filter((item) => item.id !== state.editor.id);
+      await requestJson(ENDPOINTS.dhcp, { method: 'PUT', body: JSON.stringify(dhcpScopePayload(scope, { allow_deny_list: access })) });
+      state.saving = false;
+      state.drawer = '';
+      state.notice = 'DHCP 准入规则已删除并应用';
+      state.noticeTone = 'ok';
+      await load(true);
+    } catch (error) {
+      state.saving = false;
+      state.notice = `删除失败：${firstText(error.message, '后端未接受 DHCP 准入规则')}`;
+      state.noticeTone = 'bad';
+      render();
+    }
+  }
+
+  async function saveDhcpPrefix() {
+    const editor = clone(state.editor);
+    const scope = state.draft.scopes.find((item) => item.id === editor.scope_id);
+    const duid = firstText(editor.duid).replace(/[^0-9a-f]/gi, '').toLowerCase();
+    const iaid = firstText(editor.iaid).replace(/[^0-9a-f]/gi, '').toLowerCase();
+    const prefixLength = Number(String(editor.prefix || '').split('/')[1]);
+    if (!scope || !editor.name || !duid || !editor.prefix || !Number.isInteger(prefixLength)) {
+      state.notice = '名称、DUID、IPv6 前缀和作用域不能为空';
+      state.noticeTone = 'bad';
+      render();
+      return;
+    }
+    delete editor._new;
+    delete editor._original_scope_id;
+    delete editor.scope;
+    delete editor.scope_id;
+    delete editor.lan_id;
+    editor.duid = `${duid}${iaid ? `%${iaid}` : ''}`;
+    editor.iaid = iaid;
+    editor.prefix_len = prefixLength;
+    const prefixes = (scope.prefixes || []).filter((item) => item.id !== editor.id);
+    prefixes.push(editor);
+    state.saving = true;
+    render();
+    try {
+      await requestJson(ENDPOINTS.dhcp, { method: 'PUT', body: JSON.stringify(dhcpScopePayload(scope, { prefix_reservations: prefixes })) });
+      state.saving = false;
+      state.drawer = '';
+      state.notice = 'DHCPv6 静态前缀已保存并应用';
+      state.noticeTone = 'ok';
+      await load(true);
+    } catch (error) {
+      state.saving = false;
+      state.notice = `保存失败：${firstText(error.message, '后端未接受 DHCPv6 静态前缀')}`;
+      state.noticeTone = 'bad';
+      render();
+    }
+  }
+
+  async function deleteDhcpPrefix() {
+    if (!state.confirmDelete) { state.confirmDelete = true; render(); return; }
+    const scope = state.draft.scopes.find((item) => item.id === state.editor._original_scope_id);
+    if (!scope) return;
+    state.saving = true;
+    render();
+    try {
+      const prefixes = (scope.prefixes || []).filter((item) => item.id !== state.editor.id);
+      await requestJson(ENDPOINTS.dhcp, { method: 'PUT', body: JSON.stringify(dhcpScopePayload(scope, { prefix_reservations: prefixes })) });
+      state.saving = false;
+      state.drawer = '';
+      state.notice = 'DHCPv6 静态前缀已删除并应用';
+      state.noticeTone = 'ok';
+      await load(true);
+    } catch (error) {
+      state.saving = false;
+      state.notice = `删除失败：${firstText(error.message, '后端未接受 DHCPv6 静态前缀')}`;
       state.noticeTone = 'bad';
       render();
     }
@@ -1061,7 +1279,6 @@ export function mount(context = {}) {
   }
 
   function onClick(event) {
-    if (event.target.closest('[data-network-service-refresh]')) { load(true); return; }
     if (event.target.closest('[data-dwrt-confirm-cancel], [data-dwrt-modal-close]')) { state.confirmDelete = false; render(); return; }
     if (event.target.closest('[data-dwrt-confirm-accept]') && state.confirmDelete === 'dns') { confirmDnsDelete(); return; }
     const dnsGroup = event.target.closest('[data-dns-group-toggle]');
@@ -1095,17 +1312,25 @@ export function mount(context = {}) {
     if (mapping) { openUpnpMapping(mapping.dataset.upnpEditMapping); return; }
     const reservation = event.target.closest('[data-dhcp-reservation]');
     if (reservation) { openDhcpReservation(reservation.dataset.dhcpReservation, reservation.dataset.dhcpReservationScope); return; }
+    const access = event.target.closest('[data-dhcp-access]');
+    if (access) { openDhcpAccess(access.dataset.dhcpAccess); return; }
+    const prefix = event.target.closest('[data-dhcp-prefix]');
+    if (prefix) { openDhcpPrefix(prefix.dataset.dhcpPrefix); return; }
     const acl = event.target.closest('[data-upnp-edit-acl]');
     if (acl) { openUpnpAcl(acl.dataset.upnpEditAcl); return; }
     if (event.target.closest('[data-network-service-create]')) {
       if (service === 'dns') openDnsEditor(state.tab === 'upstreams' ? 'upstream' : 'rule');
       else if (service === 'dhcp' && state.tab === 'reservations') openDhcpReservation();
+      else if (service === 'dhcp' && state.tab === 'access') openDhcpAccess();
+      else if (service === 'dhcp' && state.tab === 'prefixes') openDhcpPrefix();
       else if (service === 'upnp' && state.tab === 'access') openUpnpAcl();
       else if (service === 'upnp') openUpnpMapping();
       return;
     }
     if (event.target.closest('[data-network-service-editor-save]')) {
       if (state.drawer === 'dhcp-reservation') saveDhcpReservation();
+      else if (state.drawer === 'dhcp-access') saveDhcpAccess();
+      else if (state.drawer === 'dhcp-prefix') saveDhcpPrefix();
       else if (state.drawer === 'upnp-acl') saveUpnpAcl();
       else if (service === 'dns') saveDnsEditor();
       else if (service === 'upnp') saveUpnpMapping();
@@ -1113,6 +1338,8 @@ export function mount(context = {}) {
     }
     if (event.target.closest('[data-network-service-delete]')) {
       if (state.drawer === 'dhcp-reservation') deleteDhcpReservation();
+      else if (state.drawer === 'dhcp-access') deleteDhcpAccess();
+      else if (state.drawer === 'dhcp-prefix') deleteDhcpPrefix();
       else if (state.drawer === 'upnp-acl') deleteUpnpAcl();
       else if (service === 'dns') deleteDnsEditor();
       else if (service === 'upnp') deleteUpnpMapping();
@@ -1193,12 +1420,14 @@ export function mount(context = {}) {
   stage?.classList.add('is-network-services');
   render();
   load();
+  startPolling();
 
   return {
     refresh() { return load(true); },
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      stopPolling();
       root.removeEventListener('click', onClick);
       root.removeEventListener('input', onInput);
       root.removeEventListener('change', onChange);

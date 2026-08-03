@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
   const fetchApi = api.fetch || (async (name, url) => {
-    const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+    const response = await sessionFetch(url, { credentials: 'same-origin', cache: 'no-store' });
     const json = await response.json().catch(() => ({}));
     return { name, ok: response.ok && json?.ok !== false, data: json?.data ?? json, raw: json };
   });
@@ -262,13 +262,22 @@ export function mount(context = {}) {
     const data = result?.data || {};
     return data.data && typeof data.data === 'object' ? data.data : data;
   }
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
     return { Accept: 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(typeof api.authHeaders === 'function' ? api.authHeaders() : {}), ...extra };
   }
   async function requestJson(url, options = {}) {
-    const response = await fetch(url, {
+    const response = await sessionFetch(url, {
       credentials: 'same-origin', cache: 'no-store', ...options,
       headers: authHeaders({ ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) })
     });

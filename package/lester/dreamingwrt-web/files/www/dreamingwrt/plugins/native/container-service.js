@@ -1,4 +1,4 @@
-const VERSION = '20260719-05';
+const VERSION = '20260802-ui-batch-01';
 const ENDPOINT = '/api/v1/container_service';
 const REFRESH_MS = 5000;
 
@@ -76,6 +76,15 @@ export function mount(context = {}) {
     return current || {};
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -93,7 +102,7 @@ export function mount(context = {}) {
       if (!result?.ok) throw result?.error || new Error('容器服务接口不可用');
       return unwrap(result.data ?? result.raw ?? {});
     }
-    const response = await fetch(`${ENDPOINT}?v=${VERSION}`, {
+    const response = await sessionFetch(`${ENDPOINT}?v=${VERSION}`, {
       credentials: 'same-origin',
       cache: 'no-store',
       headers: authHeaders()
@@ -209,7 +218,7 @@ export function mount(context = {}) {
 
   function toolbar() {
     const searchable = state.tab !== 'overview' && state.tab !== 'config';
-    return `<header class="container-service-header">${tabs()}<div class="container-service-actions">${searchable ? `<label class="policy-search policy-search-main container-service-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-container-search value="${escapeHtml(state.query)}" placeholder="搜索当前列表" autocomplete="off"></label>` : ''}<button class="policy-filter-button" type="button" data-container-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '正在刷新' : '刷新'}</span></button></div></header>`;
+    return `<header class="container-service-header">${tabs()}<div class="container-service-actions">${searchable ? `<label class="policy-search policy-search-main container-service-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-container-search value="${escapeHtml(state.query)}" placeholder="搜索当前列表" autocomplete="off"></label>` : ''}</div></header>`;
   }
 
   function statusPill(value) {
@@ -328,20 +337,11 @@ export function mount(context = {}) {
     current.replaceWith(template.content.firstElementChild);
   }
 
-  function patchRefresh() {
-    const button = root?.querySelector('[data-container-refresh]');
-    if (!button) return;
-    button.disabled = state.refreshing;
-    const label = button.querySelector('span');
-    if (label) label.textContent = state.refreshing ? '正在刷新' : '刷新';
-  }
-
   async function load(explicit = false) {
     if (!state.mounted || state.refreshing) return;
     const seq = ++state.seq;
     state.refreshing = true;
     state.error = '';
-    patchRefresh();
     try {
       const next = normalize(await requestJson());
       if (!state.mounted || seq !== state.seq) return;
@@ -351,7 +351,7 @@ export function mount(context = {}) {
       state.signature = signature;
       state.loading = false;
       state.refreshing = false;
-      if (changed || explicit) render(); else patchRefresh();
+      if (changed || explicit) render();
     } catch (error) {
       if (!state.mounted || seq !== state.seq) return;
       state.loading = false;
@@ -370,7 +370,6 @@ export function mount(context = {}) {
       requestAnimationFrame(() => root?.querySelector(`[data-container-tab="${state.tab}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' }));
       return;
     }
-    if (event.target.closest('[data-container-refresh]')) load(true);
   }
 
   function onInput(event) {

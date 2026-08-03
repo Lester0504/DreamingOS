@@ -57,6 +57,17 @@ static const struct route_risk g_route_risks[] = {
     { "/api/v1/system/ttyd",           "PUT",      JMX_RISK_MEDIUM },
     { "/terminal",                     "GET,HEAD,POST", JMX_RISK_MEDIUM },
     { "/api/v1/auth/pair/approve",     "POST", JMX_RISK_HIGH },
+    /*
+     * Cloud relay. Reading identity and status is harmless routing metadata, but
+     * the writes decide whether this router is reachable from the internet and
+     * which credential it uses, so they are owner-only rather than falling
+     * through to the default MEDIUM for unlisted writes.
+     */
+    { "/api/v1/cloud/status",          "GET",  JMX_RISK_LOW },
+    { "/api/v1/cloud/identity",        "GET",  JMX_RISK_LOW },
+    { "/api/v1/cloud/config",          "POST,PUT", JMX_RISK_HIGH },
+    { "/api/v1/cloud/enroll",          "POST", JMX_RISK_HIGH },
+    { "/api/v1/cloud/disable",         "POST", JMX_RISK_HIGH },
     { "/api/v1/system/kernel/restore-defaults", "POST,PUT", JMX_RISK_HIGH },
     { "/api/v1/system/advanced/cpu-interrupt",  "GET", JMX_RISK_LOW },
     { "/api/v1/system/advanced/cpu-interrupt",  "POST,PUT", JMX_RISK_HIGH },

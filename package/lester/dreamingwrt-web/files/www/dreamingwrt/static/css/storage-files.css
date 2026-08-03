@@ -4,7 +4,7 @@
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
   width: 100%;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block) var(--app-page-gutter-inline);
   overflow: hidden;
@@ -263,7 +263,7 @@
 .storage-file-row-actions button:hover { color: var(--app-text); background: var(--dwrt-interactive-hover-bg); box-shadow: inset 0 0 0 1px var(--dwrt-interactive-hover-border); }
 .storage-file-row-actions button.danger:hover { color: #ff7f8d; background: rgba(255,82,104,.10); }
 
-.storage-file-drawer { --dwrt-kit-sheet-z: 76; --dwrt-kit-sheet-width: min(92vw, 720px); }
+.storage-file-drawer { --dwrt-kit-sheet-z: 76; --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-wide); }
 .storage-file-drawer.dwrt-kit-sheet {
   position: fixed;
   inset: 0 0 0 auto;

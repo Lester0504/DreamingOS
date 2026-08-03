@@ -1,4 +1,4 @@
-const SYSTEM_USERS_VERSION = '20260729-user-avatar-01';
+const SYSTEM_USERS_VERSION = '20260802-ui-batch-01';
 
 function avatarText(value) {
   if (value === undefined || value === null) return '';
@@ -82,7 +82,8 @@ export function mount(context = {}) {
     notice: '',
     currentUsername: '',
     avatarRevision: Date.now(),
-    seq: 0
+    seq: 0,
+    pollTimer: 0
   };
 
   function firstText(...values) {
@@ -125,6 +126,15 @@ export function mount(context = {}) {
     return current || {};
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -132,7 +142,7 @@ export function mount(context = {}) {
   }
 
   async function requestJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
       credentials: 'same-origin',
       cache: 'no-store',
       ...options,
@@ -368,10 +378,14 @@ export function mount(context = {}) {
     </tr>`;
   }
 
-  function renderToolbar() {
+  /*
+   * 控件全部收进表格工具条（用户第 9 条），页面级 header 取消；
+   * 手动刷新按钮删除，数据由 startPolling() 的轮询和写操作后的读回驱动。
+   */
+  function renderToolbarControls() {
     const permissions = permissionOptions();
-    return `<header class="policy-toolbar system-users-toolbar">
-      <label class="policy-search policy-search-main" data-dwrt-component="expand-search">${icon('search')}<input type="search" data-system-user-search placeholder="搜索姓名、邮箱、角色或权限" value="${escapeHtml(state.query)}"></label>
+    return `<div class="system-users-toolbar-controls">
+      <label class="dwrt-kit-expand-search system-users-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-system-user-search placeholder="搜索姓名、邮箱、角色或权限" value="${escapeHtml(state.query)}"></label>
       <div class="policy-toolbar-actions system-users-toolbar-actions">
         <label class="system-users-filter"><span>管理员权限</span><select data-system-user-permission><option value="all">全部权限</option>${permissions.map((item) => `<option value="${escapeHtml(item)}" ${state.permission === item ? 'selected' : ''}>${escapeHtml(item)}</option>`).join('')}</select></label>
         <button class="policy-filter-button" type="button" data-system-user-groups>${icon('users')}<span>管理组</span></button>
@@ -384,13 +398,13 @@ export function mount(context = {}) {
         </div>
         <input type="file" data-system-user-import-file accept=".csv,text/csv" hidden>
       </div>
-    </header>`;
+    </div>`;
   }
 
   function renderTable() {
     const users = filteredUsers();
     return `<section class="system-users-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface">
-      <div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>用户</strong><span class="${state.error ? 'is-warning' : ''}">${escapeHtml(state.loading ? '正在读取用户目录' : state.error || `数据源：${state.source}`)}</span></div><div class="system-users-table-meta"><span class="dwrt-kit-table-count">${users.length} / ${state.users.length} 位用户</span><button type="button" data-system-user-refresh aria-label="刷新">${icon('refresh')}</button></div></div>
+      <div class="dwrt-kit-table-toolbar system-users-table-toolbar"><div class="dwrt-kit-table-title system-users-table-meta"><span class="dwrt-kit-table-count">${users.length} / ${state.users.length} 位用户</span><span class="${state.error ? 'is-warning' : ''}">${escapeHtml(state.loading ? '正在读取用户目录' : state.error || `数据源：${state.source}`)}</span></div>${renderToolbarControls()}</div>
       <div class="dwrt-kit-table-scroll system-users-table-scroll">
         <table class="dwrt-kit-table dwrt-kit-ikuai-table system-users-table"><thead><tr><th>姓名</th><th>状态</th><th>邮箱</th><th>最后活动</th><th>分配</th><th>角色</th><th>权限</th></tr></thead><tbody>${state.loading ? '<tr><td colspan="7" class="dwrt-kit-table-empty">正在读取用户</td></tr>' : users.length ? users.map(userRow).join('') : `<tr><td colspan="7" class="dwrt-kit-table-empty">${escapeHtml(state.query || state.permission !== 'all' ? '没有匹配的用户' : state.error || '暂无用户')}</td></tr>`}</tbody></table>
       </div>
@@ -437,7 +451,7 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', MODULE_CLASS);
-    root.innerHTML = `<section class="policy-table-shell system-users-shell">${renderToolbar()}${renderTable()}${renderDrawer()}</section>`;
+    root.innerHTML = `<section class="policy-table-shell system-users-shell">${renderTable()}${renderDrawer()}</section>`;
     bindEvents();
     ui.mountAll?.(root);
     ui.scheduleGlassCardsRender?.(120);
@@ -526,7 +540,6 @@ export function mount(context = {}) {
   function bindEvents() {
     root.querySelector('[data-system-user-search]')?.addEventListener('input', (event) => { state.query = event.target.value || ''; patchTable(); });
     root.querySelector('[data-system-user-permission]')?.addEventListener('change', (event) => { state.permission = event.target.value || 'all'; patchTable(); });
-    root.querySelector('[data-system-user-refresh]')?.addEventListener('click', load);
     root.querySelector('[data-system-user-create-menu]')?.addEventListener('click', () => { state.createMenu = !state.createMenu; const menu = root.querySelector('.system-users-create-menu'); if (menu) menu.hidden = !state.createMenu; });
     root.querySelector('[data-system-user-create]')?.addEventListener('click', () => { state.createMenu = false; state.drawer = 'create'; state.draft = { role: 'admin' }; state.notice = ''; render(); });
     root.querySelector('[data-system-user-groups]')?.addEventListener('click', () => { state.drawer = 'groups'; render(); });
@@ -626,10 +639,28 @@ export function mount(context = {}) {
     }
   }
 
+  function startPolling() {
+    stopPolling();
+    state.pollTimer = window.setInterval(() => {
+      if (!state.mounted) return;
+      if (document.hidden) return;
+      if (state.loading || state.saving) return;
+      if (state.drawer || state.createMenu) return;
+      load();
+    }, 20000);
+  }
+
+  function stopPolling() {
+    if (!state.pollTimer) return;
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = 0;
+  }
+
   window.addEventListener('dwrt:admin-avatar-changed', onAdminAvatarChanged);
   render();
   load();
-  return { unmount() { state.mounted = false; state.seq += 1; window.removeEventListener('dwrt:admin-avatar-changed', onAdminAvatarChanged); root?.replaceChildren(); root?.classList.remove(MODULE_CLASS, 'policy-table-route-host', 'route-workspace'); } };
+  startPolling();
+  return { unmount() { state.mounted = false; state.seq += 1; stopPolling(); window.removeEventListener('dwrt:admin-avatar-changed', onAdminAvatarChanged); root?.replaceChildren(); root?.classList.remove(MODULE_CLASS, 'policy-table-route-host', 'route-workspace'); } };
 }
 
 export default { mount };

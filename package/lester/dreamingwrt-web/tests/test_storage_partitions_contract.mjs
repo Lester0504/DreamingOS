@@ -84,7 +84,7 @@ assert.ok(!/rgba?\(/.test(style), 'page CSS must use semantic tokens instead of 
 for (const radius of ['border-radius: 8px', 'border-radius: 6px', 'border-radius: 4px']) requireStyle(radius);
 requireStyle('var(--color-surface-stable', 'stable surfaces must consume semantic material tokens');
 requireStyle('@media (max-width: 767px)', 'mobile layout contract missing');
-requireStyle('--dwrt-kit-sheet-width: 100vw', 'mobile sheet must become full screen');
+requireStyle('--dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full)', 'mobile sheet must become full screen');
 requireStyle('overflow: auto', 'wide tables and long content need scoped scrolling');
 
 for (const sourcePath of [modulePath, stylePath]) {

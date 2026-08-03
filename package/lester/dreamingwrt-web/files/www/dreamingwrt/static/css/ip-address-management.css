@@ -1,7 +1,7 @@
 .console-stage.is-ip-address-management {
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
   overflow: hidden;
@@ -293,8 +293,8 @@
 }
 
 .ipam-detail-sheet {
-  --dwrt-kit-sheet-width: min(460px, calc(100vw - 20px));
-  --dwrt-kit-sheet-max-width: min(460px, calc(100vw - 20px));
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
+  --dwrt-kit-sheet-max-width: calc(100vw - 28px);
 }
 
 .ipam-detail-body {

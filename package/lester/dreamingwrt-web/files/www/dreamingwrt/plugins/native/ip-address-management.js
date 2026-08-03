@@ -6,7 +6,7 @@ export function mount(context = {}) {
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character])));
   const signal = context.signal;
   const stage = root?.closest('.console-stage');
-  const VERSION = '20260801-ipam-kit-controls-02';
+  const VERSION = '20260802-sheet-portal-scope-01';
 
   const state = {
     mounted: true,
@@ -17,8 +17,30 @@ export function mount(context = {}) {
     source: 'all',
     query: '',
     selectedId: '',
-    refreshPromise: null
+    refreshPromise: null,
+    pollTimer: 0
   };
+
+  /*
+   * 手动刷新按钮按用户第 9 条删除。registry 只按 TTL 缓存、不自轮询，
+   * 所以补一条可见性受控的轮询；详情抽屉打开或用户正在输入筛选时跳过。
+   */
+  function startPolling() {
+    stopPolling();
+    state.pollTimer = window.setInterval(() => {
+      if (!state.mounted) return;
+      if (document.hidden) return;
+      if (state.refreshPromise) return;
+      if (state.selectedId) return;
+      refresh();
+    }, 15000);
+  }
+
+  function stopPolling() {
+    if (!state.pollTimer) return;
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = 0;
+  }
 
   const pageHost = document.createElement('div');
   pageHost.className = 'ipam-page-host';
@@ -272,7 +294,6 @@ export function mount(context = {}) {
         ${statusBadge('只读', 'muted', { dot: false })}
         <span>${escapeHtml(viewState.detail)}</span>
       </div>
-      <button class="dwrt-kit-button dwrt-kit-icon-button" data-dwrt-component="icon-button" data-variant="ghost" type="button" data-ipam-refresh aria-label="刷新 IP 地址" data-dwrt-tooltip="刷新" ${state.refreshPromise ? 'disabled' : ''}>${icon('refresh-cw')}</button>
     </header>`;
   }
 
@@ -463,7 +484,6 @@ export function mount(context = {}) {
   }
 
   function onClick(event) {
-    if (event.target.closest('[data-ipam-refresh]')) return void refresh();
     const detail = event.target.closest('[data-ipam-detail]');
     if (detail) {
       state.selectedId = detail.dataset.ipamDetail || '';
@@ -510,11 +530,13 @@ export function mount(context = {}) {
   renderPage();
   renderOverlay();
   registry?.request?.('network.ipam', { signal });
+  startPolling();
 
   return {
     refresh,
     unmount() {
       state.mounted = false;
+      stopPolling();
       unsubscribe?.();
       root.removeEventListener('click', onClick);
       root.removeEventListener('keydown', onKeydown);

@@ -3,6 +3,7 @@
 
 import gzip
 import json
+import re
 from pathlib import Path
 
 
@@ -55,12 +56,15 @@ def test_data_workbench_uses_shared_kit_components() -> None:
         'data-dwrt-component="data-table"',
         'data-dwrt-component="select"',
         'data-dwrt-component="expand-search"',
-        'data-dwrt-component="icon-button"',
         'data-dwrt-component="state-panel"',
         'data-dwrt-component="sheet"',
         'data-dwrt-sheet-variant="copilot"',
     ):
         assert component in MODULE
+    # 手动刷新按钮按用户第 9 条删除，页内已无 kit icon-button；改为可见性受控的轮询。
+    assert 'data-dwrt-component="icon-button"' not in MODULE
+    assert "data-ipam-refresh" not in MODULE
+    assert "function startPolling()" in MODULE and "function stopPolling()" in MODULE
     assert "statusBadgeMarkup" in MODULE
     assert "单一" not in MODULE  # no explanatory design copy leaks into the UI
     assert "新建" not in MODULE
@@ -86,7 +90,6 @@ def test_filters_search_and_truthful_read_only_states_are_present() -> None:
         "data-ipam-status",
         "data-ipam-source",
         "data-ipam-search",
-        "data-ipam-refresh",
         "data-ipam-detail",
     ):
         assert marker in MODULE
@@ -101,8 +104,11 @@ def test_filters_search_and_truthful_read_only_states_are_present() -> None:
 def test_transparent_route_root_table_radius_and_copilot_sheet_geometry() -> None:
     assert "background: transparent" in STYLE
     assert "border-radius: var(--app-radius-card, 24px)" in STYLE
-    assert "--dwrt-kit-sheet-width: min(460px" in STYLE
-    assert "--dwrt-kit-sheet-max-width: min(460px" in STYLE
+    assert "--dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard)" in STYLE
+    # 抽屉宽度只能引用 Kit 的四档变量。写死像素会让页面自建一套宽度标准，
+    # 所以这里守的是「档位变量 + 视口留白」，不是某个具体像素值。
+    assert re.search(r"--dwrt-kit-sheet-max-width:\s*calc\(100vw - \d+px\)", STYLE)
+    assert not re.search(r"--dwrt-kit-sheet-width:\s*min\(\d+px", STYLE)
     assert "overflow: auto" in STYLE
     assert "scrollbar-gutter: stable" in STYLE
     assert "@media (max-width: 760px)" in STYLE
@@ -121,8 +127,10 @@ def test_menu_and_manifest_expose_a_read_only_real_route() -> None:
     assert item["availability"] == "available"
     assert item["frontend_owned"] is True
     assert item["module"] == "native/ip-address-management.js"
-    assert item["module_version"] == "20260801-ipam-kit-controls-02"
-    assert item["style_version"] == "20260801-ipam-kit-controls-02"
+    module_version = re.search(r"const VERSION = '([^']+)'", MODULE)
+    assert module_version, "ip-address-management.js missing const VERSION"
+    assert item["module_version"] == module_version.group(1)
+    assert item["style_version"] == module_version.group(1)
     assert item["style"] == "/static/css/ip-address-management.css"
     route = next(route for route in MANIFEST["routes"] if route["route"] == "#/network/bulk-ip")
     assert route == {
@@ -161,7 +169,12 @@ def test_filter_controls_use_kit_material() -> None:
     assert 'class="ipam-filter-field"' not in module or "ipam-filter-field" in style
     # wrappers stay inline so the toolbar remains a single row
     assert ".ipam-filter-field.dwrt-kit-field" in style
-    assert "20260801-ipam-kit-controls-02" in module
+    # 这里要守的是「模块内 VERSION 与 main.json 的两个版本键一致」，而不是某个具体字面量。
+    version = re.search(r"const VERSION = '([^']+)'", module)
+    assert version, "ip-address-management.js missing const VERSION"
+    entry = next(item for item in walk(MENU["items"]) if item.get("id") == "bulk-ip")
+    assert entry["module_version"] == version.group(1)
+    assert entry["style_version"] == version.group(1)
     # mountExpandSearch() bails out when the flag is already set, which left the search box
     # as an empty circle. Markup must not pre-stamp it.
     assert 'data-dwrt-expand-search' not in module

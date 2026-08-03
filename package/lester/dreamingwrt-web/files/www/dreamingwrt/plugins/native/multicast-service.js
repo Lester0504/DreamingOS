@@ -6,7 +6,7 @@ export function mount(context = {}) {
   if (!root) return () => {};
   const stage = root.closest('.console-stage');
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260730-multicast-layout-02';
+  const VERSION = '20260802-ui-batch-01';
   const TABS = [
     ['overview', '总览'],
     ['igmp', 'IGMP / MLD 代理'],
@@ -32,7 +32,8 @@ export function mount(context = {}) {
     error: '',
     notice: '',
     confirmation: null,
-    lastUpdated: 0
+    lastUpdated: 0,
+    pollTimer: 0
   };
 
   function firstText(...values) {
@@ -84,6 +85,15 @@ export function mount(context = {}) {
     return array(value).map((item) => idValue(item)).filter(Boolean);
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -96,7 +106,7 @@ export function mount(context = {}) {
   }
 
   async function requestJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
       credentials: 'same-origin',
       cache: 'no-store',
       signal: context.signal,
@@ -356,7 +366,21 @@ export function mount(context = {}) {
     render();
   }
 
-  function icon(name) {
+  function icon(name, size = 18) {
+    const lucideName = {
+      network: 'chart-network',
+      users: 'users',
+      activity: 'activity',
+      shield: 'shield-check',
+      refresh: 'refresh-cw',
+      plus: 'plus',
+      trash: 'trash-2',
+      warning: 'triangle-alert',
+      gauge: 'gauge',
+      router: 'router'
+    }[name] || name;
+    const rendered = typeof ui.lucideIcon === 'function' ? ui.lucideIcon(lucideName, { size, strokeWidth: 1.8 }) : '';
+    if (rendered) return rendered;
     const paths = {
       network: '<rect x="3" y="4" width="18" height="16" rx="3"></rect><path d="M7 9h10M7 13h6M17 13h.01"></path>',
       users: '<circle cx="8" cy="9" r="3"></circle><circle cx="16" cy="9" r="3"></circle><path d="M3 20c.8-3 2.6-5 5-5s4.2 2 5 5M11 20c.8-3 2.6-5 5-5 2 0 3.6 1.4 4.6 3.7"></path>',
@@ -365,9 +389,11 @@ export function mount(context = {}) {
       refresh: '<path d="M20 11a8 8 0 1 0 1 4"></path><path d="M20 4v7h-7"></path>',
       plus: '<path d="M12 5v14M5 12h14"></path>',
       trash: '<path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v5m4-5v5"></path>',
-      warning: '<path d="M12 9v4M12 17h.01"></path><path d="M10.3 3.4 2.7 17a2 2 0 0 0 1.8 3h15a2 2 0 0 0 1.8-3L13.7 3.4a2 2 0 0 0-3.4 0Z"></path>'
+      warning: '<path d="M12 9v4M12 17h.01"></path><path d="M10.3 3.4 2.7 17a2 2 0 0 0 1.8 3h15a2 2 0 0 0 1.8-3L13.7 3.4a2 2 0 0 0-3.4 0Z"></path>',
+      gauge: '<path d="m12 14 4-4"></path><path d="M3.34 19a10 10 0 1 1 17.32 0"></path>',
+      router: '<rect x="3" y="11" width="18" height="8" rx="2"></rect><path d="M7 15h.01M11 15h.01M16 11V7m-3 1 3-3 3 3"></path>'
     };
-    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.network}</svg>`;
+    return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.network}</svg>`;
   }
 
   function formatRate(value) {
@@ -408,7 +434,7 @@ export function mount(context = {}) {
   }
 
   function pageToolbar() {
-    return `<header class="multicast-page-header">${tabsMarkup()}<div class="multicast-page-actions"><button class="dwrt-kit-button multicast-refresh" data-dwrt-component="button" data-variant="ghost" type="button" data-multicast-refresh aria-label="刷新组播服务" data-dwrt-tooltip="刷新" ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '正在刷新' : '刷新'}</span></button></div></header>`;
+    return `<header class="multicast-page-header">${tabsMarkup()}<div class="multicast-page-actions"></div></header>`;
   }
 
   function noticeMarkup() {
@@ -416,13 +442,20 @@ export function mount(context = {}) {
     return `<div class="multicast-notice ${state.error ? 'is-error' : ''}" role="${state.error ? 'alert' : 'status'}">${escapeHtml(state.error || state.notice)}</div>`;
   }
 
-  function overviewSummaryMarkup() {
-    const data = state.draft || defaultService();
+  function overviewCardsRow() {
+    const renderer = ui.overviewCardsMarkup || window.DWRT_UI_KIT?.overviewCardsMarkup;
+    if (typeof renderer !== 'function' || !state.draft) return '';
+    const data = state.draft;
     const status = data.status;
     const configured = data.igmp_proxy.enabled || data.iptv_passthrough.enabled || data.udpxy.enabled || data.discovery.mdns_reflector || data.discovery.ssdp_relay;
     const runtimeVerified = data.runtime?.verified === true || data.runtime?.applied === true || data.runtime?.state === 'running';
     const instances = data.udpxy.instances.filter((item) => item.enabled).length;
-    return `<dl class="multicast-runtime-summary" aria-label="组播服务概览"><div><dt>服务配置</dt><dd>${configured ? '已配置' : '未启用'}<small>${runtimeVerified ? '运行态已验证' : '尚无运行态验证'}</small></dd></div><div><dt>组播订阅</dt><dd>${status.groups}<small>${status.subscribers} 个订阅端</small></dd></div><div><dt>转发速率</dt><dd>${escapeHtml(formatRate(status.rx_rate + status.tx_rate))}<small>丢弃 ${status.dropped}</small></dd></div><div><dt>UDPXY</dt><dd>${instances} / ${data.udpxy.instances.length}<small>${data.udpxy.status === 'unknown' ? '运行状态未知' : `后端状态：${escapeHtml(data.udpxy.status)}`}</small></dd></div></dl>`;
+    return renderer([
+      { key: 'service', label: '服务配置', value: configured ? '已配置' : '未启用', detail: runtimeVerified ? '运行态已验证' : '尚无运行态验证', tone: configured ? (runtimeVerified ? 'ok' : 'warn') : 'neutral', icon: icon('activity', 22) },
+      { key: 'groups', label: '组播订阅', value: String(status.groups), detail: `${status.subscribers} 个订阅端`, tone: 'info', icon: icon('network', 22) },
+      { key: 'throughput', label: '转发速率', value: formatRate(status.rx_rate + status.tx_rate), detail: `丢弃 ${status.dropped}`, tone: status.dropped ? 'warn' : 'neutral', icon: icon('gauge', 22) },
+      { key: 'udpxy', label: 'UDPXY', value: `${instances} / ${data.udpxy.instances.length}`, detail: data.udpxy.status === 'unknown' ? '运行状态未知' : `后端状态：${data.udpxy.status}`, tone: instances ? 'ok' : 'neutral', icon: icon('router', 22) }
+    ], { className: 'multicast-overview', label: '组播服务概览' });
   }
 
   function tableShell(title, detail, headings, rows, empty, className = '') {
@@ -472,8 +505,10 @@ export function mount(context = {}) {
     return `<section class="multicast-dependency ${inactive ? 'is-inactive' : ''}" data-dwrt-component="dependency-group"><label class="dwrt-kit-switch multicast-master-switch"><input type="checkbox" data-multicast-field="${escapeHtml(path)}" ${checked ? 'checked' : ''} ${disabled || !canWrite() ? 'disabled' : ''}><span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(description)}</small></span></label>${dependentMarkup ? `<div class="multicast-dependency-fields" ${inactive ? 'aria-disabled="true"' : ''}>${dependentMarkup}</div>` : ''}</section>`;
   }
 
-  function settingsSurface(title, detail, content) {
-    return `<section class="multicast-settings-surface"><header class="multicast-surface-header"><span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(detail)}</small></span>${statusBadge(canWrite() ? '可配置' : '只读', canWrite() ? 'success' : 'warning')}</header>${capabilityPanel()}<div class="multicast-surface-body">${content}</div></section>`;
+  // The active tab already names the section, so the surface carries only the
+  // read/write badge instead of repeating the tab label and its description.
+  function settingsSurface(content) {
+    return `<section class="multicast-settings-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass" data-adaptive-sample><header class="multicast-surface-header">${statusBadge(canWrite() ? '可配置' : '只读', canWrite() ? 'success' : 'warning')}</header>${capabilityPanel()}<div class="multicast-surface-body">${content}</div></section>`;
   }
 
   function igmpPanel() {
@@ -481,14 +516,14 @@ export function mount(context = {}) {
     const igmp = data.igmp_proxy;
     const proxyFields = `<div class="multicast-field-grid">${field('IGMP 版本', 'igmp_proxy.version', igmp.version, { type: 'select', items: [['2', 'IGMPv2'], ['3', 'IGMPv3']] })}${field('上联接口', 'igmp_proxy.upstream', igmp.upstream, { type: 'select', items: interfaceOptions('wan', igmp.upstream) })}${multiSelectField('下联网络', 'igmp_proxy.downstreams', igmp.downstreams, 'lan')}${field('允许源网段', 'igmp_proxy.alt_subnets', igmp.alt_subnets.join(', '), { wide: true, placeholder: '0.0.0.0/0', description: '多个网段以逗号分隔' })}</div>${dependencySwitch('igmp_proxy.quick_leave', '快速离组', '最后一个客户端离开时立即退订上游组播。', igmp.quick_leave)}`;
     const mldFields = dependencySwitch('discovery.mld_snooping', 'MLD 侦听', '按 IPv6 订阅关系转发组播，减少局域网泛洪。', data.discovery.mld_snooping);
-    return settingsSurface('IGMP / MLD 代理', '配置 IPv4 与 IPv6 组播订阅转发。', `${dependencySwitch('igmp_proxy.enabled', 'IGMP 代理', '在选定 WAN 与 LAN 之间代理运营商组播。', igmp.enabled, proxyFields)}${mldFields}`);
+    return settingsSurface(`${dependencySwitch('igmp_proxy.enabled', 'IGMP 代理', '在选定 WAN 与 LAN 之间代理运营商组播。', igmp.enabled, proxyFields)}${mldFields}`);
   }
 
   function iptvPanel() {
     const data = state.draft || defaultService();
     const iptv = data.iptv_passthrough;
     const fields = `<div class="multicast-field-grid">${field('IPTV 上联', 'iptv_passthrough.wan_iface', iptv.wan_iface, { type: 'select', items: interfaceOptions('wan', iptv.wan_iface) })}${field('目标 LAN', 'iptv_passthrough.lan_iface', iptv.lan_iface, { type: 'select', items: interfaceOptions('lan', iptv.lan_iface) })}${field('VLAN ID', 'iptv_passthrough.vlan_id', iptv.vlan_id, { type: 'number', min: 1, max: 4094, placeholder: '可留空' })}${field('透传模式', 'iptv_passthrough.mode', iptv.mode, { type: 'select', items: [['bridge', '桥接透传'], ['route', '路由代理'], ['hybrid', '混合模式']] })}${multiSelectField('机顶盒端口', 'iptv_passthrough.stb_ports', iptv.stb_ports, 'port', '仅选择实际连接机顶盒的物理端口。')}</div>${dependencySwitch('iptv_passthrough.keep_internet', '保留互联网访问', '机顶盒在接收 IPTV 的同时继续允许普通上网。', iptv.keep_internet)}${dependencySwitch('discovery.igmp_snooping', 'IGMP 侦听', '按订阅关系转发 IPTV 流量，避免在 LAN 内泛洪。', data.discovery.igmp_snooping)}`;
-    return settingsSurface('IPTV 透传', '设置运营商上联、目标网络与机顶盒端口。', dependencySwitch('iptv_passthrough.enabled', 'IPTV 透传', '为运营商 IPTV 建立专用桥接或代理路径。', iptv.enabled, fields));
+    return settingsSurface(dependencySwitch('iptv_passthrough.enabled', 'IPTV 透传', '为运营商 IPTV 建立专用桥接或代理路径。', iptv.enabled, fields));
   }
 
   function udpxyRow(item, index) {
@@ -501,7 +536,7 @@ export function mount(context = {}) {
     const globalFields = `<div class="multicast-field-grid">${field('默认监听接口', 'udpxy.listen_iface', udpxy.listen_iface, { type: 'select', items: interfaceOptions('lan', udpxy.listen_iface) })}${field('默认监听端口', 'udpxy.listen_port', udpxy.listen_port, { type: 'number', min: 1, max: 65535 })}${field('默认信号源', 'udpxy.source_iface', udpxy.source_iface, { type: 'select', items: interfaceOptions('wan', udpxy.source_iface) })}${field('最大客户端', 'udpxy.max_clients', udpxy.max_clients, { type: 'number', min: 1 })}${field('缓冲区 (KB)', 'udpxy.buffer_kb', udpxy.buffer_kb, { type: 'number', min: 64 })}</div>`;
     const rows = udpxy.instances.map(udpxyRow);
     const instanceTable = `<section class="multicast-inline-table"><div class="multicast-section-heading"><span><strong>UDPXY 实例</strong><small>每个监听地址与端口组合必须唯一</small></span><button class="dwrt-kit-button" type="button" data-add-instance ${!canWrite() ? 'disabled' : ''}>${icon('plus')}<span>添加实例</span></button></div>${tableShell('实例列表', `${udpxy.instances.filter((item) => item.enabled).length} 个已启用`, ['启用', '名称', '信号源', '监听网络', '端口', '订阅周期', '外网访问', '状态', '操作'], rows, '尚未创建 UDPXY 实例', 'multicast-udpxy-table')}</section>`;
-    return settingsSurface('UDPXY', '管理组播转单播服务及监听实例。', `${dependencySwitch('udpxy.enabled', 'UDPXY 服务', '将 UDP 组播流转换为 HTTP 单播，供不支持组播的播放器使用。', udpxy.enabled, `${globalFields}${instanceTable}`)}`);
+    return settingsSurface(`${dependencySwitch('udpxy.enabled', 'UDPXY 服务', '将 UDP 组播流转换为 HTTP 单播，供不支持组播的播放器使用。', udpxy.enabled, `${globalFields}${instanceTable}`)}`);
   }
 
   function allowedRow(item, index) {
@@ -512,16 +547,16 @@ export function mount(context = {}) {
     const data = state.draft || defaultService();
     const discovery = data.discovery;
     const allowedRows = discovery.allowed_groups.map(allowedRow);
-    return settingsSurface('局域发现', '管理跨网络发现、侦听、查询器与允许组。', `${dependencySwitch('discovery.mdns_reflector', 'mDNS 反射', '让 AirPlay、HomeKit 与 Chromecast 等设备跨网络发现。', discovery.mdns_reflector)}${dependencySwitch('discovery.ssdp_relay', 'SSDP 中继', '让 DLNA 与 UPnP 设备跨网络发现。', discovery.ssdp_relay)}${dependencySwitch('discovery.igmp_snooping', 'IGMP 侦听', '按 IPv4 订阅关系转发组播，减少桥接泛洪。', discovery.igmp_snooping)}${dependencySwitch('discovery.mld_snooping', 'MLD 侦听', '按 IPv6 订阅关系转发组播。', discovery.mld_snooping)}${dependencySwitch('discovery.querier', '组播查询器', 'LAN 内没有其他查询器时，由网关维护订阅关系。', discovery.querier, `<div class="multicast-field-grid">${field('查询间隔 (秒)', 'discovery.query_interval', discovery.query_interval, { type: 'number', min: 10, max: 3600 })}</div>`)}<section class="multicast-inline-table"><div class="multicast-section-heading"><span><strong>允许组播组</strong><small>限制可通过网关转发的组播范围</small></span><button class="dwrt-kit-button" type="button" data-add-allow ${!canWrite() ? 'disabled' : ''}>${icon('plus')}<span>添加规则</span></button></div>${tableShell('允许规则', 'IPv4 组地址与源网段', ['启用', '组地址', '源地址', '下联网络', '备注', '操作'], allowedRows, '未限制允许组播组', 'multicast-allow-table')}</section>`);
+    return settingsSurface(`${dependencySwitch('discovery.mdns_reflector', 'mDNS 反射', '让 AirPlay、HomeKit 与 Chromecast 等设备跨网络发现。', discovery.mdns_reflector)}${dependencySwitch('discovery.ssdp_relay', 'SSDP 中继', '让 DLNA 与 UPnP 设备跨网络发现。', discovery.ssdp_relay)}${dependencySwitch('discovery.igmp_snooping', 'IGMP 侦听', '按 IPv4 订阅关系转发组播，减少桥接泛洪。', discovery.igmp_snooping)}${dependencySwitch('discovery.mld_snooping', 'MLD 侦听', '按 IPv6 订阅关系转发组播。', discovery.mld_snooping)}${dependencySwitch('discovery.querier', '组播查询器', 'LAN 内没有其他查询器时，由网关维护订阅关系。', discovery.querier, `<div class="multicast-field-grid">${field('查询间隔 (秒)', 'discovery.query_interval', discovery.query_interval, { type: 'number', min: 10, max: 3600 })}</div>`)}<section class="multicast-inline-table"><div class="multicast-section-heading"><span><strong>允许组播组</strong><small>限制可通过网关转发的组播范围</small></span><button class="dwrt-kit-button" type="button" data-add-allow ${!canWrite() ? 'disabled' : ''}>${icon('plus')}<span>添加规则</span></button></div>${tableShell('允许规则', 'IPv4 组地址与源网段', ['启用', '组地址', '源地址', '下联网络', '备注', '操作'], allowedRows, '未限制允许组播组', 'multicast-allow-table')}</section>`);
   }
 
   function overviewPanel() {
-    return settingsSurface('组播服务', '查看当前配置、订阅和转发状态。', `${overviewSummaryMarkup()}${runtimeTable()}`);
+    return settingsSurface(runtimeTable());
   }
 
   function panelMarkup() {
     if (state.loading && !state.draft) return `<section class="dwrt-kit-state-panel" data-dwrt-component="state-panel" data-dwrt-state="loading" aria-busy="true"><strong>正在读取组播服务</strong><p>页面结构已就绪，正在读取配置与运行状态。</p></section>`;
-    if (!state.draft) return `<section class="dwrt-kit-state-panel" data-dwrt-component="state-panel" data-dwrt-state="error"><strong>无法显示组播服务</strong><p>${escapeHtml(state.error || '后端未返回组播服务配置。')}</p><button class="dwrt-kit-button" type="button" data-multicast-refresh>重试</button></section>`;
+    if (!state.draft) return `<section class="dwrt-kit-state-panel" data-dwrt-component="state-panel" data-dwrt-state="error"><strong>无法显示组播服务</strong><p>${escapeHtml(state.error || '后端未返回组播服务配置。')}</p><button class="dwrt-kit-button" type="button" data-multicast-retry>重试</button></section>`;
     if (state.tab === 'igmp') return igmpPanel();
     if (state.tab === 'iptv') return iptvPanel();
     if (state.tab === 'udpxy') return udpxyPanel();
@@ -577,7 +612,7 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'multicast-service-route-host');
-    root.innerHTML = `<section class="multicast-service-shell" data-multicast-version="${VERSION}">${pageToolbar()}<main class="multicast-service-main">${noticeMarkup()}${panelMarkup()}</main>${savebarMarkup()}${confirmationMarkup()}</section>`;
+    root.innerHTML = `<section class="multicast-service-shell" data-multicast-version="${VERSION}">${pageToolbar()}${overviewCardsRow()}<main class="multicast-service-main">${noticeMarkup()}${panelMarkup()}</main>${savebarMarkup()}${confirmationMarkup()}</section>`;
     ui.mountAll?.(root);
     ui.scheduleAdaptiveForegroundSample?.(20, root);
   }
@@ -602,6 +637,7 @@ export function mount(context = {}) {
   }
 
   function onClick(event) {
+    if (event.target.closest('[data-multicast-retry]')) { load(true); return; }
     const tab = event.target.closest('[data-multicast-tab]');
     if (tab) {
       state.tab = tab.dataset.multicastTab;
@@ -609,7 +645,6 @@ export function mount(context = {}) {
       render();
       return;
     }
-    if (event.target.closest('[data-multicast-refresh]')) { load(true); return; }
     if (event.target.closest('[data-multicast-discard], [data-dwrt-savebar-discard]')) { discard(); return; }
     if (event.target.closest('[data-multicast-save], [data-dwrt-savebar-save]')) { save(); return; }
     if (event.target.closest('[data-add-instance]')) {
@@ -698,9 +733,21 @@ export function mount(context = {}) {
   render();
   load();
 
+  /*
+   * 手动刷新按钮按用户第 9 条删除，补一条可见性受控的轮询代替；
+   * 有未保存草稿、抽屉或确认弹窗时跳过，避免刷掉用户填的内容。
+   */
+  state.pollTimer = window.setInterval(() => {
+    if (!state.mounted || document.hidden) return;
+    if (state.loading || state.refreshing || state.saving) return;
+    if (state.dirty || state.confirmation) return;
+    load(true);
+  }, 15000);
+
   return () => {
     state.mounted = false;
     state.seq += 1;
+    window.clearInterval(state.pollTimer);
     root.removeEventListener('click', onClick);
     root.removeEventListener('change', onChange);
     root.removeEventListener('input', onInput);

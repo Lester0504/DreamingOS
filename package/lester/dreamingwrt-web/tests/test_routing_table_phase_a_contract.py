@@ -86,7 +86,7 @@ def test_shared_kit_components_and_half_sheet_are_used() -> None:
     assert "data-dwrt-confirm-accept" in MODULE
     assert "data-dwrt-confirm-cancel" in MODULE
     assert "window.confirm" not in MODULE
-    assert "--dwrt-kit-sheet-width: min(460px" in STYLE
+    assert "--dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard)" in STYLE
     assert "--dwrt-kit-sheet-max-width: min(460px" in STYLE
     assert "backdrop-filter" not in STYLE
     assert "letter-spacing: 0" in STYLE

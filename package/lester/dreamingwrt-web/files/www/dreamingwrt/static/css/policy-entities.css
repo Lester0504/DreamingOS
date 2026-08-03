@@ -2,7 +2,7 @@
 .console-stage:has(.policy-objects-route-host) {
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
   overflow: hidden;
@@ -143,16 +143,6 @@
 .policy-region-zone-table .dwrt-kit-table-title strong,
 .policy-region-zone-table .dwrt-kit-table-count {
   white-space: nowrap;
-}
-
-.policy-region-zone-table [data-region-refresh] {
-  min-width: 44px;
-  min-height: 44px;
-}
-
-.policy-region-zone-table [data-region-refresh]:disabled {
-  opacity: .62;
-  cursor: wait;
 }
 
 .policy-region-flow {
@@ -522,7 +512,7 @@
 }
 
 .policy-entity-sheet {
-  --dwrt-kit-sheet-width: min(460px, calc(100vw - 28px));
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
 }
 
 .policy-entity-sheet-body {

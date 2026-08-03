@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
   const formatBytes = utils.formatBytes || fallbackFormatBytes;
-  const VERSION = '20260719-01';
+  const VERSION = '20260802-ui-batch-01';
   const MODULE_CLASS = 'storage-overview-route-host';
   const stage = root?.closest('.console-stage');
   const RANGE_LABELS = { '1h': '近一小时', '1d': '近一天', '7d': '近七天' };
@@ -22,8 +22,37 @@ export function mount(context = {}) {
     data: emptyData(),
     charts: new Map(),
     hiddenDisks: new Set(),
-    resizeObserver: null
+    resizeObserver: null,
+    pollTimer: 0
   };
+
+  /*
+   * 手动刷新按钮按用户第 9 条删除。占用率、I/O 与延迟三张图都是时序数据，
+   * 所以补一条可见性受控的轮询，跟随当前选中的历史范围后台重取。
+   */
+  function startPolling() {
+    stopPolling();
+    state.pollTimer = window.setInterval(() => {
+      if (!state.mounted) return;
+      if (document.hidden) return;
+      if (state.loading || state.refreshing) return;
+      load(true);
+    }, 20000);
+  }
+
+  function stopPolling() {
+    if (!state.pollTimer) return;
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = 0;
+  }
+
+  /*
+   * 会话闸门适配器：见 dwrt-session-gate.js 的 DWRT_REQUEST。裸 fetch 会绕过 token 刷新，
+   * 过期时并发请求集体拿 401，切走再切回来才恢复；走闸门可自动刷新并单次重试。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
 
   function emptyData() {
     return { disks: [], history: [], smart: [], summary: {}, aggregateOnly: false };
@@ -72,7 +101,7 @@ export function mount(context = {}) {
       if (!result?.ok) throw result?.error || new Error(`${name} API 不可用`);
       return result.data || {};
     }
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
       credentials: 'same-origin', cache: 'no-store', headers: typeof api.authHeaders === 'function' ? api.authHeaders() : {}
     });
     const json = await response.json();
@@ -138,7 +167,7 @@ export function mount(context = {}) {
     const seq = ++state.seq;
     if (background) state.refreshing = true; else state.loading = true;
     state.error = '';
-    if (background) patchRefreshState(); else render();
+    if (!background) render();
     try {
       let next;
       try {
@@ -229,17 +258,9 @@ export function mount(context = {}) {
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', MODULE_CLASS);
     const notice = state.error ? `<div class="storage-overview-notice">${escapeHtml(state.error)}</div>` : '';
-    root.innerHTML = `<section class="storage-overview-shell"><header class="storage-overview-toolbar"><div class="storage-range" role="group" aria-label="历史范围">${Object.entries(RANGE_LABELS).map(([id, label]) => `<button type="button" data-storage-range="${id}" class="${state.range === id ? 'is-active' : ''}">${label}</button>`).join('')}</div><button class="policy-filter-button" type="button" data-storage-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '正在刷新' : '刷新'}</span></button></header><main class="storage-overview-scroll">${notice}${summaryMarkup()}<section class="storage-chart-grid">${chartCard('usage', '磁盘占用率变化', '各磁盘已用容量百分比', 'usage')}${chartCard('io', '磁盘 I/O 变化', '各磁盘读取与写入速率', 'io')}${chartCard('latency', '读写延迟变化', '各磁盘读取与写入等待时间', 'latency')}</section>${smartMarkup()}</main></section>`;
+    root.innerHTML = `<section class="storage-overview-shell"><header class="storage-overview-toolbar"><div class="storage-range" role="group" aria-label="历史范围">${Object.entries(RANGE_LABELS).map(([id, label]) => `<button type="button" data-storage-range="${id}" class="${state.range === id ? 'is-active' : ''}">${label}</button>`).join('')}</div></header><main class="storage-overview-scroll">${notice}${summaryMarkup()}<section class="storage-chart-grid">${chartCard('usage', '磁盘占用率变化', '各磁盘已用容量百分比', 'usage')}${chartCard('io', '磁盘 I/O 变化', '各磁盘读取与写入速率', 'io')}${chartCard('latency', '读写延迟变化', '各磁盘读取与写入等待时间', 'latency')}</section>${smartMarkup()}</main></section>`;
     ui.mountAll?.(root);
     requestAnimationFrame(renderCharts);
-  }
-
-  function patchRefreshState() {
-    const button = root?.querySelector('[data-storage-refresh]');
-    if (!button) return;
-    button.disabled = state.refreshing;
-    const label = button.querySelector('span');
-    if (label) label.textContent = state.refreshing ? '正在刷新' : '刷新';
   }
 
   function chartTimes() {
@@ -338,7 +359,6 @@ export function mount(context = {}) {
   function onClick(event) {
     const range = event.target.closest('[data-storage-range]');
     if (range && RANGE_LABELS[range.dataset.storageRange] && state.range !== range.dataset.storageRange) { state.range = range.dataset.storageRange; disposeCharts(); load(); return; }
-    if (event.target.closest('[data-storage-refresh]')) { load(true); return; }
     const disk = event.target.closest('[data-storage-disk]');
     if (disk) {
       const id = disk.dataset.storageDisk;
@@ -354,12 +374,14 @@ export function mount(context = {}) {
   if (root) state.resizeObserver.observe(root);
   render();
   load();
+  startPolling();
 
   return {
     refresh() { return load(true); },
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      stopPolling();
       root?.removeEventListener('click', onClick);
       state.resizeObserver?.disconnect();
       disposeCharts();

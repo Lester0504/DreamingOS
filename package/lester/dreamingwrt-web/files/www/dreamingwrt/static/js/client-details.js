@@ -3398,7 +3398,7 @@
       return `<section class="client-control-panel client-detail-card ${page.controlEditorOpen ? 'is-editor-open' : ''}">
         <div class="client-control-toolbar">
           <div>${rows.length ? `<strong>共 ${escapeHtml(formatInteger(rows.length))} 条</strong>` : '<strong>管控规则</strong>'}${notice && !page.controlEditorOpen ? `<span>${escapeHtml(notice)}</span>` : ''}</div>
-          <div><button class="client-control-add-button" type="button" data-client-control-add>新增</button><button class="client-control-auto-button" type="button" data-client-control-refresh>自动刷新</button><button class="client-control-icon-button" type="button" data-client-control-refresh aria-label="刷新管控详情">A</button></div>
+          <div><button class="client-control-add-button" type="button" data-client-control-add>新增</button></div>
         </div>
         ${rows.length ? `<div class="client-control-table-scroll"><table class="client-control-table"><thead><tr><th>名称</th><th>管控类型</th><th>内容</th><th>备注</th><th>操作</th></tr></thead><tbody>${rows.map((rule) => `<tr data-client-control-rule="${escapeHtml(rule.id)}"><td><span class="client-control-state ${rule.enabled ? 'is-on' : 'is-off'}">▶</span><strong>${escapeHtml(rule.name)}</strong></td><td>${escapeHtml(rule.type)}</td><td class="client-control-content">${controlRuleContent(rule)}</td><td>${escapeHtml(rule.note || '--')}</td><td><button type="button" data-client-control-toggle="${escapeHtml(rule.id)}">${rule.enabled ? '关闭' : '开启'}</button><button type="button" data-client-control-action="${escapeHtml(rule.id)}">管控控制</button><button type="button" data-client-control-delete="${escapeHtml(rule.id)}">删除</button></td></tr>`).join('')}</tbody></table></div>` : controlEmptyState(merged)}
         ${controlDrawer(merged, profile)}
@@ -3415,7 +3415,6 @@
           <div class="client-connection-actions">
             <button type="button" data-client-connection-clear>清除连接</button>
             <button type="button" data-client-connection-autorefresh>${auto ? '自动刷新' : '手动刷新'}</button>
-            <button class="client-connection-icon-button" type="button" data-client-connection-refresh aria-label="刷新连接详情"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 1-13.66 5.66M4 12A8 8 0 0 1 17.66 6.34M17 3v4h4M7 21v-4H3"></path></svg></button>
             <button class="client-connection-icon-button is-options" type="button" data-client-connection-options aria-label="显示选项"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M7 12h10M10 17h4"></path></svg></button>
           </div>
         </div>
@@ -4901,10 +4900,6 @@
         }
         return;
       }
-      if (event.target.closest('[data-client-control-refresh]')) {
-        if (page.detail && page.detail.mac) loadProfile(page.detail.mac, { preserve: true });
-        return;
-      }
       const controlToggle = event.target.closest('[data-client-control-toggle]');
       if (controlToggle) {
         const rule = currentControlRule(controlToggle.dataset.clientControlToggle);
@@ -4951,10 +4946,6 @@
         page.connectionFilters.line = connectionLine.dataset.clientConnectionFilterLine || 'all';
         saveConnectionFilters();
         render();
-        return;
-      }
-      if (event.target.closest('[data-client-connection-refresh]')) {
-        if (page.detail && page.detail.mac) loadProfile(page.detail.mac, { preserve: true });
         return;
       }
       if (event.target.closest('[data-client-connection-autorefresh]')) {

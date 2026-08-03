@@ -5,9 +5,35 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const source = fs.readFileSync(path.join(root, 'files/www/dreamingwrt/plugins/native/wifi-management.js'), 'utf8');
 const shell = fs.readFileSync(path.join(root, 'files/www/dreamingwrt/static/js/menu-shell.js'), 'utf8');
+const routeCss = fs.readFileSync(path.join(root, 'files/www/dreamingwrt/static/css/wifi-management.css'), 'utf8');
+
+// 版本键每次改动都会 bump。这里断言模块声明了 VERSION 并且 main.json 的两个版本键与它
+// 一致，而不是把某一次的字面量钉死在测试里。
+const menu = JSON.parse(fs.readFileSync(path.join(root, 'files/www/dreamingwrt/static/menu/main.json'), 'utf8'));
+const moduleVersion = source.match(/const VERSION = '([^']+)'/);
+if (!moduleVersion) throw new Error('wifi-management.js missing const VERSION');
+const wifiRoutes = [];
+(function walk(items) {
+  items.forEach((item) => {
+    if (item.module === 'native/wifi-management.js') wifiRoutes.push(item);
+    if (item.children) walk(item.children);
+  });
+})(menu.items);
+if (!wifiRoutes.length) throw new Error('no wifi-management routes in main.json');
+wifiRoutes.forEach((item) => {
+  if (item.module_version !== moduleVersion[1] || item.style_version !== moduleVersion[1]) {
+    throw new Error(`stale cache key on ${item.id}: ${item.module_version} / ${item.style_version} vs ${moduleVersion[1]}`);
+  }
+});
 
 for (const expected of [
-  "const VERSION = '20260725-wifi-environment-02'",
+  'const LABEL_MAX_CHARS = 22',
+  'function clipLabel(value, max = LABEL_MAX_CHARS)',
+  'class="airview-check-label"',
+  'class="dwrt-kit-sheet airview-radio-sheet policy-stable-glass is-open" data-dwrt-component="sheet"',
+  'const offsets = captureScrollOffsets(results)',
+  'restoreScrollOffsets(results, offsets)',
+  "boundary.querySelectorAll('.wifi-table-scroll, [data-airview-scroll]')",
   "ap_id: apId || firstText(",
   "radio_id: firstText(ssid.radio_id",
   "const broadcasts = new Map()",
@@ -78,6 +104,27 @@ for (const forbidden of [
 
 if (/shellVersioned = new Set\([^\n]*wifi-management/.test(shell)) {
   throw new Error('Wi-Fi route resources must use their menu-owned version instead of the shell version');
+}
+
+// Both AirView drawers must keep the fixed right-edge geometry even when the
+// ui-kit legacy-glass allowlist misses a class combination, and the width
+// override must not sit on a bare page class that loses to the kit base rule.
+for (const expected of [
+  '.wireless-status-route-host .dwrt-kit-sheet.airview-radio-sheet,\n.wireless-status-route-host .dwrt-kit-sheet.airview-ap-sheet {',
+  '.dwrt-kit-sheet.airview-radio-sheet {',
+  '.wireless-status-route-host .dwrt-kit-sheet-overlay {'
+]) {
+  if (!routeCss.includes(expected)) throw new Error(`missing AirView sheet geometry rule: ${expected}`);
+}
+
+// A bare text node cannot take min-width: 0, so the label needs its own element
+// or a long AP name pushes the device icon onto a second line.
+if (!/\.airview-check > span > \.airview-check-label \{[^}]*text-overflow: ellipsis/.test(routeCss)) {
+  throw new Error('filter labels must carry ellipsis on their own element');
+}
+
+if (/(^|\n)\.airview-radio-sheet\s*\{/.test(routeCss)) {
+  throw new Error('airview-radio-sheet width override must be prefixed with .dwrt-kit-sheet to outweigh the kit base rule');
 }
 
 console.log('ok: wireless status follows the UniFi AirView resource and column contract without fabricated telemetry');

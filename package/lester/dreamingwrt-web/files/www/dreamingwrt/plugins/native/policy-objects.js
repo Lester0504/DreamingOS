@@ -132,6 +132,7 @@ export function mount(context = {}) {
     refreshing: false,
     refreshQueued: false,
     refreshPromise: null,
+    pollTimer: 0,
     detail: null,
     source: {
       routing: { status: 'loading', data: null, error: null },
@@ -256,7 +257,7 @@ export function mount(context = {}) {
   }
 
   function workbenchMarkup() {
-    return `<section class="policy-entity-page policy-objects-page"><header class="policy-object-toolbar" data-adaptive-sample>${tabsMarkup()}<div class="policy-entity-header-actions"><span class="policy-object-readonly-status">${statusBadge('只读分类', 'warning')}</span>${button(state.refreshing ? '正在刷新' : '刷新', `data-object-refresh aria-label="刷新对象来源" data-dwrt-tooltip="刷新" ${state.refreshing ? 'disabled' : ''}`, 'ghost', 'refresh-cw')}</div></header><main class="policy-object-workbench">${overviewMarkup()}<section class="policy-object-source-view" data-object-source-view="${state.tab}">${activeSourceMarkup()}</section></main></section>`;
+    return `<section class="policy-entity-page policy-objects-page"><header class="policy-object-toolbar" data-adaptive-sample>${tabsMarkup()}<div class="policy-entity-header-actions"><span class="policy-object-readonly-status">${statusBadge('只读分类', 'warning')}</span></div></header><main class="policy-object-workbench">${overviewMarkup()}<section class="policy-object-source-view" data-object-source-view="${state.tab}">${activeSourceMarkup()}</section></main></section>`;
   }
 
   function detailData() {
@@ -376,6 +377,28 @@ export function mount(context = {}) {
     return state.refreshPromise;
   }
 
+  /*
+   * 手动刷新按钮按用户第 9 条删除。registry 只按 TTL 缓存、不自轮询，
+   * 三个附加来源更是纯手动拉取，所以这里补一条可见性受控的轮询；
+   * 详情抽屉打开时跳过，避免正在看的那一行被整页重绘顶掉。
+   */
+  function startPolling() {
+    stopPolling();
+    state.pollTimer = window.setInterval(() => {
+      if (!state.mounted) return;
+      if (document.hidden) return;
+      if (state.refreshing || state.refreshPromise) return;
+      if (state.detail) return;
+      refresh();
+    }, 20000);
+  }
+
+  function stopPolling() {
+    if (!state.pollTimer) return;
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = 0;
+  }
+
   function onClick(event) {
     const tab = event.target.closest('[data-object-tab]');
     if (tab) {
@@ -385,7 +408,6 @@ export function mount(context = {}) {
       renderOverlay();
       return;
     }
-    if (event.target.closest('[data-object-refresh]')) return void refresh();
     const open = event.target.closest('[data-object-detail]');
     if (open) {
       const splitAt = String(open.dataset.objectDetail || '').indexOf(':');
@@ -408,11 +430,13 @@ export function mount(context = {}) {
   renderOverlay();
   if (registry) registry.request('policy.objects', { signal });
   Promise.allSettled([loadSource('routing'), loadSource('flowObjects'), loadSource('flowd')]).then(() => { if (state.mounted) renderPage(); });
+  startPolling();
 
   return {
     refresh,
     unmount() {
       state.mounted = false;
+      stopPolling();
       unsubscribe?.();
       root.removeEventListener('click', onClick);
       window.DWRT_UI_KIT?.unmount?.(root);

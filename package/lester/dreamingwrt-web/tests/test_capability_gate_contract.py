@@ -18,7 +18,6 @@ expected = {
     "#/authentication/web-access-control",
     "#/authentication/app-filter",
     "#/authentication/client-network-control",
-    "#/network/qwrt-modules",
     "#/plugins/native",
     "#/plugins/market",
 }
@@ -81,4 +80,14 @@ assert bulk_ip["frontend_owned"] is True
 assert bulk_ip["module"] == "native/ip-address-management.js"
 assert bulk_ip["style"] == "/static/css/ip-address-management.css"
 
-print("ok: placeholder routes use one capability gate; IPAM, VPN, multicast, UPnP and partitions use real frontend routes")
+# qwrt-modules left the gated set once the real cellular endpoints were wired up.
+# The runtime menu gate still drops it when no capability bit is declared, so the
+# shell has to keep it reachable; the page classifies real failures itself.
+qwrt = next(item for item in walk(MENU["items"]) if item.get("id") == "qwrt-modules")
+assert qwrt["availability"] == "available"
+assert qwrt["frontend_owned"] is True
+assert qwrt["module"] == "native/qwrt-modules.js"
+assert qwrt["style"] == "/static/css/qwrt-modules.css"
+assert "'qwrt-modules'" in SHELL
+
+print("ok: placeholder routes use one capability gate; IPAM, VPN, multicast, UPnP, partitions and QWRT modules use real frontend routes")

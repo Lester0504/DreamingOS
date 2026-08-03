@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
-  const VERSION = '20260722-42';
+  const VERSION = '20260802-ui-batch-01';
   const kind = /(?:^|[-_/])wan(?:$|[-_/])/.test(`${item.id || ''} ${item.func_name || ''} ${item.path || ''}`) ? 'wan' : 'lan';
   const isWan = kind === 'wan';
   const embedded = context.embedded === true;
@@ -33,8 +33,32 @@ export function mount(context = {}) {
     fieldErrors: {},
     seq: 0,
     returnFocus: null,
-    editorOpen: isWan ? 'identity' : 'identity'
+    editorOpen: isWan ? 'identity' : 'identity',
+    pollTimer: 0
   };
+
+  /*
+   * 手动刷新按钮按用户第 9 条删除。这里只在独立路由下自轮询：内嵌进全局配置时
+   * 数据由宿主页喂进来（deferLoad + setData），再自己拉一遍就会打断宿主的节奏。
+   * 抽屉打开、正在保存或用户输入了筛选词时跳过。
+   */
+  function startPolling() {
+    if (context.embedded || context.deferLoad === true) return;
+    stopPolling();
+    state.pollTimer = window.setInterval(() => {
+      if (!state.mounted) return;
+      if (document.hidden) return;
+      if (state.loading || state.refreshing || state.saving) return;
+      if (state.drawer) return;
+      load(true);
+    }, 15000);
+  }
+
+  function stopPolling() {
+    if (!state.pollTimer) return;
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = 0;
+  }
 
   function firstText(...values) {
     for (const value of values) {
@@ -95,6 +119,15 @@ export function mount(context = {}) {
     return Boolean(value);
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -107,7 +140,7 @@ export function mount(context = {}) {
   }
 
   async function requestJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
       credentials: 'same-origin',
       cache: 'no-store',
       ...options,
@@ -472,7 +505,6 @@ export function mount(context = {}) {
         ${showHeading ? `<div class="network-interface-heading"><span>${isWan ? icon('internet') : icon('network')}</span><div><strong>${isWan ? 'WAN 配置' : 'LAN 配置'}</strong><small>${isWan ? '外网线路、接入方式与链路参数' : '本地网络、地址分配与端口成员'}</small></div></div>` : ''}
         <div class="network-interface-toolbar-actions">
           ${showTable ? `<label class="network-interface-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-interface-search placeholder="搜索名称、接口或地址" value="${escapeHtml(state.query)}"></label>` : ''}
-          <button class="policy-secondary" type="button" data-interface-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '刷新中' : '刷新'}</span></button>
           <button class="policy-primary" type="button" data-interface-create>${icon('plus')}<span>新建${isWan ? ' WAN' : ' LAN'}</span></button>
         </div>
       </header>`;
@@ -481,7 +513,6 @@ export function mount(context = {}) {
       <div class="network-interface-heading"><span>${isWan ? icon('internet') : icon('network')}</span><div><strong>${isWan ? 'WAN 配置' : 'LAN 配置'}</strong><small>${isWan ? '外网线路、接入方式与链路参数' : '本地网络、地址分配与端口成员'}</small></div></div>
       <div class="network-interface-toolbar-actions">
         <label class="network-interface-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-interface-search placeholder="搜索名称、接口或地址" value="${escapeHtml(state.query)}"></label>
-        <button class="policy-secondary" type="button" data-interface-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '刷新中' : '刷新'}</span></button>
         <button class="policy-primary" type="button" data-interface-create>${icon('plus')}<span>新建${isWan ? ' WAN' : ' LAN'}</span></button>
       </div>
     </header>`;
@@ -1078,8 +1109,6 @@ export function mount(context = {}) {
   function onClick(event) {
     const create = event.target.closest('[data-interface-create]');
     if (create) { openDrawer('create'); return; }
-    const refresh = event.target.closest('[data-interface-refresh]');
-    if (refresh) { load(true); return; }
     const close = event.target.closest('[data-interface-close], [data-dwrt-confirm-cancel]');
     if (close) { closeDrawer(); return; }
     const edit = event.target.closest('[data-interface-edit]');
@@ -1172,6 +1201,7 @@ export function mount(context = {}) {
   if (context.initialDataReady && context.initialData) applyData(context.initialData.config, context.initialData.ports);
   else if (context.deferLoad === true) render();
   else load();
+  startPolling();
 
   return {
     setQuery(value) {
@@ -1192,6 +1222,7 @@ export function mount(context = {}) {
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      stopPolling();
       root.removeEventListener('click', onClick);
       root.removeEventListener('input', onInput);
       root.removeEventListener('change', onChange);

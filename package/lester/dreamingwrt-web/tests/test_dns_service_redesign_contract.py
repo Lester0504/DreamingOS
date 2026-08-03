@@ -78,8 +78,8 @@ def test_menu_uses_the_new_shared_asset_version():
         item = items[item_id]
         assert item["module"] == "native/network-services.js"
         assert item["style"] == "/static/css/network-services.css"
-        assert item["module_version"] == "20260725-dns-02"
-        assert item["style_version"] == "20260725-dns-02"
+        assert item["module_version"] == "20260802-ui-batch-01"
+        assert item["style_version"] == "20260802-ui-batch-01"
 
 
 def test_gzip_files_match_sources():

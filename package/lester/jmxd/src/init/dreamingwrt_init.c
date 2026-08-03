@@ -30,6 +30,7 @@
 
 #define DWRT_INIT_VERSION "0.1.5"
 #define DWRT_INIT_SOCKET "/var/run/dreamingwrt-init.sock"
+#define DWRT_INIT_SELF_PATH "/usr/bin/dreamingwrt-init"
 #define DWRT_INIT_CONFIG "/etc/dreamingwrt/init.json"
 #define DWRT_APP_DB "/etc/dreamingwrt/apid.db"
 #define DWRT_CONFIG_DB "/etc/dreamingwrt/config.db"
@@ -1073,6 +1074,46 @@ static int token_matches_component(const char *tok, const struct component *c)
     return 0;
 }
 
+/*
+ * True when the pid is running the dreamingwrt-init binary itself, whether as
+ * the supervisor or as a short-lived CLI invocation. Identity comes from
+ * argv[0] plus /proc/<pid>/comm; the CLI's own arguments are deliberately not
+ * consulted because those name the component being acted on, not the program.
+ */
+static int pid_is_init_tool(pid_t pid)
+{
+    char path[64];
+    char buf[4096];
+    const char *self = base_name(DWRT_INIT_SELF_PATH);
+    int n;
+
+    snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);
+    n = read_file(path, buf, sizeof(buf));
+    if (n > 0 && buf[0] && strcmp(base_name(buf), self) == 0)
+        return 1;
+
+    snprintf(path, sizeof(path), "/proc/%ld/comm", (long)pid);
+    n = read_file(path, buf, sizeof(buf));
+    if (n > 0) {
+        size_t len;
+        char *nl = strchr(buf, '\n');
+        if (nl)
+            *nl = '\0';
+        len = strlen(buf);
+        /*
+         * comm is capped at 15 characters by the kernel, so "dreamingwrt-init"
+         * (16 chars) arrives truncated as "dreamingwrt-ini". Accept that form
+         * as well, but only at the full 15-character cap so shorter names
+         * cannot match by prefix.
+         */
+        if (len && strcmp(buf, self) == 0)
+            return 1;
+        if (len == 15 && strncmp(self, buf, len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 static int pid_matches_component(pid_t pid, const struct component *c)
 {
     char path[64];
@@ -1081,6 +1122,17 @@ static int pid_matches_component(pid_t pid, const struct component *c)
     int pos = 0;
 
     if (pid <= 1 || pid == getpid())
+        return 0;
+    /*
+     * dreamingwrt-init is never a component, and its own argv carries the
+     * component name it was asked to act on ("dreamingwrt-init restart
+     * dreamingwrt-webd"). Without this guard the token scan below matches the
+     * very CLI that requested the restart and the supervisor SIGTERMs it as a
+     * stray orphan, so the caller sees "Terminated" even though the restart
+     * itself succeeded. Interpreter-launched components such as rulesd keep
+     * their name in argv[1], so the token scan has to stay.
+     */
+    if (pid_is_init_tool(pid))
         return 0;
 
     snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);

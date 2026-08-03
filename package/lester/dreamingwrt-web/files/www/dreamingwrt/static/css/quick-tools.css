@@ -3,7 +3,7 @@
 .console-stage:has(.route-preview.quick-tools-route-host) {
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
   overflow: hidden;
@@ -45,7 +45,7 @@
   background: rgba(255,255,255,.035); box-shadow: inset 0 0 0 1px rgba(255,255,255,.11); cursor: pointer;
 }
 .quick-tool-back:hover, .quick-tool-icon-button:hover, .quick-tool-row-actions button:hover, .quick-tool-row-actions a:hover { background: var(--dwrt-interactive-hover-bg); box-shadow: inset 0 0 0 1px var(--dwrt-interactive-hover-border); }
-.quick-tool-back svg, .quick-tool-icon-button svg, .quick-tool-row-actions svg, .quick-tool-run svg, .quick-tool-flow-toolbar svg { width: 18px; height: 18px; display: block; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.quick-tool-back svg, .quick-tool-icon-button svg, .quick-tool-row-actions svg, .quick-tool-run svg { width: 18px; height: 18px; display: block; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 
 .quick-tool-body { min-width: 0; min-height: 0; overflow: auto; display: grid; align-content: start; gap: 14px; padding: 0 2px 2px; scrollbar-gutter: stable; }
 .quick-tool-form { display: flex; align-items: end; gap: 14px; min-width: 0; padding: 18px; border-radius: var(--app-radius-card, 18px); background: rgba(255,255,255,.025); box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); }
@@ -59,6 +59,10 @@
 .quick-tool-field input:focus, .quick-tool-field select:focus { box-shadow: inset 0 0 0 1px rgba(91,169,255,.54), 0 0 0 3px rgba(91,169,255,.12); }
 .quick-tool-run { min-width: 128px; height: 42px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; white-space: nowrap; }
 .quick-tool-result { min-height: 200px; overflow: hidden; border-radius: var(--app-radius-card, 18px); padding: 18px; }
+/* When a table below already carries the detail, the summary card only holds a
+   few rows; the 200px floor meant for the empty and console states would leave
+   a large blank band under them. */
+.quick-tool-result:has(.quick-tool-result-list):not(:has(.quick-tool-console)) { min-height: 0; }
 .quick-tool-empty { min-height: 160px; display: grid; place-content: center; justify-items: center; gap: 7px; text-align: center; }
 .quick-tool-empty strong { font-size: 14px; }.quick-tool-empty small { color: var(--app-text-muted); font-size: 11px; }.quick-tool-empty.is-warning strong { color: #f4bd64; }
 .quick-tool-spinner { width: 24px; height: 24px; border: 2px solid rgba(255,255,255,.18); border-top-color: var(--app-accent, #68b7ff); border-radius: 50%; animation: quick-tool-spin .8s linear infinite; }
@@ -66,7 +70,10 @@
 .quick-tool-console { max-height: 360px; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word; color: var(--app-text); font: 12px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .quick-tool-result-list { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); margin: 0; }
 .quick-tool-result-list > div { min-width: 0; min-height: 52px; display: grid; grid-template-columns: 130px minmax(0,1fr); align-items: center; gap: 10px; border-bottom: 1px solid rgba(255,255,255,.07); }
-.quick-tool-result-list dt { color: var(--app-text-muted); font-size: 11px; text-transform: capitalize; }.quick-tool-result-list dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 12px; }
+/* With an odd row count the two-column grid leaves a half-drawn rule under the
+   last cell, so the trailing row in each column loses its divider. */
+.quick-tool-result-list > div:last-of-type, .quick-tool-result-list > div:nth-last-of-type(2):nth-of-type(odd) { border-bottom: 0; }
+.quick-tool-result-list dt { color: var(--app-text-muted); font-size: 11px; }.quick-tool-result-list dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 12px; }
 
 .quick-tool-checks { display: grid; grid-template-columns: repeat(4, minmax(150px,1fr)); gap: 1px; overflow: hidden; border-radius: var(--app-radius-card, 18px); }
 .quick-tool-checks > div { min-height: 74px; display: grid; align-content: center; gap: 6px; padding: 14px 18px; background: rgba(255,255,255,.02); }
@@ -76,12 +83,26 @@
 .quick-tool-table .dwrt-kit-table-scroll { min-height: 210px; max-height: 440px; overflow: auto; }
 .quick-tool-table table { min-width: 760px; }
 .quick-tool-row-actions { display: inline-flex; gap: 7px; }.quick-tool-row-actions button, .quick-tool-row-actions a { width: 30px; height: 30px; }
-.quick-tool-flow-toolbar { display: flex; justify-content: flex-end; }.quick-tool-flow-toolbar .policy-filter-button { display: inline-flex; align-items: center; gap: 8px; }
+.quick-tool-task { min-width: 0; min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 18px; border-radius: var(--app-radius-card, 18px); }
+.quick-tool-task-copy { min-width: 0; display: grid; gap: 3px; }
+.quick-tool-task-copy strong { font-size: 13px; }
+.quick-tool-task-copy small { color: var(--app-text-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The hop and answer tables carry 3-5 narrow columns, so the 760px floor used by
+   the flow and capture tables would force a scrollbar with nothing to scroll. */
+.quick-tool-table[data-hop-table] table { min-width: 620px; }
+.quick-tool-table[data-answer-table] table { min-width: 420px; }
+.quick-tool-pending {
+  min-height: 44px; display: flex; align-items: center; gap: 10px; margin: 0;
+  padding: 12px 16px; border-radius: var(--app-radius-control, 12px);
+  color: var(--app-text-muted); background: rgba(244,189,100,.08);
+  box-shadow: inset 0 0 0 1px rgba(244,189,100,.22); font-size: 12px; line-height: 1.6;
+}
 
 @media (max-width: 1180px) { .quick-tools-grid { grid-template-columns: repeat(2, minmax(240px,1fr)); }.quick-tool-fields { grid-template-columns: repeat(2,minmax(160px,1fr)); }.quick-tool-checks { grid-template-columns: repeat(3,minmax(150px,1fr)); } }
 @media (max-width: 760px) {
   .quick-tools-grid { grid-template-columns: minmax(0,1fr); }.quick-tool-card { height: 156px; grid-template-columns: minmax(0,1fr) 90px; padding: 18px; }.quick-tool-card img { width: 84px; height: 84px; }
   .quick-tool-header { grid-template-columns: 40px minmax(0,1fr) 68px; }.quick-tool-header img { width: 66px; height: 66px; }.quick-tool-header p { display: none; }
   .quick-tool-form { align-items: stretch; flex-direction: column; }.quick-tool-fields { grid-template-columns: minmax(0,1fr); }.quick-tool-run { width: 100%; }.quick-tool-checks { grid-template-columns: repeat(2,minmax(0,1fr)); }.quick-tool-result-list { grid-template-columns: minmax(0,1fr); }
+  .quick-tool-task { align-items: flex-start; flex-direction: column; }
 }
 @media (prefers-reduced-motion: reduce) { .quick-tool-card { transition: none; }.quick-tool-card:hover { transform: none; }.quick-tool-spinner { animation-duration: 1.8s; } }

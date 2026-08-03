@@ -3,7 +3,7 @@
   grid-template-rows: minmax(0, 1fr);
   align-items: start;
   width: 100%;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block, var(--app-page-gutter, 16px)) var(--app-page-gutter-inline, var(--app-page-gutter, 16px));
   overflow: hidden;
@@ -39,7 +39,7 @@
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 10px;
   overflow: hidden;
   color: var(--color-text-primary, var(--app-text));
@@ -114,6 +114,20 @@
   padding-bottom: var(--app-page-gap, 16px);
 }
 
+/* Status metrics read as one row above the workbench and stay visible on every tab.
+   The double class beats the shared grid's single-class column rule. */
+.multicast-overview.dwrt-kit-overview-grid {
+  min-width: 0;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.multicast-overview .dwrt-kit-overview-card {
+  min-height: 0;
+  padding: 14px 16px;
+}
+
+.multicast-overview .dwrt-kit-overview-content strong { font-size: 22px; }
+
 .multicast-notice {
   flex: 0 0 auto;
   min-height: 38px;
@@ -143,32 +157,13 @@
 
 .multicast-surface-header {
   min-width: 0;
-  min-height: 56px;
+  min-height: 44px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 16px;
-  padding: 8px 0 12px;
+  padding: 10px 16px;
   border-bottom: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 10%, transparent));
-}
-
-.multicast-surface-header > span {
-  min-width: 0;
-  display: grid;
-  gap: 3px;
-}
-
-.multicast-surface-header strong {
-  color: var(--color-text-primary, var(--app-text));
-  font-size: 16px;
-  font-weight: 740;
-  line-height: 1.35;
-}
-
-.multicast-surface-header small {
-  color: var(--color-text-muted, var(--app-text-muted));
-  font-size: 12px;
-  line-height: 1.4;
 }
 
 .multicast-surface-header > .dwrt-kit-status {
@@ -179,6 +174,7 @@
   min-width: 0;
   display: grid;
   align-content: start;
+  padding: 4px 16px 12px;
   border-bottom: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 10%, transparent));
 }
 
@@ -219,57 +215,12 @@
   line-height: 1.45;
 }
 
-.multicast-runtime-summary {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  margin: 0;
-  padding: 12px 0;
-  border-bottom: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 10%, transparent));
-}
 
-.multicast-runtime-summary > div {
-  min-width: 0;
-  display: grid;
-  gap: 3px;
-  padding: 2px 14px;
-}
 
-.multicast-runtime-summary > div:first-child {
-  padding-left: 0;
-}
 
-.multicast-runtime-summary > div + div {
-  border-left: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 9%, transparent));
-}
 
-.multicast-runtime-summary dt {
-  color: var(--color-text-muted, var(--app-text-muted));
-  font-size: 10px;
-  font-weight: 650;
-  line-height: 1.4;
-}
 
-.multicast-runtime-summary dd {
-  min-width: 0;
-  display: grid;
-  gap: 2px;
-  margin: 0;
-  overflow-wrap: anywhere;
-  color: var(--color-text-primary, var(--app-text));
-  font-size: 14px;
-  font-weight: 740;
-  line-height: 1.35;
-}
 
-.multicast-runtime-summary dd small {
-  overflow: hidden;
-  color: var(--color-text-muted, var(--app-text-muted));
-  font-size: 10px;
-  font-weight: 520;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
 .multicast-dependency {
   position: relative;
@@ -544,20 +495,8 @@
     padding-inline: 14px;
   }
 
-  .multicast-runtime-summary {
+  .multicast-overview.dwrt-kit-overview-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0;
-  }
-
-  .multicast-runtime-summary > div:nth-child(3) {
-    padding-left: 0;
-    border-left: 0;
-  }
-
-  .multicast-runtime-summary > div:nth-child(n + 3) {
-    margin-top: 8px;
-    padding-top: 8px;
-    border-top: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 9%, transparent));
   }
 }
 
@@ -595,28 +534,31 @@
   }
 
   .multicast-surface-header {
-    min-height: 56px;
-    padding: 8px 0 12px;
-  }
-
-  .multicast-surface-header strong {
-    font-size: 15px;
-  }
-
-  .multicast-surface-header small {
-    font-size: 11px;
+    min-height: 40px;
+    padding: 8px 12px;
   }
 
   .multicast-capability {
     padding: 9px 12px;
   }
 
-  .multicast-runtime-summary {
-    padding-inline: 0;
+  .multicast-surface-body {
+    padding: 4px 12px 10px;
   }
 
-  .multicast-runtime-summary > div {
-    padding-inline: 10px;
+  /* Four stacked cards would push the settings surface off the first screen; keep two up
+     and trade the icon badge for text room. */
+  .multicast-overview .dwrt-kit-overview-card {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 12px 14px;
+  }
+
+  .multicast-overview .dwrt-kit-overview-card .dwrt-kit-overview-icon {
+    display: none !important;
+  }
+
+  .multicast-overview .dwrt-kit-overview-content strong {
+    font-size: 19px;
   }
 
   .multicast-field-grid,

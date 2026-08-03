@@ -1,4 +1,4 @@
-const VERSION = '20260723-vpn-01';
+const VERSION = '20260802-ui-batch-01';
 
 const ENDPOINTS = Object.freeze({
   overview: '/api/v1/network/settings-overview',
@@ -46,6 +46,7 @@ export function mount(context = {}) {
     loading: true,
     refreshing: false,
     seq: 0,
+    pollTimer: 0,
     error: '',
     notice: '',
     overview: {},
@@ -65,6 +66,14 @@ export function mount(context = {}) {
     localUsers: [],
     localClients: []
   };
+
+  /*
+   * 会话闸门适配器：见 dwrt-session-gate.js 的 DWRT_REQUEST。裸 fetch 会绕过 token 刷新，
+   * 过期时并发请求集体拿 401，切走再切回来才恢复；走闸门可自动刷新并单次重试。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
 
   function icon(name, size = 20) {
     return `<i data-lucide="${escapeHtml(name)}" width="${size}" height="${size}" aria-hidden="true"></i>`;
@@ -111,7 +120,7 @@ export function mount(context = {}) {
       }
       return unwrap(result);
     }
-    const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store', signal: context.signal, headers: { Accept: 'application/json' } });
+    const response = await sessionFetch(url, { credentials: 'same-origin', cache: 'no-store', signal: context.signal, headers: { Accept: 'application/json' } });
     const json = await response.json().catch(() => ({}));
     if (!response.ok || json?.ok === false) {
       const error = new Error(firstText(json?.message, json?.error, response.status));
@@ -234,7 +243,7 @@ export function mount(context = {}) {
 
   function renderPage() {
     return `<section class="vpn-config-shell" data-vpn-version="${VERSION}">
-      <header class="vpn-page-toolbar" data-dwrt-component="toolbar"><div><strong>VPN</strong><span>远程接入、策略出口与站点互联</span></div>${actionButton(state.refreshing ? '正在刷新' : '刷新', 'refresh', { icon: 'refresh-cw', disabled: state.refreshing })}</header>
+      <header class="vpn-page-toolbar" data-dwrt-component="toolbar"></header>
       ${state.error ? `<div class="vpn-notice is-error" role="alert">${escapeHtml(state.error)}</div>` : ''}
       ${state.notice ? `<div class="vpn-notice" role="status">${escapeHtml(state.notice)}</div>` : ''}
       <main class="vpn-section-stack">
@@ -401,7 +410,6 @@ export function mount(context = {}) {
 
   function onClick(event) {
     const action = event.target.closest('[data-vpn-action]')?.dataset.vpnAction;
-    if (action === 'refresh') { load(true); return; }
     if (action === 'close') { closeDrawer(); return; }
     if (action === 'teleport') return;
     if (action === 'save') { save(); return; }
@@ -463,11 +471,23 @@ export function mount(context = {}) {
   render();
   load();
 
+  /*
+   * 手动刷新按钮按用户第 9 条删除，补一条可见性受控的轮询代替；
+   * 抽屉打开或正在保存时跳过，避免刷掉用户填的内容。
+   */
+  state.pollTimer = window.setInterval(() => {
+    if (!state.mounted || document.hidden) return;
+    if (state.loading || state.refreshing || state.saving) return;
+    if (state.drawer) return;
+    load(true);
+  }, 15000);
+
   return {
     refresh() { return load(true); },
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      window.clearInterval(state.pollTimer);
       root.removeEventListener('click', onClick);
       root.removeEventListener('input', onInput);
       root.removeEventListener('change', onChange);

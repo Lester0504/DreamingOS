@@ -14,7 +14,7 @@
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
   padding: 0;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   overflow: hidden;
 }
@@ -96,14 +96,14 @@
 .insights-search-row {
   height: 36px;
   display: grid;
-  grid-template-columns: 31px minmax(0, 1fr) 36px;
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
   align-items: center;
   margin-bottom: 12px;
 }
 
 .insights-search {
-  grid-column: 1 / 3;
+  grid-column: 1 / -1;
   height: 36px;
   display: grid;
   grid-template-columns: 31px minmax(0, 1fr);
@@ -2023,14 +2023,6 @@ html[data-theme-resolved="light"] .insights-action-button {
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.075);
 }
 
-.insights-audit-toolbar {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
 .insights-audit-search {
   min-width: min(320px, 100%);
   height: 36px;
@@ -2062,7 +2054,6 @@ html[data-theme-resolved="light"] .insights-action-button {
   font-weight: 650;
 }
 
-.insights-audit-range,
 .insights-audit-tabs.dwrt-kit-tabs {
   height: 36px;
   display: inline-flex;
@@ -2074,7 +2065,6 @@ html[data-theme-resolved="light"] .insights-action-button {
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.09);
 }
 
-.insights-audit-range button,
 .insights-audit-tabs .dwrt-kit-tab {
   height: 30px;
   min-width: 68px;
@@ -2092,7 +2082,6 @@ html[data-theme-resolved="light"] .insights-action-button {
   cursor: pointer;
 }
 
-.insights-audit-range button.is-active,
 .insights-audit-tabs .dwrt-kit-tab.is-active {
   color: var(--dwrt-selected, #0b7cff);
   background: rgba(255,255,255,0.09);
@@ -2238,15 +2227,6 @@ html[data-theme-resolved="light"] .insights-action-button {
   .insights-audit-summary-row {
     grid-template-columns: 1fr 1fr;
   }
-
-  .insights-audit-toolbar {
-    align-items: stretch;
-  }
-
-  .insights-audit-range {
-    max-width: 100%;
-    overflow-x: auto;
-  }
 }
 
 /* 2026-07-08: audit pages are full-width content pages, not menu-adjacent side cards. */
@@ -2292,6 +2272,42 @@ html[data-theme-resolved="light"] .insights-action-button {
   color: var(--dwrt-ink, var(--app-text));
 }
 
+/* 四张顶部状态卡片在主表格卡之外（用户第 11 条）。 */
+.insights-audit-overview {
+  flex: 0 0 auto;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+/* 控件全部在表格工具条里，卡片外不再有散落控件。 */
+.insights-audit-table-toolbar {
+  flex-wrap: wrap;
+}
+
+.insights-audit-toolbar-controls {
+  min-width: 0;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.insights-audit-range-select {
+  flex: 0 0 auto;
+  min-width: 132px;
+}
+
+.insights-audit-table-toolbar .insights-audit-tabs {
+  flex: 0 0 auto;
+}
+
+.insights-audit-table-toolbar .insights-audit-search.dwrt-kit-expand-search {
+  flex: 0 1 auto;
+  min-width: 0;
+  --dwrt-search-expanded-width: min(320px, 30vw);
+}
+
 .insights-audit-status-strip,
 .insights-audit-summary-row {
   display: none !important;
@@ -2311,24 +2327,6 @@ html[data-theme-resolved="light"] .insights-action-button {
   box-shadow: inset 0 0 0 1px rgba(255, 191, 93, 0.16);
   font-size: 12px;
   font-weight: 650;
-}
-
-.insights-audit-toolbar {
-  min-width: 0;
-  min-height: 50px;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 10px;
-  flex-wrap: nowrap;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: none;
-  -webkit-overflow-scrolling: touch;
-}
-
-.insights-audit-toolbar::-webkit-scrollbar {
-  display: none;
 }
 
 .insights-audit-search {
@@ -2372,7 +2370,6 @@ html[data-theme-resolved="light"] .insights-action-button {
   color: var(--dwrt-muted, rgba(218,229,244,0.62));
 }
 
-.insights-audit-range,
 .insights-audit-tabs.dwrt-kit-tabs {
   flex: 0 0 auto;
   height: 44px;
@@ -2389,7 +2386,6 @@ html[data-theme-resolved="light"] .insights-action-button {
     inset 0 1px 0 rgba(255,255,255,0.10);
 }
 
-.insights-audit-range button,
 .insights-audit-tabs .dwrt-kit-tab {
   height: 36px;
   min-width: 66px;
@@ -2408,20 +2404,17 @@ html[data-theme-resolved="light"] .insights-action-button {
   transition: color 160ms ease, background 160ms ease, transform 160ms var(--app-spring);
 }
 
-.insights-audit-range button:hover,
 .insights-audit-tabs .dwrt-kit-tab:hover {
   color: var(--dwrt-ink, var(--app-text));
   background: rgba(255,255,255,0.055);
 }
 
-.insights-audit-range button:active,
 .insights-audit-tabs .dwrt-kit-tab:active,
 .insights-audit-link:active,
 .insights-audit-select:active {
   transform: scale(0.98);
 }
 
-.insights-audit-range button.is-active,
 .insights-audit-tabs .dwrt-kit-tab.is-active {
   color: var(--dwrt-selected, #0b7cff);
   background: rgba(255,255,255,0.11);
@@ -2496,7 +2489,7 @@ html[data-theme-resolved="light"] .insights-action-button {
   background: rgba(11,124,255,0.58);
 }
 
-.insights-audit-toolbar .insights-icon-button {
+.insights-audit-toolbar-controls .insights-icon-button {
   flex: 0 0 44px;
   width: 44px;
   height: 44px;
@@ -2507,7 +2500,7 @@ html[data-theme-resolved="light"] .insights-action-button {
     inset 0 1px 0 rgba(255,255,255,0.10);
 }
 
-.insights-audit-toolbar .insights-icon-button svg {
+.insights-audit-toolbar-controls .insights-icon-button svg {
   width: 20px;
   height: 20px;
 }
@@ -2559,56 +2552,6 @@ html[data-theme-resolved="light"] .insights-action-button {
   color: color-mix(in srgb, #ffbf5d 78%, var(--dwrt-kit-muted, #fff) 22%);
 }
 
-.insights-audit-table-meta {
-  min-width: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 10px;
-  flex: 0 1 auto;
-}
-
-.insights-audit-toolbar-stats {
-  min-width: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.insights-audit-stat-chip {
-  min-width: 0;
-  height: 26px;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 0 9px;
-  border-radius: 999px;
-  color: var(--dwrt-kit-muted, var(--dwrt-muted));
-  background: rgba(255,255,255,0.045);
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.075);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-.insights-audit-stat-chip em {
-  color: inherit;
-  font-style: normal;
-  font-size: 11px;
-  font-weight: 650;
-}
-
-.insights-audit-stat-chip strong {
-  color: var(--dwrt-ink, var(--app-text));
-  font-size: 12px;
-  font-weight: 760;
-}
-
-.insights-audit-stat-chip.good strong { color: #54d68b; }
-.insights-audit-stat-chip.warn strong { color: #ffbc4b; }
-.insights-audit-stat-chip.bad strong { color: #ff6375; }
-
 .insights-audit-table-scroll {
   width: 100%;
   max-width: 100%;
@@ -2659,13 +2602,8 @@ html[data-theme-resolved="light"] .insights-action-button {
 }
 
 @media (max-width: 1180px) {
-  .insights-audit-toolbar {
-    justify-content: flex-start;
-  }
-
-  .insights-audit-search {
-    min-width: 280px;
-    flex-basis: 320px;
+  .insights-audit-overview {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .insights-audit-table-card .dwrt-kit-table-toolbar {
@@ -2673,9 +2611,10 @@ html[data-theme-resolved="light"] .insights-action-button {
     flex-direction: column;
   }
 
-  .insights-audit-table-meta {
+  .insights-audit-toolbar-controls {
     width: 100%;
-    justify-content: space-between;
+    margin-left: 0;
+    justify-content: flex-start;
   }
 }
 
@@ -2684,29 +2623,29 @@ html[data-theme-resolved="light"] .insights-action-button {
     padding: 10px;
   }
 
-  .insights-audit-toolbar {
-    min-height: 44px;
+  .insights-audit-overview {
+    grid-template-columns: minmax(0, 1fr);
   }
 
-  .insights-audit-search,
-  .insights-audit-range,
   .insights-audit-tabs.dwrt-kit-tabs,
   .insights-audit-select,
-  .insights-audit-link,
-  .insights-audit-toolbar .insights-icon-button {
+  .insights-audit-link {
     height: 40px;
   }
 
-  .insights-audit-range button,
   .insights-audit-tabs .dwrt-kit-tab {
     height: 32px;
     min-width: 58px;
   }
+
+  .insights-audit-table-toolbar .insights-audit-search.dwrt-kit-expand-search {
+    --dwrt-search-expanded-width: 100%;
+    max-width: 100% !important;
+  }
 }
 
 /* 2026-07-08: audit toolbar icons must not inherit raw SVG intrinsic size. */
-.insights-audit-toolbar svg,
-.insights-audit-range button svg,
+.insights-audit-toolbar-controls svg,
 .insights-audit-tabs .dwrt-kit-tab svg,
 .insights-audit-link svg,
 .insights-audit-select svg {
@@ -2714,11 +2653,6 @@ html[data-theme-resolved="light"] .insights-action-button {
   height: 18px;
   flex: 0 0 18px;
   display: block;
-}
-
-.insights-audit-range button[data-date-range-trigger] {
-  min-width: 44px;
-  padding-inline: 0;
 }
 
 /* 2026-07-09: Offline cyber traffic map. Uses local ECharts GeoJSON assets instead of external tile APIs. */

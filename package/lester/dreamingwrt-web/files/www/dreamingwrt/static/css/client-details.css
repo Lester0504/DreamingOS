@@ -1,7 +1,7 @@
 .console-stage.is-client-details {
   grid-template-rows: minmax(0, 1fr);
   align-items: start;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
   overflow-x: hidden;
@@ -648,11 +648,25 @@
   z-index: 1;
 }
 
-.client-detail-drawer {
-  --dwrt-kit-modal-width: min(1120px, calc(100vw - 56px));
-  width: min(var(--dwrt-kit-modal-width), calc(100vw - 32px));
-  height: min(820px, calc(100dvh - 48px));
-  max-height: calc(100dvh - 48px);
+/* 终端详情走整屏工作台，不是居中卡片。
+   菜单栏是常驻导航，不能被盖住：层本身从菜单玻璃的右边缘起算，把剩下的区域整块让给详情，
+   遮罩也只落在这块区域内，所以左侧菜单在详情打开时仍可点击、仍是当前位置的参照。
+   偏移一律读 `--app-menu-glass-width`，它随侧栏折叠、子菜单隐藏和 640px 断点自己变，
+   这里不复制任何一档像素值。 */
+/* 与 Kit 基线同权重会输给加载顺序，按抽屉同一条约定用双类提权 */
+.dwrt-kit-modal-layer.client-detail-layer {
+  inset: var(--app-content-inset-top, 0px) 0 0 var(--app-menu-glass-width, 0px);
+  padding: 0;
+  place-items: stretch;
+}
+
+.dwrt-kit-modal.client-detail-drawer {
+  --dwrt-kit-modal-width: 100%;
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  border-width: 0 0 0 1px;
+  border-radius: 0;
   grid-template-rows: auto minmax(0, 1fr);
 }
 
@@ -701,6 +715,13 @@
   padding: clamp(16px, 2vw, 24px);
   overflow: auto;
   overscroll-behavior: contain;
+}
+
+/* 外壳整屏，正文仍按可读宽度收拢并居中。放开到 1600px 是因为概览是双列图表，
+   再宽字段就被拉成横条；不收拢则一行文本会跨过整个屏幕。 */
+.client-detail-drawer .client-detail-drawer-body > * {
+  width: min(1600px, 100%);
+  margin-inline: auto;
 }
 
 .client-detail-hero {
@@ -1196,7 +1217,7 @@
 
 .client-connection-options-modal {
   --dwrt-kit-sheet-z: 141;
-  --dwrt-kit-sheet-width: min(75vw, 430px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   --dwrt-kit-sheet-max-width: calc(100vw - 24px);
 }
 
@@ -1567,7 +1588,7 @@
 
 .client-filter-drawer {
   --dwrt-kit-sheet-z: 90;
-  --dwrt-kit-sheet-width: min(75vw, 460px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   --dwrt-kit-sheet-max-width: calc(100vw - 24px);
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   color: var(--app-text);
@@ -2129,11 +2150,8 @@
     grid-template-columns: 1fr;
   }
 
-  .client-detail-drawer {
-    --dwrt-kit-modal-width: calc(100vw - 24px);
-    height: calc(100dvh - 24px);
-    max-height: calc(100dvh - 24px);
-  }
+  /* 窄屏仍是整屏，几何全部继承基线。这里只留断点内的栅格降列，
+     不再把宽高改回「视口减 24px」的居中卡片，否则详情又会盖住左栏。 */
 
   .client-fingerprint-modal {
     width: calc(100vw - 20px);
@@ -2302,7 +2320,7 @@
 }
 
 .client-connection-options-layer.is-side-drawer .client-connection-options-modal {
-  --dwrt-kit-sheet-width: min(75vw, 430px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   --dwrt-kit-sheet-max-width: calc(100vw - 24px);
   height: 100%;
   max-height: 100%;
@@ -2886,9 +2904,7 @@
   flex: 0 0 auto;
 }
 
-.client-control-add-button,
-.client-control-auto-button,
-.client-control-icon-button {
+.client-control-add-button {
   border: 1px solid color-mix(in srgb, var(--app-text) 12%, transparent);
   border-radius: 12px;
   min-height: 34px;
@@ -2908,15 +2924,7 @@
   box-shadow: 0 12px 26px rgba(23,126,233,.22);
 }
 
-.client-control-icon-button {
-  width: 36px;
-  padding: 0;
-  font-weight: 900;
-}
-
-.client-control-add-button:hover,
-.client-control-auto-button:hover,
-.client-control-icon-button:hover {
+.client-control-add-button:hover {
   border-color: color-mix(in srgb, #4a99f4 45%, transparent);
   background-color: var(--dwrt-interactive-hover-bg);
   box-shadow: var(--dwrt-interactive-hover-shadow);
@@ -3084,7 +3092,7 @@
 
 .client-control-editor {
   --dwrt-kit-sheet-z: 71;
-  --dwrt-kit-sheet-width: min(75vw, 520px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   --dwrt-kit-sheet-max-width: 100vw;
   height: 100%;
   max-height: 100%;

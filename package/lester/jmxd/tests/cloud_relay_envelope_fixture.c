@@ -318,6 +318,59 @@ static void test_base64_helpers(void)
     assert(cloud_base64_decode_fixed(NULL, fixed, sizeof(fixed)) != 0);
 }
 
+/*
+ * The authorized_apps declaration crosses into Go, which decodes with
+ * base64.StdEncoding: standard alphabet, padding required. A variant mismatch
+ * would make the relay silently skip every key and refuse all presence queries,
+ * so the exact expected strings are pinned here.
+ */
+static void test_base64_matches_go_stdencoding(void)
+{
+    /* Lengths 1..3 cover both padding cases plus the unpadded one. */
+    static const struct {
+        unsigned char raw[3];
+        size_t length;
+        const char *expected;
+    } cases[] = {
+        {{0xff, 0x00, 0x00}, 1, "/w=="},
+        {{0xfb, 0xf0, 0x00}, 2, "+/A="},
+        {{0xfb, 0xff, 0xbf}, 3, "+/+/"},
+    };
+    char *encoded = NULL;
+    unsigned int i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        assert(cloud_base64_encode(cases[i].raw, cases[i].length,
+                                   &encoded) == 0);
+        assert(!strcmp(encoded, cases[i].expected));
+        free(encoded);
+        encoded = NULL;
+    }
+
+    /* A 32-byte key encodes to 44 characters ending in one '=', which is the
+     * shape the relay's length check expects for an Ed25519 key. */
+    assert(cloud_base64_encode(kat_signing_public,
+                               sizeof(kat_signing_public), &encoded) == 0);
+    assert(strlen(encoded) == 44 && encoded[43] == '=');
+    free(encoded);
+}
+
+/*
+ * The App database path has to be the one webd actually writes.
+ *
+ * This is not a hypothetical: the first version of this daemon pointed at
+ * /etc/dreamingwrt/app_api.db while webd uses apid.db, so every signing-key
+ * lookup would have found no rows and refused all remote access with
+ * app_not_authorized. Nothing else in the build would have complained.
+ */
+static void test_app_db_path_matches_webd(void)
+{
+    assert(!strcmp(CLOUD_APP_DB_PATH, "/etc/dreamingwrt/apid.db"));
+    /* Local replay must target webd's listener, not some other component. */
+    assert(CLOUD_LOCAL_PORT == 12517);
+    assert(!strcmp(CLOUD_LOCAL_HOST, "127.0.0.1"));
+}
+
 int main(void)
 {
     unsigned char traffic_key[CLOUD_TRAFFIC_KEY_LEN];
@@ -331,6 +384,8 @@ int main(void)
     test_reference_response(traffic_key);
     test_replay_guard();
     test_base64_helpers();
+    test_base64_matches_go_stdencoding();
+    test_app_db_path_matches_webd();
     OPENSSL_cleanse(traffic_key, sizeof(traffic_key));
     puts("ok: relay envelope KAT matches the independent RFC reference, "
          "signature/tag/replay rejection holds");

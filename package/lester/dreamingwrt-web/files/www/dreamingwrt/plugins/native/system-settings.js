@@ -6,13 +6,13 @@ export function mount(context = {}) {
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
   const formatInteger = utils.formatInteger || ((value) => new Intl.NumberFormat('zh-CN').format(Number(value) || 0));
   const fetchApi = api.fetch || (async (name, url) => {
-    const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+    const response = await sessionFetch(url, { credentials: 'same-origin', cache: 'no-store' });
     const json = await response.json().catch(() => ({}));
     const ok = response.ok && json?.ok !== false;
     return { name, ok, data: json?.data ?? json, raw: json, error: ok ? null : new Error(json?.error?.message || json?.message || response.statusText || 'request failed') };
   });
 
-  const VERSION = '20260720-03';
+  const VERSION = '20260802-ui-batch-01';
   const MODULE_CLASS = 'system-settings-route-host';
   const ENDPOINT = '/api/v1/system/basic';
   const SAVE_ENDPOINTS = ['/api/v1/system/settings', '/api/v1/save_system_settings'];
@@ -84,6 +84,14 @@ export function mount(context = {}) {
     saveCapable: true,
     touchedFields: new Set()
   };
+
+  /*
+   * 会话闸门适配器：见 dwrt-session-gate.js 的 DWRT_REQUEST。裸 fetch 会绕过 token 刷新，
+   * 过期时并发请求集体拿 401，切走再切回来才恢复；走闸门可自动刷新并单次重试。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
 
   function currentSystemPage() {
     const id = context.item?.id || context.id || '';
@@ -654,9 +662,11 @@ export function mount(context = {}) {
     return `
       <section class="system-demo-panel system-time-control-panel">
         <div class="system-demo-panel-title">${systemSettingsIcon('gear')}<span>服务控制</span></div>
-        ${systemSettingsItem('启用 NTP 客户端', systemIosSwitch('general.time_sync', g.time_sync !== false))}
-        ${systemSettingsItem('作为 NTP 服务器提供服务', systemIosSwitch('general.ntp_server_enabled', Boolean(g.ntp_server_enabled)))}
-        ${systemSettingsItem('使用 DHCP 通告的服务器', systemIosSwitch('general.ntp_use_dhcp', g.ntp_use_dhcp !== false))}
+        <div class="system-advanced-hero-grid system-time-hero-grid">
+          ${systemAdvancedHeroCard('启用 NTP 客户端', '向上游服务器同步本机时间', 'general.time_sync', g.time_sync !== false, 'hourglass')}
+          ${systemAdvancedHeroCard('作为 NTP 服务器提供服务', '为局域网内的设备提供时间源', 'general.ntp_server_enabled', Boolean(g.ntp_server_enabled), 'globe')}
+          ${systemAdvancedHeroCard('使用 DHCP 通告的服务器', '优先采用上游 DHCP 下发的 NTP 地址', 'general.ntp_use_dhcp', g.ntp_use_dhcp !== false, 'link')}
+        </div>
       </section>
       <section class="system-demo-panel system-ntp-panel">
         <div class="system-demo-panel-title">${systemSettingsIcon('hourglass')}<span>候选 NTP 服务器</span></div>
@@ -936,7 +946,7 @@ export function mount(context = {}) {
           <span><i class="zram"></i>ZRam 交换区（${formatInteger(zramMb)}MB）</span>
         </div>
         ${systemZramItem('ZRam 大小', '虚拟内存设备的大小（建议设为物理内存的 50%-100%）', `<div class="system-field-wrap">${systemInputControl('advanced.zram_size_mb', zramMb, 'number')}<span class="system-field-unit">MiB</span></div>`)}
-        ${systemZramItem('压缩算法', 'lz4 速度最快，zstd 压缩率最高', `<div class="system-field-wrap select-arrow">${systemSelectControl('advanced.zram_algorithm', a.zram_algorithm || 'lz4', [['lzo', 'lzo'], ['lz4', 'lz4（推荐）'], ['zstd', 'zstd（平衡）'], ['deflate', 'deflate']])}</div>`)}
+        ${systemZramItem('压缩算法', 'lz4 速度最快，zstd 压缩率最高', `<div class="system-field-wrap">${systemSelectControl('advanced.zram_algorithm', a.zram_algorithm || 'lz4', [['lzo', 'lzo'], ['lz4', 'lz4（推荐）'], ['zstd', 'zstd（平衡）'], ['deflate', 'deflate']])}</div>`)}
       </section>
     `;
   }
@@ -1430,65 +1440,67 @@ export function mount(context = {}) {
           <section class="system-demo-panel system-admin-chamber system-admin-account-chamber">
             <div class="system-demo-panel-title system-admin-chamber-title">${systemSettingsIcon('identity')}<span>管理员账户设置</span></div>
             <div class="system-admin-account-body">
-              <div class="system-admin-avatar-card">
-                <span class="system-admin-avatar-preview" aria-hidden="true">
-                  ${avatarPreview ? `<img src="${escapeHtml(avatarPreview)}" alt="" data-system-avatar-img>` : systemSettingsIcon('identity')}
-                </span>
-                <div class="system-admin-input-group">
-                  <span>用户头像</span>
-                  <div class="system-admin-avatar-actions">
-                    <label class="system-admin-upload-btn ${state.avatarWorking ? 'is-working' : ''}">
-                      <input type="file" accept="image/png,image/jpeg,image/webp" data-system-avatar-upload ${state.avatarWorking ? 'disabled' : ''}>
-                      <span>${systemSettingsIcon('upload')}${state.avatarWorking ? '正在上传' : '从浏览器上传'}</span>
-                    </label>
-                    <em class="${admin.avatar_upload_error ? 'error' : ''}">${escapeHtml(admin.avatar_upload_error || admin.avatar_filename || '选择后立即生效，支持 PNG / JPG / WebP')}</em>
-                  </div>
+              <div class="system-admin-identity">
+                <label class="system-admin-avatar-box ${state.avatarWorking ? 'is-working' : ''}" data-dwrt-tooltip="${escapeHtml(state.avatarWorking ? '正在上传' : '从浏览器上传头像，支持 PNG / JPG / WebP')}">
+                  <input type="file" accept="image/png,image/jpeg,image/webp" data-system-avatar-upload ${state.avatarWorking ? 'disabled' : ''}>
+                  <span class="system-admin-avatar-preview" aria-hidden="true">
+                    ${avatarPreview ? `<img src="${escapeHtml(avatarPreview)}" alt="" data-system-avatar-img>` : systemSettingsIcon('identity')}
+                  </span>
+                  <span class="system-admin-avatar-trigger" aria-hidden="true">${systemSettingsIcon('upload')}</span>
+                  <span class="system-admin-avatar-label">${escapeHtml(state.avatarWorking ? '正在上传' : '更换头像')}</span>
+                </label>
+                <div class="system-admin-identity-titles">
+                  <strong>${escapeHtml(admin.username || 'root')}</strong>
+                  <em class="${admin.avatar_upload_error ? 'error' : ''}">${escapeHtml(admin.avatar_upload_error || admin.avatar_filename || '选择图片后立即生效，支持 PNG / JPG / WebP')}</em>
                 </div>
               </div>
               <div class="system-admin-account-meta-grid">
-                <label class="system-admin-input-group system-admin-account-username">
-                  <span>登录用户名</span>
-                  ${systemInputControl('admin.username', admin.username || 'root', 'text', '设置新的用户名')}
+                <label class="system-admin-strip">
+                  <span class="system-admin-strip-label">登录用户名</span>
+                  <input class="system-glass-input system-admin-strip-input" type="text" value="${escapeHtml(admin.username || 'root')}" placeholder="设置新的用户名" data-system-field="admin.username">
+                  <em class="system-admin-strip-unit">USER</em>
                 </label>
-                <label class="system-admin-input-group">
-                  <span>Web 登录超时</span>
-                  <div class="system-admin-unit-field">
-                    <input class="system-glass-input" type="number" min="1" max="1440" value="${escapeHtml(admin.web_login_timeout_min || 60)}" data-system-field="admin.web_login_timeout_min" ${webTimeoutSupported ? '' : 'disabled'}>
-                    <em>MINS</em>
-                  </div>
-                  ${webTimeoutSupported ? '' : '<small class="system-admin-capability-note">后端待接入</small>'}
+                <label class="system-admin-strip ${webTimeoutSupported ? '' : 'is-disabled'}">
+                  <span class="system-admin-strip-label">Web 登录超时</span>
+                  <input class="system-glass-input system-admin-strip-input" type="number" min="1" max="1440" value="${escapeHtml(admin.web_login_timeout_min || 60)}" data-system-field="admin.web_login_timeout_min" ${webTimeoutSupported ? '' : 'disabled'}>
+                  <em class="system-admin-strip-unit">${webTimeoutSupported ? 'MINS' : '待接入'}</em>
                 </label>
               </div>
-              <div class="system-admin-password-grid">
-                <label class="system-admin-input-group">
-                  <span>新登录密码</span>
-                  ${systemInputControl('admin.new_password', admin.new_password || '', 'password', '••••••••')}
-                </label>
-                <label class="system-admin-input-group">
-                  <span>确认新密码</span>
-                  ${systemInputControl('admin.confirm_password', admin.confirm_password || '', 'password', '••••••••')}
-                </label>
-              </div>
+              <section class="system-admin-security-well">
+                <div class="system-admin-well-title">${systemSettingsIcon('key')}<span>安全凭据修改</span></div>
+                <div class="system-admin-password-grid">
+                  <label class="system-admin-input-group">
+                    <span>新登录密码</span>
+                    ${systemInputControl('admin.new_password', admin.new_password || '', 'password', '••••••••')}
+                  </label>
+                  <label class="system-admin-input-group">
+                    <span>确认新密码</span>
+                    ${systemInputControl('admin.confirm_password', admin.confirm_password || '', 'password', '••••••••')}
+                  </label>
+                </div>
+              </section>
             </div>
           </section>
           <section class="system-demo-panel system-admin-chamber system-admin-ssh-chamber">
             <div class="system-demo-panel-title system-admin-chamber-title">${systemSettingsIcon('key')}<span>SSH 访问控制</span></div>
             <div class="system-admin-ssh-quick-grid">
-              ${systemAdminHeroCard('启用 SSH 服务', '允许通过命令行终端管理路由器', 'ssh.enabled', ssh.enabled !== false)}
-              <label class="system-admin-input-group">
-                <span>监听端口</span>
-                <div class="system-admin-unit-field">
-                  ${systemInputControl('ssh.port', ssh.port || 22, 'number')}
-                  <em>PORT</em>
-                </div>
-              </label>
-              <label class="system-admin-input-group">
-                <span>空闲超时</span>
-                <div class="system-admin-unit-field">
-                  ${systemInputControl('ssh.idle_timeout_min', ssh.idle_timeout_min ?? 30, 'number')}
-                  <em>MINS</em>
-                </div>
-              </label>
+              ${systemAdvancedHeroCard('启用 SSH 服务', '允许通过命令行终端管理路由器', 'ssh.enabled', ssh.enabled !== false, 'terminal')}
+              <div class="system-admin-ssh-params">
+                <label class="system-admin-input-group">
+                  <span>监听端口</span>
+                  <div class="system-admin-unit-field">
+                    ${systemInputControl('ssh.port', ssh.port || 22, 'number')}
+                    <em>PORT</em>
+                  </div>
+                </label>
+                <label class="system-admin-input-group">
+                  <span>空闲超时</span>
+                  <div class="system-admin-unit-field">
+                    ${systemInputControl('ssh.idle_timeout_min', ssh.idle_timeout_min ?? 30, 'number')}
+                    <em>MINS</em>
+                  </div>
+                </label>
+              </div>
             </div>
             <div class="system-admin-policy-list">
               ${systemAdminPolicyTile('允许密码登录', 'ssh.password_login', ssh.password_login !== false)}
@@ -1498,20 +1510,10 @@ export function mount(context = {}) {
           </section>
         </div>
         <div class="system-admin-security-grid">
-          ${systemTwofaPanel(twofa)}
-          ${systemAppPairingPanel(apiData)}
+          ${systemSecurityBindingPanel(twofa, apiData)}
+          ${systemCloudPairingPanel(data)}
         </div>
       </div>
-    `;
-  }
-
-  function systemAdminHeroCard(label, hint, field, checked) {
-    return `
-      <label class="system-admin-hero-card">
-        <input type="checkbox" ${checked ? 'checked' : ''} data-system-field="${escapeHtml(field)}">
-        <span class="system-admin-hero-copy"><strong>${escapeHtml(label)}</strong><em>${escapeHtml(hint)}</em></span>
-        <span class="system-admin-master-switch" aria-hidden="true"><i></i></span>
-      </label>
     `;
   }
 
@@ -1524,44 +1526,102 @@ export function mount(context = {}) {
     `;
   }
 
-  function systemTwofaPanel(twofa = {}) {
+  /*
+   * OTP 与 App 配对合并为单张「安全绑定」卡：两者都是同一件事的两半（谁能登录、
+   * 用什么第二因子），此前分成两张并排面板会让同一主题的状态被卡片边界割开。
+   * 常驻区只保留状态行与单一入口，短流程仍走 Kit 居中对话框（design.md 规则 16）。
+   */
+  function systemSecurityBindingPanel(twofa = {}, apiData = {}) {
     const enabled = Boolean(twofa.twofa_enabled || twofa.enabled);
     const hasPrepared = Boolean(twofa.secret || twofa.otpauth_url);
-    const meta = `${Number(twofa.digits || 6)} 位 · ${Number(twofa.period || 30)} 秒刷新 · ${escapeHtml(twofa.method || 'totp').toUpperCase()}`;
+    const meta = `${Number(twofa.digits || 6)} 位 · ${Number(twofa.period || 30)} 秒刷新 · ${String(twofa.method || 'totp').toUpperCase()}`;
+    const devices = Array.isArray(apiData.paired_devices) ? apiData.paired_devices : [];
+    const pairedDevices = devices.filter((device) => Number(device?.paired_at || 0) > 0 || String(device?.state || '') === 'paired');
     return `
-      <section class="system-demo-panel system-admin-otp-panel">
-        <div class="system-demo-panel-title">${systemSettingsIcon('shield')}<span>OTP 验证码绑定</span></div>
-        <div class="system-admin-status-row">
-          <span class="system-admin-status-light ${enabled ? 'ok' : ''}" aria-hidden="true">${systemSettingsIcon('key')}</span>
-          <div>
-            <strong>${enabled ? '已启用双因素验证' : (hasPrepared ? '已生成绑定密钥，等待验证' : '未绑定双因素验证')}</strong>
-            <em>${escapeHtml(meta)}</em>
+      <section class="system-demo-panel system-admin-security-panel">
+        <div class="system-demo-panel-title">${systemSettingsIcon('shield')}<span>安全绑定</span></div>
+        <div class="system-admin-binding-group">
+          <div class="system-admin-status-row">
+            <span class="system-admin-status-light ${enabled ? 'ok' : ''}" aria-hidden="true">${systemSettingsIcon('key')}</span>
+            <div>
+              <strong>${enabled ? '已启用双因素验证' : (hasPrepared ? '已生成绑定密钥，等待验证' : '未绑定双因素验证')}</strong>
+              <em>OTP 验证码 · ${escapeHtml(meta)}</em>
+            </div>
+            <button class="system-demo-btn ${enabled ? 'secondary' : 'primary'}" type="button" data-system-action="twofa-open-binding" ${state.twofaWorking ? 'disabled' : ''}>${enabled ? '管理绑定' : '准备绑定'}</button>
           </div>
-          <button class="system-demo-btn ${enabled ? 'secondary' : 'primary'}" type="button" data-system-action="twofa-open-binding" ${state.twofaWorking ? 'disabled' : ''}>${enabled ? '管理绑定' : '准备绑定'}</button>
+          <p class="system-admin-security-note">${enabled ? '登录时需要验证器生成的动态验证码。解绑也会在小窗口中再次验证。' : '扫描二维码并输入动态验证码，请妥善保管密钥。'}</p>
         </div>
-        <p class="system-admin-security-note">${enabled ? '登录时需要验证器生成的动态验证码。解绑也会在小窗口中再次验证。' : '扫描二维码并输入动态验证码，请妥善保管密钥。'}</p>
+        <div class="system-admin-binding-group">
+          <div class="system-admin-status-row">
+            <span class="system-admin-status-light ${pairedDevices.length ? 'ok' : ''}" aria-hidden="true">${systemSettingsIcon('phone')}</span>
+            <div>
+              <strong>${pairedDevices.length} 台 App 已绑定</strong>
+              <em>App 配对 · 由 App 使用自身设备身份发起</em>
+            </div>
+            <button class="system-demo-btn primary" type="button" data-system-action="api-open-pairing" ${state.pairWorking ? 'disabled' : ''}>准备绑定</button>
+          </div>
+          <div class="system-api-device-list">
+            ${pairedDevices.length ? pairedDevices.map(systemApiDeviceRow).join('') : `<div class="system-api-empty">还没有已绑定 App。</div>`}
+          </div>
+        </div>
       </section>
     `;
   }
 
-  function systemAppPairingPanel(apiData = {}) {
+  /*
+   * 云平台配对。目前只读，而且刻意不画任何点不动的按钮。
+   *
+   * 后端现状（已在 Front-to-Backend-cloud-pairing-api.md 里核实并交接）：
+   * dreamingos-cloud 的 ubus 面只有 status / identity 两个 NOARG 只读方法，webd 没有
+   * 任何 /api/v1/cloud|relay|remote 路由，所以 WebUI 拿不到隧道状态，也没有写入口去
+   * 初始化配对。唯一能在浏览器里读到的真实云端信号来自 /api/v1/auth/devices 的
+   * last_remote_seen / last_access_path：这两列由 dreamingos-cloud 在经中继服务请求时
+   * 回写，因此「有没有设备真的走过远程链路」是可信的，而隧道自身的开关状态不可知。
+   * 这里如实呈现这一点，不猜测、不乐观展示。
+   */
+  function systemCloudPairingPanel(data = {}) {
+    const apiData = data.api || {};
     const devices = Array.isArray(apiData.paired_devices) ? apiData.paired_devices : [];
     const pairedDevices = devices.filter((device) => Number(device?.paired_at || 0) > 0 || String(device?.state || '') === 'paired');
+    const remoteDevices = pairedDevices.filter((device) => Number(device?.last_remote_seen || 0) > 0);
+    const relayDevices = pairedDevices.filter((device) => String(device?.last_access_path || 'local') !== 'local');
+    const lastRemote = remoteDevices.reduce((max, device) => Math.max(max, Number(device.last_remote_seen || 0)), 0);
+    const observed = remoteDevices.length > 0 || relayDevices.length > 0;
     return `
-      <section class="system-demo-panel system-admin-app-panel">
-        <div class="system-demo-panel-title">${systemSettingsIcon('phone')}<span>App 配对</span></div>
-        <div class="system-admin-status-row system-admin-app-status">
-          <span class="system-admin-status-light ${pairedDevices.length ? 'ok' : ''}" aria-hidden="true">${systemSettingsIcon('phone')}</span>
+      <section class="system-demo-panel system-admin-cloud-panel">
+        <div class="system-demo-panel-title">${systemSettingsIcon('cloud')}<span>云平台配对</span></div>
+        <div class="system-admin-status-row">
+          <span class="system-admin-status-light ${observed ? 'ok' : ''}" aria-hidden="true">${systemSettingsIcon('link')}</span>
           <div>
-            <strong>${pairedDevices.length} 台 App 已绑定</strong>
+            <strong>${observed ? '已观测到远程接入' : '未观测到远程接入'}</strong>
+            <em>${observed
+              ? escapeHtml(`${remoteDevices.length} 台 App 走过中继${lastRemote ? ` · 最近 ${relativeSeconds(lastRemote)}` : ''}`)
+              : '已绑定的 App 目前都只从本地网络访问'}</em>
           </div>
-          <button class="system-demo-btn primary" type="button" data-system-action="api-open-pairing" ${state.pairWorking ? 'disabled' : ''}>准备绑定</button>
         </div>
-        <div class="system-api-device-list">
-          <div class="system-admin-list-head"><strong>已绑定 App</strong><span>${pairedDevices.length} 台设备</span></div>
-          ${pairedDevices.length ? pairedDevices.map(systemApiDeviceRow).join('') : `<div class="system-api-empty">还没有已绑定 App。</div>`}
+        <div class="system-admin-cloud-metrics">
+          ${systemCloudMetric('已绑定 App', String(pairedDevices.length), '可用于远程接入的设备总数')}
+          ${systemCloudMetric('走过中继', String(remoteDevices.length), observed ? '按后端远程接入审计列统计' : '暂无远程接入记录')}
+          ${systemCloudMetric('最近远程访问', lastRemote ? relativeSeconds(lastRemote) : '无记录', lastRemote ? '来自 last_remote_seen' : 'no_remote_access_recorded')}
+        </div>
+        <div class="system-admin-cloud-notice">
+          ${systemSettingsIcon('warning')}
+          <div>
+            <strong>云端配对入口尚未开放</strong>
+            <em>路由器侧的云端代理只提供只读状态，Web 端没有可用的配对与启用接口，因此这里不提供操作按钮。当前需要由运维在路由器上完成中继接入配置。</em>
+          </div>
         </div>
       </section>
+    `;
+  }
+
+  function systemCloudMetric(label, value, hint) {
+    return `
+      <div class="system-admin-cloud-metric">
+        <span>${escapeHtml(label)}</span>
+        <strong>${escapeHtml(value)}</strong>
+        <em>${escapeHtml(hint)}</em>
+      </div>
     `;
   }
 
@@ -1869,12 +1929,22 @@ export function mount(context = {}) {
     const enabled = device.enabled !== false && device.state !== 'disabled';
     const lastSeen = Number(device.last_seen || 0);
     const pairedAt = Number(device.paired_at || 0);
+    const lastRemote = Number(device.last_remote_seen || 0);
+    const accessPath = String(device.last_access_path || 'local');
+    const fingerprint = String(device.public_key_fingerprint || '');
+    const meta = [
+      device.platform,
+      device.role,
+      lastSeen ? `上次 ${relativeSeconds(lastSeen)}` : '',
+      pairedAt ? `绑定 ${relativeSeconds(pairedAt)}` : '',
+      lastRemote ? `远程 ${relativeSeconds(lastRemote)}` : ''
+    ].filter(Boolean).join(' · ');
     return `
       <article class="system-api-row ${enabled ? '' : 'disabled'}">
         <span class="system-api-row-icon" aria-hidden="true">${systemSettingsIcon(device.platform === 'android' ? 'android' : 'phone')}</span>
         <span>
-          <strong>${escapeHtml(device.name || 'App Device')}</strong>
-          <em>${escapeHtml([device.platform, device.role, lastSeen ? `上次 ${relativeSeconds(lastSeen)}` : '', pairedAt ? `绑定 ${relativeSeconds(pairedAt)}` : ''].filter(Boolean).join(' · ') || id || '等待后端返回设备信息')}</em>
+          <strong><span class="system-api-row-name">${escapeHtml(device.name || 'App Device')}</span>${accessPath !== 'local' ? `<b class="system-api-path-tag">${escapeHtml(accessPath === 'relay' ? '远程' : accessPath)}</b>` : ''}</strong>
+          <em>${escapeHtml(meta || id || '等待后端返回设备信息')}${fingerprint ? ` · <i class="system-api-row-fingerprint">指纹 ${escapeHtml(fingerprint)}</i>` : ''}</em>
         </span>
         <b class="${enabled ? 'good' : ''}">${enabled ? '启用' : '停用'}</b>
         <button class="system-demo-btn secondary compact-btn" type="button" data-system-action="api-revoke-device" data-api-id="${escapeHtml(id)}" ${!id || state.deviceWorking === id ? 'disabled' : ''}>撤销</button>
@@ -3039,7 +3109,7 @@ export function mount(context = {}) {
   }
 
   async function fetchJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
       credentials: 'same-origin',
       cache: 'no-store',
       headers: { ...(api.authHeaders ? api.authHeaders() : {}), ...(options.headers || {}) },
@@ -3061,7 +3131,7 @@ export function mount(context = {}) {
   }
 
   async function postJson(url, body) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
       method: 'POST',
       credentials: 'same-origin',
       cache: 'no-store',
@@ -3094,6 +3164,8 @@ export function mount(context = {}) {
     if (type === 'clock') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg>`;
     if (type === 'terminal') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="m7 9 3 3-3 3"></path><path d="M12 15h5"></path></svg>`;
     if (type === 'globe') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M3 12h18"></path><path d="M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"></path></svg>`;
+    if (type === 'cloud') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7.2 18.5h9.6a3.7 3.7 0 0 0 .3-7.4 5.2 5.2 0 0 0-10-1.5 3.9 3.9 0 0 0 .1 8.9Z"></path></svg>`;
+    if (type === 'link') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a4 4 0 0 0 5.7 0l2.6-2.6a4 4 0 0 0-5.7-5.7L11.5 6"></path><path d="M14 11a4 4 0 0 0-5.7 0L5.7 13.6a4 4 0 0 0 5.7 5.7L12.5 18"></path></svg>`;
     if (type === 'disk') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5a2 2 0 0 1 2-2h10l4 4v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"></path><path d="M8 3v6h8"></path><path d="M8 17h8"></path></svg>`;
     if (type === 'gear') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9.7 4.1a2.3 2.3 0 0 1 4.6 0 2.3 2.3 0 0 0 3.3 1.9 2.3 2.3 0 0 1 2.3 4 2.3 2.3 0 0 0 0 3.8 2.3 2.3 0 0 1-2.3 4 2.3 2.3 0 0 0-3.3 1.9 2.3 2.3 0 0 1-4.6 0 2.3 2.3 0 0 0-3.3-1.9 2.3 2.3 0 0 1-2.3-4 2.3 2.3 0 0 0 0-3.8 2.3 2.3 0 0 1 2.3-4 2.3 2.3 0 0 0 3.3-1.9"></path><circle cx="12" cy="12" r="3"></circle></svg>`;
     if (type === 'hourglass') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h12M6 21h12"></path><path d="M7 3c0 5 10 5 10 9s-10 4-10 9"></path><path d="M17 3c0 5-10 5-10 9s10 4 10 9"></path></svg>`;

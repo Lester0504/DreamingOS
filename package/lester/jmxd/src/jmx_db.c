@@ -9,6 +9,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <arpa/inet.h>
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,7 +39,7 @@ static int g_fingerprint_catalog_changed = 0;
 #define FINGERPRINT_CATALOG_VERSION 4
 #define FINGERPRINT_DB_APPLICATION_ID 1146570320
 #define FINGERPRINT_DB_SCHEMA_VERSION 1
-#define JMX_DB_SCHEMA_VERSION 6
+#define JMX_DB_SCHEMA_VERSION 7
 
 static int db_signature_db_path(char *path, size_t path_len)
 {
@@ -495,6 +496,130 @@ static void db_add_ipv6_contract(struct json_object *o, const char *raw_json,
         json_object_put(parsed);
 }
 
+/*
+ * STALE is deliberately excluded. Its kernel meaning is "was reachable once,
+ * not verified since", and an IPv6 STALE entry can survive long after a client
+ * disappears. Treating it as liveness is what kept deleted container veths
+ * listed as online.
+ */
+static int db_client_neigh_reachable(const char *state)
+{
+    return state && state[0] &&
+           (strstr(state, "REACHABLE") || strstr(state, "DELAY") ||
+            strstr(state, "PROBE") || strstr(state, "PERMANENT") ||
+            strstr(state, "NOARP") || strstr(state, "arp_reachable"));
+}
+
+/*
+ * Online decision, isolated from row/JSON plumbing so it can be exercised
+ * directly by tests. Every field is evidence the caller has already gathered;
+ * this function only weighs it.
+ *
+ * Ghost-client rule: a client whose IPv4 neighbour entry FAILED, or that the
+ * LAN bridge has not seen a frame from, is offline unless traffic, conntrack
+ * or a genuinely reachable neighbour state says otherwise. STALE is not
+ * reachable: it only means "was reachable once, unverified now".
+ */
+void jmx_db_client_online_verdict(const struct jmx_db_client_evidence *ev,
+                                  struct jmx_db_client_verdict *out)
+{
+    int online;
+    int sample_valid;
+    int has_active_evidence;
+    int neigh_failed = 0;
+    int neigh_reachable = 0;
+    int fdb_absent;
+    int64_t tx_rate;
+    int64_t rx_rate;
+    int connections;
+
+    if (!ev || !out)
+        return;
+    memset(out, 0, sizeof(*out));
+    online = ev->db_online;
+    tx_rate = ev->tx_rate;
+    rx_rate = ev->rx_rate;
+    connections = ev->connections;
+
+    /* IPv4 is authoritative because this router owns the IPv4 LAN. An IPv6
+     * STALE entry must never mask an IPv4 FAILED one; that shared field was
+     * the original defect. */
+    if (strstr(ev->neigh_state_v4, "FAILED") ||
+        strstr(ev->neigh_state_v4, "INCOMPLETE"))
+        neigh_failed = 1;
+    else if (!ev->neigh_state_v4[0] &&
+             (strstr(ev->neigh_state_v6, "FAILED") ||
+              strstr(ev->neigh_state_v6, "INCOMPLETE")))
+        neigh_failed = 1;
+    else if (strstr(ev->neigh_state, "FAILED") ||
+             strstr(ev->neigh_state, "INCOMPLETE"))
+        neigh_failed = 1;
+    neigh_reachable = db_client_neigh_reachable(ev->neigh_state_v4) ||
+                      db_client_neigh_reachable(ev->neigh_state_v6) ||
+                      db_client_neigh_reachable(ev->neigh_state);
+    /* -1 means no bridge could be read, which is not evidence of absence. */
+    fdb_absent = ev->bridge_fdb_present == 0;
+
+    sample_valid = ev->sample_age_ms >= 0 && ev->sample_age_ms <= 30000;
+    if (!sample_valid) {
+        tx_rate = 0;
+        rx_rate = 0;
+        connections = 0;
+    }
+    has_active_evidence = (sample_valid &&
+                           (tx_rate > 0 || rx_rate > 0 || connections > 0 ||
+                            (ev->last_seen_age >= 0 && ev->last_seen_age <= 120))) ||
+                          (ev->runtime_online && sample_valid) ||
+                          (online && sample_valid && !neigh_failed);
+    if (fdb_absent && !neigh_reachable && tx_rate <= 0 && rx_rate <= 0 &&
+        connections <= 0) {
+        has_active_evidence = 0;
+        out->offline_reason = "not_in_bridge_fdb";
+    }
+    if (online && (!has_active_evidence ||
+                   (neigh_failed && tx_rate <= 0 && rx_rate <= 0 &&
+                    connections <= 0))) {
+        online = 0;
+        if (ev->sample_age_ms < 0 || ev->sample_age_ms > 30000)
+            sample_valid = 0;
+    }
+
+    out->online = online;
+    out->sample_valid = sample_valid;
+    out->neigh_failed = neigh_failed;
+    out->neigh_reachable = neigh_reachable;
+    out->has_active_evidence = has_active_evidence;
+    out->tx_rate = tx_rate;
+    out->rx_rate = rx_rate;
+    out->connections = connections;
+    /* Only report a live source while the client is actually online; otherwise
+     * a leftover runtime value keeps claiming "arp" for a client this router
+     * can no longer see. */
+    out->online_source = (online && ev->runtime_online_source &&
+                          ev->runtime_online_source[0]) ? ev->runtime_online_source :
+                         (online ? "client_network_state" :
+                          (out->offline_reason ? out->offline_reason :
+                           (neigh_failed ? "neigh_failed" :
+                            (!has_active_evidence ? "stale_client_db" : ""))));
+    out->zero_reason = (tx_rate > 0 || rx_rate > 0) ? "" :
+                       (online ? (sample_valid ? "idle" : "no_sample") :
+                        (out->offline_reason ? out->offline_reason :
+                         (neigh_failed ? "neigh_failed" : "no_active_evidence")));
+}
+
+/* Mirrors jmx_core_legacy_netlink_enabled() in main.c and its twin in
+ * jmx_dreamingwrt_api.c. Both are file-static there, and the value decides which
+ * writer fills the hourly byte buckets, so the reader has to ask the same
+ * question the same way - accepting the value, not merely the variable's
+ * presence. */
+static int db_legacy_netlink_enabled(void)
+{
+    const char *v = getenv("DREAMINGWRT_CORE_LEGACY_NETLINK");
+
+    return v && (!strcmp(v, "1") || !strcasecmp(v, "true") ||
+                 !strcasecmp(v, "yes") || !strcasecmp(v, "on"));
+}
+
 static client_node_t *db_find_runtime_client(const char *mac)
 {
     client_node_t *c = NULL;
@@ -537,6 +662,163 @@ static int db_count_conntrack_for_ip(const char *ip)
     }
     fclose(fp);
     return count;
+}
+
+/* Per-family conntrack counts for one client.
+ *
+ * db_count_conntrack_for_ip() above cannot see IPv6 traffic: it takes a single
+ * IPv4 string and matches it literally, while conntrack prints IPv6 addresses
+ * fully expanded and zero padded (src=2409:8a10:001e:8aa4:...) where the client
+ * record holds the compressed form (2409:8a10:1e:8aa4::6c9). A literal compare
+ * of those two spellings can never succeed.
+ *
+ * Addresses are normalised with inet_pton and compared as bytes, so both
+ * spellings agree. One pass over conntrack serves both families.
+ *
+ * Rates and byte counters are NOT split by family: the kernel module exposes a
+ * single UpRate/DownRate pair per MAC in /proc/dreamingwrt/jmx/af_client with no
+ * family dimension, so a per-family rate would be invented. Callers publish
+ * ipv6_rate_supported=false with a reason instead. */
+#define DB_CONN_ADDR_MAX 12
+
+typedef struct {
+    unsigned char bytes[16];
+    int len;
+} db_conn_addr_t;
+
+static void db_conn_addr_add(db_conn_addr_t *slots, int *count, const char *addr)
+{
+    unsigned char buf[16];
+    int len;
+    int i;
+
+    if (!slots || !count || *count >= DB_CONN_ADDR_MAX || !addr || !addr[0])
+        return;
+    if (strchr(addr, ':')) {
+        if (inet_pton(AF_INET6, addr, buf) != 1)
+            return;
+        len = 16;
+    } else {
+        if (inet_pton(AF_INET, addr, buf) != 1)
+            return;
+        len = 4;
+    }
+    for (i = 0; i < *count; i++)
+        if (slots[i].len == len && !memcmp(slots[i].bytes, buf, (size_t)len))
+            return;
+    memcpy(slots[*count].bytes, buf, (size_t)len);
+    slots[*count].len = len;
+    (*count)++;
+}
+
+/* client_node_t.ipv6_addrs is a |-delimited list. */
+static void db_conn_addr_add_pipe(db_conn_addr_t *slots, int *count, const char *pipe)
+{
+    const char *p = pipe;
+
+    if (!slots || !count || !pipe)
+        return;
+    while ((p = strchr(p, '|')) != NULL) {
+        const char *end = strchr(p + 1, '|');
+        char addr[128];
+        size_t len;
+
+        if (!end)
+            break;
+        len = (size_t)(end - (p + 1));
+        if (len > 0 && len < sizeof(addr)) {
+            memcpy(addr, p + 1, len);
+            addr[len] = '\0';
+            db_conn_addr_add(slots, count, addr);
+        }
+        p = end;
+    }
+}
+
+static void db_count_conntrack_by_family(const client_node_t *c,
+                                         int *out_v4, int *out_v6)
+{
+    db_conn_addr_t addrs[DB_CONN_ADDR_MAX];
+    int addr_count = 0;
+    FILE *fp;
+    char line[2048];
+    int v4 = 0;
+    int v6 = 0;
+
+    if (out_v4)
+        *out_v4 = 0;
+    if (out_v6)
+        *out_v6 = 0;
+    if (!c)
+        return;
+
+    memset(addrs, 0, sizeof(addrs));
+    db_conn_addr_add(addrs, &addr_count, c->ip);
+    db_conn_addr_add(addrs, &addr_count, c->ipv6);
+    db_conn_addr_add(addrs, &addr_count, c->ipv6_global);
+    db_conn_addr_add(addrs, &addr_count, c->ipv6_lan);
+    db_conn_addr_add(addrs, &addr_count, c->ipv6_link_local);
+    db_conn_addr_add_pipe(addrs, &addr_count, c->ipv6_addrs);
+    if (addr_count == 0)
+        return;
+
+    fp = fopen("/proc/net/nf_conntrack", "r");
+    if (!fp)
+        fp = fopen("/proc/net/ip_conntrack", "r");
+    if (!fp)
+        return;
+    while (fgets(line, sizeof(line), fp)) {
+        const char *keys[2] = { "src=", "dst=" };
+        int matched_len = 0;
+        int k;
+
+        for (k = 0; k < 2 && !matched_len; k++) {
+            const char *p = strstr(line, keys[k]);
+            char addr[128];
+            unsigned char buf[16];
+            const char *e;
+            size_t len;
+            int alen;
+            int i;
+
+            if (!p)
+                continue;
+            p += 4;
+            e = p;
+            while (*e && *e != ' ' && *e != '\t' && *e != '\n')
+                e++;
+            len = (size_t)(e - p);
+            if (len == 0 || len >= sizeof(addr))
+                continue;
+            memcpy(addr, p, len);
+            addr[len] = '\0';
+            if (strchr(addr, ':')) {
+                if (inet_pton(AF_INET6, addr, buf) != 1)
+                    continue;
+                alen = 16;
+            } else {
+                if (inet_pton(AF_INET, addr, buf) != 1)
+                    continue;
+                alen = 4;
+            }
+            for (i = 0; i < addr_count; i++) {
+                if (addrs[i].len == alen &&
+                    !memcmp(addrs[i].bytes, buf, (size_t)alen)) {
+                    matched_len = alen;
+                    break;
+                }
+            }
+        }
+        if (matched_len == 16)
+            v6++;
+        else if (matched_len == 4)
+            v4++;
+    }
+    fclose(fp);
+    if (out_v4)
+        *out_v4 = v4;
+    if (out_v6)
+        *out_v6 = v6;
 }
 
 static const char *db_guess_type_from_hostname(const char *host)
@@ -2635,6 +2917,26 @@ int jmx_db_init(void)
                         "ON storage_disk_sample(disk_id,ts);") != 0)
                 goto migration_failed;
         }
+        /* Schema v7: lifetime WAN byte counters that survive interface rebuilds.
+         * PPPoE recreates its virtual interface on every reconnect, which resets
+         * the kernel counter to zero.  Reading that counter directly made the
+         * reported cumulative usage collapse to "since last reconnect" without
+         * telling anyone (Acceptance A-013). */
+        if (version < 7) {
+            if (db_exec("CREATE TABLE IF NOT EXISTS wan_lifetime_usage ("
+                        " wan_id TEXT PRIMARY KEY,"
+                        " first_seen_ts INTEGER NOT NULL DEFAULT 0,"
+                        " last_ts INTEGER NOT NULL DEFAULT 0,"
+                        " last_rx_bytes INTEGER NOT NULL DEFAULT 0,"
+                        " last_tx_bytes INTEGER NOT NULL DEFAULT 0,"
+                        " base_rx_bytes INTEGER NOT NULL DEFAULT 0,"
+                        " base_tx_bytes INTEGER NOT NULL DEFAULT 0,"
+                        " reset_count INTEGER NOT NULL DEFAULT 0,"
+                        " last_reset_ts INTEGER NOT NULL DEFAULT 0,"
+                        " sample_count INTEGER NOT NULL DEFAULT 0,"
+                        " updated_at INTEGER NOT NULL DEFAULT 0);") != 0)
+                goto migration_failed;
+        }
         if (db_set_schema_version(JMX_DB_SCHEMA_VERSION) != 0 || db_commit() != 0)
             goto migration_failed;
         migration_started = 0;
@@ -2813,6 +3115,202 @@ int jmx_db_update_daily_usage_counter(const char *wan_id,
     rc = db_step_done(st);
     sqlite3_finalize(st);
     return rc;
+}
+
+/* Lifetime WAN counters (schema v7).
+ *
+ * The kernel byte counters we sample live on the WAN's runtime device.  For
+ * PPPoE that device is destroyed and recreated on every reconnect, so the
+ * counter restarts from zero and any consumer reading it directly sees the
+ * cumulative usage collapse.  We therefore keep a monotonic total per WAN:
+ * every sample adds the forward delta, and a counter that moved backwards is
+ * treated as a rebuild whose pre-reset total is already banked in base_*.
+ *
+ * This also covers 32-bit counter wrap, which is indistinguishable from a
+ * rebuild at this layer.  Traffic that flowed while the interface was down is
+ * unobservable and is not invented here.
+ */
+int jmx_db_update_wan_lifetime_usage(const char *wan_id,
+                                     unsigned long long rx_bytes,
+                                     unsigned long long tx_bytes,
+                                     int online)
+{
+    sqlite3_stmt *st = NULL;
+    int64_t now = now_s();
+    int64_t last_rx = 0, last_tx = 0;
+    int64_t base_rx = 0, base_tx = 0;
+    int64_t last_reset_ts = 0;
+    int reset_count = 0;
+    int have = 0;
+    int reset_seen = 0;
+    int rc = -1;
+
+    if (!wan_id || !wan_id[0])
+        return -1;
+    if (jmx_db_init() != 0)
+        return -1;
+
+    if (db_prepare(&st,
+        "SELECT last_rx_bytes,last_tx_bytes,base_rx_bytes,base_tx_bytes,"
+        "reset_count,last_reset_ts FROM wan_lifetime_usage WHERE wan_id=?1") == 0) {
+        sqlite3_bind_text(st, 1, wan_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            last_rx = sqlite3_column_int64(st, 0);
+            last_tx = sqlite3_column_int64(st, 1);
+            base_rx = sqlite3_column_int64(st, 2);
+            base_tx = sqlite3_column_int64(st, 3);
+            reset_count = sqlite3_column_int(st, 4);
+            last_reset_ts = sqlite3_column_int64(st, 5);
+            have = 1;
+        }
+        sqlite3_finalize(st);
+    }
+
+    if (!have) {
+        /* First observation: adopt the counter as-is.  It already reflects real
+         * traffic on the current interface generation, so discarding it would
+         * under-report; what we cannot know is anything from generations before
+         * we started watching, and first_seen_ts says exactly that. */
+        if (db_prepare(&st,
+            "INSERT INTO wan_lifetime_usage("
+            "wan_id,first_seen_ts,last_ts,last_rx_bytes,last_tx_bytes,"
+            "base_rx_bytes,base_tx_bytes,reset_count,last_reset_ts,"
+            "sample_count,updated_at) "
+            "VALUES(?1,?2,?2,?3,?4,0,0,0,0,1,?2) "
+            "ON CONFLICT(wan_id) DO NOTHING") != 0)
+            return -1;
+        sqlite3_bind_text(st, 1, wan_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, now);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)rx_bytes);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)tx_bytes);
+        rc = db_step_done(st);
+        sqlite3_finalize(st);
+        return rc;
+    }
+
+    /* An offline WAN keeps its banked total but must not fold a stale or zeroed
+     * counter into the baseline; re-baseline instead and wait for it to return. */
+    if (!online) {
+        if ((int64_t)rx_bytes < last_rx || (int64_t)tx_bytes < last_tx) {
+            base_rx += last_rx;
+            base_tx += last_tx;
+            reset_count++;
+            last_reset_ts = now;
+            reset_seen = 1;
+        }
+    } else if ((int64_t)rx_bytes < last_rx || (int64_t)tx_bytes < last_tx) {
+        /* Counter went backwards on at least one direction: the device was
+         * rebuilt (or wrapped).  Bank both directions together so rx and tx
+         * stay on the same baseline generation. */
+        base_rx += last_rx;
+        base_tx += last_tx;
+        reset_count++;
+        last_reset_ts = now;
+        reset_seen = 1;
+    }
+
+    if (db_prepare(&st,
+        "UPDATE wan_lifetime_usage SET last_ts=?2,last_rx_bytes=?3,last_tx_bytes=?4,"
+        "base_rx_bytes=?5,base_tx_bytes=?6,reset_count=?7,last_reset_ts=?8,"
+        "sample_count=sample_count+1,updated_at=?2 WHERE wan_id=?1") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, wan_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, now);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)rx_bytes);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)tx_bytes);
+    sqlite3_bind_int64(st, 5, base_rx < 0 ? 0 : base_rx);
+    sqlite3_bind_int64(st, 6, base_tx < 0 ? 0 : base_tx);
+    sqlite3_bind_int(st, 7, reset_count);
+    sqlite3_bind_int64(st, 8, last_reset_ts);
+    rc = db_step_done(st);
+    sqlite3_finalize(st);
+    (void)reset_seen;
+    return rc;
+}
+
+int jmx_db_read_wan_lifetime_usage(const char *wan_id,
+                                   struct jmx_wan_lifetime_usage *out)
+{
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+
+    if (!out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    if (!wan_id || !wan_id[0])
+        return -1;
+    if (jmx_db_init() != 0)
+        return -1;
+    if (db_prepare(&st,
+        "SELECT first_seen_ts,last_ts,last_rx_bytes,last_tx_bytes,"
+        "base_rx_bytes,base_tx_bytes,reset_count,last_reset_ts,sample_count "
+        "FROM wan_lifetime_usage WHERE wan_id=?1") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, wan_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        int64_t last_rx = sqlite3_column_int64(st, 2);
+        int64_t last_tx = sqlite3_column_int64(st, 3);
+        int64_t base_rx = sqlite3_column_int64(st, 4);
+        int64_t base_tx = sqlite3_column_int64(st, 5);
+
+        out->first_seen_ts = sqlite3_column_int64(st, 0);
+        out->last_ts = sqlite3_column_int64(st, 1);
+        out->reset_count = sqlite3_column_int(st, 6);
+        out->last_reset_ts = sqlite3_column_int64(st, 7);
+        out->sample_count = sqlite3_column_int(st, 8);
+        out->rx_bytes = (base_rx < 0 ? 0 : base_rx) + (last_rx < 0 ? 0 : last_rx);
+        out->tx_bytes = (base_tx < 0 ? 0 : base_tx) + (last_tx < 0 ? 0 : last_tx);
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    return found ? 0 : -1;
+}
+
+/* Emit a WAN's cumulative byte counters into a response object.
+ *
+ * Every caller that used to add up_bytes/down_bytes straight from the sampled
+ * kernel counter goes through here, so a new response builder cannot quietly
+ * reintroduce the PPPoE-reconnect zeroing. The raw counter is still published
+ * as device_*_bytes because it is the honest answer to "this session".
+ */
+void jmx_db_add_wan_cumulative_bytes(struct json_object *out, const char *wan_id,
+                                     int64_t device_rx_bytes,
+                                     int64_t device_tx_bytes)
+{
+    struct jmx_wan_lifetime_usage lt;
+    int64_t rx = device_rx_bytes < 0 ? 0 : device_rx_bytes;
+    int64_t tx = device_tx_bytes < 0 ? 0 : device_tx_bytes;
+    const char *source = "runtime_device_counter";
+
+    if (!out)
+        return;
+    if (wan_id && wan_id[0] && jmx_db_read_wan_lifetime_usage(wan_id, &lt) == 0) {
+        /* The lifetime total is a superset of the current counter by
+         * construction; never report less than the device shows. */
+        if (lt.rx_bytes > rx)
+            rx = lt.rx_bytes;
+        if (lt.tx_bytes > tx)
+            tx = lt.tx_bytes;
+        source = "persisted_lifetime_counter";
+        json_object_object_add(out, "counter_since", json_object_new_int64(lt.first_seen_ts));
+        json_object_object_add(out, "counter_reset_detected",
+                               json_object_new_boolean(lt.reset_count > 0));
+        json_object_object_add(out, "counter_reset_count", json_object_new_int(lt.reset_count));
+        json_object_object_add(out, "counter_last_reset_at",
+                               json_object_new_int64(lt.last_reset_ts));
+    } else {
+        /* No persisted history, so the raw counter is all we have.  Say so
+         * instead of implying it covers the interface's whole life. */
+        json_object_object_add(out, "counter_since", json_object_new_int64(0));
+        json_object_object_add(out, "counter_reset_detected", json_object_new_boolean(0));
+        json_object_object_add(out, "counter_reset_count", json_object_new_int(0));
+        json_object_object_add(out, "counter_last_reset_at", json_object_new_int64(0));
+    }
+    json_object_object_add(out, "up_bytes", json_object_new_int64(tx));
+    json_object_object_add(out, "down_bytes", json_object_new_int64(rx));
+    json_object_object_add(out, "device_up_bytes", json_object_new_int64(device_tx_bytes));
+    json_object_object_add(out, "device_down_bytes", json_object_new_int64(device_rx_bytes));
+    json_object_object_add(out, "bytes_source", json_object_new_string(source));
 }
 
 static int jmx_db_usage_counter_all_wans(int64_t start, int64_t end,
@@ -3631,6 +4129,33 @@ int jmx_db_sync_clients_from_memory(void)
         json_object_object_add(ns, "link_type", json_object_new_string("unknown"));
         json_object_object_add(ns, "tx_rate", json_object_new_int64(c->up_rate));
         json_object_object_add(ns, "rx_rate", json_object_new_int64(c->down_rate));
+        /* Byte counters were never written here, so client_network_state.tx_bytes
+         * and rx_bytes stayed at their column default of 0 for every client on
+         * every router, while the rates next to them were live. The numbers did
+         * exist in memory the whole time; they were simply dropped on the way to
+         * the database.
+         *
+         * What we have is a per-hour ring for the current day only
+         * (client_node_t.daily_stats.hourly_traffic[24], accumulated in
+         * jmx_netlink.c). There is no lifetime counter anywhere in jmxd for a
+         * client, so summing the 24 buckets yields a TODAY total that resets at
+         * local midnight - not a lifetime total. The reader publishes
+         * bytes_window="today" next to these values so no consumer can mistake
+         * one for the other. */
+        {
+            daily_hourly_stat_t *today = get_today_stat(c);
+            unsigned long long up = 0, down = 0;
+
+            if (today) {
+                int hour;
+                for (hour = 0; hour < HOURS_PER_DAY; hour++) {
+                    up += today->hourly_traffic[hour].up_bytes;
+                    down += today->hourly_traffic[hour].down_bytes;
+                }
+            }
+            json_object_object_add(ns, "tx_bytes", json_object_new_int64((int64_t)up));
+            json_object_object_add(ns, "rx_bytes", json_object_new_int64((int64_t)down));
+        }
         json_object_object_add(ns, "connections", json_object_new_int(db_count_conntrack_for_ip(c->ip)));
         json_object_object_add(ns, "online", json_object_new_int(c->online));
         db_upsert_network_state(cid, ns);
@@ -3728,22 +4253,37 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
     int64_t sample_age_ms = network_updated_at > 0 && now >= network_updated_at ? (now - network_updated_at) * 1000 : -1;
     int64_t tx_rate = sqlite3_column_int64(st, 25);
     int64_t rx_rate = sqlite3_column_int64(st, 26);
+    int64_t tx_bytes = sqlite3_column_int64(st, 27);
+    int64_t rx_bytes = sqlite3_column_int64(st, 28);
+    const char *bytes_source = "client_network_state";
     int connections = sqlite3_column_int(st, 29);
     int online = sqlite3_column_int(st, 37) != 0;
     int sample_valid;
     int has_active_evidence;
-    int neigh_failed = 0;
+    const char *offline_reason = NULL;
+    const char *verdict_online_source = NULL;
+    const char *verdict_zero_reason = NULL;
     client_node_t *runtime = NULL;
+    struct jmx_db_client_evidence evidence;
+    struct jmx_db_client_verdict verdict;
     int64_t online_since = 0;
     int64_t online_duration = 0;
     char online_duration_source[64] = "";
     char resolved_model[256] = "";
     char model_source[96] = "";
+    int conn_v4 = 0;
+    int conn_v6 = 0;
 
     runtime = db_find_runtime_client((const char *)sqlite3_column_text(st, 1));
     if (runtime) {
-        int runtime_ct = db_count_conntrack_for_ip(runtime->ip);
+        /* Count both families in one conntrack pass. The old call counted only
+         * the IPv4 literal, so a dual-stack client's IPv6 connections were
+         * missing from the total the UI shows. */
+        int runtime_ct;
         int runtime_live = runtime->online || runtime->up_rate > 0 || runtime->down_rate > 0;
+
+        db_count_conntrack_by_family(runtime, &conn_v4, &conn_v6);
+        runtime_ct = conn_v4 + conn_v6;
 
         /* Runtime can keep an old offline client node around while DB/identityd
          * has fresher topology/IP evidence.  Do not let a stale runtime node, or
@@ -3752,6 +4292,33 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
         if (runtime->up_rate > 0 || runtime->down_rate > 0) {
             tx_rate = runtime->up_rate;
             rx_rate = runtime->down_rate;
+        }
+        /* Byte totals get the same runtime override the rates already had. The
+         * stored row is only as fresh as the last bulk sync, and on a router
+         * whose storage guard is refusing bulk writes it is never refreshed at
+         * all - which is exactly the state 30.1 was in, reporting live rates
+         * beside zero byte counters. Reading the in-memory day ring here keeps
+         * the two consistent. Larger-wins because the ring is authoritative for
+         * today and the stored row can only lag it. */
+        {
+            daily_hourly_stat_t *today = get_today_stat(runtime);
+
+            if (today) {
+                unsigned long long up = 0, down = 0;
+                int hour;
+
+                for (hour = 0; hour < HOURS_PER_DAY; hour++) {
+                    up += today->hourly_traffic[hour].up_bytes;
+                    down += today->hourly_traffic[hour].down_bytes;
+                }
+                if ((int64_t)up > tx_bytes || (int64_t)down > rx_bytes) {
+                    if ((int64_t)up > tx_bytes)
+                        tx_bytes = (int64_t)up;
+                    if ((int64_t)down > rx_bytes)
+                        rx_bytes = (int64_t)down;
+                    bytes_source = "client_hourly_traffic";
+                }
+            }
         }
         if (runtime_live && runtime_ct > connections)
             connections = runtime_ct;
@@ -3764,27 +4331,46 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
             last_seen = runtime->last_seen_ts ? runtime->last_seen_ts : last_seen;
             last_seen_age = last_seen > 0 && now >= last_seen ? now - last_seen : -1;
         }
-        if (strstr(runtime->neigh_state, "FAILED") ||
-            strstr(runtime->neigh_state, "INCOMPLETE"))
-            neigh_failed = 1;
     }
-    sample_valid = sample_age_ms >= 0 && sample_age_ms <= 30000;
-    if (!sample_valid) {
-        tx_rate = 0;
-        rx_rate = 0;
-        connections = 0;
+    /* One shared verdict function so the API, the tests and any future caller
+     * cannot drift apart on what "online" means. */
+    memset(&evidence, 0, sizeof(evidence));
+    evidence.db_online = online;
+    evidence.runtime_online = runtime && runtime->online;
+    evidence.tx_rate = tx_rate;
+    evidence.rx_rate = rx_rate;
+    evidence.connections = connections;
+    evidence.sample_age_ms = sample_age_ms;
+    evidence.last_seen_age = last_seen_age;
+    /* Ask the bridge directly rather than reading runtime->bridge_fdb_present:
+     * that field is only refreshed by the legacy scheduler, which is disabled on
+     * current deployments, so it would stay -1 and silently switch off the
+     * ghost-client cross-check. */
+    evidence.bridge_fdb_present =
+        client_bridge_fdb_present((const char *)sqlite3_column_text(st, 1));
+    if (evidence.bridge_fdb_present < 0 && runtime)
+        evidence.bridge_fdb_present = runtime->bridge_fdb_present;
+    if (runtime) {
+        snprintf(evidence.neigh_state, sizeof(evidence.neigh_state), "%s",
+                 runtime->neigh_state);
+        snprintf(evidence.neigh_state_v4, sizeof(evidence.neigh_state_v4), "%s",
+                 runtime->neigh_state_v4);
+        snprintf(evidence.neigh_state_v6, sizeof(evidence.neigh_state_v6), "%s",
+                 runtime->neigh_state_v6);
+        evidence.runtime_online_source = runtime->online_source;
     }
-    has_active_evidence = (sample_valid &&
-                           (tx_rate > 0 || rx_rate > 0 || connections > 0 ||
-                            (last_seen_age >= 0 && last_seen_age <= 120))) ||
-                          (runtime && runtime->online && sample_valid) ||
-                          (online && sample_valid && !neigh_failed);
-    if (online && (!has_active_evidence ||
-                   (neigh_failed && tx_rate <= 0 && rx_rate <= 0 && connections <= 0))) {
-        online = 0;
-        if (sample_age_ms < 0 || sample_age_ms > 30000)
-            sample_valid = 0;
-    }
+    jmx_db_client_online_verdict(&evidence, &verdict);
+    online = verdict.online;
+    sample_valid = verdict.sample_valid;
+    has_active_evidence = verdict.has_active_evidence;
+    tx_rate = verdict.tx_rate;
+    rx_rate = verdict.rx_rate;
+    connections = verdict.connections;
+    offline_reason = verdict.offline_reason;
+    verdict_online_source = verdict.online_source;
+    verdict_zero_reason = verdict.zero_reason;
+    (void)has_active_evidence;
+    (void)offline_reason;
     (void)db_runtime_online_session(runtime, online, now, &online_since,
                                     &online_duration, online_duration_source,
                                     sizeof(online_duration_source));
@@ -3875,9 +4461,42 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
     json_object_object_add(o, "rx_rate", json_object_new_int64(rx_rate));
     json_object_object_add(o, "up_rate", json_object_new_int64(tx_rate));
     json_object_object_add(o, "down_rate", json_object_new_int64(rx_rate));
-    json_object_object_add(o, "tx_bytes", json_object_new_int64(sqlite3_column_int64(st, 27)));
-    json_object_object_add(o, "rx_bytes", json_object_new_int64(sqlite3_column_int64(st, 28)));
+    json_object_object_add(o, "tx_bytes", json_object_new_int64(tx_bytes));
+    json_object_object_add(o, "rx_bytes", json_object_new_int64(rx_bytes));
+    /* These two are a TODAY total, not a lifetime one: jmxd keeps per-client
+     * traffic in a 24-hour ring for the current day and has no lifetime counter,
+     * so the value resets at local midnight. Saying so explicitly is the whole
+     * point - the field names read like lifetime counters and cannot be renamed
+     * without breaking the shipped Web module and the iOS App, so the window is
+     * published alongside them instead. */
+    json_object_object_add(o, "bytes_window", json_object_new_string("today"));
+    json_object_object_add(o, "bytes_source", json_object_new_string(bytes_source));
+    json_object_object_add(o, "bytes_reset_at", json_object_new_string("local_midnight"));
+    /* The hourly buckets behind these values are normally filled by integrating
+     * the sampled rate, so treat them as an estimate unless the exact kernel
+     * counter path is running. client_traffic_history.today_metrics.bytes_method
+     * names which writer produced them. */
+    json_object_object_add(o, "bytes_estimated",
+                           json_object_new_boolean(!db_legacy_netlink_enabled()));
     json_object_object_add(o, "connections", json_object_new_int(connections));
+    /* IPv6 dimension the UI asked for. Connection counts are real (conntrack);
+     * rates and byte counters are family-agnostic in the kernel module, so they
+     * are reported as unsupported with a reason instead of a fabricated 0. */
+    json_object_object_add(o, "ipv4_connections", json_object_new_int(conn_v4));
+    json_object_object_add(o, "ipv6_connections", json_object_new_int(conn_v6));
+    json_object_object_add(o, "connections_ipv4", json_object_new_int(conn_v4));
+    json_object_object_add(o, "connections_ipv6", json_object_new_int(conn_v6));
+    json_object_object_add(o, "connections_source",
+                           json_object_new_string(conn_v4 + conn_v6 > 0 ?
+                                                  "nf_conntrack_by_family" :
+                                                  "client_network_state"));
+    json_object_object_add(o, "ipv6_connections_supported", json_object_new_boolean(1));
+    json_object_object_add(o, "ipv6_rate_supported", json_object_new_boolean(0));
+    json_object_object_add(o, "ipv6_rate_reason",
+        json_object_new_string("jmx_per_client_accounting_is_family_agnostic"));
+    json_object_object_add(o, "ipv6_bytes_supported", json_object_new_boolean(0));
+    json_object_object_add(o, "ipv6_bytes_reason",
+        json_object_new_string("jmx_per_client_accounting_is_family_agnostic"));
     json_object_object_add(o, "online", json_object_new_boolean(online));
     if (online_since > 0) {
         json_object_object_add(o, "online_since", json_object_new_int64(online_since));
@@ -3900,16 +4519,25 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
     json_object_object_add(o, "rate_source", json_object_new_string(
         runtime && (runtime->up_rate > 0 || runtime->down_rate > 0) ? "client_runtime" : "client_network_state"));
     json_object_object_add(o, "online_source", json_object_new_string(
-        runtime && runtime->online_source[0] ? runtime->online_source :
-        (online ? "client_network_state" :
-         (neigh_failed ? "neigh_failed" :
-          (!has_active_evidence ? "stale_client_db" : "")))));
+        verdict_online_source ? verdict_online_source : ""));
     json_object_object_add(o, "neigh_state", json_object_new_string(
         runtime && runtime->neigh_state[0] ? runtime->neigh_state : ""));
+    /* Publish both families so a disagreement is diagnosable from the API
+     * instead of requiring shell access to the router. */
+    json_object_object_add(o, "neigh_state_ipv4", json_object_new_string(
+        runtime && runtime->neigh_state_v4[0] ? runtime->neigh_state_v4 : ""));
+    json_object_object_add(o, "neigh_state_ipv6", json_object_new_string(
+        runtime && runtime->neigh_state_v6[0] ? runtime->neigh_state_v6 : ""));
+    if (evidence.bridge_fdb_present >= 0)
+        json_object_object_add(o, "bridge_fdb_present",
+                               json_object_new_boolean(evidence.bridge_fdb_present));
+    else {
+        json_object_object_add(o, "bridge_fdb_present", NULL);
+        json_object_object_add(o, "bridge_fdb_reason",
+                               json_object_new_string("bridge_fdb_unreadable"));
+    }
     json_object_object_add(o, "zero_reason", json_object_new_string(
-        (tx_rate > 0 || rx_rate > 0) ? "" :
-        (online ? (sample_valid ? "idle" : "no_sample") :
-         (neigh_failed ? "neigh_failed" : "no_active_evidence"))));
+        verdict_zero_reason ? verdict_zero_reason : ""));
 
     json_object_object_add(fp, "engine", json_object_new_int(engine));
     json_object_object_add(fp, "device_id", json_object_new_int(device_id));
@@ -4433,8 +5061,12 @@ int jmx_db_write_interface_state(const char *name, int online, unsigned long lon
     sqlite3_bind_int64(st, 6, rx_rate); sqlite3_bind_int64(st, 7, tx_rate); sqlite3_bind_int(st, 8, latency_ms); sqlite3_bind_int(st, 9, loss_pct);
     rc = db_step_done(st);
     sqlite3_finalize(st);
-    if (rc == 0)
+    if (rc == 0) {
         jmx_db_update_daily_usage_counter(name, rx_bytes, tx_bytes, online);
+        /* Lifetime totals must be maintained on every sample, online or not, or
+         * a reconnect that lands between two samples silently rebases them. */
+        jmx_db_update_wan_lifetime_usage(name, rx_bytes, tx_bytes, online);
+    }
     return rc;
 }
 
@@ -4659,8 +5291,7 @@ struct json_object *jmx_db_api_line_load(struct json_object *req)
             }
             json_object_object_add(o, "up_rate", json_object_new_int64((int64_t)tx_rate));
             json_object_object_add(o, "down_rate", json_object_new_int64((int64_t)rx_rate));
-            json_object_object_add(o, "up_bytes", json_object_new_int64(tx_bytes));
-            json_object_object_add(o, "down_bytes", json_object_new_int64(rx_bytes));
+            jmx_db_add_wan_cumulative_bytes(o, name, rx_bytes, tx_bytes);
             json_object_object_add(o, "connections", json_object_new_int(0));
             json_object_object_add(o, "online", json_object_new_boolean(online != 0));
             json_object_object_add(o, "status", json_object_new_string(online ? ((loss >= 50 || latency >= 180) ? "bad" : ((loss > 0 || latency >= 80) ? "warn" : "ok")) : "down"));
@@ -5487,8 +6118,7 @@ struct json_object *jmx_db_api_ipv6_load(struct json_object *req)
             json_object_object_add(o, "ipv6", json_object_new_string(ipv6));
             json_object_object_add(o, "up_rate", json_object_new_int64((int64_t)tx_rate));
             json_object_object_add(o, "down_rate", json_object_new_int64((int64_t)rx_rate));
-            json_object_object_add(o, "up_bytes", json_object_new_int64(tx_bytes));
-            json_object_object_add(o, "down_bytes", json_object_new_int64(rx_bytes));
+            jmx_db_add_wan_cumulative_bytes(o, name, rx_bytes, tx_bytes);
             json_object_object_add(o, "connections", json_object_new_int(0));
             json_object_object_add(o, "uptime", json_object_new_int64(0));
             json_object_array_add(arr, o);

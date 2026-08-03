@@ -77,8 +77,30 @@ export function mount(context = {}) {
     sheetReturnFocus: null,
     selectedPair: null,
     policyQuery: '',
-    policyFamilies: new Set(['ipv4', 'ipv6'])
+    policyFamilies: new Set(['ipv4', 'ipv6']),
+    pollTimer: 0
   };
+
+  /*
+   * 手动刷新按钮按用户第 9 条删除。这一页虽然订阅了 registry，但 registry 只按 TTL
+   * 缓存、不自轮询，所以补一条可见性受控的轮询；抽屉打开或正在保存时跳过。
+   */
+  function startPolling() {
+    stopPolling();
+    state.pollTimer = window.setInterval(() => {
+      if (!state.mounted) return;
+      if (document.hidden) return;
+      if (state.refreshing || state.refreshPromise || state.saving) return;
+      if (state.sheet || state.confirmDelete) return;
+      refresh(true);
+    }, 20000);
+  }
+
+  function stopPolling() {
+    if (!state.pollTimer) return;
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = 0;
+  }
   const pageHost = document.createElement('div');
   const overlayHost = document.createElement('div');
   pageHost.className = 'policy-entity-page-host';
@@ -268,7 +290,7 @@ export function mount(context = {}) {
     const content = zones.length
       ? `<div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr><th>区域名称</th><th>网络 / 接口</th><th><span class="policy-entity-visually-hidden">详情</span></th></tr></thead><tbody>${zones.map((zone) => `<tr class="policy-region-zone-row" data-region-open="${escapeHtml(zone.id)}"><td><strong>${escapeHtml(zone.label)}</strong><small>${escapeHtml(zone.virtual ? '虚拟区域' : zone.name)}</small></td><td>${zone.members.length ? `<div class="policy-region-members">${zone.members.map((member) => `<span>${escapeHtml(member)}</span>`).join('')}</div>` : '<span class="policy-entity-muted">-</span>'}</td><td><button type="button" data-dwrt-component="icon-button" aria-label="查看 ${escapeHtml(zone.label)}">${icon('chevron-right')}</button></td></tr>`).join('')}</tbody></table></div>`
       : statePanel('empty', '尚未定义区域', '区域接口已就绪，但当前没有可展示的真实或虚拟区域。');
-    return `<section class="policy-entity-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface policy-region-zone-table" data-dwrt-component="data-table"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>区域</strong><span>每个网络只能属于一个区域</span></div><div class="dwrt-kit-table-toolbar-actions">${statusBadge(canWrite() ? '事务写入可用' : '只读', canWrite() ? 'success' : 'warning')}<span class="dwrt-kit-table-count">${zones.length} 个区域</span>${button(state.refreshing ? '正在刷新' : '刷新', `data-region-refresh aria-label="刷新区域" data-dwrt-tooltip="刷新" ${state.refreshing ? 'disabled' : ''}`, 'ghost', 'refresh-cw')}</div></div>${content}${canWrite() ? `<footer class="policy-region-zone-footer">${button('创建区域', 'data-region-create', 'ghost', 'plus')}</footer>` : ''}</section>`;
+    return `<section class="policy-entity-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface policy-region-zone-table" data-dwrt-component="data-table"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>区域</strong><span>每个网络只能属于一个区域</span></div><div class="dwrt-kit-table-toolbar-actions">${statusBadge(canWrite() ? '事务写入可用' : '只读', canWrite() ? 'success' : 'warning')}<span class="dwrt-kit-table-count">${zones.length} 个区域</span></div></div>${content}${canWrite() ? `<footer class="policy-region-zone-footer">${button('创建区域', 'data-region-create', 'ghost', 'plus')}</footer>` : ''}</section>`;
   }
 
   function actionPresentation(pair) {
@@ -514,7 +536,6 @@ export function mount(context = {}) {
   }
 
   function onClick(event) {
-    if (event.target.closest('[data-region-refresh]')) return void refresh(true);
     const create = event.target.closest('[data-region-create]');
     if (create) return openZone('', create);
     if (event.target.closest('[data-region-pair-all]')) { state.selectedPair = null; renderPage(); return; }
@@ -589,11 +610,13 @@ export function mount(context = {}) {
     registry.request('network.lans', { signal }),
     registry.request('network.wans', { signal })
   ]).then(() => { if (state.mounted) { hydrate(); renderPage(); } });
+  startPolling();
 
   return {
     refresh,
     unmount() {
       state.mounted = false;
+      stopPolling();
       unsubscribers.forEach((unsubscribe) => unsubscribe());
       root.removeEventListener('click', onClick);
       root.removeEventListener('change', onChange);

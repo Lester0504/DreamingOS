@@ -5,12 +5,12 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character])));
   const fetchApi = api.fetch || (async (name, url) => {
-    const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store', headers: authHeaders() });
+    const response = await sessionFetch(url, { credentials: 'same-origin', cache: 'no-store', headers: authHeaders() });
     const json = await response.json().catch(() => ({}));
     return { name, ok: response.ok && json?.ok !== false, data: json?.data ?? json, raw: json };
   });
 
-  const VERSION = '20260731-routing-phase-a-02';
+  const VERSION = '20260802-sheet-portal-scope-01';
   const POLICY_ENDPOINT = '/api/v1/policy-engine/policy-table';
   const ROUTING_ENDPOINT = '/api/v1/routing';
   const RESOURCE_ENDPOINTS = {
@@ -36,7 +36,7 @@ export function mount(context = {}) {
     drawer: '', editorKind: '', editorMode: '', editor: {}, selected: null,
     confirmDelete: false, saving: false, resolving: false,
     resolveMode: 'table', resolveValue: '', resolution: null,
-    mounted: true, seq: 0
+    mounted: true, seq: 0, pollTimer: 0
   };
   let searchTimer = 0;
 
@@ -73,13 +73,22 @@ export function mount(context = {}) {
   function unwrapResult(result) { return result?.data ?? result?.raw?.data ?? result?.raw ?? result ?? {}; }
   function normalizeKey(value) { return String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_'); }
   function cap(name) { return state.capabilities?.[name] === true; }
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
     return { Accept: 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(typeof api.authHeaders === 'function' ? api.authHeaders() : {}), ...extra };
   }
   async function requestJson(url, options = {}) {
-    const response = await fetch(url, {
+    const response = await sessionFetch(url, {
       credentials: 'same-origin', cache: 'no-store', signal: context.signal, ...options,
       headers: authHeaders({ ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) })
     });
@@ -218,7 +227,7 @@ export function mount(context = {}) {
     const creatable = ['tables', 'objects', 'cross'].includes(state.tab);
     const labels = { tables: '新建路由表', objects: '新建路由对象', cross: '新建服务' };
     const capability = { tables: 'table_crud', objects: 'object_crud', cross: 'cross_service_config_crud' }[state.tab];
-    return `<header class="routing-page-toolbar"><div class="routing-page-heading"><strong>路由表</strong><span>${state.revision === null ? '路由配置与解析' : `配置版本 ${escapeHtml(state.revision)}`}</span></div>${tabsMarkup()}<div class="routing-page-actions"><label class="routing-search" data-dwrt-component="expand-search">${icon('search')}<input type="search" data-routing-search value="${escapeHtml(state.query)}" placeholder="搜索当前视图" aria-label="搜索当前视图"></label><button class="routing-icon-button" type="button" data-routing-refresh aria-label="刷新" title="刷新">${icon('refresh')}</button>${creatable ? `<button class="dwrt-kit-button routing-create-button" data-dwrt-component="button" data-variant="primary" type="button" data-routing-create="${state.tab}" ${cap(capability) ? '' : 'disabled'}>${icon('plus')}<span>${labels[state.tab]}</span></button>` : ''}</div></header>`;
+    return `<header class="routing-page-toolbar"><div class="routing-page-heading"><strong>路由表</strong><span>${state.revision === null ? '路由配置与解析' : `配置版本 ${escapeHtml(state.revision)}`}</span></div>${tabsMarkup()}<div class="routing-page-actions"><label class="routing-search" data-dwrt-component="expand-search">${icon('search')}<input type="search" data-routing-search value="${escapeHtml(state.query)}" placeholder="搜索当前视图" aria-label="搜索当前视图"></label>${creatable ? `<button class="dwrt-kit-button routing-create-button" data-dwrt-component="button" data-variant="primary" type="button" data-routing-create="${state.tab}" ${cap(capability) ? '' : 'disabled'}>${icon('plus')}<span>${labels[state.tab]}</span></button>` : ''}</div></header>`;
   }
   function noticeMarkup(message = state.notice, tone = 'warning') {
     if (!message) return '';
@@ -413,7 +422,6 @@ export function mount(context = {}) {
   }
   function bindEvents() {
     root.querySelectorAll('[data-routing-tab]').forEach((button) => button.addEventListener('click', () => { state.tab = button.dataset.routingTab; state.query = ''; state.notice = ''; render(); }));
-    root.querySelectorAll('[data-routing-refresh]').forEach((button) => button.addEventListener('click', load));
     root.querySelectorAll('[data-routing-create]').forEach((button) => button.addEventListener('click', () => openCreate(button.dataset.routingCreate)));
     root.querySelectorAll('[data-routing-open]').forEach((button) => button.addEventListener('click', () => openItem(button.dataset.routingOpen, button.dataset.routingId)));
     root.querySelectorAll('[data-routing-close]').forEach((button) => button.addEventListener('click', closeDrawer));
@@ -435,9 +443,20 @@ export function mount(context = {}) {
 
   render();
   load();
+
+  /*
+   * 手动刷新按钮按用户第 9 条删除，补一条可见性受控的轮询代替；
+   * 抽屉打开、正在保存或有未提交草稿时跳过，避免刷掉用户填的内容。
+   */
+  state.pollTimer = window.setInterval(() => {
+    if (!state.mounted || document.hidden) return;
+    if (state.loading || state.saving || state.resolving) return;
+    if (state.drawer) return;
+    load();
+  }, 20000);
   return {
     unmount() {
-      state.mounted = false; state.seq += 1; window.clearTimeout(searchTimer);
+      state.mounted = false; state.seq += 1; window.clearTimeout(searchTimer); window.clearInterval(state.pollTimer);
       root?.replaceChildren(); root?.classList.remove(MODULE_CLASS, 'route-workspace');
     }
   };

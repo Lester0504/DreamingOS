@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN" data-theme-resolved="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/network-services.css">
+  <style>
+    :root {
+      --app-page-gutter-block: 12px;
+      --app-page-gutter-inline: 12px;
+      --app-radius-card: 8px;
+      --app-radius-control: 6px;
+      --app-text: rgb(239 245 252);
+      --app-text-secondary: rgb(214 224 238);
+      --app-text-muted: rgb(177 193 213);
+      --app-accent: rgb(46 139 255);
+      --color-accent: var(--app-accent);
+      --color-on-accent: white;
+      --color-text-primary: var(--app-text);
+      --color-text-secondary: var(--app-text-secondary);
+      --color-text-muted: var(--app-text-muted);
+      --color-border-control: rgb(255 255 255 / .2);
+      --color-border-subtle: rgb(255 255 255 / .12);
+      --color-surface-control: rgb(255 255 255 / .06);
+      --dwrt-glass-ink: var(--app-text);
+      --dwrt-glass-text: var(--app-text-secondary);
+      --dwrt-glass-muted: var(--app-text-muted);
+      --dwrt-kit-text: var(--app-text);
+      --dwrt-kit-muted: var(--app-text-muted);
+    }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body { color: var(--app-text); background: linear-gradient(135deg, rgb(17 48 79), rgb(80 44 29)); font-family: system-ui, sans-serif; }
+    .console-stage { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; }
+  </style>
+</head>
+<body>
+  <main class="console-stage"><div class="route-preview" id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/network-services.js';
+
+    const root = document.getElementById('routePreview');
+    const writes = [];
+    const params = new URLSearchParams(location.search);
+    const serviceId = params.get('service') === 'dns' ? 'dns-service' : 'dhcp-service';
+    const dhcp = {
+      selected: 'lan',
+      source: 'fixture',
+      scopes: [
+        {
+          id: 'lan', lan_id: 'lan', name: 'LAN', interface: 'br-lan', enabled: true,
+          gateway: '192.168.30.1', netmask: '255.255.255.0', pool: '192.168.30.100-192.168.30.249',
+          exclude_pool: [], dns1: '192.168.30.1', dns2: '', lease: 120, domain: 'lan', options: [],
+          reservations: [{ id: 'desk', name: 'Desk', mac: 'aa:bb:cc:dd:ee:01', ip: '192.168.30.101', remark: '', enabled: true }],
+          allow_deny_list: [{ id: 'allow-desk', action: 'allow', name: 'Desk', mac: 'aa:bb:cc:dd:ee:01', remark: '', enabled: true, sort_order: 0 }],
+          prefix_reservations: [], leases: []
+        },
+        {
+          id: 'guest', lan_id: 'guest', name: 'Guest', interface: 'br-guest', enabled: true,
+          gateway: '192.168.40.1', netmask: '255.255.255.0', pool: '192.168.40.100-192.168.40.249',
+          exclude_pool: [], dns1: '192.168.40.1', dns2: '', lease: 60, domain: 'guest', options: [],
+          reservations: [], allow_deny_list: [], prefix_reservations: [], leases: []
+        }
+      ],
+      whitelist: [{ id: 'allow-desk', action: 'allow', name: 'Desk', mac: 'aa:bb:cc:dd:ee:01', remark: '', enabled: true, sort_order: 0, scope_id: 'lan', lan_id: 'lan' }],
+      blacklist: [], prefix_reservations: [],
+      capabilities: {
+        service_update: true, static_reservations: true, reservation_delete: true,
+        allow_deny_list: true, access_list_replace: true, access_list_apply: true,
+        dhcpv6_static_prefix: true, prefix_reservations: true, prefix_reservation_apply: true,
+        prefix_reservation_readback: true, lease_read: true
+      }
+    };
+    const dns = {
+      enabled: true, mode: 'proxy', listen_interfaces: ['lan', 'guest'], listen_port: 53,
+      cache_enabled: true, cache_size: 4096, local_domain: 'lan', rebind_protection: true,
+      hijack_protection: true, edns_client_subnet: false, ipv6_dns: true,
+      configured: true, running: true, applied: true, apply_state: 'applied',
+      upstreams: [
+        { id: 'dns-1', name: 'AliDNS', address: '223.5.5.5', port: 53, protocol: 'udp', group: '默认', enabled: true },
+        { id: 'dns-2', name: 'Cloudflare', address: '1.1.1.1', port: 53, protocol: 'tcp', group: '备用', enabled: true }
+      ],
+      rules: [{ id: 'rule-1', domain: 'router.lan', type: 'host', target: '192.168.30.1', remark: '', enabled: true }],
+      stats: { cache_hits: 12, queries: 30 }, supported_protocols: ['udp', 'tcp'],
+      capabilities: { service_update: true }
+    };
+
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = async (url, init = {}) => {
+      const target = new URL(url, location.href).pathname;
+      const method = String(init.method || 'GET').toUpperCase();
+      if (!target.startsWith('/api/v1/')) return originalFetch(url, init);
+      if (method !== 'GET') writes.push({ target, method, body: JSON.parse(init.body || '{}') });
+      let payload = {};
+      if (target === '/api/v1/services/dhcp') payload = dhcp;
+      else if (target === '/api/v1/services/dns') payload = dns;
+      else if (target === '/api/v1/network/wans') payload = { wans: [] };
+      else if (target === '/api/v1/network/lans') payload = { lans: dhcp.scopes };
+      return new Response(JSON.stringify({ ok: true, data: payload }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    const kit = window.DWRT_UI_KIT;
+    const instance = mount({
+      root,
+      item: { id: serviceId },
+      ui: {
+        mountAll: node => kit.mountAll(node),
+        statusBadgeMarkup: (...args) => kit.statusBadgeMarkup(...args),
+        overviewCardsMarkup: (...args) => kit.overviewCardsMarkup(...args),
+        floatingSavebarMarkup: (...args) => kit.floatingSavebarMarkup(...args),
+        confirmationMarkup: (...args) => kit.confirmationMarkup(...args),
+        scheduleAdaptiveForegroundSample: () => {}
+      },
+      utils: { escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]) }
+    });
+
+    window.NETWORK_SERVICES_FIXTURE = {
+      writes,
+      async ready() {
+        for (let index = 0; index < 100; index += 1) {
+          if (!root.textContent.includes('正在读取配置') && root.querySelector('.network-service-workbench')) return true;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        return false;
+      },
+      unmount() { instance?.unmount?.(); }
+    };
+  </script>
+</body>
+</html>

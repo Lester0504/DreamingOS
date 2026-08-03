@@ -137,7 +137,7 @@ def test_optional_endpoints_do_not_break_existing_aegis_page() -> None:
 
 
 def test_region_controls_are_compact_and_dependency_gated() -> None:
-    assert "const VERSION = '20260730-aegisx-ux-08'" in MODULE
+    assert "const VERSION = '20260802-ui-batch-01'" in MODULE
     assert "switchControl('geo-enabled', regionEnabled, !state.saving" in MODULE
     assert "regionEnabled ? `<div class=\"aegisx-region-dependent\">" in MODULE
     assert "shieldBan:" in MODULE
@@ -173,13 +173,14 @@ def test_tab_persistence_and_page_owned_vertical_scroll() -> None:
 
 def test_geo_sheet_and_honeypot_action_layout() -> None:
     assert 'data-dwrt-sheet-variant="copilot"' in MODULE
-    assert "--dwrt-kit-sheet-width: min(100vw, 460px);" in STYLE
+    # Sheet widths are named tiers in the kit now, not page-private magic values.
+    assert "--dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);" in STYLE
     assert ".aegisx-geo-drawer .aegisx-drawer-body { width: 100%; max-width: 100%; overflow-x: hidden; }" in STYLE
     assert ".aegisx-country-list { width: 100%; max-width: 100%;" in STYLE
     assert "overflow-x: hidden;" in STYLE
     assert ".aegisx-honeypot-row { min-width: 0; width: 100%; display: flex; align-items: center; justify-content: flex-start;" in STYLE
     assert ".aegisx-app-drawer," in STYLE
-    assert "--dwrt-kit-sheet-width: 100vw; --dwrt-kit-sheet-max-width: 100vw;" in STYLE
+    assert "--dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full); --dwrt-kit-sheet-max-width: 100vw;" in STYLE
     assert 'data-dwrt-modal-variant="copilot"' in MODULE
     assert 'data-dwrt-component="modal"' in MODULE
 
@@ -197,15 +198,15 @@ def test_content_policy_editor_uses_compact_copilot_relationship_rows() -> None:
         assert control in MODULE
     assert ".aegisx-content-form-row {" in STYLE
     assert "grid-template-columns: 112px minmax(0, 1fr)" in STYLE
-    assert ".aegisx-content-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: min(100vw, 460px); }" in STYLE
+    assert ".aegisx-content-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }" in STYLE
 
 
 def test_menu_versions_and_gzip_parity() -> None:
     menu = json.loads(MENU_PATH.read_text(encoding="utf-8"))
     policy = next(item for item in menu["items"] if item.get("id") == "policy-engine")
     aegis = next(item for item in policy["children"] if item.get("id") == "policy-aegisx")
-    assert aegis["module_version"] == "20260730-aegisx-ux-08"
-    assert aegis["style_version"] == "20260730-aegisx-ux-08"
+    assert aegis["module_version"] == "20260802-ui-batch-01"
+    assert aegis["style_version"] == "20260802-ui-batch-01"
     for source in (MODULE_PATH, STYLE_PATH, MENU_PATH):
         compressed = source.with_name(source.name + ".gz")
         assert compressed.is_file(), compressed

@@ -230,6 +230,20 @@ static void wifi_replace_null(struct json_object *obj, const char *key)
     json_object_object_add(obj, key, json_object_new_null());
 }
 
+/* The survey reason is produced by apd (`iw survey dump`). Promote it verbatim
+ * so the UI shows why a driver withheld the sample instead of a generic text. */
+static const char *wifi_survey_absence_reason(struct json_object *survey,
+                                              const char *missing_survey,
+                                              const char *missing_field)
+{
+    const char *reason;
+
+    if (!survey)
+        return missing_survey;
+    reason = wifi_string(survey, "reason", "");
+    return reason[0] ? reason : missing_field;
+}
+
 static void wifi_namespace_reference(struct json_object *resource,
                                      const char *key, const char *scope,
                                      const char *ap_id, const char *kind)
@@ -781,26 +795,60 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
             wifi_replace_string(radio, "tx_power_reason", "not_reported_by_driver");
         }
         wifi_replace_null(radio, "tx_power_mode");
-        wifi_replace_string(radio, "tx_power_mode_reason", "not_reported_by_driver");
+        /* `iw dev` reports an effective dBm only; neither it nor the UCI
+         * wifi-device sections carry an auto/manual selector, and the desired
+         * radio ids (wifi0..n) cannot be mapped onto runtime phys, so there is
+         * no honest source for a mode. */
+        wifi_replace_string(radio, "tx_power_mode_reason",
+                            "tx_power_mode_not_exposed_by_driver_or_uci");
         wifi_replace_null(radio, "history_24h");
         wifi_replace_string(radio, "history_24h_reason", "radio_history_not_collected");
         {
             struct json_object *survey = wifi_child_object(radio, "survey");
             struct json_object *utilization = wifi_child(survey, "utilization_pct");
+            struct json_object *noise = wifi_child(survey, "noise_dbm");
 
             if (utilization && json_object_is_type(utilization, json_type_double) &&
                 json_object_get_double(utilization) >= 0.0 &&
                 json_object_get_double(utilization) <= 100.0) {
+                double pct = json_object_get_double(utilization);
+
                 json_object_object_del(radio, "channel_utilization_pct");
                 json_object_object_add(radio, "channel_utilization_pct",
-                                       json_object_new_double(
-                                           json_object_get_double(utilization)));
+                                       json_object_new_double(pct));
+                /* Both frontends read `channel_utilization`; publish the same
+                 * percent scale under both names rather than a second unit. */
+                json_object_object_del(radio, "channel_utilization");
+                json_object_object_add(radio, "channel_utilization",
+                                       json_object_new_double(pct));
                 wifi_replace_string(radio, "channel_utilization_source", "iw_survey");
             } else {
                 wifi_replace_null(radio, "channel_utilization_pct");
+                wifi_replace_null(radio, "channel_utilization");
                 wifi_replace_string(radio, "channel_utilization_source",
                                     survey ? "iw_survey_unavailable" :
                                              "channel_survey_not_reported");
+                wifi_replace_string(radio, "channel_utilization_reason",
+                    wifi_survey_absence_reason(survey,
+                                               "channel_survey_not_reported",
+                                               "channel_utilization_not_sampled"));
+            }
+            if (noise && (json_object_is_type(noise, json_type_int) ||
+                          json_object_is_type(noise, json_type_double))) {
+                json_object_object_del(radio, "noise_dbm");
+                json_object_object_add(radio, "noise_dbm",
+                                       json_object_new_double(
+                                           json_object_get_double(noise)));
+                wifi_replace_string(radio, "noise_source", "iw_survey");
+            } else {
+                wifi_replace_null(radio, "noise_dbm");
+                wifi_replace_string(radio, "noise_source",
+                                    survey ? "iw_survey_unavailable" :
+                                             "channel_survey_not_reported");
+                wifi_replace_string(radio, "noise_reason",
+                    wifi_survey_absence_reason(survey,
+                                               "channel_survey_not_reported",
+                                               "noise_floor_not_reported_by_driver"));
             }
         }
         wifi_replace_null(radio, "avg_interference_pct");

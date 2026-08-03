@@ -1,4 +1,4 @@
-.console-stage.is-gateway-shadow { grid-template-rows: minmax(0, 1fr); width: 100%; height: 100dvh; min-height: 0; padding: var(--app-page-gutter-block, 16px) var(--app-page-gutter-inline, 16px); overflow: hidden; }
+.console-stage.is-gateway-shadow { grid-template-rows: minmax(0, 1fr); width: 100%; height: var(--app-stage-height); min-height: 0; padding: var(--app-page-gutter-block, 16px) var(--app-page-gutter-inline, 16px); overflow: hidden; }
 .console-stage.is-gateway-shadow .stage-header { display: none; }
 .console-stage.is-gateway-shadow .gateway-shadow-route-host { width: 100%; max-width: none; height: 100%; min-height: 0; margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; overflow: hidden; }
 .gateway-shadow-route-host { color: var(--color-text-primary, var(--app-text)); letter-spacing: 0; }
@@ -6,8 +6,7 @@
 .shadow-toolbar { min-width: 0; min-height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 12px; overflow-x: auto; scrollbar-width: none; }
 .shadow-toolbar::-webkit-scrollbar { display: none; }
 .shadow-tabs { flex: 0 0 auto; }
-.shadow-refresh { flex: 0 0 auto; margin-left: auto; }
-.shadow-refresh i, .shadow-refresh svg, .shadow-notice i, .shadow-notice svg, .shadow-risk i, .shadow-risk svg, .shadow-readonly i, .shadow-readonly svg, .shadow-operation-bar i, .shadow-operation-bar svg { width: 18px; height: 18px; }
+.shadow-notice i, .shadow-notice svg, .shadow-risk i, .shadow-risk svg, .shadow-readonly i, .shadow-readonly svg, .shadow-operation-bar i, .shadow-operation-bar svg { width: 18px; height: 18px; }
 .gateway-shadow-workbench { min-width: 0; min-height: 0; display: grid; align-content: start; gap: var(--app-page-gap, 16px); overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding-bottom: var(--app-page-gap, 16px); }
 .shadow-loading { min-height: 220px; display: grid; place-items: center; color: var(--color-text-muted, var(--app-text-muted)); }
 .shadow-surface, .shadow-operation-bar, .shadow-preflight, .shadow-availability, .shadow-risk { min-width: 0; border-radius: var(--app-radius-card, 8px); overflow: hidden; }
@@ -21,14 +20,24 @@
 .shadow-badge.is-success { color: var(--color-success, #2fb171); border-color: color-mix(in srgb, currentColor 35%, transparent); }
 .shadow-badge.is-danger { color: var(--color-danger, #e05757); border-color: color-mix(in srgb, currentColor 35%, transparent); }
 .shadow-badge.is-warning { color: var(--color-warning, #d39424); border-color: color-mix(in srgb, currentColor 35%, transparent); }
-.shadow-status-grid { margin: 0; padding: 0 18px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.shadow-status-grid > div { min-width: 0; padding: 14px; display: grid; gap: 4px; border-bottom: 1px solid var(--color-border-subtle); }
-.shadow-status-grid > div:not(:nth-child(4n + 1)) { border-left: 1px solid var(--color-border-subtle); }
-.shadow-status-grid dt { color: var(--color-text-muted, var(--app-text-muted)); font-size: 11px; font-weight: 650; }
-.shadow-status-grid dd { min-width: 0; margin: 0; overflow: hidden; font-size: 13px; font-weight: 720; text-overflow: ellipsis; white-space: nowrap; }
+/* 运行状态：顶部一排共享概览卡（Kit 网格），四张卡随视口收敛到 2 列再到 1 列。 */
+.shadow-overview { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.shadow-daemons { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--color-border-subtle); border-radius: var(--app-radius-card, 8px); overflow: hidden; }
+.shadow-daemon-item { min-width: 0; min-height: 66px; padding: 12px 18px; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.shadow-daemon-item:nth-child(2) { border-left: 1px solid var(--color-border-subtle); }
+/* menu-shell.css 的 `.route-preview span { display: block }` 是 0-1-1，压得住裸类名
+   规则（0-1-0）。这里和下面的文字容器都必须带路由宿主类提权，否则图标会被挤到上一行。 */
+.gateway-shadow-route-host .shadow-daemon-copy { min-width: 0; display: flex; align-items: center; gap: 11px; }
+.gateway-shadow-route-host .shadow-daemon-copy > span { min-width: 0; display: grid; gap: 2px; }
+.shadow-daemon-copy strong { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; font-weight: 740; }
+.shadow-daemon-copy small { color: var(--color-text-muted, var(--app-text-muted)); font-size: 11px; }
+.shadow-daemon-copy > svg { flex: 0 0 18px; color: var(--color-accent, var(--app-accent)); }
 .shadow-runtime-error, .shadow-notice, .shadow-risk, .shadow-readonly { min-width: 0; padding: 12px 16px; display: flex; align-items: center; gap: 10px; }
-.shadow-runtime-error { margin: 12px 18px 18px; border-left: 3px solid var(--color-danger, #e05757); background: color-mix(in srgb, var(--color-danger, #e05757) 10%, transparent); }
+.shadow-runtime-error { border: 1px solid color-mix(in srgb, var(--color-danger, #e05757) 35%, transparent); border-left-width: 3px; border-radius: var(--app-radius-card, 8px); background: color-mix(in srgb, var(--color-danger, #e05757) 10%, transparent); }
+.shadow-runtime-error > i, .shadow-runtime-error > svg { flex: 0 0 20px; color: var(--color-danger, #e05757); }
 .shadow-runtime-error > span { display: grid; gap: 2px; }
+.shadow-runtime-error strong { font-size: 14px; font-weight: 740; }
+.shadow-runtime-error small { color: var(--color-text-muted, var(--app-text-muted)); font-size: 12px; line-height: 1.45; }
 .shadow-notice { border: 1px solid var(--color-border-subtle); border-radius: var(--app-radius-control, 8px); }
 .shadow-notice.is-danger { color: var(--color-danger, #e05757); }
 .shadow-notice.is-success { color: var(--color-success, #2fb171); }
@@ -57,19 +66,45 @@
 .shadow-availability dt { color: var(--color-text-muted, var(--app-text-muted)); font-size: 11px; }
 .shadow-availability dd { margin: 0; font-size: 12px; font-weight: 650; }
 .shadow-availability p { margin: 0; color: var(--color-text-muted, var(--app-text-muted)); font-size: 12px; line-height: 1.5; }
-.shadow-primary-switch { border-bottom: 1px solid var(--color-border-subtle); }
+/* 配置页：主控卡 + 三个分舱。舱内字段按语义分行，不再是一张 12 字段的三列网格。 */
+.shadow-master-card { min-width: 0; min-height: 76px; padding: 14px 20px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 1px solid var(--color-border-subtle); border-radius: var(--app-radius-card, 8px); }
+.shadow-master-copy { min-width: 0; display: grid; gap: 4px; }
+.shadow-master-copy strong { min-width: 0; display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 760; }
+.gateway-shadow-route-host .shadow-master-copy strong > span { min-width: 0; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shadow-master-copy strong i, .shadow-master-copy strong svg { flex: 0 0 20px; width: 20px; height: 20px; color: var(--color-accent, var(--app-accent)); }
+.shadow-master-copy small { color: var(--color-text-muted, var(--app-text-muted)); font-size: 12px; }
+.shadow-chamber { min-width: 0; border: 1px solid var(--color-border-subtle); border-radius: var(--app-radius-card, 8px); }
+.shadow-chamber-head { min-width: 0; min-height: 52px; padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border-bottom: 1px solid var(--color-border-subtle); }
+.gateway-shadow-route-host .shadow-chamber-head > span { min-width: 0; display: flex; align-items: center; gap: 10px; }
+.shadow-chamber-head strong { font-size: 13px; font-weight: 780; letter-spacing: .04em; }
+.shadow-chamber-head small { flex: 0 1 auto; min-width: 0; overflow: hidden; color: var(--color-text-muted, var(--app-text-muted)); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.shadow-chamber-head i, .shadow-chamber-head svg { flex: 0 0 18px; width: 18px; height: 18px; color: var(--color-accent, var(--app-accent)); }
+.shadow-chamber-body { padding: 16px 20px; display: grid; gap: 14px; }
+.shadow-grid-2 { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 18px; }
+.shadow-grid-3 { min-width: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px 18px; }
+.shadow-chamber-body .shadow-switch-row { margin: 0 -20px -16px; border-top: 1px solid var(--color-border-subtle); }
 .shadow-switch-row, .shadow-fixed-setting { min-height: 62px; padding: 10px 18px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; }
 .shadow-switch-row > span:first-child, .shadow-fixed-setting > span:first-child { min-width: 0; display: grid; gap: 3px; }
-.shadow-form { padding: 16px 18px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px 16px; }
+/* Kit 的 segmented 默认 inline-grid，这里让它与同排字段等宽；只改几何，不改材质。 */
+.shadow-role-segmented { display: grid; width: 100%; }
+.shadow-fixed-value { min-width: 0; min-height: 38px; display: flex; align-items: center; gap: 10px; }
+.shadow-fixed-value small { min-width: 0; color: var(--color-text-muted, var(--app-text-muted)); font-size: 11px; line-height: 1.4; }
+.gateway-shadow-route-host .shadow-field-unit-wrap { position: relative; min-width: 0; display: flex; align-items: center; }
+/* 后缀是绝对定位的覆盖层，必须给输入框留出右侧空间，否则长数字会压到单位下面。
+   .shadow-field input 的 padding 是 0-2-0，这里同权重叠加一个属性选择器提权。 */
+.shadow-field .shadow-field-unit-wrap input[type] { padding-right: 52px; }
+/* 带单位后缀的数字框必须去掉原生步进箭头，否则箭头会和单位文字叠在同一处。 */
+.shadow-field-unit-wrap input[type=number]::-webkit-outer-spin-button,
+.shadow-field-unit-wrap input[type=number]::-webkit-inner-spin-button { margin: 0; -webkit-appearance: none; appearance: none; }
+.shadow-field-unit-wrap input[type=number] { -moz-appearance: textfield; }
+.gateway-shadow-route-host .shadow-field-unit { position: absolute; right: 11px; display: block; color: var(--color-text-muted, var(--app-text-muted)); font-size: 10px; font-style: normal; font-weight: 800; letter-spacing: .06em; pointer-events: none; }
 .shadow-field, .shadow-exchange-field { min-width: 0; display: grid; gap: 7px; }
 .shadow-field.is-wide { grid-column: 1 / -1; }
 .shadow-field > span, .shadow-exchange-field > span { font-size: 12px; font-weight: 680; }
 .shadow-field input, .shadow-field select, .shadow-exchange-field input, .shadow-exchange-field textarea { box-sizing: border-box; width: 100%; min-width: 0; min-height: 38px; padding: 8px 10px; border: 1px solid var(--color-border-subtle); border-radius: var(--app-radius-control, 8px); color: var(--color-text-primary, var(--app-text)); background: var(--dwrt-control-bg, rgba(10, 16, 25, .16)); font: inherit; font-size: 13px; outline: none; }
 .shadow-field input:focus, .shadow-field select:focus, .shadow-exchange-field input:focus, .shadow-exchange-field textarea:focus { border-color: var(--color-accent, var(--app-accent)); box-shadow: 0 0 0 2px var(--dwrt-interactive-focus-ring); }
 .shadow-field input:disabled, .shadow-field select:disabled { opacity: .58; cursor: not-allowed; }
-.shadow-dependent { margin: 0 18px 16px; border-left: 3px solid var(--color-accent, var(--app-accent)); background: color-mix(in srgb, var(--color-accent, var(--app-accent)) 6%, transparent); }
 .shadow-fixed-setting { border-top: 1px solid var(--color-border-subtle); }
-.shadow-actions { min-height: 62px; padding: 10px 18px; display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--color-border-subtle); }
 .shadow-operation-bar { padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid var(--color-border-subtle); }
 .shadow-operation-bar > div:first-child { min-width: 0; display: grid; gap: 3px; }
 .shadow-operation-bar > div:last-child { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
@@ -83,6 +118,7 @@
 .shadow-one-time-code { margin: 14px 18px 0; padding: 12px 14px; display: grid; gap: 4px; border: 1px solid color-mix(in srgb, var(--color-warning, #d39424) 35%, transparent); border-radius: var(--app-radius-control, 8px); }
 .shadow-one-time-code span, .shadow-one-time-code small { color: var(--color-text-muted, var(--app-text-muted)); font-size: 11px; }
 .shadow-one-time-code strong { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 22px; font-variant-numeric: tabular-nums; }
-@media (max-width: 980px) { .shadow-status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .shadow-status-grid > div:not(:nth-child(4n + 1)) { border-left: 0; } .shadow-status-grid > div:nth-child(even) { border-left: 1px solid var(--color-border-subtle); } .shadow-form { grid-template-columns: repeat(2, minmax(0, 1fr)); } .shadow-preflight ul { grid-template-columns: repeat(2, minmax(0, 1fr)); } .shadow-preflight li:not(:nth-child(3n + 1)) { border-left: 0; } .shadow-preflight li:nth-child(even) { border-left: 1px solid var(--color-border-subtle); } .shadow-availability dl { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; } }
-@media (max-width: 720px) { .console-stage.is-gateway-shadow { padding: 10px; } .shadow-toolbar { min-height: 48px; } .shadow-pairing-grid, .shadow-form, .shadow-status-grid, .shadow-preflight ul { grid-template-columns: 1fr; } .shadow-status-grid > div, .shadow-preflight li { border-left: 0 !important; } .shadow-surface-head, .shadow-pair-card > header { align-items: flex-start; flex-direction: column; } .shadow-operation-bar { align-items: stretch; flex-direction: column; } .shadow-operation-bar > div:last-child { display: grid; grid-template-columns: 1fr; } .shadow-operation-bar .dwrt-kit-button { width: 100%; } .shadow-availability > div { padding-left: 16px; } .shadow-availability dl { grid-template-columns: 1fr; } .shadow-actions { position: sticky; bottom: 0; background: var(--dwrt-glass-absorption, rgba(10, 16, 25, .12)); } }
+@media (max-width: 1180px) { .shadow-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 980px) { .shadow-grid-3, .shadow-grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .shadow-preflight ul { grid-template-columns: repeat(2, minmax(0, 1fr)); } .shadow-preflight li:not(:nth-child(3n + 1)) { border-left: 0; } .shadow-preflight li:nth-child(even) { border-left: 1px solid var(--color-border-subtle); } .shadow-availability dl { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; } }
+@media (max-width: 720px) { .console-stage.is-gateway-shadow { padding: 10px; } .shadow-toolbar { min-height: 48px; } .shadow-pairing-grid, .shadow-grid-2, .shadow-grid-3, .shadow-overview, .shadow-daemons, .shadow-preflight ul { grid-template-columns: 1fr; } .shadow-daemon-item:nth-child(2) { border-left: 0; border-top: 1px solid var(--color-border-subtle); } .shadow-preflight li { border-left: 0; } .shadow-surface-head, .shadow-pair-card > header, .shadow-chamber-head { align-items: flex-start; flex-direction: column; } .shadow-master-card { align-items: flex-start; flex-direction: column; } .shadow-operation-bar { align-items: stretch; flex-direction: column; } .shadow-operation-bar > div:last-child { display: grid; grid-template-columns: 1fr; } .shadow-operation-bar .dwrt-kit-button { width: 100%; } .shadow-availability > div { padding-left: 16px; } .shadow-availability dl { grid-template-columns: 1fr; } }
 @media (prefers-reduced-motion: reduce) { .shadow-availability > button > svg:last-child { transition: none; } }

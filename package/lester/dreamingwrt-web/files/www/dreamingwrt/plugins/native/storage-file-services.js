@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260722-overlay-01';
+  const VERSION = '20260802-ui-batch-01';
   const MODULE_CLASS = 'storage-file-services-route-host';
   const stage = root?.closest('.console-stage');
   const TABS = [['nfs', 'NFS'], ['samba', 'Samba'], ['webdav', 'WebDAV'], ['ftp', 'FTP']];
@@ -40,6 +40,7 @@ export function mount(context = {}) {
   const state = {
     mounted: true,
     seq: 0,
+    pollTimer: 0,
     loading: true,
     refreshing: false,
     saving: false,
@@ -98,6 +99,15 @@ export function mount(context = {}) {
     try { return structuredClone(value); } catch (_) { return JSON.parse(JSON.stringify(value || {})); }
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -115,7 +125,7 @@ export function mount(context = {}) {
       if (!result?.ok) throw result?.error || new Error('文件服务 API 不可用');
       return result.data || {};
     }
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
       credentials: 'same-origin', cache: 'no-store', ...options,
       headers: authHeaders({ ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) })
     });
@@ -339,7 +349,7 @@ export function mount(context = {}) {
     const createLabel = state.tab === 'nfs' ? (state.nfsView === 'exports' ? '添加共享' : '添加挂载') : state.tab === 'samba' && state.sambaView === 'shares' ? '添加共享' : state.tab === 'ftp' && state.ftpView === 'users' ? '新建用户' : '';
     const settingsLabel = state.tab === 'webdav' || (state.tab === 'samba' && state.sambaView === 'settings') || (state.tab === 'ftp' && state.ftpView === 'settings') ? '编辑设置' : '';
     const placeholder = state.tab === 'nfs' ? '搜索路径、客户端或选项' : state.tab === 'samba' ? '搜索共享名称、路径、用户或备注' : '搜索用户名或目录';
-    return `<header class="policy-toolbar file-service-toolbar"><div class="file-service-toolbar-leading">${segmentedMarkup()}${searchable ? `<label class="policy-search policy-search-main" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-file-search value="${escapeHtml(state.query)}" placeholder="${placeholder}"></label>` : ''}</div><div class="policy-toolbar-actions"><button class="policy-filter-button" type="button" data-file-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '正在刷新' : '刷新'}</span></button>${settingsLabel ? `<button class="policy-create-button" type="button" data-file-settings="${state.tab}">${icon('edit')}<span>${settingsLabel}</span></button>` : ''}${createLabel ? `<button class="policy-create-button" type="button" data-file-create>${icon('plus')}<span>${createLabel}</span></button>` : ''}</div></header>`;
+    return `<header class="policy-toolbar file-service-toolbar"><div class="file-service-toolbar-leading">${segmentedMarkup()}${searchable ? `<label class="policy-search policy-search-main" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-file-search value="${escapeHtml(state.query)}" placeholder="${placeholder}"></label>` : ''}</div><div class="policy-toolbar-actions">${settingsLabel ? `<button class="policy-create-button" type="button" data-file-settings="${state.tab}">${icon('edit')}<span>${settingsLabel}</span></button>` : ''}${createLabel ? `<button class="policy-create-button" type="button" data-file-create>${icon('plus')}<span>${createLabel}</span></button>` : ''}</div></header>`;
   }
 
   function noticeMarkup() {
@@ -684,7 +694,7 @@ export function mount(context = {}) {
   async function downloadRegistry() {
     if (!capability('webdav', 'download_registry')) return;
     try {
-      const response = await fetch(`${ENDPOINTS.webdav}/registry?v=${VERSION}`, { credentials: 'same-origin', cache: 'no-store', headers: authHeaders() });
+      const response = await sessionFetch(`${ENDPOINTS.webdav}/registry?v=${VERSION}`, { credentials: 'same-origin', cache: 'no-store', headers: authHeaders() });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
@@ -702,7 +712,6 @@ export function mount(context = {}) {
 
   function onClick(event) {
     if (event.target.closest('[data-file-close]')) { closeDrawer(); return; }
-    if (event.target.closest('[data-file-refresh]')) { load(true); return; }
     if (event.target.closest('[data-file-create]')) { openCreate(); return; }
     if (event.target.closest('[data-file-save]')) { saveEditor(); return; }
     if (event.target.closest('[data-file-delete]')) { deleteEditor(); return; }
@@ -761,11 +770,23 @@ export function mount(context = {}) {
   render();
   load();
 
+  /*
+   * 手动刷新按钮按用户第 9 条删除，补一条可见性受控的轮询代替；
+   * 抽屉打开、正在保存或有未提交草稿时跳过，避免刷掉用户填的内容。
+   */
+  state.pollTimer = window.setInterval(() => {
+    if (!state.mounted || document.hidden) return;
+    if (state.loading || state.refreshing || state.saving) return;
+    if (state.drawer) return;
+    load(true);
+  }, 15000);
+
   return {
     refresh() { return load(true); },
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      window.clearInterval(state.pollTimer);
       root?.removeEventListener('click', onClick);
       root?.removeEventListener('input', onInput);
       root?.removeEventListener('change', onChange);

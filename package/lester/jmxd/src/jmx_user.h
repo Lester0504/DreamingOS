@@ -109,6 +109,12 @@ typedef struct client_node
     char ipv6_link_local[128];
     char ipv6_addrs[512];
     char neigh_state[32];
+    /* IPv4 and IPv6 neighbour evidence must be kept apart: a long-lived IPv6
+     * STALE entry used to overwrite an IPv4 FAILED one, which kept vanished
+     * virtual interfaces reported as online. */
+    char neigh_state_v4[32];
+    char neigh_state_v6[32];
+    int bridge_fdb_present;
     char online_source[64];
     u_int32_t runtime_updated_at;
     u_int32_t last_seen_ts;
@@ -167,6 +173,17 @@ int check_client_expire(void);
 void flush_expire_client_node(void);
 void move_expired_online_visit_to_offline(void);
 void update_client_list(void);
+
+/*
+ * Bridge-FDB presence for one MAC: 1 present, 0 absent, -1 unreadable.
+ *
+ * Exported because the periodic refresh that used to populate
+ * client_node_t.bridge_fdb_present only runs when the legacy scheduler is
+ * enabled (DREAMINGWRT_CORE_LEGACY_SCHEDULER), which is off on current
+ * deployments. Response builders therefore have to ask for this at read time
+ * instead of trusting a field that nothing refreshes.
+ */
+int client_bridge_fdb_present(const char *mac);
 void update_client_nickname(void);
 void update_client_visiting_info(void);
 void update_hourly_top_apps(client_node_t *client);

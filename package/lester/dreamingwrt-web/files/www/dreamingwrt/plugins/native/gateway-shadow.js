@@ -1,4 +1,4 @@
-const VERSION = '20260801-high-availability-02';
+const VERSION = '20260802-sheet-portal-scope-01';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -18,7 +18,7 @@ export function mount(context = {}) {
     mounted: true, loading: true, refreshing: false, busy: '', tab: 'status',
     error: '', notice: '', noticeTone: '', config: { ...DEFAULT_CONFIG },
     draft: { ...DEFAULT_CONFIG }, peer: {}, capabilities: {}, status: {},
-    preflight: null, dirty: false, availabilityOpen: false, confirmation: '',
+    preflight: null, dirty: false, availabilityOpen: false, confirmation: '', pollTimer: 0,
     pairing: { code: '', offer: '', acceptance: '', confirmation: '', inputOffer: '', inputCode: '', inputAcceptance: '', inputConfirmation: '' }
   };
 
@@ -66,12 +66,21 @@ export function mount(context = {}) {
   function reason() { return firstText(state.capabilities?.reason, state.preflight?.reason, state.status?.last_error); }
   function writeAllowed(name) { return ownerWriteAllowed() && capability(name); }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     return { Accept: 'application/json', ...(typeof api.authHeaders === 'function' ? api.authHeaders() : {}), ...extra };
   }
 
   async function requestJson(path, options = {}) {
-    const response = await fetch(`${ENDPOINT}${path}${path.includes('?') ? '&' : '?'}v=${VERSION}`, {
+    const response = await sessionFetch(`${ENDPOINT}${path}${path.includes('?') ? '&' : '?'}v=${VERSION}`, {
       credentials: 'same-origin', cache: 'no-store', signal: context.signal, ...options,
       headers: authHeaders({ ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) })
     });
@@ -260,6 +269,30 @@ export function mount(context = {}) {
   }
 
   function icon(name) { return `<i data-lucide="${escapeHtml(name)}" aria-hidden="true"></i>`; }
+
+  /*
+   * 概览卡片的图标必须是真实 SVG：Kit 的 normalizeOverviewIcon() 只重写 <svg> 标签，
+   * 传 <i data-lucide> 进去会原样落到卡片里、等 lucide 后置替换，卡片首帧是空的。
+   * 按 design.md 的约定同时给 lucide 名与内置 path，未命中不静默兜底。
+   */
+  function cardIcon(name, size = 22) {
+    const lucideName = {
+      role: 'server-cog', peer: 'link', session: 'activity', guard: 'shield-alert',
+      keepalived: 'heart-pulse', conntrackd: 'arrow-left-right'
+    }[name] || name;
+    const rendered = typeof ui.lucideIcon === 'function' ? ui.lucideIcon(lucideName, { size, strokeWidth: 1.8 }) : '';
+    if (rendered) return rendered;
+    const paths = {
+      role: '<path d="M4 5h16v5H4zM4 14h9v5H4z"></path><circle cx="18" cy="16.5" r="2.5"></circle><path d="M18 12.8v.9m0 5.6v.9m3.2-3.7h-.9m-4.6 0h-.9"></path>',
+      peer: '<path d="M9 15 5.6 18.4a3.5 3.5 0 0 0 4.9 4.9"></path><path d="M15 9l3.4-3.4a3.5 3.5 0 0 0-4.9-4.9"></path><path d="m9.5 14.5 5-5"></path>',
+      session: '<path d="M3 12h4l2-6 4 12 2-6h6"></path>',
+      guard: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"></path><path d="M12 8v4"></path><path d="M12 16h.01"></path>',
+      keepalived: '<path d="M3 12h3l2-4 2.5 8 2-6 1.5 3h6"></path><path d="M20.5 6.5a3.2 3.2 0 0 0-4.5 0L15 7.5"></path>',
+      conntrackd: '<path d="m8 7-4 4 4 4"></path><path d="M4 11h16"></path><path d="m16 17 4-4-4-4"></path>'
+    };
+    return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.role}</svg>`;
+  }
+
   function badge(label, tone = 'neutral') { return `<span class="shadow-badge is-${tone}">${escapeHtml(label)}</span>`; }
   function stateTone(value) { return ['active', 'master', 'backup'].includes(String(value).toLowerCase()) ? 'success' : ['blocked', 'error', 'fault'].includes(String(value).toLowerCase()) ? 'danger' : 'neutral'; }
   function triState(value) { return value === true ? '可达' : value === false ? '不可达' : '未知'; }
@@ -272,7 +305,7 @@ export function mount(context = {}) {
   }
 
   function toolbarMarkup() {
-    return `<header class="shadow-toolbar"><nav class="dwrt-kit-tabs dwrt-kit-page-tabs shadow-tabs" data-dwrt-component="tabs" role="tablist" aria-label="高可用性视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${TABS.map(([id, label]) => `<button class="dwrt-kit-tab ${state.tab === id ? 'is-active' : ''}" type="button" role="tab" data-shadow-tab="${id}" data-value="${id}" aria-selected="${state.tab === id}">${label}</button>`).join('')}</nav><button class="dwrt-kit-button shadow-refresh" data-dwrt-component="button" data-variant="ghost" type="button" data-shadow-refresh aria-label="刷新高可用性状态" data-dwrt-tooltip="刷新" ${state.refreshing ? 'disabled' : ''}>${icon('refresh-cw')}<span>${state.refreshing ? '正在刷新' : '刷新'}</span></button></header>`;
+    return `<header class="shadow-toolbar"><nav class="dwrt-kit-tabs dwrt-kit-page-tabs shadow-tabs" data-dwrt-component="tabs" role="tablist" aria-label="高可用性视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${TABS.map(([id, label]) => `<button class="dwrt-kit-tab ${state.tab === id ? 'is-active' : ''}" type="button" role="tab" data-shadow-tab="${id}" data-value="${id}" aria-selected="${state.tab === id}">${label}</button>`).join('')}</nav></header>`;
   }
 
   function availabilityMarkup() {
@@ -280,10 +313,80 @@ export function mount(context = {}) {
     return `<section class="shadow-availability dwrt-kit-glass-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass" data-adaptive-sample><button type="button" data-shadow-availability aria-expanded="${state.availabilityOpen}"><span>${icon('shield-check')}<span><strong>可用性说明</strong><small>${available ? reasonLabel(reason()) : '当前账号不是 owner，页面保持只读'}</small></span></span>${icon('chevron-down')}</button>${state.availabilityOpen ? `<div><dl><div><dt>配对</dt><dd>${capability('pairing_supported') ? '可用' : reasonLabel(reason())}</dd></div><div><dt>VRRP</dt><dd>${capability('vrrp_supported') ? 'keepalived 可用' : 'keepalived 缺失'}</dd></div><div><dt>连接同步</dt><dd>${capability('connection_sync_supported') ? 'conntrackd 可用' : 'conntrackd 缺失'}</dd></div><div><dt>会话连续性</dt><dd>best effort</dd></div></dl><p>高可用性不能保证所有连接无损迁移。对端状态未知或链路分区时存在 split-brain 风险，必须先完成预检。</p></div>` : ''}</section>`;
   }
 
+  /*
+   * 运行状态按用户第 1 条重构：四项关键运行指标提成顶部一排共享概览卡，
+   * 守护组件（keepalived / conntrackd）放进一条深井，告警与边界说明各自成条。
+   * 原先那张八宫格 <dl> 把角色、对端、组件、VIP 混在一起，扫读代价高。
+   * 卡片用 Kit 的 overviewCardsMarkup()，不复制 demo 的私有卡片材质。
+   */
+  function statusOverviewCards() {
+    const renderer = ui.overviewCardsMarkup || window.DWRT_UI_KIT?.overviewCardsMarkup;
+    if (typeof renderer !== 'function') return '';
+    const runtimeState = firstText(state.status.state, 'unknown').toLowerCase();
+    const configuredRole = firstText(state.status.configured_role);
+    const runtimeRole = runtimeRoleLabel(firstText(state.status.vrrp_state, state.status.runtime_role, 'unknown'));
+    const enabled = state.config.enabled === true;
+    const paired = state.status.paired === true;
+    const blocked = ['blocked', 'error', 'fault'].includes(runtimeState) || !enabled;
+    const syncSupported = capability('connection_sync_supported');
+    const syncOn = state.config.connection_sync === true && syncSupported;
+    return renderer([
+      {
+        key: 'role',
+        label: '节点角色',
+        value: configuredRole ? (configuredRole === 'secondary' ? '备网关' : '主网关') : '未配置',
+        detail: `运行角色 ${runtimeRole} · 虚拟 IP ${state.status.virtual_ipv4_present ? '已绑定' : '未绑定'}`,
+        tone: enabled ? (runtimeRole === 'MASTER' ? 'ok' : runtimeRole === 'BACKUP' ? 'info' : 'warn') : 'bad',
+        icon: cardIcon('role')
+      },
+      {
+        key: 'peer',
+        label: '对端互信',
+        value: paired ? '已配对' : '未配对',
+        detail: `对端可达性 ${triState(state.status.peer_reachable)}`,
+        tone: paired ? (state.status.peer_reachable === true ? 'ok' : 'warn') : 'warn',
+        icon: cardIcon('peer')
+      },
+      {
+        key: 'session',
+        label: '会话连续性',
+        value: syncOn ? '尽力而为' : '未启用',
+        detail: syncSupported ? '不支持完全无损迁移' : 'conntrackd 不可用',
+        tone: syncOn ? 'info' : 'neutral',
+        icon: cardIcon('session')
+      },
+      {
+        key: 'guard',
+        label: '集群防护',
+        value: blocked ? '已阻断' : '已放行',
+        detail: blocked ? reasonLabel(firstText(state.status.last_error, reason(), enabled ? '' : 'gateway_shadow_disabled')) : 'VRRP 协议栈运行中',
+        tone: blocked ? 'bad' : 'ok',
+        icon: cardIcon('guard')
+      }
+    ], { className: 'shadow-overview', label: '高可用性运行状态' });
+  }
+
+  function daemonRow(name, title, description, available, running) {
+    const label = available ? (running ? '运行中' : '可用 / 未运行') : '未安装';
+    const tone = available ? (running ? 'success' : 'warning') : 'danger';
+    return `<div class="shadow-daemon-item"><span class="shadow-daemon-copy">${cardIcon(name, 18)}<span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(description)}</small></span></span>${badge(label, tone)}</div>`;
+  }
+
+  function daemonsMarkup() {
+    return `<section class="shadow-daemons dwrt-kit-glass-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass" data-adaptive-sample>
+      ${daemonRow('keepalived', 'keepalived', 'VRRP 网关冗余与 VIP 漂移守护进程', state.status.keepalived_available === true, state.status.keepalived_running === true)}
+      ${daemonRow('conntrackd', 'conntrackd', '连接跟踪表双向同步服务', state.status.conntrackd_available === true, state.status.conntrackd_running === true)}
+    </section>`;
+  }
+
+  function runtimeErrorMarkup() {
+    const text = firstText(state.status.last_error);
+    if (!text) return '';
+    return `<section class="shadow-runtime-error dwrt-kit-glass-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass" role="status" data-adaptive-sample>${icon('triangle-alert')}<span><strong>最近错误</strong><small>${escapeHtml(reasonLabel(text))}</small></span></section>`;
+  }
+
   function statusMarkup() {
-    const runtimeState = firstText(state.status.state, 'unknown');
-    const vrrp = runtimeRoleLabel(firstText(state.status.vrrp_state, state.status.runtime_role, 'unknown'));
-    return `<section class="shadow-surface dwrt-kit-glass-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass" data-adaptive-sample><header class="shadow-surface-head"><span>${icon('server-cog')}<span><strong>高可用性</strong><small>VRRP 网关冗余状态与控制</small></span></span><span>${badge(runtimeState, stateTone(runtimeState))}${badge(vrrp.toUpperCase(), stateTone(vrrp))}</span></header><dl class="shadow-status-grid"><div><dt>配置角色</dt><dd>${escapeHtml(valueOrDash(state.status.configured_role))}</dd></div><div><dt>运行角色</dt><dd>${escapeHtml(valueOrDash(state.status.runtime_role))}</dd></div><div><dt>对端信任</dt><dd>${state.status.paired ? '已配对' : '未配对'}</dd></div><div><dt>对端可达</dt><dd>${triState(state.status.peer_reachable)}</dd></div><div><dt>keepalived</dt><dd>${state.status.keepalived_available ? (state.status.keepalived_running ? '运行中' : '可用 / 未运行') : '未安装'}</dd></div><div><dt>conntrackd</dt><dd>${state.status.conntrackd_available ? (state.status.conntrackd_running ? '运行中' : '可用 / 未运行') : '未安装'}</dd></div><div><dt>虚拟 IPv4</dt><dd>${state.status.virtual_ipv4_present ? '已绑定' : '未绑定'}</dd></div><div><dt>会话连续性</dt><dd>best effort</dd></div></dl>${state.status.last_error ? `<div class="shadow-runtime-error" role="status">${icon('triangle-alert')}<span><strong>最近错误</strong><small>${escapeHtml(reasonLabel(state.status.last_error))}</small></span></div>` : ''}</section>${riskMarkup()}${preflightMarkup()}${availabilityMarkup()}`;
+    return `${statusOverviewCards()}${daemonsMarkup()}${runtimeErrorMarkup()}${riskMarkup()}${preflightMarkup()}${availabilityMarkup()}`;
   }
 
   function riskMarkup() {
@@ -303,7 +406,11 @@ export function mount(context = {}) {
     let control;
     if (options.options) control = `<select ${attrs}>${options.options.map(([id, text]) => `<option value="${id}" ${String(value) === id ? 'selected' : ''}>${text}</option>`).join('')}</select>`;
     else control = `<input type="${options.type || 'text'}" value="${escapeHtml(valueOrDash(value) === '--' ? '' : value)}" ${attrs} ${options.min !== undefined ? `min="${options.min}"` : ''} ${options.max !== undefined ? `max="${options.max}"` : ''} ${options.placeholder ? `placeholder="${escapeHtml(options.placeholder)}"` : ''}>`;
-    return `<label class="shadow-field ${options.wide ? 'is-wide' : ''}"><span>${label}</span>${control}${options.help ? `<small>${options.help}</small>` : ''}</label>`;
+    // 单位后缀贴在控件右侧（demo 的 input-unit），所以控件要包一层定位容器。
+    const body = options.unit
+      ? `<span class="shadow-field-unit-wrap">${control}<em class="shadow-field-unit">${escapeHtml(options.unit)}</em></span>`
+      : control;
+    return `<label class="shadow-field ${options.wide ? 'is-wide' : ''}"><span>${label}</span>${body}${options.help ? `<small>${options.help}</small>` : ''}</label>`;
   }
 
   function switchField(label, name, help) {
@@ -311,9 +418,70 @@ export function mount(context = {}) {
     return `<label class="shadow-switch-row"><span><strong>${label}</strong><small>${help}</small></span><span class="dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-shadow-field="${name}" ${state.draft[name] ? 'checked' : ''} ${disabled ? 'disabled' : ''}><span aria-hidden="true"></span></span></label>`;
   }
 
+  /*
+   * 角色是二选一的枚举，用分段控件比下拉更直观（demo 的 pill-switcher 同理），
+   * 材质走 Kit 的 segmented，不自绘药丸。
+   */
+  function roleSegmentedField() {
+    const disabled = !writeAllowed('save');
+    const options = [['primary', '主网关 Master'], ['secondary', '备网关 Backup']];
+    // Kit 的 segmented 契约是 [data-dwrt-segment] + data-value，并自带键盘导航与
+    // dwrt-segment-change 事件；这里只提供选项，不自己实现激活态切换。
+    return `<div class="shadow-field"><span>配置角色</span><div class="dwrt-kit-segmented shadow-role-segmented" data-dwrt-component="segmented" data-shadow-role-group role="radiogroup" aria-label="配置角色" data-dwrt-value="${escapeHtml(state.draft.role || 'primary')}">${options.map(([id, label]) => `<button class="${state.draft.role === id ? 'is-active' : ''}" type="button" role="radio" aria-checked="${state.draft.role === id}" data-dwrt-segment data-value="${id}" ${disabled ? 'disabled' : ''}>${escapeHtml(label)}</button>`).join('')}</div></div>`;
+  }
+
+  function chamber(iconName, title, hint, body) {
+    return `<section class="shadow-chamber dwrt-kit-glass-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass" data-adaptive-sample>
+      <header class="shadow-chamber-head"><span>${icon(iconName)}<strong>${escapeHtml(title)}</strong></span>${hint ? `<small>${escapeHtml(hint)}</small>` : ''}</header>
+      <div class="shadow-chamber-body">${body}</div>
+    </section>`;
+  }
+
+  /*
+   * 配置页按用户第 2 条重构成 demo 的分舱结构：顶部主控卡承载总开关与同步状态，
+   * 下面三个玻璃舱分别是集群角色与 VIP、心跳链路、VRRP 协议参数，
+   * 底部一条动作条收纳保存 / 预检 / 应用 / 禁用。
+   * 原先是一张长卡片里塞 12 个字段的三列网格，字段之间没有语义分组。
+   */
   function configMarkup() {
     const canSave = writeAllowed('save');
-    return `<section class="shadow-surface shadow-config dwrt-kit-glass-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass" data-adaptive-sample><header class="shadow-surface-head"><span>${icon('settings-2')}<span><strong>网关冗余配置</strong><small>先保存草稿，再预检并应用</small></span></span>${badge(state.dirty ? '未保存' : '已同步', state.dirty ? 'warning' : 'neutral')}</header><div class="shadow-primary-switch">${switchField('启用高可用性', 'enabled', '启用仅写入草稿；应用前仍须通过预检。')}</div><div class="shadow-form">${field('配置角色', 'role', { options: [['primary', '主网关'], ['secondary', '备网关']] })}${field('LAN 接口', 'lan_interface', { placeholder: 'br-lan' })}${field('管理 IPv4', 'management_ipv4', { placeholder: '192.168.30.2/24' })}${field('虚拟 IPv4', 'virtual_ipv4', { placeholder: '192.168.30.1/24' })}${field('心跳接口', 'heartbeat_interface', { placeholder: 'eth1' })}${field('本机心跳地址', 'heartbeat_local_ip', { placeholder: '169.254.30.1' })}${field('对端心跳地址', 'heartbeat_peer_ip', { placeholder: '169.254.30.2' })}${field('心跳前缀', 'heartbeat_prefix_length', { type: 'number', min: 1, max: 32 })}${field('VRID', 'virtual_router_id', { type: 'number', min: 1, max: 255 })}${field('优先级', 'priority', { type: 'number', min: 1, max: 254 })}${field('通告间隔（秒）', 'advert_interval_seconds', { type: 'number', min: 1, max: 60 })}${field('认证密钥', 'auth_key', { type: 'password', wide: true, placeholder: '留空表示保持现有密钥', help: '只写字段，16-128 个字符；提交后立即清空且不会回填。' })}</div><div class="shadow-dependent">${switchField('连接状态同步', 'connection_sync', capability('connection_sync_supported') ? '由 conntrackd 提供 best effort 会话同步。' : 'conntrackd 不可用，启用后预检将失败。')}<div class="shadow-fixed-setting"><span><strong>抢占模式</strong><small>阶段一固定为关闭，避免产生未验证的强制主切换。</small></span>${badge('关闭', 'neutral')}</div></div>${!canSave ? `<div class="shadow-readonly">${icon('lock-keyhole')}<span>${ownerWriteAllowed() ? reasonLabel(reason()) : '仅 owner 可以修改高可用性配置'}</span></div>` : ''}<footer class="shadow-actions"><button class="dwrt-kit-button" data-dwrt-component="button" data-variant="ghost" type="button" data-shadow-reset ${!state.dirty || state.busy ? 'disabled' : ''}>复位</button><button class="dwrt-kit-button" data-dwrt-component="async-button" data-variant="primary" type="button" data-shadow-save ${!state.dirty || !canSave || state.busy ? 'disabled' : ''}>${state.busy === 'save' ? '正在保存' : '保存草稿'}</button></footer></section><section class="shadow-operation-bar dwrt-kit-glass-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass" data-adaptive-sample><div><strong>应用控制</strong><small>${state.dirty ? '先保存当前配置' : state.preflight?.ready ? '预检已通过，等待确认应用' : '必须先运行预检'}</small></div><div><button class="dwrt-kit-button" data-dwrt-component="async-button" data-variant="ghost" type="button" data-shadow-preflight ${state.dirty || !writeAllowed('preflight') || state.busy ? 'disabled' : ''}>${icon('list-checks')}<span>${state.busy === 'preflight' ? '正在预检' : '运行预检'}</span></button><button class="dwrt-kit-button" data-dwrt-component="button" data-variant="primary" type="button" data-shadow-confirm="apply" ${state.dirty || !state.preflight?.ready || !writeAllowed('apply_supported') || state.busy ? 'disabled' : ''}>${icon('play')}<span>应用</span></button><button class="dwrt-kit-button shadow-danger" data-dwrt-component="button" data-variant="danger" type="button" data-shadow-confirm="disable" ${!writeAllowed('disable_supported') || state.busy ? 'disabled' : ''}>${icon('power')}<span>禁用</span></button></div></section>${preflightMarkup()}${availabilityMarkup()}`;
+    const masterCard = `<section class="shadow-master-card dwrt-kit-glass-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass" data-adaptive-sample>
+      <div class="shadow-master-copy">
+        <strong>${icon('server-cog')}<span>启用高可用冗余 VRRP</span>${badge(state.dirty ? '未保存' : '已同步', state.dirty ? 'warning' : 'success')}</strong>
+        <small>先保存配置草稿，完成系统预检无误后再应用规则</small>
+      </div>
+      <span class="dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-shadow-field="enabled" ${state.draft.enabled ? 'checked' : ''} ${canSave ? '' : 'disabled'}><span aria-hidden="true"></span></span>
+    </section>`;
+
+    const clusterChamber = chamber('globe', '集群角色与虚拟 IP', '对外广播的共享虚拟网关', `
+      <div class="shadow-grid-2">${roleSegmentedField()}${field('绑定 LAN 接口', 'lan_interface', { placeholder: 'br-lan' })}</div>
+      <div class="shadow-grid-2">${field('虚拟 IPv4（VIP 网关）', 'virtual_ipv4', { placeholder: '192.168.30.1/24' })}${field('本机管理 IPv4', 'management_ipv4', { placeholder: '192.168.30.2/24' })}</div>
+    `);
+
+    const heartbeatChamber = chamber('heart-pulse', '心跳与节点链路', '节点间 keepalive 探测私有通道', `
+      <div class="shadow-grid-2">${field('心跳接口', 'heartbeat_interface', { placeholder: 'eth1' })}${field('心跳掩码前缀', 'heartbeat_prefix_length', { type: 'number', min: 1, max: 32, unit: 'CIDR' })}</div>
+      <div class="shadow-grid-2">${field('本机心跳地址', 'heartbeat_local_ip', { placeholder: '169.254.30.1' })}${field('对端心跳地址', 'heartbeat_peer_ip', { placeholder: '169.254.30.2' })}</div>
+    `);
+
+    const protocolChamber = chamber('settings-2', 'VRRP 协议参数', '', `
+      <div class="shadow-grid-3">${field('虚拟路由 ID', 'virtual_router_id', { type: 'number', min: 1, max: 255, unit: 'VRID' })}${field('节点优先级', 'priority', { type: 'number', min: 1, max: 254, unit: 'PRIO' })}${field('通告间隔', 'advert_interval_seconds', { type: 'number', min: 1, max: 60, unit: 'SEC' })}</div>
+      <div class="shadow-grid-2">${field('认证密钥', 'auth_key', { type: 'password', placeholder: '留空表示保持现有密钥', help: '只写字段，16-128 个字符；提交后立即清空且不会回填。' })}<div class="shadow-field"><span>抢占模式</span><div class="shadow-fixed-value">${badge('关闭', 'neutral')}<small>阶段一固定为关闭，避免产生未验证的强制主切换。</small></div></div></div>
+      ${switchField('连接状态同步', 'connection_sync', capability('connection_sync_supported') ? '由 conntrackd 提供 best effort 会话同步。' : 'conntrackd 不可用，启用后预检将失败。')}
+    `);
+
+    const actionBar = `<section class="shadow-operation-bar dwrt-kit-glass-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass" data-adaptive-sample>
+      <div><small>${escapeHtml(state.dirty ? '先保存当前配置草稿' : state.preflight?.ready ? '预检已通过，等待确认应用' : '应用前必须先通过运行预检')}</small></div>
+      <div>
+        <button class="dwrt-kit-button" data-dwrt-component="button" data-variant="ghost" type="button" data-shadow-reset ${!state.dirty || state.busy ? 'disabled' : ''}>复位</button>
+        <button class="dwrt-kit-button" data-dwrt-component="async-button" data-variant="primary" type="button" data-shadow-save ${!state.dirty || !canSave || state.busy ? 'disabled' : ''}>${state.busy === 'save' ? '正在保存' : '保存草稿'}</button>
+        <button class="dwrt-kit-button" data-dwrt-component="async-button" data-variant="ghost" type="button" data-shadow-preflight ${state.dirty || !writeAllowed('preflight') || state.busy ? 'disabled' : ''}>${icon('list-checks')}<span>${state.busy === 'preflight' ? '正在预检' : '运行预检'}</span></button>
+        <button class="dwrt-kit-button" data-dwrt-component="button" data-variant="primary" type="button" data-shadow-confirm="apply" ${state.dirty || !state.preflight?.ready || !writeAllowed('apply_supported') || state.busy ? 'disabled' : ''}>${icon('play')}<span>应用配置</span></button>
+        <button class="dwrt-kit-button shadow-danger" data-dwrt-component="button" data-variant="danger" type="button" data-shadow-confirm="disable" ${!writeAllowed('disable_supported') || state.busy ? 'disabled' : ''}>${icon('power')}<span>禁用服务</span></button>
+      </div>
+    </section>`;
+
+    const readonlyNote = canSave ? '' : `<div class="shadow-readonly">${icon('lock-keyhole')}<span>${ownerWriteAllowed() ? reasonLabel(reason()) : '仅 owner 可以修改高可用性配置'}</span></div>`;
+    return `${masterCard}${clusterChamber}${heartbeatChamber}${protocolChamber}${readonlyNote}${actionBar}${preflightMarkup()}${availabilityMarkup()}`;
   }
 
   function exchangeField(label, key, options = {}) {
@@ -351,12 +519,7 @@ export function mount(context = {}) {
     const key = target.dataset.shadowField; if (!key || key === 'auth_key') return;
     const value = target.type === 'checkbox' ? target.checked : target.type === 'number' ? number(target.value, state.draft[key]) : target.value;
     state.draft[key] = value; state.dirty = JSON.stringify(state.draft) !== JSON.stringify(state.config); state.preflight = null;
-    const apply = root?.querySelector('[data-shadow-confirm="apply"]');
-    const preflight = root?.querySelector('[data-shadow-preflight]');
-    const save = root?.querySelector('[data-shadow-save]');
-    if (apply) apply.disabled = true;
-    if (preflight) preflight.disabled = state.dirty || !writeAllowed('preflight');
-    if (save) save.disabled = !state.dirty || !writeAllowed('save');
+    syncActionButtons();
   }
 
   function handleInput(event) {
@@ -365,9 +528,34 @@ export function mount(context = {}) {
     const fieldTarget = event.target.closest('[data-shadow-field]'); if (fieldTarget) updateField(fieldTarget);
   }
 
+  /*
+   * 角色分段控件由 Kit 托管激活态，页面只消费它的 change 事件写草稿。
+   * 不重绘整页：重绘会把 Kit 刚设置的焦点与 tabIndex 一起丢掉。
+   */
+  function handleSegmentChange(event) {
+    const group = event.target.closest('[data-shadow-role-group]');
+    if (!group) return;
+    const next = String(event.detail?.value || '');
+    if (!next || next === state.draft.role || !writeAllowed('save')) return;
+    state.draft.role = next;
+    state.dirty = JSON.stringify(state.draft) !== JSON.stringify(state.config);
+    state.preflight = null;
+    syncActionButtons();
+  }
+
+  function syncActionButtons() {
+    const apply = root?.querySelector('[data-shadow-confirm="apply"]');
+    const preflight = root?.querySelector('[data-shadow-preflight]');
+    const save = root?.querySelector('[data-shadow-save]');
+    const reset = root?.querySelector('[data-shadow-reset]');
+    if (apply) apply.disabled = true;
+    if (preflight) preflight.disabled = state.dirty || !writeAllowed('preflight');
+    if (save) save.disabled = !state.dirty || !writeAllowed('save');
+    if (reset) reset.disabled = !state.dirty;
+  }
+
   async function handleClick(event) {
     const tab = event.target.closest('[data-shadow-tab]'); if (tab) { state.tab = tab.dataset.shadowTab; render(); return; }
-    if (event.target.closest('[data-shadow-refresh]')) { await load(true); return; }
     if (event.target.closest('[data-shadow-availability]')) { state.availabilityOpen = !state.availabilityOpen; render(); return; }
     if (event.target.closest('[data-shadow-reset]')) { state.draft = clone(state.config); state.dirty = false; state.preflight = null; render(); return; }
     if (event.target.closest('[data-shadow-save]')) { await saveConfig(); return; }
@@ -379,8 +567,30 @@ export function mount(context = {}) {
     if (pairing) { const action = pairing.dataset.shadowPair; if (action === 'start') await startPairing(); else if (action === 'approve') await approvePairing(); else if (action === 'finalize') await finalizePairing(); else if (action === 'confirm') await confirmPairing(); }
   }
 
-  root?.addEventListener('input', handleInput); root?.addEventListener('change', handleInput); root?.addEventListener('click', handleClick);
-  stage?.classList.add('is-gateway-shadow'); render(); load();
+  /*
+   * 手动刷新按钮已按用户第 9 条删除，这里补一条可见性受控的轮询：
+   * 有草稿改动、预检结果或确认弹窗时跳过，避免把用户正在填的内容刷掉。
+   */
+  function startPolling() {
+    stopPolling();
+    state.pollTimer = window.setInterval(() => {
+      if (!state.mounted) return;
+      if (document.hidden) return;
+      if (state.loading || state.refreshing || state.busy) return;
+      if (state.dirty || state.preflight || state.confirmation) return;
+      load(true);
+    }, 15000);
+  }
 
-  return { unmount() { state.mounted = false; clearPairingSecrets(); state.pairing.offer = ''; state.pairing.acceptance = ''; state.pairing.confirmation = ''; root?.removeEventListener('input', handleInput); root?.removeEventListener('change', handleInput); root?.removeEventListener('click', handleClick); stage?.classList.remove('is-gateway-shadow'); root?.classList.remove('gateway-shadow-route-host'); } };
+  function stopPolling() {
+    if (!state.pollTimer) return;
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = 0;
+  }
+
+  root?.addEventListener('input', handleInput); root?.addEventListener('change', handleInput); root?.addEventListener('click', handleClick);
+  root?.addEventListener('dwrt-segment-change', handleSegmentChange);
+  stage?.classList.add('is-gateway-shadow'); render(); load(); startPolling();
+
+  return { unmount() { state.mounted = false; stopPolling(); clearPairingSecrets(); state.pairing.offer = ''; state.pairing.acceptance = ''; state.pairing.confirmation = ''; root?.removeEventListener('input', handleInput); root?.removeEventListener('change', handleInput); root?.removeEventListener('click', handleClick); root?.removeEventListener('dwrt-segment-change', handleSegmentChange); stage?.classList.remove('is-gateway-shadow'); root?.classList.remove('gateway-shadow-route-host'); } };
 }

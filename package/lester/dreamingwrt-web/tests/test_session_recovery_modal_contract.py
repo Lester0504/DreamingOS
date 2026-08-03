@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import gzip
+import re
 from pathlib import Path
 
 
@@ -79,10 +80,14 @@ for resource in (
     assert compressed.is_file(), f"missing gzip: {resource}"
     assert gzip.open(compressed, "rb").read() == source.read_bytes(), f"stale gzip: {resource}"
 
-assert "/static/css/menu-shell.css?v=20260730-session-recovery-clip-06" in APP
-assert "/static/js/menu-shell.js?v=20260731-policy-runtime-evidence-01" in APP
-assert "/static/js/shell-prewarm.js?v=20260731-policy-runtime-evidence-01" in APP
-assert "/static/css/menu-shell.css?v=20260730-session-recovery-clip-06" in PREWARM
-assert "/static/js/menu-shell.js?v=20260731-policy-runtime-evidence-01" in PREWARM
+# 外壳缓存键每次改动都会 bump。要守的是「app/index.html 与 shell-prewarm.js 引用同一个键，
+# 且它等于 shell-prewarm 自己声明的 VERSION」，写死字面量只会让测试变成日常噪音。
+_shell_version = re.search(r"const VERSION = '([^']+)'", PREWARM)
+assert _shell_version, "shell-prewarm.js missing const VERSION"
+_key = _shell_version.group(1)
+for _resource in ("/static/css/menu-shell.css", "/static/js/menu-shell.js", "/static/js/shell-prewarm.js"):
+    assert f"{_resource}?v={_key}" in APP, f"{_resource} cache key drifted in app/index.html"
+for _resource in ("/static/css/menu-shell.css", "/static/js/menu-shell.js"):
+    assert f"{_resource}?v={_key}" in PREWARM, f"{_resource} cache key drifted in shell-prewarm.js"
 
 print("ok: expired sessions use one sampled-glass UI Kit modal with a clear primary re-authentication action")

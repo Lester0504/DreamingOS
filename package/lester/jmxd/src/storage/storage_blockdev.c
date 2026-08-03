@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -368,9 +369,189 @@ static int blkdev_u64_add_ok(uint64_t a, uint64_t b, uint64_t *out)
     return 1;
 }
 
-/* sfdisk computes the usable ranges from the on-disk partition table. This is
- * intentionally not reconstructed as disk-size minus partition sizes: GPT/MBR
- * metadata and alignment gaps are not necessarily allocatable. */
+/* Read one unsigned decimal value out of a sysfs attribute. Returns -1 when the
+ * attribute is missing or unparsable, so the caller can stay honest about it
+ * rather than publishing a zero it never measured. */
+static int64_t blkdev_sysfs_u64(const char *name, const char *attr)
+{
+    char path[256];
+    char buf[64];
+    FILE *fp;
+    int64_t value = -1;
+
+    if (!name || !name[0] || !attr || !attr[0])
+        return -1;
+    /* Only bare device names come from lsblk; reject anything that could walk
+     * out of /sys/class/block. */
+    if (strchr(name, '/') || !strcmp(name, ".") || !strcmp(name, ".."))
+        return -1;
+    if (snprintf(path, sizeof(path), "/sys/class/block/%s/%s", name, attr) >=
+        (int)sizeof(path))
+        return -1;
+    fp = fopen(path, "re");
+    if (!fp)
+        return -1;
+    if (fgets(buf, sizeof(buf), fp)) {
+        char *end = NULL;
+        unsigned long long parsed;
+
+        errno = 0;
+        parsed = strtoull(buf, &end, 10);
+        if (!errno && end != buf && parsed <= (unsigned long long)INT64_MAX)
+            value = (int64_t)parsed;
+    }
+    fclose(fp);
+    return value;
+}
+
+/*
+ * Partition placement, straight from the kernel.
+ *
+ * `/sys/class/block/<part>/{start,size}` are in 512-byte units regardless of the
+ * device's logical sector size, which is what the partition table also reports
+ * on every device in this fleet. end_sector is inclusive.
+ */
+static void blkdev_add_partition_extent(struct json_object *part,
+                                        const char *name)
+{
+    int64_t start = blkdev_sysfs_u64(name, "start");
+    int64_t sectors = blkdev_sysfs_u64(name, "size");
+
+    if (start < 0 || sectors <= 0) {
+        json_object_object_add(part, "start_sector", NULL);
+        json_object_object_add(part, "end_sector", NULL);
+        json_object_object_add(part, "sector_count", NULL);
+        blkdev_add_str(part, "extent_reason",
+                       "sysfs_partition_geometry_unavailable");
+        return;
+    }
+    blkdev_add_i64(part, "start_sector", start);
+    blkdev_add_i64(part, "end_sector", start + sectors - 1);
+    blkdev_add_i64(part, "sector_count", sectors);
+    blkdev_add_str(part, "extent_source", "sysfs_block_geometry");
+}
+
+/*
+ * Filesystem usage for a mounted partition.
+ *
+ * statvfs is used instead of parsing df: same numbers, no subprocess. Two
+ * distinct "unknown" cases are reported separately so the UI can tell "we did
+ * not implement it" from "physically unavailable":
+ *   not_mounted        - usage cannot exist without a mounted filesystem
+ *   statvfs_failed     - mounted, but the kernel refused to answer
+ * used_bytes is total-minus-free (all blocks), while available_bytes is the
+ * unprivileged figure, so reserved blocks do not silently vanish.
+ */
+static void blkdev_add_partition_usage(struct json_object *part,
+                                       const char *mount_point, int mounted)
+{
+    struct statvfs vfs;
+
+    if (!mounted || !mount_point || !mount_point[0]) {
+        json_object_object_add(part, "used_bytes", NULL);
+        json_object_object_add(part, "available_bytes", NULL);
+        json_object_object_add(part, "filesystem_total_bytes", NULL);
+        json_object_object_add(part, "usage_percent", NULL);
+        json_object_object_add(part, "usage_available", json_object_new_boolean(0));
+        blkdev_add_str(part, "usage_reason", "not_mounted");
+        return;
+    }
+    if (statvfs(mount_point, &vfs) != 0 || !vfs.f_frsize || !vfs.f_blocks) {
+        json_object_object_add(part, "used_bytes", NULL);
+        json_object_object_add(part, "available_bytes", NULL);
+        json_object_object_add(part, "filesystem_total_bytes", NULL);
+        json_object_object_add(part, "usage_percent", NULL);
+        json_object_object_add(part, "usage_available", json_object_new_boolean(0));
+        blkdev_add_str(part, "usage_reason", "statvfs_failed");
+        return;
+    }
+    {
+        uint64_t frsize = (uint64_t)vfs.f_frsize;
+        uint64_t total = (uint64_t)vfs.f_blocks * frsize;
+        uint64_t avail = (uint64_t)vfs.f_bavail * frsize;
+        uint64_t used = (uint64_t)(vfs.f_blocks - vfs.f_bfree) * frsize;
+        /* Percent over the space a normal user can actually reach, which is how
+         * df computes it; otherwise reserved blocks make a full disk read 95%. */
+        uint64_t denominator = used + avail;
+
+        if (total > (uint64_t)INT64_MAX || used > (uint64_t)INT64_MAX ||
+            avail > (uint64_t)INT64_MAX) {
+            json_object_object_add(part, "usage_available",
+                                   json_object_new_boolean(0));
+            blkdev_add_str(part, "usage_reason", "statvfs_value_out_of_range");
+            return;
+        }
+        blkdev_add_i64(part, "used_bytes", (int64_t)used);
+        blkdev_add_i64(part, "available_bytes", (int64_t)avail);
+        blkdev_add_i64(part, "filesystem_total_bytes", (int64_t)total);
+        if (denominator)
+            json_object_object_add(part, "usage_percent",
+                                   json_object_new_double(
+                                       (double)used * 100.0 / (double)denominator));
+        else
+            json_object_object_add(part, "usage_percent", NULL);
+        json_object_object_add(part, "usage_available", json_object_new_boolean(1));
+        blkdev_add_str(part, "usage_source", "statvfs");
+    }
+}
+
+/* Append one inclusive [start_sector, end_sector] free region, refusing any
+ * arithmetic that would not survive the JSON int64 contract. */
+static int blkdev_free_extent_add(struct json_object *extents, uint64_t start,
+                                  uint64_t end_inclusive, uint64_t sector_size,
+                                  uint64_t *total, const char **reason_out)
+{
+    struct json_object *extent;
+    uint64_t sectors, capacity;
+
+    if (!extents || !total || !reason_out || end_inclusive < start) {
+        if (reason_out)
+            *reason_out = "sfdisk_invalid_free_extent";
+        return -1;
+    }
+    sectors = end_inclusive - start + 1;
+    if (!sector_size || sectors > UINT64_MAX / sector_size) {
+        *reason_out = "sfdisk_free_extent_out_of_bounds";
+        return -1;
+    }
+    capacity = sectors * sector_size;
+    if (start > INT64_MAX || end_inclusive > INT64_MAX ||
+        sectors > INT64_MAX || capacity > INT64_MAX ||
+        *total > UINT64_MAX - capacity) {
+        *reason_out = "sfdisk_free_extent_out_of_bounds";
+        return -1;
+    }
+    extent = json_object_new_object();
+    json_object_object_add(extent, "start_sector",
+                           json_object_new_int64((int64_t)start));
+    json_object_object_add(extent, "end_sector",
+                           json_object_new_int64((int64_t)end_inclusive));
+    json_object_object_add(extent, "sector_count",
+                           json_object_new_int64((int64_t)sectors));
+    json_object_object_add(extent, "capacity_bytes",
+                           json_object_new_int64((int64_t)capacity));
+    json_object_array_add(extents, extent);
+    *total += capacity;
+    return 0;
+}
+
+/*
+ * Free regions are derived from the on-disk partition table, bounded by the
+ * table's own usable range (firstlba..lastlba), so GPT/MBR metadata is never
+ * counted as allocatable.
+ *
+ * This deliberately does not ask sfdisk for the free list: real sfdisk
+ * (util-linux 2.42.x) rejects `--json --list-free` with "options --json and
+ * --list-free cannot be combined", so that call could never succeed on any
+ * device and the feature silently reported sfdisk_list_free_failed forever.
+ * `--json` alone gives firstlba/lastlba/sectorsize plus every partition, which
+ * is enough to compute the gaps exactly.
+ *
+ * Note this can differ from `sfdisk --list-free`, which suppresses regions
+ * smaller than its 1MiB alignment grain: a 2015-sector tail is reported here as
+ * 1031680 bytes while --list-free prints 0. The number below is the true
+ * unallocated space; whether it is usable depends on alignment.
+ */
 int jmx_storage_unallocated_extents(const char *device, uint64_t disk_bytes,
                                     uint64_t fallback_sector_size,
                                     struct json_object **extents_out,
@@ -381,7 +562,8 @@ int jmx_storage_unallocated_extents(const char *device, uint64_t disk_bytes,
     struct blkdev_exec_result res;
     struct json_object *parsed = NULL, *table = NULL, *parts = NULL;
     struct json_object *extents = NULL;
-    uint64_t sector_size = fallback_sector_size, total = 0, previous_end = 0;
+    uint64_t sector_size = fallback_sector_size, total = 0;
+    uint64_t first_usable, last_usable, cursor, disk_sectors = 0;
     size_t i, count;
     int rc = -1;
 
@@ -395,8 +577,7 @@ int jmx_storage_unallocated_extents(const char *device, uint64_t disk_bytes,
         !sfdisk)
         return -1;
     {
-        char *argv[] = { (char *)sfdisk, "--json", "--list-free",
-                         (char *)device, NULL };
+        char *argv[] = { (char *)sfdisk, "--json", (char *)device, NULL };
         if (blkdev_exec(argv, BLKDEV_SFDISK_TIMEOUT_MS, &res) != 0) {
             *reason_out = "sfdisk_exec_failed";
             return -1;
@@ -411,7 +592,7 @@ int jmx_storage_unallocated_extents(const char *device, uint64_t disk_bytes,
         goto out;
     }
     if (res.exit_code != 0 || !res.output || !res.output_len) {
-        *reason_out = "sfdisk_list_free_failed";
+        *reason_out = "sfdisk_json_failed";
         goto out;
     }
     parsed = json_tokener_parse(res.output);
@@ -419,7 +600,7 @@ int jmx_storage_unallocated_extents(const char *device, uint64_t disk_bytes,
         !json_object_is_type(table, json_type_object) ||
         !json_object_object_get_ex(table, "partitions", &parts) ||
         !json_object_is_type(parts, json_type_array)) {
-        *reason_out = "sfdisk_list_free_invalid_json";
+        *reason_out = "sfdisk_json_invalid";
         goto out;
     }
     {
@@ -431,49 +612,72 @@ int jmx_storage_unallocated_extents(const char *device, uint64_t disk_bytes,
         *reason_out = "sfdisk_invalid_sector_size";
         goto out;
     }
+    if (disk_bytes)
+        disk_sectors = disk_bytes / sector_size;
+    /* firstlba/lastlba come from the table itself (GPT always reports them; for
+     * MBR sfdisk omits them, so fall back to the device geometry). */
+    {
+        int64_t first_i = blkdev_json_i64(table, "firstlba");
+        int64_t last_i = blkdev_json_i64(table, "lastlba");
+
+        first_usable = first_i > 0 ? (uint64_t)first_i : 0;
+        if (last_i > 0)
+            last_usable = (uint64_t)last_i;
+        else if (disk_sectors > 0)
+            last_usable = disk_sectors - 1;
+        else {
+            *reason_out = "sfdisk_usable_range_unknown";
+            goto out;
+        }
+        if (disk_sectors > 0 && last_usable > disk_sectors - 1)
+            last_usable = disk_sectors - 1;
+        if (first_usable > last_usable) {
+            *reason_out = "sfdisk_usable_range_invalid";
+            goto out;
+        }
+    }
     extents = json_object_new_array();
     count = json_object_array_length(parts);
+    cursor = first_usable;
     for (i = 0; i < count; i++) {
         struct json_object *row = json_object_array_get_idx(parts, i);
         int64_t start_i = blkdev_json_i64(row, "start");
         int64_t size_i = blkdev_json_i64(row, "size");
-        uint64_t start, sectors, end_exclusive, capacity;
-        struct json_object *extent;
+        uint64_t start, sectors, end_exclusive;
 
         if (start_i < 0 || size_i <= 0) {
-            *reason_out = "sfdisk_invalid_free_extent";
+            *reason_out = "sfdisk_invalid_partition_extent";
             goto out;
         }
         start = (uint64_t)start_i;
         sectors = (uint64_t)size_i;
+        /* Partitions must be ordered and non-overlapping for the gap walk to be
+         * meaningful; sfdisk emits them in table order, so a regression here is
+         * a corrupt table, not a formatting quirk. */
         if (!blkdev_u64_add_ok(start, sectors, &end_exclusive) ||
-            start < previous_end || sectors > UINT64_MAX / sector_size) {
-            *reason_out = "sfdisk_invalid_free_extent";
+            start < cursor || sectors > UINT64_MAX / sector_size) {
+            *reason_out = "sfdisk_invalid_partition_extent";
             goto out;
         }
-        capacity = sectors * sector_size;
         if (start > INT64_MAX || sectors > INT64_MAX ||
-            end_exclusive - 1 > INT64_MAX || capacity > INT64_MAX ||
-            (disk_bytes && (start > disk_bytes / sector_size ||
-                            end_exclusive > disk_bytes / sector_size ||
-                            capacity > disk_bytes - start * sector_size)) ||
-            total > UINT64_MAX - capacity) {
-            *reason_out = "sfdisk_free_extent_out_of_bounds";
+            end_exclusive - 1 > INT64_MAX ||
+            (disk_sectors > 0 && (start > disk_sectors ||
+                                  end_exclusive > disk_sectors))) {
+            *reason_out = "sfdisk_partition_out_of_bounds";
             goto out;
         }
-        extent = json_object_new_object();
-        json_object_object_add(extent, "start_sector",
-                               json_object_new_int64((int64_t)start));
-        json_object_object_add(extent, "end_sector",
-                               json_object_new_int64((int64_t)(end_exclusive - 1)));
-        json_object_object_add(extent, "sector_count",
-                               json_object_new_int64((int64_t)sectors));
-        json_object_object_add(extent, "capacity_bytes",
-                               json_object_new_int64((int64_t)capacity));
-        json_object_array_add(extents, extent);
-        total += capacity;
-        previous_end = end_exclusive;
+        if (start > cursor &&
+            blkdev_free_extent_add(extents, cursor, start - 1, sector_size,
+                                   &total, reason_out) != 0)
+            goto out;
+        if (end_exclusive > cursor)
+            cursor = end_exclusive;
     }
+    /* Tail gap between the last partition and the end of the usable range. */
+    if (cursor <= last_usable &&
+        blkdev_free_extent_add(extents, cursor, last_usable, sector_size,
+                               &total, reason_out) != 0)
+        goto out;
     *extents_out = extents;
     *bytes_out = total;
     *reason_out = "sfdisk_partition_table_free_regions";
@@ -532,6 +736,14 @@ static struct json_object *blkdev_partition_from_lsblk(struct json_object *node,
                            json_object_new_boolean(mounted));
     json_object_object_add(part, "system",
                            json_object_new_boolean(is_protected));
+    /* Placement comes from the kernel, usage from the mounted filesystem. Both
+     * report an explicit reason when unavailable instead of a bare null. */
+    blkdev_add_partition_extent(part, name);
+    {
+        const char *mp = mount[0] ? mount : blkdev_json_str(node, "mountpoint");
+
+        blkdev_add_partition_usage(part, mp, mounted);
+    }
     /* per-partition capabilities: honest false for protected/mounted */
     {
         struct json_object *caps = json_object_new_object();
@@ -889,6 +1101,171 @@ static void blkdev_raid_collect_active(const char *mdadm,
     fclose(fp);
 }
 
+/*
+ * Enumerates candidate RAID member disks from lsblk. Read-only by construction:
+ * it never invokes mdadm write actions. Disks already claimed by an active array
+ * are still listed but flagged, so the UI can show why they are not selectable
+ * instead of silently hiding them.
+ */
+/*
+ * A disk counts as in use when the whole device or any of its partitions is
+ * mounted. Checking only the disk node would miss the common layout where the
+ * disk itself has no mountpoint but its partitions carry / and /data.
+ */
+static int blkdev_disk_has_mount(struct json_object *node)
+{
+    struct json_object *children = NULL;
+    const char *mp = blkdev_json_str(node, "mountpoint");
+    size_t i, n;
+
+    if (mp && *mp)
+        return 1;
+    if (!json_object_object_get_ex(node, "children", &children) ||
+        !json_object_is_type(children, json_type_array))
+        return 0;
+    n = json_object_array_length(children);
+    for (i = 0; i < n; i++) {
+        struct json_object *ch = json_object_array_get_idx(children, i);
+        const char *cmp = blkdev_json_str(ch, "mountpoint");
+        char mount[512] = "";
+        const char *path;
+
+        if (cmp && *cmp)
+            return 1;
+        path = blkdev_json_str(ch, "path");
+        if (path && blkdev_mount_of(path, mount, sizeof(mount)) == 0 && mount[0])
+            return 1;
+    }
+    return 0;
+}
+
+static int blkdev_raid_disk_in_arrays(struct json_object *arrays, const char *path)
+{
+    size_t i, n;
+
+    if (!arrays || !path || !path[0])
+        return 0;
+    n = json_object_array_length(arrays);
+    for (i = 0; i < n; i++) {
+        struct json_object *array = json_object_array_get_idx(arrays, i);
+        struct json_object *members = NULL;
+        size_t j, m;
+
+        if (!array ||
+            !json_object_object_get_ex(array, "members", &members) ||
+            !json_object_is_type(members, json_type_array))
+            continue;
+        m = json_object_array_length(members);
+        for (j = 0; j < m; j++) {
+            struct json_object *member = json_object_array_get_idx(members, j);
+            /* Members are objects carrying a partition path such as
+             * /dev/sda1, so compare against the parent disk path. */
+            const char *device = json_object_is_type(member, json_type_string)
+                ? json_object_get_string(member)
+                : blkdev_json_str(member, "device");
+
+            if (!device || !device[0])
+                continue;
+            if (!strncmp(device, path, strlen(path)))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static struct json_object *blkdev_raid_member_candidates(struct json_object *arrays,
+                                                         int *have_inventory)
+{
+    struct json_object *disks = json_object_new_array();
+    const char *lsblk = blkdev_lsblk_path();
+    struct blkdev_exec_result res;
+
+    if (have_inventory)
+        *have_inventory = 0;
+    if (!disks || !lsblk)
+        return disks;
+    {
+        char *argv[] = {
+            (char *)lsblk, "-J", "-b", "-o",
+            "NAME,PATH,TYPE,SIZE,FSTYPE,LABEL,UUID,PARTLABEL,PARTUUID,"
+            "MOUNTPOINT,MODEL,SERIAL,TRAN,PTTYPE,RM,RO,PHY-SEC,LOG-SEC",
+            NULL
+        };
+        if (blkdev_exec(argv, BLKDEV_LSBLK_TIMEOUT_MS, &res) == 0 &&
+            res.exit_code == 0 && res.output && res.output_len) {
+            struct json_object *parsed = json_tokener_parse(res.output);
+            struct json_object *bd = NULL;
+
+            if (parsed &&
+                json_object_object_get_ex(parsed, "blockdevices", &bd) &&
+                json_object_is_type(bd, json_type_array)) {
+                size_t i, n = json_object_array_length(bd);
+
+                for (i = 0; i < n; i++) {
+                    struct json_object *node = json_object_array_get_idx(bd, i);
+                    const char *type = blkdev_json_str(node, "type");
+                    const char *name = blkdev_json_str(node, "name");
+                    struct json_object *disk;
+                    const char *path;
+                    int in_array;
+                    int mounted;
+                    int system_disk;
+
+                    if (!type || strcmp(type, "disk"))
+                        continue;
+                    if (name && (!strncmp(name, "loop", 4) ||
+                                 !strncmp(name, "ram", 3) ||
+                                 !strncmp(name, "zram", 4) ||
+                                 !strncmp(name, "nbd", 3) ||
+                                 !strncmp(name, "sr", 2) ||
+                                 !strncmp(name, "md", 2)))
+                        continue;
+                    disk = blkdev_disk_from_lsblk(node);
+                    if (!disk)
+                        continue;
+                    /* blkdev_disk_from_lsblk() reports the disk path under
+                     * "device" and already sets "system" from its protected
+                     * partition scan. */
+                    path = blkdev_json_str(disk, "device");
+                    in_array = blkdev_raid_disk_in_arrays(arrays,
+                                                          path ? path : (name ? name : ""));
+                    mounted = blkdev_disk_has_mount(node);
+                    system_disk = blkdev_json_bool(disk, "system");
+
+                    /* Field names follow the contract the RAID page consumes:
+                     * it filters on eligible && !in_use && !system. Note that
+                     * the page defaults a missing `eligible` to true, so an
+                     * unusable disk must state eligible=false explicitly
+                     * rather than relying on another flag. */
+                    json_object_object_add(disk, "in_use",
+                                           json_object_new_boolean(in_array || mounted));
+                    json_object_object_add(disk, "eligible",
+                        json_object_new_boolean(!in_array && !mounted && !system_disk));
+                    /* The page also reads size_bytes; total_bytes alone would
+                     * render as "--". */
+                    blkdev_add_i64(disk, "size_bytes",
+                                   blkdev_json_i64(node, "size"));
+                    blkdev_add_str(disk, "id", path);
+                    if (in_array)
+                        blkdev_add_str(disk, "reason",
+                                       "already_member_of_active_array");
+                    else if (mounted)
+                        blkdev_add_str(disk, "reason", "disk_currently_mounted");
+                    else if (system_disk)
+                        blkdev_add_str(disk, "reason", "system_disk_protected");
+                    json_object_array_add(disks, disk);
+                    if (have_inventory)
+                        *have_inventory = 1;
+                }
+            }
+            if (parsed)
+                json_object_put(parsed);
+        }
+        blkdev_exec_free(&res);
+    }
+    return disks;
+}
+
 struct json_object *jmx_storage_raid_get(void)
 {
     struct json_object *root = json_object_new_object();
@@ -896,18 +1273,27 @@ struct json_object *jmx_storage_raid_get(void)
     struct json_object *arrays = json_object_new_array();
     struct json_object *recoverable = json_object_new_array();
     const char *mdadm = blkdev_mdadm_path();
+    struct json_object *disks;
+    int have_disks = 0;
 
     blkdev_raid_collect_active(mdadm, arrays);
+    /* Candidate member disks come from the same read-only lsblk inventory the
+     * partition view uses. Without them the RAID create flow has nothing to
+     * select, which is why an empty list must not be reported as inventory. */
+    disks = blkdev_raid_member_candidates(arrays, &have_disks);
 
     json_object_object_add(raid, "arrays", arrays);
-    json_object_object_add(raid, "disks", json_object_new_array());
+    json_object_object_add(raid, "disks", disks);
     json_object_object_add(raid, "recoverable", recoverable);
     json_object_object_add(raid, "capabilities",
-        blkdev_raid_capabilities(mdadm != NULL,
+        blkdev_raid_capabilities(mdadm != NULL && have_disks,
                                  (int)json_object_array_length(arrays)));
     if (!mdadm)
         json_object_object_add(raid, "reason",
                                json_object_new_string("mdadm_not_installed"));
+    else if (!have_disks)
+        json_object_object_add(raid, "reason",
+                               json_object_new_string("no_block_device_inventory"));
     json_object_object_add(root, "raid", raid);
     json_object_object_add(root, "ok", json_object_new_boolean(1));
     return root;

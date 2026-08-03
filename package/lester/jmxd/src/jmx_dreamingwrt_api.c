@@ -57,6 +57,7 @@
 #include "jmx_signature_update.h"
 #include "jmx_storage_guard.h"
 #include "jmx_identification_runtime.h"
+#include "jmx_exec.h"
 #include "webd/webd_mmdb.h"
 #include "storage/storage_overview.h"
 #include "storage/storage_files.h"
@@ -103,6 +104,8 @@ extern struct ubus_context *ubus_ctx;
 #define DW_INIT_STATUS_MAX (256U * 1024U)
 #define DW_IDENTITY_RUNTIME_STATE "/run/dreamingwrt/identityd-state.json"
 #define DW_JMX_RECORD_ENABLE_PATH "/proc/sys/dreamingwrt/jmx/record_enable"
+#define DW_TOOL_OUTPUT_MAX (256U * 1024U)
+#define DW_TOOL_TIMEOUT_MS 5000
 
 typedef struct {
     char name[32];
@@ -168,7 +171,20 @@ typedef struct {
 
 static struct blob_buf dw_b;
 
+/*
+ * ubus is built with -DUBUS_MAX_MSGLEN=1048576 (see ubus CMakeLists.txt in the
+ * OpenWrt build tree).  ubus_send_reply() wraps our payload in an outer blob
+ * carrying UBUS_ATTR_OBJID plus the UBUS_ATTR_DATA header, and ubusd checks the
+ * padded length of that outer frame, so the usable payload is slightly smaller
+ * than the raw limit.  Keep a 32 KiB margin rather than computing the wrapper
+ * exactly, so a future attribute addition cannot silently reintroduce the hang.
+ */
+#define DW_UBUS_MAX_MSGLEN      (1024u * 1024u)
+#define DW_UBUS_REPLY_SAFE_BYTES (DW_UBUS_MAX_MSGLEN - (32u * 1024u))
+
 static void dw_send_ok(struct ubus_context *ctx, struct ubus_request_data *req);
+static void dw_send_error(struct ubus_context *ctx, struct ubus_request_data *req,
+                          int code, const char *msg);
 static const char *dw_json_get_string(struct json_object *obj, const char *key, const char *def);
 static int64_t dw_json_get_int64(struct json_object *obj, const char *key, int64_t def);
 static int dw_json_get_bool(struct json_object *obj, const char *key, int def);
@@ -201,12 +217,67 @@ static struct json_object *dw_build_topology_infrastructure_contract(struct json
                                                                      const char *hostname);
 static int dw_logd_event_add(struct json_object *body);
 static int dw_notifyd_enqueue(struct json_object *body);
+static int
+dw_parse_write_payload(struct ubus_context *ctx,
+                       struct ubus_request_data *req,
+                       struct blob_attr *msg, char **msg_json,
+                       struct json_object **in,
+                       struct json_object **payload);
 
 static void dw_send_json(struct ubus_context *ctx, struct ubus_request_data *req,
                          struct json_object *obj)
 {
+    size_t raw;
+
     blob_buf_init(&dw_b, 0);
     blobmsg_add_object(&dw_b, obj);
+
+    /*
+     * libubus silently refuses to write any message whose padded blob exceeds
+     * UBUS_MAX_MSGLEN (1 MiB), and ubusd drops the peer's oversized frame the
+     * same way.  ubus_send_reply() then returns without the caller ever seeing
+     * a reply, so the client sits until its own timeout fires and reports
+     * UBUS_STATUS_TIMEOUT against an empty body.  Acceptance measured that as a
+     * 25-30 s hang on audit_flows/audit_activity_usage with rc=249 and 0 bytes.
+     *
+     * Fail loudly and immediately instead: swap the payload for a bounded error
+     * envelope that names the real limit, so callers can retry with a smaller
+     * limit rather than stalling.  This sits at the single choke point every
+     * core response passes through, which covers the methods Acceptance had not
+     * finished probing as well.
+     */
+    raw = (size_t)blob_pad_len(dw_b.head);
+    if (raw > DW_UBUS_REPLY_SAFE_BYTES) {
+        struct json_object *err = json_object_new_object();
+
+        LOG_WARN("dw_send_json: reply %zu bytes exceeds ubus safe limit %zu, "
+                 "replaced with response_too_large error\n",
+                 raw, (size_t)DW_UBUS_REPLY_SAFE_BYTES);
+        blob_buf_free(&dw_b);
+        if (err) {
+            json_object_object_add(err, "code",
+                                   json_object_new_int(API_CODE_ERROR));
+            json_object_object_add(err, "message",
+                                   json_object_new_string("response_too_large"));
+            json_object_object_add(err, "error",
+                                   json_object_new_string("response_too_large"));
+            json_object_object_add(err, "reason",
+                json_object_new_string("serialized_reply_exceeds_ubus_max_msglen"));
+            json_object_object_add(err, "response_bytes",
+                                   json_object_new_int64((int64_t)raw));
+            json_object_object_add(err, "response_limit_bytes",
+                json_object_new_int64((int64_t)DW_UBUS_REPLY_SAFE_BYTES));
+            json_object_object_add(err, "ubus_max_msglen",
+                json_object_new_int64((int64_t)DW_UBUS_MAX_MSGLEN));
+            json_object_object_add(err, "hint",
+                json_object_new_string("retry with a smaller limit/matrix_limit or a lighter mode"));
+            blob_buf_init(&dw_b, 0);
+            blobmsg_add_object(&dw_b, err);
+            json_object_put(err);
+        } else {
+            blob_buf_init(&dw_b, 0);
+        }
+    }
     ubus_send_reply(ctx, req, dw_b.head);
     blob_buf_free(&dw_b);
 }
@@ -4243,6 +4314,42 @@ static int dw_command_exists(const char *cmd)
     return 0;
 }
 
+static int dw_command_path(const char *cmd, char *resolved, size_t resolved_len)
+{
+    static const char *paths[] = { "/usr/sbin", "/usr/bin", "/sbin", "/bin", NULL };
+    int i;
+
+    if (!cmd || !cmd[0] || !resolved || resolved_len == 0)
+        return -1;
+    resolved[0] = '\0';
+    if (strchr(cmd, '/')) {
+        int n = snprintf(resolved, resolved_len, "%s", cmd);
+        return n > 0 && (size_t)n < resolved_len && access(resolved, X_OK) == 0
+            ? 0 : -1;
+    }
+    for (i = 0; paths[i]; i++) {
+        int n = snprintf(resolved, resolved_len, "%s/%s", paths[i], cmd);
+        if (n > 0 && (size_t)n < resolved_len && access(resolved, X_OK) == 0)
+            return 0;
+    }
+    resolved[0] = '\0';
+    return -1;
+}
+
+static int dw_tool_capture(char *const argv[], struct jmx_exec_result *result)
+{
+    if (!argv || !argv[0] || argv[0][0] != '/' || !result ||
+        jmx_exec_capture(argv[0], argv, DW_TOOL_OUTPUT_MAX,
+                         DW_TOOL_TIMEOUT_MS, result) != 0)
+        return -1;
+    if (result->timed_out || result->truncated || result->term_signal != 0 ||
+        result->exit_code != 0 || !result->output) {
+        jmx_exec_result_free(result);
+        return -1;
+    }
+    return 0;
+}
+
 static int dw_process_running(const char *name)
 {
     DIR *d;
@@ -4566,6 +4673,8 @@ static struct json_object *dw_build_devices(void);
 static int dw_merge_missing_devices(struct json_object *devices, struct json_object *extra);
 static int dw_count_conntrack_for_client(const char *ip, const char *ifname);
 static int dw_ip_is_private_or_local(const char *ip);
+static void dw_count_conntrack_for_client_by_family(const client_node_t *c,
+                                                    int *out_v4, int *out_v6);
 void dw_refresh_wan_state(void);
 
 static void dw_unifi_add_rate_fields(struct json_object *obj, int64_t rx_rate, int64_t tx_rate)
@@ -4852,9 +4961,11 @@ static int dw_load_bridge_links(const char *bridge, dw_bridge_link_t *links, int
     struct dirent *de;
     int count = 0;
 
-    if (!bridge || !links || max_links <= 0)
+    if (!bridge || !links || max_links <= 0 ||
+        !jmx_interface_name_valid(bridge, 1))
         return 0;
-    snprintf(br_path, sizeof(br_path), "/sys/class/net/%s/brif", bridge);
+    snprintf(br_path, sizeof(br_path), "/sys/class/net/%.*s/brif",
+             IFNAMSIZ - 1, bridge);
     dir = opendir(br_path);
     if (!dir)
         return 0;
@@ -4863,19 +4974,35 @@ static int dw_load_bridge_links(const char *bridge, dw_bridge_link_t *links, int
         char raw[64];
         dw_bridge_link_t *link;
 
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+        size_t ifname_len;
+        char *end = NULL;
+        long speed;
+
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..") ||
+            !jmx_interface_name_valid(de->d_name, 1))
+            continue;
+        ifname_len = strlen(de->d_name);
+        if (ifname_len >= sizeof(links[count].ifname))
             continue;
         link = &links[count];
         memset(link, 0, sizeof(*link));
-        snprintf(link->ifname, sizeof(link->ifname), "%s", de->d_name);
-        snprintf(path, sizeof(path), "/sys/class/net/%s/brif/%s/port_no", bridge, de->d_name);
+        memcpy(link->ifname, de->d_name, ifname_len + 1);
+        snprintf(path, sizeof(path), "/sys/class/net/%.*s/brif/%.*s/port_no",
+                 IFNAMSIZ - 1, bridge, IFNAMSIZ - 1, de->d_name);
         if (dw_read_first_line(path, raw, sizeof(raw)) != 0)
-            snprintf(path, sizeof(path), "/sys/class/net/%s/brport/port_no", de->d_name);
+            snprintf(path, sizeof(path), "/sys/class/net/%.*s/brport/port_no",
+                     IFNAMSIZ - 1, de->d_name);
         if (dw_read_first_line(path, raw, sizeof(raw)) == 0)
             dw_normalize_bridge_port_no(raw, link->port_no, sizeof(link->port_no));
-        snprintf(path, sizeof(path), "/sys/class/net/%s/speed", de->d_name);
-        if (dw_read_first_line(path, raw, sizeof(raw)) == 0 && strcmp(raw, "-1"))
-            snprintf(link->link_speed, sizeof(link->link_speed), "%s Mbps", raw);
+        snprintf(path, sizeof(path), "/sys/class/net/%.*s/speed",
+                 IFNAMSIZ - 1, de->d_name);
+        errno = 0;
+        if (dw_read_first_line(path, raw, sizeof(raw)) == 0) {
+            speed = strtol(raw, &end, 10);
+            if (!errno && end != raw && *end == '\0' && speed >= 0)
+                snprintf(link->link_speed, sizeof(link->link_speed),
+                         "%ld Mbps", speed);
+        }
         count++;
     }
     closedir(dir);
@@ -4906,10 +5033,12 @@ static int dw_bridge_fdb_lookup_port(const char *bridge, const char *mac,
                                      char *link_speed, size_t link_speed_len)
 {
     dw_bridge_link_t links[DW_BRIDGE_LINK_MAX];
-    char cmd[160];
+    struct jmx_exec_result result;
+    char brctl[192];
+    char *line;
+    char *saveptr = NULL;
     char mac_l[MAX_MAC_LEN] = {0};
     char found_port[32] = {0};
-    FILE *fp;
     int link_count;
 
     if (ifname && ifname_len)
@@ -4925,17 +5054,21 @@ static int dw_bridge_fdb_lookup_port(const char *bridge, const char *mac,
         return -1;
 
     link_count = dw_load_bridge_links(bridge, links, DW_BRIDGE_LINK_MAX);
-    snprintf(cmd, sizeof(cmd), "brctl showmacs %s 2>/dev/null", bridge);
-    fp = popen(cmd, "r");
-    if (!fp)
+    if (dw_command_path("brctl", brctl, sizeof(brctl)) != 0)
         return -1;
-    while (fgets(cmd, sizeof(cmd), fp)) {
+    {
+        char *argv[] = { (char *)brctl, "showmacs", (char *)bridge, NULL };
+        if (dw_tool_capture(argv, &result) != 0)
+            return -1;
+    }
+    for (line = strtok_r(result.output, "\n", &saveptr); line;
+         line = strtok_r(NULL, "\n", &saveptr)) {
         char raw_port[32] = {0};
         char fdb_mac[64] = {0};
         char local[16] = {0};
         char fdb_mac_l[MAX_MAC_LEN] = {0};
 
-        if (sscanf(cmd, "%31s %63s %15s", raw_port, fdb_mac, local) < 3)
+        if (sscanf(line, "%31s %63s %15s", raw_port, fdb_mac, local) < 3)
             continue;
         if (!strcmp(local, "yes"))
             continue;
@@ -4946,7 +5079,7 @@ static int dw_bridge_fdb_lookup_port(const char *bridge, const char *mac,
             snprintf(found_port, sizeof(found_port), "%s", raw_port);
         break;
     }
-    pclose(fp);
+    jmx_exec_result_free(&result);
 
     if (!found_port[0])
         return -1;
@@ -6337,8 +6470,10 @@ static struct json_object *dw_infra_bridge_fdb_entries(const char *bridge, int m
                                                        int *limited)
 {
     dw_bridge_link_t links[DW_BRIDGE_LINK_MAX];
-    char cmd[160];
-    FILE *fp;
+    struct jmx_exec_result result;
+    char brctl[192];
+    char *line;
+    char *saveptr = NULL;
     struct json_object *entries = json_object_new_array();
     int remote = 0;
     int local = 0;
@@ -6353,18 +6488,20 @@ static struct json_object *dw_infra_bridge_fdb_entries(const char *bridge, int m
         *limited = 0;
     if (!bridge || !bridge[0])
         return entries;
-    if (!dw_command_exists("brctl")) {
+    if (dw_command_path("brctl", brctl, sizeof(brctl)) != 0) {
         json_object_put(entries);
         return NULL;
     }
     link_count = dw_load_bridge_links(bridge, links, DW_BRIDGE_LINK_MAX);
-    snprintf(cmd, sizeof(cmd), "brctl showmacs %s 2>/dev/null", bridge);
-    fp = popen(cmd, "r");
-    if (!fp) {
-        json_object_put(entries);
-        return NULL;
+    {
+        char *argv[] = { (char *)brctl, "showmacs", (char *)bridge, NULL };
+        if (dw_tool_capture(argv, &result) != 0) {
+            json_object_put(entries);
+            return NULL;
+        }
     }
-    while (fgets(cmd, sizeof(cmd), fp)) {
+    for (line = strtok_r(result.output, "\n", &saveptr); line;
+         line = strtok_r(NULL, "\n", &saveptr)) {
         char raw_port[32] = {0};
         char norm_port[32] = {0};
         char fdb_mac[64] = {0};
@@ -6374,7 +6511,7 @@ static struct json_object *dw_infra_bridge_fdb_entries(const char *bridge, int m
         struct json_object *entry;
         int is_local_bool;
 
-        if (sscanf(cmd, "%31s %63s %15s", raw_port, fdb_mac, is_local) < 3)
+        if (sscanf(line, "%31s %63s %15s", raw_port, fdb_mac, is_local) < 3)
             continue;
         dw_lower_mac(fdb_mac, fdb_mac_l, sizeof(fdb_mac_l));
         if (!dw_mac_string_valid(fdb_mac_l))
@@ -6406,7 +6543,7 @@ static struct json_object *dw_infra_bridge_fdb_entries(const char *bridge, int m
         json_object_object_add(entry, "reason", json_object_new_string("local_bridge_fdb_observation_only"));
         json_object_array_add(entries, entry);
     }
-    pclose(fp);
+    jmx_exec_result_free(&result);
     if (remote_count)
         *remote_count = remote;
     if (local_count)
@@ -6437,39 +6574,26 @@ static int dw_infra_lldp_neighbor_count(struct json_object *raw)
 
 static struct json_object *dw_infra_lldp_raw_json(int *neighbor_count, int *truncated)
 {
-    FILE *fp;
-    char *buf;
-    size_t cap = 65536;
-    size_t len = 0;
+    struct jmx_exec_result result;
+    char lldpcli[192];
     struct json_object *raw = NULL;
 
     if (neighbor_count)
         *neighbor_count = 0;
     if (truncated)
         *truncated = 0;
-    if (!dw_command_exists("lldpcli"))
+    if (dw_command_path("lldpcli", lldpcli, sizeof(lldpcli)) != 0)
         return NULL;
-    buf = calloc(1, cap + 1);
-    if (!buf)
-        return NULL;
-    fp = popen("lldpcli show neighbors -f json 2>/dev/null", "r");
-    if (!fp) {
-        free(buf);
-        return NULL;
+    {
+        char *argv[] = {
+            (char *)lldpcli, "show", "neighbors", "-f", "json", NULL
+        };
+        if (dw_tool_capture(argv, &result) != 0)
+            return NULL;
     }
-    while (len < cap) {
-        size_t n = fread(buf + len, 1, cap - len, fp);
-        len += n;
-        if (n == 0)
-            break;
-    }
-    if (len >= cap && truncated)
-        *truncated = 1;
-    pclose(fp);
-    buf[len] = '\0';
-    if (len > 0)
-        raw = json_tokener_parse(buf);
-    free(buf);
+    if (result.output_len > 0)
+        raw = json_tokener_parse(result.output);
+    jmx_exec_result_free(&result);
     if (raw && neighbor_count)
         *neighbor_count = dw_infra_lldp_neighbor_count(raw);
     return raw;
@@ -8451,6 +8575,212 @@ static int dw_count_conntrack_for_client(const char *ip, const char *ifname)
     return slot ? slot->count : 0;
 }
 
+/* client_connections address matching.
+ *
+ * A client can legitimately hold one IPv4 plus several IPv6 addresses (GUA,
+ * ULA, link-local, plus rotating privacy addresses), so the filter needs a set.
+ * 12 slots covers every client observed on 30.1 with room to spare; overflow
+ * degrades to "match what we have" rather than failing the call. */
+#define DW_CONN_ADDR_MAX 12
+#define DW_CONN_LIMIT_MAX 2000
+
+struct dw_conn_addr_slot {
+    unsigned char bytes[16];
+    int len;
+    char text[128];
+};
+
+/* Normalise through inet_pton so the compressed form the client record holds
+ * and the zero-padded form conntrack prints compare equal. */
+static void dw_conn_addr_add(struct dw_conn_addr_slot *slots, int *count,
+                             const char *addr)
+{
+    unsigned char buf[16];
+    int len = 0;
+    int i;
+
+    if (!slots || !count || *count >= DW_CONN_ADDR_MAX || !addr || !addr[0])
+        return;
+    if (strchr(addr, ':')) {
+        if (inet_pton(AF_INET6, addr, buf) != 1)
+            return;
+        len = 16;
+    } else {
+        if (inet_pton(AF_INET, addr, buf) != 1)
+            return;
+        len = 4;
+    }
+    for (i = 0; i < *count; i++) {
+        if (slots[i].len == len && !memcmp(slots[i].bytes, buf, (size_t)len))
+            return;
+    }
+    memcpy(slots[*count].bytes, buf, (size_t)len);
+    slots[*count].len = len;
+    snprintf(slots[*count].text, sizeof(slots[*count].text), "%s", addr);
+    (*count)++;
+}
+
+/* client_node_t.ipv6_addrs is a |-delimited list, same encoding
+ * dw_ipv6_parse_pipe() consumes. */
+static void dw_conn_addr_add_pipe(struct dw_conn_addr_slot *slots, int *count,
+                                  const char *pipe)
+{
+    const char *p = pipe;
+
+    if (!slots || !count || !pipe)
+        return;
+    while ((p = strchr(p, '|')) != NULL) {
+        const char *end = strchr(p + 1, '|');
+        char addr[128];
+        size_t len;
+
+        if (!end)
+            break;
+        len = (size_t)(end - (p + 1));
+        if (len > 0 && len < sizeof(addr)) {
+            memcpy(addr, p + 1, len);
+            addr[len] = '\0';
+            dw_conn_addr_add(slots, count, addr);
+        }
+        p = end;
+    }
+}
+
+/* Does this conntrack line involve any of the client's addresses? Parses the
+ * first src=/dst= pair (the original direction) and compares as bytes. */
+static int dw_conn_line_matches(const char *line,
+                                const struct dw_conn_addr_slot *slots,
+                                int count, int *family_len)
+{
+    const char *keys[2] = { "src=", "dst=" };
+    int k;
+
+    if (!line || !slots || count <= 0)
+        return 0;
+    for (k = 0; k < 2; k++) {
+        const char *p = strstr(line, keys[k]);
+        char addr[128];
+        unsigned char buf[16];
+        const char *e;
+        size_t len;
+        int alen;
+        int i;
+
+        if (!p)
+            continue;
+        p += 4;
+        e = p;
+        while (*e && *e != ' ' && *e != '\t' && *e != '\n')
+            e++;
+        len = (size_t)(e - p);
+        if (len == 0 || len >= sizeof(addr))
+            continue;
+        memcpy(addr, p, len);
+        addr[len] = '\0';
+        if (strchr(addr, ':')) {
+            if (inet_pton(AF_INET6, addr, buf) != 1)
+                continue;
+            alen = 16;
+        } else {
+            if (inet_pton(AF_INET, addr, buf) != 1)
+                continue;
+            alen = 4;
+        }
+        for (i = 0; i < count; i++) {
+            if (slots[i].len == alen && !memcmp(slots[i].bytes, buf, (size_t)alen)) {
+                if (family_len)
+                    *family_len = alen;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Per-family conntrack counts for one client.
+ *
+ * The string-keyed cache above cannot serve IPv6: it only records addresses
+ * dw_ip_is_private_or_local() accepts (fe80::/fc/fd/::1), so a client's GUA is
+ * never counted, and it compares literal text while conntrack prints IPv6
+ * zero-padded and the client record stores it compressed.
+ *
+ * This walks conntrack once and matches byte-normalised addresses, so both
+ * spellings agree. Cached for 1 s because clients/client_detail call it once
+ * per client per response.
+ *
+ * Rates and byte counters are deliberately NOT split here: the kernel module
+ * exposes a single UpRate/DownRate pair per MAC in
+ * /proc/dreamingwrt/jmx/af_client with no address family dimension, so any
+ * per-family rate would be invented. Callers report that honestly instead. */
+static void dw_count_conntrack_for_client_by_family(const client_node_t *c,
+                                                    int *out_v4, int *out_v6)
+{
+    static char cached_mac[MAX_MAC_LEN];
+    static int cached_v4;
+    static int cached_v6;
+    static int64_t cached_at_ms;
+    struct dw_conn_addr_slot addrs[DW_CONN_ADDR_MAX];
+    int addr_count = 0;
+    int64_t now_ms;
+    FILE *fp;
+    char line[2048];
+    int v4 = 0;
+    int v6 = 0;
+
+    if (out_v4)
+        *out_v4 = 0;
+    if (out_v6)
+        *out_v6 = 0;
+    if (!c)
+        return;
+
+    now_ms = dw_monotonic_ms();
+    if (cached_mac[0] && !strcmp(cached_mac, c->mac) && cached_at_ms > 0 &&
+        now_ms >= cached_at_ms && now_ms - cached_at_ms < 1000) {
+        if (out_v4)
+            *out_v4 = cached_v4;
+        if (out_v6)
+            *out_v6 = cached_v6;
+        return;
+    }
+
+    memset(addrs, 0, sizeof(addrs));
+    dw_conn_addr_add(addrs, &addr_count, c->ip);
+    dw_conn_addr_add(addrs, &addr_count, c->ipv6);
+    dw_conn_addr_add(addrs, &addr_count, c->ipv6_global);
+    dw_conn_addr_add(addrs, &addr_count, c->ipv6_lan);
+    dw_conn_addr_add(addrs, &addr_count, c->ipv6_link_local);
+    dw_conn_addr_add_pipe(addrs, &addr_count, c->ipv6_addrs);
+    if (addr_count == 0)
+        return;
+
+    fp = fopen("/proc/net/nf_conntrack", "r");
+    if (!fp)
+        fp = fopen("/proc/net/ip_conntrack", "r");
+    if (!fp)
+        return;
+    while (fgets(line, sizeof(line), fp)) {
+        int fam_len = 0;
+
+        if (!dw_conn_line_matches(line, addrs, addr_count, &fam_len))
+            continue;
+        if (fam_len == 16)
+            v6++;
+        else
+            v4++;
+    }
+    fclose(fp);
+
+    snprintf(cached_mac, sizeof(cached_mac), "%s", c->mac);
+    cached_v4 = v4;
+    cached_v6 = v6;
+    cached_at_ms = now_ms;
+    if (out_v4)
+        *out_v4 = v4;
+    if (out_v6)
+        *out_v6 = v6;
+}
+
 static int dw_client_runtime_mac_online(const char *mac)
 {
     client_node_t *client;
@@ -8552,7 +8882,9 @@ static int dw_client_today_legacy_netlink_enabled(void)
 static void dw_client_today_add_interval(client_node_t *client,
                                          int64_t start,
                                          int64_t end,
-                                         int active)
+                                         int active,
+                                         int64_t up_rate,
+                                         int64_t down_rate)
 {
     daily_hourly_stat_t *stat;
     int64_t today_start;
@@ -8595,6 +8927,26 @@ static void dw_client_today_add_interval(client_node_t *client,
         if (active)
             stat->hourly_active_time[local_tm.tm_hour] +=
                 (unsigned long long)seconds;
+        /* Integrate the observed rate over the segment to get bytes.
+         *
+         * The hourly byte buckets used to be filled only by the legacy kernel
+         * netlink path, which is opt-in and off by default because it can starve
+         * ubus on a busy router. The result was that every client reported zero
+         * bytes forever while live rates sat right next to them. This sampler
+         * already walks the same hour boundaries every 4 seconds and already has
+         * the rates, so the bytes come from the same evidence as the rates and
+         * cannot disagree with them.
+         *
+         * This is an integral of a sampled rate, not a counter read from the data
+         * path, so it is an estimate: bursts between samples are averaged and a
+         * sampling gap contributes nothing. The API labels it accordingly rather
+         * than presenting it as an exact byte count. */
+        if (up_rate > 0)
+            stat->hourly_traffic[local_tm.tm_hour].up_bytes +=
+                (unsigned long long)(up_rate * seconds);
+        if (down_rate > 0)
+            stat->hourly_traffic[local_tm.tm_hour].down_bytes +=
+                (unsigned long long)(down_rate * seconds);
         start = segment_end;
     }
 }
@@ -8659,7 +9011,12 @@ static void dw_client_today_metrics_sample_tick(int64_t now)
         }
         active = (uint64_t)client->up_rate + (uint64_t)client->down_rate >=
                  DW_CLIENT_ACTIVE_RATE_THRESHOLD_BPS;
-        dw_client_today_add_interval(client, start, now, active);
+        /* Double counting is impossible here: this whole tick returns early when
+         * the legacy netlink path is enabled (see the guard at the top), and that
+         * path is the only other writer of the hourly byte buckets. */
+        dw_client_today_add_interval(client, start, now, active,
+                                     (int64_t)client->up_rate,
+                                     (int64_t)client->down_rate);
         ring->today_sample_count++;
     }
     dw_client_today_last_sample_at = now;
@@ -12028,6 +12385,476 @@ static void dw_ping_reap_cache(void)
     }
 }
 
+/* ═══ traceroute / nslookup diagnostics ═══
+ *
+ * Both spawn a system tool through jmx_exec_capture(), which execs an argv
+ * array with a clean environment. No caller-supplied byte ever reaches a
+ * shell. Targets are validated before the fork, and a rejected target fails
+ * without spawning anything.
+ */
+
+#define DW_DIAG_OUTPUT_MAX      (128U * 1024U)
+#define DW_TRACEROUTE_HOPS_MIN  1
+#define DW_TRACEROUTE_HOPS_MAX  64
+#define DW_TRACEROUTE_HOPS_DEF  30
+#define DW_TRACEROUTE_TIMEOUT_MS 60000
+#define DW_NSLOOKUP_TIMEOUT_MS  10000
+
+/* Accepts a hostname or an IP literal. Deliberately strict: only characters
+ * that can appear in a host are allowed, so a target can never carry shell
+ * metacharacters, whitespace, or a leading '-' that a tool would read as a
+ * flag. */
+static int dw_diag_target_ok(const char *s)
+{
+    size_t len;
+    const char *p;
+    int label_len = 0;
+
+    if (!s || !s[0])
+        return 0;
+    len = strlen(s);
+    if (len > 253)
+        return 0;
+    if (s[0] == '-' || s[0] == '.' || s[len - 1] == '.')
+        return 0;
+    for (p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+
+        if (c == '.' || c == ':') {
+            /* ':' keeps IPv6 literals usable; both reset the label. */
+            if (c == '.' && label_len == 0)
+                return 0;
+            label_len = 0;
+            continue;
+        }
+        if (!(isalnum(c) || c == '-' || c == '_'))
+            return 0;
+        if (++label_len > 63)
+            return 0;
+    }
+    return 1;
+}
+
+/* One traceroute line into a hop object. Handles the three shapes BusyBox and
+ * iputils emit: a probed hop, a fully timed-out hop, and a hop that answered
+ * without a resolvable name. */
+static struct json_object *dw_traceroute_parse_line(const char *line, int *out_hop)
+{
+    struct json_object *hop;
+    struct json_object *rtts;
+    const char *p = line;
+    char host[256] = "";
+    /* Sized like host[]: a hop name can be as long as a legal hostname, and
+     * when no parenthesised address follows we reuse the name here. */
+    char address[256] = "";
+    int hop_no = 0;
+    int timeouts = 0;
+    int answered = 0;
+
+    if (out_hop)
+        *out_hop = 0;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (!isdigit((unsigned char)*p))
+        return NULL;
+    hop_no = atoi(p);
+    if (hop_no <= 0)
+        return NULL;
+    while (isdigit((unsigned char)*p))
+        p++;
+
+    hop = json_object_new_object();
+    rtts = json_object_new_array();
+    if (!hop || !rtts) {
+        if (hop) json_object_put(hop);
+        if (rtts) json_object_put(rtts);
+        return NULL;
+    }
+
+    while (*p) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
+        if (*p == '*') {
+            timeouts++;
+            p++;
+            continue;
+        }
+        /* "1.234 ms" — a round-trip sample. */
+        if (isdigit((unsigned char)*p)) {
+            char *end = NULL;
+            double value = strtod(p, &end);
+
+            if (end && end != p) {
+                const char *unit = end;
+
+                while (*unit == ' ')
+                    unit++;
+                if (!strncmp(unit, "ms", 2)) {
+                    json_object_array_add(rtts, json_object_new_double(value));
+                    answered = 1;
+                    p = unit + 2;
+                    continue;
+                }
+            }
+        }
+        /* A hostname or address token. The first is the name, a following
+         * parenthesised token is the address. */
+        if (*p == '(') {
+            int i = 0;
+
+            p++;
+            while (*p && *p != ')' && i < (int)sizeof(address) - 1)
+                address[i++] = *p++;
+            address[i] = '\0';
+            if (*p == ')')
+                p++;
+            answered = 1;
+            continue;
+        }
+        {
+            int i = 0;
+
+            while (*p && *p != ' ' && *p != '\t' && *p != '(' &&
+                   i < (int)sizeof(host) - 1)
+                host[i++] = *p++;
+            host[i] = '\0';
+            if (host[0])
+                answered = 1;
+            /* Keep scanning: rtt samples follow the host token. */
+            if (!host[0] && *p)
+                p++;
+            continue;
+        }
+    }
+
+    if (!address[0] && host[0])
+        dw_copy_string(address, sizeof(address), host);
+
+    json_object_object_add(hop, "hop", json_object_new_int(hop_no));
+    json_object_object_add(hop, "host", json_object_new_string(host));
+    json_object_object_add(hop, "address", json_object_new_string(address));
+    json_object_object_add(hop, "rtt_ms", rtts);
+    json_object_object_add(hop, "probes_lost", json_object_new_int(timeouts));
+    json_object_object_add(hop, "timeout", json_object_new_boolean(!answered));
+    json_object_object_add(hop, "responded", json_object_new_boolean(answered));
+    if (out_hop)
+        *out_hop = hop_no;
+    return hop;
+}
+
+enum {
+    DW_TRACEROUTE_TARGET,
+    DW_TRACEROUTE_MAX_HOPS,
+    DW_TRACEROUTE_IFNAME,
+    DW_TRACEROUTE_MAX
+};
+static const struct blobmsg_policy dw_traceroute_policy[DW_TRACEROUTE_MAX] = {
+    [DW_TRACEROUTE_TARGET] = { .name = "target", .type = BLOBMSG_TYPE_STRING },
+    [DW_TRACEROUTE_MAX_HOPS] = { .name = "max_hops", .type = BLOBMSG_TYPE_INT32 },
+    [DW_TRACEROUTE_IFNAME] = { .name = "ifname", .type = BLOBMSG_TYPE_STRING },
+};
+
+static int dw_handle_traceroute(struct ubus_context *ctx, struct ubus_object *obj,
+                                struct ubus_request_data *req, const char *method,
+                                struct blob_attr *msg)
+{
+    static const char *const candidates[] = {
+        "/usr/bin/traceroute", "/bin/traceroute", "/usr/sbin/traceroute"
+    };
+    struct blob_attr *tb[DW_TRACEROUTE_MAX];
+    struct jmx_exec_result result;
+    struct json_object *root;
+    struct json_object *hops;
+    const char *target = NULL;
+    const char *ifname = NULL;
+    const char *binary = NULL;
+    char safe_target[256] = "";
+    char safe_ifname[64] = "";
+    char hops_arg[8];
+    char *argv[10];
+    int max_hops = DW_TRACEROUTE_HOPS_DEF;
+    int argc = 0;
+    int rc;
+    size_t i;
+    int reached = 0;
+    int last_hop = 0;
+    (void)obj; (void)method;
+
+    blobmsg_parse(dw_traceroute_policy, DW_TRACEROUTE_MAX, tb,
+                  blob_data(msg), blob_len(msg));
+    if (tb[DW_TRACEROUTE_TARGET])
+        target = blobmsg_get_string(tb[DW_TRACEROUTE_TARGET]);
+    if (tb[DW_TRACEROUTE_MAX_HOPS])
+        max_hops = (int)blobmsg_get_u32(tb[DW_TRACEROUTE_MAX_HOPS]);
+    if (tb[DW_TRACEROUTE_IFNAME])
+        ifname = blobmsg_get_string(tb[DW_TRACEROUTE_IFNAME]);
+
+    if (!dw_diag_target_ok(target)) {
+        dw_send_error(ctx, req, 400, "invalid traceroute target");
+        return 0;
+    }
+    if (max_hops < DW_TRACEROUTE_HOPS_MIN || max_hops > DW_TRACEROUTE_HOPS_MAX) {
+        dw_send_error(ctx, req, 400, "max_hops out of range");
+        return 0;
+    }
+    dw_copy_string(safe_target, sizeof(safe_target), target);
+    if (ifname && ifname[0]) {
+        if (!nc_iface_name_ok(ifname)) {
+            dw_send_error(ctx, req, 400, "invalid ifname");
+            return 0;
+        }
+        dw_copy_string(safe_ifname, sizeof(safe_ifname), ifname);
+    }
+
+    for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (access(candidates[i], X_OK) == 0) {
+            binary = candidates[i];
+            break;
+        }
+    }
+    root = json_object_new_object();
+    json_object_object_add(root, "ts", json_object_new_int((int)dw_now()));
+    json_object_object_add(root, "target", json_object_new_string(safe_target));
+    json_object_object_add(root, "max_hops", json_object_new_int(max_hops));
+    json_object_object_add(root, "ifname", json_object_new_string(safe_ifname));
+    if (!binary) {
+        json_object_object_add(root, "ok", json_object_new_boolean(0));
+        json_object_object_add(root, "available", json_object_new_boolean(0));
+        json_object_object_add(root, "error", json_object_new_string("tool_missing"));
+        json_object_object_add(root, "message",
+            json_object_new_string("traceroute binary is not installed"));
+        dw_send_json(ctx, req, root);
+        json_object_put(root);
+        return 0;
+    }
+
+    snprintf(hops_arg, sizeof(hops_arg), "%d", max_hops);
+    argv[argc++] = (char *)binary;
+    argv[argc++] = "-n";           /* no reverse DNS: keeps the run bounded */
+    argv[argc++] = "-q";
+    argv[argc++] = "1";            /* one probe per hop, gentler on the link */
+    argv[argc++] = "-w";
+    argv[argc++] = "2";
+    argv[argc++] = "-m";
+    argv[argc++] = hops_arg;
+    argv[argc++] = safe_target;    /* validated above; never shell-interpreted */
+    argv[argc] = NULL;
+
+    rc = jmx_exec_capture(binary, argv, DW_DIAG_OUTPUT_MAX,
+                          DW_TRACEROUTE_TIMEOUT_MS, &result);
+    hops = json_object_new_array();
+    if (rc == 0 && result.output) {
+        char *saveptr = NULL;
+        char *line = strtok_r(result.output, "\n", &saveptr);
+
+        while (line) {
+            int hop_no = 0;
+            struct json_object *hop = dw_traceroute_parse_line(line, &hop_no);
+
+            if (hop) {
+                json_object_array_add(hops, hop);
+                if (hop_no > last_hop)
+                    last_hop = hop_no;
+            }
+            line = strtok_r(NULL, "\n", &saveptr);
+        }
+    }
+    /* The final hop answering means the target was reached. Report it rather
+     * than letting the UI guess from the hop count. */
+    if (json_object_array_length(hops) > 0) {
+        struct json_object *last = json_object_array_get_idx(hops,
+            json_object_array_length(hops) - 1);
+        struct json_object *responded = NULL;
+
+        if (last && json_object_object_get_ex(last, "responded", &responded))
+            reached = json_object_get_boolean(responded) &&
+                      last_hop < max_hops;
+    }
+    json_object_object_add(root, "ok",
+        json_object_new_boolean(rc == 0 && json_object_array_length(hops) > 0));
+    json_object_object_add(root, "available", json_object_new_boolean(1));
+    json_object_object_add(root, "hops", hops);
+    json_object_object_add(root, "hop_count",
+        json_object_new_int((int)json_object_array_length(hops)));
+    json_object_object_add(root, "reached", json_object_new_boolean(reached));
+    json_object_object_add(root, "timed_out",
+        json_object_new_boolean(rc == 0 && result.timed_out));
+    json_object_object_add(root, "truncated",
+        json_object_new_boolean(rc == 0 && result.truncated));
+    json_object_object_add(root, "exit_code",
+        json_object_new_int(rc == 0 ? result.exit_code : -1));
+    if (rc != 0)
+        json_object_object_add(root, "error",
+            json_object_new_string("exec_failed"));
+    else if (!json_object_array_length(hops))
+        json_object_object_add(root, "error",
+            json_object_new_string(result.timed_out ? "timeout" : "no_hops_parsed"));
+    if (rc == 0)
+        jmx_exec_result_free(&result);
+    dw_send_json(ctx, req, root);
+    json_object_put(root);
+    return 0;
+}
+
+enum {
+    DW_NSLOOKUP_TARGET,
+    DW_NSLOOKUP_SERVER,
+    DW_NSLOOKUP_MAX
+};
+static const struct blobmsg_policy dw_nslookup_policy[DW_NSLOOKUP_MAX] = {
+    [DW_NSLOOKUP_TARGET] = { .name = "target", .type = BLOBMSG_TYPE_STRING },
+    [DW_NSLOOKUP_SERVER] = { .name = "server", .type = BLOBMSG_TYPE_STRING },
+};
+
+static int dw_handle_nslookup(struct ubus_context *ctx, struct ubus_object *obj,
+                              struct ubus_request_data *req, const char *method,
+                              struct blob_attr *msg)
+{
+    static const char *const candidates[] = {
+        "/usr/bin/nslookup", "/bin/nslookup", "/usr/sbin/nslookup"
+    };
+    struct blob_attr *tb[DW_NSLOOKUP_MAX];
+    struct jmx_exec_result result;
+    struct json_object *root;
+    struct json_object *answers;
+    const char *target = NULL;
+    const char *server = NULL;
+    const char *binary = NULL;
+    char safe_target[256] = "";
+    char safe_server[128] = "";
+    char *argv[4];
+    int argc = 0;
+    int rc;
+    size_t i;
+    (void)obj; (void)method;
+
+    blobmsg_parse(dw_nslookup_policy, DW_NSLOOKUP_MAX, tb,
+                  blob_data(msg), blob_len(msg));
+    if (tb[DW_NSLOOKUP_TARGET])
+        target = blobmsg_get_string(tb[DW_NSLOOKUP_TARGET]);
+    if (tb[DW_NSLOOKUP_SERVER])
+        server = blobmsg_get_string(tb[DW_NSLOOKUP_SERVER]);
+
+    if (!dw_diag_target_ok(target)) {
+        dw_send_error(ctx, req, 400, "invalid nslookup target");
+        return 0;
+    }
+    dw_copy_string(safe_target, sizeof(safe_target), target);
+    if (server && server[0]) {
+        if (!dw_diag_target_ok(server)) {
+            dw_send_error(ctx, req, 400, "invalid nslookup server");
+            return 0;
+        }
+        dw_copy_string(safe_server, sizeof(safe_server), server);
+    }
+
+    for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (access(candidates[i], X_OK) == 0) {
+            binary = candidates[i];
+            break;
+        }
+    }
+    root = json_object_new_object();
+    json_object_object_add(root, "ts", json_object_new_int((int)dw_now()));
+    json_object_object_add(root, "target", json_object_new_string(safe_target));
+    json_object_object_add(root, "server", json_object_new_string(safe_server));
+    if (!binary) {
+        json_object_object_add(root, "ok", json_object_new_boolean(0));
+        json_object_object_add(root, "available", json_object_new_boolean(0));
+        json_object_object_add(root, "error", json_object_new_string("tool_missing"));
+        json_object_object_add(root, "message",
+            json_object_new_string("nslookup binary is not installed"));
+        dw_send_json(ctx, req, root);
+        json_object_put(root);
+        return 0;
+    }
+
+    argv[argc++] = (char *)binary;
+    argv[argc++] = safe_target;    /* validated above; never shell-interpreted */
+    if (safe_server[0])
+        argv[argc++] = safe_server;
+    argv[argc] = NULL;
+
+    rc = jmx_exec_capture(binary, argv, DW_DIAG_OUTPUT_MAX,
+                          DW_NSLOOKUP_TIMEOUT_MS, &result);
+    answers = json_object_new_array();
+    if (rc == 0 && result.output) {
+        char *saveptr = NULL;
+        char *line = strtok_r(result.output, "\n", &saveptr);
+        int in_answer = 0;
+        char pending_name[256] = "";
+
+        while (line) {
+            const char *p = line;
+
+            while (*p == ' ' || *p == '\t')
+                p++;
+            if (!strncmp(p, "Server:", 7) || !strncmp(p, "Address:", 8)) {
+                /* The pre-answer block names the resolver, not the result. */
+                if (!in_answer) {
+                    if (!strncmp(p, "Server:", 7)) {
+                        const char *v = p + 7;
+                        while (*v == ' ' || *v == '\t') v++;
+                        if (v[0] && !safe_server[0])
+                            json_object_object_add(root, "resolver",
+                                json_object_new_string(v));
+                    }
+                    line = strtok_r(NULL, "\n", &saveptr);
+                    continue;
+                }
+            }
+            if (strstr(p, "Non-authoritative answer") ||
+                strstr(p, "Name:") || strstr(p, "name =")) {
+                in_answer = 1;
+            }
+            if (!strncmp(p, "Name:", 5)) {
+                const char *v = p + 5;
+                while (*v == ' ' || *v == '\t') v++;
+                dw_copy_string(pending_name, sizeof(pending_name), v);
+            } else if (in_answer && !strncmp(p, "Address:", 8)) {
+                const char *v = p + 8;
+                struct json_object *entry;
+
+                while (*v == ' ' || *v == '\t') v++;
+                if (v[0]) {
+                    entry = json_object_new_object();
+                    json_object_object_add(entry, "name",
+                        json_object_new_string(pending_name));
+                    json_object_object_add(entry, "address",
+                        json_object_new_string(v));
+                    json_object_object_add(entry, "type",
+                        json_object_new_string(strchr(v, ':') ? "AAAA" : "A"));
+                    json_object_array_add(answers, entry);
+                }
+            }
+            line = strtok_r(NULL, "\n", &saveptr);
+        }
+    }
+    json_object_object_add(root, "ok",
+        json_object_new_boolean(rc == 0 && json_object_array_length(answers) > 0));
+    json_object_object_add(root, "available", json_object_new_boolean(1));
+    json_object_object_add(root, "answers", answers);
+    json_object_object_add(root, "answer_count",
+        json_object_new_int((int)json_object_array_length(answers)));
+    json_object_object_add(root, "timed_out",
+        json_object_new_boolean(rc == 0 && result.timed_out));
+    json_object_object_add(root, "exit_code",
+        json_object_new_int(rc == 0 ? result.exit_code : -1));
+    if (rc != 0)
+        json_object_object_add(root, "error",
+            json_object_new_string("exec_failed"));
+    else if (!json_object_array_length(answers))
+        json_object_object_add(root, "error",
+            json_object_new_string(result.timed_out ? "timeout" : "nxdomain_or_no_answer"));
+    if (rc == 0)
+        jmx_exec_result_free(&result);
+    dw_send_json(ctx, req, root);
+    json_object_put(root);
+    return 0;
+}
+
 static int dw_handle_ping(struct ubus_context *ctx, struct ubus_object *obj,
                           struct ubus_request_data *req, const char *method,
                           struct blob_attr *msg)
@@ -12462,6 +13289,18 @@ static sqlite3 *g_dw_audit_db = NULL;
 #define DW_AUDIT_URL_RETENTION_DAYS_DEFAULT 3
 #define DW_AUDIT_URL_MAX_DB_ROWS 200000
 #define DW_AUDIT_FLOW_SAMPLE_RETENTION_SEC 3600
+
+/*
+ * audit_flows row caps per mode, derived from serialized cost measured on 30.1
+ * with limit=60 (bytes/row): sample 5642, lifecycle 6470, event_lifecycle 10655.
+ * Against the ~992 KiB usable ubus payload that gives hard ceilings of roughly
+ * 180 / 157 / 95 rows.  The caps below keep about 20% headroom because row size
+ * varies with hostname and app-name length, and a row that grows past the
+ * average must not push the reply over the limit.
+ */
+#define DW_AUDIT_FLOWS_MAX_SAMPLE          144
+#define DW_AUDIT_FLOWS_MAX_LIFECYCLE       125
+#define DW_AUDIT_FLOWS_MAX_EVENT_LIFECYCLE  76
 #define DW_AUDIT_FLOW_LIFECYCLE_RETENTION_SEC (7 * 86400)
 #define DW_AUDIT_FLOW_EVENT_LIFECYCLE_RETENTION_SEC (3 * 86400)
 #define DW_AUDIT_FLOW_SAMPLE_MAX_DB_ROWS 120000
@@ -15000,12 +15839,20 @@ static struct json_object *dw_audit_api_flow_ingest(struct json_object *req)
 
 static int dw_audit_flow_backfill_event_from_history(sqlite3 *db, struct json_object *o);
 
-static int dw_audit_url_backfill_from_event_lifecycle(sqlite3 *db, int limit)
+/* host_only: restrict the candidate scan to rows that already carry a hostname,
+ * which keeps the per-row history probe out of the hot path (see the measured
+ * numbers on dw_audit_url_backfill_tick).
+ * since_ts: recency floor, 0 for "whole table". Without a floor the NOT EXISTS
+ * anti-join walks the full 300k-row history every beat. */
+static int dw_audit_url_backfill_from_event_lifecycle_ex(sqlite3 *db, int limit,
+                                                        int host_only,
+                                                        int64_t since_ts)
 {
     sqlite3_stmt *sel = NULL;
     sqlite3_stmt *ins = NULL;
     int inserted = 0;
     int rc;
+    char sql[1400];
 
     if (!db)
         return -1;
@@ -15013,17 +15860,22 @@ static int dw_audit_url_backfill_from_event_lifecycle(sqlite3 *db, int limit)
         limit = 500;
     if (limit > 2000)
         limit = 2000;
+    if (since_ts < 0)
+        since_ts = 0;
 
-    if (sqlite3_prepare_v2(db,
+    snprintf(sql, sizeof(sql),
             "SELECT flow_id,destroy_ts,proto,protocol,src_ip,dst_ip,source_ip,destination_ip,"
             "src_port,dst_port,source_port,destination_port,client_ip,client_mac,client_name,remote_ip,"
             "destination_private,destination_host,host,host_source,destination_app_id,destination_app_name,"
             "tx_bytes,rx_bytes,wan_id,wan_ifname,route_wan,action "
             "FROM audit_flow_event_lifecycle e "
-            "WHERE destroy_ts>0 AND COALESCE(destination_private,0)=0 "
+            "WHERE destroy_ts>%s AND COALESCE(destination_private,0)=0 "
+            "%s"
             "AND NOT EXISTS (SELECT 1 FROM audit_url_event u WHERE u.flow_id=e.flow_id) "
             "ORDER BY destroy_ts DESC LIMIT ?1",
-            -1, &sel, NULL) != SQLITE_OK)
+            since_ts > 0 ? "?2" : "0",
+            host_only ? "AND COALESCE(destination_host,'')<>'' AND instr(destination_host,'.')>0 " : "");
+    if (sqlite3_prepare_v2(db, sql, -1, &sel, NULL) != SQLITE_OK)
         return -1;
     if (sqlite3_prepare_v2(db,
             "INSERT OR IGNORE INTO audit_url_event "
@@ -15035,6 +15887,8 @@ static int dw_audit_url_backfill_from_event_lifecycle(sqlite3 *db, int limit)
         return -1;
     }
     sqlite3_bind_int(sel, 1, limit);
+    if (since_ts > 0)
+        sqlite3_bind_int64(sel, 2, since_ts);
     while ((rc = sqlite3_step(sel)) == SQLITE_ROW) {
         struct json_object *o = json_object_new_object();
         const char *flow_id = (const char *)sqlite3_column_text(sel, 0);
@@ -15181,6 +16035,62 @@ static int dw_audit_worker_status_update_url(sqlite3 *db, int ok, int rows,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* Drives the two URL-audit helpers above, which had no caller at all: the
+ * backfill turns lifecycle rows into audit_url_event, and the status writer
+ * feeds audit_worker_status. Both tables therefore sat at 0 rows permanently.
+ *
+ * Runs on the same 60 s beat as the flow sampler (metricsd invokes
+ * _metrics_tick with audit_flow_sample every METRICSD_AUDIT_FLOW_TICKS ticks),
+ * so it needs no new metricsd field and stays aligned with the sample bucket.
+ *
+ * Batch size is measured, not guessed. On 30.1 (audit.db 553 MB, 300k lifecycle
+ * rows, 286k of them never converted):
+ *   - lifecycle grows ~613 public rows/min, so a 60 s beat must clear at least
+ *     that much or the backlog is permanent;
+ *   - only ~13% of candidate rows carry a host, and every row *without* one
+ *     triggers dw_audit_flow_backfill_event_from_history(), measured at
+ *     3.15 ms/row against audit_flow_sample + audit_flow_lifecycle. A blind
+ *     512-row batch would therefore park this synchronous ubus handler for
+ *     ~1.4 s every minute;
+ *   - host-first ORDER BY fills a batch with usable rows but costs a 98 ms
+ *     TEMP B-TREE sort over the whole window.
+ * So the caller pre-filters to rows that already have a host (1.8 ms, index
+ * driven via idx_audit_flow_event_lifecycle_destroy) and passes a batch the
+ * helper can convert without the history probe dominating.
+ *
+ * Row-count growth stays bounded by the existing pruning the sampler already
+ * performs (DW_AUDIT_URL_MAX_DB_ROWS, dw_audit_url_retention_days). The status
+ * row is written on failure too, otherwise a broken backfill would look
+ * identical to one that never ran. */
+#define DW_AUDIT_URL_BACKFILL_BATCH 512
+/* Two beats' worth of lifecycle rows: wide enough to absorb a missed tick,
+ * narrow enough that the NOT EXISTS anti-join stays on the destroy_ts index. */
+#define DW_AUDIT_URL_BACKFILL_WINDOW_SEC 180
+
+static int dw_audit_url_backfill_tick(void)
+{
+    sqlite3 *db = NULL;
+    int inserted;
+    int64_t since = (int64_t)dw_now() - DW_AUDIT_URL_BACKFILL_WINDOW_SEC;
+
+    if (dw_audit_db_open(&db) != 0 || !db)
+        return -1;
+
+    if (since < 0)
+        since = 0;
+    inserted = dw_audit_url_backfill_from_event_lifecycle_ex(
+        db, DW_AUDIT_URL_BACKFILL_BATCH, 1, since);
+    if (inserted < 0) {
+        const char *err = sqlite3_errmsg(db);
+
+        (void)dw_audit_worker_status_update_url(db, 0, 0,
+                                               (err && err[0]) ? err : "url_backfill_failed");
+    } else {
+        (void)dw_audit_worker_status_update_url(db, 1, inserted, "");
+    }
+    return inserted;
+}
+
 static int dw_audit_flow_sample_collect(int limit)
 {
     sqlite3 *db = NULL;
@@ -15210,7 +16120,21 @@ static int dw_audit_flow_sample_collect(int limit)
     json_object_object_add(flow_req, "limit", json_object_new_int(limit));
     json_object_object_add(flow_req, "sample_mode", json_object_new_boolean(1));
     json_object_object_add(flow_req, "include_devices", json_object_new_boolean(0));
-    json_object_object_add(flow_req, "include_hosts", json_object_new_boolean(0));
+    /* Host resolution stays ON for the sampler. It used to be forced off here,
+     * which meant dw_collect_active_hosts() was never called and every row
+     * landed with an empty destination_host - so audit_flow_sample and the
+     * audit_client_app_usage_bucket derived from it could only ever aggregate by
+     * protocol, which is why the UI showed "https" and "tcp/25565" where an
+     * application name belonged.
+     *
+     * Measured cost on 30.1 at limit=64: 36 ms with hosts off, 44 ms with hosts
+     * on (mean of 3 runs), for 13 of 64 rows gaining a real hostname. The read
+     * is a 65-line procfs snapshot and dw_resolve_host_app_id_cached() carries
+     * its own TTL cache, so 8 ms buys back the entire application dimension.
+     *
+     * include_identity stays off: that one does OUI vendor lookups per row and
+     * contributes nothing to application identity. */
+    json_object_object_add(flow_req, "include_hosts", json_object_new_boolean(1));
     json_object_object_add(flow_req, "include_history", json_object_new_boolean(0));
     json_object_object_add(flow_req, "include_identity", json_object_new_boolean(0));
     json_object_object_add(flow_req, "refresh_clients", json_object_new_boolean(0));
@@ -19099,6 +20023,8 @@ static struct json_object *dw_audit_api_flows(struct json_object *req)
     int64_t nat_tuple_rows = 0;
     int returned = 0;
     int rc;
+    int mode_limit_cap = 0;
+    int limit_capped_from = 0;
     int has_mode = json_object_object_get(req, "mode") != NULL;
     int has_source = json_object_object_get(req, "source") != NULL;
     int auto_mode = (!has_mode && !has_source) ||
@@ -19226,6 +20152,26 @@ static struct json_object *dw_audit_api_flows(struct json_object *req)
         lifecycle = 1;
 retry_flow_query:
     event_lifecycle = lifecycle == 2;
+    /*
+     * Per-mode row caps, not one flat 500.
+     *
+     * The old uniform "limit > 500" clamp was five times higher than what
+     * event_lifecycle can actually serve: that row carries 57 columns and
+     * measures ~10.5 KB serialized, so ~100 rows already fill the 1 MiB ubus
+     * message limit and anything past it used to be dropped on the floor.
+     * sample and lifecycle rows are far smaller (~5.6 KB and ~6.4 KB measured
+     * on 30.1), so they keep a higher ceiling.  Values below leave roughly 20%
+     * headroom against the measured per-row cost.
+     */
+    mode_limit_cap = event_lifecycle ? DW_AUDIT_FLOWS_MAX_EVENT_LIFECYCLE :
+                     (lifecycle ? DW_AUDIT_FLOWS_MAX_LIFECYCLE :
+                                  DW_AUDIT_FLOWS_MAX_SAMPLE);
+    if (limit > mode_limit_cap) {
+        limit_capped_from = limit;
+        limit = mode_limit_cap;
+    }
+    if (page_size > mode_limit_cap)
+        page_size = mode_limit_cap;
     if (event_lifecycle) {
         event_collector_status = jmx_flow_event_status_json();
         event_collector_started_at = dw_json_get_int64(event_collector_status, "started_at", 0);
@@ -19462,6 +20408,19 @@ retry_flow_query:
     json_object_object_add(data, "total", json_object_new_int64(total));
     json_object_object_add(data, "returned", json_object_new_int(returned));
     json_object_object_add(data, "limit", json_object_new_int(limit));
+    /*
+     * Tell callers when their own limit was reduced, and by which rule, so a
+     * short page is distinguishable from "no more data".  has_more below already
+     * reflects the effective limit.
+     */
+    json_object_object_add(data, "max_safe_limit", json_object_new_int(mode_limit_cap));
+    json_object_object_add(data, "limit_capped", json_object_new_boolean(limit_capped_from > 0));
+    if (limit_capped_from > 0) {
+        json_object_object_add(data, "requested_limit",
+                               json_object_new_int(limit_capped_from));
+        json_object_object_add(data, "limit_capped_reason",
+            json_object_new_string("mode_row_size_vs_ubus_max_msglen"));
+    }
     json_object_object_add(data, "offset", json_object_new_int(offset));
     json_object_object_add(data, "pageNumber", json_object_new_int(page_number));
     json_object_object_add(data, "pageSize", json_object_new_int(page_size));
@@ -20050,22 +21009,27 @@ static int dw_handle_identification_set(struct ubus_context *ctx, struct ubus_ob
                                         struct ubus_request_data *req, const char *method,
                                         struct blob_attr *msg)
 {
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : NULL;
-    const char *mode = dw_json_get_string(in, "mode", "");
+    char *msg_json = NULL;
+    struct json_object *in = NULL;
+    struct json_object *payload = NULL;
+    const char *mode;
     char old_mode[32] = "unavailable";
     int old_record = 0;
-    int target_record = strcmp(mode, "disabled") != 0;
+    int target_record;
     int kernel_readback = -1;
     int saved = 0;
     int proc_ok = 0;
     struct json_object *state;
 
     (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    mode = dw_json_get_string(payload, "mode", "");
     if (!strcmp(mode, "device_traffic"))
         mode = "device_and_traffic";
     else if (!strcmp(mode, "traffic"))
         mode = "traffic_only";
+    target_record = strcmp(mode, "disabled") != 0;
     if (!strcmp(mode, "disabled") || !strcmp(mode, "device_and_traffic") ||
         !strcmp(mode, "traffic_only")) {
         if (jmx_identification_mode_get(old_mode, sizeof(old_mode), &old_record) == 0 &&
@@ -20451,9 +21415,16 @@ static int dw_handle_metrics_tick(struct ubus_context *ctx, struct ubus_object *
         dw_collect_ipv6_load();
     if (audit_flow_sample && bulk_writes_allowed) {
         int flow_samples = dw_audit_flow_sample_collect(64);
+        int url_rows;
 
         if (flow_samples < 0)
             LOG_WARN("_metrics_tick: audit flow sample collect failed\n");
+
+        /* URL audit runs right after the sampler on the same beat: the sampler
+         * has just refreshed the host snapshot the backfill reads from. */
+        url_rows = dw_audit_url_backfill_tick();
+        if (url_rows < 0)
+            LOG_WARN("_metrics_tick: audit url backfill failed\n");
     }
     if (interface_traffic) {
         if (bulk_writes_allowed)
@@ -20703,21 +21674,21 @@ static int dw_handle_route_config_set(struct ubus_context *ctx, struct ubus_obje
                                       struct ubus_request_data *req, const char *method,
                                       struct blob_attr *msg)
 {
-    struct json_object *in;
+    struct json_object *in = NULL;
+    struct json_object *payload = NULL;
     struct json_object *resp;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
+    char *msg_json = NULL;
 
     (void)obj;
     (void)method;
 
-    in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    if (!in)
-        in = json_object_new_object();
-    resp = jmx_api_route_config_set(in);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_api_route_config_set(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
     json_object_put(in);
-    free(msg_json);
+    if (msg_json) free(msg_json);
     return 0;
 }
 
@@ -20910,6 +21881,7 @@ void dw_update_wan_profiles(void)
 
 #define IPV6_MAX_INTERFACES 32
 #define NFT_TABLE_NAME "dreamingwrt_ipv6_load"
+#define IPV6_NFT_PATH "/usr/sbin/nft"
 
 typedef struct {
     char id[32];
@@ -20939,92 +21911,148 @@ static ipv6_iface_t g_ipv6_ifaces[IPV6_MAX_INTERFACES];
 static int g_ipv6_iface_count = 0;
 static int g_ipv6_counters_installed = 0;
 
+static int dw_ipv6_nft_capture(char *const argv[], struct jmx_exec_result *result)
+{
+    if (!argv || !argv[0] || strcmp(argv[0], IPV6_NFT_PATH) != 0)
+        return -1;
+    return dw_tool_capture(argv, result);
+}
+
+static int dw_ipv6_nft_wait(char *const argv[])
+{
+    struct jmx_exec_result result;
+
+    if (dw_ipv6_nft_capture(argv, &result) != 0)
+        return -1;
+    jmx_exec_result_free(&result);
+    return 0;
+}
+
+static int dw_ipv6_nft_name_ok(const char *name)
+{
+    const unsigned char *p;
+
+    if (!name || !name[0] || strlen(name) >= 64)
+        return 0;
+    for (p = (const unsigned char *)name; *p; p++)
+        if (!(isalnum(*p) || *p == '_'))
+            return 0;
+    return 1;
+}
+
+static int dw_ipv6_counter_name(const char *id, const char *suffix,
+                                char *out, size_t out_len)
+{
+    size_t id_len;
+    size_t suffix_len;
+
+    if (!id || !suffix || !out || out_len == 0 ||
+        (strcmp(suffix, "_in") && strcmp(suffix, "_out")))
+        return -1;
+    id_len = strnlen(id, sizeof(g_ipv6_ifaces[0].id));
+    suffix_len = strlen(suffix);
+    if (id_len == 0 || id_len >= sizeof(g_ipv6_ifaces[0].id) ||
+        id_len + suffix_len >= out_len)
+        return -1;
+    memcpy(out, id, id_len);
+    memcpy(out + id_len, suffix, suffix_len + 1);
+    return dw_ipv6_nft_name_ok(out) ? 0 : -1;
+}
+
+static int dw_ipv6_device_ok(const char *device)
+{
+    return device && device[0] && strlen(device) < IFNAMSIZ &&
+           if_nametoindex(device) != 0;
+}
+
+static void dw_ipv6_nft_delete_table(void)
+{
+    char *argv[] = { IPV6_NFT_PATH, "delete", "table", "inet",
+                     NFT_TABLE_NAME, NULL };
+
+    (void)dw_ipv6_nft_wait(argv);
+}
+
 static int dw_install_ipv6_counters(void)
 {
     int i;
-    char cmd[256];
-    FILE *fp;
-    char line[256];
-    int table_ok = 0, chain_ok = 0;
+    char *add_table[] = { IPV6_NFT_PATH, "add", "table", "inet",
+                          NFT_TABLE_NAME, NULL };
+    char *add_chain[] = { IPV6_NFT_PATH, "add", "chain", "inet",
+                          NFT_TABLE_NAME, "ipv6_load",
+                          "{ type filter hook prerouting priority -150; policy accept; }", NULL };
 
     fprintf(stderr, "[ipv6_load] installing counters for %d interfaces\n", g_ipv6_iface_count);
+    g_ipv6_counters_installed = 0;
+    dw_ipv6_nft_delete_table();
+    if (dw_ipv6_nft_wait(add_table) != 0 || dw_ipv6_nft_wait(add_chain) != 0)
+        goto failed;
 
-    /* Remove old table if exists */
-    system("nft delete table inet " NFT_TABLE_NAME " 2>/dev/null");
-
-    /* Create table */
-    system("nft add table inet " NFT_TABLE_NAME);
-    /* Verify table exists */
-    {
-        char vcmd[128];
-        snprintf(vcmd, sizeof(vcmd), "nft list table inet " NFT_TABLE_NAME " 2>/dev/null");
-        FILE *vfp = popen(vcmd, "r");
-        if (vfp) {
-            while (fgets(line, sizeof(line), vfp)) { if (strstr(line, "table")) table_ok = 1; }
-            pclose(vfp);
-        }
-    }
-    fprintf(stderr, "[ipv6_load] table ok=%d\n", table_ok);
-    if (!table_ok) return -1;
-
-    /* Create named counter objects */
     for (i = 0; i < g_ipv6_iface_count; i++) {
         ipv6_iface_t *iface = &g_ipv6_ifaces[i];
-        snprintf(cmd, sizeof(cmd), "nft add counter inet " NFT_TABLE_NAME " %s_in 2>&1", iface->id);
-        fp = popen(cmd, "r");
-        if (fp) { while (fgets(line, sizeof(line), fp)) fprintf(stderr, "[ipv6_load] nft: %s", line); pclose(fp); }
-        snprintf(cmd, sizeof(cmd), "nft add counter inet " NFT_TABLE_NAME " %s_out 2>&1", iface->id);
-        fp = popen(cmd, "r");
-        if (fp) { while (fgets(line, sizeof(line), fp)) fprintf(stderr, "[ipv6_load] nft: %s", line); pclose(fp); }
-    }
+        char counter_in[64];
+        char counter_out[64];
+        char *add_counter_in[] = { IPV6_NFT_PATH, "add", "counter", "inet",
+                                   NFT_TABLE_NAME, counter_in, NULL };
+        char *add_counter_out[] = { IPV6_NFT_PATH, "add", "counter", "inet",
+                                    NFT_TABLE_NAME, counter_out, NULL };
+        char *add_rule_in[] = { IPV6_NFT_PATH, "add", "rule", "inet",
+                                NFT_TABLE_NAME, "ipv6_load", "meta", "nfproto",
+                                "ipv6", "iifname", iface->device, "counter",
+                                "name", counter_in, NULL };
+        char *add_rule_out[] = { IPV6_NFT_PATH, "add", "rule", "inet",
+                                 NFT_TABLE_NAME, "ipv6_load", "meta", "nfproto",
+                                 "ipv6", "oifname", iface->device, "counter",
+                                 "name", counter_out, NULL };
 
-    /* Create chain with type and hook in one step */
-    system("nft add chain inet " NFT_TABLE_NAME " ipv6_load '{ type filter hook prerouting priority -150; policy accept; }'");
-    /* Verify chain */
-    {
-        char vcmd[128];
-        snprintf(vcmd, sizeof(vcmd), "nft list chain inet " NFT_TABLE_NAME " ipv6_load 2>/dev/null");
-        FILE *vfp = popen(vcmd, "r");
-        if (vfp) { while (fgets(line, sizeof(line), vfp)) { if (strstr(line, "type filter")) chain_ok = 1; } pclose(vfp); }
-    }
-    fprintf(stderr, "[ipv6_load] chain ok=%d\n", chain_ok);
-    if (!chain_ok) return -1;
-
-    /* Add rules */
-    for (i = 0; i < g_ipv6_iface_count; i++) {
-        ipv6_iface_t *iface = &g_ipv6_ifaces[i];
-        snprintf(cmd, sizeof(cmd),
-            "nft add rule inet " NFT_TABLE_NAME " ipv6_load meta nfproto ipv6 iifname \"%s\" counter name %s_in 2>&1",
-            iface->device, iface->id);
-        fp = popen(cmd, "r");
-        if (fp) { while (fgets(line, sizeof(line), fp)) fprintf(stderr, "[ipv6_load] nft: %s", line); pclose(fp); }
-        snprintf(cmd, sizeof(cmd),
-            "nft add rule inet " NFT_TABLE_NAME " ipv6_load meta nfproto ipv6 oifname \"%s\" counter name %s_out 2>&1",
-            iface->device, iface->id);
-        fp = popen(cmd, "r");
-        if (fp) { while (fgets(line, sizeof(line), fp)) fprintf(stderr, "[ipv6_load] nft: %s", line); pclose(fp); }
+        if (dw_ipv6_counter_name(iface->id, "_in", counter_in,
+                                 sizeof(counter_in)) != 0 ||
+            dw_ipv6_counter_name(iface->id, "_out", counter_out,
+                                 sizeof(counter_out)) != 0 ||
+            !dw_ipv6_device_ok(iface->device) ||
+            dw_ipv6_nft_wait(add_counter_in) != 0 ||
+            dw_ipv6_nft_wait(add_counter_out) != 0 ||
+            dw_ipv6_nft_wait(add_rule_in) != 0 ||
+            dw_ipv6_nft_wait(add_rule_out) != 0)
+            goto failed;
     }
 
     g_ipv6_counters_installed = 1;
     fprintf(stderr, "[ipv6_load] counters installed for %d interfaces\n", g_ipv6_iface_count);
     return 0;
+
+failed:
+    dw_ipv6_nft_delete_table();
+    return -1;
 }
 
-static uint64_t dw_read_nft_counter(const char *counter_name)
+static int dw_read_nft_counter(const char *counter_name, uint64_t *bytes)
 {
-    char cmd[128];
-    char line[256];
-    FILE *fp;
-    uint64_t bytes = 0;
-    snprintf(cmd, sizeof(cmd), "nft list counter inet " NFT_TABLE_NAME " %s 2>/dev/null", counter_name);
-    fp = popen(cmd, "r");
-    if (!fp) return 0;
-    while (fgets(line, sizeof(line), fp)) {
-        char *p = strstr(line, "bytes ");
-        if (p) { p += 6; bytes = strtoull(p, NULL, 10); }
+    char *argv[] = { IPV6_NFT_PATH, "list", "counter", "inet",
+                     NFT_TABLE_NAME, (char *)counter_name, NULL };
+    struct jmx_exec_result result;
+    char *p;
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (!bytes || !dw_ipv6_nft_name_ok(counter_name) ||
+        dw_ipv6_nft_capture(argv, &result) != 0)
+        return -1;
+    p = strstr(result.output, "bytes ");
+    if (!p) {
+        jmx_exec_result_free(&result);
+        return -1;
     }
-    pclose(fp);
-    return bytes;
+    p += strlen("bytes ");
+    errno = 0;
+    parsed = strtoull(p, &end, 10);
+    if (errno != 0 || end == p || (*end && !isspace((unsigned char)*end))) {
+        jmx_exec_result_free(&result);
+        return -1;
+    }
+    *bytes = (uint64_t)parsed;
+    jmx_exec_result_free(&result);
+    return 0;
 }
 
 static int dw_ipv6_hex_to_text(const char *hex, char *out, size_t out_len)
@@ -21286,20 +22314,23 @@ static void dw_enum_ipv6_interfaces(void)
 /* Verify that the nft table still exists (may have been flushed externally) */
 static int dw_ipv6_nft_table_ok(void)
 {
-    FILE *fp;
-    char line[256];
-    fp = popen("nft list table inet " NFT_TABLE_NAME " 2>/dev/null", "r");
-    if (!fp) return 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "table")) { pclose(fp); return 1; }
-    }
-    pclose(fp);
-    return 0;
+    char *argv[] = { IPV6_NFT_PATH, "list", "table", "inet",
+                     NFT_TABLE_NAME, NULL };
+    struct jmx_exec_result result;
+    int ok;
+
+    if (dw_ipv6_nft_capture(argv, &result) != 0)
+        return 0;
+    ok = strstr(result.output, "table inet " NFT_TABLE_NAME) != NULL &&
+         strstr(result.output, "chain ipv6_load") != NULL;
+    jmx_exec_result_free(&result);
+    return ok;
 }
 
 void dw_collect_ipv6_load(void)
 {
     int i;
+    int all_valid = 1;
     int64_t now = (int64_t)dw_now();
 
     /* Ensure interfaces are enumerated */
@@ -21317,17 +22348,32 @@ void dw_collect_ipv6_load(void)
     /* Read named counters directly (not by rule index) */
     for (i = 0; i < g_ipv6_iface_count; i++) {
         ipv6_iface_t *iface = &g_ipv6_ifaces[i];
-        char cname_in[64], cname_out[64];
-        snprintf(cname_in, sizeof(cname_in), "%s_in", iface->id);
-        snprintf(cname_out, sizeof(cname_out), "%s_out", iface->id);
-        iface->down_bytes = dw_read_nft_counter(cname_in);
-        iface->up_bytes   = dw_read_nft_counter(cname_out);
+        char cname_in[64] = {0};
+        char cname_out[64] = {0};
+        iface->valid = dw_ipv6_counter_name(iface->id, "_in", cname_in,
+                                            sizeof(cname_in)) == 0 &&
+                       dw_ipv6_counter_name(iface->id, "_out", cname_out,
+                                            sizeof(cname_out)) == 0 &&
+                       dw_read_nft_counter(cname_in, &iface->down_bytes) == 0 &&
+                       dw_read_nft_counter(cname_out, &iface->up_bytes) == 0;
+        if (!iface->valid) {
+            iface->down_bytes = 0;
+            iface->up_bytes = 0;
+            all_valid = 0;
+        }
     }
+    if (!all_valid)
+        g_ipv6_counters_installed = 0;
 
     /* Calculate rates */
     for (i = 0; i < g_ipv6_iface_count; i++) {
         ipv6_iface_t *iface = &g_ipv6_ifaces[i];
         int64_t dt = now - iface->prev_ts;
+        if (!iface->valid) {
+            iface->up_rate = 0;
+            iface->down_rate = 0;
+            continue;
+        }
         if (iface->prev_ts > 0 && dt > 0 && dt < 120) {
             iface->up_rate = (iface->up_bytes >= iface->prev_up_bytes) ?
                 (int64_t)(iface->up_bytes - iface->prev_up_bytes) / dt : 0;
@@ -21340,7 +22386,8 @@ void dw_collect_ipv6_load(void)
         iface->prev_up_bytes = iface->up_bytes;
         iface->prev_down_bytes = iface->down_bytes;
         iface->prev_ts = now;
-        iface->valid = g_ipv6_counters_installed ? 1 : 0;
+        if (!g_ipv6_counters_installed)
+            iface->valid = 0;
     }
     dw_count_ipv6_conntrack();
 }
@@ -21738,7 +22785,35 @@ static void dw_add_client_detail(struct json_object *d, client_node_t *c,
     json_object_object_add(d, "down_rate", json_object_new_int64(c->down_rate));
     json_object_object_add(d, "up_bytes", json_object_new_int64((int64_t)today_up));
     json_object_object_add(d, "down_bytes", json_object_new_int64((int64_t)today_down));
-    json_object_object_add(d, "connections", json_object_new_int(0));
+    {
+        /* This was hardcoded to 0, which made the detail page contradict the
+         * clients list for the same MAC at the same instant (0 vs 646 while
+         * conntrack showed 644). Counted per family from conntrack instead.
+         *
+         * Rates and byte counters are deliberately not split by family: the
+         * kernel module publishes a single UpRate/DownRate pair per MAC in
+         * /proc/dreamingwrt/jmx/af_client with no family dimension, so any
+         * per-family rate would be fabricated. The *_supported=false flags say
+         * so rather than shipping a plausible-looking 0. */
+        int conn_v4 = 0;
+        int conn_v6 = 0;
+
+        dw_count_conntrack_for_client_by_family(c, &conn_v4, &conn_v6);
+        json_object_object_add(d, "connections", json_object_new_int(conn_v4 + conn_v6));
+        json_object_object_add(d, "ipv4_connections", json_object_new_int(conn_v4));
+        json_object_object_add(d, "ipv6_connections", json_object_new_int(conn_v6));
+        json_object_object_add(d, "connections_ipv4", json_object_new_int(conn_v4));
+        json_object_object_add(d, "connections_ipv6", json_object_new_int(conn_v6));
+        json_object_object_add(d, "connections_source",
+                               json_object_new_string("nf_conntrack_by_family"));
+        json_object_object_add(d, "ipv6_connections_supported", json_object_new_boolean(1));
+        json_object_object_add(d, "ipv6_rate_supported", json_object_new_boolean(0));
+        json_object_object_add(d, "ipv6_rate_reason",
+            json_object_new_string("jmx_per_client_accounting_is_family_agnostic"));
+        json_object_object_add(d, "ipv6_bytes_supported", json_object_new_boolean(0));
+        json_object_object_add(d, "ipv6_bytes_reason",
+            json_object_new_string("jmx_per_client_accounting_is_family_agnostic"));
+    }
     json_object_object_add(d, "online", json_object_new_boolean(c->online != 0));
     if (c->online && c->online_time > 0 && now >= c->online_time) {
         int64_t online_since = (int64_t)c->online_time;
@@ -22236,17 +23311,15 @@ static int dw_handle_hybrid_line_save(struct ubus_context *ctx, struct ubus_obje
                                       struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *payload = in;
-    struct json_object *wrapped = NULL;
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
     int rc;
 
-    if (!in)
-        in = json_object_new_object();
-    if (json_object_object_get_ex(in, "data", &wrapped) && wrapped)
-        payload = wrapped;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
 
     rc = jmx_netconfig_hybrid_line_set(payload);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
@@ -22254,8 +23327,8 @@ static int dw_handle_hybrid_line_save(struct ubus_context *ctx, struct ubus_obje
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -22298,7 +23371,7 @@ static int dw_handle_wan_set(struct ubus_context *ctx, struct ubus_object *obj,
                               struct blob_attr *msg)
 {
     char *msg_json = NULL;
-    struct json_object *in = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
     struct json_object *warnings = json_object_new_array();
     struct json_object *addresses = NULL;
@@ -22310,20 +23383,22 @@ static int dw_handle_wan_set(struct ubus_context *ctx, struct ubus_object *obj,
     int rc = -1, arc = -1;
     (void)obj; (void)method;
 
-    if (msg) msg_json = blobmsg_format_json(msg, true);
-    if (msg_json) in = json_tokener_parse(msg_json);
-    if (!in) in = json_object_new_object();
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        json_object_put(warnings);
+        return 0;
+    }
 
-    id = dw_json_get_string(in, "id", "");
-    device = dw_json_get_string(in, "device", "");
-    pppoe_ac = dw_json_get_string(in, "pppoe_ac", "");
-    if (!pppoe_ac[0]) pppoe_ac = dw_json_get_string(in, "ac", "");
-    pppoe_ac_mac = dw_json_get_string(in, "pppoe_ac_mac", "");
-    if (!pppoe_ac_mac[0]) pppoe_ac_mac = dw_json_get_string(in, "ac_mac", "");
-    pppoe_service = dw_json_get_string(in, "pppoe_service", "");
-    if (!pppoe_service[0]) pppoe_service = dw_json_get_string(in, "service", "");
-    ipaddr = dw_json_get_string(in, "ipaddr", "");
-    netmask = dw_json_get_string(in, "netmask", "");
+    id = dw_json_get_string(payload, "id", "");
+    device = dw_json_get_string(payload, "device", "");
+    pppoe_ac = dw_json_get_string(payload, "pppoe_ac", "");
+    if (!pppoe_ac[0]) pppoe_ac = dw_json_get_string(payload, "ac", "");
+    pppoe_ac_mac = dw_json_get_string(payload, "pppoe_ac_mac", "");
+    if (!pppoe_ac_mac[0]) pppoe_ac_mac = dw_json_get_string(payload, "ac_mac", "");
+    pppoe_service = dw_json_get_string(payload, "pppoe_service", "");
+    if (!pppoe_service[0]) pppoe_service = dw_json_get_string(payload, "service", "");
+    ipaddr = dw_json_get_string(payload, "ipaddr", "");
+    netmask = dw_json_get_string(payload, "netmask", "");
 
     if (!id[0]) {
         json_object_object_add(data, "error", json_object_new_string("id required"));
@@ -22339,20 +23414,20 @@ static int dw_handle_wan_set(struct ubus_context *ctx, struct ubus_object *obj,
     }
 
     /* Compatibility with the old flat wan_set payload: promote static address into addresses[]. */
-    if (!json_object_object_get_ex(in, "addresses", &addresses) && ipaddr[0]) {
+    if (!json_object_object_get_ex(payload, "addresses", &addresses) && ipaddr[0]) {
         addresses = json_object_new_array();
         struct json_object *a = json_object_new_object();
         json_object_object_add(a, "ip", json_object_new_string(ipaddr));
         json_object_object_add(a, "prefix", json_object_new_int(dw_netmask_to_cidr(netmask)));
         json_object_object_add(a, "primary", json_object_new_boolean(1));
         json_object_array_add(addresses, a);
-        json_object_object_add(in, "addresses", addresses);
+        json_object_object_add(payload, "addresses", addresses);
     }
 
     /* Preserve PPPoE discovery fields in advanced.pppoe for SQLite. */
-    if (!json_object_object_get_ex(in, "advanced", &adv) || !adv || !json_object_is_type(adv, json_type_object)) {
+    if (!json_object_object_get_ex(payload, "advanced", &adv) || !adv || !json_object_is_type(adv, json_type_object)) {
         adv = json_object_new_object();
-        json_object_object_add(in, "advanced", adv);
+        json_object_object_add(payload, "advanced", adv);
     }
     if (!json_object_object_get_ex(adv, "pppoe", &pppoe) || !pppoe || !json_object_is_type(pppoe, json_type_object)) {
         pppoe = json_object_new_object();
@@ -22362,7 +23437,7 @@ static int dw_handle_wan_set(struct ubus_context *ctx, struct ubus_object *obj,
     if (pppoe_ac_mac[0]) json_object_object_add(pppoe, "ac_mac", json_object_new_string(pppoe_ac_mac));
     if (pppoe_service[0]) json_object_object_add(pppoe, "service", json_object_new_string(pppoe_service));
 
-    rc = jmx_netconfig_wan_set(in);
+    rc = jmx_netconfig_wan_set(payload);
     if (rc == 0)
         arc = jmx_netconfig_apply_wan(id);
 
@@ -22397,7 +23472,7 @@ done:
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
     json_object_put(in);
-    if (msg_json) free(msg_json);
+    free(msg_json);
     return 0;
 }
 
@@ -22407,31 +23482,40 @@ static int dw_handle_hybrid_line_add(struct ubus_context *ctx, struct ubus_objec
                                       struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
-    const char *parent = dw_json_get_string(in, "parent", dw_json_get_string(in, "parent_wan_id", ""));
-    const char *name = dw_json_get_string(in, "name", "");
-    const char *mode = dw_json_get_string(in, "mode", "hybrid_macvlan");
-    const char *mac = dw_json_get_string(in, "mac", "");
+    const char *parent;
+    const char *name;
+    const char *mode;
+    const char *mac;
     char gen_mac[32] = {0};
     char idbuf[96];
     int rc = -1, arc = -1;
 
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    parent = dw_json_get_string(payload, "parent", dw_json_get_string(payload, "parent_wan_id", ""));
+    name = dw_json_get_string(payload, "name", "");
+    mode = dw_json_get_string(payload, "mode", "hybrid_macvlan");
+    mac = dw_json_get_string(payload, "mac", "");
+
     if (!parent[0] || !name[0]) { json_object_object_add(data, "error", json_object_new_string("parent and name required")); goto done; }
     if (!dw_is_valid_name(parent) || !dw_is_valid_name(name)) { json_object_object_add(data, "error", json_object_new_string("invalid name")); goto done; }
     if (strcmp(mode, "hybrid_vlan") == 0) {
-        int vid = dw_json_get_int(in, "vlan_id", atoi(dw_json_get_string(in, "vlan_id", "0")));
+        int vid = dw_json_get_int(payload, "vlan_id", atoi(dw_json_get_string(payload, "vlan_id", "0")));
         if (vid < 1 || vid > 4094) { json_object_object_add(data, "error", json_object_new_string("vlan_id must be 1-4094")); goto done; }
     }
-    if (!mac[0]) { dw_generate_mac(gen_mac, sizeof(gen_mac)); json_object_object_add(in, "mac", json_object_new_string(gen_mac)); mac = gen_mac; }
+    if (!mac[0]) { dw_generate_mac(gen_mac, sizeof(gen_mac)); json_object_object_add(payload, "mac", json_object_new_string(gen_mac)); mac = gen_mac; }
     if (mac[0] && !dw_is_valid_mac(mac)) { json_object_object_add(data, "error", json_object_new_string("invalid mac")); goto done; }
     snprintf(idbuf, sizeof(idbuf), "line_%s_%s", parent, name);
-    if (!dw_json_get_string(in, "id", "")[0]) json_object_object_add(in, "id", json_object_new_string(idbuf));
+    if (!dw_json_get_string(payload, "id", "")[0]) json_object_object_add(payload, "id", json_object_new_string(idbuf));
 
-    rc = jmx_netconfig_hybrid_line_set(in);
-    if (rc == 0) arc = jmx_netconfig_apply_hybrid_line(dw_json_get_string(in, "id", idbuf));
-    json_object_object_add(data, "id", json_object_new_string(dw_json_get_string(in, "id", idbuf)));
+    rc = jmx_netconfig_hybrid_line_set(payload);
+    if (rc == 0) arc = jmx_netconfig_apply_hybrid_line(dw_json_get_string(payload, "id", idbuf));
+    json_object_object_add(data, "id", json_object_new_string(dw_json_get_string(payload, "id", idbuf)));
     json_object_object_add(data, "mac", json_object_new_string(mac));
     json_object_object_add(data, "saved", json_object_new_boolean(rc == 0));
     json_object_object_add(data, "applied", json_object_new_boolean(arc == 0));
@@ -22444,7 +23528,7 @@ done:
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
     if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    free(msg_json);
     return 0;
 }
 
@@ -22454,17 +23538,21 @@ static int dw_handle_hybrid_line_delete(struct ubus_context *ctx, struct ubus_ob
                                          struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    const char *id = dw_json_get_string(payload, "id", "");
     int rc = jmx_netconfig_hybrid_line_delete(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -22474,11 +23562,15 @@ static int dw_handle_hybrid_line_enable(struct ubus_context *ctx, struct ubus_ob
                                          struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
-    int enabled = dw_json_get_int(in, "enabled", 1);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    const char *id = dw_json_get_string(payload, "id", "");
+    int enabled = dw_json_get_int(payload, "enabled", 1);
     int rc = jmx_netconfig_hybrid_line_enable(id, enabled);
     int arc = (rc == 0 && enabled) ? jmx_netconfig_apply_hybrid_line(id) : 0;
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0 && arc == 0));
@@ -22487,8 +23579,8 @@ static int dw_handle_hybrid_line_enable(struct ubus_context *ctx, struct ubus_ob
     struct json_object *resp = jmx_gen_api_response_data((rc == 0 && arc == 0) ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -22497,11 +23589,15 @@ static int dw_handle_wan_enable(struct ubus_context *ctx, struct ubus_object *ob
                                 struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
-    int enabled = dw_json_get_int(in, "enabled", 1);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    const char *id = dw_json_get_string(payload, "id", "");
+    int enabled = dw_json_get_int(payload, "enabled", 1);
     int rc = jmx_netconfig_wan_set_enabled(id, enabled);
     int arc = (rc == 0 && id && id[0]) ? jmx_netconfig_apply_wan(id) : 0;
 
@@ -22524,8 +23620,8 @@ static int dw_handle_wan_enable(struct ubus_context *ctx, struct ubus_object *ob
         json_object_put(evt);
     }
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -22534,11 +23630,15 @@ static int dw_handle_lan_enable(struct ubus_context *ctx, struct ubus_object *ob
                                 struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
-    int enabled = dw_json_get_int(in, "enabled", 1);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    const char *id = dw_json_get_string(payload, "id", "");
+    int enabled = dw_json_get_int(payload, "enabled", 1);
     int rc = jmx_netconfig_lan_set_enabled(id, enabled);
     int arc = (rc == 0 && id && id[0]) ? jmx_netconfig_apply_lan(id) : 0;
 
@@ -22561,8 +23661,8 @@ static int dw_handle_lan_enable(struct ubus_context *ctx, struct ubus_object *ob
         json_object_put(evt);
     }
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -22820,13 +23920,15 @@ static int dw_handle_wan_config_save(struct ubus_context *ctx, struct ubus_objec
                                      struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *resp = jmx_netconfig_wan_save_apply_result(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    struct json_object *resp = jmx_netconfig_wan_save_apply_result(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -22835,14 +23937,16 @@ static int dw_handle_wan_config_delete(struct ubus_context *ctx, struct ubus_obj
                                        struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *id = dw_json_get_string(payload, "id", "");
     struct json_object *resp = jmx_netconfig_wan_delete_result(id);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -22851,9 +23955,11 @@ static int dw_handle_wan_delete(struct ubus_context *ctx, struct ubus_object *ob
                                  struct blob_attr *msg)
 {
     (void)obj; (void)method; (void)msg;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *id = dw_json_get_string(payload, "id", "");
     struct json_object *data = json_object_new_object();
     int rc = jmx_netconfig_wan_delete(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
@@ -22861,8 +23967,8 @@ static int dw_handle_wan_delete(struct ubus_context *ctx, struct ubus_object *ob
         rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -22871,14 +23977,15 @@ static int dw_handle_lan_set(struct ubus_context *ctx, struct ubus_object *obj,
                               struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
-    struct json_object *lan_json = NULL;
-    json_object_object_get_ex(in, "data", &lan_json);
-    if (!lan_json) lan_json = in;
-    int rc = jmx_netconfig_lan_set(lan_json);
-    const char *id = dw_json_get_string(lan_json, "id", "");
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    int rc = jmx_netconfig_lan_set(payload);
+    const char *id = dw_json_get_string(payload, "id", "");
     int arc = (rc == 0 && id && id[0]) ? jmx_netconfig_apply_lan(id) : 0;
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0 && arc == 0));
     json_object_object_add(data, "saved", json_object_new_boolean(rc == 0));
@@ -22889,7 +23996,8 @@ static int dw_handle_lan_set(struct ubus_context *ctx, struct ubus_object *obj,
         (rc == 0 && arc == 0) ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -22898,13 +24006,15 @@ static int dw_handle_lan_config_save(struct ubus_context *ctx, struct ubus_objec
                                      struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *resp = jmx_netconfig_lan_save_apply_result(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    struct json_object *resp = jmx_netconfig_lan_save_apply_result(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -22981,15 +24091,17 @@ static int dw_handle_lan_delete(struct ubus_context *ctx, struct ubus_object *ob
                                  struct blob_attr *msg)
 {
     (void)obj; (void)method; (void)msg;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
-    const char *management_client_ip = dw_json_get_string(in, "management_client_ip", "");
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *id = dw_json_get_string(payload, "id", "");
+    const char *management_client_ip = dw_json_get_string(payload, "management_client_ip", "");
     struct json_object *resp = jmx_netconfig_lan_delete_result(id, management_client_ip);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -22998,11 +24110,13 @@ static int dw_handle_lan_set_ports(struct ubus_context *ctx, struct ubus_object 
                                     struct blob_attr *msg)
 {
     (void)obj; (void)method; (void)msg;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *id = dw_json_get_string(payload, "id", "");
     struct json_object *ports = NULL;
-    json_object_object_get_ex(in, "ports", &ports);
+    json_object_object_get_ex(payload, "ports", &ports);
     struct json_object *data = json_object_new_object();
     int rc = jmx_netconfig_lan_set_ports(id, ports);
     int arc = (rc == 0 && id && id[0]) ? jmx_netconfig_apply_lan(id) : 0;
@@ -23015,7 +24129,8 @@ static int dw_handle_lan_set_ports(struct ubus_context *ctx, struct ubus_object 
         (rc == 0 && arc == 0) ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -23130,20 +24245,17 @@ static int dw_handle_physical_port_config_apply(struct ubus_context *ctx, struct
                                                 struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *cfg = NULL;
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *resp = NULL;
 
-    if (in)
-        json_object_object_get_ex(in, "data", &cfg);
-    if (!cfg)
-        cfg = in;
-    resp = jmx_netconfig_physical_port_config_apply(cfg);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_netconfig_physical_port_config_apply(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -23179,15 +24291,17 @@ static int dw_handle_gateway_ports_apply(struct ubus_context *ctx, struct ubus_o
                                          struct ubus_request_data *req, const char *method,
                                          struct blob_attr *msg)
 {
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *resp;
     (void)obj; (void)method;
-    resp = jmx_netconfig_gateway_ports_apply(in);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_netconfig_gateway_ports_apply(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -23226,21 +24340,18 @@ static int dw_handle_physical_port_profile_set(struct ubus_context *ctx, struct 
                                                struct ubus_request_data *req, const char *method,
                                                struct blob_attr *msg)
 {
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *cfg = NULL;
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *resp;
     (void)obj; (void)method;
 
-    if (in)
-        json_object_object_get_ex(in, "data", &cfg);
-    if (!cfg)
-        cfg = in;
-    resp = jmx_netconfig_physical_port_profile_set(cfg);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_netconfig_physical_port_profile_set(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -23248,17 +24359,19 @@ static int dw_handle_physical_port_profile_delete(struct ubus_context *ctx, stru
                                                   struct ubus_request_data *req, const char *method,
                                                   struct blob_attr *msg)
 {
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *resp;
     (void)obj; (void)method;
 
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *id = dw_json_get_string(payload, "id", "");
     resp = jmx_netconfig_physical_port_profile_delete(id);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -23278,19 +24391,20 @@ static int dw_handle_radius_set(struct ubus_context *ctx, struct ubus_object *ob
                                 struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
-    struct json_object *radius = NULL;
-    json_object_object_get_ex(in, "data", &radius);
-    if (!radius) radius = in;
-    int rc = jmx_netconfig_radius_set(radius);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    int rc = jmx_netconfig_radius_set(payload);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -23299,17 +24413,21 @@ static int dw_handle_radius_delete(struct ubus_context *ctx, struct ubus_object 
                                    struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    const char *id = dw_json_get_string(payload, "id", "");
     int rc = jmx_netconfig_radius_delete(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -23393,22 +24511,24 @@ static int dw_handle_network_batch(struct ubus_context *ctx, struct ubus_object 
                                    struct ubus_request_data *req, struct blob_attr *msg,
                                    int is_wan, int apply)
 {
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *management_client_ip = dw_json_get_string(in, "management_client_ip", "");
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *resp;
 
     (void)obj;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *management_client_ip = dw_json_get_string(payload, "management_client_ip", "");
     if (is_wan)
-        resp = apply ? jmx_netconfig_wan_batch_apply(in, management_client_ip) :
-                       jmx_netconfig_wan_batch_preview(in, management_client_ip);
+        resp = apply ? jmx_netconfig_wan_batch_apply(payload, management_client_ip) :
+                       jmx_netconfig_wan_batch_preview(payload, management_client_ip);
     else
-        resp = apply ? jmx_netconfig_lan_batch_apply(in, management_client_ip) :
-                       jmx_netconfig_lan_batch_preview(in, management_client_ip);
+        resp = apply ? jmx_netconfig_lan_batch_apply(payload, management_client_ip) :
+                       jmx_netconfig_lan_batch_preview(payload, management_client_ip);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -23478,10 +24598,12 @@ static int dw_handle_wan_apply(struct ubus_context *ctx, struct ubus_object *obj
                                 struct ubus_request_data *req, const char *method,
                                 struct blob_attr *msg)
 {
-    (void)obj; (void)method; (void)msg;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    (void)obj; (void)method;
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *id = dw_json_get_string(payload, "id", "");
     struct json_object *data = json_object_new_object();
     int rc = jmx_netconfig_apply_wan(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
@@ -23499,7 +24621,8 @@ static int dw_handle_wan_apply(struct ubus_context *ctx, struct ubus_object *obj
         json_object_put(evt);
     }
     json_object_put(resp);
-    if (in) json_object_put(in);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -23508,10 +24631,12 @@ static int dw_handle_lan_apply(struct ubus_context *ctx, struct ubus_object *obj
                                 struct ubus_request_data *req, const char *method,
                                 struct blob_attr *msg)
 {
-    (void)obj; (void)method; (void)msg;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    (void)obj; (void)method;
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *id = dw_json_get_string(payload, "id", "");
     struct json_object *data = json_object_new_object();
     int rc = jmx_netconfig_apply_lan(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
@@ -23526,7 +24651,8 @@ static int dw_handle_lan_apply(struct ubus_context *ctx, struct ubus_object *obj
         json_object_put(evt);
     }
     json_object_put(resp);
-    if (in) json_object_put(in);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -23538,14 +24664,224 @@ static struct json_object *dw_payload_or_self(struct json_object *in)
     return in;
 }
 
+#define DW_JSON_TEXT_MAX_BYTES (1024U * 1024U)
+#define DW_JSON_MAX_DEPTH 32U
+#define DW_JSON_MAX_NODES 16384U
+#define DW_JSON_MAX_OBJECT_MEMBERS 8192U
+#define DW_JSON_MAX_ARRAY_ITEMS 8192U
+#define DW_JSON_MAX_STRING_BYTES (512U * 1024U)
+#define DW_JSON_MAX_TOTAL_STRING_BYTES (768U * 1024U)
+#define DW_JSON_PARSE_ERROR_KEY "__dreamingwrt_parse_error"
+
+struct dw_json_budget {
+    size_t nodes;
+    size_t object_members;
+    size_t array_items;
+    size_t string_bytes;
+};
+
+static int dw_json_budget_add_string(struct dw_json_budget *budget,
+                                     size_t bytes, const char **reason)
+{
+    if (bytes > DW_JSON_MAX_STRING_BYTES) {
+        *reason = "json_string_too_long";
+        return -1;
+    }
+    if (budget->string_bytes > DW_JSON_MAX_TOTAL_STRING_BYTES ||
+        bytes > DW_JSON_MAX_TOTAL_STRING_BYTES - budget->string_bytes) {
+        *reason = "json_string_budget_exceeded";
+        return -1;
+    }
+    budget->string_bytes += bytes;
+    return 0;
+}
+
+static int dw_json_budget_walk(struct json_object *value, unsigned int depth,
+                               struct dw_json_budget *budget,
+                               const char **reason)
+{
+    enum json_type type;
+
+    if (!value) {
+        *reason = "invalid_json_value";
+        return -1;
+    }
+    if (depth > DW_JSON_MAX_DEPTH) {
+        *reason = "json_depth_exceeded";
+        return -1;
+    }
+    if (budget->nodes >= DW_JSON_MAX_NODES) {
+        *reason = "json_node_budget_exceeded";
+        return -1;
+    }
+    budget->nodes++;
+    type = json_object_get_type(value);
+
+    if (type == json_type_object) {
+        json_object_object_foreach(value, key, child) {
+            size_t key_len = strlen(key);
+
+            if (budget->object_members >= DW_JSON_MAX_OBJECT_MEMBERS) {
+                *reason = "json_object_member_budget_exceeded";
+                return -1;
+            }
+            budget->object_members++;
+            if (dw_json_budget_add_string(budget, key_len, reason) != 0 ||
+                dw_json_budget_walk(child, depth + 1, budget, reason) != 0)
+                return -1;
+        }
+    } else if (type == json_type_array) {
+        size_t i;
+        size_t count = json_object_array_length(value);
+
+        if (budget->array_items > DW_JSON_MAX_ARRAY_ITEMS ||
+            count > DW_JSON_MAX_ARRAY_ITEMS - budget->array_items) {
+            *reason = "json_array_item_budget_exceeded";
+            return -1;
+        }
+        budget->array_items += count;
+        for (i = 0; i < count; i++) {
+            if (dw_json_budget_walk(json_object_array_get_idx(value, i),
+                                    depth + 1, budget, reason) != 0)
+                return -1;
+        }
+    } else if (type == json_type_string) {
+        if (dw_json_budget_add_string(budget,
+                                      json_object_get_string_len(value),
+                                      reason) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static void dw_payload_parse_error_set(struct json_object **in,
+                                       const char *reason)
+{
+    *in = json_object_new_object();
+    if (*in)
+        json_object_object_add(*in, DW_JSON_PARSE_ERROR_KEY,
+                               json_object_new_string(reason));
+}
+
+static const char *dw_payload_parse_error_get(struct json_object *in)
+{
+    struct json_object *error = NULL;
+
+    if (in && json_object_object_get_ex(in, DW_JSON_PARSE_ERROR_KEY, &error) &&
+        error && json_object_is_type(error, json_type_string))
+        return json_object_get_string(error);
+    return "json_parse_failed";
+}
+
 static struct json_object *dw_parse_payload(struct blob_attr *msg, char **msg_json,
                                            struct json_object **in)
 {
-    *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    *in = *msg_json ? json_tokener_parse(*msg_json) : json_object_new_object();
-    if (!*in)
+    struct json_tokener *tok = NULL;
+    struct json_object *payload = NULL;
+    struct dw_json_budget budget = { 0 };
+    enum json_tokener_error parse_error;
+    struct json_object *wrapped_data = NULL;
+    int has_wrapped_data;
+    const char *reason = "json_parse_failed";
+    size_t text_len;
+
+    *msg_json = NULL;
+    *in = NULL;
+    if (!msg) {
         *in = json_object_new_object();
-    return dw_payload_or_self(*in);
+        if (!*in)
+            return NULL;
+        return *in;
+    }
+    if ((size_t)blob_len(msg) > DW_JSON_TEXT_MAX_BYTES) {
+        dw_payload_parse_error_set(in, "json_text_too_large");
+        return NULL;
+    }
+    *msg_json = blobmsg_format_json(msg, true);
+    if (!*msg_json) {
+        dw_payload_parse_error_set(in, "json_format_failed");
+        return NULL;
+    }
+    text_len = strlen(*msg_json);
+    if (text_len > DW_JSON_TEXT_MAX_BYTES) {
+        dw_payload_parse_error_set(in, "json_text_too_large");
+        return NULL;
+    }
+
+    tok = json_tokener_new_ex(DW_JSON_MAX_DEPTH + 1);
+    if (!tok) {
+        dw_payload_parse_error_set(in, "json_parser_unavailable");
+        return NULL;
+    }
+    json_tokener_set_flags(tok, JSON_TOKENER_STRICT);
+    *in = json_tokener_parse_ex(tok, *msg_json, text_len);
+    parse_error = json_tokener_get_error(tok);
+    if (parse_error != json_tokener_success || !*in ||
+        json_tokener_get_parse_end(tok) != text_len) {
+        if (parse_error == json_tokener_error_depth)
+            reason = "json_depth_exceeded";
+        json_tokener_free(tok);
+        if (*in) {
+            json_object_put(*in);
+            *in = NULL;
+        }
+        dw_payload_parse_error_set(in, reason);
+        return NULL;
+    }
+    json_tokener_free(tok);
+
+    if (!json_object_is_type(*in, json_type_object)) {
+        reason = "json_root_must_be_object";
+        goto reject;
+    }
+    has_wrapped_data = json_object_object_get_ex(*in, "data", &wrapped_data);
+    if (has_wrapped_data &&
+        (!wrapped_data || !json_object_is_type(wrapped_data, json_type_object))) {
+        reason = "json_data_must_be_object";
+        goto reject;
+    }
+    payload = has_wrapped_data ? wrapped_data : *in;
+    if (dw_json_budget_walk(*in, 1, &budget, &reason) != 0)
+        goto reject;
+    return payload;
+
+reject:
+    json_object_put(*in);
+    *in = NULL;
+    dw_payload_parse_error_set(in, reason);
+    return NULL;
+}
+
+static int dw_parse_write_payload(struct ubus_context *ctx,
+                                  struct ubus_request_data *req,
+                                  struct blob_attr *msg, char **msg_json,
+                                  struct json_object **in,
+                                  struct json_object **payload)
+{
+    struct json_object *data;
+    struct json_object *response;
+    const char *reason;
+
+    *payload = dw_parse_payload(msg, msg_json, in);
+    if (*payload)
+        return 0;
+
+    reason = dw_payload_parse_error_get(*in);
+    data = json_object_new_object();
+    json_object_object_add(data, "ok", json_object_new_boolean(0));
+    json_object_object_add(data, "error", json_object_new_string("invalid_request"));
+    json_object_object_add(data, "reason", json_object_new_string(reason));
+    json_object_object_add(data, "field", json_object_new_string("data"));
+    response = jmx_gen_api_response_data(API_CODE_ERROR, data);
+    dw_send_json(ctx, req, response);
+    json_object_put(response);
+    if (*in) {
+        json_object_put(*in);
+        *in = NULL;
+    }
+    free(*msg_json);
+    *msg_json = NULL;
+    return -1;
 }
 
 static void dw_send_owned_json(struct ubus_context *ctx,
@@ -23678,11 +25014,14 @@ static int dw_handle_file_service_write(struct ubus_context *ctx, struct ubus_ob
 {
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    const char *id = dw_json_get_string(payload, "id", "");
+    struct json_object *payload = NULL;
+    const char *id;
     struct json_object *response;
 
     (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    id = dw_json_get_string(payload, "id", "");
     if (!strcmp(resource, "samba"))
         response = is_delete ? jmx_samba_share_delete(id, payload) :
                                jmx_samba_share_upsert(id, payload);
@@ -23711,13 +25050,16 @@ static int dw_handle_system_power_schedule_write(
 {
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    const char *id = dw_json_get_string(payload, "id", "");
-    struct json_object *response = is_delete ?
-        jmx_system_power_schedule_delete(id, payload) :
-        jmx_system_power_schedule_upsert(id, payload);
+    struct json_object *payload = NULL;
+    const char *id;
+    struct json_object *response;
 
     (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    id = dw_json_get_string(payload, "id", "");
+    response = is_delete ? jmx_system_power_schedule_delete(id, payload) :
+                           jmx_system_power_schedule_upsert(id, payload);
     dw_send_owned_json(ctx, req, response);
     if (in) json_object_put(in);
     free(msg_json);
@@ -23746,10 +25088,13 @@ static int dw_handle_system_power_action(struct ubus_context *ctx,
 {
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    const char *action = dw_json_get_string(payload, "action", "");
+    struct json_object *payload = NULL;
+    const char *action;
 
     (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    action = dw_json_get_string(payload, "action", "");
     dw_send_owned_json(ctx, req,
         jmx_system_power_immediate_action(action, payload));
     if (in) json_object_put(in);
@@ -24449,10 +25794,20 @@ static int dw_handle_dhcp_service_set(struct ubus_context *ctx, struct ubus_obje
                                       struct ubus_request_data *req, const char *method,
                                       struct blob_attr *msg)
 {
-    (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *data = json_object_new_object();
-    struct json_object *before = jmx_dhcp_service_get(), *before_data = NULL, *before_scopes = NULL, *restore = NULL;
-    const char *lan_id = dw_json_get_string(in, "lan_id", ""); int rc, arc, rolled_back = 0; int i, n;
+    char *msg_json = NULL;
+    struct json_object *in = NULL;
+    struct json_object *payload = NULL;
+    struct json_object *data;
+    struct json_object *before_data = NULL, *before_scopes = NULL, *restore = NULL;
+    const char *lan_id;
+    int rc, arc, rolled_back = 0; int i, n;
+
+    (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    data = json_object_new_object();
+    lan_id = dw_json_get_string(payload, "lan_id", "");
+    struct json_object *before = jmx_dhcp_service_get();
     before_data = dw_jmx_response_data_ref(before);
     if (before_data && json_object_object_get_ex(before_data, "scopes", &before_scopes) && before_scopes && json_object_is_type(before_scopes, json_type_array)) {
         n = json_object_array_length(before_scopes);
@@ -24469,7 +25824,7 @@ static int dw_handle_dhcp_service_set(struct ubus_context *ctx, struct ubus_obje
     if (before_data) json_object_put(before_data);
     /* before/restore uses the whole scope object, including prefix_reservations/prefixes,
      * so DHCPv6 IA_PD reservations roll back with pool/reservations/access list. */
-    rc = jmx_dhcp_service_set(in); arc = (rc == 0) ? jmx_dhcp_service_apply(lan_id) : -1;
+    rc = jmx_dhcp_service_set(payload); arc = (rc == 0) ? jmx_dhcp_service_apply(lan_id) : -1;
     if (rc == 0 && arc != 0 && restore && jmx_dhcp_service_set(restore) == 0 && jmx_dhcp_service_apply(lan_id) == 0)
         rolled_back = 1;
     json_object_object_add(data,"ok",json_object_new_boolean(rc==0&&arc==0)); json_object_object_add(data,"saved",json_object_new_boolean(rc==0)); json_object_object_add(data,"applied",json_object_new_boolean(rc==0&&arc==0));
@@ -24488,9 +25843,21 @@ static int dw_handle_dhcp_reservation_delete(struct ubus_context *ctx, struct ub
                                              struct ubus_request_data *req, const char *method,
                                              struct blob_attr *msg)
 {
-    (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *data = json_object_new_object();
-    const char *id = dw_json_get_string(in,"id",""); char lan_id[128]={0}; int rc = jmx_dhcp_reservation_delete_resolve(id,lan_id,sizeof(lan_id)); int arc = (rc == 0) ? jmx_dhcp_service_apply(lan_id) : -1;
+    char *msg_json = NULL;
+    struct json_object *in = NULL;
+    struct json_object *payload = NULL;
+    struct json_object *data;
+    const char *id;
+    char lan_id[128] = {0};
+    int rc, arc;
+
+    (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    data = json_object_new_object();
+    id = dw_json_get_string(payload, "id", "");
+    rc = jmx_dhcp_reservation_delete_resolve(id, lan_id, sizeof(lan_id));
+    arc = (rc == 0) ? jmx_dhcp_service_apply(lan_id) : -1;
     json_object_object_add(data,"ok",json_object_new_boolean(rc==0&&arc==0)); json_object_object_add(data,"deleted",json_object_new_boolean(rc==0)); json_object_object_add(data,"applied",json_object_new_boolean(rc==0&&arc==0)); json_object_object_add(data,"apply_state",json_object_new_string(rc==1?"not_found":(rc!=0?"delete_failed":(arc==0?"applied":"deleted_not_applied")))); json_object_object_add(data,"lan_id",json_object_new_string(lan_id));
     if(rc==1)json_object_object_add(data,"error",json_object_new_string("reservation_not_found")); else if(rc!=0)json_object_object_add(data,"error",json_object_new_string("reservation_delete_failed")); else if(arc!=0)json_object_object_add(data,"error",json_object_new_string("dhcp_apply_failed_after_delete"));
     { struct json_object *readback=jmx_dhcp_service_get(); struct json_object *readback_data=dw_jmx_response_data_ref(readback); if(readback_data)json_object_object_add(data,"readback",readback_data); if(readback)json_object_put(readback); }
@@ -24510,11 +25877,11 @@ static int dw_handle_firewall_service_get(struct ubus_context *ctx, struct ubus_
 static int dw_handle_firewall_service_set(struct ubus_context *ctx, struct ubus_object *obj,
                                           struct ubus_request_data *req, const char *method,
                                           struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json=msg?blobmsg_format_json(msg,true):NULL; struct json_object *in=msg_json?json_tokener_parse(msg_json):json_object_new_object(); struct json_object *data=json_object_new_object(); int rc=jmx_firewall_service_set(in); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); json_object_object_add(data,"saved",json_object_new_boolean(rc==0)); struct json_object *resp=jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx,req,resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json=NULL; struct json_object *in=NULL, *payload=NULL, *data, *resp; int rc; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; data=json_object_new_object(); rc=jmx_firewall_service_set(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); json_object_object_add(data,"saved",json_object_new_boolean(rc==0)); resp=jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx,req,resp); json_object_put(resp); if(in)json_object_put(in); free(msg_json); return 0; }
 static int dw_handle_firewall_service_apply(struct ubus_context *ctx, struct ubus_object *obj,
                                             struct ubus_request_data *req, const char *method,
                                             struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json=msg?blobmsg_format_json(msg,true):NULL; struct json_object *in=msg_json?json_tokener_parse(msg_json):json_object_new_object(); struct json_object *resp=jmx_firewall_service_apply(in); dw_send_json(ctx,req,resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json=NULL; struct json_object *in=NULL, *payload=NULL, *resp; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; resp=jmx_firewall_service_apply(payload); dw_send_json(ctx,req,resp); json_object_put(resp); if(in)json_object_put(in); free(msg_json); return 0; }
 
 static int dw_handle_flow_control_rule_test(struct ubus_context *ctx, struct ubus_object *obj,
                                             struct ubus_request_data *req, const char *method,
@@ -24533,9 +25900,13 @@ static int dw_handle_vpn_config_set(struct ubus_context *ctx, struct ubus_object
                                     struct ubus_request_data *req, const char *method,
                                     struct blob_attr *msg)
 {
-    (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *data = json_object_new_object(); int rc = jmx_vpn_config_set(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *data;
+    int rc;
+    (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    data = json_object_new_object(); rc = jmx_vpn_config_set(payload);
     json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); json_object_object_add(data,"saved",json_object_new_boolean(rc==0));
     struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data);
     dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0;
@@ -24544,9 +25915,12 @@ static int dw_handle_vpn_config_apply(struct ubus_context *ctx, struct ubus_obje
                                       struct ubus_request_data *req, const char *method,
                                       struct blob_attr *msg)
 {
-    (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *resp = jmx_vpn_config_apply(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *resp;
+    (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_vpn_config_apply(payload);
     dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0;
 }
 
@@ -24565,9 +25939,13 @@ static int dw_handle_bulk_ip_set(struct ubus_context *ctx, struct ubus_object *o
                                  struct ubus_request_data *req, const char *method,
                                  struct blob_attr *msg)
 {
-    (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *data = json_object_new_object(); int rc = jmx_bulk_ip_set(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *data;
+    int rc;
+    (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    data = json_object_new_object(); rc = jmx_bulk_ip_set(payload);
     json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); json_object_object_add(data,"saved",json_object_new_boolean(rc==0));
     struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data);
     dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0;
@@ -24577,9 +25955,12 @@ static int dw_handle_bulk_ip_import(struct ubus_context *ctx, struct ubus_object
                                     struct ubus_request_data *req, const char *method,
                                     struct blob_attr *msg)
 {
-    (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *resp = jmx_bulk_ip_import(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *resp;
+    (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_bulk_ip_import(payload);
     dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0;
 }
 
@@ -24608,10 +25989,12 @@ static int dw_handle_upnp_service_set(struct ubus_context *ctx, struct ubus_obje
                                       struct ubus_request_data *req, const char *method,
                                       struct blob_attr *msg)
 {
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *resp;
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *resp = jmx_upnp_service_save_apply_result(in);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_upnp_service_save_apply_result(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp); if (in) json_object_put(in); if (msg_json) free(msg_json);
     return 0;
@@ -24621,10 +26004,12 @@ static int dw_handle_upnp_acl_set(struct ubus_context *ctx, struct ubus_object *
                                   struct ubus_request_data *req, const char *method,
                                   struct blob_attr *msg)
 {
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *resp;
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *resp = jmx_upnp_acl_save_apply_result(in);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_upnp_acl_save_apply_result(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp); if (in) json_object_put(in); if (msg_json) free(msg_json);
     return 0;
@@ -24634,11 +26019,14 @@ static int dw_handle_upnp_acl_delete(struct ubus_context *ctx, struct ubus_objec
                                      struct ubus_request_data *req, const char *method,
                                      struct blob_attr *msg)
 {
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *resp;
+    const char *id;
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
-    struct json_object *resp = jmx_upnp_acl_delete_apply_result(id);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    id = dw_json_get_string(payload, "id", "");
+    resp = jmx_upnp_acl_delete_apply_result(id);
     dw_send_json(ctx, req, resp);
     json_object_put(resp); if (in) json_object_put(in); if (msg_json) free(msg_json);
     return 0;
@@ -24660,13 +26048,18 @@ static int dw_handle_upnp_mapping_set(struct ubus_context *ctx, struct ubus_obje
                                       struct ubus_request_data *req, const char *method,
                                       struct blob_attr *msg)
 {
-    (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *data = json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *data;
     char port_owner[96] = {0};
-    int rc = jmx_upnp_mapping_set_ex(in, port_owner, sizeof(port_owner));
-    const char *err = NULL;
+    int rc;
+    const char *err;
+
+    (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    data = json_object_new_object();
+    rc = jmx_upnp_mapping_set_ex(payload, port_owner, sizeof(port_owner));
+    err = NULL;
 
     switch (rc) {
     case 0:  break;
@@ -24737,10 +26130,12 @@ static int dw_handle_routing_static_route_set(struct ubus_context *ctx, struct u
                                               struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     struct json_object *data = json_object_new_object();
-    int rc = jmx_routing_static_route_set(in);
+    int rc = jmx_routing_static_route_set(payload);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
@@ -24752,9 +26147,11 @@ static int dw_handle_routing_static_route_delete(struct ubus_context *ctx, struc
                                                  struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *id = dw_json_get_string(payload, "id", "");
     struct json_object *data = json_object_new_object();
     int rc = jmx_routing_static_route_delete(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
@@ -24782,10 +26179,12 @@ static int dw_handle_routing_policy_rule_set(struct ubus_context *ctx, struct ub
                                              struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     struct json_object *data = json_object_new_object();
-    int rc = jmx_routing_policy_rule_set(in);
+    int rc = jmx_routing_policy_rule_set(payload);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
@@ -24797,9 +26196,11 @@ static int dw_handle_routing_policy_rule_delete(struct ubus_context *ctx, struct
                                                 struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *id = dw_json_get_string(payload, "id", "");
     struct json_object *data = json_object_new_object();
     int rc = jmx_routing_policy_rule_delete(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
@@ -24827,10 +26228,12 @@ static int dw_handle_routing_table_set(struct ubus_context *ctx, struct ubus_obj
                                        struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     struct json_object *data = json_object_new_object();
-    int rc = jmx_routing_table_set(in);
+    int rc = jmx_routing_table_set(payload);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
@@ -24842,9 +26245,11 @@ static int dw_handle_routing_table_delete(struct ubus_context *ctx, struct ubus_
                                           struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *id = dw_json_get_string(payload, "id", "");
     struct json_object *data = json_object_new_object();
     int rc = jmx_routing_table_delete(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
@@ -24882,6 +26287,30 @@ static int dw_handle_flow_rules_list(struct ubus_context *ctx, struct ubus_objec
     return 0;
 }
 
+enum {
+    DW_RATE_LIMIT_DATA,
+    DW_RATE_LIMIT_MAC,
+    DW_RATE_LIMIT_IP,
+    DW_RATE_LIMIT_UPLOAD_KBPS,
+    DW_RATE_LIMIT_DOWNLOAD_KBPS,
+    DW_RATE_LIMIT_REMARK,
+    __DW_RATE_LIMIT_MAX
+};
+
+static const struct blobmsg_policy dw_client_rate_limit_set_policy[] = {
+    [DW_RATE_LIMIT_DATA] = { .name = "data", .type = BLOBMSG_TYPE_TABLE },
+    [DW_RATE_LIMIT_MAC] = { .name = "mac", .type = BLOBMSG_TYPE_STRING },
+    [DW_RATE_LIMIT_IP] = { .name = "ip", .type = BLOBMSG_TYPE_STRING },
+    [DW_RATE_LIMIT_UPLOAD_KBPS] = { .name = "upload_kbps", .type = BLOBMSG_TYPE_INT32 },
+    [DW_RATE_LIMIT_DOWNLOAD_KBPS] = { .name = "download_kbps", .type = BLOBMSG_TYPE_INT32 },
+    [DW_RATE_LIMIT_REMARK] = { .name = "remark", .type = BLOBMSG_TYPE_STRING },
+};
+
+static const struct blobmsg_policy dw_client_rate_limit_delete_policy[] = {
+    [DW_RATE_LIMIT_DATA] = { .name = "data", .type = BLOBMSG_TYPE_TABLE },
+    [DW_RATE_LIMIT_MAC] = { .name = "mac", .type = BLOBMSG_TYPE_STRING },
+};
+
 static int dw_handle_client_rate_limit_set(struct ubus_context *ctx, struct ubus_object *obj,
                                            struct ubus_request_data *req, const char *method,
                                            struct blob_attr *msg)
@@ -24890,16 +26319,17 @@ static int dw_handle_client_rate_limit_set(struct ubus_context *ctx, struct ubus
     char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
     struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
     struct json_object *payload = dw_payload_or_self(in);
-    const char *mac = dw_json_get_string(payload, "mac", "");
-    const char *ip = dw_json_get_string(payload, "ip", "");
-    const char *remark = dw_json_get_string(payload, "remark", "app rate limit");
-    int up = dw_json_get_int(payload, "upload_kbps", 0);
-    int down = dw_json_get_int(payload, "download_kbps", 0);
-    int rc = nc_client_rate_limit_set(mac, ip, up, down, remark);
+    const char *reason = "invalid_request";
+    const char *field = "data";
+    int rc = nc_client_rate_limit_set_json(payload, &reason, &field);
     struct json_object *data = json_object_new_object();
 
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     json_object_object_add(data, "saved", json_object_new_boolean(rc == 0));
+    if (rc != 0) {
+        json_object_object_add(data, "reason", json_object_new_string(reason));
+        json_object_object_add(data, "field", json_object_new_string(field));
+    }
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
@@ -24916,12 +26346,17 @@ static int dw_handle_client_rate_limit_delete(struct ubus_context *ctx, struct u
     char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
     struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
     struct json_object *payload = dw_payload_or_self(in);
-    const char *mac = dw_json_get_string(payload, "mac", "");
-    int rc = nc_client_rate_limit_delete(mac);
+    const char *reason = "invalid_request";
+    const char *field = "data";
+    int rc = nc_client_rate_limit_delete_json(payload, &reason, &field);
     struct json_object *data = json_object_new_object();
 
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     json_object_object_add(data, "deleted", json_object_new_boolean(rc == 0));
+    if (rc != 0) {
+        json_object_object_add(data, "reason", json_object_new_string(reason));
+        json_object_object_add(data, "field", json_object_new_string(field));
+    }
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
@@ -24937,9 +26372,14 @@ static int dw_handle_flow_control_set(struct ubus_context *ctx, struct ubus_obje
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *data = json_object_new_object();
-    int rc = jmx_flow_control_set(payload);
+    int rc;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    rc = jmx_flow_control_set(payload);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
@@ -24955,8 +26395,11 @@ static int dw_handle_flow_control_apply(struct ubus_context *ctx, struct ubus_ob
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    struct json_object *resp = jmx_flow_control_apply(payload);
+    struct json_object *payload = NULL;
+    struct json_object *resp;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_flow_control_apply(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
     if (in) json_object_put(in);
@@ -24968,13 +26411,15 @@ static int dw_handle_flow_control_rule_set(struct ubus_context *ctx, struct ubus
                                            struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     struct json_object *data = json_object_new_object();
     int any_ok = 0;
     /* Handle rules array */
     struct json_object *rules_arr = NULL;
-    if (json_object_object_get_ex(in, "rules", &rules_arr) && rules_arr && json_object_is_type(rules_arr, json_type_array)) {
+    if (json_object_object_get_ex(payload, "rules", &rules_arr) && rules_arr && json_object_is_type(rules_arr, json_type_array)) {
         for (int i = 0; i < (int)json_object_array_length(rules_arr); i++) {
             struct json_object *r = json_object_array_get_idx(rules_arr, i);
             if (jmx_flow_rule_set(r) == 0) any_ok = 1;
@@ -24982,7 +26427,7 @@ static int dw_handle_flow_control_rule_set(struct ubus_context *ctx, struct ubus
     }
     /* Handle client_limits array */
     struct json_object *cl_arr = NULL;
-    if (json_object_object_get_ex(in, "client_limits", &cl_arr) && cl_arr && json_object_is_type(cl_arr, json_type_array)) {
+    if (json_object_object_get_ex(payload, "client_limits", &cl_arr) && cl_arr && json_object_is_type(cl_arr, json_type_array)) {
         for (int i = 0; i < (int)json_object_array_length(cl_arr); i++) {
             struct json_object *c = json_object_array_get_idx(cl_arr, i);
             if (jmx_flow_client_limit_save(c) == 0) any_ok = 1;
@@ -24990,8 +26435,8 @@ static int dw_handle_flow_control_rule_set(struct ubus_context *ctx, struct ubus
     }
     /* Fallback: try single object with "id" field as a rule */
     struct json_object *id_obj = NULL;
-    if (!any_ok && json_object_object_get_ex(in, "id", &id_obj) && id_obj) {
-        any_ok = (jmx_flow_rule_set(in) == 0);
+    if (!any_ok && json_object_object_get_ex(payload, "id", &id_obj) && id_obj) {
+        any_ok = (jmx_flow_rule_set(payload) == 0);
     }
     json_object_object_add(data, "ok", json_object_new_boolean(any_ok));
     struct json_object *resp = jmx_gen_api_response_data(any_ok ? API_CODE_SUCCESS : API_CODE_ERROR, data);
@@ -25004,9 +26449,11 @@ static int dw_handle_flow_control_smart_set(struct ubus_context *ctx, struct ubu
                                            struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    int rc = jmx_flow_control_smart_set(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    int rc = jmx_flow_control_smart_set(payload);
     struct json_object *data = json_object_new_object();
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
@@ -25019,9 +26466,11 @@ static int dw_handle_flow_control_priority_set(struct ubus_context *ctx, struct 
                                                struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    int rc = jmx_flow_control_priority_set(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    int rc = jmx_flow_control_priority_set(payload);
     struct json_object *data = json_object_new_object();
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
@@ -25034,9 +26483,11 @@ static int dw_handle_flow_control_group_carrier_set(struct ubus_context *ctx, st
                                                     struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    int rc = jmx_flow_control_group_carrier_set(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    int rc = jmx_flow_control_group_carrier_set(payload);
     struct json_object *data = json_object_new_object();
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
@@ -25049,9 +26500,11 @@ static int dw_handle_flow_control_rule_delete(struct ubus_context *ctx, struct u
                                               struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *id = dw_json_get_string(payload, "id", "");
     struct json_object *data = json_object_new_object();
     int rc = jmx_flow_rule_delete(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
@@ -25062,15 +26515,56 @@ static int dw_handle_flow_control_rule_delete(struct ubus_context *ctx, struct u
 }
 
 /* ── Bulk IP handlers ── */
+static int dw_handle_bulk_ip_transaction(struct ubus_context *ctx,
+                                         struct ubus_object *obj,
+                                         struct ubus_request_data *req,
+                                         const char *method,
+                                         struct blob_attr *msg)
+{
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *resp;
+    (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_bulk_ip_transaction(payload);
+    dw_send_json(ctx, req, resp);
+    if (resp) json_object_put(resp);
+    if (in) json_object_put(in);
+    if (msg_json) free(msg_json);
+    return 0;
+}
+
+static int dw_handle_bulk_ip_refresh(struct ubus_context *ctx,
+                                     struct ubus_object *obj,
+                                     struct ubus_request_data *req,
+                                     const char *method,
+                                     struct blob_attr *msg)
+{
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *resp;
+    (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_bulk_ip_refresh(payload);
+    dw_send_json(ctx, req, resp);
+    if (resp) json_object_put(resp);
+    if (in) json_object_put(in);
+    if (msg_json) free(msg_json);
+    return 0;
+}
+
 static int dw_handle_bulk_ip_reserve(struct ubus_context *ctx, struct ubus_object *obj,
                                      struct ubus_request_data *req, const char *method,
                                      struct blob_attr *msg)
 {
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *data;
+    int rc;
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *data = json_object_new_object();
-    int rc = jmx_bulk_ip_reserve(in);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    data = json_object_new_object();
+    rc = jmx_bulk_ip_reserve(payload);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
@@ -25081,12 +26575,16 @@ static int dw_handle_bulk_ip_delete(struct ubus_context *ctx, struct ubus_object
                                     struct ubus_request_data *req, const char *method,
                                     struct blob_attr *msg)
 {
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *data;
+    const char *id;
+    int rc;
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
-    struct json_object *data = json_object_new_object();
-    int rc = jmx_bulk_ip_delete(id);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    id = dw_json_get_string(payload, "id", "");
+    data = json_object_new_object();
+    rc = jmx_bulk_ip_delete(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
@@ -25098,13 +26596,18 @@ static int dw_handle_upnp_mapping_delete(struct ubus_context *ctx, struct ubus_o
                                          struct ubus_request_data *req, const char *method,
                                          struct blob_attr *msg)
 {
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *data;
+    const char *id, *err;
+    int rc;
+
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *data = json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
-    int rc = jmx_upnp_mapping_delete(id);
-    const char *err = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    data = json_object_new_object();
+    id = dw_json_get_string(payload, "id", "");
+    rc = jmx_upnp_mapping_delete(id);
+    err = NULL;
 
     switch (rc) {
     case 0:  break;
@@ -25190,9 +26693,10 @@ static int dw_handle_dns_service_set(struct ubus_context *ctx, struct ubus_objec
                                       struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *payload = dw_payload_or_self(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     int apply = dw_json_get_bool(in, "apply", 1);
     struct json_object *resp = jmx_dns_service_save_apply_result(payload, apply);
     dw_send_json(ctx, req, resp);
@@ -25221,9 +26725,10 @@ static int dw_handle_dns_service_save_apply_result(struct ubus_context *ctx, str
                                                    struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *payload = dw_payload_or_self(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     int apply = dw_json_get_bool(in, "apply", dw_json_get_bool(payload, "apply", 1));
     struct json_object *resp = jmx_dns_service_save_apply_result(payload, apply);
 
@@ -25312,10 +26817,12 @@ static int dw_handle_wan_dns_policy_set(struct ubus_context *ctx, struct ubus_ob
                                         struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    const char *wan_id = dw_json_get_string(in, "wan_id", "");
-    struct json_object *resp = jmx_wan_dns_policy_save_apply_result(wan_id, in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    const char *wan_id = dw_json_get_string(payload, "wan_id", "");
+    struct json_object *resp = jmx_wan_dns_policy_save_apply_result(wan_id, payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
     json_object_put(in);
@@ -25328,9 +26835,11 @@ static int dw_handle_wan_dns_policy_delete(struct ubus_context *ctx, struct ubus
                                            struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    int policy_id = dw_json_get_int(in, "id", 0);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    int policy_id = dw_json_get_int(payload, "id", 0);
     struct json_object *resp = jmx_wan_dns_policy_delete_apply_result(policy_id);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
@@ -25356,10 +26865,13 @@ static int dw_handle_cellular_service_set(struct ubus_context *ctx, struct ubus_
                                           struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *payload = dw_payload_or_self(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
     int rc = jmx_cellular_service_set(payload);
     int arc = (rc == 0) ? jmx_cellular_service_apply(0) : -1;
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0 && arc == 0));
@@ -25368,8 +26880,8 @@ static int dw_handle_cellular_service_set(struct ubus_context *ctx, struct ubus_
     struct json_object *resp = jmx_gen_api_response_data((rc == 0 && arc == 0) ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -25378,11 +26890,15 @@ static int dw_handle_cellular_service_apply(struct ubus_context *ctx, struct ubu
                                             struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *v = NULL, *data = json_object_new_object();
     int dry_run = 0;
-    if (in && json_object_object_get_ex(in, "dry_run", &v) && v) dry_run = json_object_get_boolean(v);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    if (json_object_object_get_ex(payload, "dry_run", &v) && v) dry_run = json_object_get_boolean(v);
     int rc = jmx_cellular_service_apply(dry_run);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     json_object_object_add(data, "dry_run", json_object_new_boolean(dry_run));
@@ -25390,8 +26906,8 @@ static int dw_handle_cellular_service_apply(struct ubus_context *ctx, struct ubu
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -25400,10 +26916,13 @@ static int dw_handle_cellular_slot_set(struct ubus_context *ctx, struct ubus_obj
                                        struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *payload = dw_payload_or_self(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
     int rc = jmx_cellular_slot_set(payload);
     int arc = (rc == 0) ? jmx_cellular_service_apply(0) : -1;
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0 && arc == 0));
@@ -25412,8 +26931,8 @@ static int dw_handle_cellular_slot_set(struct ubus_context *ctx, struct ubus_obj
     struct json_object *resp = jmx_gen_api_response_data((rc == 0 && arc == 0) ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -25422,10 +26941,14 @@ static int dw_handle_cellular_slot_delete(struct ubus_context *ctx, struct ubus_
                                           struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    const char *id = dw_json_get_string(payload, "id", "");
     int rc = jmx_cellular_slot_delete(id);
     int arc = (rc == 0) ? jmx_cellular_service_apply(0) : -1;
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0 && arc == 0));
@@ -25434,8 +26957,8 @@ static int dw_handle_cellular_slot_delete(struct ubus_context *ctx, struct ubus_
     struct json_object *resp = jmx_gen_api_response_data((rc == 0 && arc == 0) ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -25444,18 +26967,21 @@ static int dw_handle_cellular_apn_profile_set(struct ubus_context *ctx, struct u
                                               struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *payload = dw_payload_or_self(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
     int rc = jmx_cellular_apn_profile_set(payload);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     json_object_object_add(data, "saved", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -25464,17 +26990,21 @@ static int dw_handle_cellular_apn_profile_delete(struct ubus_context *ctx, struc
                                                  struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    const char *id = dw_json_get_string(payload, "id", "");
     int rc = jmx_cellular_apn_profile_delete(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -25483,17 +27013,21 @@ static int dw_handle_cellular_sms_delete(struct ubus_context *ctx, struct ubus_o
                                          struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
     struct json_object *data = json_object_new_object();
-    const char *id = dw_json_get_string(in, "id", "");
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    const char *id = dw_json_get_string(payload, "id", "");
     int rc = jmx_cellular_sms_delete(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
-    if (in) json_object_put(in);
-    if (msg_json) free(msg_json);
+    json_object_put(in);
+    free(msg_json);
     return 0;
 }
 
@@ -25522,9 +27056,12 @@ static int dw_handle_wifi_config_save(struct ubus_context *ctx, struct ubus_obje
                                       struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *payload = dw_payload_or_self(in), *data = json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *data = json_object_new_object();
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
     int rc = jmx_wifi_config_save(payload);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     json_object_object_add(data, "saved", json_object_new_boolean(rc == 0));
@@ -25548,9 +27085,10 @@ static int dw_handle_wifi_config_apply(struct ubus_context *ctx, struct ubus_obj
                                        struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *payload = dw_payload_or_self(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     struct json_object *resp = jmx_wifi_config_apply(payload);
     dw_send_json(ctx, req, resp); json_object_put(resp); if (in) json_object_put(in); if (msg_json) free(msg_json); return 0;
 }
@@ -25587,9 +27125,14 @@ static int dw_handle_multicast_service_set(struct ubus_context *ctx, struct ubus
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *data = json_object_new_object();
-    int rc = jmx_multicast_service_set(payload);
+    int rc;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    rc = jmx_multicast_service_set(payload);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
@@ -25606,10 +27149,16 @@ static int dw_handle_multicast_service_apply(struct ubus_context *ctx, struct ub
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    int dry_run = dw_json_get_bool(payload, "dry_run", 0);
+    struct json_object *payload = NULL;
+    int dry_run;
     struct json_object *data = json_object_new_object();
-    int rc = jmx_multicast_service_apply(dry_run);
+    int rc;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    dry_run = dw_json_get_bool(payload, "dry_run", 0);
+    rc = jmx_multicast_service_apply(dry_run);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     dw_send_json(ctx, req, resp);
@@ -25635,9 +27184,12 @@ static int dw_handle_advanced_routing_set(struct ubus_context *ctx, struct ubus_
                                           struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *payload = dw_payload_or_self(in), *data = json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *data = json_object_new_object();
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
     int rc = jmx_advanced_routing_set(payload);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     json_object_object_add(data, "saved", json_object_new_boolean(rc == 0));
@@ -25650,9 +27202,10 @@ static int dw_handle_advanced_routing_apply(struct ubus_context *ctx, struct ubu
                                             struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *payload = dw_payload_or_self(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     struct json_object *resp = jmx_advanced_routing_apply(payload);
     dw_send_json(ctx, req, resp); json_object_put(resp); if (in) json_object_put(in); if (msg_json) free(msg_json); return 0;
 }
@@ -25682,9 +27235,12 @@ static int dw_handle_custom_config_save(struct ubus_context *ctx, struct ubus_ob
                                         struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *payload = dw_payload_or_self(in), *data = json_object_new_object();
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL, *data = json_object_new_object();
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
     int rc = jmx_custom_config_save(payload);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == 0));
     json_object_object_add(data, "saved", json_object_new_boolean(rc == 0));
@@ -25697,9 +27253,10 @@ static int dw_handle_custom_config_apply(struct ubus_context *ctx, struct ubus_o
                                          struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object();
-    struct json_object *payload = dw_payload_or_self(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     struct json_object *resp = jmx_custom_config_apply(payload);
     dw_send_json(ctx, req, resp); json_object_put(resp); if (in) json_object_put(in); if (msg_json) free(msg_json); return 0;
 }
@@ -25723,7 +27280,7 @@ static int dw_handle_network_control_get(struct ubus_context *ctx, struct ubus_o
 static int dw_handle_network_control_save(struct ubus_context *ctx, struct ubus_object *obj,
                                           struct ubus_request_data *req, const char *method,
                                           struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in), *data = json_object_new_object(); int rc = jmx_network_control_save(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); json_object_object_add(data,"saved",json_object_new_boolean(rc==0)); struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL, *data = json_object_new_object(); if (dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0) { json_object_put(data); return 0; } int rc = jmx_network_control_save(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); json_object_object_add(data,"saved",json_object_new_boolean(rc==0)); struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_rulesd_config_get(struct ubus_context *ctx, struct ubus_object *obj,
                                        struct ubus_request_data *req, const char *method,
@@ -25733,7 +27290,7 @@ static int dw_handle_rulesd_config_get(struct ubus_context *ctx, struct ubus_obj
 static int dw_handle_rulesd_config_migrate(struct ubus_context *ctx, struct ubus_object *obj,
                                            struct ubus_request_data *req, const char *method,
                                            struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_rulesd_config_migrate(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if (dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0) return 0; struct json_object *resp = jmx_rulesd_config_migrate(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_aegis_app_blocks(struct ubus_context *ctx, struct ubus_object *obj,
                                       struct ubus_request_data *req, const char *method,
@@ -25753,12 +27310,12 @@ static int dw_handle_aegis_app_block_upsert(struct ubus_context *ctx, struct ubu
 static int dw_handle_aegis_app_block_delete(struct ubus_context *ctx, struct ubus_object *obj,
                                             struct ubus_request_data *req, const char *method,
                                             struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_aegis_app_block_delete(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if (dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0) return 0; struct json_object *resp = jmx_aegis_app_block_delete(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_network_control_apply(struct ubus_context *ctx, struct ubus_object *obj,
                                            struct ubus_request_data *req, const char *method,
                                            struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_network_control_apply(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if (dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0) return 0; struct json_object *resp = jmx_network_control_apply(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_network_control_status(struct ubus_context *ctx, struct ubus_object *obj,
                                             struct ubus_request_data *req, const char *method,
@@ -25790,7 +27347,7 @@ static int dw_handle_log_center_export(struct ubus_context *ctx, struct ubus_obj
 static int dw_handle_log_center_clear(struct ubus_context *ctx, struct ubus_object *obj,
                                       struct ubus_request_data *req, const char *method,
                                       struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_log_center_clear(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_log_center_clear(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_log_center_mark_read(struct ubus_context *ctx, struct ubus_object *obj,
                                           struct ubus_request_data *req, const char *method,
@@ -25800,18 +27357,18 @@ static int dw_handle_log_center_mark_read(struct ubus_context *ctx, struct ubus_
 static int dw_handle_log_center_syslog_set(struct ubus_context *ctx, struct ubus_object *obj,
                                            struct ubus_request_data *req, const char *method,
                                            struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in), *data = json_object_new_object(); int rc = jmx_log_center_syslog_set(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL, *data = json_object_new_object(); if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0){json_object_put(data);return 0;} int rc = jmx_log_center_syslog_set(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_log_center_settings_set(struct ubus_context *ctx, struct ubus_object *obj,
                                              struct ubus_request_data *req, const char *method,
                                              struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in), *data = json_object_new_object(); int rc = jmx_log_center_settings_set(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL, *data = json_object_new_object(); if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0){json_object_put(data);return 0;} int rc = jmx_log_center_settings_set(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 
 static int dw_handle_log_center_event_add(struct ubus_context *ctx, struct ubus_object *obj,
                                           struct ubus_request_data *req, const char *method,
                                           struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_log_center_event_add(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_log_center_event_add(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_log_center_warning_rules_get(struct ubus_context *ctx, struct ubus_object *obj,
                                                   struct ubus_request_data *req, const char *method,
@@ -25821,7 +27378,7 @@ static int dw_handle_log_center_warning_rules_get(struct ubus_context *ctx, stru
 static int dw_handle_log_center_warning_rules_set(struct ubus_context *ctx, struct ubus_object *obj,
                                                   struct ubus_request_data *req, const char *method,
                                                   struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in), *data = json_object_new_object(); int rc = jmx_log_center_warning_rules_set(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL, *data = json_object_new_object(); if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0){json_object_put(data);return 0;} int rc = jmx_log_center_warning_rules_set(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 
 static int dw_handle_log_center_alarm_get(struct ubus_context *ctx, struct ubus_object *obj,
@@ -25832,7 +27389,7 @@ static int dw_handle_log_center_alarm_get(struct ubus_context *ctx, struct ubus_
 static int dw_handle_log_center_alarm_update(struct ubus_context *ctx, struct ubus_object *obj,
                                              struct ubus_request_data *req, const char *method,
                                              struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_log_center_alarm_update(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_log_center_alarm_update(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 
 static int dw_handle_log_center_delivery_get(struct ubus_context *ctx, struct ubus_object *obj,
@@ -25843,7 +27400,7 @@ static int dw_handle_log_center_delivery_get(struct ubus_context *ctx, struct ub
 static int dw_handle_log_center_delivery_update(struct ubus_context *ctx, struct ubus_object *obj,
                                                 struct ubus_request_data *req, const char *method,
                                                 struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_log_center_delivery_update(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_log_center_delivery_update(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_log_center_channels_get(struct ubus_context *ctx, struct ubus_object *obj,
                                              struct ubus_request_data *req, const char *method,
@@ -25853,13 +27410,13 @@ static int dw_handle_log_center_channels_get(struct ubus_context *ctx, struct ub
 static int dw_handle_log_center_channels_set(struct ubus_context *ctx, struct ubus_object *obj,
                                              struct ubus_request_data *req, const char *method,
                                              struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in), *data = json_object_new_object(); int rc = jmx_log_center_channels_set(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL, *data = json_object_new_object(); if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0){json_object_put(data);return 0;} int rc = jmx_log_center_channels_set(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 
 static int dw_handle_log_center_delivery_claim(struct ubus_context *ctx, struct ubus_object *obj,
                                                struct ubus_request_data *req, const char *method,
                                                struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_log_center_delivery_claim(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_log_center_delivery_claim(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_log_center_delivery_stats(struct ubus_context *ctx, struct ubus_object *obj,
                                                struct ubus_request_data *req, const char *method,
@@ -25871,12 +27428,12 @@ static int dw_handle_log_center_delivery_stats(struct ubus_context *ctx, struct 
 static int dw_handle_log_center_delivery_replay(struct ubus_context *ctx, struct ubus_object *obj,
                                                 struct ubus_request_data *req, const char *method,
                                                 struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_log_center_delivery_replay(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_log_center_delivery_replay(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_log_center_prune(struct ubus_context *ctx, struct ubus_object *obj,
                                       struct ubus_request_data *req, const char *method,
                                       struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_log_center_prune(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_log_center_prune(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_log_center_event_search(struct ubus_context *ctx, struct ubus_object *obj,
                                              struct ubus_request_data *req, const char *method,
@@ -25898,7 +27455,7 @@ static int dw_handle_system_settings_draft_apply(struct ubus_context *ctx, struc
 static int dw_handle_network_control_bulk_delete(struct ubus_context *ctx, struct ubus_object *obj,
                                                  struct ubus_request_data *req, const char *method,
                                                  struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); int rc = jmx_network_control_rules_bulk_delete(payload); struct json_object *d = json_object_new_object(); json_object_object_add(d, "deleted", json_object_new_int(rc)); struct json_object *resp = jmx_gen_api_response_data(rc>=0?API_CODE_SUCCESS:API_CODE_ERROR, d); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; int rc = jmx_network_control_rules_bulk_delete(payload); struct json_object *d = json_object_new_object(); json_object_object_add(d, "deleted", json_object_new_int(rc)); struct json_object *resp = jmx_gen_api_response_data(rc>=0?API_CODE_SUCCESS:API_CODE_ERROR, d); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 /* ── System settings handlers ── */
 static int dw_handle_system_settings_get(struct ubus_context *ctx, struct ubus_object *obj,
@@ -25909,22 +27466,22 @@ static int dw_handle_system_settings_get(struct ubus_context *ctx, struct ubus_o
 static int dw_handle_system_settings_set(struct ubus_context *ctx, struct ubus_object *obj,
                                          struct ubus_request_data *req, const char *method,
                                          struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_system_settings_save_apply_result(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_system_settings_save_apply_result(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_system_settings_apply(struct ubus_context *ctx, struct ubus_object *obj,
                                           struct ubus_request_data *req, const char *method,
                                           struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_system_settings_apply_result(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_system_settings_apply_result(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_system_service_set(struct ubus_context *ctx, struct ubus_object *obj,
                                         struct ubus_request_data *req, const char *method,
                                         struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_system_service_set(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_system_service_set(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_system_cron_set(struct ubus_context *ctx, struct ubus_object *obj,
                                      struct ubus_request_data *req, const char *method,
                                      struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in), *data = json_object_new_object(); int rc = jmx_system_cron_set(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL, *data = json_object_new_object(); if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0){json_object_put(data);return 0;} int rc = jmx_system_cron_set(payload); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); struct json_object *resp = jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 
 static int dw_handle_system_kernel_restore_defaults(struct ubus_context *ctx, struct ubus_object *obj,
                                                     struct ubus_request_data *req, const char *method,
@@ -25933,8 +27490,12 @@ static int dw_handle_system_kernel_restore_defaults(struct ubus_context *ctx, st
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    struct json_object *resp = jmx_system_kernel_restore_defaults(payload);
+    struct json_object *payload = NULL;
+    struct json_object *resp;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_system_kernel_restore_defaults(payload);
 
     if (!resp)
         resp = jmx_gen_api_response_data(API_CODE_ERROR, NULL);
@@ -25952,9 +27513,14 @@ static int dw_handle_system_cpu_interrupt_set(struct ubus_context *ctx, struct u
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *data = json_object_new_object();
-    int rc = jmx_system_cpu_interrupt_set(payload, data);
+    int rc;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    rc = jmx_system_cpu_interrupt_set(payload, data);
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
 
     dw_send_json(ctx, req, resp);
@@ -25984,9 +27550,14 @@ static int dw_handle_system_ssh_idle_timeout_set(struct ubus_context *ctx, struc
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *data = json_object_new_object();
-    int rc = jmx_system_ssh_idle_timeout_set(payload, data);
+    int rc;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    rc = jmx_system_ssh_idle_timeout_set(payload, data);
     struct json_object *resp = jmx_gen_api_response_data(rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
 
     dw_send_json(ctx, req, resp);
@@ -26003,8 +27574,12 @@ static int dw_handle_system_startup_service_action(struct ubus_context *ctx, str
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    struct json_object *resp = jmx_system_startup_service_action(payload);
+    struct json_object *payload = NULL;
+    struct json_object *resp;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_system_startup_service_action(payload);
 
     if (!resp) {
         resp = json_object_new_object();
@@ -26025,11 +27600,19 @@ static int dw_handle_system_crontab_apply(struct ubus_context *ctx, struct ubus_
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    const char *text = dw_json_get_string(payload, "text", "");
+    struct json_object *payload = NULL;
+    const char *text;
     struct json_object *resp = json_object_new_object();
     struct json_object *data = json_object_new_object();
-    int ok = jmx_crontab_apply_text(text, data) == 0;
+    int ok;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(resp);
+        json_object_put(data);
+        return 0;
+    }
+    text = dw_json_get_string(payload, "text", "");
+    ok = jmx_crontab_apply_text(text, data) == 0;
 
     json_object_object_add(resp, "ok", json_object_new_boolean(ok));
     json_object_object_add(resp, "data", data);
@@ -26048,12 +27631,21 @@ static int dw_handle_system_rc_local_apply(struct ubus_context *ctx, struct ubus
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    const char *content = dw_json_get_string(payload, "content", "");
-    int confirm = dw_json_get_bool(payload, "confirm_no_exit0", 0);
+    struct json_object *payload = NULL;
+    const char *content;
+    int confirm;
     struct json_object *resp = json_object_new_object();
     struct json_object *data = json_object_new_object();
-    int ok = jmx_system_rc_local_apply(content, confirm, data) == 0;
+    int ok;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(resp);
+        json_object_put(data);
+        return 0;
+    }
+    content = dw_json_get_string(payload, "content", "");
+    confirm = dw_json_get_bool(payload, "confirm_no_exit0", 0);
+    ok = jmx_system_rc_local_apply(content, confirm, data) == 0;
 
     json_object_object_add(resp, "ok", json_object_new_boolean(ok));
     json_object_object_add(resp, "data", data);
@@ -26071,11 +27663,19 @@ static int dw_handle_system_time_sync_browser(struct ubus_context *ctx, struct u
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    int64_t ts = dw_json_get_int64(payload, "client_ts", 0);
+    struct json_object *payload = NULL;
+    int64_t ts;
     struct json_object *resp = json_object_new_object();
     struct json_object *data = json_object_new_object();
-    int ok = jmx_system_time_sync_browser(ts, data) == 0;
+    int ok;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(resp);
+        json_object_put(data);
+        return 0;
+    }
+    ts = dw_json_get_int64(payload, "client_ts", 0);
+    ok = jmx_system_time_sync_browser(ts, data) == 0;
 
     json_object_object_add(resp, "ok", json_object_new_boolean(ok));
     json_object_object_add(resp, "data", data);
@@ -26117,10 +27717,17 @@ static int dw_handle_system_admin_avatar_set(struct ubus_context *ctx, struct ub
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *out = json_object_new_object();
     struct json_object *resp = json_object_new_object();
-    int ok = jmx_admin_avatar_set(payload, out) == 0;
+    int ok;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(resp);
+        json_object_put(out);
+        return 0;
+    }
+    ok = jmx_admin_avatar_set(payload, out) == 0;
 
     json_object_object_add(resp, "ok", json_object_new_boolean(ok));
     if (ok) {
@@ -26145,10 +27752,17 @@ static int dw_handle_system_admin_rename(struct ubus_context *ctx, struct ubus_o
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *out = json_object_new_object();
     struct json_object *resp = json_object_new_object();
-    int ok = jmx_admin_rename(payload, out) == 0;
+    int ok;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(resp);
+        json_object_put(out);
+        return 0;
+    }
+    ok = jmx_admin_rename(payload, out) == 0;
 
     json_object_object_add(resp, "ok", json_object_new_boolean(ok));
     if (ok) {
@@ -26176,10 +27790,17 @@ static int dw_handle_system_admin_password_set(struct ubus_context *ctx, struct 
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *out = json_object_new_object();
     struct json_object *resp = json_object_new_object();
-    int ok = jmx_admin_password_set(payload, out) == 0;
+    int ok;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(resp);
+        json_object_put(out);
+        return 0;
+    }
+    ok = jmx_admin_password_set(payload, out) == 0;
 
     json_object_object_add(resp, "ok", json_object_new_boolean(ok));
     if (!ok) {
@@ -26201,8 +27822,12 @@ static int dw_handle_system_flash_factory_reset(struct ubus_context *ctx, struct
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    struct json_object *resp = jmx_flash_factory_reset(payload);
+    struct json_object *payload = NULL;
+    struct json_object *resp;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_flash_factory_reset(payload);
 
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
@@ -26235,8 +27860,12 @@ static int dw_handle_system_flash_preserve_config_set(struct ubus_context *ctx, 
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    struct json_object *resp = jmx_flash_preserve_config_set(payload);
+    struct json_object *payload = NULL;
+    struct json_object *resp;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_flash_preserve_config_set(payload);
 
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
@@ -26267,11 +27896,11 @@ static int dw_handle_signature_db_fingerprint_rules(struct ubus_context *ctx, st
 static int dw_handle_signature_resolve_app(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
 { (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_signature_db_resolve_app(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 static int dw_handle_signature_update_validate(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_signature_update_validate(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_signature_update_validate(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 static int dw_handle_signature_update_apply(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_signature_update_apply(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_signature_update_apply(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 static int dw_handle_signature_update_status(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_signature_update_status(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; (void)msg; struct json_object *resp = jmx_signature_update_status(NULL); dw_send_json(ctx, req, resp); json_object_put(resp); return 0; }
 static int dw_handle_core_status(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
 { (void)obj; (void)method; (void)msg; struct json_object *resp = jmx_core_status_json(); dw_send_json(ctx, req, resp); json_object_put(resp); return 0; }
 static int dw_handle_unified_status(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
@@ -26315,7 +27944,7 @@ static int dw_handle_signature_db_carrier_prefixes(struct ubus_context *ctx, str
 static int dw_handle_system_disabled_functions_get(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
 { (void)obj; (void)method; (void)msg; struct json_object *resp = jmx_system_disabled_functions_get(); dw_send_json(ctx, req, resp); json_object_put(resp); return 0; }
 static int dw_handle_system_disabled_functions_set(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
-{ (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_system_disabled_functions_set(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
+{ (void)obj; (void)method; char *msg_json = NULL; struct json_object *in = NULL, *payload = NULL; if(dw_parse_write_payload(ctx,req,msg,&msg_json,&in,&payload)!=0)return 0; struct json_object *resp = jmx_system_disabled_functions_set(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 static int dw_handle_system_services_status(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
 { (void)obj; (void)method; char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL; struct json_object *in = msg_json ? json_tokener_parse(msg_json) : json_object_new_object(); struct json_object *payload = dw_payload_or_self(in); struct json_object *resp = jmx_system_services_status(payload); dw_send_json(ctx, req, resp); json_object_put(resp); if(in)json_object_put(in); if(msg_json)free(msg_json); return 0; }
 static int dw_handle_system_mounts_status(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req, const char *method, struct blob_attr *msg)
@@ -26331,7 +27960,8 @@ static int dw_handle_system_mount_save_point(struct ubus_context *ctx, struct ub
     struct json_object *resp;
 
     (void)obj; (void)method;
-    payload = dw_parse_payload(msg, &msg_json, &in);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     resp = jmx_api_system_mount_save_point(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
@@ -26350,7 +27980,8 @@ static int dw_handle_system_mount_delete_point(struct ubus_context *ctx, struct 
     struct json_object *resp;
 
     (void)obj; (void)method;
-    payload = dw_parse_payload(msg, &msg_json, &in);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     resp = jmx_api_system_mount_delete_point(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
@@ -26369,11 +28000,9 @@ static int dw_handle_system_mount_unmount(struct ubus_context *ctx, struct ubus_
     struct json_object *resp;
 
     (void)obj; (void)method;
-    payload = dw_parse_payload(msg, &msg_json, &in);
-    if (!payload || !json_object_is_type(payload, json_type_object))
-        payload = in;
-    if (payload)
-        json_object_object_add(payload, "action", json_object_new_string("umount"));
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    json_object_object_add(payload, "action", json_object_new_string("umount"));
     resp = jmx_api_system_mount_execute(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
@@ -26405,7 +28034,8 @@ static int dw_handle_system_mount_generate_config(struct ubus_context *ctx, stru
     char *msg_json = NULL; struct json_object *in = NULL;
     struct json_object *payload, *resp;
     (void)obj; (void)method;
-    payload = dw_parse_payload(msg, &msg_json, &in);
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     resp = jmx_api_system_mount_generate_config(payload);
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
@@ -26450,6 +28080,8 @@ static int dw_handle_client_connections(struct ubus_context *ctx, struct ubus_ob
 {
     struct json_object *root = json_object_new_object();
     struct json_object *arr = json_object_new_array();
+    struct json_object *arr4 = json_object_new_array();
+    struct json_object *arr6 = json_object_new_array();
     char *msg_json = NULL;
     struct json_object *in = NULL;
     const char *mac_filter = "";
@@ -26460,7 +28092,23 @@ static int dw_handle_client_connections(struct ubus_context *ctx, struct ubus_ob
     const char *reason = "";
     FILE *fp;
     char line[2048];
+    /* Address set, not a single needle. conntrack writes IPv6 fully expanded
+     * and zero padded (src=2409:8a10:001e:8aa4:...) while the client record
+     * carries the compressed form (2409:8a10:1e:8aa4::6c9), so a plain strstr
+     * can never match. Every candidate is normalised through inet_pton and
+     * compared as raw bytes. */
+    struct dw_conn_addr_slot addrs[DW_CONN_ADDR_MAX];
+    int addr_count = 0;
+    int total_ipv4 = 0;
+    int total_ipv6 = 0;
+    int returned_ipv4 = 0;
+    int returned_ipv6 = 0;
+    int matched_total = 0;
+    int truncated = 0;
+    int scanned = 0;
     (void)obj; (void)method;
+
+    memset(addrs, 0, sizeof(addrs));
 
     if (msg) msg_json = blobmsg_format_json(msg, true);
     if (msg_json) in = json_tokener_parse(msg_json);
@@ -26468,6 +28116,10 @@ static int dw_handle_client_connections(struct ubus_context *ctx, struct ubus_ob
         mac_filter = dw_json_get_string(in, "mac", "");
         limit = dw_json_get_int(in, "limit", 200);
     }
+    if (limit <= 0)
+        limit = 200;
+    if (limit > DW_CONN_LIMIT_MAX)
+        limit = DW_CONN_LIMIT_MAX;
 
     /* Resolve MAC to IP if mac_filter given */
     if (mac_filter[0]) {
@@ -26479,13 +28131,28 @@ static int dw_handle_client_connections(struct ubus_context *ctx, struct ubus_ob
         list_for_each_entry(c, &client_list, client) {
             char cm[MAX_MAC_LEN] = {0};
             dw_lower_mac(c->mac, cm, sizeof(cm));
-            if (!strcmp(cm, mac_l) && dw_flow_ip_usable(c->ip)) { snprintf(ip_filter, sizeof(ip_filter), "%s", c->ip); break; }
+            if (strcmp(cm, mac_l))
+                continue;
+            if (dw_flow_ip_usable(c->ip)) {
+                snprintf(ip_filter, sizeof(ip_filter), "%s", c->ip);
+                dw_conn_addr_add(addrs, &addr_count, c->ip);
+            }
+            /* Same IPv6 evidence the clients contract already exposes. */
+            dw_conn_addr_add(addrs, &addr_count, c->ipv6);
+            dw_conn_addr_add(addrs, &addr_count, c->ipv6_global);
+            dw_conn_addr_add(addrs, &addr_count, c->ipv6_lan);
+            dw_conn_addr_add(addrs, &addr_count, c->ipv6_link_local);
+            dw_conn_addr_add_pipe(addrs, &addr_count, c->ipv6_addrs);
+            break;
         }
-        if (!ip_filter[0])
+        if (!ip_filter[0]) {
             dw_arp_lookup_ip_by_mac(mac_l, ip_filter, sizeof(ip_filter));
+            if (ip_filter[0])
+                dw_conn_addr_add(addrs, &addr_count, ip_filter);
+        }
     }
 
-    if (mac_filter[0] && !ip_filter[0]) {
+    if (mac_filter[0] && addr_count == 0) {
         degraded = 1;
         reason = "client_ip_unavailable";
         fp = NULL;
@@ -26498,23 +28165,28 @@ static int dw_handle_client_connections(struct ubus_context *ctx, struct ubus_ob
         }
     }
     if (fp) {
-        while (fgets(line, sizeof(line), fp) && count < limit) {
+        /* Scan every line, not just until the limit is reached. The old loop
+         * stopped at `count < limit`, so on a client with hundreds of IPv4
+         * connections the IPv6 ones (which appear later in the file) were
+         * silently dropped and `total` reported the truncated count as if it
+         * were the real one. Now matches are bucketed per family and the limit
+         * is applied afterwards with a per-family quota. */
+        while (fgets(line, sizeof(line), fp)) {
             char src[64] = {0}, dst[64] = {0}, proto[16] = {0};
             int sport = 0, dport = 0;
             unsigned long long bytes_orig = 0, bytes_reply = 0;
             int got_first_src = 0;
+            int fam_len = 0;
             char *q;
 
             /* Skip empty lines */
             if (!line[0] || line[0] == '\n') continue;
 
-            /* Filter by IP */
-            if (ip_filter[0]) {
-                char needle_src[96], needle_dst[96];
-                snprintf(needle_src, sizeof(needle_src), "src=%s", ip_filter);
-                snprintf(needle_dst, sizeof(needle_dst), "dst=%s", ip_filter);
-                if (!strstr(line, needle_src) && !strstr(line, needle_dst)) continue;
-            }
+            scanned++;
+            /* Filter by the client's whole address set (IPv4 + every IPv6). */
+            if (addr_count > 0 &&
+                !dw_conn_line_matches(line, addrs, addr_count, &fam_len))
+                continue;
 
             /* Extract protocol: conntrack format "ipv4  2 tcp  6 300 ..." -> field index 2 */
             {
@@ -26557,25 +28229,110 @@ static int dw_handle_client_connections(struct ubus_context *ctx, struct ubus_ob
                 app_proto = app_buf;
             }
 
+            /* Family from the matched address when we filtered, otherwise from
+             * the conntrack row itself (the leading "ipv4"/"ipv6" token, with
+             * the parsed address as the fallback). */
+            const char *family;
+            int is_v6;
+
+            if (fam_len == 16)
+                is_v6 = 1;
+            else if (fam_len == 4)
+                is_v6 = 0;
+            else
+                is_v6 = (!strncmp(line, "ipv6", 4) ||
+                         (src[0] && strchr(src, ':') != NULL));
+            family = is_v6 ? "ipv6" : "ipv4";
+
+            matched_total++;
+            if (is_v6)
+                total_ipv6++;
+            else
+                total_ipv4++;
+
+            /* Buffer per family and allocate the budget once the real per-family
+             * totals are known. A single streaming pass cannot do a fair split,
+             * because when an early IPv4 row arrives we do not yet know how many
+             * IPv6 rows will follow. Each bucket is capped at `limit`, so memory
+             * stays bounded at 2x the caller's own budget. */
+            if (json_object_array_length(is_v6 ? arr6 : arr4) >= (size_t)limit) {
+                truncated = 1;
+                continue;
+            }
+
             struct json_object *conn = json_object_new_object();
             json_object_object_add(conn, "proto", json_object_new_string(proto));
             json_object_object_add(conn, "app_proto", json_object_new_string(app_proto));
+            json_object_object_add(conn, "family", json_object_new_string(family));
             json_object_object_add(conn, "src", json_object_new_string(src));
             json_object_object_add(conn, "dst", json_object_new_string(dst));
             json_object_object_add(conn, "sport", json_object_new_int(sport));
             json_object_object_add(conn, "dport", json_object_new_int(dport));
             json_object_object_add(conn, "bytes_orig", json_object_new_int64((int64_t)bytes_orig));
             json_object_object_add(conn, "bytes_reply", json_object_new_int64((int64_t)bytes_reply));
-            json_object_array_add(arr, conn);
-            count++;
+            json_object_array_add(is_v6 ? arr6 : arr4, conn);
         }
         fclose(fp);
     }
 
+    /* Fair split: give each family up to half the budget, then let the family
+     * with more connections use whatever the other one left unused. */
+    {
+        int have4 = (int)json_object_array_length(arr4);
+        int have6 = (int)json_object_array_length(arr6);
+        int take4 = have4;
+        int take6 = have6;
+        int i;
+
+        if (have4 + have6 > limit) {
+            int half = limit / 2;
+
+            take4 = have4 < half ? have4 : half;
+            take6 = have6 < half ? have6 : half;
+            /* Hand the leftover to whichever family still has rows waiting. */
+            if (take4 < have4 && take4 + take6 < limit) {
+                int room = limit - take4 - take6;
+                take4 += (have4 - take4) < room ? (have4 - take4) : room;
+            }
+            if (take6 < have6 && take4 + take6 < limit) {
+                int room = limit - take4 - take6;
+                take6 += (have6 - take6) < room ? (have6 - take6) : room;
+            }
+            truncated = 1;
+        }
+        for (i = 0; i < take4; i++)
+            json_object_array_add(arr, json_object_get(json_object_array_get_idx(arr4, i)));
+        for (i = 0; i < take6; i++)
+            json_object_array_add(arr, json_object_get(json_object_array_get_idx(arr6, i)));
+        count = take4 + take6;
+        returned_ipv4 = take4;
+        returned_ipv6 = take6;
+    }
+    json_object_put(arr4);
+    json_object_put(arr6);
+
     json_object_object_add(root, "ts", json_object_new_int64((int64_t)dw_now()));
     json_object_object_add(root, "mac", json_object_new_string(mac_filter));
     json_object_object_add(root, "ip", json_object_new_string(ip_filter));
-    json_object_object_add(root, "total", json_object_new_int(count));
+    /* total is the real number of matching connections, not the number
+     * returned. returned/truncated tell the caller what it actually got. */
+    json_object_object_add(root, "total", json_object_new_int(matched_total));
+    json_object_object_add(root, "returned", json_object_new_int(count));
+    json_object_object_add(root, "truncated", json_object_new_boolean(truncated));
+    json_object_object_add(root, "limit", json_object_new_int(limit));
+    json_object_object_add(root, "total_ipv4", json_object_new_int(total_ipv4));
+    json_object_object_add(root, "total_ipv6", json_object_new_int(total_ipv6));
+    json_object_object_add(root, "returned_ipv4", json_object_new_int(returned_ipv4));
+    json_object_object_add(root, "returned_ipv6", json_object_new_int(returned_ipv6));
+    json_object_object_add(root, "scanned", json_object_new_int(scanned));
+    {
+        struct json_object *filter_arr = json_object_new_array();
+        int i;
+
+        for (i = 0; i < addr_count; i++)
+            json_object_array_add(filter_arr, json_object_new_string(addrs[i].text));
+        json_object_object_add(root, "filter_addrs", filter_arr);
+    }
     json_object_object_add(root, "connections", arr);
     json_object_object_add(root, "degraded", json_object_new_boolean(degraded));
     json_object_object_add(root, "reason", json_object_new_string(reason));
@@ -26721,7 +28478,13 @@ static int dw_handle_client_traffic_history(struct ubus_context *ctx, struct ubu
         const char *source = dw_client_today_legacy_netlink_enabled() ?
             "legacy_netlink_client_hourly_runtime" :
             "metricsd_client_runtime_sampler";
-        int bytes_available = dw_client_today_legacy_netlink_enabled();
+        /* Bytes are available from either writer now. The legacy netlink path
+         * reports counter deltas from the data path; the runtime sampler
+         * integrates the sampled rate over each interval. Both fill the same
+         * hourly buckets, and only one of them can be active at a time. */
+        int bytes_available = today_available;
+        const char *bytes_method = dw_client_today_legacy_netlink_enabled() ?
+            "kernel_counter_delta" : "sampled_rate_integral";
         const char *reason = today_available ?
             (dw_client_today_last_gap_at > 0 ?
              "partial_since_core_start; runtime_sampling_gap_detected" :
@@ -26745,6 +28508,17 @@ static int dw_handle_client_traffic_history(struct ubus_context *ctx, struct ubu
                                json_object_new_int64(dw_client_today_sample_count));
         json_object_object_add(today, "bytes_available",
                                json_object_new_boolean(bytes_available));
+        /* Name the method, because the two differ in kind and a consumer that
+         * charts them needs to know which it has. "kernel_counter_delta" is exact
+         * to the data path; "sampled_rate_integral" is an estimate that averages
+         * bursts between 4-second samples and loses whatever happened during a
+         * sampling gap. Neither is a lifetime total - both reset at local
+         * midnight. */
+        json_object_object_add(today, "bytes_method",
+                               json_object_new_string(bytes_method));
+        json_object_object_add(today, "bytes_exact",
+                               json_object_new_boolean(
+                                   !strcmp(bytes_method, "kernel_counter_delta")));
         json_object_object_add(today, "online_time_available",
                                json_object_new_boolean(today_available));
         json_object_object_add(today, "active_time_available",
@@ -27172,11 +28946,18 @@ static int dw_handle_docker_container_action(struct ubus_context *ctx, struct ub
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *data = json_object_new_object();
-    const char *id = dw_json_get_string(payload, "id", "");
-    const char *action = dw_json_get_string(payload, "action", "");
+    const char *id;
+    const char *action;
     int rc = -1;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    id = dw_json_get_string(payload, "id", "");
+    action = dw_json_get_string(payload, "action", "");
 
     if (!dw_json_get_bool(payload, "confirm", 0)) {
         json_object_object_add(data, "ok", json_object_new_boolean(0));
@@ -27219,10 +29000,15 @@ static int dw_handle_docker_image_action(struct ubus_context *ctx, struct ubus_o
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    const char *id = dw_json_get_string(payload, "id", "");
-    const char *action = dw_json_get_string(payload, "action", "");
+    struct json_object *payload = NULL;
+    const char *id;
+    const char *action;
     struct json_object *r = NULL;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    id = dw_json_get_string(payload, "id", "");
+    action = dw_json_get_string(payload, "action", "");
 
     if (!dw_json_get_bool(payload, "confirm", 0)) {
         struct json_object *data = json_object_new_object();
@@ -27295,9 +29081,14 @@ static int dw_handle_docker_job_cancel(struct ubus_context *ctx, struct ubus_obj
 {
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *data = json_object_new_object();
-    int rc = jmx_docker_job_cancel(dw_json_get_string(payload, "id", ""), payload, data);
+    int rc;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    rc = jmx_docker_job_cancel(dw_json_get_string(payload, "id", ""), payload, data);
     struct json_object *r = jmx_gen_api_response_data(
         rc == 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
     (void)obj; (void)method;
@@ -27314,10 +29105,15 @@ static int dw_handle_docker_network_action(struct ubus_context *ctx, struct ubus
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    const char *id = dw_json_get_string(payload, "id", "");
-    const char *action = dw_json_get_string(payload, "action", "");
+    struct json_object *payload = NULL;
+    const char *id;
+    const char *action;
     struct json_object *r = NULL;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    id = dw_json_get_string(payload, "id", "");
+    action = dw_json_get_string(payload, "action", "");
 
     if (!dw_json_get_bool(payload, "confirm", 0)) {
         struct json_object *data = json_object_new_object();
@@ -27359,10 +29155,15 @@ static int dw_handle_docker_volume_action(struct ubus_context *ctx, struct ubus_
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    const char *name = dw_json_get_string(payload, "name", "");
-    const char *action = dw_json_get_string(payload, "action", "");
+    struct json_object *payload = NULL;
+    const char *name;
+    const char *action;
     struct json_object *r = NULL;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    name = dw_json_get_string(payload, "name", "");
+    action = dw_json_get_string(payload, "action", "");
 
     if (!name[0])
         name = dw_json_get_string(payload, "id", "");
@@ -27417,10 +29218,15 @@ static int dw_handle_docker_service_action(struct ubus_context *ctx, struct ubus
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *data = json_object_new_object();
-    const char *action = dw_json_get_string(payload, "action", "");
+    const char *action;
     int rc = -1;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    action = dw_json_get_string(payload, "action", "");
     if (!dw_json_get_bool(payload, "confirm", 0)) {
         json_object_object_add(data, "ok", json_object_new_boolean(0));
         json_object_object_add(data, "error", json_object_new_string("confirmation_required"));
@@ -27452,9 +29258,13 @@ static int dw_handle_docker_config_set(struct ubus_context *ctx, struct ubus_obj
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *data = json_object_new_object();
     int rc = -1;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
     json_object_object_add(data, "ok", json_object_new_boolean(0));
     json_object_object_add(data, "error", json_object_new_string(
         dw_json_get_bool(payload, "confirm", 0) ? "capability_disabled" : "confirmation_required"));
@@ -27482,11 +29292,18 @@ static int dw_handle_lxc_container_action(struct ubus_context *ctx, struct ubus_
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *data = json_object_new_object();
-    const char *name = dw_container_name_arg(payload);
-    const char *action = dw_json_get_string(payload, "action", "");
+    const char *name;
+    const char *action;
     int rc = -1;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    name = dw_container_name_arg(payload);
+    action = dw_json_get_string(payload, "action", "");
 
     json_object_object_add(data, "ok", json_object_new_boolean(0));
     json_object_object_add(data, "error", json_object_new_string(
@@ -27579,9 +29396,13 @@ static int dw_handle_lxc_config_set(struct ubus_context *ctx, struct ubus_object
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
+    struct json_object *payload = NULL;
     struct json_object *data = json_object_new_object();
     int rc = -1;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
     json_object_object_add(data, "ok", json_object_new_boolean(0));
     json_object_object_add(data, "error", json_object_new_string(
         dw_json_get_bool(payload, "confirm", 0) ? "capability_disabled" : "confirmation_required"));
@@ -27615,9 +29436,12 @@ static int dw_handle_ai_config_set(struct ubus_context *ctx, struct ubus_object 
         struct ubus_request_data *req, const char *method, struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = blobmsg_format_json(msg, true);
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : NULL;
-    int rc = jmx_ai_config_set(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    int rc;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    rc = jmx_ai_config_set(payload);
     if (rc != 0) {
         if (rc == -2 || rc == -3 || rc == -4 || rc == -5) {
             struct json_object *data = json_object_new_object();
@@ -27673,9 +29497,12 @@ static int dw_handle_ai_chat(struct ubus_context *ctx, struct ubus_object *obj,
         struct ubus_request_data *req, const char *method, struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = blobmsg_format_json(msg, true);
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : NULL;
-    struct json_object *r = jmx_ai_chat(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    struct json_object *r;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    r = jmx_ai_chat(payload);
     dw_send_json(ctx, req, r);
     json_object_put(r);
     if (in) json_object_put(in);
@@ -27703,9 +29530,12 @@ static int dw_handle_ai_conversation_save(struct ubus_context *ctx, struct ubus_
         struct ubus_request_data *req, const char *method, struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = blobmsg_format_json(msg, true);
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : NULL;
-    int rc = jmx_ai_conversation_save(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    int rc;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    rc = jmx_ai_conversation_save(payload);
     if (rc != 0) dw_send_error(ctx, req, 500, "save failed");
     else dw_send_ok(ctx, req);
     if (in) json_object_put(in);
@@ -27753,8 +29583,11 @@ static int dw_handle_ai_tool_call(struct ubus_context *ctx, struct ubus_object *
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    struct json_object *r = jmx_ai_tool_call(payload);
+    struct json_object *payload = NULL;
+    struct json_object *r;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    r = jmx_ai_tool_call(payload);
     dw_send_json(ctx, req, r);
     json_object_put(r);
     if (in) json_object_put(in);
@@ -27833,8 +29666,11 @@ static int dw_handle_ai_history_save(struct ubus_context *ctx, struct ubus_objec
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    struct json_object *r = jmx_ai_history_save(payload);
+    struct json_object *payload = NULL;
+    struct json_object *r;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    r = jmx_ai_history_save(payload);
     dw_send_json(ctx, req, r);
     json_object_put(r);
     if (in) json_object_put(in);
@@ -27848,10 +29684,16 @@ static int dw_handle_ai_history_delete(struct ubus_context *ctx, struct ubus_obj
     (void)obj; (void)method;
     char *msg_json = NULL;
     struct json_object *in = NULL;
-    struct json_object *payload = dw_parse_payload(msg, &msg_json, &in);
-    const char *id = dw_json_get_string(payload, "id", "");
+    struct json_object *payload = NULL;
+    const char *id;
     struct json_object *data = json_object_new_object();
-    int rc = jmx_ai_history_delete(id);
+    int rc;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    id = dw_json_get_string(payload, "id", "");
+    rc = jmx_ai_history_delete(id);
     json_object_object_add(data, "ok", json_object_new_boolean(rc == JMX_AI_HISTORY_DELETE_OK));
     if (rc == JMX_AI_HISTORY_DELETE_NOT_FOUND) {
         json_object_object_add(data, "error", json_object_new_string("not_found"));
@@ -27890,9 +29732,10 @@ static int dw_handle_firewall_geo_block_set(struct ubus_context *ctx, struct ubu
         struct ubus_request_data *req, const char *method, struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    char *msg_json = blobmsg_format_json(msg, true);
-    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : NULL;
-    struct json_object *payload = dw_payload_or_self(in);
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
     struct json_object *response = jmx_geo_block_update(payload);
     dw_send_json(ctx, req, response);
     json_object_put(response);
@@ -27958,6 +29801,8 @@ static struct ubus_method dw_methods[] = {
     UBUS_METHOD("devices", dw_handle_devices, dw_empty_policy),
     UBUS_METHOD("apps", dw_handle_apps, dw_empty_policy),
     UBUS_METHOD("ping", dw_handle_ping, dw_ping_policy),
+    UBUS_METHOD("traceroute", dw_handle_traceroute, dw_traceroute_policy),
+    UBUS_METHOD("nslookup", dw_handle_nslookup, dw_nslookup_policy),
     UBUS_METHOD("activity", dw_handle_activity, dw_activity_policy),
     UBUS_METHOD("events_stream", dw_handle_events_stream, dw_empty_policy),
     UBUS_METHOD("clients_observe", dw_handle_clients_observe, dw_empty_policy),
@@ -28100,8 +29945,8 @@ static struct ubus_method dw_methods[] = {
     /* Flow Control rules CRUD */
     UBUS_METHOD("flow_control_rules_get", dw_handle_flow_control_rules_get, dw_empty_policy),
     UBUS_METHOD("flow_rules_list", dw_handle_flow_rules_list, dw_empty_policy),
-    UBUS_METHOD("client_rate_limit_set", dw_handle_client_rate_limit_set, dw_empty_policy),
-    UBUS_METHOD("client_rate_limit_delete", dw_handle_client_rate_limit_delete, dw_empty_policy),
+    UBUS_METHOD("client_rate_limit_set", dw_handle_client_rate_limit_set, dw_client_rate_limit_set_policy),
+    UBUS_METHOD("client_rate_limit_delete", dw_handle_client_rate_limit_delete, dw_client_rate_limit_delete_policy),
     UBUS_METHOD("flow_control_set", dw_handle_flow_control_set, dw_empty_policy),
     UBUS_METHOD("flow_control_apply", dw_handle_flow_control_apply, dw_empty_policy),
     UBUS_METHOD("flow_control_rule_set", dw_handle_flow_control_rule_set, dw_empty_policy),
@@ -28114,6 +29959,8 @@ static struct ubus_method dw_methods[] = {
     /* Bulk IP */
     UBUS_METHOD("bulk_ip_get", dw_handle_bulk_ip_get, dw_empty_policy),
     UBUS_METHOD("bulk_ip_set", dw_handle_bulk_ip_set, dw_empty_policy),
+    UBUS_METHOD("bulk_ip_transaction", dw_handle_bulk_ip_transaction, dw_empty_policy),
+    UBUS_METHOD("bulk_ip_refresh", dw_handle_bulk_ip_refresh, dw_empty_policy),
     UBUS_METHOD("bulk_ip_reserve", dw_handle_bulk_ip_reserve, dw_empty_policy),
     UBUS_METHOD("bulk_ip_delete", dw_handle_bulk_ip_delete, dw_empty_policy),
     UBUS_METHOD("bulk_ip_import", dw_handle_bulk_ip_import, dw_empty_policy),

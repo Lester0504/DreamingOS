@@ -2,7 +2,7 @@
   grid-template-rows: minmax(0, 1fr);
   align-items: start;
   width: 100%;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block) var(--app-page-gutter-inline);
   overflow: hidden;
@@ -40,16 +40,13 @@
 
 .vpn-page-toolbar {
   min-width: 0;
-  min-height: 52px;
+  min-height: 44px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 16px;
 }
 
-.vpn-page-toolbar > div { min-width: 0; display: flex; align-items: baseline; gap: 12px; }
-.vpn-page-toolbar > div > strong { font-size: 18px; font-weight: 760; }
-.vpn-page-toolbar > div > span { color: var(--app-text-muted); font-size: 12px; }
 .vpn-action-button svg { width: 17px; height: 17px; }
 
 .vpn-section-stack {
@@ -141,7 +138,7 @@
 }
 
 .vpn-config-sheet {
-  --dwrt-kit-sheet-width: min(680px, 52vw);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form);
   --dwrt-kit-sheet-max-width: calc(100vw - var(--app-menu-glass-width, 48px) - 16px);
 }
 
@@ -249,19 +246,18 @@
 .vpn-backend-gate small { color: var(--app-text-muted); font-size: 10px; line-height: 1.4; }
 
 @media (max-width: 980px) {
-  .vpn-config-sheet { --dwrt-kit-sheet-width: min(720px, 72vw); }
+  .vpn-config-sheet { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-wide); }
   .vpn-protocol-chooser > div { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .vpn-resource-actions .vpn-action-button span { display: none; }
 }
 
 @media (max-width: 720px) {
   .console-stage.is-vpn-config { padding-inline: 8px; }
-  .vpn-page-toolbar > div > span { display: none; }
   .vpn-section-header,
   .vpn-teleport { grid-template-columns: 38px minmax(0, 1fr); padding: 13px 12px; }
   .vpn-section-actions { grid-column: 1 / -1; justify-content: flex-end; }
   .vpn-resource-actions .vpn-action-button span { display: inline; }
-  .vpn-config-sheet { --dwrt-kit-sheet-width: calc(100vw - var(--app-menu-glass-width, 48px) - 8px); --dwrt-kit-sheet-max-width: calc(100vw - var(--app-menu-glass-width, 48px) - 8px); }
+  .vpn-config-sheet { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full); --dwrt-kit-sheet-max-width: calc(100vw - var(--app-menu-glass-width, 48px) - 8px); }
   .vpn-protocol-chooser > div,
   .vpn-form-grid,
   .vpn-routing-groups { grid-template-columns: 1fr; }

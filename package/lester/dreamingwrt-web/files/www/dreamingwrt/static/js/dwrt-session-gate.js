@@ -149,4 +149,60 @@
 
   window.DWRTSessionGate = SessionGate;
   window.DWRT_SESSION = window.DWRT_SESSION || new SessionGate();
+
+  /*
+   * 页面插件的共享 JSON 请求入口。
+   *
+   * 此前 30 个插件各自写了一份私有 requestJson：裸 fetch + 直接从 localStorage 取
+   * access token，完全绕过会话闸门。后果是 token 过期时它们既不刷新也不重试，并发请求
+   * 会集体拿 401 —— 通知推送页六个并发请求就显示成「unauthorized · unauthorized · ...」
+   * 六连，切走再切回来（其他页面走闸门刷新了 token）又恢复正常。
+   *
+   * 这里统一走 DWRT_SESSION.fetch()，它内部已经处理 ensureFresh -> 401 -> refresh ->
+   * 单次重试，并且 refreshPromise 是单例，并发刷新会自动合并成一次。
+   */
+  async function sessionRequestJson(url, options = {}) {
+    const { version, errorMessages, ...request } = options || {};
+    const requestUrl = version
+      ? `${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(version)}`
+      : url;
+    const messages = errorMessages || {};
+    const headers = {
+      Accept: 'application/json',
+      ...(request.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(request.headers || {})
+    };
+    const gate = window.DWRT_SESSION;
+    const init = { credentials: 'same-origin', cache: 'no-store', ...request, headers };
+    const response = gate ? await gate.fetch(requestUrl, init) : await fetch(requestUrl, init);
+    const text = await response.text();
+    let json = {};
+    if (text) {
+      try { json = JSON.parse(text); } catch (_) { throw new Error(messages.invalidJson || 'invalid json'); }
+    }
+    if (!response.ok || json?.ok === false) {
+      const detail = json?.error?.message || json?.error?.code || json?.error || json?.message || json?.code;
+      const error = new Error(String(detail || response.status));
+      error.status = response.status;
+      error.payload = json;
+      throw error;
+    }
+    return json;
+  }
+
+  /*
+   * 纯传输层入口：签名与原生 fetch 完全一致，返回同一个 Response。
+   *
+   * 各页面插件对响应的解包、业务码判定与报错文案差异很大（有的看 json.code、有的看
+   * payload.ok、有的自带中文兜底），这些逻辑不应被共享层接管。所以插件只把那一次
+   * fetch 换成这里，其余代码原样保留：改动面最小，同时补上 token 刷新与 401 重试。
+   *
+   * 闸门会自行注入 Authorization，所以调用方传入的 headers 不需要再带 token。
+   */
+  function sessionFetch(url, init = {}) {
+    const gate = window.DWRT_SESSION;
+    return gate ? gate.fetch(url, init) : fetch(url, init);
+  }
+
+  window.DWRT_REQUEST = window.DWRT_REQUEST || { json: sessionRequestJson, fetch: sessionFetch };
 })();

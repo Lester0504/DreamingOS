@@ -3,7 +3,7 @@
 .console-stage:has(.route-preview.system-settings-route-host) {
   grid-template-rows: minmax(0, 1fr);
   align-items: start;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block) var(--app-page-gutter-inline);
   overflow-x: hidden;
@@ -1628,8 +1628,12 @@ textarea.system-glass-input {
   font-weight: 720;
 }
 
+/* 控件列固定宽度，否则两行分别按 number 输入框与 select 的内在宽度收缩，
+   视觉上一宽一窄（用户 pic-9）。 */
 .system-zram-control {
-  min-width: 200px;
+  flex: 0 0 220px;
+  width: 220px;
+  min-width: 0;
 }
 
 .system-field-wrap {
@@ -1650,17 +1654,6 @@ textarea.system-glass-input {
 
 .system-field-wrap .system-glass-input[type="number"] {
   padding-right: 48px;
-}
-
-.system-field-wrap.select-arrow::after {
-  content: "↕";
-  position: absolute;
-  right: 12px;
-  top: 50%;
-  color: var(--system-muted);
-  font-size: 12px;
-  pointer-events: none;
-  transform: translateY(-50%);
 }
 
 .glass-btn {
@@ -1770,70 +1763,38 @@ textarea.system-glass-input {
   gap: 14px;
 }
 
+/* 两列：左侧是开关卡片，右侧把监听端口与空闲超时纵向堆成一列。
+   三项平铺时「启用 SSH 服务」会被挤成两行折断（用户 pic-4）。 */
 .system-admin-ssh-quick-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) repeat(2, minmax(0, 0.85fr));
-  align-items: end;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.78fr);
+  align-items: stretch;
   gap: 14px;
   min-width: 0;
 }
 
-.system-admin-hero-card {
-  position: relative;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 50px;
-  align-items: center;
-  gap: 12px;
-  min-height: 92px;
-  min-width: 0;
-  overflow: hidden;
-  border: 1px solid rgba(255,255,255,0.10);
-  border-radius: var(--app-radius-panel, 18px);
-  background: rgba(255,255,255,0.035);
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.07),
-    inset 0 -14px 22px rgba(2,8,18,0.08);
-  cursor: pointer;
-  padding: 14px 16px;
-  transition: border-color 180ms ease, background 180ms ease, box-shadow 180ms ease, transform 180ms ease;
-}
-
-.system-admin-hero-card:hover {
-  border-color: rgba(94,199,255,0.26);
-}
-
-.system-admin-hero-card:active {
-  transform: scale(0.992);
-}
-
-.system-admin-hero-card input {
-  position: absolute;
-  z-index: 3;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  margin: 0;
-  opacity: 0;
-  cursor: pointer;
-}
-
-.system-admin-hero-card:has(input:checked) {
-  border-color: rgba(94,199,255,0.42);
-  background:
-    radial-gradient(circle at 88% 8%, rgba(10,132,255,0.16), transparent 42%),
-    rgba(255,255,255,0.045);
-  box-shadow:
-    inset 0 0 0 1px rgba(255,255,255,0.06),
-    inset 0 -14px 24px rgba(2,8,18,0.08),
-    0 0 18px rgba(10,132,255,0.10);
-}
-
-.system-admin-hero-copy {
-  position: relative;
-  z-index: 1;
+.system-admin-ssh-params {
   min-width: 0;
   display: grid;
-  gap: 4px;
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  align-content: stretch;
+  gap: 10px;
+}
+
+.system-admin-ssh-params .system-admin-input-group {
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  gap: 6px;
+}
+
+/* 开关卡片在这里不需要 advanced 面板的 132px 起高，让它跟右列同高即可。 */
+.system-admin-ssh-quick-grid .system-advanced-hero-card {
+  min-height: 0;
+}
+
+.system-admin-ssh-quick-grid .system-advanced-hero-card > strong {
+  font-size: 15px;
 }
 
 .system-admin-status-light {
@@ -1853,12 +1814,6 @@ textarea.system-glass-input {
   transition: background 180ms ease, box-shadow 180ms ease, color 180ms ease, border-color 180ms ease;
 }
 
-.system-admin-hero-card .system-admin-status-light {
-  position: relative;
-  top: auto;
-  right: auto;
-}
-
 .system-admin-status-light svg,
 .system-settings-route-host .system-admin-status-light > svg,
 .system-api-row-icon svg,
@@ -1876,7 +1831,6 @@ textarea.system-glass-input {
   height: 19px;
 }
 
-.system-admin-hero-card:has(input:checked) .system-admin-status-light,
 .system-admin-status-light.ok {
   border-color: rgba(94,199,255,0.35);
   background: rgba(10,132,255,0.78);
@@ -1884,9 +1838,7 @@ textarea.system-glass-input {
   box-shadow: 0 0 16px rgba(10,132,255,0.30);
 }
 
-.system-admin-hero-card strong,
 .system-admin-status-row strong,
-.system-admin-list-head strong,
 .system-api-row strong,
 .system-api-pairing-card strong,
 .system-otp-secret-box strong {
@@ -1895,11 +1847,6 @@ textarea.system-glass-input {
   font-weight: 850;
 }
 
-.system-admin-hero-card strong {
-  font-size: 15px;
-}
-
-.system-admin-hero-card em,
 .system-admin-status-row em,
 .system-api-row em,
 .system-api-pairing-card em,
@@ -1914,21 +1861,27 @@ textarea.system-glass-input {
   text-overflow: ellipsis;
 }
 
-.system-admin-hero-card em,
 .system-api-row em {
   white-space: nowrap;
 }
 
-.system-admin-avatar-card {
-  display: grid;
-  grid-template-columns: 74px minmax(0, 1fr);
-  align-items: center;
-  gap: 16px;
-  min-width: 0;
-  padding: 4px 0;
+/*
+ * 设备行的副文本现在带指纹与远程时间，单行 nowrap 会把指纹从中间切断，
+ * 而被截断的指纹没有任何校验价值。允许它折成两行，并按分隔符换行。
+ */
+.system-api-row em {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
-.system-admin-avatar-card.span-2,
+/* 指纹作为整体标识符：可以整段换到下一行，但不能在连字符处被拆开 */
+.system-api-row .system-api-row-fingerprint {
+  display: inline;
+  font-style: normal;
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
 .system-admin-input-group.span-2 {
   grid-column: span 2;
 }
@@ -1936,13 +1889,13 @@ textarea.system-glass-input {
 .system-admin-avatar-preview {
   display: grid !important;
   place-items: center !important;
-  width: 62px;
-  min-width: 62px;
-  height: 62px;
-  min-height: 62px;
+  width: 72px;
+  min-width: 72px;
+  height: 72px;
+  min-height: 72px;
   overflow: hidden;
   border: 1px solid rgba(255,255,255,0.16);
-  border-radius: 20px;
+  border-radius: 22px;
   background:
     radial-gradient(circle at 28% 22%, rgba(255,255,255,0.20), transparent 34%),
     rgba(255,255,255,0.08);
@@ -1984,24 +1937,24 @@ textarea.system-glass-input {
   padding: 12px 16px;
 }
 
-.system-admin-avatar-actions {
-  display: flex;
-  flex-wrap: wrap;
+/* 身份页眉：头像本身就是上传触发器，右侧只留账户名与一行状态说明（pic-6）。 */
+.system-admin-identity {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
-  gap: 8px 10px;
+  gap: 18px;
   min-width: 0;
 }
 
-.system-admin-upload-btn {
+.system-admin-avatar-box {
   position: relative;
-  display: inline-flex;
-  align-items: center;
-  max-width: 100%;
-  min-height: 32px;
+  display: grid;
+  justify-items: center;
+  gap: 6px;
   cursor: pointer;
 }
 
-.system-admin-upload-btn input {
+.system-admin-avatar-box input {
   position: absolute;
   inline-size: 1px;
   block-size: 1px;
@@ -2009,53 +1962,145 @@ textarea.system-glass-input {
   pointer-events: none;
 }
 
-.system-admin-upload-btn > span {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  min-width: 0;
-  min-height: 32px;
-  border: 1px solid rgba(255,255,255,0.16);
+.system-admin-avatar-trigger {
+  position: absolute;
+  top: 50px;
+  right: -3px;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
   border-radius: 999px;
-  background: rgba(255,255,255,0.06);
-  color: var(--system-ink);
-  font-size: 12px;
-  font-weight: 850;
-  line-height: 1;
-  padding: 0 12px;
+  background: color-mix(in srgb, var(--appearance-accent, #0a84ff) 92%, transparent);
+  box-shadow: 0 6px 14px rgba(0,0,0,0.22), inset 0 0 0 2px rgba(255,255,255,0.72);
+  color: #fff;
+  line-height: 0;
+  transition: transform 180ms ease, background 180ms ease;
 }
 
-.system-admin-upload-btn svg {
-  width: 14px;
-  height: 14px;
+.system-admin-avatar-trigger svg {
+  display: block;
+  width: 13px;
+  height: 13px;
 }
 
-.system-admin-avatar-actions em {
-  min-width: 0;
-  overflow: hidden;
+.system-admin-avatar-box:hover .system-admin-avatar-trigger {
+  transform: scale(1.06);
+}
+
+.system-admin-avatar-label {
   color: var(--system-muted);
   font-size: 11px;
-  font-style: normal;
-  font-weight: 720;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-weight: 780;
 }
 
-.system-admin-avatar-actions em.error {
-  color: #ff9f8f;
-}
-
-.system-admin-upload-btn.is-working {
+.system-admin-avatar-box.is-working {
   cursor: wait;
   opacity: 0.72;
 }
 
-.system-admin-capability-note {
+.system-admin-identity-titles {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.system-admin-identity-titles strong {
+  overflow: hidden;
+  color: var(--system-ink);
+  font-size: 22px;
+  font-weight: 860;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.system-admin-identity-titles em {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--system-muted);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.system-admin-identity-titles em.error {
+  color: #ff9f8f;
+}
+
+/* 参数条带：标签在左、数值右对齐、单位收尾，两条并排一行。 */
+.system-admin-strip {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 44px;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 50px;
+  padding: 0 16px;
+  border-radius: 16px;
+  background: rgba(6, 12, 23, 0.14);
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.16), inset 0 0 0 1px rgba(255,255,255,0.07);
+}
+
+.system-admin-strip.is-disabled {
+  opacity: 0.72;
+}
+
+.system-admin-strip-label {
+  color: var(--system-muted);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.system-admin-strip .system-admin-strip-input {
+  min-height: 34px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--system-ink);
+  font-size: 15px;
+  font-weight: 760;
+  text-align: right;
+}
+
+.system-admin-strip-unit {
+  color: color-mix(in srgb, var(--appearance-accent, #0a84ff) 82%, var(--system-ink) 18%);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 860;
+  letter-spacing: 0.04em;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* 密码深槽：用我们的内阴影 token，不照抄 demo 的 rgba(0,0,0,0.3)。 */
+.system-admin-security-well {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  padding: 20px;
+  border-radius: 20px;
+  background: rgba(6, 12, 23, 0.18);
+  box-shadow: inset 0 2px 6px rgba(0,0,0,0.18), inset 0 0 0 1px rgba(255,255,255,0.06);
+}
+
+.system-admin-well-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   color: var(--system-muted);
   font-size: 11px;
-  font-weight: 720;
-  padding-left: 5px;
+  font-weight: 860;
+  letter-spacing: 0.06em;
+}
+
+.system-admin-well-title svg {
+  display: block;
+  width: 15px;
+  height: 15px;
 }
 
 .system-admin-policy-tile {
@@ -2075,60 +2120,6 @@ textarea.system-glass-input {
 .system-admin-policy-tile:hover {
   border-color: rgba(255,255,255,0.14);
   background: rgba(255,255,255,0.065);
-}
-
-.system-admin-ssh-chamber:not(:has([data-system-field="ssh.enabled"]:checked)) .system-admin-hero-card {
-  border-color: rgba(255,255,255,0.09);
-  background: rgba(255,255,255,0.028);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.045), inset 0 -14px 22px rgba(2,8,18,0.07);
-}
-
-.system-admin-ssh-chamber:not(:has([data-system-field="ssh.enabled"]:checked)) .system-admin-status-light {
-  border-color: rgba(255,255,255,0.10);
-  color: var(--system-muted);
-  background: rgba(255,255,255,0.045);
-  box-shadow: none;
-}
-
-.system-admin-ssh-chamber:has([data-system-field="ssh.enabled"]:checked) .system-admin-status-light {
-  border-color: rgba(94,199,255,0.35);
-  color: #fff;
-  background: rgba(10,132,255,0.78);
-  box-shadow: 0 0 16px rgba(10,132,255,0.30);
-}
-
-.system-admin-master-switch {
-  position: relative;
-  z-index: 1;
-  width: 44px;
-  height: 24px;
-  display: block;
-  border-radius: 999px;
-  background: rgba(255,255,255,0.10);
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.10);
-  pointer-events: none;
-  transition: background 180ms ease, box-shadow 180ms ease;
-}
-
-.system-admin-master-switch > i {
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  background: #fff;
-  box-shadow: 0 2px 6px rgba(0,0,0,0.22);
-  transition: transform 180ms cubic-bezier(.2,.8,.2,1);
-}
-
-.system-admin-hero-card:has(input:checked) .system-admin-master-switch {
-  background: #30d158;
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.18), 0 0 12px rgba(48,209,88,0.14);
-}
-
-.system-admin-hero-card:has(input:checked) .system-admin-master-switch > i {
-  transform: translateX(20px);
 }
 
 .system-admin-policy-tile > span:first-child {
@@ -2184,14 +2175,106 @@ textarea.system-glass-input {
 
 .system-admin-security-grid {
   display: grid;
-  grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
   gap: 18px;
+  min-width: 0;
+  align-items: start;
+}
+
+.system-admin-security-panel,
+.system-admin-cloud-panel {
+  align-content: start;
+}
+
+.system-admin-binding-group {
+  display: grid;
+  gap: 10px;
   min-width: 0;
 }
 
-.system-admin-otp-panel,
-.system-admin-app-panel {
-  align-content: start;
+.system-admin-binding-group + .system-admin-binding-group {
+  margin-top: 4px;
+  padding-top: 14px;
+  border-top: 1px solid var(--system-border);
+}
+
+.system-admin-cloud-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+
+.system-admin-cloud-metric {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--system-border);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.04);
+}
+
+.system-admin-cloud-metric > span {
+  color: var(--system-muted);
+  font-size: 11px;
+  font-weight: 760;
+}
+
+.system-admin-cloud-metric > strong {
+  color: var(--system-ink);
+  font-size: 19px;
+  font-weight: 800;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+.system-admin-cloud-metric > em {
+  color: var(--system-muted);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 620;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.system-admin-cloud-notice {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  min-width: 0;
+  padding: 11px 13px;
+  border: 1px solid rgba(255,199,88,0.28);
+  border-radius: 8px;
+  background: rgba(255,199,88,0.1);
+}
+
+.system-admin-cloud-notice > svg {
+  display: block;
+  width: 20px;
+  height: 20px;
+  color: #ffc758;
+}
+
+.system-admin-cloud-notice > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.system-admin-cloud-notice strong {
+  color: var(--system-ink);
+  font-size: 13px;
+  font-weight: 780;
+}
+
+.system-admin-cloud-notice em {
+  color: var(--system-text);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 620;
+  line-height: 1.6;
 }
 
 .system-admin-security-note {
@@ -2558,21 +2641,6 @@ textarea.system-glass-input {
   min-width: 0;
 }
 
-.system-admin-list-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  min-width: 0;
-  padding: 0 2px 2px;
-}
-
-.system-admin-list-head span {
-  color: var(--system-muted);
-  font-size: 12px;
-  font-weight: 760;
-}
-
 .system-api-row {
   display: grid;
   grid-template-columns: 36px minmax(0, 1fr) auto auto;
@@ -2629,6 +2697,30 @@ textarea.system-glass-input {
   color: #53dda0;
 }
 
+.system-api-row > span:nth-child(2) > strong {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+/* 名称过长时省略号截断，让远程标签始终留在同一行内 */
+.system-api-row .system-api-row-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.system-api-row b.system-api-path-tag {
+  flex: 0 0 auto;
+  background: rgba(94,199,255,0.14);
+  color: #5ec7ff;
+  font-size: 10px;
+  font-weight: 900;
+  padding: 4px 7px;
+}
+
 @media (max-width: 1080px) {
   .system-general-card-grid,
   .system-admin-chambers,
@@ -2637,11 +2729,12 @@ textarea.system-glass-input {
   }
 
   .system-admin-ssh-quick-grid {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr;
   }
 
-  .system-admin-ssh-quick-grid .system-admin-hero-card {
-    grid-column: 1 / -1;
+  .system-admin-ssh-params {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: auto;
   }
 
   .system-admin-chamber { min-height: 0; }
@@ -2652,18 +2745,19 @@ textarea.system-glass-input {
     padding: 22px;
   }
 
-  .system-admin-avatar-card,
   .system-admin-password-grid,
   .system-admin-account-meta-grid,
   .system-admin-ssh-quick-grid {
     grid-template-columns: 1fr;
   }
 
-  .system-admin-hero-card {
-    grid-template-columns: minmax(0, 1fr) 50px;
+  .system-admin-identity {
+    grid-template-columns: auto minmax(0, 1fr);
   }
 
-  .system-admin-ssh-quick-grid .system-admin-hero-card { grid-column: auto; }
+  .system-admin-ssh-params {
+    grid-template-columns: minmax(0, 1fr);
+  }
 
   .system-admin-avatar-preview {
     width: 58px;

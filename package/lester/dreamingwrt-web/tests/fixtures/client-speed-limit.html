@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN" data-theme-resolved="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/policy-table.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/user-authentication.css">
+  <style>
+    :root {
+      --app-radius-card: 24px;
+      --app-radius-control: 12px;
+      --app-text: rgb(239 245 252);
+      --app-text-secondary: rgb(214 224 238);
+      --app-text-muted: rgb(177 193 213);
+      --app-accent: rgb(46 139 255);
+      --color-text-primary: var(--app-text);
+      --color-text-secondary: var(--app-text-secondary);
+      --color-text-muted: var(--app-text-muted);
+      --color-accent: var(--app-accent);
+      --color-on-accent: white;
+      --color-danger: rgb(239 86 99);
+      --color-warning: rgb(238 177 52);
+      --color-border-control: rgb(255 255 255 / .2);
+      --color-border-subtle: rgb(255 255 255 / .12);
+      --color-surface-control: rgb(255 255 255 / .06);
+      --dwrt-glass-ink: var(--app-text);
+      --dwrt-glass-text: var(--app-text-secondary);
+      --dwrt-glass-muted: var(--app-text-muted);
+      --dwrt-kit-text: var(--app-text);
+      --dwrt-kit-muted: var(--app-text-muted);
+    }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body { color: var(--app-text); background: linear-gradient(135deg, rgb(17 48 79), rgb(80 44 29)); font-family: system-ui, sans-serif; }
+    .console-stage { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; padding: 12px; box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <main class="console-stage"><div class="route-preview" id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/client-speed-limit.js';
+
+    const root = document.getElementById('routePreview');
+    const clients = Array.from({ length: 6 }, (_, index) => ({
+      id: `client-${index + 1}`,
+      name: `终端 ${index + 1}`,
+      ip: `192.168.30.${20 + index}`,
+      mac: `02:00:00:00:00:0${index + 1}`,
+      online: index < 4
+    }));
+    const rules = new Map(clients.map(client => [client.mac, []]));
+    rules.set(clients[0].mac, [{
+      id: 'rule-1', mac: clients[0].mac, name: '工作站上网', enabled: true,
+      control_type: 'IP限速', schedule_mode: 'week', days_array: ['一','二','三','四','五'],
+      start_time: '08:00', end_time: '22:00', limit_mode: '独立限速',
+      up_limit: 10, up_unit: 'Mbps', down_limit: 100, down_unit: 'Mbps',
+      line: '', protocol: 'TCP', note: '办公设备', runtime_apply: true,
+      apply_state: 'applied', apply_reason: 'tc_runtime_applied', runtime_match_precision: 'client_mac_and_l4_protocol'
+    }]);
+    rules.set(clients[1].mac, [{
+      id: 'rule-2', mac: clients[1].mac, name: '访客限速', enabled: false,
+      control_type: 'IP限速', schedule_mode: 'daily', days_array: ['一','二','三','四','五','六','日'],
+      start_time: '00:00', end_time: '23:59', limit_mode: '独立限速',
+      up_limit: 512, up_unit: 'KB/s', down_limit: 2, down_unit: 'Mbps',
+      line: '', protocol: '任意', note: '', runtime_apply: false,
+      apply_state: 'disabled', apply_reason: 'rule_disabled'
+    }]);
+    const capabilities = {
+      control_rule_crud: true,
+      client_control_rule_api: true,
+      client_control_fail_closed: true,
+      client_control_rate_limit: true,
+      client_control_protocol_runtime: true,
+      client_control_line_runtime: false,
+      client_control_shared_rate_limit: false
+    };
+    const reads = [];
+    const writes = [];
+    const ruleList = () => Array.from(rules.values()).flat();
+
+    window.fetch = async (url, init = {}) => {
+      const parsed = new URL(url, location.href);
+      const method = String(init.method || 'GET').toUpperCase();
+      if (parsed.pathname === '/api/v1/clients') {
+        reads.push(parsed.pathname);
+        return new Response(JSON.stringify({ ok: true, data: { clients } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (parsed.pathname === '/api/v1/client_control_rules' && method === 'GET') {
+        reads.push(parsed.pathname);
+        return new Response(JSON.stringify({ ok: true, data: { rules: ruleList(), capabilities } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (parsed.pathname.startsWith('/api/v1/client_control_rule') && method === 'POST') {
+        const body = JSON.parse(init.body || '{}');
+        writes.push({ path: parsed.pathname, body });
+        const collection = rules.get(body.mac) || [];
+        if (parsed.pathname.endsWith('/toggle')) {
+          const target = collection.find(item => item.id === body.id);
+          if (target) { target.enabled = body.enabled; target.runtime_apply = body.enabled; target.apply_state = body.enabled ? 'applied' : 'disabled'; }
+        } else if (parsed.pathname.endsWith('/delete')) {
+          rules.set(body.mac, collection.filter(item => item.id !== body.id));
+        } else {
+          const id = body.id || `rule-${Date.now()}`;
+          const next = { ...body, id, runtime_apply: body.enabled !== false, apply_state: body.enabled !== false ? 'applied' : 'disabled', apply_reason: 'fixture_applied', runtime_match_precision: body.protocol === '任意' ? 'client_mac_exact' : 'client_mac_and_l4_protocol' };
+          const index = collection.findIndex(item => item.id === id);
+          if (index >= 0) collection[index] = next; else collection.push(next);
+          rules.set(body.mac, collection);
+        }
+        return new Response(JSON.stringify({ ok: true, data: { changed: true } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ ok: false, error: 'unexpected_fixture_request' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    let instance = mount({
+      root,
+      item: { id: 'authentication-client-speed-limit' },
+      ui: {
+        mountAll: node => window.DWRT_UI_KIT.mountAll(node),
+        statusBadgeMarkup: (...args) => window.DWRT_UI_KIT.statusBadgeMarkup(...args),
+        confirmationMarkup: (...args) => window.DWRT_UI_KIT.confirmationMarkup(...args)
+      },
+      utils: { escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]) }
+    });
+
+    window.CLIENT_SPEED_FIXTURE = {
+      reads,
+      writes,
+      async ready() {
+        for (let index = 0; index < 120; index += 1) {
+          if (root.querySelectorAll('[data-client-speed-rule]').length === 2) return true;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        return false;
+      },
+      unmount() { instance?.unmount?.(); instance = null; }
+    };
+  </script>
+</body>
+</html>

@@ -3,7 +3,7 @@
 .console-stage.is-global-config {
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
   overflow: hidden;
@@ -603,10 +603,10 @@
 
 .global-drawer { --dwrt-kit-sheet-z: 70; }
 .global-filter-drawer,
-.global-columns-drawer { --dwrt-kit-sheet-width: min(75vw, 400px); }
-.global-settings-drawer { --dwrt-kit-sheet-width: min(88vw, 590px); }
-.global-port-drawer { --dwrt-kit-sheet-width: min(92vw, 680px); }
-.global-resource-drawer { --dwrt-kit-sheet-width: min(92vw, 720px); }
+.global-columns-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }
+.global-settings-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form); }
+.global-port-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form); }
+.global-resource-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-wide); }
 .global-drawer .dwrt-kit-sheet-header span { display: block; color: var(--app-text-muted); font-size: 10px; font-weight: 760; }
 .global-drawer .dwrt-kit-sheet-header strong { display: block; margin-top: 2px; font-size: 17px; }
 .global-drawer-body { display: grid; align-content: start; gap: 16px; padding: 18px var(--dwrt-kit-sheet-padding-x); }

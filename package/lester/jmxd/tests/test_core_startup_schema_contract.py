@@ -43,14 +43,24 @@ db_init = between(
     "int jmx_db_init(void)",
     "void jmx_db_close(void)",
 )
-assert "JMX_DB_SCHEMA_VERSION 6" in DB
+assert "JMX_DB_SCHEMA_VERSION 7" in DB
 assert 'db_exec("PRAGMA journal_mode=WAL;")' in db_init
 version_gate = db_init.index("if (version < JMX_DB_SCHEMA_VERSION)")
 begin = db_init.index("if (db_begin() != 0)")
 schema_v1 = db_init.index("if (version < 1 && db_schema_v1() != 0)")
 schema_v2 = db_init.index("if (version < 2 && db_schema_v2() != 0)")
+schema_v3 = db_init.index("if (version < 3)")
+schema_v4 = db_init.index("if (version < 4)")
+schema_v5 = db_init.index("if (version < 5)")
+schema_v6 = db_init.index("if (version < 6)")
+schema_v7 = db_init.index("if (version < 7)")
 set_version = db_init.index("db_set_schema_version(JMX_DB_SCHEMA_VERSION)")
-assert version_gate < begin < schema_v1 < schema_v2 < set_version
+assert version_gate < begin < schema_v1 < schema_v2 < schema_v3 < schema_v4
+assert schema_v4 < schema_v5 < schema_v6 < schema_v7 < set_version
+# The v7 migration must create the lifetime WAN counter table inside the same
+# transaction as every other migration step, so a failure cannot leave the DB
+# claiming v7 without the table.
+assert "wan_lifetime_usage" in db_init
 assert "if (version > JMX_DB_SCHEMA_VERSION)" in db_init
 assert "if (migration_started)\n        db_rollback();" in db_init
 assert "sqlite3_close(g_db);\n    g_db = NULL;" in db_init

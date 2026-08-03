@@ -1,5 +1,15 @@
 :root {
   --dwrt-kit-radius: min(var(--lg-corner-radius, 25px), 24px);
+  /*
+   * 抽屉宽度档位。此前 23 个页面 CSS 各写各的，全树共 32 种不同取值（从 min(75vw,390px)
+   * 到 min(92vw,920px) 到 100vw），同一类抽屉在不同页面宽度不一致。收敛为四档具名档位，
+   * 页面只允许引用档位；确有更宽需求的（如接口配置的长表单）用 -form / -wide 档，
+   * 不再写页面私有魔法值。标准档与 AI 抽屉的 460px 对齐。
+   */
+  --dwrt-kit-sheet-width-standard: min(460px, calc(100vw - 20px));
+  --dwrt-kit-sheet-width-form: min(620px, calc(100vw - 20px));
+  --dwrt-kit-sheet-width-wide: min(820px, calc(100vw - 20px));
+  --dwrt-kit-sheet-width-full: 100vw;
   --dwrt-kit-text: var(--dashboard-ink, rgba(248, 251, 255, 0.96));
   --dwrt-kit-muted: var(--dashboard-muted, rgba(214, 225, 240, 0.78));
   --dwrt-kit-panel: rgba(255, 255, 255, calc(0.020 + var(--lg-effective-opacity, 0.42) * 0.014));
@@ -2639,8 +2649,50 @@ body:has(.dwrt-kit-modal-layer.is-open) {
   pointer-events: auto;
 }
 
+/*
+ * 抽屉传送门容器。它自己绝不能带 transform / filter / contain / perspective，
+ * 否则又会成为新的包含块，等于把问题搬到了另一层。零尺寸、不拦事件。
+ */
+/* portal 会镜像原路由宿主的作用域类名，让页面 CSS 的宿主前缀与壳层自定义属性在抽屉里
+   继续生效。镜像下来的壳层规则里可能带 display / backdrop-filter 等布局与合成属性，
+   而 backdrop-filter 恰好会重建包含块，正是 portal 要规避的问题，所以这里把 portal
+   自身的盒模型与合成属性一律压平。 */
+.dwrt-kit-sheet-portal,
+#dwrtKitSheetPortal {
+  position: static;
+  inset: auto;
+  width: 0;
+  height: 0;
+  min-width: 0;
+  min-height: 0;
+  max-width: none;
+  max-height: none;
+  display: block;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  filter: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  transform: none;
+  perspective: none;
+  contain: none;
+  will-change: auto;
+  scrollbar-gutter: auto;
+  pointer-events: none;
+}
+
+.dwrt-kit-sheet-portal > * {
+  pointer-events: auto;
+}
+
 .dwrt-kit-sheet {
-  --dwrt-kit-sheet-width: min(75vw, 390px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   --dwrt-kit-sheet-max-width: calc(100vw - 28px);
   --dwrt-kit-sheet-radius: min(var(--lg-corner-radius, 25px), 24px);
   --dwrt-kit-sheet-padding-x: clamp(16px, 2vw, 24px);

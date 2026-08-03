@@ -1,0 +1,748 @@
+.console-stage.is-qwrt-modules {
+  box-sizing: border-box;
+  grid-template-rows: minmax(0, 1fr);
+  align-items: start;
+  width: 100%;
+  height: var(--app-stage-height);
+  min-height: 0;
+  padding: var(--app-page-gutter-block, var(--app-page-gutter, 16px)) var(--app-page-gutter-inline, var(--app-page-gutter, 16px));
+  overflow: hidden;
+}
+
+.console-stage.is-qwrt-modules .stage-header {
+  display: none;
+}
+
+.console-stage.is-qwrt-modules .route-preview.qwrt-modules-route-host {
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.qwrt-modules-route-host,
+.qwrt-modules-route-host * {
+  box-sizing: border-box;
+}
+
+.qwrt-modules-shell {
+  height: 100%;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
+  overflow: hidden;
+  color: var(--color-text-primary, var(--app-text));
+  font-variant-numeric: tabular-nums;
+}
+
+.qwrt-page-header {
+  min-height: 52px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.qwrt-tabs {
+  width: min(100%, 760px);
+  max-width: 100%;
+  min-width: 0;
+  min-height: 52px;
+  justify-content: flex-start;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: none;
+}
+
+.qwrt-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.qwrt-tabs .dwrt-kit-tab {
+  flex: 0 0 auto;
+  min-width: max-content;
+  height: 40px;
+  padding-inline: 16px;
+  white-space: nowrap;
+}
+
+.qwrt-page-actions {
+  flex: 0 0 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.qwrt-refresh {
+  flex: 0 0 auto;
+  min-height: 36px;
+  gap: 7px;
+  white-space: nowrap;
+}
+
+.qwrt-refresh svg,
+.qwrt-add-button svg {
+  width: 18px;
+  height: 18px;
+}
+
+.qwrt-modules-main {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  align-content: start;
+  gap: var(--app-page-gap, 16px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding-bottom: var(--app-page-gap, 16px);
+}
+
+/* Status metrics stay as one row above the workbench on every tab. The double
+   class beats the shared grid's single-class column rule. */
+.qwrt-overview.dwrt-kit-overview-grid {
+  min-width: 0;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.qwrt-overview .dwrt-kit-overview-card {
+  min-height: 0;
+  padding: 14px 16px;
+}
+
+.qwrt-overview .dwrt-kit-overview-content strong { font-size: 22px; }
+
+.qwrt-notice {
+  flex: 0 0 auto;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 16%, transparent));
+  border-radius: 6px;
+  padding: 9px 12px;
+  color: var(--color-text-primary, var(--app-text));
+  background: var(--color-surface-dense, color-mix(in srgb, var(--app-text) 6%, transparent));
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.qwrt-notice.is-error {
+  border-color: color-mix(in srgb, var(--color-danger) 48%, transparent);
+  color: var(--color-danger);
+}
+
+.qwrt-settings-surface {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  align-content: start;
+}
+
+.qwrt-surface-header {
+  min-width: 0;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 10%, transparent));
+}
+
+.qwrt-surface-header > .dwrt-kit-status {
+  flex: 0 0 auto;
+}
+
+.qwrt-surface-body {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  padding: 12px 16px 14px;
+  border-bottom: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 10%, transparent));
+}
+
+.qwrt-capability,
+.qwrt-inline-warning {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--color-warning) 30%, transparent);
+  border-radius: 6px;
+  margin-bottom: 12px;
+  color: var(--color-text-primary, var(--app-text));
+  background: color-mix(in srgb, var(--color-warning) 7%, transparent);
+}
+
+.qwrt-capability > svg,
+.qwrt-inline-warning > svg {
+  width: 18px;
+  height: 18px;
+  color: var(--color-warning);
+}
+
+.qwrt-capability > span,
+.qwrt-inline-warning > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.qwrt-capability strong {
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.qwrt-capability small,
+.qwrt-inline-warning span {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+/* menu-shell.css turns every `code` inside .route-preview into a block with a
+   top margin, which would stretch these inline chips into full-width bars. The
+   selector below ties that rule's specificity and wins on load order. */
+.qwrt-capability code {
+  display: inline;
+  margin-top: 0;
+  border-radius: 4px;
+  padding: 1px 4px;
+  background: color-mix(in srgb, var(--app-text) 9%, transparent);
+  font: inherit;
+  font-family: var(--app-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+/* 主体上的 overflow-wrap: anywhere 会把按钮文字断行后裁掉，按钮内一律不断词 */
+.qwrt-modules-main :where(.dwrt-kit-button, .dwrt-kit-tab) {
+  overflow-wrap: normal;
+  word-break: keep-all;
+}
+
+.qwrt-table-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.qwrt-add-button {
+  flex: 0 0 auto;
+  min-height: 32px;
+  gap: 6px;
+  padding: 0 12px;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: keep-all;
+}
+
+.qwrt-empty-block {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  margin-top: 14px;
+  border: 1px dashed var(--color-border-subtle, color-mix(in srgb, var(--app-text) 20%, transparent));
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.qwrt-empty-block > svg {
+  width: 18px;
+  height: 18px;
+  color: var(--color-text-muted, var(--app-text-muted));
+}
+
+.qwrt-empty-block > span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.qwrt-empty-block strong { font-size: 13px; line-height: 1.4; }
+
+.qwrt-empty-block small {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.qwrt-slot-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.qwrt-slot-card {
+  min-width: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  border: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 14%, transparent));
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: var(--color-surface-dense, color-mix(in srgb, var(--app-text) 5%, transparent));
+}
+
+.qwrt-slot-card > header {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Same trap as the code chips: `.route-preview span { display: block }` in
+   menu-shell.css beats a bare page class, so every span we lay out has to be
+   addressed through its parent. */
+.qwrt-slot-card > header > .qwrt-slot-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  color: var(--color-accent, var(--app-accent));
+  background: color-mix(in srgb, var(--color-accent, var(--app-accent)) 12%, transparent);
+}
+
+/* The label needs to be its own element: a bare text node cannot take
+   min-width: 0, so a long slot name would push the badge onto a second row. */
+.qwrt-slot-card > header > .qwrt-slot-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.qwrt-slot-title strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.qwrt-slot-title small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.qwrt-slot-card > header > .dwrt-kit-status {
+  flex: 0 0 auto;
+}
+
+.qwrt-slot-card > dl {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 12px;
+  margin: 0;
+}
+
+.qwrt-slot-card > dl > div {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.qwrt-slot-card dt {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 10px;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+
+.qwrt-slot-card dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.qwrt-slot-card > footer {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-top: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 10%, transparent));
+  padding-top: 8px;
+}
+
+.qwrt-slot-card > footer > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.qwrt-dependency {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  padding: 0 4px;
+}
+
+.qwrt-master-switch {
+  min-width: 0;
+  min-height: 58px;
+  padding: 10px 0;
+}
+
+.qwrt-master-switch > span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.qwrt-master-switch strong {
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.qwrt-master-switch small {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.qwrt-dependency-fields {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  gap: 14px;
+  margin: 0 0 16px 20px;
+  padding: 4px 0 0 20px;
+}
+
+.qwrt-dependency-fields::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 2px;
+  border-radius: 999px;
+  background: var(--color-accent, var(--app-accent));
+  opacity: 0.62;
+}
+
+.qwrt-dependency.is-inactive > .qwrt-dependency-fields {
+  display: none;
+}
+
+.qwrt-field-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 12px 16px;
+}
+
+.qwrt-field-grid > .is-wide {
+  grid-column: 1 / -1;
+}
+
+.qwrt-table {
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+  margin: 14px 0 4px;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.qwrt-table .dwrt-kit-table-scroll {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: visible;
+  overscroll-behavior-inline: contain;
+}
+
+.qwrt-slot-table .dwrt-kit-table,
+.qwrt-apn-table .dwrt-kit-table {
+  min-width: 980px;
+}
+
+.qwrt-sms-table .dwrt-kit-table {
+  min-width: 760px;
+}
+
+.qwrt-runtime-table .dwrt-kit-table {
+  min-width: 520px;
+}
+
+.qwrt-sms-content {
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qwrt-row-actions {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.qwrt-row-actions > button + button {
+  margin-left: 6px;
+}
+
+.qwrt-modules-shell button svg {
+  flex: 0 0 auto;
+}
+
+.qwrt-savebar {
+  z-index: 58;
+}
+
+/* Sheet geometry is restated inside the route host on purpose. The kit reaffirms
+   sheet geometry by enumerating legacy glass class combinations; a sheet that
+   matches none of them falls back into normal flow and lands at the end of the
+   page. The prefix .dwrt-kit-sheet is required so this outweighs the kit
+   baseline, which loads first at equal specificity. */
+.qwrt-modules-route-host .dwrt-kit-sheet.qwrt-sheet {
+  position: fixed;
+  z-index: var(--dwrt-kit-sheet-z, 59);
+  inset: 0 0 0 auto;
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form);
+  --dwrt-kit-sheet-max-width: calc(100vw - 24px);
+  width: min(var(--dwrt-kit-sheet-width), var(--dwrt-kit-sheet-max-width));
+  height: 100dvh;
+  max-height: 100dvh;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.qwrt-modules-route-host .dwrt-kit-sheet.qwrt-sheet.is-compact {
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
+}
+
+.qwrt-modules-route-host .dwrt-kit-sheet-overlay {
+  position: fixed;
+  inset: 0;
+}
+
+.qwrt-sheet .dwrt-kit-sheet-header > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.qwrt-sheet .dwrt-kit-sheet-header strong { font-size: 15px; line-height: 1.35; }
+
+.qwrt-sheet .dwrt-kit-sheet-header small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 12px;
+}
+
+.qwrt-sheet-body {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  align-content: start;
+  gap: 18px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 16px;
+}
+
+.qwrt-sheet-body > section {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.qwrt-sheet-body h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+  letter-spacing: 0;
+  text-transform: uppercase;
+  color: var(--color-text-muted, var(--app-text-muted));
+}
+
+.qwrt-sheet-fields {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 12px 14px;
+}
+
+.qwrt-sheet-fields > .is-wide {
+  grid-column: 1 / -1;
+}
+
+.qwrt-sheet-switch {
+  min-width: 0;
+  min-height: 48px;
+}
+
+.qwrt-sheet-switch > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.qwrt-sheet-switch strong { font-size: 13px; line-height: 1.4; }
+
+.qwrt-sheet-switch small {
+  color: var(--color-text-muted, var(--app-text-muted));
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+@media (max-width: 900px) {
+  .qwrt-page-header {
+    gap: 8px;
+  }
+
+  .qwrt-tabs .dwrt-kit-tab {
+    padding-inline: 14px;
+  }
+
+  .qwrt-overview.dwrt-kit-overview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .qwrt-modules-route-host .dwrt-kit-sheet.qwrt-sheet,
+  .qwrt-modules-route-host .dwrt-kit-sheet.qwrt-sheet.is-compact {
+    --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full);
+    --dwrt-kit-sheet-max-width: calc(100vw - 36px);
+  }
+}
+
+@media (max-width: 640px) {
+  .qwrt-modules-shell {
+    gap: var(--app-page-gap, 16px);
+  }
+
+  .qwrt-page-header,
+  .qwrt-tabs {
+    min-height: 48px;
+  }
+
+  .qwrt-tabs .dwrt-kit-tab {
+    height: 40px;
+    padding-inline: 12px;
+  }
+
+  .qwrt-refresh {
+    width: 40px;
+    min-width: 40px;
+    padding-inline: 0;
+  }
+
+  .qwrt-refresh span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .qwrt-surface-header {
+    min-height: 40px;
+    padding: 8px 12px;
+  }
+
+  .qwrt-surface-body {
+    padding: 10px 12px 12px;
+  }
+
+  /* Four stacked cards would push the workbench off the first screen; keep two
+     across and trade the icon badge for text room. */
+  .qwrt-overview .dwrt-kit-overview-card {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 12px 14px;
+  }
+
+  .qwrt-overview .dwrt-kit-overview-card .dwrt-kit-overview-icon {
+    display: none !important;
+  }
+
+  .qwrt-overview .dwrt-kit-overview-content strong {
+    font-size: 19px;
+  }
+
+  .qwrt-field-grid,
+  .qwrt-sheet-fields,
+  .qwrt-slot-card > dl {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .qwrt-slot-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .qwrt-table .dwrt-kit-table-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .qwrt-table-actions {
+    justify-content: space-between;
+  }
+
+  .qwrt-field-grid :is(input, select),
+  .qwrt-sheet-fields :is(input, select) {
+    font-size: 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .qwrt-modules-shell *,
+  .qwrt-modules-shell *::before,
+  .qwrt-modules-shell *::after {
+    scroll-behavior: auto;
+    transition-duration: 0.01ms;
+    animation-duration: 0.01ms;
+  }
+}

@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '20260710-16';
+  const VERSION = '20260802-ui-batch-01';
   const REFRESH_MS = 30000;
   const SEARCH_DEBOUNCE_MS = 650;
   const DEFAULT_PAGE_SIZE = 25;
@@ -1179,16 +1179,15 @@
       </div>`;
     }
 
+    /*
+     * 搜索按用户第 9 条移到表格工具条，左侧筛选栏不再自带搜索行；
+     * 手动刷新按钮删除，页面本来就有 REFRESH_MS 的自动轮询（:1133）。
+     */
     function searchMarkup() {
-      return `<div class="log-center-search-row">
-        <label class="log-center-search" data-dwrt-component="expand-search">
-          <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M9 3a6 6 0 1 0 3.65 10.76l2.8 2.8a.5.5 0 1 0 .7-.72l-2.78-2.78A6 6 0 0 0 9 3Zm-5 6a5 5 0 1 1 10 0A5 5 0 0 1 4 9Z"></path></svg>
-          <input type="search" value="${html(state.search)}" data-log-search placeholder="搜索日志、对象、IP、MAC">
-        </label>
-        <button type="button" class="log-center-icon-button" data-log-refresh aria-label="刷新日志" title="刷新">
-          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M15.084 2.906c-.224.243-.36.567-.36.922v4.738c0 .355.26.673.614.707a.682.682 0 0 0 .747-.679V4.845a8.246 8.246 0 0 1 4.153 7.153c0 4.543-3.695 8.239-8.238 8.239-.464 0-.92-.038-1.362-.113v1.378c.446.064.899.096 1.362.096 5.293 0 9.6-4.307 9.6-9.6a9.602 9.602 0 0 0-4.564-8.17h3.815a.682.682 0 0 0 .678-.747c-.034-.354-.351-.614-.706-.614h-4.738c-.396 0-.753.169-1 .44ZM3.762 11.998C3.762 7.456 7.457 3.76 12 3.76c.464 0 .92.038 1.362.113V2.495A9.555 9.555 0 0 0 12 2.398c-5.293 0-9.6 4.307-9.6 9.6a9.602 9.602 0 0 0 4.564 8.17l.005.004H3.15a.682.682 0 0 0-.678.747c.034.354.351.614.707.614h4.737c.396 0 .753-.168 1-.44.226-.242.362-.566.362-.921v-4.766a.682.682 0 0 0-.748-.678c-.354.034-.614.351-.614.706v3.718a8.246 8.246 0 0 1-4.153-7.154Z"></path></svg>
-        </button>
-      </div>`;
+      return `<label class="dwrt-kit-expand-search log-center-search" data-dwrt-component="expand-search">
+        <span class="dwrt-kit-expand-search-original-icon"><svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M9 3a6 6 0 1 0 3.65 10.76l2.8 2.8a.5.5 0 1 0 .7-.72l-2.78-2.78A6 6 0 0 0 9 3Zm-5 6a5 5 0 1 1 10 0A5 5 0 0 1 4 9Z"></path></svg></span>
+        <input type="search" value="${html(state.search)}" data-log-search placeholder="搜索日志、对象、IP、MAC">
+      </label>`;
     }
 
     function periodMarkup() {
@@ -1293,7 +1292,6 @@
       const programs = Array.from(programMap.values()).sort((left, right) => Number(right.count || 0) - Number(left.count || 0));
       if (state.mode === 'AUDIT') {
         return `<div class="log-filter-scroll">
-          ${searchMarkup()}
           ${severityMarkup()}
           ${periodMarkup()}
           ${filterGroup('sources', '日志来源', modeSourceFilters().map((item) => sourceRow(item, sourceCounts)).join(''), { count: modeSourceFilters().length })}
@@ -1307,7 +1305,6 @@
         </div>`;
       }
       return `<div class="log-filter-scroll">
-        ${searchMarkup()}
         ${severityMarkup()}
         ${periodMarkup()}
         ${filterGroup('sources', '日志来源', modeSourceFilters().map((item) => sourceRow(item, sourceCounts)).join(''), { count: modeSourceFilters().length })}
@@ -1460,6 +1457,7 @@
           </div>
           <div class="log-center-toolbar-actions">
             ${state.notice ? `<span class="log-center-notice">${html(state.notice)}</span>` : ''}
+            ${searchMarkup()}
             <button type="button" class="log-ai-button" data-log-ask-ai ${state.selectedRows.size && !state.aiLoading ? '' : 'disabled'} aria-label="让 AI 分析选中的日志">
               <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M10 2.5c.27 0 .49.2.55.46a4.3 4.3 0 0 0 3.2 3.2c.26.06.45.29.45.55s-.19.49-.45.55a4.3 4.3 0 0 0-3.2 3.2.56.56 0 0 1-1.1 0 4.3 4.3 0 0 0-3.2-3.2.56.56 0 0 1 0-1.1 4.3 4.3 0 0 0 3.2-3.2c.06-.26.28-.46.55-.46Zm5.2 8.8c.22 0 .4.16.45.37a2.64 2.64 0 0 0 1.98 1.98.46.46 0 0 1 0 .9 2.64 2.64 0 0 0-1.98 1.98.46.46 0 0 1-.9 0 2.64 2.64 0 0 0-1.98-1.98.46.46 0 0 1 0-.9 2.64 2.64 0 0 0 1.98-1.98.46.46 0 0 1 .45-.37Z"></path></svg>
               ${html(state.aiLoading ? '分析中' : `问 AI${state.selectedRows.size ? ` (${state.selectedRows.size})` : ''}`)}
@@ -1873,10 +1871,6 @@
         state.programs.clear();
         state.selectedRows.clear();
         refresh({ resetPage: true });
-        return;
-      }
-      if (event.target.closest('[data-log-refresh]')) {
-        refresh();
         return;
       }
       const periodButton = event.target.closest('[data-log-period]');

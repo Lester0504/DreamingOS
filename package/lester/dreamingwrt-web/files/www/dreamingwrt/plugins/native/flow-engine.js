@@ -289,7 +289,8 @@ export function mount(context = {}) {
     refreshQueued: false,
     refreshPromise: null,
     suppressRegistryRender: true,
-    renderFrame: 0
+    renderFrame: 0,
+    pollTimer: 0
   };
 
   const pageHost = document.createElement('div');
@@ -590,7 +591,7 @@ export function mount(context = {}) {
     const stale = Object.values(state.snapshots).some((snapshot) => snapshot?.stale)
       ? `<div class="policy-entity-alert is-warning" role="status"><strong>正在显示上次可用快照</strong><span>部分刷新失败，页面仍保留最后一次成功数据。</span></div>` : '';
     return `<section class="flow-engine-page">
-      <div class="flow-engine-page-toolbar">${tabsMarkup()}<div class="flow-engine-toolbar-actions">${statusBadge(canWrite() ? '写入可用' : '只读', canWrite() ? 'success' : 'warning')}${button(state.refreshing ? '正在刷新' : '刷新', `data-flow-refresh aria-label="刷新流量引擎" data-dwrt-tooltip="刷新" ${state.refreshing ? 'disabled' : ''}`, 'ghost', 'refresh-cw')}</div></div>
+      <div class="flow-engine-page-toolbar">${tabsMarkup()}<div class="flow-engine-toolbar-actions">${statusBadge(canWrite() ? '写入可用' : '只读', canWrite() ? 'success' : 'warning')}</div></div>
       <main class="flow-engine-workbench">${degradedBannerMarkup()}${stale}<div class="flow-engine-tab-content">${tabContentMarkup()}</div></main>
     </section>`;
   }
@@ -672,9 +673,6 @@ export function mount(context = {}) {
       }
       return;
     }
-    if (event.target.closest?.('[data-flow-refresh]')) {
-      refresh(true);
-    }
   }
 
   function subscribe(key, slot) {
@@ -705,10 +703,22 @@ export function mount(context = {}) {
       renderPage();
     });
 
+  /*
+   * 手动刷新按钮按用户第 9 条删除。这一页订阅了 registry，但 registry 只按 TTL
+   * 缓存、不自轮询，所以补一条可见性受控的轮询强制重取（QoS 队列、apply 任务、
+   * WAN 健康都是运行态数据）。
+   */
+  state.pollTimer = window.setInterval(() => {
+    if (!state.mounted || document.hidden) return;
+    if (state.refreshing || state.refreshPromise) return;
+    refresh(true);
+  }, 15000);
+
   return {
     refresh,
     unmount() {
       state.mounted = false;
+      window.clearInterval(state.pollTimer);
       if (state.renderFrame) window.cancelAnimationFrame(state.renderFrame);
       unsubscribers.forEach((unsubscribe) => unsubscribe());
       root.removeEventListener('click', onClick);

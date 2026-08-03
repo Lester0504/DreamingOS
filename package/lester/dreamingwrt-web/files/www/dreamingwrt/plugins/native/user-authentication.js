@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260730-user-auth-online-layout-11';
+  const VERSION = '20260802-ui-batch-01';
   const MODULE_CLASS = 'user-authentication-route-host';
   const stage = root?.closest('.console-stage');
   const PAGE_BY_ID = {
@@ -64,6 +64,7 @@ export function mount(context = {}) {
   const state = {
     mounted: true,
     seq: 0,
+    pollTimer: 0,
     loading: true,
     loaded: false,
     refreshing: false,
@@ -172,6 +173,15 @@ export function mount(context = {}) {
     };
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -180,7 +190,7 @@ export function mount(context = {}) {
 
   async function requestJson(url, options = {}) {
     const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
       credentials: 'same-origin', cache: 'no-store', ...options,
       headers: authHeaders({ ...(options.body && !isFormData ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) })
     });
@@ -268,7 +278,7 @@ export function mount(context = {}) {
   }
 
   function toolbarMarkup(options = {}) {
-    return `<header class="policy-toolbar user-auth-toolbar"><div class="user-auth-toolbar-leading">${options.leading || (options.search === false ? '' : searchMarkup(options.placeholder))}</div><div class="policy-toolbar-actions">${actionButton(state.refreshing ? '正在刷新' : '刷新', 'refresh', 'refresh', { disabled: state.refreshing })}${options.actions || ''}</div></header>`;
+    return `<header class="policy-toolbar user-auth-toolbar"><div class="user-auth-toolbar-leading">${options.leading || (options.search === false ? '' : searchMarkup(options.placeholder))}</div><div class="policy-toolbar-actions">${options.actions || ''}</div></header>`;
   }
 
   function statusPill(label, active = false, warning = false) {
@@ -998,7 +1008,6 @@ export function mount(context = {}) {
     if (format) { document.execCommand(format.dataset.userAuthFormat, false); return; }
     const action = event.target.closest('[data-user-auth-action]')?.dataset.userAuthAction;
     if (!action) return;
-    if (action === 'refresh') load(true);
     else if (action === 'preview-portal' || action === 'preview-notification') { state.preview = true; render(); }
     else if (action === 'edit-web') openEditor('web');
     else if (action === 'edit-portal') openEditor('portal');
@@ -1104,11 +1113,23 @@ export function mount(context = {}) {
   render();
   load();
 
+  /*
+   * 手动刷新按钮按用户第 9 条删除，补一条可见性受控的轮询代替；
+   * 抽屉打开或正在保存时跳过，避免刷掉用户填的内容。
+   */
+  state.pollTimer = window.setInterval(() => {
+    if (!state.mounted || document.hidden) return;
+    if (state.loading || state.refreshing || state.saving) return;
+    if (state.drawer) return;
+    load(true);
+  }, 15000);
+
   return {
     refresh() { return load(true); },
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      window.clearInterval(state.pollTimer);
       root?.removeEventListener('click', onClick);
       root?.removeEventListener('input', onInput);
       root?.removeEventListener('change', onChange);

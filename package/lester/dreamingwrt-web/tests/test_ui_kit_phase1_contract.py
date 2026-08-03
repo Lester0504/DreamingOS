@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import re
 from pathlib import Path
 
 
@@ -66,7 +67,19 @@ assert 'background: var(--color-surface-dense' in KIT_CSS
 assert '@media (prefers-reduced-transparency: reduce)' in KIT_CSS
 
 assert 'id="aiBootstrap"' in APP
-assert '/static/js/dwrt-session-gate.js?v=20260720-01' in APP
+# Kit 与会话闸门的缓存键都随内容变更 bump，这里只守"引用存在且外壳预热用同一个键"。
+_gate = re.compile(r"/static/js/dwrt-session-gate\.js\?v=([0-9a-z.-]+)")
+_kit_js = re.compile(r"/static/ui-kit/dwrt-ui-kit\.js\?v=([0-9a-z.-]+)")
+_kit_css = re.compile(r"/static/ui-kit/dwrt-ui-kit\.css\?v=([0-9a-z.-]+)")
+PREWARM = (ROOT / "files/www/dreamingwrt/static/js/shell-prewarm.js").read_text(encoding="utf-8")
+for label, pattern in (("session-gate", _gate), ("ui-kit.js", _kit_js), ("ui-kit.css", _kit_css)):
+    in_app = pattern.findall(APP)
+    in_prewarm = pattern.findall(PREWARM)
+    assert in_app, f"app/index.html 必须带版本号引用 {label}"
+    assert in_prewarm, f"shell-prewarm.js 必须带版本号预热 {label}"
+    assert set(in_app) == set(in_prewarm), (
+        f"{label} 缓存键不一致: app={in_app} prewarm={in_prewarm}"
+    )
 assert 'id="sessionRecovery"' in APP
 assert "window.DWRT_SESSION.fetch" in SHELL
 assert "window.DWRT_SESSION.refresh" in SHELL

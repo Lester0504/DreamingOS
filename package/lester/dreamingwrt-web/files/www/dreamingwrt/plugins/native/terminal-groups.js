@@ -5,13 +5,14 @@ export function mount(context = {}) {
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
   const formatInteger = utils.formatInteger || ((value) => new Intl.NumberFormat('zh-CN').format(Number(value) || 0));
-  const VERSION = '20260710-02';
+  const VERSION = '20260802-ui-batch-01';
   const MODULE_CLASS = 'terminal-groups-route-host';
   const ENDPOINT = '/api/v1/policy-engine/terminal-groups';
   const CLIENTS_ENDPOINT = '/api/v1/clients';
 
   const state = {
     mounted: true,
+    pollTimer: 0,
     available: false,
     loading: true,
     clientsLoading: true,
@@ -129,6 +130,15 @@ export function mount(context = {}) {
     };
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -136,7 +146,7 @@ export function mount(context = {}) {
   }
 
   async function requestJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
       credentials: 'same-origin',
       cache: 'no-store',
       ...options,
@@ -278,7 +288,7 @@ export function mount(context = {}) {
     return `<section class="terminal-group-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface">
       <div class="dwrt-kit-table-toolbar terminal-group-table-toolbar">
         <div class="dwrt-kit-table-title"><strong>终端分组</strong><span class="${state.error ? 'is-warning' : ''}">${escapeHtml(subtitle)}</span></div>
-        <div class="terminal-group-table-meta"><span class="dwrt-kit-table-count">${escapeHtml(formatInteger(groups.length))} 个分组 · ${escapeHtml(formatInteger(groups.reduce((sum, item) => sum + item.member_count, 0)))} 个成员</span><button type="button" data-terminal-group-refresh title="刷新" aria-label="刷新终端分组">${icon('refresh')}</button></div>
+        <div class="terminal-group-table-meta"><span class="dwrt-kit-table-count">${escapeHtml(formatInteger(groups.length))} 个分组 · ${escapeHtml(formatInteger(groups.reduce((sum, item) => sum + item.member_count, 0)))} 个成员</span></div>
       </div>
       <div class="dwrt-kit-table-scroll terminal-group-table-scroll">
         <table class="dwrt-kit-table dwrt-kit-ikuai-table terminal-group-table">
@@ -511,7 +521,6 @@ export function mount(context = {}) {
     bindTableActions();
     root.querySelector('[data-terminal-group-create]')?.addEventListener('click', () => openDrawer('create'));
     root.querySelectorAll('[data-terminal-group-close]').forEach((button) => button.addEventListener('click', closeDrawer));
-    root.querySelector('[data-terminal-group-refresh]')?.addEventListener('click', load);
     root.querySelector('[data-terminal-group-import]')?.addEventListener('click', () => root.querySelector('[data-terminal-group-import-file]')?.click());
     root.querySelector('[data-terminal-group-import-file]')?.addEventListener('change', handleImportFile);
     root.querySelectorAll('[data-terminal-group-export]').forEach((button) => button.addEventListener('click', () => exportGroups(button.dataset.terminalGroupExport)));
@@ -728,10 +737,22 @@ export function mount(context = {}) {
   render();
   load();
 
+  /*
+   * 手动刷新按钮按用户第 9 条删除，补一条可见性受控的轮询代替；
+   * 有未保存草稿、抽屉或确认弹窗时跳过，避免刷掉用户填的内容。
+   */
+  state.pollTimer = window.setInterval(() => {
+    if (!state.mounted || document.hidden) return;
+    if (state.loading || state.clientsLoading || state.saving) return;
+    if (state.drawerOpen) return;
+    load();
+  }, 20000);
+
   return {
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      window.clearInterval(state.pollTimer);
       if (root) root.replaceChildren();
       root?.classList.remove(MODULE_CLASS, 'policy-table-route-host', 'route-workspace');
     }

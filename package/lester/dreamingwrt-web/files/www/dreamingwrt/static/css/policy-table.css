@@ -2,7 +2,7 @@
 .console-stage.is-policy-table {
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
   overflow: hidden;
@@ -492,7 +492,7 @@
 
 .policy-filter-drawer {
   --dwrt-kit-sheet-z: 70;
-  --dwrt-kit-sheet-width: min(75vw, 390px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   grid-template-rows: auto minmax(0, 1fr) auto;
 }
 
@@ -683,11 +683,11 @@
 
 .policy-side-panel {
   --dwrt-kit-sheet-z: 70;
-  --dwrt-kit-sheet-width: min(86vw, 560px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form);
 }
 
 .policy-create-panel {
-  --dwrt-kit-sheet-width: min(92vw, 620px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form);
   grid-template-rows: auto minmax(0, 1fr) auto;
 }
 
@@ -1258,7 +1258,7 @@ html[data-theme-resolved="light"] .policy-table-route-host .policy-stable-glass 
 }
 
 @media (max-width: 560px) {
-  .policy-create-panel { --dwrt-kit-sheet-width: 100vw; }
+  .policy-create-panel { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full); }
   .policy-create-panel .policy-side-body { padding-inline: 15px; }
   .policy-type-picker label { min-width: 64px; padding-inline: 10px; }
   .policy-time-grid,

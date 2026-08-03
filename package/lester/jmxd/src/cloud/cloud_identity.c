@@ -141,26 +141,119 @@ static int cloud_identity_generate(unsigned char *private_key)
     return rc;
 }
 
-/* router_id is a UUID v4. It is public, non-secret routing metadata. */
-static int cloud_identity_generate_router_id(char *out, size_t out_size)
+/* Ed25519 keygen and public-key derivation. Kept separate from the X25519
+ * helpers rather than parameterised: the two key types are persisted to
+ * different files and a mix-up would be silent until enrollment failed. */
+static int cloud_identity_generate_signing(unsigned char *private_key)
 {
-    unsigned char raw[16];
+    EVP_PKEY_CTX *ctx;
+    EVP_PKEY *key = NULL;
+    size_t length = CLOUD_ED25519_KEY_LEN;
+    int rc = -1;
 
-    if (out_size < CLOUD_UUID_LEN + 1)
+    ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+    if (!ctx)
         return -1;
-    if (RAND_bytes(raw, sizeof(raw)) != 1)
+    if (EVP_PKEY_keygen_init(ctx) == 1 && EVP_PKEY_keygen(ctx, &key) == 1 &&
+        EVP_PKEY_get_raw_private_key(key, private_key, &length) == 1 &&
+        length == CLOUD_ED25519_KEY_LEN)
+        rc = 0;
+    EVP_PKEY_free(key);
+    EVP_PKEY_CTX_free(ctx);
+    return rc;
+}
+
+static int cloud_identity_derive_signing_public(const unsigned char *private_key,
+                                                unsigned char *public_key)
+{
+    EVP_PKEY *key;
+    size_t length = CLOUD_ED25519_KEY_LEN;
+    int rc = -1;
+
+    key = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, private_key,
+                                       CLOUD_ED25519_KEY_LEN);
+    if (!key)
         return -1;
-    raw[6] = (unsigned char)((raw[6] & 0x0f) | 0x40);
-    raw[8] = (unsigned char)((raw[8] & 0x3f) | 0x80);
-    snprintf(out, out_size,
-             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-             raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14],
-             raw[15]);
+    if (EVP_PKEY_get_raw_public_key(key, public_key, &length) == 1 &&
+        length == CLOUD_ED25519_KEY_LEN)
+        rc = 0;
+    EVP_PKEY_free(key);
+    return rc;
+}
+
+/*
+ * ROUTER_AGENT_CONTRACT.md section 2. The relay records this id but never
+ * assigns it: if it could, a relay operator would be able to point a stored App
+ * profile at a different router, which is the one way to bypass the end-to-end
+ * encryption. Deriving it from both public keys makes claiming someone else's id
+ * equivalent to a second-preimage attack on 128-bit truncated SHA-256.
+ */
+int cloud_identity_derive_router_id(const unsigned char *kex_public_key,
+                                    const unsigned char *signing_public_key,
+                                    char *out, size_t out_size)
+{
+    unsigned char material[CLOUD_X25519_KEY_LEN + CLOUD_ED25519_KEY_LEN];
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    static const char hex[] = "0123456789abcdef";
+    size_t i, o;
+
+    /* "router-" + 32 hex chars + NUL */
+    if (!kex_public_key || !signing_public_key || !out || out_size < 40)
+        return -1;
+    memcpy(material, kex_public_key, CLOUD_X25519_KEY_LEN);
+    memcpy(material + CLOUD_X25519_KEY_LEN, signing_public_key,
+           CLOUD_ED25519_KEY_LEN);
+    if (!SHA256(material, sizeof(material), digest))
+        return -1;
+    memcpy(out, "router-", 7);
+    o = 7;
+    for (i = 0; i < 16; i++) {
+        out[o++] = hex[(digest[i] >> 4) & 0x0f];
+        out[o++] = hex[digest[i] & 0x0f];
+    }
+    out[o] = '\0';
     return 0;
 }
 
-static int cloud_identity_router_id_valid(const char *value)
+int cloud_identity_sign(const unsigned char *message, size_t message_len,
+                        unsigned char *out, size_t out_size)
+{
+    EVP_PKEY *key = NULL;
+    EVP_MD_CTX *ctx = NULL;
+    size_t signature_len = 64;
+    int rc = -1;
+
+    if (!out || out_size < 64)
+        return -1;
+    if (cloud_identity_load(NULL) != 0)
+        return -1;
+    key = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL,
+                                       g_identity.signing_private_key,
+                                       CLOUD_ED25519_KEY_LEN);
+    if (!key)
+        return -1;
+    ctx = EVP_MD_CTX_new();
+    if (ctx &&
+        EVP_DigestSignInit(ctx, NULL, NULL, NULL, key) == 1 &&
+        EVP_DigestSign(ctx, out, &signature_len, message, message_len) == 1 &&
+        signature_len == 64)
+        rc = 0;
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(key);
+    return rc;
+}
+
+/*
+ * Accepts both id shapes that exist in the field.
+ *
+ * The contract form is the fingerprint of both public keys. The UUID form was
+ * minted by earlier builds of this daemon; per contract section 2 it still works
+ * for static registration in the relay's config.json but cannot self enroll,
+ * because no signature can produce a matching fingerprint. Rewriting one to the
+ * other would change the identity every paired App has pinned, so an existing id
+ * is kept as-is and only its capability is downgraded.
+ */
+static int cloud_identity_router_id_is_uuid(const char *value)
 {
     size_t i;
 
@@ -180,10 +273,48 @@ static int cloud_identity_router_id_valid(const char *value)
     return 1;
 }
 
-static int cloud_identity_load_router_id(char *out, size_t out_size)
+/* "router-" + exactly 32 lowercase hex characters. */
+static int cloud_identity_router_id_is_fingerprint(const char *value)
 {
-    char buffer[CLOUD_UUID_LEN + 2] = {0};
+    size_t i;
+
+    if (!value || strlen(value) != 7 + 32 || strncmp(value, "router-", 7))
+        return 0;
+    for (i = 7; i < 7 + 32; i++) {
+        char c = value[i];
+
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return 0;
+    }
+    return 1;
+}
+
+static int cloud_identity_router_id_valid(const char *value)
+{
+    return cloud_identity_router_id_is_fingerprint(value) ||
+           cloud_identity_router_id_is_uuid(value);
+}
+
+/*
+ * Loads the persisted router_id, deriving and persisting the contract form on
+ * first run. `key_derived` reports whether the effective id is the fingerprint
+ * of the two public keys, which is what decides whether self enrollment is even
+ * possible.
+ */
+static int cloud_identity_load_router_id(const unsigned char *kex_public_key,
+                                        const unsigned char *signing_public_key,
+                                        char *out, size_t out_size,
+                                        int *key_derived)
+{
+    char buffer[CLOUD_ROUTER_ID_MAX + 2] = {0};
+    char derived[64];
     FILE *fp;
+
+    if (key_derived)
+        *key_derived = 0;
+    if (cloud_identity_derive_router_id(kex_public_key, signing_public_key,
+                                        derived, sizeof(derived)) != 0)
+        return -1;
 
     fp = fopen(CLOUD_ROUTER_ID_PATH, "r");
     if (fp) {
@@ -197,6 +328,20 @@ static int cloud_identity_load_router_id(char *out, size_t out_size)
         fclose(fp);
         if (cloud_identity_router_id_valid(buffer)) {
             snprintf(out, out_size, "%s", buffer);
+            if (key_derived)
+                *key_derived = !strcmp(buffer, derived);
+            /*
+             * A stored fingerprint that does not match the current keys means
+             * the id and the key files have drifted apart. Reported, not
+             * silently corrected: the App pinned the stored value, and the
+             * honest answer is that this router can no longer prove that id.
+             */
+            if (cloud_identity_router_id_is_fingerprint(buffer) &&
+                strcmp(buffer, derived))
+                fprintf(stderr,
+                        "[%s] router_id does not match the current keys "
+                        "stored=%s derived=%s\n",
+                        CLOUD_SERVICE_NAME, buffer, derived);
             return 0;
         }
         /* A corrupt id is reported rather than silently replaced: replacing it
@@ -204,12 +349,14 @@ static int cloud_identity_load_router_id(char *out, size_t out_size)
         if (buffer[0])
             return -1;
     }
-    if (cloud_identity_generate_router_id(out, out_size) != 0)
-        return -1;
+
+    snprintf(out, out_size, "%s", derived);
     if (cloud_identity_write_secret(CLOUD_ROUTER_ID_PATH,
                                     (const unsigned char *)out, strlen(out),
                                     0644) != 0)
         return -1;
+    if (key_derived)
+        *key_derived = 1;
     return 0;
 }
 
@@ -251,19 +398,58 @@ int cloud_identity_load(struct cloud_identity *out)
                 CLOUD_SERVICE_NAME);
     }
 
+    /*
+     * The signing key is generated on demand, including for routers installed
+     * before it existed. It is a separate file so an upgrade adds the signing
+     * ability without touching the X25519 key the Apps already pinned.
+     */
+    if (cloud_identity_read_file(CLOUD_SIGNING_KEY_PATH,
+                                 identity.signing_private_key,
+                                 CLOUD_ED25519_KEY_LEN) != 0) {
+        struct stat st;
+
+        if (stat(CLOUD_SIGNING_KEY_PATH, &st) == 0) {
+            fprintf(stderr,
+                    "[%s] signing key present but unreadable path=%s\n",
+                    CLOUD_SERVICE_NAME, CLOUD_SIGNING_KEY_PATH);
+            OPENSSL_cleanse(identity.private_key, sizeof(identity.private_key));
+            return -1;
+        }
+        if (cloud_identity_generate_signing(identity.signing_private_key) != 0 ||
+            cloud_identity_write_secret(CLOUD_SIGNING_KEY_PATH,
+                                        identity.signing_private_key,
+                                        CLOUD_ED25519_KEY_LEN, 0600) != 0) {
+            OPENSSL_cleanse(identity.private_key, sizeof(identity.private_key));
+            OPENSSL_cleanse(identity.signing_private_key,
+                            sizeof(identity.signing_private_key));
+            return -1;
+        }
+        fprintf(stderr, "[%s] generated new relay signing key\n",
+                CLOUD_SERVICE_NAME);
+    }
+
     if (cloud_identity_derive_public(identity.private_key,
                                      identity.public_key) != 0 ||
-        cloud_identity_load_router_id(identity.router_id,
-                                      sizeof(identity.router_id)) != 0 ||
+        cloud_identity_derive_signing_public(identity.signing_private_key,
+                                             identity.signing_public_key) != 0 ||
+        cloud_identity_load_router_id(identity.public_key,
+                                      identity.signing_public_key,
+                                      identity.router_id,
+                                      sizeof(identity.router_id),
+                                      &identity.router_id_is_key_derived) != 0 ||
         cloud_identity_fingerprint(identity.public_key, identity.fingerprint,
                                    sizeof(identity.fingerprint)) != 0) {
         OPENSSL_cleanse(identity.private_key, sizeof(identity.private_key));
+        OPENSSL_cleanse(identity.signing_private_key,
+                        sizeof(identity.signing_private_key));
         return -1;
     }
 
     g_identity = identity;
     g_identity_loaded = 1;
     OPENSSL_cleanse(identity.private_key, sizeof(identity.private_key));
+    OPENSSL_cleanse(identity.signing_private_key,
+                    sizeof(identity.signing_private_key));
     if (out)
         *out = g_identity;
     return 0;

@@ -690,6 +690,20 @@ static void client_iface_cache_refresh(void)
     g_client_iface_cache_at = get_timestamp();
 }
 
+/* The interface cache used to be refreshed only as a side effect of
+ * client_iface_is_lan(). Callers that need the LAN list directly -- the bridge
+ * FDB cross-check in particular -- would then walk an empty list and report
+ * "unreadable" for every client, which silently disabled the ghost-client
+ * detection. Every consumer goes through here now. */
+static void client_iface_cache_ensure(void)
+{
+    u_int32_t now = get_timestamp();
+
+    if (!g_client_iface_cache_at ||
+        now - g_client_iface_cache_at >= CLIENT_IFACE_CACHE_TTL)
+        client_iface_cache_refresh();
+}
+
 static int client_iface_is_lan(const char *ifname)
 {
     char path[160];
@@ -700,8 +714,8 @@ static int client_iface_is_lan(const char *ifname)
 
     if (!ifname || !ifname[0])
         return 0;
-    if (!g_client_iface_cache_at || now - g_client_iface_cache_at >= CLIENT_IFACE_CACHE_TTL)
-        client_iface_cache_refresh();
+    (void)now;
+    client_iface_cache_ensure();
     if (client_iface_list_has(g_client_wan_ifaces, g_client_wan_iface_count, ifname))
         return 0;
     if (client_iface_list_has(g_client_lan_ifaces, g_client_lan_iface_count, ifname))
@@ -773,8 +787,13 @@ static void client_set_ipv6_evidence(client_node_t *node, const char *addr,
     } else if (!node->ipv6_global[0]) {
         snprintf(node->ipv6_global, sizeof(node->ipv6_global), "%s", addr);
     }
-    if (state && state[0])
-        snprintf(node->neigh_state, sizeof(node->neigh_state), "%s", state);
+    if (state && state[0]) {
+        snprintf(node->neigh_state_v6, sizeof(node->neigh_state_v6), "%s", state);
+        /* Kept for existing consumers, but IPv6 must not clobber an IPv4
+         * observation; that overwrite is what produced the ghost clients. */
+        if (!node->neigh_state_v4[0])
+            snprintf(node->neigh_state, sizeof(node->neigh_state), "%s", state);
+    }
 }
 
 static int client_neigh_state_observed(const char *state)
@@ -783,6 +802,85 @@ static int client_neigh_state_observed(const char *state)
            (strstr(state, "REACHABLE") || strstr(state, "STALE") ||
             strstr(state, "DELAY") || strstr(state, "PROBE") ||
             strstr(state, "PERMANENT") || strstr(state, "NOARP"));
+}
+
+/* FAILED/INCOMPLETE are real observations, not an absence of one. Dropping
+ * them lost the negative evidence that the offline fallback depends on. */
+static int client_neigh_state_negative(const char *state)
+{
+    return state && state[0] &&
+           (strstr(state, "FAILED") || strstr(state, "INCOMPLETE"));
+}
+
+/*
+ * Bridge forwarding-database evidence.
+ *
+ * `/sys/class/net/<bridge>/brforward` answers a harder question than the
+ * neighbour cache does: has this bridge actually received a frame from that
+ * MAC recently. A vanished container veth disappears from here immediately,
+ * while its IPv6 neighbour entry can linger in STALE for a long time.
+ *
+ * Layout is a packed array of 16-byte records; the MAC occupies the first six
+ * bytes. Read as binary rather than shelling out, and treat an unreadable
+ * bridge as "no information" instead of "absent".
+ */
+#define CLIENT_FDB_RECORD_LEN 16
+#define CLIENT_FDB_MAX_RECORDS 4096
+
+static int client_bridge_fdb_has_mac(const char *bridge, const char *mac_l)
+{
+    char path[192];
+    unsigned char record[CLIENT_FDB_RECORD_LEN];
+    unsigned int probe[6];
+    unsigned char want[6];
+    size_t records = 0;
+    FILE *fp;
+    int found = 0;
+    int i;
+
+    if (!bridge || !bridge[0] || !mac_l || !mac_l[0])
+        return -1;
+    if (sscanf(mac_l, "%2x:%2x:%2x:%2x:%2x:%2x", &probe[0], &probe[1],
+               &probe[2], &probe[3], &probe[4], &probe[5]) != 6)
+        return -1;
+    for (i = 0; i < 6; i++)
+        want[i] = (unsigned char)probe[i];
+    if (snprintf(path, sizeof(path), "/sys/class/net/%s/brforward", bridge) >=
+        (int)sizeof(path))
+        return -1;
+    fp = fopen(path, "rb");
+    if (!fp)
+        return -1;
+    while (fread(record, 1, sizeof(record), fp) == sizeof(record)) {
+        if (++records > CLIENT_FDB_MAX_RECORDS)
+            break;
+        if (!memcmp(record, want, sizeof(want))) {
+            found = 1;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
+/* Any LAN bridge counts: a client behind a guest bridge is still present. */
+static int client_fdb_lookup(const char *mac_l)
+{
+    int known = 0;
+    int i;
+
+    /* Without this the list can still be empty on the first pass and every
+     * client would be reported as "bridge unreadable". */
+    client_iface_cache_ensure();
+    for (i = 0; i < g_client_lan_iface_count; i++) {
+        int rc = client_bridge_fdb_has_mac(g_client_lan_ifaces[i], mac_l);
+
+        if (rc > 0)
+            return 1;
+        if (rc == 0)
+            known = 1;
+    }
+    return known ? 0 : -1;
 }
 
 static int client_neigh_state_marks_online(const char *state)
@@ -826,8 +924,12 @@ static void client_set_ipv4_evidence(client_node_t *node, const char *ip,
         return;
     if (strcmp(ip, "0.0.0.0"))
         snprintf(node->ip, sizeof(node->ip), "%s", ip);
-    if (state && state[0])
+    if (state && state[0]) {
+        snprintf(node->neigh_state_v4, sizeof(node->neigh_state_v4), "%s", state);
+        /* IPv4 is authoritative for the shared field: this router owns the
+         * IPv4 LAN, so a FAILED here is the strongest available signal. */
         snprintf(node->neigh_state, sizeof(node->neigh_state), "%s", state);
+    }
 }
 
 static void client_mark_online(client_node_t *node, const char *source)
@@ -1029,6 +1131,9 @@ void clean_client_online_status(void)
         node->ipv6_link_local[0] = '\0';
         node->ipv6_addrs[0] = '\0';
         node->neigh_state[0] = '\0';
+        node->neigh_state_v4[0] = '\0';
+        node->neigh_state_v6[0] = '\0';
+        node->bridge_fdb_present = -1;   /* -1 = not determined this round */
         if (node->online)
         {
             node->offline_time = get_timestamp();
@@ -1080,8 +1185,27 @@ static void client_collect_ip_neigh(int family)
         client_last_token(line, state, sizeof(state));
         if (!state[0])
             snprintf(state, sizeof(state), "%s", "unknown");
-        if (!client_neigh_state_observed(state))
+        if (!client_neigh_state_observed(state) &&
+            !client_neigh_state_negative(state))
             continue;
+        if (client_neigh_state_negative(state)) {
+            /* Record the failure on a node we already know about, but never
+             * create one from it: an unreachable address is not a new client. */
+            node = find_client_node(mac_l);
+            if (!node)
+                continue;
+            if (family == AF_INET6)
+                snprintf(node->neigh_state_v6,
+                         sizeof(node->neigh_state_v6), "%s", state);
+            else
+                snprintf(node->neigh_state_v4,
+                         sizeof(node->neigh_state_v4), "%s", state);
+            /* IPv4 owns the shared field; IPv6 only fills it when IPv4 said
+             * nothing, so a stale v6 entry cannot mask a v4 failure. */
+            if (family == AF_INET || !node->neigh_state_v4[0])
+                snprintf(node->neigh_state, sizeof(node->neigh_state), "%s", state);
+            continue;
+        }
         node = find_client_node(mac_l);
         if (!node) {
             if (!client_neigh_state_marks_online(state))
@@ -1214,9 +1338,35 @@ ipv6_neigh:
     fclose(fp);
 }
 
+/* Runs after every source has had its say, so one lookup per client covers
+ * ARP, IPv4 and IPv6 neighbour evidence alike. */
+static void client_refresh_bridge_fdb(void)
+{
+    client_node_t *node = NULL;
+
+    list_for_each_entry(node, &client_list, client)
+        node->bridge_fdb_present = client_fdb_lookup(node->mac);
+}
+
+/* Read-time entry point for callers outside this file. Lowercases the MAC the
+ * same way the collectors do so a caller passing an upper-case address from the
+ * database still matches. */
+int client_bridge_fdb_present(const char *mac)
+{
+    char mac_l[MAX_MAC_LEN] = {0};
+
+    if (!mac || !mac[0])
+        return -1;
+    client_lower_mac(mac, mac_l, sizeof(mac_l));
+    if (!mac_l[0])
+        return -1;
+    return client_fdb_lookup(mac_l);
+}
+
 void update_client_online_status(void)
 {
     update_client_from_kernel();
+    client_refresh_bridge_fdb();
 }
 
 #define CLIENT_OFFLINE_TIME (SECONDS_PER_DAY * 3)

@@ -3,7 +3,7 @@
   grid-template-rows: minmax(0, 1fr);
   align-items: start;
   width: 100%;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block, var(--app-page-gutter, 16px)) var(--app-page-gutter-inline, var(--app-page-gutter, 16px));
   overflow: hidden;
@@ -508,7 +508,7 @@
 .upnp-address small { font-size: 11px; }
 
 .upnp-sheet {
-  --dwrt-kit-sheet-width: min(460px, calc(100vw - var(--app-menu-glass-width, 0px) - 18px));
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   z-index: 91;
 }
 
@@ -613,7 +613,7 @@
   }
 
   .upnp-sheet {
-    --dwrt-kit-sheet-width: calc(100vw - 18px);
+    --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full);
     --dwrt-kit-sheet-max-width: calc(100vw - 18px);
   }
 }

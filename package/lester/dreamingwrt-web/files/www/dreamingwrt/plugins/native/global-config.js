@@ -1,4 +1,4 @@
-import { mount as mountNetworkInterfaceConfig } from './network-interface-config.js?v=20260722-42';
+import { mount as mountNetworkInterfaceConfig } from './network-interface-config.js?v=20260802-ui-batch-01';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -6,7 +6,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
-  const VERSION = '20260722-42';
+  const VERSION = '20260802-ui-batch-01';
   const MODULE_CLASS = 'global-config-route-host';
   const ENDPOINTS = {
     overview: '/api/v1/network/overview',
@@ -72,7 +72,7 @@ export function mount(context = {}) {
     globalTab: 'internet',
     bulkDraft: { speed: 0, duplex: 'full', autoneg: true }, bulkInitial: { speed: 0, duplex: 'full', autoneg: true }, bulkPreview: null,
     saving: false, notice: '', globalNotice: '', timer: 0, statsTimer: 0, statsRefreshing: false, preferencesLoaded: false,
-    advancedOpen: new Set(['wan-policy'])
+    advancedOpen: new Set(['wan-policy']), pollTimer: 0
   };
   let searchTimer = 0;
   let interfaceInstances = new Map();
@@ -178,13 +178,22 @@ export function mount(context = {}) {
     }
     return null;
   }
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
     return { Accept: 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(typeof api.authHeaders === 'function' ? api.authHeaders() : {}), ...extra };
   }
   async function requestJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
       credentials: 'same-origin', cache: 'no-store', ...options,
       headers: authHeaders({ ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) })
     });
@@ -637,7 +646,7 @@ export function mount(context = {}) {
     }
     if (state.pageTab === 'wan' || state.pageTab === 'lan') {
       const kind = state.pageTab;
-      return `<div class="global-page-actions global-interface-page-actions"><label class="policy-search policy-search-main global-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-global-interface-search="${kind}" placeholder="搜索名称、接口、地址或运营商" value="${escapeHtml(state.query)}"></label><button class="policy-filter-button" type="button" data-global-interface-refresh="${kind}">${icon('refresh')}<span>刷新</span></button><button class="policy-create-button" type="button" data-global-interface-create="${kind}">${icon('plus')}<span>新建 ${kind.toUpperCase()}</span></button></div>`;
+      return `<div class="global-page-actions global-interface-page-actions"><label class="policy-search policy-search-main global-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-global-interface-search="${kind}" placeholder="搜索名称、接口、地址或运营商" value="${escapeHtml(state.query)}"></label><button class="policy-create-button" type="button" data-global-interface-create="${kind}">${icon('plus')}<span>新建 ${kind.toUpperCase()}</span></button></div>`;
     }
     return '';
   }
@@ -743,7 +752,7 @@ export function mount(context = {}) {
     const tableWidth = columns.reduce((total, column) => total + column.width, 0);
     const subtitle = state.error || `${state.ports.filter((port) => port.connected).length} 个使用中 · ${state.ports.length - state.ports.filter((port) => port.connected).length} 个未连接`;
     const allSelected = rows.length > 0 && rows.every((port) => state.selectedPorts.has(port.id));
-    return `<section class="global-port-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface" data-dwrt-component="data-table" data-global-table><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>所有端口</strong><span class="${state.error ? 'is-warning' : ''}">${escapeHtml(subtitle)}</span></div><div class="global-table-meta">${state.selectedPorts.size ? `<button class="global-bulk-button" type="button" data-global-bulk>${icon('batch')}批量配置 ${state.selectedPorts.size}</button>` : ''}<span class="dwrt-kit-table-count">${rows.length}/${state.ports.length} 个端口</span><button type="button" data-global-refresh aria-label="刷新端口" title="刷新">${icon('refresh')}</button></div></div><div class="dwrt-kit-table-scroll global-port-table-scroll" data-global-scroll><table class="dwrt-kit-table dwrt-kit-ikuai-table global-port-table" style="--global-port-table-width:${tableWidth}px"><thead><tr>${columns.map((column) => `<th style="width:${column.width}px;min-width:${column.width}px">${column.key === 'select' ? `<label class="global-row-select" aria-label="选择当前结果"><input type="checkbox" data-global-select-all ${allSelected ? 'checked' : ''}><span></span></label>` : `<button type="button" data-global-sort="${column.key}" ${column.key === 'actions' ? 'disabled' : ''}>${escapeHtml(column.label)}${sortIndicator(column.key)}</button>`}</th>`).join('')}</tr></thead><tbody>${state.loading ? `<tr><td colspan="${columns.length}" class="dwrt-kit-table-empty">正在读取端口状态</td></tr>` : rows.length ? rows.map((port) => `<tr data-global-port-id="${escapeHtml(port.id)}" class="${port.connected ? 'is-connected' : 'is-disconnected'} ${state.selectedPorts.has(port.id) ? 'is-selected' : ''}">${columns.map((column) => `<td class="is-${column.key}">${cell(port, column.key)}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${columns.length}" class="dwrt-kit-table-empty">${escapeHtml(state.error || '没有匹配的端口')}</td></tr>`}</tbody></table></div></section>`;
+    return `<section class="global-port-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface" data-dwrt-component="data-table" data-global-table><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>所有端口</strong><span class="${state.error ? 'is-warning' : ''}">${escapeHtml(subtitle)}</span></div><div class="global-table-meta">${state.selectedPorts.size ? `<button class="global-bulk-button" type="button" data-global-bulk>${icon('batch')}批量配置 ${state.selectedPorts.size}</button>` : ''}<span class="dwrt-kit-table-count">${rows.length}/${state.ports.length} 个端口</span></div></div><div class="dwrt-kit-table-scroll global-port-table-scroll" data-global-scroll><table class="dwrt-kit-table dwrt-kit-ikuai-table global-port-table" style="--global-port-table-width:${tableWidth}px"><thead><tr>${columns.map((column) => `<th style="width:${column.width}px;min-width:${column.width}px">${column.key === 'select' ? `<label class="global-row-select" aria-label="选择当前结果"><input type="checkbox" data-global-select-all ${allSelected ? 'checked' : ''}><span></span></label>` : `<button type="button" data-global-sort="${column.key}" ${column.key === 'actions' ? 'disabled' : ''}>${escapeHtml(column.label)}${sortIndicator(column.key)}</button>`}</th>`).join('')}</tr></thead><tbody>${state.loading ? `<tr><td colspan="${columns.length}" class="dwrt-kit-table-empty">正在读取端口状态</td></tr>` : rows.length ? rows.map((port) => `<tr data-global-port-id="${escapeHtml(port.id)}" class="${port.connected ? 'is-connected' : 'is-disconnected'} ${state.selectedPorts.has(port.id) ? 'is-selected' : ''}">${columns.map((column) => `<td class="is-${column.key}">${cell(port, column.key)}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${columns.length}" class="dwrt-kit-table-empty">${escapeHtml(state.error || '没有匹配的端口')}</td></tr>`}</tbody></table></div></section>`;
   }
   function gatewayPorts() {
     return [...state.ports].sort((a, b) => {
@@ -901,7 +910,7 @@ export function mount(context = {}) {
   function renderGatewayPorts() {
     const canApply = state.gatewayPreview && state.gatewayPreview.failed === 0 && strictCap('gateway_port_assignment_atomic_apply');
     const noticeError = /失败|不支持|未实现|未知|无法|必须/.test(state.gatewayNotice);
-    return `<section class="gateway-ports-card dwrt-kit-glass-surface" data-global-gateway><header><div><strong>Gateway 端口</strong><span>查看链路状态并分配 WAN 角色</span></div><button class="policy-secondary" type="button" data-global-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '刷新中' : '刷新'}</span></button></header><div class="gateway-ports-body"><div class="gateway-port-map">${gatewayDiagramMarkup()}${gatewayLegendMarkup()}</div>${gatewayTableMarkup()}${gatewayPreviewMarkup()}${state.gatewayNotice ? `<div class="global-notice ${noticeError ? 'is-error' : ''}">${escapeHtml(state.gatewayNotice)}</div>` : ''}</div>${gatewayDirty() ? `<footer><button class="policy-secondary" type="button" data-gateway-reset>取消</button>${canApply ? `<button class="policy-primary" type="button" data-gateway-apply ${state.saving ? 'disabled' : ''}>${state.saving ? '正在应用' : '确认应用'}</button>` : `<button class="policy-primary" type="button" data-gateway-preview ${state.saving ? 'disabled' : ''}>${state.saving ? '正在检查' : state.gatewayPreview ? '重新检查' : '应用更改'}</button>`}</footer>` : ''}</section>`;
+    return `<section class="gateway-ports-card dwrt-kit-glass-surface" data-global-gateway><header><div><strong>Gateway 端口</strong><span>查看链路状态并分配 WAN 角色</span></div></header><div class="gateway-ports-body"><div class="gateway-port-map">${gatewayDiagramMarkup()}${gatewayLegendMarkup()}</div>${gatewayTableMarkup()}${gatewayPreviewMarkup()}${state.gatewayNotice ? `<div class="global-notice ${noticeError ? 'is-error' : ''}">${escapeHtml(state.gatewayNotice)}</div>` : ''}</div>${gatewayDirty() ? `<footer><button class="policy-secondary" type="button" data-gateway-reset>取消</button>${canApply ? `<button class="policy-primary" type="button" data-gateway-apply ${state.saving ? 'disabled' : ''}>${state.saving ? '正在应用' : '确认应用'}</button>` : `<button class="policy-primary" type="button" data-gateway-preview ${state.saving ? 'disabled' : ''}>${state.saving ? '正在检查' : state.gatewayPreview ? '重新检查' : '应用更改'}</button>`}</footer>` : ''}</section>`;
   }
   function radio(name, value, label, count, checked) { return `<label class="policy-filter-row"><input type="radio" name="${name}" value="${value}" ${checked ? 'checked' : ''}><span class="policy-control-dot"></span><span class="policy-filter-label">${escapeHtml(label)}</span><span class="policy-filter-count">${count}</span></label>`; }
   function renderFilterDrawer() {
@@ -1311,7 +1320,6 @@ export function mount(context = {}) {
   function bindTableEvents() {
     root.querySelectorAll('[data-global-port]').forEach((button)=>button.addEventListener('click',()=>openPort(button.dataset.globalPort)));
     root.querySelectorAll('[data-global-sort]').forEach((button)=>button.addEventListener('click',()=>{const key=button.dataset.globalSort;if(!key||key==='actions')return;if(state.sortKey===key)state.sortDirection=state.sortDirection==='asc'?'desc':'asc';else{state.sortKey=key;state.sortDirection='asc';}patchMain();}));
-    root.querySelectorAll('[data-global-refresh]').forEach((button)=>button.addEventListener('click',()=>load(true)));
     root.querySelectorAll('[data-global-port-select]').forEach((input)=>input.addEventListener('change',()=>{if(input.checked)state.selectedPorts.add(input.dataset.globalPortSelect);else state.selectedPorts.delete(input.dataset.globalPortSelect);patchMain();}));
     root.querySelectorAll('[data-global-select-all]').forEach((input)=>input.addEventListener('change',()=>{filteredPorts().forEach((port)=>{if(input.checked)state.selectedPorts.add(port.id);else state.selectedPorts.delete(port.id);});patchMain();}));
     root.querySelectorAll('[data-global-bulk]').forEach((button)=>button.addEventListener('click',()=>{state.bulkDraft=clone(state.bulkInitial);state.bulkPreview=null;state.notice='';state.drawer='bulk';render();}));
@@ -1335,7 +1343,6 @@ export function mount(context = {}) {
       state.query = input.value;
       interfaceInstances.get(`${input.dataset.globalInterfaceSearch}-table`)?.setQuery?.(state.query);
     }));
-    root.querySelectorAll('[data-global-interface-refresh]').forEach((button) => button.addEventListener('click', () => interfaceInstances.get(`${button.dataset.globalInterfaceRefresh}-table`)?.refresh?.()));
     root.querySelectorAll('[data-global-interface-create]').forEach((button) => button.addEventListener('click', () => interfaceInstances.get(`${button.dataset.globalInterfaceCreate}-table`)?.openCreate?.()));
     root.querySelectorAll('[data-gateway-assignment]').forEach((select) => select.addEventListener('change', () => setGatewayAssignment(select.dataset.gatewayAssignment, select.value)));
     root.querySelectorAll('[data-gateway-port]').forEach((button) => button.addEventListener('click', () => {
@@ -1395,7 +1402,18 @@ export function mount(context = {}) {
   render();
   load();
   state.statsTimer = window.setInterval(refreshPortStatistics, 2000);
-  return { unmount(){state.mounted=false;state.seq+=1;window.clearTimeout(searchTimer);window.clearInterval(state.statsTimer);interfaceInstances.forEach((instance)=>instance.unmount?.());interfaceInstances.clear();root?.replaceChildren();root?.classList.remove(MODULE_CLASS,'route-workspace');} };
+  /*
+   * 手动刷新按钮（Gateway 端口卡片、内嵌 LAN/WAN 工具栏）按用户第 9 条删除。
+   * 已有的 statsTimer 只补端口速率，配置本体不动，所以再加一条慢轮询；
+   * 有草稿、抽屉、批量选择或正在保存时跳过，避免刷掉用户填的内容。
+   */
+  state.pollTimer = window.setInterval(() => {
+    if (!state.mounted || document.hidden) return;
+    if (state.loading || state.refreshing || state.saving) return;
+    if (state.drawer || state.selectedPorts.size) return;
+    load(true);
+  }, 20000);
+  return { unmount(){state.mounted=false;state.seq+=1;window.clearTimeout(searchTimer);window.clearInterval(state.statsTimer);window.clearInterval(state.pollTimer);interfaceInstances.forEach((instance)=>instance.unmount?.());interfaceInstances.clear();root?.replaceChildren();root?.classList.remove(MODULE_CLASS,'route-workspace');} };
 }
 
 export default { mount };

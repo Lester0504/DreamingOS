@@ -67,7 +67,6 @@
 .routing-search input { width: 100%; min-width: 0; height: 100%; border: 0; padding: 0 10px 0 36px; color: var(--app-text); background: transparent; font: inherit; font-size: 12px; outline: 0; }
 .routing-search input::placeholder { color: var(--app-text-muted); }
 
-.routing-icon-button,
 .routing-row-action {
   width: 38px;
   height: 38px;
@@ -80,7 +79,6 @@
   box-shadow: inset 0 0 0 1px var(--color-border-subtle, rgba(255,255,255,.09));
   cursor: pointer;
 }
-.routing-icon-button:hover,
 .routing-row-action:hover { color: var(--app-text); background: var(--dwrt-interactive-hover-bg, rgba(255,255,255,.09)); }
 .routing-create-button { min-height: 38px; display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
 .routing-create-button:disabled { cursor: not-allowed; opacity: .46; }
@@ -179,8 +177,8 @@
 
 .routing-drawer {
   --dwrt-kit-sheet-z: 70;
-  --dwrt-kit-sheet-width: min(460px, calc(100vw - 20px));
-  --dwrt-kit-sheet-max-width: min(460px, calc(100vw - 20px));
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
+  --dwrt-kit-sheet-max-width: calc(100vw - 28px);
 }
 .routing-drawer .dwrt-kit-sheet-header span { display: block; color: var(--app-text-muted); font-size: 10px; font-weight: 760; }
 .routing-drawer .dwrt-kit-sheet-header strong { display: block; margin-top: 2px; color: var(--app-text); font-size: 17px; }

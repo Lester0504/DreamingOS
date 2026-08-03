@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260716-25';
+  const VERSION = '20260802-ui-batch-01';
   const ENDPOINT = '/api/v1/storage/files';
   const MODULE_CLASS = 'storage-files-route-host';
   const stage = root?.closest('.console-stage');
@@ -17,6 +17,7 @@ export function mount(context = {}) {
   const state = {
     mounted: true,
     seq: 0,
+    pollTimer: 0,
     loading: true,
     refreshing: false,
     saving: false,
@@ -74,6 +75,15 @@ export function mount(context = {}) {
     return [];
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -86,7 +96,7 @@ export function mount(context = {}) {
   }
 
   async function requestJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${VERSION}`, {
       credentials: 'same-origin', cache: 'no-store', ...options,
       headers: authHeaders({ ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) })
     });
@@ -290,7 +300,7 @@ export function mount(context = {}) {
   function toolbarMarkup() {
     const count = state.selected.size;
     const canPaste = Boolean(state.clipboard?.paths?.length) && hasCapability(state.clipboard.action === 'cut' ? 'move' : 'copy');
-    return `<header class="storage-file-toolbar"><div class="storage-file-toolbar-top">${rootsMarkup()}${breadcrumbMarkup()}</div><div class="policy-toolbar storage-file-actions"><label class="policy-search policy-search-main storage-file-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-file-search value="${escapeHtml(state.query)}" placeholder="搜索文件或文件夹"></label><div class="storage-file-selection-actions"><button class="policy-filter-button" type="button" data-file-copy ${count ? '' : 'disabled'}>${icon('copy')}<span>复制</span></button><button class="policy-filter-button" type="button" data-file-cut ${count ? '' : 'disabled'}>${icon('cut')}<span>剪切</span></button><button class="policy-filter-button" type="button" data-file-paste ${canPaste ? '' : 'disabled'}>${icon('paste')}<span>粘贴</span></button><button class="policy-filter-button" type="button" data-file-compress ${count ? '' : 'disabled'}>${icon('compress')}<span>压缩</span></button><button class="policy-filter-button danger" type="button" data-file-delete-selected ${count ? '' : 'disabled'}>${icon('trash')}<span>删除</span></button></div><div class="policy-toolbar-actions"><button class="policy-filter-button" type="button" data-file-refresh ${state.refreshing ? 'disabled' : ''}>${icon('refresh')}<span>${state.refreshing ? '正在刷新' : '刷新'}</span></button><button class="policy-filter-button" type="button" data-file-upload>${icon('upload')}<span>上传</span></button><button class="policy-create-button" type="button" data-file-new>${icon('plus')}<span>新建</span></button></div></div></header>`;
+    return `<header class="storage-file-toolbar"><div class="storage-file-toolbar-top">${rootsMarkup()}${breadcrumbMarkup()}</div><div class="policy-toolbar storage-file-actions"><label class="policy-search policy-search-main storage-file-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-file-search value="${escapeHtml(state.query)}" placeholder="搜索文件或文件夹"></label><div class="storage-file-selection-actions"><button class="policy-filter-button" type="button" data-file-copy ${count ? '' : 'disabled'}>${icon('copy')}<span>复制</span></button><button class="policy-filter-button" type="button" data-file-cut ${count ? '' : 'disabled'}>${icon('cut')}<span>剪切</span></button><button class="policy-filter-button" type="button" data-file-paste ${canPaste ? '' : 'disabled'}>${icon('paste')}<span>粘贴</span></button><button class="policy-filter-button" type="button" data-file-compress ${count ? '' : 'disabled'}>${icon('compress')}<span>压缩</span></button><button class="policy-filter-button danger" type="button" data-file-delete-selected ${count ? '' : 'disabled'}>${icon('trash')}<span>删除</span></button></div><div class="policy-toolbar-actions"><button class="policy-filter-button" type="button" data-file-upload>${icon('upload')}<span>上传</span></button><button class="policy-create-button" type="button" data-file-new>${icon('plus')}<span>新建</span></button></div></div></header>`;
   }
 
   function kindIcon(kind) {
@@ -627,7 +637,6 @@ export function mount(context = {}) {
 
   function onClick(event) {
     if (event.target.closest('[data-file-close]')) { closeDrawer(); return; }
-    if (event.target.closest('[data-file-refresh]')) { load(state.path, true); return; }
     if (event.target.closest('[data-file-upload]')) { openUpload(); return; }
     if (event.target.closest('[data-file-new]')) { openNew(); return; }
     if (event.target.closest('[data-file-copy]')) { rememberSelection('copy'); return; }
@@ -713,11 +722,23 @@ export function mount(context = {}) {
   render();
   load('/');
 
+  /*
+   * 手动刷新按钮按用户第 9 条删除，补一条可见性受控的轮询代替；
+   * 抽屉打开、正在保存或有未提交草稿时跳过，避免刷掉用户填的内容。
+   */
+  state.pollTimer = window.setInterval(() => {
+    if (!state.mounted || document.hidden) return;
+    if (state.loading || state.refreshing || state.saving) return;
+    if (state.drawer || state.selected.size) return;
+    load(state.path, true);
+  }, 20000);
+
   return {
     refresh() { return load(state.path, true); },
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      window.clearInterval(state.pollTimer);
       root?.removeEventListener('click', onClick);
       root?.removeEventListener('input', onInput);
       root?.removeEventListener('change', onChange);

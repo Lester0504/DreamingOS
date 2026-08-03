@@ -164,7 +164,7 @@ def test_design_system_and_dhcp_aligned_settings_contract() -> None:
 
 
 def test_dhcp_aligned_fixed_header_and_workbench_scroll_contract() -> None:
-    assert "20260801-upnp-overview-cards-02" in MODULE
+    assert "20260802-ui-batch-01" in MODULE
     assert ".console-stage.is-upnp-service" in STYLE
     # toolbar / overview cards / workbench
     assert "grid-template-rows: auto auto minmax(0, 1fr)" in STYLE
@@ -176,7 +176,7 @@ def test_dhcp_aligned_fixed_header_and_workbench_scroll_contract() -> None:
     assert "border-radius: var(--upnp-radius-card)" in STYLE
     assert "height: max-content" in STYLE
     assert "align-self: start" in STYLE
-    assert "width: min(460px" in STYLE
+    assert "--dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard)" in STYLE
     # mountExpandSearch() bails out when the flag is already set, which left the search box
     # as an empty circle. Markup must not pre-stamp it.
     assert 'data-dwrt-expand-search' not in MODULE
@@ -203,7 +203,12 @@ def test_no_fake_runtime_values_or_browser_persistence() -> None:
     assert "localStorage.setItem" not in MODULE
     assert "/etc/config" not in MODULE
     assert "Math.random" not in MODULE
-    assert "setInterval" not in MODULE
+    # 手动刷新按钮按用户第 9 条删除，映射表改由可见性受控的轮询驱动；
+    # 这里只保证轮询是"受控的"（隐藏页签、脏草稿、抽屉都要跳过），而不是禁止定时器。
+    assert "state.pollTimer = window.setInterval" in MODULE
+    assert "document.hidden" in MODULE
+    assert "state.dirty || state.drawer || state.confirmDelete" in MODULE
+    assert "data-upnp-refresh" not in MODULE
     assert "live_packets') ? firstNumber(item.packets).toLocaleString() : '--'" in MODULE
     assert "不显示伪造流量" in MODULE
 

@@ -1,4 +1,4 @@
-const VERSION = '20260724-storage-partitions-01';
+const VERSION = '20260802-sheet-portal-scope-01';
 const PARTITION_ENDPOINT = '/api/v1/storage/partitions';
 const OVERVIEW_ENDPOINT = '/api/v1/storage/overview?range=1h';
 const MOUNTS_ENDPOINT = '/api/v1/system/mounts';
@@ -31,7 +31,8 @@ export function mount(context = {}) {
     editor: emptyEditor(),
     confirmation: null,
     working: false,
-    seq: 0
+    seq: 0,
+    pollTimer: 0
   };
 
   function emptyCapabilities() {
@@ -89,6 +90,15 @@ export function mount(context = {}) {
     return code !== 2000 && !(code >= 200 && code < 300);
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -101,7 +111,7 @@ export function mount(context = {}) {
   }
 
   async function request(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
       credentials: 'same-origin',
       cache: 'no-store',
       signal: context.signal,
@@ -248,7 +258,6 @@ export function mount(context = {}) {
     const seq = ++state.seq;
     if (background) state.refreshing = true; else state.loading = true;
     state.error = '';
-    patchRefresh();
     if (!background) render();
     try {
       const [partitionResult, overviewResult, mountsResult, discoveryResult] = await Promise.allSettled([
@@ -349,19 +358,27 @@ export function mount(context = {}) {
     return `<div class="storage-partitions-disk-tabs"><div class="dwrt-kit-tabs dwrt-kit-page-tabs" data-dwrt-component="tabs" role="tablist" aria-label="选择物理磁盘">${tabs || '<button class="dwrt-kit-tab is-active" type="button" role="tab" aria-selected="true" disabled>没有磁盘</button>'}</div></div>`;
   }
 
-  function toolbarMarkup() {
+  /*
+   * 磁盘切换与新增分区都是控制表格的控件，按用户第 9 条收进表格工具条；
+   * 手动刷新按钮删除，数据由 startPartitionPolling() 的轮询与写操作后的读回驱动。
+   */
+  function createButtonMarkup() {
     const reason = capabilityReason('create');
-    return `<header class="storage-partitions-toolbar">${diskTabsMarkup()}<div class="storage-partitions-toolbar-actions"><button class="dwrt-kit-button dwrt-kit-icon-button" data-dwrt-component="icon-button" data-variant="ghost" type="button" data-partition-refresh aria-label="刷新磁盘与分区" data-dwrt-tooltip="刷新" ${state.refreshing ? 'disabled' : ''}>${icon('RefreshCw')}</button><button class="dwrt-kit-button" data-dwrt-component="button" data-variant="primary" type="button" data-partition-create ${canTransact('create') ? '' : 'disabled'} ${reason ? `data-dwrt-tooltip="${escapeHtml(reason)}"` : ''}>${icon('Plus')}<span>新增分区</span></button></div></header>`;
+    return `<button class="dwrt-kit-button" data-dwrt-component="button" data-variant="primary" type="button" data-partition-create ${canTransact('create') ? '' : 'disabled'} ${reason ? `data-dwrt-tooltip="${escapeHtml(reason)}"` : ''}>${icon('Plus')}<span>新增分区</span></button>`;
   }
 
+  /*
+   * 磁盘详情三段式（验收单第 3 条）：身份区在 header，技术规格进深槽，分区映射条在最下。
+   * 深槽的六项都是后端真读数，缺就写 `--`，不推导也不补默认值。
+   */
   function diskFactsMarkup(disk) {
     const facts = [
-      ['设备', disk.device || '--'],
-      ['型号', disk.model || '--'],
-      ['分区表', disk.table ? disk.table.toUpperCase() : '--'],
-      ['接口', disk.transport ? disk.transport.toUpperCase() : '--'],
-      ['扇区', disk.sectorSize ? `${disk.sectorSize}${disk.physicalSectorSize ? ` / ${disk.physicalSectorSize}` : ''} B` : '--'],
-      ['序列号', disk.serial || '--']
+      ['设备节点', disk.device || '--'],
+      ['分区表类型', disk.table ? disk.table.toUpperCase() : '--'],
+      ['物理扇区', disk.sectorSize ? `${disk.sectorSize}${disk.physicalSectorSize ? ` / ${disk.physicalSectorSize}` : ''} B` : '--'],
+      ['接口类型', disk.transport ? disk.transport.toUpperCase() : '--'],
+      ['序列号', disk.serial || '--'],
+      ['健康状态', disk.smartStatus || '未上报']
     ];
     return `<dl class="storage-partitions-facts">${facts.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>`;
   }
@@ -386,14 +403,38 @@ export function mount(context = {}) {
     return statusBadge('未格式化', 'info');
   }
 
+  /* 用量条着色只反映后端真实读数：低占用绿、常规蓝、接近写满橙；无读数不画条。 */
+  function usageTone(percent) {
+    if (percent === null) return 'unknown';
+    if (percent >= 85) return 'warn';
+    if (percent >= 60) return 'busy';
+    return 'ok';
+  }
+
   function usageMarkup(partition) {
-    if (partition.usedBytes === null || partition.capacityBytes === null) return `<strong>${escapeHtml(formatBytes(partition.capacityBytes))}</strong><small>用量未知</small>`;
-    return `<strong>${escapeHtml(formatBytes(partition.capacityBytes))}</strong><small>${escapeHtml(`${formatBytes(partition.usedBytes)} 已用${partition.usedPercent === null ? '' : ` · ${Math.round(partition.usedPercent)}%`}`)}</small>`;
+    const percent = partition.usedBytes === null || partition.capacityBytes === null ? null : partition.usedPercent;
+    const tone = usageTone(percent);
+    const ratio = percent === null ? 0 : Math.max(1, Math.min(100, Math.round(percent)));
+    const track = percent === null
+      ? '<span class="storage-partitions-usage-track is-unknown" aria-hidden="true"></span>'
+      : `<span class="storage-partitions-usage-track" aria-hidden="true"><i style="--partition-usage:${ratio}%"></i></span>`;
+    const detail = percent === null
+      ? '用量未知'
+      : `${formatBytes(partition.usedBytes)} / ${formatBytes(partition.capacityBytes)} · ${ratio}%`;
+    const mount = partition.mountPoints.join('、');
+    return `<span class="storage-partitions-usage is-${escapeHtml(tone)}">${track}<span class="storage-partitions-usage-meta"><small>${escapeHtml(detail)}</small><small class="storage-partitions-usage-mount" data-dwrt-tooltip="${escapeHtml(partition.mountPoints.join('\n') || '未挂载')}">${escapeHtml(mount || '未挂载')}</small></span></span>`;
+  }
+
+  function sectorRangeMarkup(partition) {
+    if (partition.startSector === null && partition.endSector === null) return '<span class="storage-partitions-sectors"><span>--</span></span>';
+    const start = partition.startSector === null ? '--' : partition.startSector.toLocaleString();
+    const end = partition.endSector === null ? '--' : partition.endSector.toLocaleString();
+    return `<span class="storage-partitions-sectors"><span>${escapeHtml(start)}</span><small>${escapeHtml(`→ ${end}`)}</small></span>`;
   }
 
   function tableMarkup(disk) {
-    const rows = disk.partitions.map((partition) => `<tr><td><span class="storage-partitions-primary"><strong>${escapeHtml(partition.name)}</strong><small>${escapeHtml(partition.device || '--')}</small></span></td><td class="storage-partitions-capacity">${usageMarkup(partition)}</td><td><span class="storage-partitions-sectors"><span>${partition.startSector === null ? '--' : partition.startSector.toLocaleString()}</span><small>${partition.endSector === null ? '--' : partition.endSector.toLocaleString()}</small></span></td><td><span class="storage-partitions-primary"><strong>${escapeHtml(partition.filesystem || '--')}</strong><small>${escapeHtml(partition.label || partition.uuid || '无卷标')}</small></span></td><td><span class="storage-partitions-mount" data-dwrt-tooltip="${escapeHtml(partition.mountPoints.join('\n') || '未挂载')}">${escapeHtml(partition.mountPoints.join('、') || '--')}</span></td><td>${partitionStatus(partition)}</td><td><button class="dwrt-kit-button dwrt-kit-icon-button storage-partitions-row-action" data-dwrt-component="icon-button" data-variant="ghost" type="button" data-partition-detail="${escapeHtml(partition.id)}" aria-label="查看 ${escapeHtml(partition.name)} 详情" data-dwrt-tooltip="详情与操作">${icon('Ellipsis')}</button></td></tr>`).join('');
-    return `<section class="storage-partitions-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface" data-dwrt-component="table"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>分区信息</strong><span>设备、容量、扇区、文件系统与挂载状态</span></div><span class="dwrt-kit-table-count">${disk.partitions.length} 个</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr><th>名称 / 设备</th><th>容量 / 用量</th><th>起始 / 结束扇区</th><th>文件系统 / 标识</th><th>挂载点</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="7" class="dwrt-kit-table-empty">后端没有返回这个磁盘的分区</td></tr>'}</tbody></table></div></section>`;
+    const rows = disk.partitions.map((partition) => `<tr class="storage-partitions-row ${partition.mounted ? '' : 'is-idle'}"><td><span class="storage-partitions-primary"><strong>${escapeHtml(partition.name)}</strong><small>${escapeHtml(partition.device || '--')}</small></span></td><td>${usageMarkup(partition)}</td><td><span class="storage-partitions-primary"><strong>${escapeHtml(partition.label || '无卷标')}</strong><small>${escapeHtml(partition.filesystem || '文件系统未知')}</small></span></td><td>${sectorRangeMarkup(partition)}</td><td>${partitionStatus(partition)}</td><td><button class="dwrt-kit-button dwrt-kit-icon-button storage-partitions-row-action" data-dwrt-component="icon-button" data-variant="ghost" type="button" data-partition-detail="${escapeHtml(partition.id)}" aria-label="查看 ${escapeHtml(partition.name)} 详情" data-dwrt-tooltip="详情与操作">${icon('Ellipsis')}</button></td></tr>`).join('');
+    return `<section class="storage-partitions-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface" data-dwrt-component="table"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><span class="dwrt-kit-table-count">${disk.partitions.length} 个分区</span></div>${diskTabsMarkup()}<div class="storage-partitions-table-actions">${createButtonMarkup()}</div></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr><th>名称 / 设备</th><th>用量 / 挂载点</th><th>卷标 / 文件系统</th><th>扇区范围</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="6" class="dwrt-kit-table-empty">后端没有返回这个磁盘的分区</td></tr>'}</tbody></table></div></section>`;
   }
 
   function emptyMarkup() {
@@ -404,7 +445,7 @@ export function mount(context = {}) {
   function workbenchMarkup() {
     const disk = selectedDisk();
     if (!disk) return emptyMarkup();
-    return `<div class="storage-partitions-scroll"><section class="storage-partitions-disk-summary dwrt-kit-glass-surface" data-dwrt-surface="stable-glass"><header><span class="storage-partitions-disk-icon">${icon('HardDrive', 24)}</span><div><strong>${escapeHtml(disk.name)}</strong><span>${escapeHtml([disk.model, formatBytes(disk.totalBytes), disk.system ? '系统磁盘' : '', disk.removable ? '可移除' : ''].filter(Boolean).join(' · '))}</span></div>${disk.system ? statusBadge('系统磁盘', 'warning') : statusBadge('数据磁盘', 'info')}</header>${diskFactsMarkup(disk)}${layoutMarkup(disk)}</section>${tableMarkup(disk)}</div>`;
+    return `<div class="storage-partitions-scroll"><section class="storage-partitions-disk-summary dwrt-kit-glass-surface" data-dwrt-surface="stable-glass"><header><span class="storage-partitions-disk-icon">${icon('HardDrive', 24)}</span><div><strong>${escapeHtml(disk.name)}</strong><span>${escapeHtml([disk.model || '型号未上报', formatBytes(disk.totalBytes), disk.removable ? '可移除' : ''].filter(Boolean).join(' · '))}</span></div>${disk.system ? statusBadge('系统磁盘', 'warning') : statusBadge('数据磁盘', 'info')}</header>${diskFactsMarkup(disk)}${layoutMarkup(disk)}</section>${tableMarkup(disk)}</div>`;
   }
 
   function detailPair(label, value, code = false) {
@@ -481,15 +522,26 @@ export function mount(context = {}) {
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'storage-partitions-route-host');
     stage?.classList.add('is-storage-partitions');
-    root.innerHTML = `<section class="storage-partitions-shell">${toolbarMarkup()}${noticeMarkup()}<main class="storage-partitions-workbench">${workbenchMarkup()}</main>${sheetMarkup()}${confirmationMarkup()}</section>`;
+    root.innerHTML = `<section class="storage-partitions-shell">${noticeMarkup()}<main class="storage-partitions-workbench">${workbenchMarkup()}</main>${sheetMarkup()}${confirmationMarkup()}</section>`;
     ui.mountAll?.(root);
   }
 
-  function patchRefresh() {
-    const button = root.querySelector('[data-partition-refresh]');
-    if (!button) return;
-    button.disabled = state.refreshing;
-    button.classList.toggle('is-loading', state.refreshing);
+  /* 删掉手动刷新按钮的前提是页面自己会更新，所以这里补一条可见性受控的轮询。 */
+  function startPolling() {
+    stopPolling();
+    state.pollTimer = window.setInterval(() => {
+      if (!state.mounted) return;
+      if (document.hidden) return;
+      if (state.loading || state.refreshing || state.working) return;
+      if (state.sheet || state.confirmation) return;
+      load(true);
+    }, 20000);
+  }
+
+  function stopPolling() {
+    if (!state.pollTimer) return;
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = 0;
   }
 
   function openCreate() {
@@ -611,7 +663,6 @@ export function mount(context = {}) {
       render();
       return;
     }
-    if (target.matches('[data-partition-refresh]')) { load(true); return; }
     if (target.matches('[data-partition-create]')) { openCreate(); return; }
     if (target.matches('[data-partition-detail]')) { openDetail(target.dataset.partitionDetail || ''); return; }
     if (target.matches('[data-partition-close], [data-dwrt-confirm-cancel], [data-dwrt-modal-close]')) { closeOverlay(); return; }
@@ -643,6 +694,7 @@ export function mount(context = {}) {
     if (!state.mounted) return;
     state.mounted = false;
     state.seq += 1;
+    stopPolling();
     root.removeEventListener('click', onClick);
     root.removeEventListener('input', onInput);
     root.removeEventListener('change', onInput);
@@ -659,6 +711,7 @@ export function mount(context = {}) {
   document.addEventListener('keydown', onKeydown, true);
   context.signal?.addEventListener('abort', unmount, { once: true });
   load();
+  startPolling();
 
   return { unmount };
 }

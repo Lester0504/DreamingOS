@@ -10,13 +10,13 @@ export function mount(context = {}) {
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
   const formatInteger = utils.formatInteger || ((value) => new Intl.NumberFormat('zh-CN').format(Number(value) || 0));
   const fetchApi = api.fetch || (async (name, url) => {
-    const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+    const response = await sessionFetch(url, { credentials: 'same-origin', cache: 'no-store' });
     const json = await response.json().catch(() => ({}));
     const ok = response.ok && json?.ok !== false;
     return { name, ok, data: json?.data ?? json, raw: json, error: ok ? null : new Error(apiErrorText(json, response.statusText)) };
   });
 
-  const VERSION = '20260727-ai-stream-01';
+  const VERSION = '20260802-ui-batch-01';
   const INSTANCE_ID = `ai-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
   const MODULE_CLASS = 'ai-assistant-route-host';
   const ACTIVE_CONVERSATION_KEY = 'dreamingwrt.ai.activeConversation';
@@ -74,6 +74,14 @@ export function mount(context = {}) {
     ['confirm_all', '所有操作均需确认']
   ];
 
+  /*
+   * 会话闸门适配器：见 dwrt-session-gate.js 的 DWRT_REQUEST。裸 fetch 会绕过 token 刷新，
+   * 过期时并发请求集体拿 401，切走再切回来才恢复；走闸门可自动刷新并单次重试。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function loadOrbState() {
     try {
       const value = JSON.parse(localStorage.getItem('dreamingwrt.ai.orb') || 'null');
@@ -122,6 +130,7 @@ export function mount(context = {}) {
     config: normalizeConfig({}),
     baseline: '',
     models: [],
+    modelsListed: false,
     history: [],
     historyQuery: '',
     current: newConversation(),
@@ -744,7 +753,7 @@ export function mount(context = {}) {
   async function streamRequest(url, body, handlers = {}) {
     const controller = new AbortController();
     state.stream.controller = controller;
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
       method: 'POST',
       credentials: 'same-origin',
       cache: 'no-store',
@@ -1057,6 +1066,9 @@ export function mount(context = {}) {
     }
     if (modelsResult?.ok) {
       state.models = uniqueModels(asArray(unwrap(modelsResult.data).models || unwrap(modelsResult.data)));
+      // 后端真的给了列表才算已同步；下面的兜底只是让下拉框有东西可选，
+      // 概览不能把它说成「已同步 1 个模型」。
+      state.modelsListed = state.models.length > 0;
     }
     if (!state.models.length) state.models = uniqueModels([state.config.model]);
     if (historyResult?.ok) {
@@ -1555,7 +1567,7 @@ export function mount(context = {}) {
       const page = Math.max(1, Math.min(totalPages, state.historyPage));
       const pageRows = rows.slice((page - 1) * state.historyPageSize, page * state.historyPageSize);
       return `<section class="ai-drawer-history">
-        <div class="ai-drawer-history-toolbar"><label>${icon('search')}<input type="search" value="${escapeHtml(state.historyQuery)}" placeholder="搜索对话" data-ai-history-search></label><button class="ai-copilot-icon-button" type="button" data-ai-history-refresh title="刷新" aria-label="刷新历史">${icon('refresh')}</button></div>
+        <div class="ai-drawer-history-toolbar"><label>${icon('search')}<input type="search" value="${escapeHtml(state.historyQuery)}" placeholder="搜索对话" data-ai-history-search></label></div>
         <div class="ai-drawer-history-list" data-ai-scroll="history">${state.historyLoading ? loadingState('正在读取历史对话') : pageRows.length ? pageRows.map(historyStrip).join('') : `<div class="ai-empty-state"><strong>${state.historyQuery ? '没有匹配的对话' : '暂无历史对话'}</strong></div>`}</div>
         <footer class="ai-history-pagination"><button type="button" data-ai-history-page="${page - 1}" ${page <= 1 ? 'disabled' : ''}>上一页</button><span>${page} / ${totalPages}</span><button type="button" data-ai-history-page="${page + 1}" ${page >= totalPages ? 'disabled' : ''}>下一页</button></footer>
       </section>`;
@@ -1570,7 +1582,6 @@ export function mount(context = {}) {
           <div class="ai-history-actions">
             <label class="ai-history-search" data-dwrt-component="expand-search">${icon('search')}<input type="search" value="${escapeHtml(state.historyQuery)}" placeholder="搜索对话" data-ai-history-search></label>
             <span class="dwrt-kit-table-count">${formatInteger(rows.length)} 条</span>
-            <button class="ai-icon-button" type="button" data-ai-history-refresh title="刷新" aria-label="刷新历史">${icon('refresh')}</button>
             <button class="ai-secondary-button" type="button" data-ai-new>新建对话</button>
           </div>
         </div>
@@ -1713,18 +1724,12 @@ export function mount(context = {}) {
       : state.config.provider === 'openai_compatible'
         ? 'OpenAI 兼容服务需要填写完整 API Base URL'
         : '留空时后端使用该提供商的默认 API 地址';
+    const tab = settingsTab();
+    // 概览的四张卡提到主卡片外面，和其他页面一致；主卡片顶部不再复述 Tab 名。
     return `
+      ${tab === 'overview' ? settingsOverviewCards() : ''}
+      ${settingsMasterCard()}
       <form class="ai-settings-card ai-page-card dwrt-kit-page-surface dwrt-kit-glass-surface" data-ai-scroll="settings">
-        <div class="ai-settings-heading">
-          <div>
-            <strong>${escapeHtml(settingsTabLabel())}</strong>
-            <span>${escapeHtml(settingsTabDescription())}</span>
-          </div>
-          <label class="ai-switch" title="启用 AI">
-            <input type="checkbox" data-ai-config="enabled" ${state.config.enabled ? 'checked' : ''}>
-            <span aria-hidden="true"></span>
-          </label>
-        </div>
         ${state.settingsError ? `<div class="ai-inline-message error">${icon('alert')}<span>${escapeHtml(state.settingsError)}</span></div>` : ''}
         ${settingsTabContent(provider, apiBaseHelp)}
         ${settingsFooter()}
@@ -1732,22 +1737,34 @@ export function mount(context = {}) {
     `;
   }
 
+  /* 总开关卡片。demo 把「启用 LLM 服务」做成一张独立主控卡，开关在右侧；
+     关闭时下方配置主体折叠成一条占位说明，避免摆一屏点了没意义的字段。 */
+  function settingsMasterCard() {
+    const on = state.config.enabled;
+    const ready = credentialReady();
+    const badge = state.loading ? '读取中' : on ? (ready ? '运行中' : '缺少凭据') : '未启用';
+    const badgeTone = state.loading ? 'neutral' : on ? (ready ? 'ok' : 'warn') : 'neutral';
+    return `<section class="ai-master-card ${on ? 'is-active' : ''} dwrt-kit-page-surface dwrt-kit-glass-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass">
+      <div class="ai-master-copy">
+        <strong>启用 LLM 服务<span class="ai-master-badge is-${badgeTone}">${escapeHtml(badge)}</span></strong>
+        <small>路由器统一管理模型接入凭据，供本机诊断、日志解读与自然语言操作使用。</small>
+      </div>
+      <label class="ai-switch" data-dwrt-tooltip="启用 AI">
+        <input type="checkbox" data-ai-config="enabled" ${on ? 'checked' : ''} aria-label="启用 LLM 服务">
+        <span aria-hidden="true"></span>
+      </label>
+    </section>`;
+  }
+
+  // 只保留 id 与标签。Tab 已经说明了当前位置，卡片顶部不再复述描述文案。
   const SETTINGS_TABS = [
-    ['overview', '概览', '接入状态、当前生效模型与运行参数总览'],
-    ['provider', '供应商设置', '模型提供商、认证方式与凭据由路由器统一管理'],
-    ['advanced', '高级设置', '模型接口、生成参数与工具授权策略']
+    ['overview', '概览'],
+    ['provider', '供应商设置'],
+    ['advanced', '高级设置']
   ];
 
   function settingsTab() {
     return SETTINGS_TABS.some(([id]) => id === state.settingsTab) ? state.settingsTab : 'overview';
-  }
-
-  function settingsTabLabel() {
-    return SETTINGS_TABS.find(([id]) => id === settingsTab())?.[1] || '概览';
-  }
-
-  function settingsTabDescription() {
-    return SETTINGS_TABS.find(([id]) => id === settingsTab())?.[2] || '';
   }
 
   function settingsTabsMarkup() {
@@ -1762,7 +1779,7 @@ export function mount(context = {}) {
     return settingsProviderSection();
   }
 
-  function settingsOverviewSection() {
+  function settingsOverviewCards() {
     const statusText = connectionSummaryText();
     const authLabel = state.config.auth_mode === 'oauth' ? 'OAuth' : 'API Key';
     const credentialText = state.config.auth_mode === 'oauth'
@@ -1777,16 +1794,21 @@ export function mount(context = {}) {
     const cards = typeof ui.overviewCardsMarkup === 'function'
       ? ui.overviewCardsMarkup(items, { label: 'LLM 接入概览', className: 'ai-settings-summary' })
       : `<section class="dwrt-kit-overview-grid ai-settings-summary" aria-label="LLM 接入概览">${items.map((item) => `<article class="dwrt-kit-overview-card is-${item.tone}"><div class="dwrt-kit-overview-content"><span class="dwrt-kit-overview-label">${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong><small>${escapeHtml(item.detail)}</small></div><span class="dwrt-kit-overview-icon">${item.icon}</span></article>`).join('')}</section>`;
-    const apiBase = firstText(state.config.api_base, '使用提供商默认地址');
+    return cards;
+  }
+
+  /* 概览页主体。事实清单与说明段按用户要求删除（Tab 已说明当前位置，
+     四张卡已给出同样的值），这里只保留 provider 侧真正额外的运行态信息。 */
+  function settingsOverviewSection() {
+    const provider = oauthProviderLabel(state.config.provider);
+    const models = state.modelsListed ? state.models.length : 0;
+    const rows = [
+      ['当前供应商', provider, state.config.auth_mode === 'oauth' ? 'OAuth 授权' : (state.config.api_key_set ? 'API Key 已保存' : 'API Key 未配置')],
+      ['可用模型', models ? `${models} 个` : '未同步', models ? '来自最近一次模型列表同步' : '在下方操作栏同步模型列表'],
+      ['接口形态', firstText(state.config.reasoning_api_shape, '--'), reasoningDisabled() ? '当前模型不支持 reasoning_effort' : `思考强度 ${REASONING_LABELS[state.config.reasoning_effort] || 'auto'}`]
+    ];
     return `<div class="ai-settings-section ai-settings-overview">
-      ${cards}
-      <dl class="ai-settings-facts">
-        <div><dt>API 地址</dt><dd>${escapeHtml(apiBase)}</dd></div>
-        <div><dt>系统提示词</dt><dd>${state.config.system_prompt ? '已设置' : '未设置'}</dd></div>
-        <div><dt>工具授权策略</dt><dd>${escapeHtml(toolPolicyLabel(state.config.tool_policy))}</dd></div>
-        <div><dt>配置状态</dt><dd>${configDirty() ? '有未保存的修改' : '已与路由器同步'}</dd></div>
-      </dl>
-      <p class="ai-settings-hint">概览仅展示当前生效配置。修改提供商与凭据请前往“供应商设置”，调整模型接口与生成参数请前往“高级设置”。</p>
+      <div class="ai-overview-rows">${rows.map(([label, value, detail]) => `<article><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(detail)}</small></article>`).join('')}</div>
     </div>`;
   }
 
@@ -1802,8 +1824,8 @@ export function mount(context = {}) {
   }
 
   function settingsProviderSection() {
+    // 「模型提供商 / MODEL PROVIDER」这类小标题复述了 Tab 名与控件语义，按用户要求删除。
     return `<div class="ai-settings-section">
-          <div class="ai-section-title"><strong>模型提供商</strong><span>Model provider</span></div>
           <div class="ai-provider-grid" role="radiogroup" aria-label="模型提供商">
             ${PROVIDERS.map((item) => `
               <button class="ai-provider-button ${state.config.provider === item.id ? 'is-active' : ''}" type="button" role="radio" aria-checked="${state.config.provider === item.id ? 'true' : 'false'}" data-ai-provider="${item.id}">
@@ -1815,7 +1837,6 @@ export function mount(context = {}) {
           </div>
         </div>
         <div class="ai-settings-section">
-          <div class="ai-section-title"><strong>认证方式</strong><span>Authentication</span></div>
           <div class="ai-auth-mode" role="radiogroup" aria-label="认证方式">
             <button type="button" role="radio" aria-checked="${state.config.auth_mode === 'api_key'}" class="${state.config.auth_mode === 'api_key' ? 'is-active' : ''}" data-ai-auth-mode="api_key">${icon('key')}<span><strong>API Key</strong><small>使用提供商密钥</small></span></button>
             <button type="button" role="radio" aria-checked="${state.config.auth_mode === 'oauth'}" class="${state.config.auth_mode === 'oauth' ? 'is-active' : ''}" data-ai-auth-mode="oauth" ${state.oauth.available && oauthProvider()?.supported === true ? '' : 'disabled'}>${icon('link')}<span><strong>OAuth</strong><small>授权连接或企业身份</small></span></button>
@@ -1825,24 +1846,32 @@ export function mount(context = {}) {
         </div>`;
   }
 
+  /* 高级设置。排版按 demo 的三个「舱位」：运行时与接口 / 生成参数与工具授权 /
+     系统提示词。控件与材质仍是我们自己的 Kit，没有照搬 demo 的 rgba 玻璃与 emoji。 */
   function settingsAdvancedSection(provider, apiBaseHelp) {
-    return `<div class="ai-settings-section">
-          <div class="ai-section-title"><strong>模型与接口</strong><span>Model runtime</span></div>
-          <div class="ai-settings-grid">
-            <label class="ai-field ai-field-wide"><span>API 地址</span><input type="url" value="${escapeHtml(state.config.api_base)}" placeholder="${escapeHtml(provider.base || 'https://example.com/v1')}" data-ai-config="api_base"><small>${escapeHtml(apiBaseHelp)}</small></label>
+    const chambers = [
+      {
+        key: 'runtime', title: '运行时与接口',
+        body: `<label class="ai-field ai-field-wide"><span>API 基础地址</span><input type="url" value="${escapeHtml(state.config.api_base)}" placeholder="${escapeHtml(provider.base || 'https://example.com/v1')}" data-ai-config="api_base"><small>${escapeHtml(apiBaseHelp)}</small></label>
+          <div class="ai-chamber-grid">
             <label class="ai-field"><span>默认模型</span><select data-ai-config="model">${modelOptions(state.config.model)}</select></label>
             <label class="ai-field"><span>最大输出 Token</span><input type="number" min="1" max="131072" step="1" value="${state.config.max_tokens}" data-ai-config="max_tokens"></label>
+          </div>`
+      },
+      {
+        key: 'generation', title: '生成参数与工具授权',
+        body: `<div class="ai-chamber-grid">
+            <label class="ai-field ai-range-field"><span>采样温度 <output data-ai-temperature-output>${Number(state.config.temperature).toFixed(1)}</output></span><input type="range" min="0" max="2" step="0.1" value="${state.config.temperature}" data-ai-config="temperature"><small>值越低，回答越聚焦且稳定；值越高，发散性越强</small></label>
+            <label class="ai-field"><span>思考强度${reasoningDisabled() ? '' : `<em class="ai-field-tag">${escapeHtml(state.config.reasoning_api_shape)}</em>`}</span><select data-ai-config="reasoning_effort" ${reasoningDisabled() ? 'disabled' : ''}>${reasoningOptions(state.config.reasoning_effort)}</select><small>${reasoningDisabled() ? '当前模型不支持 reasoning_effort' : '决定模型在回答前投入的推理预算'}</small></label>
           </div>
-        </div>
-        <div class="ai-settings-section">
-          <div class="ai-section-title"><strong>生成与工具</strong><span>Generation</span></div>
-          <div class="ai-settings-grid">
-            <label class="ai-field ai-range-field"><span>采样温度 <output data-ai-temperature-output>${Number(state.config.temperature).toFixed(1)}</output></span><input type="range" min="0" max="2" step="0.1" value="${state.config.temperature}" data-ai-config="temperature"><small>值越低，回答越聚焦且稳定</small></label>
-            <label class="ai-field"><span>思考强度</span><select data-ai-config="reasoning_effort" ${reasoningDisabled() ? 'disabled' : ''}>${reasoningOptions(state.config.reasoning_effort)}</select><small>${reasoningDisabled() ? '当前模型不支持 reasoning_effort' : `接口形态：${escapeHtml(state.config.reasoning_api_shape)}`}</small></label>
-            <label class="ai-field"><span>工具授权策略</span><select data-ai-config="tool_policy">${TOOL_POLICIES.map(([value, label]) => `<option value="${value}" ${state.config.tool_policy === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label>
-            <label class="ai-field ai-field-wide"><span>系统提示词</span><textarea rows="4" placeholder="可选" data-ai-config="system_prompt">${escapeHtml(state.config.system_prompt)}</textarea></label>
-          </div>
-        </div>`;
+          <label class="ai-field ai-field-wide"><span>工具授权策略</span><select data-ai-config="tool_policy">${TOOL_POLICIES.map(([value, label]) => `<option value="${value}" ${state.config.tool_policy === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label>`
+      },
+      {
+        key: 'prompt', title: '系统提示词',
+        body: `<label class="ai-field ai-field-wide"><textarea rows="5" placeholder="可选。为助手设定全局人设或行为准则。" data-ai-config="system_prompt">${escapeHtml(state.config.system_prompt)}</textarea></label>`
+      }
+    ];
+    return chambers.map((chamber) => `<section class="ai-settings-chamber" data-ai-chamber="${chamber.key}"><h3>${escapeHtml(chamber.title)}</h3><div class="ai-chamber-body">${chamber.body}</div></section>`).join('');
   }
 
   function settingsFooter() {
@@ -2048,7 +2077,6 @@ export function mount(context = {}) {
       if (isGlobal) updateDrawerHistoryView();
       else updateHistoryRows();
     });
-    root.querySelector('[data-ai-history-refresh]')?.addEventListener('click', refreshHistory);
     bindHistoryItemEvents(root);
     root.querySelectorAll('[data-ai-provider]').forEach((button) => button.addEventListener('click', () => selectProvider(button.dataset.aiProvider)));
     root.querySelectorAll('[data-ai-config]').forEach((field) => {
@@ -2087,9 +2115,12 @@ export function mount(context = {}) {
 
   function bindGlobalEvents() {
     root.querySelector('[data-ai-history-toggle]')?.addEventListener('click', () => {
-      state.tab = state.tab === 'history' ? 'chat' : 'history';
+      const entering = state.tab !== 'history';
+      state.tab = entering ? 'history' : 'chat';
       state.historyPage = 1;
       render();
+      // 手动刷新按钮已删除，进入历史视图时顺带重取一次，保证列表不是打开即冻结的快照。
+      if (entering && !state.historyLoading) refreshHistory();
     });
     root.querySelector('[data-ai-history-exit]')?.addEventListener('click', () => { state.tab = 'chat'; render(); });
     root.querySelectorAll('[data-ai-drawer-close]').forEach((button) => button.addEventListener('click', () => {
@@ -2623,7 +2654,7 @@ export function mount(context = {}) {
   }
 
   async function requestJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
       credentials: 'same-origin',
       cache: 'no-store',
       headers: { ...(api.authHeaders ? api.authHeaders() : {}), ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) },

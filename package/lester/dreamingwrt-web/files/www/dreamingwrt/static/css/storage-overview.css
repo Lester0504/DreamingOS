@@ -4,7 +4,7 @@
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
   width: 100%;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block) var(--app-page-gutter-inline);
   overflow: hidden;
@@ -49,7 +49,7 @@
   min-height: 48px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 12px;
 }
 
@@ -158,8 +158,6 @@
   .storage-overview-shell { grid-template-rows: 44px minmax(0, 1fr); gap: 9px; }
   .storage-range { min-width: 0; overflow-x: auto; scrollbar-width: none; }
   .storage-range button { min-width: max-content; padding-inline: 11px; }
-  .storage-overview-toolbar .policy-filter-button { width: 42px; min-width: 42px; padding: 0; justify-content: center; }
-  .storage-overview-toolbar .policy-filter-button span { display: none; }
   .storage-overview-summary { grid-template-columns: 1fr; }
   .storage-overview-summary .dwrt-kit-overview-card { min-height: 104px; }
   .storage-chart-card > header { min-height: 72px; }

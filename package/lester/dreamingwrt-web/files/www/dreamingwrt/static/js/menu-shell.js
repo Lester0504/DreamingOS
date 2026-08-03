@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = '20260726-poll-discipline-05';
+  const VERSION = '20260802-sheet-portal-scope-01';
   const STATIC_MENU_URL = '/static/menu/main.json';
   const RUNTIME_MENU_URL = '/dynamic/menu/1.json';
   const MENU_URLS = window.DWRT_RUNTIME_MENU === false || document.documentElement.dataset.runtimeMenu === 'false'
@@ -131,12 +131,12 @@
     clientDetails: {
       url: '/static/js/client-details.js',
       globalName: 'DWRTClientDetails',
-      version: '20260722-modal-log-01'
+      version: '20260802-sheet-portal-scope-01'
     },
     insightsFlows: {
       url: '/static/js/insights-flows.js',
       globalName: 'DWRTInsightsFlows',
-      version: '20260714-03'
+      version: '20260802-sheet-portal-scope-01'
     },
   };
   const PAGE_STYLES = {
@@ -144,15 +144,15 @@
       { url: '/static/css/line-status.css', version: '20260723-line-health-history-01' }
     ],
     clientDetails: [
-      { url: '/static/css/client-details.css', version: '20260722-modal-log-01' }
+      { url: '/static/css/client-details.css', version: '20260802-sheet-portal-scope-01' }
     ],
     insightsFlows: [
-      { url: '/static/css/insights-flows.css', version: '20260714-03' }
+      { url: '/static/css/insights-flows.css', version: '20260802-sheet-portal-scope-01' }
     ],
   };
   const GLOBAL_AI_ASSETS = Object.freeze({
-    module: { url: '/plugins/native/ai-assistant.js', version: '20260727-ai-stream-01' },
-    style: { url: '/static/css/ai-assistant.css', version: '20260727-ai-stream-01' }
+    module: { url: '/plugins/native/ai-assistant.js', version: '20260802-sheet-portal-scope-01' },
+    style: { url: '/static/css/ai-assistant.css', version: '20260802-sheet-portal-scope-01' }
   });
 
   let topologyVisibilityTimer = 0;
@@ -888,7 +888,12 @@
     const hideFuncs = new Set(['ai', 'audit_view', 'advanced_audit', 'lan_config', 'wan_config', 'container_service', 'advanced_plugins', 'advanced_plugins_index', ...(config.hideFuncs || [])]);
     const hidePages = new Set(['/app/#/ai/assistant', '/app/#/network/lan-config', '/app/#/network/wan-config', '/app/#/plugins/advanced', ...(config.hidePages || [])]);
     const disabledCapabilities = new Set(config.disabledCapabilities || []);
-    const alwaysVisible = new Set(['wifi-config', 'wireless-status']);
+    // The runtime menu gate drops qwrt_modules whenever no capability bit declares
+    // it, but /api/v1/services/cellular and its slot/apn/status siblings are
+    // registered unconditionally. A resource endpoint is the authority on its own
+    // availability, so the route stays reachable and the page classifies real
+    // failures (404/405/501 vs 401 vs 5xx) itself instead of showing a stub.
+    const alwaysVisible = new Set(['wifi-config', 'wireless-status', 'qwrt-modules']);
     Object.entries(config.capabilities || {}).forEach(([key, value]) => {
       if (value === false || value === 0 || String(value).toLowerCase() === 'false') disabledCapabilities.add(key);
     });
@@ -1750,6 +1755,8 @@
       }
     });
     state.routePages = {};
+    // A new route gets a fresh verdict on the reserved footer strip.
+    resetPageFooterReserve();
   }
 
   async function renderLineStatusPage() {
@@ -3216,6 +3223,7 @@
       ['network.lans', '/api/v1/network/lans', 'jmxd.network', 5000, { prefix: 'cidr', mtu: 'bytes' }],
       ['network.wans', '/api/v1/network/wans', 'jmxd.network', 3000, { rx_bps: 'bytes/s', tx_bps: 'bytes/s', latency: 'ms' }],
       ['network.physicalPorts', '/api/v1/topology/node/ports', 'jmxd.topology', 3000, { speed: 'bits/s', rx_bps: 'bytes/s', tx_bps: 'bytes/s' }],
+      ['network.ipam', '/api/v1/bulk-ip', 'jmxd.ipam', 5000, { total: 'count', used: 'count', reserved: 'count', conflicts: 'count', last_seen: 's' }],
       ['clients.inventory', '/api/v1/clients', 'jmxd.clients', 3000, { rx_bps: 'bytes/s', tx_bps: 'bytes/s', connections: 'count' }],
       ['policy.runtime', '/api/v1/route_status', 'jmxd.policy', 2000, { active_flows: 'count' }],
       ['dashboard.aggregate', '/api/v1/dashboard/snapshot', 'webd.dashboard', 2000, { rx_bps: 'bytes/s', tx_bps: 'bytes/s', connections: 'count' }],
@@ -3229,6 +3237,7 @@
       ['policy.table', '/api/v1/policy-engine/policy-table?include_default=1', 'webd.policy-engine', 3000, { total: 'count' }],
       ['flow.engineStatus', '/api/v1/flowd/status', 'webd.flowd', 5000, { qos_classes: 'count', apply_jobs: 'count' }],
       ['flow.engineRuntime', '/api/v1/flowd/runtime', 'webd.flowd', 5000, { uptime: 's', connections: 'count' }],
+      ['flow.nftRevision', '/api/v1/flowd/nft-revision', 'webd.flowd', 5000, { observed_at: 's' }],
       ['flow.engineSettings', '/api/v1/flowd/settings', 'webd.flowd', 10000, {}],
       ['flow.qosSettings', '/api/v1/flowd/qos/settings', 'webd.flowd', 10000, { headroom_pct: 'percent' }],
       ['flow.qosClasses', '/api/v1/flowd/qos/classes', 'webd.flowd', 10000, { guarantee_pct: 'percent', ceiling_pct: 'percent', latency_ms: 'ms' }],
@@ -3270,6 +3279,119 @@
     const text = firstText(value).trim();
     if (!text) return 'Build202607180016';
     return /^build/i.test(text) ? `Build${text.slice(5)}` : `Build${text}`;
+  }
+
+  /* Footer geometry. The version strip used to claim a fixed 58px band across the
+     full content width, which cut through page-level side rails and stole rows
+     from routes that scroll on their own. Both numbers are measured instead:
+     how far the footer must stay clear of a page rail, and whether the route
+     actually leaves the strip empty. */
+  const footerLayout = { frame: 0, observer: null, watched: null };
+  const FOOTER_RAIL_DEPTH = 5;
+  const FOOTER_RAIL_BUDGET = 240;
+
+  /* How far the footer must stay clear of a page-level rail. Detection is
+     geometric rather than a list of class names, so a rail on any route is
+     honoured: it has to hug the left edge of the content column, run tall and
+     narrow, and reach down to where the footer starts. Once it does, drawing the
+     footer rule across it reads as the rail being chopped off, so the footer
+     steps aside and centres in what is left. A rail that ends well above the
+     footer is not in the way and returns 0. The dashboard status rail is a shell
+     grid column of its own and never enters this search. */
+  function footerRailInset() {
+    const host = consoleStage;
+    if (!consolePageFooter || !consoleMain || !host) return 0;
+    const column = consoleMain.getBoundingClientRect();
+    const band = consolePageFooter.getBoundingClientRect();
+    if (band.height <= 0) return 0;
+    const minHeight = Math.max(180, host.clientHeight * 0.5);
+    let inset = 0;
+    let budget = FOOTER_RAIL_BUDGET;
+    let level = [...host.children];
+    for (let depth = 0; depth < FOOTER_RAIL_DEPTH && level.length && budget > 0; depth += 1) {
+      const next = [];
+      for (const node of level) {
+        if (budget-- <= 0) break;
+        if (!(node instanceof Element) || node.hidden) continue;
+        const style = getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        const rect = node.getBoundingClientRect();
+        const hugsLeft = rect.left - column.left <= 24;
+        const isColumn = rect.width >= 120 && rect.width <= column.width * 0.45;
+        const isTall = rect.height >= minHeight;
+        const meetsBand = rect.bottom >= band.top - 4;
+        if (hugsLeft && isColumn && isTall && meetsBand) {
+          inset = Math.max(inset, Math.round(rect.right - column.left));
+          continue;
+        }
+        // Wrappers are transparent to this search; only their children can be rails.
+        if (rect.height >= minHeight && node.children.length) next.push(...node.children);
+      }
+      level = next;
+    }
+    return inset;
+  }
+
+  function syncPageFooterLayout() {
+    if (!consolePageFooter || !consoleMain) return;
+    footerLayout.frame = 0;
+    const inset = footerRailInset();
+    consolePageFooter.style.setProperty('--console-footer-inset', `${inset}px`);
+    consolePageFooter.dataset.railAvoid = inset > 0 ? 'true' : 'false';
+    // The reserved strip is only justified when the route leaves it empty. Once
+    // content spills, the strip is content the footer displaced, so it is given
+    // back and the footer trails the content instead.
+    //
+    // Dropping the strip makes the stage taller, which can clear the very
+    // overflow that triggered it, so the decision never reverses on its own:
+    // each route render and each resize restarts from "reserved" via
+    // resetPageFooterReserve(), and from there the strip can only be released.
+    const root = document.documentElement;
+    if (root.dataset.footerReserve === 'off') return;
+    const overflow = Math.max(
+      consoleStage ? consoleStage.scrollHeight - consoleStage.clientHeight : 0,
+      consoleMain.scrollHeight - consoleMain.clientHeight
+    );
+    if (overflow > 4) root.dataset.footerReserve = 'off';
+  }
+
+  function resetPageFooterReserve() {
+    if (!consolePageFooter) return;
+    document.documentElement.dataset.footerReserve = 'on';
+    schedulePageFooterLayout();
+  }
+
+  function schedulePageFooterLayout() {
+    if (!consolePageFooter || footerLayout.frame) return;
+    footerLayout.frame = requestAnimationFrame(syncPageFooterLayout);
+  }
+
+  function watchPageFooterLayout() {
+    if (!consolePageFooter || typeof ResizeObserver === 'undefined') return;
+    if (!footerLayout.observer) {
+      footerLayout.observer = new ResizeObserver(() => schedulePageFooterLayout());
+    }
+    const targets = [consoleMain, consoleStage, routePreview].filter(Boolean);
+    footerLayout.observer.disconnect();
+    targets.forEach((target) => footerLayout.observer.observe(target));
+    footerLayout.watched = targets;
+    schedulePageFooterLayout();
+  }
+
+  function initPageFooterLayout() {
+    if (!consolePageFooter) return;
+    watchPageFooterLayout();
+    // Route swaps replace the preview subtree wholesale, and a rail can appear or
+    // disappear without changing any observed box, so mutations are watched too.
+    if (typeof MutationObserver !== 'undefined' && routePreview) {
+      new MutationObserver(() => schedulePageFooterLayout())
+        .observe(routePreview, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
+    }
+    if (typeof MutationObserver !== 'undefined' && consoleStage) {
+      new MutationObserver(() => schedulePageFooterLayout())
+        .observe(consoleStage, { attributes: true, attributeFilter: ['class'] });
+    }
+    consoleMain?.addEventListener('scroll', schedulePageFooterLayout, { passive: true });
   }
 
   function updatePageFooterRelease(payload = {}) {
@@ -5273,6 +5395,7 @@
     if (workspace) workspace.hidden = false;
     if (rail) rail.hidden = false;
     if (routePreview) routePreview.hidden = true;
+    resetPageFooterReserve();
     appShell?.classList.add('dashboard-active');
     consoleStage?.classList.add('is-dashboard');
     try {
@@ -5312,6 +5435,17 @@
     }
     if (/^#\/network\/(?:lan-config|wan-config)$/.test(cleanHash)) {
       history.replaceState(null, '', '/app/#/network/global-config');
+      syncFromLocation(options);
+      return;
+    }
+    const retiredNetworkRoute = {
+      '#/network/firewall': '#/policy-engine/table',
+      '#/network/custom-config': '#/policy-engine/objects',
+      '#/network/advanced-routing': '#/policy-engine/routes',
+      '#/network/flow-control': '#/policy-engine/flow-engine'
+    }[cleanHash];
+    if (retiredNetworkRoute) {
+      history.replaceState(null, '', `/app/${retiredNetworkRoute}`);
       syncFromLocation(options);
       return;
     }
@@ -6164,6 +6298,10 @@
     '.client-filter-tabs',
     '.client-connection-options-tabs',
     '.dwrt-kit-glass-surface',
+    // Pages that adopted the shared Kit surface contract instead of the legacy glass class
+    // must still participate in page-level sampling, otherwise their text stays unreadable.
+    '[data-dwrt-surface="stable-glass"]',
+    '[data-dwrt-surface="dense-surface"]',
     '.dwrt-kit-overview-card',
     '.system-demo-panel',
     '.client-stable-glass',
@@ -7534,6 +7672,7 @@
       if (state.topology.active) resetTopologyView();
       scheduleGlassCardsRender(520);
       scheduleAdaptiveForegroundSample(180);
+      resetPageFooterReserve();
     });
     const settleAdaptiveForegroundAfterScroll = (event) => {
       const target = event?.target;
@@ -7759,6 +7898,7 @@
     initSvgImageBitmapObserver();
     setupActionIcons();
     initEvents();
+    initPageFooterLayout();
     loadPageFooterRelease().catch(() => {});
     if (!window.location.hash) history.replaceState(null, '', '/app/#/dashboard');
     hydrateShell().catch(() => {

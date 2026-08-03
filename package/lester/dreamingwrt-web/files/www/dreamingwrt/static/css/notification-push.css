@@ -3,7 +3,7 @@
 .console-stage.is-system-settings:has(.route-preview.notification-push-route-host) {
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
   overflow: hidden;
@@ -50,20 +50,16 @@
   flex: 0 1 auto;
   justify-self: start;
 }
-.notification-push-toolbar {
-  min-width: 0;
-  flex: 0 1 auto;
-  justify-content: flex-end;
-  gap: 10px;
-}
-.notification-push-toolbar.is-compact { flex: 0 0 auto; }
-.notification-push-toolbar .policy-search { min-width: 48px; }
-.notification-push-toolbar .policy-toolbar-actions { flex: 0 0 auto; }
-.notification-push-actions svg,
-.notification-row-actions svg { width: 17px; height: 17px; display: block; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.notification-push-filter { height: 48px; min-width: 145px; display: grid; grid-template-columns: auto minmax(0,1fr); align-items: center; gap: 8px; padding: 0 14px; border-radius: 999px; color: var(--app-text-muted); background: rgba(255,255,255,.035); box-shadow: inset 0 0 0 1px rgba(255,255,255,.13); }
-.notification-push-filter span { font-size: 11px; font-weight: 720; }
-.notification-push-filter select { border: 0; outline: 0; color: var(--app-text); background: transparent; font: inherit; font-size: 12px; }
+.notification-row-actions svg,
+.notification-toolbar-actions svg { width: 17px; height: 17px; display: block; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+/* 表格工具条：筛选、搜索、新建全部收在表头里（用户第 9 条）。 */
+.notification-push-table-toolbar { flex-wrap: wrap; gap: 12px; }
+.notification-toolbar-actions { min-width: 0; margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.notification-push-filter { min-width: 132px; }
+.notification-push-search { flex: 0 1 auto; }
+.notification-create-button { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.notification-create-button svg { width: 15px; height: 15px; }
+.notification-push-table-card [data-notify-table-count] { font-style: normal; }
 .notification-push-table-card { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0,1fr); overflow: hidden; border: 0 !important; }
 .notification-push-table-card.dwrt-kit-glass-surface,
 .system-users-table-card.dwrt-kit-glass-surface { border-radius: var(--app-radius-card); }
@@ -174,8 +170,8 @@
 .notification-switch-field input:checked + i::after { transform: translateX(18px); }
 .notification-switch-field.is-compact { min-height: 40px; align-self: end; }
 
-.notification-push-drawer { --dwrt-kit-sheet-width: min(92vw, 560px); --dwrt-kit-sheet-z: 70; }
-.notification-route-drawer { --dwrt-kit-sheet-width: min(92vw, 680px); }
+.notification-push-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form); --dwrt-kit-sheet-z: 70; }
+.notification-route-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form); }
 .notification-push-drawer .dwrt-kit-sheet-header span { display: block; font-size: 10px; font-weight: 760; }
 .notification-push-drawer .dwrt-kit-sheet-header strong { display: block; margin-top: 2px; font-size: 17px; }
 .notification-push-drawer-body { display: grid; align-content: start; gap: 16px; padding: 18px var(--dwrt-kit-sheet-padding-x); }
@@ -201,12 +197,36 @@
 .notification-form-notice.is-ready { color: #66dda2; background: rgba(71,212,134,.10); box-shadow: inset 0 0 0 1px rgba(71,212,134,.17); }
 .notification-form-notice.is-wide { grid-column: 1 / -1; }
 
+/* 合卡后的投递概览：一张卡内部两列，不再用两张并排面板。 */
+.notification-overview-combined { display: grid; grid-template-rows: auto minmax(0,1fr); }
+.notification-overview-split { min-width: 0; min-height: 0; display: grid; grid-template-columns: minmax(0,1.35fr) minmax(300px,.65fr); }
+.notification-overview-split > .notification-overview-column + .notification-overview-column { box-shadow: inset 1px 0 0 rgba(255,255,255,.075); }
+.notification-overview-column { min-width: 0; display: grid; grid-template-rows: auto minmax(0,1fr); align-content: start; }
+.notification-overview-column-head { min-height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 17px 6px; }
+.notification-overview-column-head > span { color: var(--app-text-muted); font-size: 11px; font-weight: 760; letter-spacing: .04em; }
+.notification-overview-column-head > button { border: 0; border-radius: 8px; padding: 5px 8px; color: var(--app-text-secondary); background: transparent; font: inherit; font-size: 11px; font-weight: 700; cursor: pointer; }
+.notification-overview-column-head > button:hover { background: var(--dwrt-interactive-hover-bg); box-shadow: inset 0 0 0 1px var(--dwrt-interactive-hover-border); }
+
+/* 开关卡片（用户 pic-5）：与系统设置的 hero 开关卡同一语义，材质走本库 token。 */
+.notification-settings-body { display: grid; gap: 16px; padding: 18px; }
+.notification-settings-body > .notification-settings-grid { padding: 0; }
+.notification-master-card { position: relative; display: grid; grid-template-columns: 40px minmax(0,1fr); grid-template-rows: auto auto; align-items: center; column-gap: 13px; row-gap: 3px; min-height: 76px; padding: 16px 18px; border-radius: 14px; background: rgba(6,12,23,.11); box-shadow: inset 0 0 0 1px rgba(255,255,255,.09); cursor: pointer; transition: background 180ms ease, box-shadow 180ms ease; }
+.notification-master-card:hover { background: var(--dwrt-interactive-hover-bg); box-shadow: inset 0 0 0 1px var(--dwrt-interactive-hover-border); }
+.notification-master-card.is-active { background: color-mix(in srgb, var(--appearance-accent, #2e8bff) 13%, rgba(7,13,24,.10)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--appearance-accent, #2e8bff) 40%, transparent); }
+.notification-master-card > input { position: absolute; opacity: 0; pointer-events: none; }
+.notification-master-icon { grid-row: 1 / span 2; width: 40px; height: 40px; display: grid; place-items: center; border-radius: 12px; color: var(--app-text-secondary); background: rgba(255,255,255,.07); box-shadow: inset 0 0 0 1px rgba(255,255,255,.10); }
+.notification-master-card.is-active .notification-master-icon { color: #fff; background: var(--appearance-accent, #2e8bff); }
+.notification-master-icon svg { width: 19px; height: 19px; display: block; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.notification-master-card > strong { min-width: 0; color: var(--app-text); font-size: 15px; font-weight: 800; }
+.notification-master-card > em { min-width: 0; color: var(--app-text-muted); font-size: 11px; font-style: normal; font-weight: 660; line-height: 1.5; }
+
 @media (max-width: 1050px) { .notification-overview-lower { grid-template-columns: minmax(0,1fr); } }
+@media (max-width: 1050px) { .notification-overview-split { grid-template-columns: minmax(0,1fr); }
+  .notification-overview-split > .notification-overview-column + .notification-overview-column { box-shadow: inset 0 1px 0 rgba(255,255,255,.075); } }
 @media (max-width: 760px) {
   .notification-push-page-header { align-items: stretch; flex-direction: column; }
   .notification-push-tabs { width: 100%; overflow-x: auto; scrollbar-width: none; }
   .notification-push-tabs::-webkit-scrollbar { display: none; }
-  .notification-push-toolbar { width: 100%; justify-content: space-between; }
   .notification-settings-grid,
   .notification-form { grid-template-columns: 1fr; }
   .notification-form label.is-wide { grid-column: auto; }

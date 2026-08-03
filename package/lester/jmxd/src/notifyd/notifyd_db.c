@@ -139,6 +139,41 @@ static const struct notifyd_event_definition notifyd_event_definitions[] = {
     { "CONFIG_COMMIT_FAILED", "ADMIN", "Configuration Commit Failed", "", "", "config_transaction_event_producer_pending", "error", 0 },
     { "APPLICATION_UPDATE_FAILED", "SYSTEM", "Application Update Failed", "", "", "otad_failure_event_producer_pending", "error", 0 },
     { "IMPROPER_SHUTDOWN", "SYSTEM", "Improper Shutdown", "", "", "boot_marker_event_producer_pending", "warning", 0 },
+
+    /*
+     * dreamingproxy is an out-of-tree Go plugin that enqueues with category
+     * "PROXY". Delivery never consulted this table, so these events were being
+     * routed all along, but the catalog omission hid them from the notification
+     * routing UI: a user could not build a PROXY-scoped route, and info-severity
+     * events were dropped because the only live route is min_severity=warning.
+     * Severities below mirror the producer exactly (internal/service/
+     * notifications.go and egress_drift.go); recovery events are info because
+     * notify/manager.go hardcodes "info" when it resolves an active state.
+     */
+    { "PROXY_NODE_MASS_FAILURE", "PROXY", "Proxy Nodes Mass Failure", "dreamingproxy", "PROXY_NODE_MASS_RECOVERED", "", "warning", 1 },
+    { "PROXY_NODE_MASS_RECOVERED", "PROXY", "Proxy Nodes Recovered", "dreamingproxy", "PROXY_NODE_MASS_FAILURE", "", "info", 1 },
+    { "PROXY_CAPABILITY_EMPTY", "PROXY", "Policy Group Candidates Empty", "dreamingproxy", "PROXY_CAPABILITY_RECOVERED", "", "error", 1 },
+    { "PROXY_CAPABILITY_RECOVERED", "PROXY", "Policy Group Candidates Recovered", "dreamingproxy", "PROXY_CAPABILITY_EMPTY", "", "info", 1 },
+    { "PROXY_BINDING_OFFLINE", "PROXY", "Client Binding Offline", "dreamingproxy", "PROXY_BINDING_RESTORED", "", "critical", 1 },
+    { "PROXY_BINDING_RESTORED", "PROXY", "Client Binding Restored", "dreamingproxy", "PROXY_BINDING_OFFLINE", "", "info", 1 },
+    { "PROXY_ALL_WANS_DEGRADED", "PROXY", "All WAN Paths Degraded", "dreamingproxy", "PROXY_WAN_PATH_RECOVERED", "", "error", 1 },
+    { "PROXY_WAN_PATH_RECOVERED", "PROXY", "WAN Path Recovered", "dreamingproxy", "PROXY_ALL_WANS_DEGRADED", "", "info", 1 },
+    { "PROXY_WAN_PATH_FLAPPING", "PROXY", "WAN Path Flapping", "dreamingproxy", "", "", "warning", 1 },
+    { "PROXY_CONFIG_APPLY_FAILED", "PROXY", "Proxy Config Apply Failed", "dreamingproxy", "", "", "error", 1 },
+    { "PROXY_CONFIG_ROLLED_BACK", "PROXY", "Proxy Config Rolled Back", "dreamingproxy", "", "", "warning", 1 },
+    { "PROXY_SUBSCRIPTION_UPDATE_FAILED", "PROXY", "Subscription Update Failed", "dreamingproxy", "PROXY_SUBSCRIPTION_UPDATE_RECOVERED", "", "warning", 1 },
+    { "PROXY_SUBSCRIPTION_UPDATE_RECOVERED", "PROXY", "Subscription Update Recovered", "dreamingproxy", "PROXY_SUBSCRIPTION_UPDATE_FAILED", "", "info", 1 },
+    { "PROXY_RULESET_UPDATE_FAILED", "PROXY", "Ruleset Update Failed", "dreamingproxy", "PROXY_RULESET_UPDATE_RECOVERED", "", "warning", 1 },
+    { "PROXY_RULESET_UPDATE_RECOVERED", "PROXY", "Ruleset Update Recovered", "dreamingproxy", "PROXY_RULESET_UPDATE_FAILED", "", "info", 1 },
+    { "PROXY_CORE_UNAVAILABLE", "PROXY", "Proxy Core Unavailable", "dreamingproxy", "PROXY_CORE_RECOVERED", "", "error", 1 },
+    { "PROXY_CORE_RECOVERED", "PROXY", "Proxy Core Recovered", "dreamingproxy", "PROXY_CORE_UNAVAILABLE", "", "info", 1 },
+    /*
+     * No recovery event by design: egress drift is a completed discrete change,
+     * so "recovered" would wrongly claim the previous exit came back. Severity
+     * is warning for operator_changed and info for unknown attribution, so the
+     * default here is the more common warning form.
+     */
+    { "PROXY_EGRESS_DRIFT", "PROXY", "Proxy Egress Address Drift", "dreamingproxy", "", "", "warning", 1 },
 };
 
 static void notifyd_event_ids_json(struct json_object *cap)
@@ -166,6 +201,8 @@ struct json_object *notifyd_event_catalog_json(void)
         { "ADMIN", "Admin" },
         { "SECURITY", "Security" },
         { "VPN", "VPN" },
+        /* Owned by the out-of-tree dreamingproxy plugin, not by notifyd. */
+        { "PROXY", "Proxy" },
     };
     struct json_object *resp = json_object_new_object();
     struct json_object *category_array = json_object_new_array();

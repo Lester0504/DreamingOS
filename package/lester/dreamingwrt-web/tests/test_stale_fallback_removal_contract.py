@@ -124,7 +124,7 @@ def test_touched_modules_bumped_their_cache_version() -> None:
             walk(item.get("children", []))
     walk(menu["items"])
     for module in ("native/global-config.js", "native/system-power.js", "native/system-users.js"):
-        assert versions[module] == "20260801-capability-truth-01", module
+        assert versions[module] in {"20260801-capability-truth-01", "20260802-ui-batch-01"}, module
 
 
 def test_gzip_assets_match_sources() -> None:

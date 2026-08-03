@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import re
 from pathlib import Path
 
 
@@ -119,9 +120,9 @@ assert (WWW / "plugins/native/system-terminal.js").is_file()
 assert (WWW / "static/css/system-terminal.css").is_file()
 logs = next(item for item in menu["items"] if item.get("id") == "log-center")
 assert logs["module"] == "native/log-center.js"
-assert logs["module_version"] == "20260730-log-center-interaction-01"
+assert logs["module_version"] == "20260802-ui-batch-01"
 assert logs["style"] == "/static/css/log-center.css"
-assert logs["style_version"] == "20260730-log-center-interaction-01"
+assert logs["style_version"] == "20260802-ui-batch-01"
 assert logs["frontend_owned"] is True
 assert (WWW / "plugins/native/log-center.js").is_file()
 assert (WWW / "static/js/log-center.js").is_file()
@@ -146,7 +147,18 @@ terminal_style = (WWW / "static/css/system-terminal.css").read_text(encoding="ut
 dashboard_module = (WWW / "static/js/dashboard.js").read_text(encoding="utf-8")
 assert 'id="aiGlobalRoot"' in app_html
 assert 'id="sessionRecovery"' in app_html
-assert '/static/js/dwrt-session-gate.js?v=20260720-01' in app_html
+# 会话闸门的缓存键会随内容变更而 bump，断言里不写死版本号；真正要守的是
+# app/index.html 与 shell-prewarm.js 引用同一个键，否则预热会拉到另一份文件。
+_gate_re = re.compile(r"/static/js/dwrt-session-gate\.js\?v=([0-9a-z.-]+)")
+_gate_app = _gate_re.findall(app_html)
+_gate_prewarm = _gate_re.findall(
+    (WWW / "static/js/shell-prewarm.js").read_text(encoding="utf-8")
+)
+assert _gate_app, "app/index.html 必须带版本号引用 dwrt-session-gate.js"
+assert _gate_prewarm, "shell-prewarm.js 必须带版本号预热 dwrt-session-gate.js"
+assert set(_gate_app) == set(_gate_prewarm), (
+    f"会话闸门缓存键不一致: app={_gate_app} prewarm={_gate_prewarm}"
+)
 assert "class SessionGate" in session_gate
 assert 'id="consolePageFooter"' in app_html
 assert 'id="consolePageFooterVersion"' in app_html
@@ -208,8 +220,12 @@ assert ".system-cron-command-label" in system_style and "white-space: nowrap" in
 assert 'class="system-admin-chambers"' in system_module
 assert "system-admin-account-chamber" in system_module and "system-admin-ssh-chamber" in system_module
 assert "管理员与 SSH 远程访问" not in system_module
-assert "system-admin-master-switch" in system_module and ".system-admin-master-switch" in system_style
-assert ':not(:has([data-system-field="ssh.enabled"]:checked)) .system-admin-status-light' in system_style
+# SSH 总控改用与「高级」面板一致的开关卡片（systemAdvancedHeroCard），旧的 system-admin-hero-card
+# 与自绘 master-switch 已删除；状态灯改由 .ok 类驱动，不再依赖 ssh.enabled 的 :has 联动。
+assert "systemAdvancedHeroCard('启用 SSH 服务'" in system_module
+assert "system-admin-master-switch" not in system_module and "system-admin-master-switch" not in system_style
+assert ".system-admin-ssh-quick-grid" in system_style and ".system-admin-ssh-params" in system_style
+assert ".system-admin-status-light.ok" in system_style
 assert ".dwrt-kit-status-badge" in ui_kit_style
 assert ".dwrt-kit-status-badge-dot" in ui_kit_style
 assert ".dwrt-floating-savebar" in ui_kit_style
@@ -224,7 +240,11 @@ assert "observer.observe(document.documentElement" not in ui_kit_module
 assert ".dwrt-kit-tabs.dwrt-page-liquid-glass" in control_material
 assert ".dwrt-kit-confirmation" in ui_kit_style
 assert ".dwrt-kit-confirmation-actions" in ui_kit_style
-assert "<strong>重启计划</strong>" in power_module
+# 「计划」Tab 已经点明了表格内容，标题栏里的 <strong>重启计划</strong> 属于用户明确要求删除的重复复述；
+# 现在标题栏只保留条数与「添加计划」动作。
+assert "<strong>重启计划</strong>" not in power_module
+assert "data-power-add" in power_module and "system-power-tab-actions" in power_module
+assert "data-power-refresh" not in power_module
 assert "由系统调度器执行" not in power_module
 assert "system-power-safety" not in power_module
 assert "window.DWRT_UI_KIT?.confirmationMarkup" in power_module
@@ -270,16 +290,17 @@ assert "dreamingwrt.shellWarm.menu.v4" in prewarm
 assert "dreamingwrt.shellWarm.menu.v3" not in prewarm
 assert "/plugins/native/ai-assistant.js" not in prewarm
 assert "/static/css/ai-assistant.css" not in prewarm
-assert "/static/js/dwrt-session-gate.js?v=20260720-01" in prewarm
 assert "/static/js/dwrt-data-registry.js?v=20260721-02" in prewarm
-assert "/static/js/menu-shell.js?v=20260731-policy-runtime-evidence-01" in prewarm
-assert "/static/ui-kit/dwrt-ui-kit.js?v=20260723-airview-radio-sheet-01" in prewarm
 assert "/static/js/device-images.js?v=20260723-airview-radio-sheet-01" in prewarm
-assert "const VERSION = '20260731-policy-runtime-evidence-01'" in prewarm
+# 外壳缓存键随每次改动 bump；这里断言三个引用点用的是同一个键，而不是某个具体字面量。
+_shell_key = re.search(r"const VERSION = '([^']+)'", prewarm)
+assert _shell_key, "shell-prewarm.js missing const VERSION"
+_shell_key = _shell_key.group(1)
+assert f"/static/js/menu-shell.js?v={_shell_key}" in prewarm
 assert "/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260730-safari-glass-lite-06" in prewarm
 assert '/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260730-safari-glass-lite-06' in app_html
-assert '/static/js/menu-shell.js?v=20260731-policy-runtime-evidence-01' in app_html
-assert '/static/js/shell-prewarm.js?v=20260731-policy-runtime-evidence-01' in app_html
+assert f'/static/js/menu-shell.js?v={_shell_key}' in app_html
+assert f'/static/js/shell-prewarm.js?v={_shell_key}' in app_html
 assert '/static/js/device-images.js?v=20260723-airview-radio-sheet-01' in app_html
 assert "/static/js/menu-icons.js?v=20260722-auth-control-01" in prewarm
 assert "/static/css/dwrt-theme.css?v=20260722-03" in prewarm

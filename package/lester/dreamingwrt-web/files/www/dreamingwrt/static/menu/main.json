@@ -1,5 +1,5 @@
 {
-  "version": "20260727-flow-engine-01",
+  "version": "20260801-high-availability-02",
   "generated_at": "2026-07-25T15:00:00+08:00",
   "meta": {
     "name": "Dreaming OS standalone console menu",
@@ -57,9 +57,9 @@
           "icon": "wireless_status",
           "path": "/app/#/monitor/wireless-status",
           "module": "native/wifi-management.js",
-          "module_version": "20260727-wifi-environment-spectrum-01",
+          "module_version": "20260802-sheet-portal-scope-01",
           "style": "/static/css/wifi-management.css",
-          "style_version": "20260727-wifi-environment-spectrum-01"
+          "style_version": "20260802-sheet-portal-scope-01"
         },
         {
           "label": "终端详情",
@@ -82,9 +82,9 @@
           "icon": "route_status_view",
           "path": "/app/#/monitor/policy-status",
           "module": "native/policy-status.js",
-          "module_version": "20260718-11",
+          "module_version": "20260731-policy-runtime-evidence-01",
           "style": "/static/css/policy-status.css",
-          "style_version": "20260718-11"
+          "style_version": "20260731-policy-runtime-evidence-01"
         }
       ]
     },
@@ -102,9 +102,9 @@
           "icon": "global_config",
           "path": "/app/#/network/global-config",
           "module": "native/global-config.js",
-          "module_version": "20260722-42",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/global-config.css",
-          "style_version": "20260722-42"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "DHCP 服务",
@@ -113,9 +113,9 @@
           "icon": "dhcp",
           "path": "/app/#/network/dhcp-service",
           "module": "native/network-services.js",
-          "module_version": "20260725-dns-02",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/network-services.css",
-          "style_version": "20260725-dns-02"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "DNS 服务",
@@ -124,9 +124,9 @@
           "icon": "dns",
           "path": "/app/#/network/dns-service",
           "module": "native/network-services.js",
-          "module_version": "20260725-dns-02",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/network-services.css",
-          "style_version": "20260725-dns-02"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "UPnP IGD",
@@ -135,30 +135,23 @@
           "icon": "upnp",
           "path": "/app/#/network/upnp-service",
           "module": "native/upnp-service.js",
-          "module_version": "20260730-upnp-dhcp-unify-05",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/upnp-service.css",
-          "style_version": "20260730-upnp-dhcp-unify-05",
+          "style_version": "20260802-ui-batch-01",
           "frontend_owned": true
         },
         {
-          "label": "流控分流",
-          "func_name": "flow",
-          "id": "flow-control",
-          "icon": "flow",
-          "path": "/app/#/network/flow-control",
-          "capability": "flow_control_workbench",
-          "availability": "unavailable",
-          "unavailable_reason": "当前固件未提供流控分流配置与应用 API。"
-        },
-        {
-          "label": "批量 IP 管理",
+          "label": "IP 地址管理",
           "func_name": "bulk_ip",
           "id": "bulk-ip",
           "icon": "bulk_ip",
           "path": "/app/#/network/bulk-ip",
-          "capability": "bulk_ip_transaction",
-          "availability": "unavailable",
-          "unavailable_reason": "当前固件未提供批量 IP 冲突检查、事务应用与回滚 API。"
+          "availability": "available",
+          "frontend_owned": true,
+          "module": "native/ip-address-management.js",
+          "module_version": "20260802-sheet-portal-scope-01",
+          "style": "/static/css/ip-address-management.css",
+          "style_version": "20260802-sheet-portal-scope-01"
         },
         {
           "label": "Wi-Fi",
@@ -167,29 +160,9 @@
           "icon": "wifi",
           "path": "/app/#/network/wifi-config",
           "module": "native/wifi-management.js",
-          "module_version": "20260727-wifi-environment-spectrum-01",
+          "module_version": "20260802-sheet-portal-scope-01",
           "style": "/static/css/wifi-management.css",
-          "style_version": "20260727-wifi-environment-spectrum-01"
-        },
-        {
-          "label": "高级路由",
-          "func_name": "advanced_routes",
-          "id": "advanced-routing",
-          "icon": "advanced_routes",
-          "path": "/app/#/network/advanced-routing",
-          "capability": "advanced_routing_workbench",
-          "availability": "unavailable",
-          "unavailable_reason": "高级路由尚未形成独立能力合同，请使用策略引擎中的路由表。"
-        },
-        {
-          "label": "自定义",
-          "func_name": "custom",
-          "id": "custom-config",
-          "icon": "custom",
-          "path": "/app/#/network/custom-config",
-          "capability": "raw_network_config",
-          "availability": "unavailable",
-          "unavailable_reason": "当前固件未提供原始网络配置校验、差异预览与安全应用 API。"
+          "style_version": "20260802-sheet-portal-scope-01"
         },
         {
           "label": "组播服务",
@@ -198,21 +171,11 @@
           "icon": "multicast",
           "path": "/app/#/network/multicast-service",
           "module": "native/multicast-service.js",
-          "module_version": "20260730-multicast-layout-02",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/multicast-service.css",
-          "style_version": "20260730-multicast-layout-02",
+          "style_version": "20260802-ui-batch-01",
           "availability": "available",
           "frontend_owned": true
-        },
-        {
-          "label": "防火墙",
-          "func_name": "firewall",
-          "id": "firewall",
-          "icon": "firewall",
-          "path": "/app/#/network/firewall",
-          "capability": "firewall_policy",
-          "availability": "unavailable",
-          "unavailable_reason": "防火墙规则尚未提供独立合同，请使用策略表的防火墙视图。"
         },
         {
           "label": "VPN",
@@ -224,9 +187,9 @@
           "availability": "available",
           "frontend_owned": true,
           "module": "native/vpn-config.js",
-          "module_version": "20260723-vpn-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/vpn-config.css",
-          "style_version": "20260723-vpn-01"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "QWRT模组管理",
@@ -235,8 +198,12 @@
           "icon": "qwrt_modules",
           "path": "/app/#/network/qwrt-modules",
           "capability": "qwrt_modules",
-          "availability": "unavailable",
-          "unavailable_reason": "当前设备未提供 QWRT 模组清单与管理 API。"
+          "availability": "available",
+          "frontend_owned": true,
+          "module": "native/qwrt-modules.js",
+          "module_version": "20260802-sheet-portal-scope-01",
+          "style": "/static/css/qwrt-modules.css",
+          "style_version": "20260802-sheet-portal-scope-01"
         }
       ]
     },
@@ -255,9 +222,9 @@
           "icon": "authentication_web",
           "path": "/app/#/authentication/web",
           "module": "native/user-authentication.js",
-          "module_version": "20260730-user-auth-online-layout-11",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260730-user-auth-online-layout-11"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "在线用户",
@@ -266,9 +233,9 @@
           "icon": "authentication_online_users",
           "path": "/app/#/authentication/online-users",
           "module": "native/user-authentication.js",
-          "module_version": "20260730-user-auth-online-layout-11",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260730-user-auth-online-layout-11"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "账号管理",
@@ -277,9 +244,9 @@
           "icon": "authentication_accounts",
           "path": "/app/#/authentication/accounts",
           "module": "native/user-authentication.js",
-          "module_version": "20260730-user-auth-online-layout-11",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260730-user-auth-online-layout-11"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "代拨服务",
@@ -288,9 +255,9 @@
           "icon": "authentication_delegated",
           "path": "/app/#/authentication/delegated",
           "module": "native/user-authentication.js",
-          "module_version": "20260730-user-auth-online-layout-11",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260730-user-auth-online-layout-11"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "终端限速",
@@ -299,8 +266,12 @@
           "icon": "authentication_client_speed_limit",
           "path": "/app/#/authentication/client-speed-limit",
           "capability": "client_speed_limit",
-          "availability": "unavailable",
-          "unavailable_reason": "当前固件尚未提供终端限速规则、应用与运行态读取 API。"
+          "availability": "available",
+          "frontend_owned": true,
+          "module": "native/client-speed-limit.js",
+          "module_version": "20260802-ui-batch-01",
+          "style": "/static/css/user-authentication.css",
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "网址浏览控制",
@@ -339,9 +310,9 @@
           "icon": "authentication_notifications",
           "path": "/app/#/authentication/notifications",
           "module": "native/user-authentication.js",
-          "module_version": "20260730-user-auth-online-layout-11",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260730-user-auth-online-layout-11"
+          "style_version": "20260802-ui-batch-01"
         }
       ]
     },
@@ -363,9 +334,9 @@
           "icon": "quick_tools",
           "path": "/app/#/plugins/native/quick-tools",
           "module": "native/quick-tools.js",
-          "module_version": "20260711-05",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/quick-tools.css",
-          "style_version": "20260711-02"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "Docker",
@@ -374,9 +345,9 @@
           "icon": "docker",
           "path": "/app/#/container/docker",
           "module": "native/container-service.js",
-          "module_version": "20260722-overlay-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/container-service.css",
-          "style_version": "20260719-03",
+          "style_version": "20260802-ui-batch-01",
           "frontend_owned": true
         },
         {
@@ -386,9 +357,9 @@
           "icon": "lxc",
           "path": "/app/#/container/lxc",
           "module": "native/container-service.js",
-          "module_version": "20260722-overlay-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/container-service.css",
-          "style_version": "20260719-03",
+          "style_version": "20260802-ui-batch-01",
           "frontend_owned": true
         },
         {
@@ -417,9 +388,9 @@
           "icon": "storage_overview",
           "path": "/app/#/storage",
           "module": "native/storage-overview.js",
-          "module_version": "20260722-overlay-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/storage-overview.css",
-          "style_version": "20260722-overlay-01"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "磁盘分区",
@@ -428,9 +399,9 @@
           "icon": "storage_partitions",
           "path": "/app/#/storage/partitions",
           "module": "native/storage-partitions.js",
-          "module_version": "20260724-storage-partitions-01",
+          "module_version": "20260802-sheet-portal-scope-01",
           "style": "/static/css/storage-partitions.css",
-          "style_version": "20260724-storage-partitions-01",
+          "style_version": "20260802-sheet-portal-scope-01",
           "availability": "available",
           "frontend_owned": true
         },
@@ -441,9 +412,9 @@
           "icon": "storage_mounts",
           "path": "/app/#/storage/mounts",
           "module": "native/system-settings.js",
-          "module_version": "20260727-pair-approve-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260720-03"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "文件管理",
@@ -452,9 +423,9 @@
           "icon": "storage_files",
           "path": "/app/#/storage/files",
           "module": "native/storage-files.js",
-          "module_version": "20260716-25",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/storage-files.css",
-          "style_version": "20260716-24"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "RAID 管理",
@@ -463,9 +434,9 @@
           "icon": "storage_raid",
           "path": "/app/#/storage/raid",
           "module": "native/storage-raid.js",
-          "module_version": "20260722-overlay-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/storage-raid.css",
-          "style_version": "20260716-20"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "文件服务",
@@ -474,9 +445,9 @@
           "icon": "storage_file_services",
           "path": "/app/#/storage/file-services",
           "module": "native/storage-file-services.js",
-          "module_version": "20260725-dreaming-os-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/storage-file-services.css",
-          "style_version": "20260719-01"
+          "style_version": "20260802-ui-batch-01"
         }
       ]
     },
@@ -552,9 +523,9 @@
           "icon": "policy_aegisx",
           "path": "/app/#/policy-engine/aegisx",
           "module": "native/aegisx.js",
-          "module_version": "20260730-aegisx-ux-08",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/aegisx.css",
-          "style_version": "20260730-aegisx-ux-08"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "策略表",
@@ -574,9 +545,9 @@
           "icon": "policy_terminal_groups",
           "path": "/app/#/policy-engine/terminal-groups",
           "module": "native/terminal-groups.js",
-          "module_version": "20260711-02",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/terminal-groups.css",
-          "style_version": "20260711-01"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "区域",
@@ -585,9 +556,9 @@
           "icon": "policy_region",
           "path": "/app/#/policy-engine/regions",
           "module": "native/policy-regions.js",
-          "module_version": "20260730-policy-regions-unify-10",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/policy-entities.css",
-          "style_version": "20260730-policy-workbench-unify-14"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "对象",
@@ -596,9 +567,9 @@
           "icon": "policy_object",
           "path": "/app/#/policy-engine/objects",
           "module": "native/policy-objects.js",
-          "module_version": "20260730-policy-objects-unify-03",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/policy-entities.css",
-          "style_version": "20260730-policy-workbench-unify-14"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "路由表",
@@ -607,9 +578,9 @@
           "icon": "policy_routes",
           "path": "/app/#/policy-engine/routes",
           "module": "native/routing-table.js",
-          "module_version": "20260722-overlay-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/routing-table.css",
-          "style_version": "20260722-overlay-01"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "流量引擎",
@@ -618,9 +589,9 @@
           "icon": "flow",
           "path": "/app/#/policy-engine/flow-engine",
           "module": "native/flow-engine.js",
-          "module_version": "20260730-flow-engine-unify-04",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/flow-engine.css",
-          "style_version": "20260730-flow-engine-unify-08"
+          "style_version": "20260802-ui-batch-01"
         }
       ]
     },
@@ -631,9 +602,9 @@
       "icon": "log_center",
       "path": "/app/#/logs",
       "module": "native/log-center.js",
-      "module_version": "20260730-log-center-interaction-01",
+      "module_version": "20260802-ui-batch-01",
       "style": "/static/css/log-center.css",
-      "style_version": "20260730-log-center-interaction-01",
+      "style_version": "20260802-ui-batch-01",
       "frontend_owned": true,
       "capability": "logs",
       "bottom": true
@@ -653,9 +624,9 @@
           "icon": "general",
           "path": "/app/#/system/general",
           "module": "native/system-settings.js",
-          "module_version": "20260727-pair-approve-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260720-03"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "管理员",
@@ -664,9 +635,9 @@
           "icon": "system",
           "path": "/app/#/system/admin",
           "module": "native/system-settings.js",
-          "module_version": "20260727-pair-approve-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260720-03"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "通知推送",
@@ -675,9 +646,9 @@
           "icon": "system_notifications",
           "path": "/app/#/system/notifications",
           "module": "native/notification-push.js",
-          "module_version": "20260727-notify-catalog-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/notification-push.css",
-          "style_version": "20260722-overlay-01"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "LLM 接入设置",
@@ -686,9 +657,9 @@
           "icon": "ai",
           "path": "/app/#/system/llm-settings",
           "module": "native/ai-assistant.js",
-          "module_version": "20260727-ai-stream-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/ai-assistant.css",
-          "style_version": "20260727-ai-stream-01",
+          "style_version": "20260802-ui-batch-01",
           "frontend_owned": true
         },
         {
@@ -698,9 +669,9 @@
           "icon": "qwrt_modules",
           "path": "/app/#/system/startup",
           "module": "native/system-settings.js",
-          "module_version": "20260727-pair-approve-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260720-03"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "计划任务",
@@ -709,9 +680,9 @@
           "icon": "log_center",
           "path": "/app/#/system/crontab",
           "module": "native/system-settings.js",
-          "module_version": "20260727-pair-approve-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260720-03"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "终端",
@@ -732,9 +703,9 @@
           "icon": "system_power",
           "path": "/app/#/system/power",
           "module": "native/system-power.js",
-          "module_version": "20260719-07",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/system-power.css",
-          "style_version": "20260719-07",
+          "style_version": "20260802-ui-batch-01",
           "frontend_owned": true
         },
         {
@@ -744,9 +715,22 @@
           "icon": "advanced_plugins",
           "path": "/app/#/system/advanced",
           "module": "native/system-settings.js",
-          "module_version": "20260727-pair-approve-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260720-03"
+          "style_version": "20260802-ui-batch-01"
+        },
+        {
+          "label": "高可用性",
+          "func_name": "system_high_availability",
+          "id": "system-high-availability",
+          "icon": "system",
+          "path": "/app/#/system/high-availability",
+          "module": "native/gateway-shadow.js",
+          "module_version": "20260802-sheet-portal-scope-01",
+          "style": "/static/css/gateway-shadow.css",
+          "style_version": "20260802-sheet-portal-scope-01",
+          "availability": "available",
+          "frontend_owned": true
         },
         {
           "label": "备份 / 升级",
@@ -755,9 +739,9 @@
           "icon": "wan",
           "path": "/app/#/system/flash",
           "module": "native/system-settings.js",
-          "module_version": "20260727-pair-approve-01",
+          "module_version": "20260802-ui-batch-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260720-03"
+          "style_version": "20260802-ui-batch-01"
         },
         {
           "label": "外观",
@@ -781,9 +765,9 @@
       "icon": "system_users",
       "path": "/app/#/system/users",
       "module": "native/system-users.js",
-      "module_version": "20260729-user-avatar-01",
+      "module_version": "20260802-ui-batch-01",
       "style": "/static/css/system-users.css",
-      "style_version": "20260729-user-avatar-01",
+      "style_version": "20260802-ui-batch-01",
       "bottom": true
     }
   ]

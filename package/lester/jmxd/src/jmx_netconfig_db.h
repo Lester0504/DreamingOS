@@ -35,6 +35,7 @@ struct uci_package;
 /* lifecycle */
 int  jmx_netconfig_db_init(void);
 void jmx_netconfig_db_close(void);
+int  jmx_flash_factory_reset_worker_main(void);
 
 typedef struct {
     char lan_ifname[32];
@@ -249,6 +250,8 @@ int  jmx_flow_rule_delete(const char *id);
 int  jmx_flow_client_limit_save(struct json_object *cfg);
 struct json_object *jmx_multicast_service_get(void);
 int  jmx_bulk_ip_set(struct json_object *cfg);
+struct json_object *jmx_bulk_ip_transaction(struct json_object *cfg);
+struct json_object *jmx_bulk_ip_refresh(struct json_object *cfg);
 struct json_object *jmx_bulk_ip_import(struct json_object *cfg);
 struct json_object *jmx_bulk_ip_export(struct json_object *cfg);
 struct json_object *jmx_network_control_apply(struct json_object *cfg);
@@ -507,6 +510,8 @@ int nc_json_bool_def(struct json_object *o, const char *k, int def);
 int nc_exec(const char *sql);
 int nc_prepare(sqlite3_stmt **st, const char *sql);
 int nc_step_done(sqlite3_stmt *st);
+int nc_txn_begin(void);
+int nc_txn_end(int rc);
 int nc_sqlite_changes(void);
 sqlite3_int64 nc_sqlite_last_insert_rowid(void);
 void nc_add_text(struct json_object *o, const char *key, sqlite3_stmt *st, int col);

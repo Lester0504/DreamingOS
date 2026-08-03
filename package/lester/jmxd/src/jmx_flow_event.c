@@ -30,6 +30,9 @@
 #include <sqlite3.h>
 #include <libnetfilter_conntrack/libnetfilter_conntrack.h>
 
+#include "proc_path.h"
+#include "jmx_netconfig_db.h"
+
 #ifndef NFCT_ALL_CT_GROUPS
 #define NFCT_ALL_CT_GROUPS (NFCT_T_ALL)
 #endif
@@ -718,6 +721,183 @@ static const char *jmx_flow_event_service_hint(const char *proto, int dport,
     return buf;
 }
 
+/*
+ * Destination host / application lookup for destroyed flows.
+ *
+ * audit_flow_event_lifecycle declares destination_host, host, host_source,
+ * destination_app_id and destination_app_name, but the INSERT never bound them,
+ * so all 300k rows carried empty values from the first day. Aggregating that
+ * table by application could then only ever produce protocol names such as
+ * "https" or "tcp/25565", which is what the UI was showing where an application
+ * name belonged.
+ *
+ * The evidence lives in the af_active_host procfs table. Two constraints shape
+ * how it can be used here:
+ *
+ * 1. This runs on the ctnetlink worker thread at roughly 8-10 destroy events per
+ *    second on 30.1 (300093 events over 37316 s measured, 576 in the busiest
+ *    60 s window). Re-reading a 65-line procfs file per event would be wasteful,
+ *    so the snapshot is cached with a short TTL.
+ * 2. By the time conntrack reports a destroy, the matching af_active_host entry
+ *    may already have aged out (that table ages at 180 s). Matching is therefore
+ *    best-effort and a miss is recorded as an empty host rather than a guess.
+ */
+#define JMX_FLOW_HOST_CACHE_TTL_SEC 5
+#define JMX_FLOW_HOST_CACHE_MAX 512
+
+struct jmx_flow_host_entry {
+    char host[256];
+    char src_ip[64];
+    char dst_ip[64];
+    char proto[16];
+    int dst_port;
+    int app_id;
+    char app_name[128];
+};
+
+static struct jmx_flow_host_entry g_flow_hosts[JMX_FLOW_HOST_CACHE_MAX];
+static int g_flow_host_count;
+static int64_t g_flow_host_loaded_at;
+
+/* Caller must hold no lock; only the ctnetlink worker thread touches this. */
+static void jmx_flow_event_refresh_hosts(int64_t now)
+{
+    FILE *fp;
+    char line[1024];
+    int line_no = 0;
+    sqlite3 *sig_db = NULL;
+
+    if (g_flow_host_loaded_at > 0 &&
+        now - g_flow_host_loaded_at < JMX_FLOW_HOST_CACHE_TTL_SEC)
+        return;
+    g_flow_host_loaded_at = now;
+    g_flow_host_count = 0;
+
+    fp = jmx_fopen_af("af_active_host", "r");
+    if (!fp)
+        return;
+    (void)jmx_signature_db_open(&sig_db);
+
+    while (fgets(line, sizeof(line), fp) && g_flow_host_count < JMX_FLOW_HOST_CACHE_MAX) {
+        char host[256] = {0}, mac[32] = {0}, src_ip[64] = {0}, dst_ip[64] = {0}, proto[16] = {0};
+        unsigned int src_port = 0, dst_port = 0, app_proto = 0, drop = 0, last_update = 0;
+        struct jmx_flow_host_entry *e;
+
+        if (line_no++ == 0)
+            continue;
+        if (sscanf(line, "%255s %31s %63s %u %63s %u %15s %u %u %u",
+                   host, mac, src_ip, &src_port, dst_ip, &dst_port, proto,
+                   &app_proto, &drop, &last_update) < 10)
+            continue;
+        if (!host[0] || !strcmp(host, "-"))
+            continue;
+
+        e = &g_flow_hosts[g_flow_host_count];
+        memset(e, 0, sizeof(*e));
+        snprintf(e->host, sizeof(e->host), "%s", host);
+        snprintf(e->src_ip, sizeof(e->src_ip), "%s", src_ip);
+        snprintf(e->dst_ip, sizeof(e->dst_ip), "%s", dst_ip);
+        snprintf(e->proto, sizeof(e->proto), "%s", proto);
+        e->dst_port = (int)dst_port;
+        /* app_proto from this table is a protocol class (1/2), never an app_id -
+         * resolve the real one from the hostname instead. */
+        if (sig_db && jmx_signature_db_resolve_host_app_id_with_db(sig_db, host, proto,
+                                                                  (int)dst_port,
+                                                                  &e->app_id) != 0)
+            e->app_id = 0;
+        /* Resolve the name here, on this thread, from the same handle. The global
+         * app_name_table that get_app_name_by_id() reads is owned by the main
+         * thread and rebuilt on signature updates, so it is not safe to read from
+         * the ctnetlink worker. */
+        if (e->app_id > 0 && sig_db) {
+            sqlite3_stmt *st = NULL;
+
+            if (sqlite3_prepare_v2(sig_db, "SELECT COALESCE(name,'') FROM app WHERE app_id=?1",
+                                   -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_int(st, 1, e->app_id);
+                if (sqlite3_step(st) == SQLITE_ROW) {
+                    const char *name = (const char *)sqlite3_column_text(st, 0);
+
+                    if (name && name[0])
+                        snprintf(e->app_name, sizeof(e->app_name), "%s", name);
+                }
+                sqlite3_finalize(st);
+            }
+        }
+        g_flow_host_count++;
+    }
+    if (sig_db)
+        sqlite3_close(sig_db);
+    fclose(fp);
+}
+
+/* Returns 1 when a hostname was found. Matching prefers the full destination
+ * tuple and falls back to destination IP alone, because NAT can rewrite the port
+ * between what af_active_host observed and what conntrack reports. */
+static int jmx_flow_event_lookup_host(const char *client_ip, const char *remote_ip,
+                                      const char *proto, int dport,
+                                      char *host, size_t host_len,
+                                      int *app_id, char *app_name, size_t app_name_len,
+                                      const char **host_source)
+{
+    int i;
+    int fallback = -1;
+
+    if (host && host_len)
+        host[0] = '\0';
+    if (app_id)
+        *app_id = 0;
+    if (app_name && app_name_len)
+        app_name[0] = '\0';
+    if (host_source)
+        *host_source = "";
+    if (!remote_ip || !remote_ip[0] || !host || !host_len)
+        return 0;
+
+    for (i = 0; i < g_flow_host_count; i++) {
+        struct jmx_flow_host_entry *e = &g_flow_hosts[i];
+
+        if (strcmp(e->dst_ip, remote_ip))
+            continue;
+        if (client_ip && client_ip[0] && e->src_ip[0] && strcmp(e->src_ip, client_ip)) {
+            if (fallback < 0)
+                fallback = i;
+            continue;
+        }
+        if (dport > 0 && e->dst_port > 0 && e->dst_port != dport) {
+            if (fallback < 0)
+                fallback = i;
+            continue;
+        }
+        if (proto && proto[0] && e->proto[0] && strcasecmp(e->proto, proto)) {
+            if (fallback < 0)
+                fallback = i;
+            continue;
+        }
+        snprintf(host, host_len, "%s", e->host);
+        if (app_id)
+            *app_id = e->app_id;
+        if (app_name && app_name_len)
+            snprintf(app_name, app_name_len, "%s", e->app_name);
+        if (host_source)
+            *host_source = "af_active_host";
+        return 1;
+    }
+    if (fallback >= 0) {
+        /* Same destination address, weaker agreement on port/protocol/client.
+         * Label it distinctly so a consumer can tell how the host was obtained. */
+        snprintf(host, host_len, "%s", g_flow_hosts[fallback].host);
+        if (app_id)
+            *app_id = g_flow_hosts[fallback].app_id;
+        if (app_name && app_name_len)
+            snprintf(app_name, app_name_len, "%s", g_flow_hosts[fallback].app_name);
+        if (host_source)
+            *host_source = "af_active_host_dst_ip";
+        return 1;
+    }
+    return 0;
+}
+
 static int jmx_flow_event_lookup_arp_mac(const char *ip, char *mac, size_t len)
 {
     FILE *fp;
@@ -1190,12 +1370,14 @@ static int jmx_flow_event_db_ensure(void)
         "direction,initiator,direction_source,reply_src_ip,reply_dst_ip,reply_src_port,reply_dst_port,"
         "snat_ip,dnat_ip,snat_port,dnat_port,"
         "source,exact_lifecycle,byte_accounting_exact,byte_counter_valid,byte_counter_reason,created_at,updated_at,"
-        "policy_id,policy_name,policy_type,policy_action,policy_hit,policy_source,policy_mark,route_rule_prio,route_wan_id,route_wan) "
+        "policy_id,policy_name,policy_type,policy_action,policy_hit,policy_source,policy_mark,route_rule_prio,route_wan_id,route_wan,"
+        "destination_host,host,host_source,destination_app_id,destination_app_name) "
         /* kept adjacent to the legacy column list by adding new bindings at the end */
         "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'destroyed',?9,?10,?11,?12,?13,?14,"
         "?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,"
         "?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,'ctnetlink_destroy',?40,?41,?42,?43,?44,?45,"
-        "?46,?47,?48,?49,?50,?51,?52,?53,?54,?55)";
+        "?46,?47,?48,?49,?50,?51,?52,?53,?54,?55,"
+        "?56,?57,?58,?59,?60)";
     int rc;
 
     if (g_flow_db && g_flow_insert)
@@ -1277,6 +1459,20 @@ static int jmx_flow_event_db_ensure(void)
         "byte_counter_valid", "INTEGER DEFAULT 1");
     (void)jmx_flow_event_add_column_if_missing(g_flow_db, "audit_flow_event_lifecycle",
         "byte_counter_reason", "TEXT DEFAULT ''");
+    /* These five are declared in the CREATE TABLE above, but a database created
+     * before they were added would not have them, and CREATE TABLE IF NOT EXISTS
+     * does not backfill columns. The INSERT binds them now, so a missing column
+     * would fail every write. */
+    (void)jmx_flow_event_add_column_if_missing(g_flow_db, "audit_flow_event_lifecycle",
+        "destination_host", "TEXT DEFAULT ''");
+    (void)jmx_flow_event_add_column_if_missing(g_flow_db, "audit_flow_event_lifecycle",
+        "host", "TEXT DEFAULT ''");
+    (void)jmx_flow_event_add_column_if_missing(g_flow_db, "audit_flow_event_lifecycle",
+        "host_source", "TEXT DEFAULT ''");
+    (void)jmx_flow_event_add_column_if_missing(g_flow_db, "audit_flow_event_lifecycle",
+        "destination_app_id", "INTEGER DEFAULT 0");
+    (void)jmx_flow_event_add_column_if_missing(g_flow_db, "audit_flow_event_lifecycle",
+        "destination_app_name", "TEXT DEFAULT ''");
     (void)jmx_flow_event_add_column_if_missing(g_flow_db, "audit_flow_event_lifecycle",
         "policy_id", "TEXT DEFAULT ''");
     (void)jmx_flow_event_add_column_if_missing(g_flow_db, "audit_flow_event_lifecycle",
@@ -1378,6 +1574,10 @@ static void jmx_flow_event_persist_destroy(const char *key,
     char policy_name[96] = "";
     char route_wan[32] = "";
     int policy_hit;
+    char dest_host[256] = "";
+    char dest_app_name[128] = "";
+    const char *host_source = "";
+    int dest_app_id = 0;
     int idx = 1;
 
     if (!key || !t)
@@ -1441,6 +1641,17 @@ static void jmx_flow_event_persist_destroy(const char *key,
     if (jmx_flow_event_db_ensure() != 0)
         return;
 
+    /* Resolve the destination hostname and application before binding. Only for
+     * flows leaving the LAN: a private destination has no hostname in
+     * af_active_host and matching one would be wrong. */
+    if (!destination_private) {
+        jmx_flow_event_refresh_hosts(now);
+        (void)jmx_flow_event_lookup_host(client_ip, remote_ip, t->proto, t->dport,
+                                         dest_host, sizeof(dest_host),
+                                         &dest_app_id, dest_app_name,
+                                         sizeof(dest_app_name), &host_source);
+    }
+
     sqlite3_reset(g_flow_insert);
     sqlite3_clear_bindings(g_flow_insert);
     sqlite3_bind_text(g_flow_insert, idx++, flow_id, -1, SQLITE_TRANSIENT);
@@ -1498,6 +1709,15 @@ static void jmx_flow_event_persist_destroy(const char *key,
     sqlite3_bind_int(g_flow_insert, idx++, (int)t->route_rule_prio);
     sqlite3_bind_int(g_flow_insert, idx++, (int)t->route_wan_id);
     sqlite3_bind_text(g_flow_insert, idx++, route_wan, -1, SQLITE_TRANSIENT);
+    /* destination_host and host carry the same value: the table declares both and
+     * consumers read either one, so leaving one empty would make the row look
+     * half-populated. host_source names how the match was made, and stays empty
+     * on a miss so an absent host is never mistaken for a resolved one. */
+    sqlite3_bind_text(g_flow_insert, idx++, dest_host, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(g_flow_insert, idx++, dest_host, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(g_flow_insert, idx++, host_source, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(g_flow_insert, idx++, dest_app_id);
+    sqlite3_bind_text(g_flow_insert, idx++, dest_app_name, -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(g_flow_insert) == SQLITE_DONE) {
         pthread_mutex_lock(&g_flow_event.lock);

@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="zh-CN" data-theme-resolved="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>quick-tools-async-fixture-01</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-control-material.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/quick-tools.css">
+  <style>
+    :root {
+      --app-radius-card: 24px;
+      --app-radius-control: 12px;
+      --app-page-gap: 16px;
+      --app-text: rgb(239 245 252);
+      --app-text-muted: rgb(177 193 213);
+      --app-accent: rgb(46 139 255);
+      --dwrt-interactive-hover-bg: rgb(255 255 255 / .08);
+      --dwrt-interactive-hover-border: rgb(255 255 255 / .18);
+    }
+    html, body { width: 100%; margin: 0; }
+    body { color: var(--app-text); background: linear-gradient(135deg, rgb(17 48 79), rgb(80 44 29)); font-family: system-ui, sans-serif; }
+    .console-stage { width: 100%; min-height: 100vh; display: grid; }
+  </style>
+</head>
+<body>
+  <main class="console-stage"><div class="route-preview" id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/quick-tools.js';
+
+    const root = document.getElementById('routePreview');
+    const calls = [];
+
+    /* Shapes copied from live 30.1 responses.
+       ubus ping first answers with pending numbers (latency 0 / loss 100), then
+       with the measurement. The fixture reproduces exactly that sequence. */
+    const pingPending = { ts: 1785650420, target: '1.1.1.1', host: '1.1.1.1', latency: 0, loss: 100, status: 'pending', stale: true, refreshing: true, pending: true, has_result: false, async: true };
+    const pingReady = { ts: 1785650426, target: '1.1.1.1', host: '1.1.1.1', latency: 173, loss: 33, status: 'warn', stale: false, refreshing: false, pending: false, has_result: true, result_ts: 1785650426, async: true };
+
+    // toolkit throughput-start / -status / -stop, mirroring toolkit_ops.c.
+    const throughputStart = { id: 'iperf-1785650500-2291', pid: 2291, mode: 'client', host: '10.0.0.9', port: 5201, duration_s: 10, started_at: 1785650500, state: 'running' };
+    const throughputResult = { end: { sum_received: { bits_per_second: 943210000 } } };
+
+    /* Real 30.1 traceroute output as parsed by dw_handle_traceroute: hop 3 answers
+       nothing, so `timeout` is the only reliable signal. nslookup returns A and
+       AAAA rows plus the resolver outside `answers`. */
+    const tracerouteReady = {
+      ts: 1785649000, target: '1.1.1.1', max_hops: 3, ifname: '', ok: true, available: true,
+      hop_count: 3, reached: true, timed_out: false, truncated: false, exit_code: 0,
+      hops: [
+        { hop: 1, host: '116.113.39.193', address: '116.113.39.193', rtt_ms: [1.415], probes_lost: 0, timeout: false, responded: true },
+        { hop: 2, host: '1.27.204.6', address: '1.27.204.6', rtt_ms: [1.289], probes_lost: 0, timeout: false, responded: true },
+        { hop: 3, host: '', address: '', rtt_ms: [], probes_lost: 1, timeout: true, responded: false }
+      ]
+    };
+    const nslookupReady = {
+      ok: true, available: true, answer_count: 2, resolver: '127.0.0.1', timed_out: false, exit_code: 0,
+      answers: [
+        { name: 'www.apple.com.w.cdngslb.com', address: '1.28.8.39', type: 'A' },
+        { name: 'www.apple.com.w.cdngslb.com', address: '2408:872b:f01:100d:3::d', type: 'AAAA' }
+      ]
+    };
+    // webd maps ok:false to HTTP 400 even though the payload is a real answer.
+    const nslookupEmpty = { ok: false, available: true, answer_count: 0, resolver: '127.0.0.1', answers: [], timed_out: false, exit_code: 1, error: 'nxdomain_or_no_answer' };
+
+    const state = { mode: 'ping-async', pingCalls: 0, throughputCalls: 0, throughputStopped: false };
+    const originalFetch = window.fetch.bind(window);
+
+    function json(data, status = 200) {
+      return new Response(JSON.stringify({ ok: true, code: 2000, data }), { status, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    function fail(code, message, status) {
+      return new Response(JSON.stringify({ ok: false, error: { code, message } }), { status, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    window.fetch = async (url, init = {}) => {
+      const parsed = new URL(url, location.href);
+      const target = parsed.pathname;
+      const method = String(init.method || 'GET').toUpperCase();
+      calls.push({ target, method, query: parsed.search, body: init.body || '' });
+
+      if (target === '/api/v1/diagnostics/ping') {
+        state.pingCalls += 1;
+        if (state.mode === 'ping-stuck') return json(pingPending);
+        return json(state.pingCalls === 1 ? pingPending : pingReady);
+      }
+      if (target === '/api/v1/diagnostics/traceroute') {
+        if (state.mode === 'legacy-webd') return fail('source_unavailable', 'ubus source is not available', 503);
+        if (state.mode === 'missing') return fail('method_not_registered', 'backend method is not registered on this build', 501);
+        return json(tracerouteReady);
+      }
+      if (target === '/api/v1/diagnostics/nslookup') {
+        if (state.mode === 'nxdomain') {
+          return new Response(JSON.stringify({ ok: true, code: 4000, data: nslookupEmpty }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+        return json(nslookupReady);
+      }
+      if (target === '/api/v1/diagnostics/speedtest') {
+        if (state.mode === 'legacy-webd') return fail('source_unavailable', 'ubus source is not available', 503);
+        return fail('method_not_registered', 'backend method is not registered on this build', 501);
+      }
+      if (target === '/api/v1/toolkit/throughput' && method === 'POST') {
+        if (state.mode === 'throughput-no-id') return json({ ...throughputStart, id: '' });
+        return json(throughputStart);
+      }
+      if (target === '/api/v1/toolkit/throughput/status') {
+        state.throughputCalls += 1;
+        if (state.throughputStopped) return json({ ...throughputStart, state: 'stopped', stopped_at: 1785650505 });
+        if (state.throughputCalls >= 3) return json({ ...throughputStart, state: 'completed', result: throughputResult });
+        return json({ ...throughputStart, state: 'running' });
+      }
+      if (target === '/api/v1/toolkit/throughput/stop') {
+        state.throughputStopped = true;
+        return json({ ...throughputStart, state: 'stopped', stopped_at: 1785650505 });
+      }
+      if (target === '/api/v1/network/wans') return json({ wans: [{ ifname: 'wan', name: '主线路' }] });
+      return originalFetch(url, init);
+    };
+
+    const ui = {
+      mountAll: node => window.DWRT_UI_KIT?.mountAll?.(node),
+      scheduleGlassCardsRender: () => {}
+    };
+    const utils = { escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]) };
+
+    let instance = mount({ root, item: { id: 'quick-tools' }, ui, utils });
+
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+    async function openTool(id) {
+      // The card grid only exists on the index view, so a tool that is already
+      // open has to be closed before another one can be picked.
+      if (!root.querySelector(`[data-quick-tool="${id}"]`)) {
+        root.querySelector('[data-tool-back]')?.click();
+        await sleep(60);
+      }
+      root.querySelector(`[data-quick-tool="${id}"]`)?.click();
+      await sleep(60);
+      return Boolean(root.querySelector(`[data-tool-form="${id}"]`));
+    }
+
+    function submit(id) {
+      const form = root.querySelector(`[data-tool-form="${id}"]`);
+      if (!form) return false;
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      return true;
+    }
+
+    function resultText() {
+      return root.querySelector('.quick-tool-result')?.textContent?.trim() || '';
+    }
+
+    function busy() {
+      return Boolean(root.querySelector('.quick-tool-spinner'));
+    }
+
+    window.QUICK_TOOLS_FIXTURE = {
+      setMode(mode) {
+        state.mode = mode;
+        state.pingCalls = 0;
+        state.throughputCalls = 0;
+        state.throughputStopped = false;
+      },
+      reset() {
+        instance?.unmount?.();
+        calls.length = 0;
+        state.pingCalls = 0;
+        state.throughputCalls = 0;
+        state.throughputStopped = false;
+        instance = mount({ root, item: { id: 'quick-tools' }, ui, utils });
+      },
+      calls: () => calls.map(entry => ({ ...entry })),
+      openTool,
+      submit,
+      resultText,
+      busy,
+      sleep,
+      // Snapshot right after submit: the pending payload must not be on screen.
+      async pingFirstFrame() {
+        await openTool('ping');
+        submit('ping');
+        await sleep(120);
+        return { busy: busy(), text: resultText(), pingCalls: state.pingCalls };
+      },
+      async pingSettled() {
+        await sleep(2200);
+        return { busy: busy(), text: resultText(), pingCalls: state.pingCalls };
+      },
+      async throughputRun() {
+        await openTool('throughput');
+        submit('throughput');
+        await sleep(200);
+        const early = {
+          hasTask: Boolean(root.querySelector('[data-throughput-task]')),
+          hasStop: Boolean(root.querySelector('[data-throughput-stop]')),
+          hasRefresh: Boolean(root.querySelector('[data-throughput-refresh]')),
+          runDisabled: Boolean(root.querySelector('.quick-tool-run')?.disabled),
+          taskText: root.querySelector('[data-throughput-task]')?.textContent?.trim() || ''
+        };
+        return early;
+      },
+      async throughputStop() {
+        // Let one poll land first so the id handoff to /status is observable.
+        await sleep(1300);
+        root.querySelector('[data-throughput-stop]')?.click();
+        await sleep(300);
+        return {
+          taskText: root.querySelector('[data-throughput-task]')?.textContent?.trim() || '',
+          hasStop: Boolean(root.querySelector('[data-throughput-stop]')),
+          stopCalls: calls.filter(entry => entry.target === '/api/v1/toolkit/throughput/stop').length,
+          statusQueries: calls.filter(entry => entry.target === '/api/v1/toolkit/throughput/status').map(entry => entry.query)
+        };
+      },
+      async throughputComplete() {
+        await sleep(3600);
+        return {
+          taskText: root.querySelector('[data-throughput-task]')?.textContent?.trim() || '',
+          hasStop: Boolean(root.querySelector('[data-throughput-stop]')),
+          consoleText: root.querySelector('.quick-tool-console')?.textContent?.trim() || '',
+          text: resultText()
+        };
+      },
+      async runMissing(id) {
+        await openTool(id);
+        submit(id);
+        await sleep(200);
+        return { text: resultText(), busy: busy() };
+      },
+      /* traceroute and nslookup answer with object arrays. The generic renderer
+         drops objects, so the table is the only place the data can appear. */
+      async runTraceroute() {
+        await openTool('traceroute');
+        submit('traceroute');
+        await sleep(300);
+        const table = root.querySelector('[data-hop-table]');
+        return {
+          hasTable: Boolean(table),
+          title: table?.querySelector('.dwrt-kit-table-title')?.textContent?.trim() || '',
+          rows: Array.from(table?.querySelectorAll('tbody tr') || []).map(row => Array.from(row.children).map(cell => cell.textContent.trim())),
+          text: resultText(),
+          hasCountField: Boolean(root.querySelector('[data-tool-form="traceroute"] [name="max_hops"]'))
+        };
+      },
+      async runNslookup() {
+        await openTool('nslookup');
+        submit('nslookup');
+        await sleep(300);
+        const table = root.querySelector('[data-answer-table]');
+        return {
+          hasTable: Boolean(table),
+          title: table?.querySelector('.dwrt-kit-table-title')?.textContent?.trim() || '',
+          rows: Array.from(table?.querySelectorAll('tbody tr') || []).map(row => Array.from(row.children).map(cell => cell.textContent.trim())),
+          text: resultText(),
+          hasServerField: Boolean(root.querySelector('[data-tool-form="nslookup"] [name="server"]'))
+        };
+      },
+      // An empty answer must read as a result, not as a failed call.
+      async runNxdomain() {
+        await openTool('nslookup');
+        submit('nslookup');
+        await sleep(300);
+        return {
+          text: resultText(),
+          warning: Boolean(root.querySelector('.quick-tool-empty.is-warning')),
+          hasTable: Boolean(root.querySelector('[data-answer-table]'))
+        };
+      },
+      async pingFields() {
+        await openTool('ping');
+        return {
+          names: Array.from(root.querySelectorAll('[data-tool-form="ping"] [name]')).map(node => node.name),
+          pendingNotice: Boolean(root.querySelector('[data-tool-pending]'))
+        };
+      },
+      async speedtestNotice() {
+        await openTool('speedtest');
+        return {
+          pendingNotice: root.querySelector('[data-tool-pending]')?.textContent?.trim() || '',
+          hasRun: Boolean(root.querySelector('[data-tool-form="speedtest"] .quick-tool-run'))
+        };
+      },
+      async switchAway() {
+        await openTool('ping');
+        submit('ping');
+        await sleep(150);
+        root.querySelector('[data-tool-back]')?.click();
+        await sleep(2200);
+        return {
+          onGrid: Boolean(root.querySelector('[data-quick-tool="ping"]')),
+          leaked: Boolean(root.querySelector('.quick-tool-result'))
+        };
+      }
+    };
+  </script>
+</body>
+</html>

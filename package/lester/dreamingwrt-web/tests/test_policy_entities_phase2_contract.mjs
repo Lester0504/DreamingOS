@@ -116,14 +116,14 @@ assert.doesNotMatch(objectsSource + regionsSource, /\.innerHTML\s*=/);
 const policy = menu.items.find((item) => item.id === 'policy-engine');
 const objectMenu = policy.children.find((item) => item.id === 'policy-object');
 const regionMenu = policy.children.find((item) => item.id === 'policy-region');
-const SHARED_STYLE_VERSION = '20260731-policy-object-sources-18';
+const SHARED_STYLE_VERSION = '20260802-ui-batch-01';
 for (const item of [objectMenu, regionMenu]) {
   assert.equal(item.style, '/static/css/policy-entities.css');
   // the two pages share one stylesheet, so the style version must stay in lockstep
   assert.equal(item.style_version, SHARED_STYLE_VERSION);
 }
-assert.equal(objectMenu.module_version, '20260731-policy-object-sources-05');
-assert.equal(regionMenu.module_version, '20260730-policy-regions-unify-10');
+assert.equal(objectMenu.module_version, '20260802-ui-batch-01');
+assert.equal(regionMenu.module_version, '20260802-ui-batch-01');
 assert.equal(objectMenu.module, 'native/policy-objects.js');
 assert.equal(regionMenu.module, 'native/policy-regions.js');
 
@@ -143,12 +143,15 @@ assert.match(css, /policy-entity-overlay-host:empty/);
 // no page-level frosted panel: the material comes from Kit table/sheet surfaces
 assert.doesNotMatch(regionsSource, /stable-glass/);
 assert.doesNotMatch(regionsSource, /data-dwrt-component="page-shell"|data-dwrt-page-shell=/);
-// no separate page header; status and refresh remain in the zone table toolbar
+// no separate page header; the write-capability badge stays in the zone table toolbar
 assert.doesNotMatch(regionsSource, /policy-region-page-header|policy-region-header-heading/);
 assert.match(regionsSource, /class="policy-region-workbench"/);
 assert.match(css, /\.policy-region-workbench\s*\{[^}]*overflow:\s*auto/);
-assert.match(css, /\.policy-region-zone-table \[data-region-refresh\][^}]*min-width:\s*44px[^}]*min-height:\s*44px/);
-assert.match(regionsSource, /dwrt-kit-table-toolbar-actions[^]*data-region-refresh/);
+// 手动刷新按钮按用户第 9 条删除（连同它的 44px 命中区规则），改为可见性受控的轮询。
+assert.doesNotMatch(regionsSource, /data-region-refresh/);
+assert.doesNotMatch(css, /data-region-refresh/);
+assert.match(regionsSource, /state\.pollTimer = window\.setInterval/);
+assert.match(regionsSource, /dwrt-kit-table-toolbar-actions/);
 assert.match(regionsSource, /事务写入可用/);
 // relationship diagram, zone table, matrix and policy table ride shared stable glass
 assert.match(regionsSource, /function topologyMarkup\(\)/);
@@ -183,7 +186,7 @@ assert.match(regionsSource, /focusTarget instanceof HTMLElement\) focusTarget\.f
 assert.match(regionsSource, /returnFocus\?\.isConnected\) returnFocus\.focus\(\{ preventScroll: true \}\)/);
 // drawers reuse the shared copilot sheet instead of a hand-rolled panel
 assert.equal((regionsSource.match(/data-dwrt-sheet-variant="copilot"/g) || []).length, 2);
-assert.match(css, /\.policy-entity-sheet\s*\{[^}]*--dwrt-kit-sheet-width:\s*min\(460px,/);
+assert.match(css, /\.policy-entity-sheet\s*\{[^}]*--dwrt-kit-sheet-width:\s*var\(--dwrt-kit-sheet-width-standard\)/);
 // UniFi zone semantics stay intact: 6 zone rows/columns driven by real pair data
 assert.match(regionsSource, /source_zone_id/);
 assert.match(regionsSource, /destination_zone_id/);

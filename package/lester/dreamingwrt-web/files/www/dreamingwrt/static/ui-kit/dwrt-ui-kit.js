@@ -240,6 +240,218 @@
     return null;
   }
 
+  /*
+   * 抽屉传送门。
+   *
+   * `.dwrt-kit-sheet` 靠 `position: fixed` 贴住视口右侧，但只要祖先链上任意一个元素带了
+   * transform / filter / contain / will-change / perspective，它就会成为新的包含块，抽屉
+   * 被重新锚定，表现为「掉到页面下方、整宽、被裁切」。页面壳层为了玻璃采样和滚动性能大量
+   * 使用这些属性，逐个摘掉属性是打地鼠。
+   *
+   * 这里改为在挂载时把抽屉连同它的遮罩一起搬到 body 直属的 portal 层（AI 抽屉一直挂在
+   * body 级的 .ai-global-layer 里，所以从来不犯这个病）。搬迁保持「遮罩紧邻抽屉之前」的
+   * 兄弟关系，因为 sheetOverlay() 依赖它；并记住原位锚点，卸载时归位，避免页面模块重绘
+   * 时找不到自己的节点。
+   */
+  const SHEET_PORTAL_ID = 'dwrtKitSheetPortal';
+
+  function sheetPortal() {
+    if (!document.body) return null;
+    let portal = document.getElementById(SHEET_PORTAL_ID);
+    if (!portal) {
+      portal = document.createElement('div');
+      portal.id = SHEET_PORTAL_ID;
+      portal.className = 'dwrt-kit-sheet-portal';
+      document.body.appendChild(portal);
+    } else if (portal.parentElement !== document.body) {
+      document.body.appendChild(portal);
+    }
+    return portal;
+  }
+
+  /*
+   * 传送门的副作用：抽屉一旦离开路由宿主，页面 CSS 里所有以宿主为前缀的规则
+   * （`.xxx-route-host .dwrt-kit-sheet …`）和挂在页面壳层上的自定义属性
+   * （`.wifi-management-shell { --wifi-line: … }`）在抽屉内部同时失效。变量失效会让
+   * `border: 1px solid var(--wifi-line)` 这类整条声明作废，表现为边框消失、下拉框回落
+   * 成浏览器原生白底。
+   *
+   * 因此搬迁时把原祖先链上承载样式作用域的类名镜像到 portal 上：portal 自身不参与布局
+   * （width/height 为 0、position: static），只作为样式作用域的替身。
+   */
+  const PORTAL_SCOPE_PATTERN = /(?:-route-host|-shell|-workspace|-layout|-scope)$/;
+
+  function scopeClassesFor(node) {
+    const classes = [];
+    let cursor = node?.parentElement;
+    let depth = 0;
+    while (cursor && cursor !== document.body && depth < 12) {
+      cursor.classList.forEach((name) => {
+        if (PORTAL_SCOPE_PATTERN.test(name) && !classes.includes(name)) classes.push(name);
+      });
+      cursor = cursor.parentElement;
+      depth += 1;
+    }
+    return classes;
+  }
+
+  function applyPortalScope(portal, classes) {
+    const previous = portal.dataset.dwrtPortalScope ? portal.dataset.dwrtPortalScope.split(' ').filter(Boolean) : [];
+    previous.forEach((name) => { if (!classes.includes(name)) portal.classList.remove(name); });
+    classes.forEach((name) => portal.classList.add(name));
+    if (classes.length) portal.dataset.dwrtPortalScope = classes.join(' ');
+    else delete portal.dataset.dwrtPortalScope;
+  }
+
+  /*
+   * 页面模块通常靠重绘整段 innerHTML 来关抽屉，被搬走的节点直接消失，unmountSheet() 不会
+   * 被调用。留在 portal 上的作用域类名于是会跨路由残留，下一页的抽屉可能吃到上一页的
+   * 变量。这里在 portal 变空时把作用域收回。
+   */
+  function pruneSheetPortal() {
+    const portal = document.getElementById(SHEET_PORTAL_ID);
+    if (!portal) return;
+    if (!portal.dataset.dwrtPortalScope) return;
+    if (portal.querySelector('.dwrt-kit-sheet, [data-dwrt-component="sheet"], [data-dwrt-component="filter-sheet"]')) return;
+    portal.querySelectorAll('.dwrt-kit-sheet-overlay').forEach((node) => node.remove());
+    applyPortalScope(portal, []);
+  }
+
+  function disposeSheet(sheet) {
+    const state = sheetState.get(sheet);
+    if (state?.frame) cancelAnimationFrame(state.frame);
+    state?.observer?.disconnect();
+    if (state?.onDocumentKeydown) document.removeEventListener('keydown', state.onDocumentKeydown, true);
+    state?.releaseDelegation?.();
+    sheetState.delete(sheet);
+    sheetOverlay(sheet)?.remove();
+    sheet.remove();
+  }
+
+  /*
+   * 事件委托的接续。
+   *
+   * 页面模块普遍把交互绑成一条委托：`root.addEventListener('click', onClick)`，再在处理器里
+   * 用 `target.matches('[data-...]')` 分派。抽屉被搬到 body 级 portal 之后就不再是 root 的
+   * 后代，冒泡永远到不了那条委托，抽屉里的按钮、下拉、输入框会集体失灵 —— 「点关闭没反应」
+   * 就是这个原因。
+   *
+   * 这里让 portal 里的抽屉把事件按原宿主重放：克隆一个同类型事件派发到宿主上，并把
+   * `target` 指回真实的抽屉内节点，页面既有的委托无需改动即可继续工作。
+   */
+  const DELEGATED_EVENTS = ['click', 'input', 'change', 'submit', 'keydown'];
+
+  function bindSheetDelegation(sheet, state) {
+    /*
+     * 转发目标不能只取抽屉的直接父节点。页面模块通常把委托绑在更外层的路由根（`context.root`
+     * 即 `#routePreview`）上，而抽屉的父节点往往是页面壳层 `.xxx-shell`。因为重放事件刻意
+     * 不冒泡（避免 document 级处理器把同一次交互跑两遍），派发到壳层就到不了那条委托。
+     * 这里沿原祖先链一直派发到路由根，逐级触发，等价于事件正常冒泡到 root 的效果。
+     */
+    const chain = [];
+    let cursor = state.portalHome?.parent;
+    while (cursor && cursor !== document.body) {
+      chain.push(cursor);
+      if (cursor.id === 'routePreview' || cursor.classList.contains('route-preview')) break;
+      cursor = cursor.parentElement;
+    }
+    if (!chain.length || state.releaseDelegation) return;
+    const listeners = [];
+    state.relayToHost = (event) => {
+      if (chain[0]?.contains(sheet)) return;
+      let prevented = false;
+      chain.forEach((node) => {
+        if (!node.isConnected) return;
+        const replay = new event.constructor(event.type, { ...eventInit(event), bubbles: false, composed: false });
+        replay.dwrtSheetRelayed = true;
+        Object.defineProperty(replay, 'target', { value: event.target, configurable: true });
+        node.dispatchEvent(replay);
+        prevented = prevented || replay.defaultPrevented;
+      });
+      if (prevented) event.preventDefault();
+    };
+    DELEGATED_EVENTS.forEach((type) => {
+      const relay = (event) => {
+        if (event.dwrtSheetRelayed) return;
+        state.relayToHost(event);
+      };
+      sheet.addEventListener(type, relay);
+      listeners.push([type, relay]);
+    });
+    state.releaseDelegation = () => {
+      listeners.forEach(([type, relay]) => sheet.removeEventListener(type, relay));
+      delete state.releaseDelegation;
+      delete state.relayToHost;
+    };
+  }
+
+  function eventInit(event) {
+    const init = { cancelable: event.cancelable };
+    ['detail', 'button', 'buttons', 'clientX', 'clientY', 'ctrlKey', 'shiftKey', 'altKey', 'metaKey', 'key', 'code', 'data', 'inputType']
+      .forEach((name) => { if (name in event && event[name] !== undefined) init[name] = event[name]; });
+    return init;
+  }
+
+  /*
+   * 页面模块关抽屉的做法是重绘整段 innerHTML，重绘后的标记里不再包含抽屉。但抽屉此刻已经
+   * 被搬进 portal，既不在路由子树里被重绘冲掉，也不会被 `unmount(root)` 扫到，于是它带着
+   * is-open 永久留在 portal 中；下一次开抽屉又插一份，选择器可能命中残留的那个，表现为
+   * 「点了没反应」。
+   *
+   * 判定方式是记住每个被搬迁抽屉的原始宿主（`state.portalHome.parent`）。宿主的内容一旦被
+   * 重绘，节点就不再是宿主的后代 —— 用这一点识别孤儿并回收。
+   */
+  function reclaimStaleSheets(context) {
+    const portal = document.getElementById(SHEET_PORTAL_ID);
+    if (!portal || !portal.firstElementChild) return;
+    const host = context?.nodeType === 1 ? context : null;
+    Array.from(portal.children).forEach((node) => {
+      if (!node.matches?.('.dwrt-kit-sheet, [data-dwrt-component="sheet"], [data-dwrt-component="filter-sheet"]')) return;
+      const home = sheetState.get(node)?.portalHome?.parent;
+      // 宿主已脱离文档，或本次重绘的正是它的宿主：这份抽屉已经和页面失联
+      if (!home || !home.isConnected || home === host || host?.contains(home)) disposeSheet(node);
+    });
+    pruneSheetPortal();
+  }
+
+  function watchSheetPortal() {
+    const portal = sheetPortal();
+    if (!portal || portal.dataset.dwrtPortalWatched === 'true') return;
+    portal.dataset.dwrtPortalWatched = 'true';
+    new MutationObserver(() => pruneSheetPortal()).observe(portal, { childList: true });
+  }
+
+  function elevateSheet(sheet, state) {
+    const portal = sheetPortal();
+    if (!portal || sheet.parentElement === portal) return;
+    const overlay = sheetOverlay(sheet);
+    // 原位锚点：优先记录一个稳定的兄弟节点，卸载时据此归位
+    state.portalHome = {
+      parent: (overlay || sheet).parentElement,
+      before: (overlay || sheet).nextElementSibling === sheet ? sheet.nextElementSibling : (overlay || sheet).nextElementSibling
+    };
+    state.portalScope = scopeClassesFor(sheet);
+    applyPortalScope(portal, state.portalScope);
+    if (overlay) portal.appendChild(overlay);
+    portal.appendChild(sheet);
+    sheet.dataset.dwrtSheetPortaled = 'true';
+    bindSheetDelegation(sheet, state);
+    watchSheetPortal();
+  }
+
+  function restoreSheetHome(sheet, state) {
+    const home = state?.portalHome;
+    if (!home?.parent?.isConnected) return;
+    const overlay = sheetOverlay(sheet);
+    const before = home.before?.isConnected ? home.before : null;
+    if (overlay) home.parent.insertBefore(overlay, before);
+    home.parent.insertBefore(sheet, before);
+    delete sheet.dataset.dwrtSheetPortaled;
+    state.releaseDelegation?.();
+    // portal 里还留着别的抽屉时保留它们需要的作用域，全空了再清干净
+    pruneSheetPortal();
+  }
+
   function paintSheet(sheet, state) {
     const width = Math.max(1, sheet.getBoundingClientRect().width || state.width || 1);
     state.width = width;
@@ -409,16 +621,20 @@
     ensureSheetMaterial(sheet);
     const recentTrigger = lastTrigger && performance.now() - lastTrigger.at < 1200 ? lastTrigger : null;
     const settleImmediately = sheet.dataset.dwrtSheetMotion === 'settled';
-    const initialWidth = sheet.getBoundingClientRect().width;
     const state = {
-      x: settleImmediately ? 0 : initialWidth,
-      v: 0, width: initialWidth,
+      x: 0,
+      v: 0, width: 0,
       target: 0, frame: 0, last: 0, dragging: false, closing: false,
       pointerId: null, startX: 0, startOffset: 0, samples: [],
       sheet,
       trigger: recentTrigger?.element || (document.activeElement?.matches?.('button, [role="button"], a') ? document.activeElement : null),
       triggerSelector: recentTrigger?.selector || (document.activeElement?.matches?.('button, [role="button"], a') ? triggerSelector(document.activeElement) : '')
     };
+    // 先搬到 body 层再量宽度：在被重锚定的祖先里量出来的是错的
+    elevateSheet(sheet, state);
+    const initialWidth = sheet.getBoundingClientRect().width;
+    state.width = initialWidth;
+    state.x = settleImmediately ? 0 : initialWidth;
     sheetState.set(sheet, state);
     state.observer = new MutationObserver(() => syncSheetOpenState(sheet));
     state.observer.observe(sheet, { attributes: true, attributeFilter: ['class'] });
@@ -428,7 +644,16 @@
     const header = sheet.querySelector('.dwrt-kit-sheet-header');
     const close = sheet.querySelector('.dwrt-kit-sheet-close');
     const interceptClose = (event) => {
-      if (event.currentTarget.dataset.dwrtSheetBypass === 'true' || !sheet.classList.contains('is-open')) return;
+      /*
+       * 关闭分两拍：第一拍拦下点击、放完滑出动画，第二拍带 bypass 标记重放，让页面自己的
+       * 处理器去清状态。抽屉被搬进 portal 后已经不是路由根的后代，第二拍的冒泡到不了页面那条
+       * 委托，于是把它显式转发到原宿主上，否则表现为「抽屉滑走了但选中状态还在、再点无反应」。
+       */
+      if (event.currentTarget.dataset.dwrtSheetBypass === 'true') {
+        state.relayToHost?.(event);
+        return;
+      }
+      if (!sheet.classList.contains('is-open')) return;
       event.preventDefault();
       event.stopImmediatePropagation();
       commitSheetClose(sheet, event.currentTarget);
@@ -547,6 +772,7 @@
     if (state.frame) cancelAnimationFrame(state.frame);
     state.observer?.disconnect();
     document.removeEventListener('keydown', state.onDocumentKeydown, true);
+    restoreSheetHome(sheet, state);
     sheetState.delete(sheet);
   }
 
@@ -1077,6 +1303,7 @@
 
   function mountAll(context = document) {
     mountLucide(context);
+    reclaimStaleSheets(context);
     const components = collectComponentRoots(context);
     const roots = (name) => components.get(name) || [];
     roots('tabs').forEach((root) => {

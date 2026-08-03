@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260719-07';
+  const VERSION = '20260802-ui-batch-01';
   const MODULE_CLASS = 'system-power-route-host';
   const stage = root?.closest('.console-stage');
   const ENDPOINTS = {
@@ -34,7 +34,8 @@ export function mount(context = {}) {
     draft: newDraft(),
     confirm: '',
     confirmDelete: '',
-    timer: 0
+    timer: 0,
+    pollTimer: 0
   };
 
   function emptyCapabilities() {
@@ -75,6 +76,15 @@ export function mount(context = {}) {
     return current || {};
   }
 
+  /*
+   * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
+   * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
+   * 闸门内部处理 ensureFresh -> 401 -> refresh -> 单次重试，refreshPromise 单例会合并并发刷新。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function authHeaders(extra = {}) {
     let token = '';
     try { token = localStorage.getItem('dreamingwrt.web.accessToken') || ''; } catch (_) {}
@@ -82,7 +92,7 @@ export function mount(context = {}) {
   }
 
   async function requestJson(url, options = {}) {
-    const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
+    const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
       credentials: 'same-origin',
       cache: 'no-store',
       ...options,
@@ -185,7 +195,6 @@ export function mount(context = {}) {
     const seq = ++state.seq;
     if (background) state.refreshing = true; else state.loading = true;
     state.error = '';
-    patchLoading();
     const results = await Promise.allSettled([
       requestJson(ENDPOINTS.basic),
       requestJson(ENDPOINTS.dashboardStatus)
@@ -312,10 +321,13 @@ export function mount(context = {}) {
     return `<button class="system-power-action is-${action}" type="button" data-power-action="${action}" ${enabled && !state.saving ? '' : 'disabled'} title="${reason}">${icon(iconName)}<span>${label}</span></button>`;
   }
 
+  /*
+   * 计划页的「添加计划」是控制表格的控件，按用户第 9 条移进表格工具条；
+   * 手动刷新按钮删除，改由 startSchedulePolling() 的轮询与写操作后的读回驱动。
+   */
   function tabsMarkup() {
-    const scheduleAction = `<div class="system-power-tab-actions"><button class="policy-filter-button" type="button" data-power-refresh ${state.refreshing ? 'disabled' : ''} title="刷新">${icon('refresh')}<span>刷新</span></button><button class="policy-create-button" type="button" data-power-add>${icon('plus')}<span>添加计划</span></button></div>`;
     const overviewActions = `<div class="system-power-tab-actions">${actionButton('shutdown', '立即关机', state.capabilities.shutdown, 'power')}${actionButton('reboot', '立即重启', state.capabilities.reboot, 'restart')}</div>`;
-    return `<header class="system-power-navigation"><div class="dwrt-kit-tabs dwrt-kit-page-tabs" role="tablist" aria-label="关机和重启页面"><button class="dwrt-kit-tab ${state.tab === 'overview' ? 'is-active' : ''}" type="button" data-power-tab="overview" aria-selected="${state.tab === 'overview'}">概览</button><button class="dwrt-kit-tab ${state.tab === 'schedules' ? 'is-active' : ''}" type="button" data-power-tab="schedules" aria-selected="${state.tab === 'schedules'}">计划</button></div>${state.tab === 'overview' ? overviewActions : scheduleAction}</header>`;
+    return `<header class="system-power-navigation"><div class="dwrt-kit-tabs dwrt-kit-page-tabs" role="tablist" aria-label="关机和重启页面"><button class="dwrt-kit-tab ${state.tab === 'overview' ? 'is-active' : ''}" type="button" data-power-tab="overview" aria-selected="${state.tab === 'overview'}">概览</button><button class="dwrt-kit-tab ${state.tab === 'schedules' ? 'is-active' : ''}" type="button" data-power-tab="schedules" aria-selected="${state.tab === 'schedules'}">计划</button></div>${state.tab === 'overview' ? overviewActions : ''}</header>`;
   }
 
   function noticeMarkup() {
@@ -338,7 +350,7 @@ export function mount(context = {}) {
     else if (!state.schedulesKnown) body = `<tr><td colspan="9" class="dwrt-kit-table-empty">${escapeHtml(firstText(state.error, '电源计划读取失败'))}</td></tr>`;
     else if (!state.schedules.length) body = '<tr><td colspan="9" class="dwrt-kit-table-empty">暂无关机或重启计划</td></tr>';
     else body = state.schedules.map(scheduleRow).join('');
-    return `<main class="system-power-schedules"><section class="system-power-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>重启计划</strong></div><span class="dwrt-kit-table-count">${state.schedulesKnown ? `${state.schedules.length} 条` : '--'}</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table system-power-table"><thead><tr><th class="system-power-check-cell"><input type="checkbox" aria-label="全选计划"></th><th>名称</th><th>计划事件</th><th>周期</th><th>日期</th><th>时间</th><th>备注</th><th>状态</th><th>操作</th></tr></thead><tbody>${body}</tbody></table></div></section></main>`;
+    return `<main class="system-power-schedules"><section class="system-power-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><span class="dwrt-kit-table-count">${state.schedulesKnown ? `${state.schedules.length} 条` : '--'}</span></div><div class="system-power-tab-actions"><button class="policy-create-button" type="button" data-power-add>${icon('plus')}<span>添加计划</span></button></div></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table system-power-table"><thead><tr><th class="system-power-check-cell"><input type="checkbox" aria-label="全选计划"></th><th>名称</th><th>计划事件</th><th>周期</th><th>日期</th><th>时间</th><th>备注</th><th>状态</th><th>操作</th></tr></thead><tbody>${body}</tbody></table></div></section></main>`;
   }
 
   function todayValue() {
@@ -416,9 +428,22 @@ export function mount(context = {}) {
     if (value) value.textContent = formatUptime(currentUptime());
   }
 
-  function patchLoading() {
-    const refresh = root?.querySelector('[data-power-refresh]');
-    if (refresh) refresh.disabled = state.refreshing;
+  /* 删掉刷新按钮的前提是数据会自己更新，所以补一条可见性受控的轮询。 */
+  function startPolling() {
+    stopPolling();
+    state.pollTimer = window.setInterval(() => {
+      if (!state.mounted) return;
+      if (document.hidden) return;
+      if (state.loading || state.refreshing || state.saving) return;
+      if (state.drawer || state.confirm || state.confirmDelete) return;
+      load(true);
+    }, 20000);
+  }
+
+  function stopPolling() {
+    if (!state.pollTimer) return;
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = 0;
   }
 
   function openDrawer(schedule = null) {
@@ -544,7 +569,6 @@ export function mount(context = {}) {
   function onClick(event) {
     const tab = event.target.closest('[data-power-tab]');
     if (tab) { state.tab = tab.dataset.powerTab; state.drawer = ''; state.notice = ''; render(); return; }
-    if (event.target.closest('[data-power-refresh]')) { load(true); return; }
     if (event.target.closest('[data-power-add]')) { openDrawer(); return; }
     const action = event.target.closest('[data-power-action]');
     if (action && !action.disabled && state.capabilities[action.dataset.powerAction]) { state.confirm = action.dataset.powerAction; render(); return; }
@@ -593,6 +617,7 @@ export function mount(context = {}) {
   render();
   load();
   state.timer = window.setInterval(patchUptime, 1000);
+  startPolling();
 
   return {
     refresh() { return load(true); },
@@ -600,6 +625,7 @@ export function mount(context = {}) {
       state.mounted = false;
       state.seq += 1;
       window.clearInterval(state.timer);
+      stopPolling();
       root?.removeEventListener('click', onClick);
       root?.removeEventListener('input', onInput);
       root?.removeEventListener('change', onChange);

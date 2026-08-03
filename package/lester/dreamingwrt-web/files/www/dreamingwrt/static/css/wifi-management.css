@@ -4,7 +4,7 @@
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
   width: 100%;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
   overflow: hidden;
@@ -762,12 +762,12 @@
 .wifi-field-unit b { color: var(--wifi-muted); font-size: 11px; }
 
 .wifi-sheet {
-  width: min(620px, calc(100vw - 24px));
+  width: var(--dwrt-kit-sheet-width-form);
   max-width: 100vw;
   border-left: 1px solid var(--wifi-line);
 }
 
-.wifi-sheet.compact { width: min(500px, calc(100vw - 24px)); }
+.wifi-sheet.compact { width: var(--dwrt-kit-sheet-width-standard); }
 
 .wifi-sheet .dwrt-kit-sheet-header {
   min-height: 72px;
@@ -1079,7 +1079,10 @@
 .airview-check > i { flex: 0 0 auto; width: 15px; height: 15px; border: 1px solid var(--wifi-line); border-radius: 4px; }
 .airview-check input:checked + i { border-color: var(--wifi-accent); background: var(--wifi-accent); box-shadow: inset 0 0 0 3px color-mix(in srgb, white 90%, transparent); }
 .airview-check > span { display: flex; align-items: center; flex: 1 1 auto; gap: 7px; min-width: 0; white-space: nowrap; }
-.airview-check > span > :last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* The label needs its own element: a bare text node cannot take min-width: 0,
+   so a long AP name used to push the icon onto its own line. */
+.airview-check > span > .airview-check-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.airview-check > span > .airview-filter-device-image { flex: 0 0 auto; }
 .airview-check.is-disabled { cursor: default; opacity: .48; }
 
 .airview-filter-device-image,
@@ -1279,13 +1282,41 @@
 .airview-radio-card footer { display: flex; justify-content: space-between; gap: 12px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--wifi-soft-line); color: var(--wifi-muted); font-size: 11px; }
 .airview-radio-card footer b { color: inherit; font-variant-numeric: tabular-nums; }
 
-.airview-radio-sheet {
-  --dwrt-kit-sheet-width: min(56vw, 760px);
+/* Kit re-asserts drawer geometry through an allowlist of legacy glass class
+   combinations. Page CSS loads after ui-kit, so pin the geometry here too: a
+   missed combination would drop the drawer into normal flow at the page end. */
+.wireless-status-route-host .dwrt-kit-sheet.airview-radio-sheet,
+.wireless-status-route-host .dwrt-kit-sheet.airview-ap-sheet {
+  position: fixed;
+  z-index: var(--dwrt-kit-sheet-z, 59);
+  inset: 0 0 0 auto;
+  height: 100dvh;
+  max-height: 100dvh;
+  display: grid;
+}
+
+.wireless-status-route-host .dwrt-kit-sheet-overlay {
+  position: fixed;
+  inset: 0;
+}
+
+.wireless-status-route-host .dwrt-kit-sheet.airview-radio-sheet {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.wireless-status-route-host .dwrt-kit-sheet.airview-ap-sheet {
+  grid-template-rows: var(--dwrt-kit-sheet-head-height) 82px minmax(0, 1fr);
+}
+
+.dwrt-kit-sheet.airview-radio-sheet {
+  /* 内容最宽只有一组两列控件（1fr + 150px），820px 的 wide 档留出大片空白，
+     按用户第 5 条降到与 AI 抽屉同量级的 form 档。 */
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form);
   --dwrt-kit-sheet-max-width: calc(100vw - 28px);
 }
 
 .dwrt-kit-sheet.airview-ap-sheet {
-  --dwrt-kit-sheet-width: min(90vw, 560px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   --dwrt-kit-sheet-max-width: calc(100vw - 28px);
   grid-template-rows: var(--dwrt-kit-sheet-head-height) 82px minmax(0, 1fr);
 }
@@ -1368,6 +1399,9 @@
 .airview-ap-kpis > div { display: grid; gap: 4px; min-width: 0; padding: 10px; border: 1px solid var(--wifi-soft-line); border-radius: var(--app-radius-control); }
 .airview-ap-kpis span { color: var(--wifi-muted); font-size: 9px; }
 .airview-ap-kpis strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+/* 缺值时的驱动原因。它是正常状态说明，不能读成告警，所以用 muted 而非 warning 色，
+   并允许换行，避免长原因被省略号吃掉。 */
+.airview-ap-kpis .airview-kpi-note { color: var(--wifi-muted); font-size: 9px; line-height: 1.35; overflow-wrap: anywhere; white-space: normal; }
 .airview-ap-settings-card h3 { margin: 0 0 14px; font-size: 14px; }
 .airview-ap-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
 .airview-ap-settings-footer { position: sticky; bottom: -1px; display: flex; justify-content: flex-end; padding: 12px 0 0; background: linear-gradient(transparent, color-mix(in srgb, var(--app-surface) 84%, transparent) 28%); }
@@ -1469,7 +1503,37 @@
 }
 
 .airview-radio-controls label { display: block; min-width: 0; }
-.airview-radio-controls select { width: 100%; height: 38px; }
+
+/* 无线电抽屉里的下拉与数字输入原先是裸控件，会落回浏览器原生白底、深灰文字，
+   与整页玻璃材质割裂。这里显式套上与 .wifi-field 同一套材质。 */
+.airview-radio-controls select,
+.airview-custom-power input,
+.airview-min-rssi input[type="number"] {
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--wifi-line);
+  border-radius: var(--app-radius-compact);
+  color: inherit;
+  background: color-mix(in srgb, currentColor 5%, transparent);
+  outline: none;
+}
+
+.airview-radio-controls select { width: 100%; height: 38px; padding-right: 26px; appearance: none; background-image: linear-gradient(45deg, transparent 49%, currentColor 50%, transparent 52%), linear-gradient(-45deg, transparent 49%, currentColor 50%, transparent 52%); background-position: calc(100% - 14px) calc(50% + 3px), calc(100% - 8px) calc(50% + 3px); background-repeat: no-repeat; background-size: 6px 6px; cursor: pointer; }
+
+.airview-radio-controls select:focus,
+.airview-custom-power input:focus,
+.airview-min-rssi input[type="number"]:focus {
+  border-color: color-mix(in srgb, var(--wifi-accent) 62%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--wifi-accent) 12%, transparent);
+}
+
+.airview-custom-power input::-webkit-inner-spin-button,
+.airview-custom-power input::-webkit-outer-spin-button,
+.airview-min-rssi input[type="number"]::-webkit-inner-spin-button,
+.airview-min-rssi input[type="number"]::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
+}
 
 .airview-segmented {
   display: inline-flex;
@@ -1696,12 +1760,12 @@
   .wifi-extension-grid,
   .wifi-sheet-fields,
   .airview-environment-grid { grid-template-columns: 1fr; }
-  .airview-radio-sheet {
-    --dwrt-kit-sheet-width: calc(100vw - 18px);
+  .dwrt-kit-sheet.airview-radio-sheet {
+    --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full);
     --dwrt-kit-sheet-max-width: calc(100vw - 18px);
   }
   .dwrt-kit-sheet.airview-ap-sheet {
-    --dwrt-kit-sheet-width: calc(100vw - 18px);
+    --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full);
     --dwrt-kit-sheet-max-width: calc(100vw - 18px);
   }
   .airview-radio-sheet-body { padding-inline: 16px; }

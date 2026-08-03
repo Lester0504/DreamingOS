@@ -25,12 +25,16 @@
 #define CLOUD_TUNNEL_BACKOFF_MAX_MS 120000
 #define CLOUD_TUNNEL_PING_INTERVAL_MS 45000
 #define CLOUD_TUNNEL_READ_TIMEOUT_MS 60000
-
-struct cloud_tunnel_connection {
-    int fd;
-    SSL *ssl;
-    SSL_CTX *context;
-};
+/*
+ * How often the authorized-App set is re-read and pushed.
+ *
+ * Pairing and revocation happen in webd, which has no channel into this
+ * process, so the set is polled. A newly paired App would otherwise be unable
+ * to query presence until the tunnel happened to reconnect, and a revoked one
+ * would keep that ability for just as long. Sixty seconds keeps the revocation
+ * lag short without querying sqlite in a tight loop.
+ */
+#define CLOUD_TUNNEL_APPS_REFRESH_MS 60000
 
 static struct {
     pthread_t thread;
@@ -183,7 +187,7 @@ static int cloud_tcp_connect(const char *host, uint16_t port)
     return fd;
 }
 
-static void cloud_tunnel_close(struct cloud_tunnel_connection *connection)
+void cloud_tls_close(struct cloud_tls *connection)
 {
     if (!connection)
         return;
@@ -199,14 +203,22 @@ static void cloud_tunnel_close(struct cloud_tunnel_connection *connection)
     connection->fd = -1;
 }
 
-static int cloud_tunnel_open(const struct cloud_config *config,
-                             struct cloud_tunnel_connection *out)
+/*
+ * Dials the relay and completes the TLS handshake.
+ *
+ * Verification failures are fatal here rather than downgraded, and the failure
+ * reason is recorded in the tunnel state so a bad CA path or an intercepting
+ * middlebox is diagnosable without packet capture.
+ */
+int cloud_tls_connect(const struct cloud_config *config, struct cloud_tls *out)
 {
-    struct cloud_tunnel_connection connection;
+    struct cloud_tls connection;
     X509_VERIFY_PARAM *parameters;
 
     memset(&connection, 0, sizeof(connection));
     connection.fd = -1;
+    if (!config || !out)
+        return -1;
 
     connection.context = SSL_CTX_new(TLS_client_method());
     if (!connection.context)
@@ -267,13 +279,13 @@ static int cloud_tunnel_open(const struct cloud_config *config,
     *out = connection;
     return 0;
 fail:
-    cloud_tunnel_close(&connection);
+    cloud_tls_close(&connection);
     return -1;
 }
 
 /* ── framing ─────────────────────────────────────────────────────── */
 
-static int cloud_ssl_read_exact(SSL *ssl, unsigned char *out, size_t length)
+static int cloud_tls_read_exact(SSL *ssl, unsigned char *out, size_t length)
 {
     size_t received = 0;
 
@@ -292,7 +304,7 @@ static int cloud_ssl_read_exact(SSL *ssl, unsigned char *out, size_t length)
     return 0;
 }
 
-static int cloud_ssl_write_all(SSL *ssl, const unsigned char *data, size_t length)
+int cloud_tls_write_all(SSL *ssl, const unsigned char *data, size_t length)
 {
     size_t sent = 0;
 
@@ -311,6 +323,25 @@ static int cloud_ssl_write_all(SSL *ssl, const unsigned char *data, size_t lengt
     return 0;
 }
 
+/* Single read, returning the byte count. Used by the HTTP paths, which cannot
+ * know the response length up front the way the frame reader can. */
+int cloud_tls_read_some(SSL *ssl, unsigned char *out, size_t length)
+{
+    for (;;) {
+        int got = SSL_read(ssl, out, (int)length);
+        int error;
+
+        if (got > 0)
+            return got;
+        error = SSL_get_error(ssl, got);
+        if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE)
+            continue;
+        if (error == SSL_ERROR_ZERO_RETURN)
+            return 0;
+        return -1;
+    }
+}
+
 static int cloud_frame_write(SSL *ssl, struct json_object *frame)
 {
     const char *text = json_object_to_json_string_ext(frame,
@@ -327,9 +358,9 @@ static int cloud_frame_write(SSL *ssl, struct json_object *frame)
     header[1] = (unsigned char)((length >> 16) & 0xff);
     header[2] = (unsigned char)((length >> 8) & 0xff);
     header[3] = (unsigned char)(length & 0xff);
-    if (cloud_ssl_write_all(ssl, header, sizeof(header)) != 0)
+    if (cloud_tls_write_all(ssl, header, sizeof(header)) != 0)
         return -1;
-    return cloud_ssl_write_all(ssl, (const unsigned char *)text, length);
+    return cloud_tls_write_all(ssl, (const unsigned char *)text, length);
 }
 
 static int cloud_frame_read(SSL *ssl, struct json_object **out)
@@ -339,7 +370,7 @@ static int cloud_frame_read(SSL *ssl, struct json_object **out)
     uint32_t length;
     struct json_object *parsed;
 
-    if (cloud_ssl_read_exact(ssl, header, sizeof(header)) != 0)
+    if (cloud_tls_read_exact(ssl, header, sizeof(header)) != 0)
         return -1;
     length = ((uint32_t)header[0] << 24) | ((uint32_t)header[1] << 16) |
              ((uint32_t)header[2] << 8) | (uint32_t)header[3];
@@ -350,7 +381,7 @@ static int cloud_frame_read(SSL *ssl, struct json_object **out)
     payload = malloc(length + 1);
     if (!payload)
         return -1;
-    if (cloud_ssl_read_exact(ssl, payload, length) != 0) {
+    if (cloud_tls_read_exact(ssl, payload, length) != 0) {
         free(payload);
         return -1;
     }
@@ -396,14 +427,14 @@ static int cloud_tunnel_upgrade(SSL *ssl, const struct cloud_config *config)
         CLOUD_SERVICE_NAME, CLOUD_CONTRACT_VERSION);
     if (length <= 0 || (size_t)length >= sizeof(request))
         return -1;
-    if (cloud_ssl_write_all(ssl, (const unsigned char *)request,
+    if (cloud_tls_write_all(ssl, (const unsigned char *)request,
                             (size_t)length) != 0)
         return -1;
 
     /* Read headers one byte at a time up to the blank line. The relay sends no
      * body with 101, so nothing is over-read into the frame stream. */
     while (received < sizeof(response) - 1) {
-        if (cloud_ssl_read_exact(ssl, (unsigned char *)response + received, 1) != 0)
+        if (cloud_tls_read_exact(ssl, (unsigned char *)response + received, 1) != 0)
             return -1;
         received++;
         response[received] = '\0';
@@ -636,19 +667,106 @@ done:
 
 /* ── session ─────────────────────────────────────────────────────── */
 
+/*
+ * Pushes the current authorized-App set as a standalone frame.
+ *
+ * Unlike the hello path this sends an empty array too: an empty refresh is how
+ * revocation of the last paired App is expressed, and skipping it would leave
+ * the relay holding a key the router no longer honours.
+ *
+ * A NULL ssl records the current set in `digest` without sending anything. That
+ * is used right after the handshake, where hello already carried the set and a
+ * second identical frame would be noise.
+ *
+ * Returns 0 when nothing needed sending or the frame went out; -1 only on a
+ * write failure, which the caller treats as a dead tunnel.
+ */
+static int cloud_tunnel_push_authorized_apps(SSL *ssl, char *digest,
+                                             size_t digest_size)
+{
+    struct json_object *authorized = cloud_devices_signing_keys();
+    struct json_object *frame;
+    const char *serialized;
+    int rc = 0;
+
+    if (!authorized)
+        return 0;
+
+    /* Only send when the set actually changed, so an idle router does not put a
+     * frame on the wire every minute. The serialized array doubles as the
+     * comparison key; it is bounded by CLOUD_MAX_AUTHORIZED_APPS entries. */
+    serialized = json_object_to_json_string_ext(authorized,
+                                                JSON_C_TO_STRING_PLAIN);
+    if (!serialized) {
+        json_object_put(authorized);
+        return 0;
+    }
+    if (!ssl) {
+        if (strlen(serialized) < digest_size)
+            snprintf(digest, digest_size, "%s", serialized);
+        else
+            digest[0] = '\0';
+        json_object_put(authorized);
+        return 0;
+    }
+    if (strlen(serialized) < digest_size && !strcmp(digest, serialized)) {
+        json_object_put(authorized);
+        return 0;
+    }
+
+    frame = json_object_new_object();
+    if (!frame) {
+        json_object_put(authorized);
+        return 0;
+    }
+    json_object_object_add(frame, "protocol",
+                           json_object_new_string(CLOUD_PROTOCOL));
+    json_object_object_add(frame, "version",
+                           json_object_new_int(CLOUD_PROTOCOL_VERSION));
+    json_object_object_add(frame, "kind",
+                           json_object_new_string("tunnel_authorized_apps"));
+    /* Ownership moves into the frame. */
+    json_object_object_add(frame, "authorized_apps", authorized);
+
+    if (cloud_frame_write(ssl, frame) != 0)
+        rc = -1;
+    else if (strlen(serialized) < digest_size)
+        snprintf(digest, digest_size, "%s", serialized);
+    else
+        digest[0] = '\0';
+
+    json_object_put(frame);
+    return rc;
+}
+
 static int cloud_tunnel_hello(SSL *ssl, const struct cloud_config *config)
 {
     const struct cloud_identity *identity = cloud_identity();
     struct json_object *frame;
     struct json_object *reply = NULL;
     struct json_object *accepted = NULL;
+    struct json_object *authorized;
+    char token[512];
     int rc = -1;
 
     if (!identity)
         return -1;
+    /*
+     * A token obtained through self enrollment wins over a UCI one. Both are
+     * valid ways to be registered, but the enrolled token was minted for this
+     * exact key pair, whereas a stale UCI value left over from an earlier relay
+     * would fail the handshake with no clue as to which credential was used.
+     */
+    if (cloud_enroll_token_load(token, sizeof(token)) != 0) {
+        if (!config->auth_token[0])
+            return -1;
+        snprintf(token, sizeof(token), "%s", config->auth_token);
+    }
     frame = json_object_new_object();
-    if (!frame)
+    if (!frame) {
+        OPENSSL_cleanse(token, sizeof(token));
         return -1;
+    }
     json_object_object_add(frame, "protocol",
                            json_object_new_string(CLOUD_PROTOCOL));
     json_object_object_add(frame, "version",
@@ -657,7 +775,25 @@ static int cloud_tunnel_hello(SSL *ssl, const struct cloud_config *config)
     json_object_object_add(frame, "router_id",
                            json_object_new_string(identity->router_id));
     json_object_object_add(frame, "auth_token",
-                           json_object_new_string(config->auth_token));
+                           json_object_new_string(token));
+    OPENSSL_cleanse(token, sizeof(token));
+    /*
+     * Declare which Apps may ask the relay whether this router is online.
+     * Without this the relay has no key to verify against and refuses every
+     * presence query, so the App would show the router as unreachable even
+     * while the tunnel is up.
+     *
+     * Only public keys are sent. The field is omitted when there is nothing to
+     * declare, because the relay treats an absent list as "no opinion" and an
+     * empty one as a deliberate statement.
+     */
+    authorized = cloud_devices_signing_keys();
+    if (authorized) {
+        if (json_object_array_length(authorized) > 0)
+            json_object_object_add(frame, "authorized_apps", authorized);
+        else
+            json_object_put(authorized);
+    }
     rc = cloud_frame_write(ssl, frame);
     json_object_put(frame);
     if (rc != 0)
@@ -683,18 +819,23 @@ static int cloud_tunnel_hello(SSL *ssl, const struct cloud_config *config)
 
 static int cloud_tunnel_session(const struct cloud_config *config)
 {
-    struct cloud_tunnel_connection connection;
+    struct cloud_tls connection;
     int64_t last_ping;
+    int64_t last_apps_refresh;
+    /* Serialized copy of the last pushed set, so an unchanged set costs no
+     * frame. Sized for CLOUD_MAX_AUTHORIZED_APPS base64 keys plus separators. */
+    char apps_digest[CLOUD_MAX_AUTHORIZED_APPS * 48 + 8];
 
     memset(&connection, 0, sizeof(connection));
     connection.fd = -1;
+    apps_digest[0] = '\0';
 
     cloud_tunnel_set_state("connecting", "");
-    if (cloud_tunnel_open(config, &connection) != 0)
+    if (cloud_tls_connect(config, &connection) != 0)
         return -1;
     if (cloud_tunnel_upgrade(connection.ssl, config) != 0 ||
         cloud_tunnel_hello(connection.ssl, config) != 0) {
-        cloud_tunnel_close(&connection);
+        cloud_tls_close(&connection);
         return -1;
     }
 
@@ -703,6 +844,10 @@ static int cloud_tunnel_session(const struct cloud_config *config)
     fprintf(stderr, "[%s] tunnel established host=%s port=%u\n",
             CLOUD_SERVICE_NAME, config->host, (unsigned int)config->port);
     last_ping = cloud_monotonic_ms();
+    last_apps_refresh = last_ping;
+    /* The hello already carried the current set, so seed the digest without
+     * sending a second copy. */
+    cloud_tunnel_push_authorized_apps(NULL, apps_digest, sizeof(apps_digest));
 
     while (cloud_tunnel_running()) {
         struct json_object *frame = NULL;
@@ -728,8 +873,20 @@ static int cloud_tunnel_session(const struct cloud_config *config)
                     if (cloud_frame_write(connection.ssl, ping) == 0)
                         last_ping = now;
                     json_object_put(ping);
-                    if (last_ping == now)
+                    if (last_ping == now) {
+                        /* Also refresh here: an idle tunnel never reaches the
+                         * bottom of the loop, and revocation must not wait for
+                         * the next App request to take effect. */
+                        if (now - last_apps_refresh >=
+                            CLOUD_TUNNEL_APPS_REFRESH_MS) {
+                            last_apps_refresh = now;
+                            if (cloud_tunnel_push_authorized_apps(
+                                    connection.ssl, apps_digest,
+                                    sizeof(apps_digest)) != 0)
+                                break;
+                        }
                         continue;
+                    }
                 }
             }
             break;
@@ -772,10 +929,50 @@ static int cloud_tunnel_session(const struct cloud_config *config)
         now = cloud_monotonic_ms();
         if (now >= 0 && now - last_ping >= CLOUD_TUNNEL_PING_INTERVAL_MS)
             last_ping = now;
+        if (now >= 0 && now - last_apps_refresh >= CLOUD_TUNNEL_APPS_REFRESH_MS) {
+            last_apps_refresh = now;
+            if (cloud_tunnel_push_authorized_apps(connection.ssl, apps_digest,
+                                                  sizeof(apps_digest)) != 0)
+                break;
+        }
     }
 
     cloud_tunnel_set_connected(0);
-    cloud_tunnel_close(&connection);
+    cloud_tls_close(&connection);
+    return 0;
+}
+
+/*
+ * Obtains a tunnel credential when none is stored yet.
+ *
+ * Enrollment runs on the tunnel thread, not at startup, because it needs the
+ * network and must not delay the daemon coming up or answering ubus. Failures
+ * are recorded in the tunnel state with the relay's own code so a disabled or
+ * statically-registered relay reads differently from a broken one.
+ *
+ * Returns 1 when a credential is available, 0 when it is not.
+ */
+static int cloud_tunnel_ensure_credential(const struct cloud_config *config)
+{
+    struct cloud_enroll_result result;
+
+    if (cloud_enroll_token_present() || config->auth_token[0])
+        return 1;
+
+    cloud_tunnel_set_state("enrolling", "");
+    if (cloud_enroll_run(config, &result) == 0)
+        return 1;
+
+    /*
+     * statically_configured is not a failure: the operator registered this
+     * router in the relay's config.json, so the token belongs in UCI. Saying so
+     * plainly keeps the UI from showing a fault for a working setup.
+     */
+    cloud_tunnel_set_state(!strcmp(result.code, "statically_configured") ?
+                               "misconfigured" : "unenrolled",
+                           result.code);
+    fprintf(stderr, "[%s] enrollment failed code=%s http=%d\n",
+            CLOUD_SERVICE_NAME, result.code, result.http_status);
     return 0;
 }
 
@@ -790,7 +987,10 @@ static void *cloud_tunnel_thread(void *argument)
     pthread_mutex_unlock(&g_tunnel.lock);
 
     while (cloud_tunnel_running()) {
-        if (cloud_tunnel_session(&config) == 0) {
+        if (!cloud_tunnel_ensure_credential(&config)) {
+            /* No credential means every dial would be refused, so back off
+             * instead of hammering the relay. */
+        } else if (cloud_tunnel_session(&config) == 0) {
             /* A clean session end means the relay closed us; retry from the
              * short backoff rather than treating it as a hard failure. */
             backoff = CLOUD_TUNNEL_BACKOFF_MIN_MS;
@@ -827,10 +1027,10 @@ int cloud_tunnel_start(const struct cloud_config *config)
         cloud_tunnel_set_state("misconfigured", "relay_host_missing");
         return 0;
     }
-    if (!config->auth_token[0]) {
-        cloud_tunnel_set_state("misconfigured", "relay_auth_token_missing");
-        return 0;
-    }
+    /*
+     * A missing token is no longer fatal: the thread enrolls to obtain one. It
+     * still needs a host, because enrollment dials the same relay.
+     */
 
     pthread_mutex_lock(&g_tunnel.lock);
     g_tunnel.config = *config;

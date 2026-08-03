@@ -82,13 +82,11 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-domain-block > header > span { display: flex; align-items: center; gap: 7px; color: var(--app-text); font-size: 12px; font-weight: 700; }
 .aegisx-domain-add { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
 .aegisx-domain-add input,
-.aegisx-event-search input,
-.aegisx-drawer-toolbar input,
+.aegisx-inline-search input,
 .aegisx-drawer-body input,
 .aegisx-drawer-body select { width: 100%; height: 38px; border: 1px solid color-mix(in srgb, var(--app-text-muted) 22%, transparent); border-radius: var(--app-radius-compact); padding: 0 10px; color: var(--app-text); background: color-mix(in srgb, var(--app-text) 6%, transparent); font: inherit; outline: 0; }
 .aegisx-domain-add input::placeholder,
-.aegisx-event-search input::placeholder,
-.aegisx-drawer-toolbar input::placeholder,
+.aegisx-inline-search input::placeholder,
 .aegisx-drawer-body input::placeholder { color: var(--app-text-muted); opacity: .78; }
 .aegisx-domain-add button { border: 0; border-radius: var(--app-radius-compact); padding: 0 10px; color: var(--app-accent); background: transparent; font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; }
 .aegisx-domain-chips { min-width: 0; display: flex; flex-wrap: wrap; gap: 6px; }
@@ -106,13 +104,11 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-overview-cards { flex: 0 0 auto; }
 .aegisx-pcdn-panel { flex: none; min-height: auto; overflow: visible; }
 .aegisx-events-card { min-width: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); border-radius: var(--app-radius-card); overflow: hidden; }
-.aegisx-events-card > header { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 13px 16px; border-bottom: 1px solid color-mix(in srgb, var(--app-text-muted) 16%, transparent); }
-.aegisx-events-card > header > div { min-width: 0; display: grid; gap: 2px; }
-.aegisx-events-card > header strong { color: var(--app-text); font-size: 14px; }
-.aegisx-events-card > header span { color: var(--app-text-muted); font-size: 11px; }
-.aegisx-event-search { width: min(260px, 40%); min-width: 160px; position: relative; display: block; }
-.aegisx-event-search svg { width: 16px; height: 16px; position: absolute; z-index: 1; left: 10px; top: 11px; color: var(--app-text-muted); pointer-events: none; }
-.aegisx-event-search input { padding-left: 33px; }
+/* 表头改用 kit 工具条，搜索换成 kit 的展开式搜索（用户第 8 条 pic-8）。
+   之前自造的 label 没有宽度上限也不参与工具条布局，所以会跑出卡片右边界。 */
+.aegisx-events-toolbar { flex-wrap: wrap; gap: 12px; }
+.aegisx-events-toolbar > .dwrt-kit-expand-search { margin-left: auto; }
+.aegisx-event-search.dwrt-kit-expand-search { --dwrt-search-expanded-width: min(260px, 34vw); }
 .aegisx-events-card .dwrt-kit-table-wrap { max-height: 430px; overflow: auto; }
 .aegisx-events-table { width: 100%; min-width: 860px; }
 .aegisx-events-table th,
@@ -132,7 +128,7 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-drawer,
 .aegisx-drawer.dwrt-page-glass-surface,
 .aegisx-drawer.dwrt-page-liquid-glass {
-  --dwrt-kit-sheet-width: min(94vw, 610px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form);
   --dwrt-kit-sheet-z: 70;
   position: fixed !important;
   inset: 0 0 0 auto !important;
@@ -142,13 +138,13 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 }
 .aegisx-geo-drawer,
 .aegisx-geo-drawer.dwrt-page-glass-surface,
-.aegisx-geo-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: min(100vw, 460px); }
+.aegisx-geo-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }
 .aegisx-app-drawer,
 .aegisx-app-drawer.dwrt-page-glass-surface,
-.aegisx-app-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: min(100vw, 460px); }
+.aegisx-app-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }
 .aegisx-content-drawer,
 .aegisx-content-drawer.dwrt-page-glass-surface,
-.aegisx-content-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: min(100vw, 460px); }
+.aegisx-content-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }
 .aegisx-geo-drawer .aegisx-drawer-body { width: 100%; max-width: 100%; overflow-x: hidden; }
 .aegisx-honeypot-modal-layer { --dwrt-kit-modal-z: 74; }
 .aegisx-honeypot-modal { --dwrt-kit-modal-width: 680px; }
@@ -187,7 +183,7 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-content-form-row small { display: block; margin-top: 6px; color: var(--app-text-muted); font-size: 11px; line-height: 1.4; }
 .aegisx-content-form-row .aegisx-choice-row,
 .aegisx-content-form-row .aegisx-check-row { gap: 8px 16px; }
-.aegisx-intrusion-drawer { --dwrt-kit-sheet-width: min(96vw, 760px); }
+.aegisx-intrusion-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-wide); }
 .aegisx-intrusion-section { min-width: 0; display: grid; gap: 10px; padding: 14px; border-radius: var(--app-radius-control); background: color-mix(in srgb, var(--app-text) 4%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-text-muted) 12%, transparent); }
 .aegisx-intrusion-section > header { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .aegisx-intrusion-section > header > div:first-child { min-width: 0; display: grid; gap: 2px; }
@@ -237,9 +233,11 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-signature-editor-actions button { min-height: 36px; padding-inline: 13px; }
 .aegisx-pagination { display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: var(--app-text-muted); font-size: 10px; }
 .aegisx-sheet-footnote { flex: 1 1 auto; color: var(--app-text-muted); font-size: 10px; }
-.aegisx-app-search { min-width: 0; position: relative; display: block; }
-.aegisx-app-search svg { width: 16px; height: 16px; position: absolute; z-index: 1; left: 10px; top: 11px; color: var(--app-text-muted); pointer-events: none; }
-.aegisx-app-search input { padding-left: 33px; }
+/* 抽屉内的搜索：kit 的 mountExpandSearch 对 .dwrt-kit-sheet 内的节点主动跳过，
+   所以这里用 kit 的 field 控件材质，不再各页自己定义输入框外观。 */
+.aegisx-inline-search { min-width: 0; position: relative; display: block; }
+.aegisx-inline-search svg { width: 16px; height: 16px; position: absolute; z-index: 1; left: 10px; top: 11px; color: var(--app-text-muted); pointer-events: none; }
+.aegisx-inline-search input { padding-left: 33px; }
 .aegisx-app-catalog { max-height: 330px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; overflow: auto; overscroll-behavior: contain; padding: 2px; }
 .aegisx-app-catalog > label { min-width: 0; min-height: 50px; display: grid; grid-template-columns: auto auto minmax(0, 1fr); grid-template-rows: auto auto; align-items: center; column-gap: 8px; border-radius: var(--app-radius-compact); padding: 7px 9px; color: var(--app-text-secondary); background: color-mix(in srgb, var(--app-text) 4%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-text-muted) 11%, transparent); cursor: pointer; }
 .aegisx-app-catalog > label > input { position: absolute; opacity: 0; pointer-events: none; }
@@ -272,8 +270,6 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-add-range { justify-self: start; }
 .aegisx-drawer-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .aegisx-drawer-toolbar > label { min-width: 0; flex: 1; position: relative; }
-.aegisx-drawer-toolbar svg { width: 16px; height: 16px; position: absolute; z-index: 1; left: 10px; top: 11px; color: var(--app-text-muted); pointer-events: none; }
-.aegisx-drawer-toolbar input { padding-left: 33px; }
 .aegisx-drawer-toolbar > span { color: var(--app-text-muted); font-size: 11px; white-space: nowrap; }
 .aegisx-country-list { width: 100%; max-width: 100%; min-height: 0; display: grid; grid-template-columns: 1fr; gap: 6px; overflow-x: hidden; }
 .aegisx-country-list > label { min-width: 0; min-height: 48px; display: grid; grid-template-columns: 18px 25px minmax(0, 1fr); grid-template-rows: auto auto; align-content: center; column-gap: 9px; border-radius: var(--app-radius-compact); padding: 7px 9px; color: var(--app-text-secondary); background: color-mix(in srgb, var(--app-text) 3%, transparent); cursor: pointer; }
@@ -312,8 +308,9 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
   .aegisx-region-config { width: 100%; }
   .aegisx-honeypot-row { justify-content: flex-start; }
   .aegisx-domain-grid { grid-template-columns: 1fr; }
-  .aegisx-events-card > header { align-items: stretch; flex-direction: column; }
-  .aegisx-event-search { width: 100%; }
+  .aegisx-events-toolbar { align-items: stretch; flex-direction: column; }
+  .aegisx-events-toolbar > .dwrt-kit-expand-search { margin-left: 0; }
+  .aegisx-event-search.dwrt-kit-expand-search { --dwrt-search-expanded-width: 100%; max-width: 100% !important; }
   .aegisx-country-list { grid-template-columns: 1fr; }
   .aegisx-app-catalog { grid-template-columns: 1fr; }
   .aegisx-intrusion-section > header { align-items: flex-start; flex-direction: column; }
@@ -324,10 +321,10 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 @media (max-width: 520px) {
   .aegisx-app-drawer,
   .aegisx-app-drawer.dwrt-page-glass-surface,
-  .aegisx-app-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: 100vw; --dwrt-kit-sheet-max-width: 100vw; }
+  .aegisx-app-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full); --dwrt-kit-sheet-max-width: 100vw; }
   .aegisx-content-drawer,
   .aegisx-content-drawer.dwrt-page-glass-surface,
-  .aegisx-content-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: 100vw; --dwrt-kit-sheet-max-width: 100vw; }
+  .aegisx-content-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full); --dwrt-kit-sheet-max-width: 100vw; }
   .aegisx-content-form-row { grid-template-columns: 96px minmax(0, 1fr); gap: 10px; }
   .aegisx-drawer-toolbar { align-items: stretch; flex-direction: column; }
   .aegisx-drawer-toolbar > label { flex: 0 0 auto; width: 100%; }

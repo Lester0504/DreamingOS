@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN" data-theme-resolved="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>system-admin-bindings-fixture-01</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-control-material.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/system-settings.css">
+  <style>
+    :root {
+      --app-menu-glass-width: 48px;
+      --app-radius-card: 24px;
+      --app-radius-panel: 18px;
+      --app-radius-control: 12px;
+      --app-page-gap: 16px;
+      --app-text: rgb(239 245 252);
+      --app-text-secondary: rgb(214 224 238);
+      --app-text-muted: rgb(177 193 213);
+      --app-accent: rgb(46 139 255);
+      --color-text-primary: var(--app-text);
+      --color-text-secondary: var(--app-text-secondary);
+      --color-text-muted: var(--app-text-muted);
+      --color-accent: var(--app-accent);
+      --color-on-accent: white;
+      --color-danger: rgb(239 86 99);
+      --color-warning: rgb(238 177 52);
+      --color-border-control: rgb(255 255 255 / .2);
+      --color-border-subtle: rgb(255 255 255 / .12);
+      --color-surface-control: rgb(255 255 255 / .06);
+      --color-surface-stable: rgb(12 20 32 / .55);
+      --color-surface-dense: rgb(10 16 25 / .78);
+      --dwrt-glass-ink: var(--app-text);
+      --dwrt-glass-text: var(--app-text-secondary);
+      --dwrt-glass-muted: var(--app-text-muted);
+      --dwrt-kit-text: var(--app-text);
+      --dwrt-kit-muted: var(--app-text-muted);
+    }
+    html, body { width: 100%; height: 100%; margin: 0; }
+    body { color: var(--app-text); background: linear-gradient(135deg, rgb(17 48 79), rgb(80 44 29)); font-family: system-ui, sans-serif; }
+    .console-stage { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; overflow: auto; }
+  </style>
+</head>
+<body>
+  <main class="console-stage"><div class="route-preview" id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/system-settings.js';
+
+    const root = document.getElementById('routePreview');
+    let mode = 'local';
+
+    // Shape mirrors /api/v1/system/basic.
+    const basic = {
+      admin: { username: 'root', web_login_timeout_min: 60 },
+      ssh: { enabled: true, port: 22, idle_timeout_min: 30, password_login: true, root_password_login: true, key_only: false },
+      capabilities: { web_login_timeout: true }
+    };
+
+    // Shape mirrors /api/v1/auth/2fa/status.
+    const twofa = { twofa_enabled: false, digits: 6, period: 30, method: 'totp' };
+
+    // Shape mirrors jmx_app_devices_list(): remote-access audit columns included.
+    const devicesLocal = [
+      {
+        id: 'app-local-1', name: 'Lester 的 iPhone', platform: 'ios', role: 'owner',
+        paired_at: 1785000000, last_seen: Math.floor(Date.now() / 1000) - 120, enabled: true, state: 'paired',
+        public_key_fingerprint: '9AF2-1C77-30BE-D145',
+        last_remote_seen: null, last_remote_seen_reason: 'no_remote_access_recorded',
+        last_access_path: 'local'
+      }
+    ];
+    const devicesRemote = [
+      devicesLocal[0],
+      {
+        id: 'app-remote-1', name: '出差用的 Pixel 8 Pro 超长设备名称占位', platform: 'android', role: 'member',
+        paired_at: 1784000000, last_seen: Math.floor(Date.now() / 1000) - 600, enabled: true, state: 'paired',
+        public_key_fingerprint: '4B10-77CA-8E23-0FD9',
+        last_remote_seen: Math.floor(Date.now() / 1000) - 1800,
+        last_access_path: 'relay'
+      }
+    ];
+
+    const json = (data, status = 200) => new Response(JSON.stringify({ ok: true, data }), { status, headers: { 'content-type': 'application/json' } });
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = async (url, init = {}) => {
+      // The module appends ?v=<VERSION> to every request, so match on the path only.
+      const target = String(url).split('?')[0];
+      if (target === '/api/v1/system/basic') return json(basic);
+      if (target === '/api/v1/auth/2fa/status') return json(twofa);
+      if (target === '/api/v1/auth/devices') return json({ devices: mode === 'remote' ? devicesRemote : devicesLocal });
+      return originalFetch(url, init);
+    };
+
+    const ui = {
+      mountAll: node => window.DWRT_UI_KIT.mountAll(node),
+      lucideIcon: (...args) => window.DWRT_UI_KIT.lucideIcon(...args),
+      statusBadgeMarkup: (...args) => window.DWRT_UI_KIT.statusBadgeMarkup(...args),
+      overviewCardsMarkup: (...args) => window.DWRT_UI_KIT.overviewCardsMarkup(...args),
+      floatingSavebarMarkup: (...args) => window.DWRT_UI_KIT.floatingSavebarMarkup(...args),
+      confirmationMarkup: (...args) => window.DWRT_UI_KIT.confirmationMarkup(...args),
+      scheduleAdaptiveForegroundSample: (delay = 0, scopeRoot = root) => {
+        setTimeout(() => {
+          const scope = scopeRoot || root;
+          if (!scope) return;
+          [
+            ...(scope.matches?.('[data-adaptive-sample]') ? [scope] : []),
+            ...scope.querySelectorAll('[data-adaptive-sample]')
+          ].forEach(node => node.setAttribute('data-adaptive-region', 'light'));
+        }, delay);
+      }
+    };
+    const utils = { escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]) };
+
+    let instance = mount({ root, item: { id: 'system-admin' }, path: '#/system/admin', ui, utils });
+
+    window.ADMIN_FIXTURE = {
+      async ready() {
+        for (let index = 0; index < 120; index += 1) {
+          if (root.querySelector('.system-admin-security-panel')) return true;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        return false;
+      },
+      async remount(next = 'local') {
+        instance?.unmount?.();
+        mode = next;
+        root.innerHTML = '';
+        instance = mount({ root, item: { id: 'system-admin' }, path: '#/system/admin', ui, utils });
+        await this.ready();
+        return true;
+      },
+      async openDialog(action) {
+        root.querySelector(`[data-system-action="${action}"]`)?.click();
+        await new Promise(resolve => setTimeout(resolve, 120));
+        return root.querySelector('.system-binding-layer')?.dataset.systemDialog || '';
+      },
+      async closeDialog() {
+        root.querySelector('.system-binding-layer [data-system-action="binding-close"]')?.click();
+        await new Promise(resolve => setTimeout(resolve, 750));
+        return Boolean(root.querySelector('.system-binding-layer'));
+      },
+      unmount() { instance?.unmount?.(); instance = null; }
+    };
+  </script>
+</body>
+</html>

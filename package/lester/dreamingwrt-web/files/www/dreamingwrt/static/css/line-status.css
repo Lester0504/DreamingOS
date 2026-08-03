@@ -1,7 +1,7 @@
 .console-stage.is-line-status {
   grid-template-rows: minmax(0, 1fr);
   align-items: start;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
   overflow-x: hidden;

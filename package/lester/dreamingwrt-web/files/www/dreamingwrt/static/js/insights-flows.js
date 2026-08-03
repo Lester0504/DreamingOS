@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '20260714-03';
+  const VERSION = '20260802-ui-batch-01';
   const PERIODS = {
     hour: { label: '1 小时', api: 'hour', ms: 3600000 },
     day: { label: '1 天', api: 'day', ms: 86400000 },
@@ -170,6 +170,7 @@
       notice: '',
       root: null,
       refreshTimer: 0,
+      auditPollTimer: 0,
       refreshSeq: 0,
       realtimeUnsubscribers: [],
       realtimeTopicsKey: '',
@@ -654,6 +655,27 @@
       state.realtimeUnsubscribers = topics.map((topic) => realtime.subscribe(topic, (data) => applyInsightsRealtime(topic, data)));
     }
 
+    /*
+     * 审计表只订阅 insights.status（见 insightsRealtimeTopics），表体不会自己更新。
+     * 删掉手动刷新按钮前必须先把轮询补上，否则页面会变成打开一次就不再刷新的快照。
+     */
+    function stopAuditPolling() {
+      window.clearInterval(state.auditPollTimer);
+      state.auditPollTimer = 0;
+    }
+
+    function startAuditPolling() {
+      stopAuditPolling();
+      if (!isAuditActivitySection()) return;
+      state.auditPollTimer = window.setInterval(() => {
+        if (!state.mounted || !state.root) return stopAuditPolling();
+        if (!isAuditActivitySection()) return stopAuditPolling();
+        if (document.visibilityState !== 'visible') return;
+        if (state.loading) return;
+        refresh();
+      }, 15000);
+    }
+
     function unsubscribeInsightsRealtime() {
       state.realtimeUnsubscribers.forEach((unsubscribe) => {
         try { unsubscribe && unsubscribe(); } catch (_) {}
@@ -1081,7 +1103,6 @@
             ${searchSvg()}
             <input type="search" placeholder="搜索" value="${html(state.search)}" data-insights-search autocomplete="off" spellcheck="false">
           </label>
-          <button class="insights-icon-button" data-insights-refresh type="button" title="刷新">${refreshSvg()}</button>
         </div>
         ${riskMarkup()}
         ${rangeMarkup()}
@@ -1615,14 +1636,6 @@
       return `<div class="insights-audit-metric"><span>${html(label)}</span><strong>${html(value)}</strong>${hint ? `<em>${html(hint)}</em>` : ''}</div>`;
     }
 
-    function auditStatsMarkup(items = []) {
-      const stats = (items || []).filter((item) => item && firstText(item.label) && firstText(item.value) !== '');
-      if (!stats.length) return '';
-      return `<div class="insights-audit-toolbar-stats" aria-label="审计统计">
-        ${stats.map((item) => `<span class="insights-audit-stat-chip ${html(item.tone || '')}"><em>${html(item.label)}</em><strong>${html(item.value)}</strong></span>`).join('')}
-      </div>`;
-    }
-
     function auditStatusObject() {
       const status = auditPayload('status');
       const urls = auditPayload('urls');
@@ -1665,19 +1678,55 @@
       return options.map(([value, label]) => `<option value="${html(value)}" ${String(current || '') === value ? 'selected' : ''}>${html(label)}</option>`).join('');
     }
 
-    function auditSearchToolbar(section, controls = '') {
-      const query = auditQuery(section);
+    /*
+     * 审计页的全部控件收进表格工具条（用户第 11 条）：时间范围由平铺按钮排改为下拉，
+     * 手动刷新按钮删除，数据由 startAuditPolling() 的轮询与筛选变更触发。
+     */
+    function auditRangeSelect() {
       const ranges = Object.entries(ACTIVITY_PERIODS).filter(([id]) => id !== 'month');
-      const rangeButtons = `<div class="insights-audit-range" role="tablist" aria-label="审计时间范围">${ranges.map(([id, item]) => `
-        <button type="button" ${id === 'custom' ? 'data-date-range-trigger title="自定义时间范围"' : `data-period="${id}"`} class="${state.period === id ? 'is-active' : ''}">${id === 'custom' ? calendarSvg() : html(item.label)}</button>
-      `).join('')}</div>`;
-      return `<div class="insights-audit-toolbar">
-        <label class="insights-audit-search" data-dwrt-component="expand-search">${searchSvg()}<input type="search" value="${html(query.q || '')}" placeholder="搜索" data-audit-search="${html(section)}" autocomplete="off" spellcheck="false"></label>
-        ${rangeButtons}
+      const options = ranges.map(([id, item]) => (id === 'custom'
+        ? `<option value="custom" ${state.period === 'custom' ? 'selected' : ''}>${html(customRangeLabel() || '自定义范围')}</option>`
+        : `<option value="${html(id)}" ${state.period === id ? 'selected' : ''}>${html(item.label)}</option>`)).join('');
+      return `<label class="insights-audit-select insights-audit-range-select" data-dwrt-component="field"><select class="dwrt-kit-select" data-dwrt-component="select" data-audit-range aria-label="审计时间范围">${options}</select></label>`;
+    }
+
+    function auditToolbarControls(section, controls = '') {
+      const query = auditQuery(section);
+      return `<div class="insights-audit-toolbar-controls">
         ${controls}
-        <button class="insights-icon-button" data-audit-refresh type="button" title="刷新">${refreshSvg()}</button>
+        ${auditRangeSelect()}
+        <label class="dwrt-kit-expand-search insights-audit-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${searchSvg()}</span><input type="search" value="${html(query.q || '')}" placeholder="搜索" data-audit-search="${html(section)}" autocomplete="off" spellcheck="false" aria-label="搜索审计记录"></label>
         <button class="insights-audit-link" data-audit-export type="button">导出</button>
       </div>`;
+    }
+
+    function customRangeLabel() {
+      if (!state.customRange) return '';
+      const fmt = (value) => {
+        const date = new Date(Number(value) || 0);
+        if (!Number.isFinite(date.getTime())) return '';
+        return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+      };
+      const start = fmt(state.customRange.start);
+      const end = fmt(state.customRange.end);
+      return start && end ? `${start} → ${end}` : '';
+    }
+
+    /* 四张顶部状态卡片，用 kit 的概览卡组件，与其他页面一致。 */
+    function auditOverviewCards(items = []) {
+      const cards = (items || []).filter((item) => item && firstText(item.label) !== '');
+      if (!cards.length) return '';
+      const renderer = window.DWRT_UI_KIT && window.DWRT_UI_KIT.overviewCardsMarkup;
+      const mapped = cards.map((item, index) => ({
+        key: `audit-stat-${index + 1}`,
+        label: item.label,
+        value: item.value,
+        detail: firstText(item.detail),
+        icon: item.icon,
+        tone: item.tone === 'good' ? 'ok' : item.tone === 'bad' ? 'bad' : item.tone === 'warn' ? 'warn' : 'neutral'
+      }));
+      if (typeof renderer === 'function') return renderer(mapped, { className: 'insights-audit-overview', label: '审计概览' });
+      return `<section class="dwrt-kit-overview-grid insights-audit-overview" aria-label="审计概览">${mapped.map((item) => `<article class="dwrt-kit-overview-card is-${html(item.tone)}"><div class="dwrt-kit-overview-content"><span class="dwrt-kit-overview-label">${html(item.label)}</span><strong>${html(item.value)}</strong><small>${html(item.detail)}</small></div></article>`).join('')}</section>`;
     }
 
     function auditTabs(section, tabs) {
@@ -1687,17 +1736,20 @@
       </div>`;
     }
 
+    /*
+     * 卡片内部不再写页面标题与说明，左侧菜单已经指明当前页面（用户第 11 条）。
+     * 保留条数与接口异常提示，后者是真实状态，不能隐藏。
+     */
     function auditTableMarkup(title, subtitle, count, columns, rows, empty, tableClass = '', options = {}) {
       const error = firstText(options.error);
       const loadingText = state.loading || state.audit.loading ? '读取中' : `${formatInteger(count)} 条`;
-      const subtitleText = error ? `${subtitle} · 接口未完全就绪：${error}` : subtitle;
       return `<section class="insights-audit-table-card dwrt-kit-table-wrap dwrt-glass-card insights-stable-glass ${html(tableClass)}">
-        <div class="dwrt-kit-table-toolbar">
-          <div class="dwrt-kit-table-title"><strong>${html(title)}</strong><span class="${error ? 'is-warning' : ''}" title="${html(subtitleText)}">${html(subtitleText)}</span></div>
-          <div class="insights-audit-table-meta">
-            ${auditStatsMarkup(options.stats || [])}
+        <div class="dwrt-kit-table-toolbar insights-audit-table-toolbar" data-dwrt-component="toolbar">
+          <div class="dwrt-kit-table-title">
             <span class="dwrt-kit-table-count">${html(loadingText)}</span>
+            ${error ? `<span class="is-warning" title="${html(error)}">接口未完全就绪：${html(error)}</span>` : ''}
           </div>
+          ${firstText(options.controls)}
         </div>
         <div class="dwrt-kit-table-scroll insights-audit-table-scroll">
           <table class="dwrt-kit-table insights-audit-table">
@@ -1868,8 +1920,8 @@
         { label: '关联流量', value: formatBytes(totalBytes) }
       ];
       return auditWorkbenchMarkup(section, `
-        ${auditSearchToolbar(section, controls)}
-        ${auditTableMarkup(query.view === 'domains' ? 'URL 域名' : 'URL 审计', query.view === 'domains' ? '按域名聚合的访问记录' : '真实 URL / Host 访问明细', auditCount(source, rows), columns, rows, { title: '没有 URL 审计记录', detail: state.audit.errors[section] ? '后端接口未返回可用数据。' : '当前筛选条件下没有记录。' }, 'url-audit-table', { stats, error: state.audit.errors[section] })}`);
+        ${auditOverviewCards(stats)}
+        ${auditTableMarkup('', '', auditCount(source, rows), columns, rows, { title: '没有 URL 审计记录', detail: state.audit.errors[section] ? '后端接口未返回可用数据。' : '当前筛选条件下没有记录。' }, 'url-audit-table', { stats, error: state.audit.errors[section], controls: auditToolbarControls(section, controls) })}`);
     }
 
     function onlineRecordRows() {
@@ -1924,8 +1976,8 @@
         { label: '漫游', value: formatInteger(roam), tone: roam ? 'warn' : '' }
       ];
       return auditWorkbenchMarkup(section, `
-        ${auditSearchToolbar(section, controls)}
-        ${auditTableMarkup('终端在线', '设备上线、离线、租约续期和漫游事件', auditCount(auditPayload('onlineRecords'), rows), columns, rows, { title: '没有终端在线记录', detail: state.audit.errors[section] ? '后端接口未返回可用数据。' : '当前筛选条件下没有记录。' }, 'online-record-table', { stats, error: state.audit.errors[section] })}`);
+        ${auditOverviewCards(stats)}
+        ${auditTableMarkup('', '', auditCount(auditPayload('onlineRecords'), rows), columns, rows, { title: '没有终端在线记录', detail: state.audit.errors[section] ? '后端接口未返回可用数据。' : '当前筛选条件下没有记录。' }, 'online-record-table', { stats, error: state.audit.errors[section], controls: auditToolbarControls(section, controls) })}`);
     }
 
     function imRecordRows() {
@@ -1981,8 +2033,8 @@
         { label: '账号数', value: formatInteger(accounts) }
       ];
       return auditWorkbenchMarkup(section, `
-        ${auditSearchToolbar(section, controls)}
-        ${auditTableMarkup('IM 在线', '即时通讯应用、账号和终端状态', auditCount(auditPayload('imRecords'), rows), columns, rows, { title: '没有 IM 在线记录', detail: state.audit.errors[section] ? '后端接口未返回可用数据。' : '当前筛选条件下没有记录。' }, 'im-record-table', { stats, error: state.audit.errors[section] })}`);
+        ${auditOverviewCards(stats)}
+        ${auditTableMarkup('', '', auditCount(auditPayload('imRecords'), rows), columns, rows, { title: '没有 IM 在线记录', detail: state.audit.errors[section] ? '后端接口未返回可用数据。' : '当前筛选条件下没有记录。' }, 'im-record-table', { stats, error: state.audit.errors[section], controls: auditToolbarControls(section, controls) })}`);
     }
 
     function auditEntityRows(kind) {
@@ -2045,8 +2097,8 @@
         { label: '未知项', value: formatInteger(unknown), tone: unknown ? 'warn' : '' }
       ];
       return auditWorkbenchMarkup(section, `
-        ${auditSearchToolbar(section, controls)}
-        ${auditTableMarkup(title, '协议 / 应用识别结果、速率、证据与终端覆盖', rows.length, columns, rows, { title: `没有${query.view === 'apps' ? '应用' : '协议'}审计记录`, detail: state.audit.errors[section] ? '后端接口未返回可用数据。' : '当前筛选条件下没有记录。' }, 'protocol-app-table', { stats, error: state.audit.errors[section] })}`);
+        ${auditOverviewCards(stats)}
+        ${auditTableMarkup('', '', rows.length, columns, rows, { title: `没有${query.view === 'apps' ? '应用' : '协议'}审计记录`, detail: state.audit.errors[section] ? '后端接口未返回可用数据。' : '当前筛选条件下没有记录。' }, 'protocol-app-table', { stats, error: state.audit.errors[section], controls: auditToolbarControls(section, controls) })}`);
     }
 
     function auditStatusMarkup() {
@@ -2067,8 +2119,8 @@
         { label: '丢弃事件', value: formatInteger(firstNumber(status.dropped_events, status.dropped)), tone: firstNumber(status.dropped_events, status.dropped) ? 'warn' : '' }
       ];
       return auditWorkbenchMarkup(section, `
-        ${auditSearchToolbar(section, '')}
-        ${auditTableMarkup('审计状态', '审计引擎配置、能力与运行状态', rows.length, columns, rows, { title: '没有审计状态数据', detail: state.audit.errors[section] ? '后端接口未返回可用数据。' : '等待 /api/v1/audit/status 返回状态。' }, 'audit-status-table', { stats, error: state.audit.errors[section] })}`);
+        ${auditOverviewCards(stats)}
+        ${auditTableMarkup('', '', rows.length, columns, rows, { title: '没有审计状态数据', detail: state.audit.errors[section] ? '后端接口未返回可用数据。' : '等待 /api/v1/audit/status 返回状态。' }, 'audit-status-table', { stats, error: state.audit.errors[section], controls: auditToolbarControls(section, '') })}`);
     }
 
     function auditStatusHint(key) {
@@ -2299,6 +2351,7 @@
         state.loading = false;
         history.replaceState(null, '', `/app/#/insights/${mode === 'activity' ? 'activity' : 'flows'}`);
         subscribeInsightsRealtime();
+        startAuditPolling();
         refresh();
       });
       const insightsSearch = root.querySelector('[data-insights-search]');
@@ -2309,7 +2362,6 @@
           state.refreshTimer = window.setTimeout(refresh, 320);
         });
       }
-      root.querySelector('[data-insights-refresh]')?.addEventListener('click', () => refresh({ forceFilters: filtersAreFresh() || hasVisibleFilterDictionary() }));
       root.querySelectorAll('[data-risk]').forEach((button) => button.addEventListener('click', () => {
         const value = button.dataset.risk;
         state.risks.has(value) ? state.risks.delete(value) : state.risks.add(value);
@@ -2539,7 +2591,31 @@
         setAuditQuery('protocol-app', { unknownFirst: !query.unknownFirst, page: 0 });
         refresh();
       });
-      root.querySelector('[data-audit-refresh]')?.addEventListener('click', () => refresh());
+      root.querySelector('[data-audit-range]')?.addEventListener('change', async (event) => {
+        const value = event.target.value || 'day';
+        if (value !== 'custom') {
+          state.period = value;
+          refresh();
+          return;
+        }
+        const now = Date.now();
+        const currentRange = state.customRange || { start: now - ACTIVITY_PERIODS.day.ms, end: now };
+        const picker = window.DWRT_UI_KIT && window.DWRT_UI_KIT.openDateRangePicker;
+        if (typeof picker !== 'function') {
+          state.notice = '日期选择器组件尚未加载。';
+          render();
+          return;
+        }
+        const result = await picker({ anchor: event.target, range: currentRange, presets: true });
+        if (!result) {
+          /* 取消时把下拉回弹到当前生效的范围，否则它会停在未生效的 custom 上。 */
+          event.target.value = state.period;
+          return;
+        }
+        state.customRange = { start: result.start, end: result.end };
+        state.period = 'custom';
+        refresh();
+      });
       root.querySelector('[data-audit-export]')?.addEventListener('click', downloadAuditCsv);
     }
 
@@ -3108,12 +3184,14 @@
       render();
       state.mounted = true;
       subscribeInsightsRealtime();
+      startAuditPolling();
       refresh();
       return { unmount };
     }
 
     function unmount() {
       window.clearTimeout(state.refreshTimer);
+      stopAuditPolling();
       window.clearTimeout(state.realtimeFrameTimer);
       state.refreshTimer = 0;
       state.realtimeFrameTimer = 0;

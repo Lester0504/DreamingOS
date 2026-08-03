@@ -3,7 +3,7 @@
 .console-stage.is-system-settings:has(.route-preview.system-users-route-host) {
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
-  height: 100dvh;
+  height: var(--app-stage-height);
   min-height: 0;
   padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
   overflow: hidden;
@@ -30,8 +30,22 @@
 .system-users-route-host,
 .system-users-route-host * { box-sizing: border-box; }
 
-.system-users-shell { grid-template-rows: auto minmax(0, 1fr); }
+.system-users-shell { grid-template-rows: minmax(0, 1fr); }
 .system-users-toolbar-actions { position: relative; }
+
+/* 控件收进表格工具条后，工具条要能换行，避免窄屏把计数挤出卡片。 */
+.system-users-table-toolbar { flex-wrap: wrap; gap: 12px; }
+.system-users-table-meta { min-width: 0; display: grid; gap: 2px; }
+.system-users-toolbar-controls {
+  min-width: 0;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.system-users-search.dwrt-kit-expand-search { flex: 0 1 auto; --dwrt-search-expanded-width: min(300px, 30vw); }
 .system-users-toolbar-actions svg,
 .system-users-table-meta svg,
 .system-user-name svg { width: 17px; height: 17px; display: block; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
@@ -78,7 +92,7 @@
 .system-users-create-menu small { color: var(--app-text-muted); font-size: 11px; }
 
 .system-users-table-card { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0,1fr); overflow: hidden; }
-.system-users-table-card.dwrt-kit-datatable-wrap { border: 0; border-radius: var(--app-radius-card); }
+.system-users-table-card.dwrt-kit-ikuai-table-wrap { border: 0; border-radius: var(--app-radius-card); }
 .system-users-table-scroll { min-width: 0; min-height: 0; overflow: auto; scrollbar-gutter: stable; }
 .system-users-table { min-width: 940px; table-layout: fixed; }
 .system-users-table th:nth-child(1) { width: 20%; }
@@ -101,14 +115,18 @@
 .system-user-name strong,
 .system-user-name small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .system-user-name small { color: var(--app-text-muted); font-size: 11px; }
-.system-user-avatar { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 8px; color: var(--app-text); background: rgba(75,145,255,0.16); box-shadow: inset 0 0 0 1px rgba(113,174,255,0.18); font-size: 13px; font-weight: 780; }
+.system-user-avatar { position: relative; width: 32px; height: 32px; display: grid; place-items: center; flex: 0 0 auto; overflow: hidden; border-radius: var(--app-radius-compact, 8px); color: var(--app-text); background: rgba(75,145,255,0.16); box-shadow: inset 0 0 0 1px rgba(113,174,255,0.18); font-size: 13px; font-weight: 780; }
 .system-user-avatar.is-large { width: 52px; height: 52px; border-radius: 12px; font-size: 20px; }
+.system-user-avatar img { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; display: block; border-radius: inherit; object-fit: cover; object-position: center; }
+.system-user-avatar img[hidden] { display: none; }
+.system-user-avatar-fallback { position: relative; z-index: 0; display: grid; place-items: center; width: 100%; height: 100%; line-height: 1; }
+.system-user-avatar.has-image .system-user-avatar-fallback { visibility: hidden; }
 .system-user-status { display: inline-flex; align-items: center; gap: 7px; color: var(--app-text-muted); }
 .system-user-status i { width: 7px; height: 7px; border-radius: 50%; background: #8994a4; }
 .system-user-status.is-active i { background: #47d486; box-shadow: 0 0 8px rgba(71,212,134,.36); }
 .system-user-permissions { display: block; overflow: hidden; text-overflow: ellipsis; color: var(--app-text-secondary); }
 
-.system-users-drawer { --dwrt-kit-sheet-width: min(92vw, 520px); --dwrt-kit-sheet-z: 70; }
+.system-users-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); --dwrt-kit-sheet-z: 70; }
 .system-users-drawer .dwrt-kit-sheet-header span { display: block; font-size: 10px; font-weight: 760; }
 .system-users-drawer .dwrt-kit-sheet-header strong { display: block; margin-top: 2px; font-size: 17px; }
 .system-users-drawer-body { display: grid; align-content: start; gap: 18px; padding: 18px var(--dwrt-kit-sheet-padding-x); }
@@ -116,6 +134,7 @@
 .system-user-profile > div { display: grid; gap: 4px; }
 .system-user-profile strong { font-size: 17px; }
 .system-user-profile span { color: var(--app-text-muted); font-size: 12px; }
+.system-user-profile .system-user-avatar-fallback { color: inherit; font-size: inherit; }
 .system-user-detail-list { display: grid; }
 .system-user-detail-list > div { min-height: 52px; display: grid; grid-template-columns: 118px minmax(0,1fr); align-items: center; gap: 12px; border-bottom: 1px solid rgba(255,255,255,.07); }
 .system-user-detail-list span { color: var(--app-text-muted); font-size: 12px; }
@@ -146,9 +165,11 @@
 @media (max-width: 900px) {
   .system-users-toolbar-actions { flex-wrap: wrap; }
   .system-users-filter { min-width: min(100%, 210px); }
+  .system-users-toolbar-controls { width: 100%; margin-left: 0; justify-content: flex-start; }
 }
 @media (max-width: 620px) {
   .system-users-filter { width: 100%; }
+  .system-users-search.dwrt-kit-expand-search { --dwrt-search-expanded-width: 100%; width: 100%; }
   .system-users-toolbar-actions > .policy-filter-button,
   .system-users-create-wrap,
   .system-users-create-wrap > .policy-create-button { width: 100%; }

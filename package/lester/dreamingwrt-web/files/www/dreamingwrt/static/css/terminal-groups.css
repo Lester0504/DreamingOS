@@ -144,7 +144,7 @@
 }
 
 .terminal-group-drawer {
-  --dwrt-kit-sheet-width: min(92vw, 920px);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-wide);
   --dwrt-kit-sheet-z: 70;
 }
 

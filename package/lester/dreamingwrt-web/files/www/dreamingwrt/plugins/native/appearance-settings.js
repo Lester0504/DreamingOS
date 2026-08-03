@@ -181,6 +181,14 @@ export function mount(context = {}) {
   const writable = (name) => capabilities.appearance !== false && state.settingsSnapshot?.value?.capabilities?.[name] !== false;
   const dirty = () => state.touched.size > 0;
 
+  /*
+   * 会话闸门适配器：见 dwrt-session-gate.js 的 DWRT_REQUEST。裸 fetch 会绕过 token 刷新，
+   * 过期时并发请求集体拿 401，切走再切回来才恢复；走闸门可自动刷新并单次重试。
+   */
+  function sessionFetch(url, init = {}) {
+    return window.DWRT_REQUEST ? window.DWRT_REQUEST.fetch(url, init) : fetch(url, init);
+  }
+
   function normalizeMedia(payload = {}) {
     const appearance = payload?.appearance && typeof payload.appearance === 'object' ? payload.appearance : payload;
     const source = appearance?.login && typeof appearance.login === 'object' ? appearance.login : appearance;
@@ -576,7 +584,7 @@ export function mount(context = {}) {
       try {
         result = typeof api.request === 'function'
           ? await api.request('appearance-save', url, { method: 'POST', body: savePayload() })
-          : await fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(savePayload()), signal }).then(async (response) => {
+          : await sessionFetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(savePayload()), signal }).then(async (response) => {
             const payload = await response.json().catch(() => ({}));
             if (!response.ok || payload?.ok === false) throw new Error(payload?.error?.message || payload?.message || response.statusText);
             return payload?.data ?? payload;
