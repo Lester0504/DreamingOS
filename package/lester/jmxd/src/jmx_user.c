@@ -15,6 +15,7 @@
 #include <json-c/json.h>
 #include <linux/socket.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -111,6 +112,35 @@ static int copy_visit_filename_date(const char *filename, char *date_str,
 #define JMX_NEIGH_TIMEOUT_MS 5000
 #define JMX_DU_OUTPUT_MAX (64U * 1024U)
 #define JMX_DU_TIMEOUT_MS 5000
+
+/*
+ * iproute2 does not live in the same place on every image: DreamingWrt ships
+ * /sbin/ip (a symlink into /usr/libexec/ip-full) and has no /bin/ip at all, so
+ * the hard-coded "/bin/ip" this collector used made execve fail with ENOENT on
+ * every pass. jmx_exec_capture() reports that as a non-zero exit and the
+ * collector returned early, which is why neighbour-derived fields
+ * (ipv6_link_local, neigh_state_ipv4/ipv6, the second global IPv6 address) were
+ * permanently empty while the neighbour table clearly had the data.
+ * Probe the known locations once and cache the answer.
+ */
+static const char *client_ip_tool_path(void)
+{
+    static const char *const candidates[] = {
+        "/sbin/ip", "/usr/sbin/ip", "/bin/ip", "/usr/bin/ip", NULL
+    };
+    static const char *cached = NULL;
+    int i;
+
+    if (cached)
+        return cached;
+    for (i = 0; candidates[i]; i++) {
+        if (access(candidates[i], X_OK) == 0) {
+            cached = candidates[i];
+            return cached;
+        }
+    }
+    return NULL;
+}
 
 const char *get_client_data_base_dir(void) {
     if (!g_client_data_base_dir_initialized) {
@@ -770,22 +800,87 @@ static void client_append_ipv6_addr(client_node_t *node, const char *addr)
              "%s%s|", used == 0 ? "|" : "", addr);
 }
 
+/*
+ * A neighbour entry is keyed by (address, lladdr), and on a bridged LAN the
+ * same lladdr can carry a link-local address that belongs to another node
+ * (an AP-side proxy/relay entry, for instance). 30.1 shows exactly that:
+ * fe80::803b:49ff:fe42:11ed sits on lladdr ea:6a:9a:62:3d:96, yet its EUI-64
+ * interface identifier decodes to 82:3b:49:42:11:ed. Publishing it as the
+ * client's own link-local address would put a different device's address on
+ * this client's detail page, so accept a link-local address only when its
+ * EUI-64 identifier actually derives from this client's MAC.
+ *
+ * Returns 1 when addr is an EUI-64 link-local address derived from mac,
+ * 0 when it demonstrably is not, and -1 when the form is not EUI-64 at all
+ * (a privacy/stable-private address, which cannot be attributed either way).
+ */
+static int client_ipv6_link_local_matches_mac(const char *addr, const char *mac)
+{
+    struct in6_addr in6;
+    unsigned int m[6];
+    unsigned char derived[8];
+    char addr_plain[128];
+    const char *pct;
+
+    if (!addr || !addr[0] || !mac || !mac[0])
+        return -1;
+    /* Strip any %scope suffix before handing the literal to inet_pton(). */
+    pct = strchr(addr, '%');
+    if (pct) {
+        size_t len = (size_t)(pct - addr);
+
+        if (len >= sizeof(addr_plain))
+            return -1;
+        memcpy(addr_plain, addr, len);
+        addr_plain[len] = '\0';
+    } else {
+        snprintf(addr_plain, sizeof(addr_plain), "%s", addr);
+    }
+    if (inet_pton(AF_INET6, addr_plain, &in6) != 1)
+        return -1;
+    if (sscanf(mac, "%x:%x:%x:%x:%x:%x",
+               &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6)
+        return -1;
+    /* Only a modified-EUI-64 identifier carries "fffe" in the middle; anything
+     * else is a privacy or stable-private address and is not attributable. */
+    if (in6.s6_addr[11] != 0xff || in6.s6_addr[12] != 0xfe)
+        return -1;
+    derived[0] = (unsigned char)((m[0] & 0xff) ^ 0x02);
+    derived[1] = (unsigned char)(m[1] & 0xff);
+    derived[2] = (unsigned char)(m[2] & 0xff);
+    derived[3] = 0xff;
+    derived[4] = 0xfe;
+    derived[5] = (unsigned char)(m[3] & 0xff);
+    derived[6] = (unsigned char)(m[4] & 0xff);
+    derived[7] = (unsigned char)(m[5] & 0xff);
+    return memcmp(&in6.s6_addr[8], derived, sizeof(derived)) == 0 ? 1 : 0;
+}
+
 static void client_set_ipv6_evidence(client_node_t *node, const char *addr,
                                      const char *state)
 {
     if (!node || !client_ipv6_is_usable(addr))
         return;
-    client_append_ipv6_addr(node, addr);
-    if (!node->ipv6[0])
-        snprintf(node->ipv6, sizeof(node->ipv6), "%s", addr);
     if (client_ipv6_is_link_local(addr)) {
+        /* Drop a link-local address that provably belongs to another MAC
+         * instead of attributing it to this client. */
+        if (client_ipv6_link_local_matches_mac(addr, node->mac) == 0)
+            return;
+        client_append_ipv6_addr(node, addr);
+        if (!node->ipv6[0])
+            snprintf(node->ipv6, sizeof(node->ipv6), "%s", addr);
         if (!node->ipv6_link_local[0])
             snprintf(node->ipv6_link_local, sizeof(node->ipv6_link_local), "%s", addr);
-    } else if (client_ipv6_is_ula(addr)) {
-        if (!node->ipv6_lan[0])
-            snprintf(node->ipv6_lan, sizeof(node->ipv6_lan), "%s", addr);
-    } else if (!node->ipv6_global[0]) {
-        snprintf(node->ipv6_global, sizeof(node->ipv6_global), "%s", addr);
+    } else {
+        client_append_ipv6_addr(node, addr);
+        if (!node->ipv6[0])
+            snprintf(node->ipv6, sizeof(node->ipv6), "%s", addr);
+        if (client_ipv6_is_ula(addr)) {
+            if (!node->ipv6_lan[0])
+                snprintf(node->ipv6_lan, sizeof(node->ipv6_lan), "%s", addr);
+        } else if (!node->ipv6_global[0]) {
+            snprintf(node->ipv6_global, sizeof(node->ipv6_global), "%s", addr);
+        }
     }
     if (state && state[0]) {
         snprintf(node->neigh_state_v6, sizeof(node->neigh_state_v6), "%s", state);
@@ -1145,8 +1240,9 @@ void clean_client_online_status(void)
 static void client_collect_ip_neigh(int family)
 {
     struct jmx_exec_result result;
+    const char *ip_tool = client_ip_tool_path();
     char *argv[] = {
-        "/bin/ip", family == AF_INET6 ? "-6" : "-4",
+        NULL, family == AF_INET6 ? "-6" : "-4",
         "neigh", "show", NULL
     };
     char *line;
@@ -1154,6 +1250,12 @@ static void client_collect_ip_neigh(int family)
 
     if (family != AF_INET && family != AF_INET6)
         return;
+    if (!ip_tool) {
+        LOG_ERROR("client neigh collect: no usable ip tool found; "
+                  "neighbour evidence unavailable\n");
+        return;
+    }
+    argv[0] = (char *)ip_tool;
     if (jmx_exec_capture(argv[0], argv, JMX_NEIGH_OUTPUT_MAX,
                          JMX_NEIGH_TIMEOUT_MS, &result) != 0)
         return;

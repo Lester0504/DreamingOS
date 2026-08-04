@@ -445,6 +445,23 @@ int cloud_identity_load(struct cloud_identity *out)
         return -1;
     }
 
+    /*
+     * Always derive the contract-form id, whatever router_id happens to be. A
+     * legacy UUID router cannot prove its stored id to the relay, but it can
+     * prove this one, since it is the fingerprint of the very keys it signs
+     * with. Keeping both lets enrollment proceed without renaming the identity
+     * that paired Apps have pinned.
+     */
+    if (cloud_identity_derive_router_id(identity.public_key,
+                                       identity.signing_public_key,
+                                       identity.relay_router_id,
+                                       sizeof(identity.relay_router_id)) != 0) {
+        OPENSSL_cleanse(identity.private_key, sizeof(identity.private_key));
+        OPENSSL_cleanse(identity.signing_private_key,
+                        sizeof(identity.signing_private_key));
+        return -1;
+    }
+
     g_identity = identity;
     g_identity_loaded = 1;
     OPENSSL_cleanse(identity.private_key, sizeof(identity.private_key));

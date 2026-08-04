@@ -341,8 +341,29 @@ struct json_object *ac_status_json(void)
     json_object_object_add(root, "service", json_object_new_string(AC_SERVICE_NAME));
     json_object_object_add(root, "schema_version", json_object_new_int(AC_SCHEMA_VERSION));
     json_object_object_add(root, "started_at", json_object_new_int64(g_ac_started_at));
-    json_object_object_add(root, "uptime_seconds",
-                           json_object_new_int64(ac_now_s() - g_ac_started_at));
+    {
+        int64_t uptime = ac_now_s() - g_ac_started_at;
+
+        /*
+         * A negative uptime is not nonsense to be hidden, it is evidence: the
+         * clock moved backwards after start, which on this platform means the
+         * service came up before the time was corrected. That is the same
+         * condition that produces a server certificate nobody will accept, so
+         * say it plainly rather than reporting a negative number and leaving the
+         * reader to wonder.
+         */
+        json_object_object_add(root, "uptime_seconds",
+                               json_object_new_int64(uptime < 0 ? 0 : uptime));
+        json_object_object_add(root, "clock_stepped_back_since_start",
+                               json_object_new_boolean(uptime < 0));
+        if (uptime < 0) {
+            json_object_object_add(root, "clock_step_seconds",
+                                   json_object_new_int64(-uptime));
+            json_object_object_add(root, "clock_step_reason",
+                json_object_new_string(
+                    "started_before_time_sync_certificates_signed_then_may_be_invalid"));
+        }
+    }
     json_object_object_add(controller, "available", json_object_new_boolean(1));
     json_object_object_add(controller, "requires_local_phy", json_object_new_boolean(0));
     json_object_object_add(controller, "controller_id",
@@ -373,6 +394,47 @@ struct json_object *ac_status_json(void)
                            json_object_new_int(ac_transport_port()));
     json_object_object_add(transport, "reason",
                            json_object_new_string(ac_transport_reason()));
+    {
+        int64_t not_before = 0;
+        int64_t not_after = 0;
+        int usable_now = 0;
+        int not_yet_valid = 0;
+        struct json_object *pki = json_object_new_object();
+
+        if (ac_transport_server_certificate_window(&not_before, &not_after,
+                                                   &usable_now,
+                                                   &not_yet_valid) == 0) {
+            json_object_object_add(pki, "available", json_object_new_boolean(1));
+            json_object_object_add(pki, "server_cert_not_before",
+                                   json_object_new_int64(not_before));
+            json_object_object_add(pki, "server_cert_not_after",
+                                   json_object_new_int64(not_after));
+            json_object_object_add(pki, "server_cert_usable_now",
+                                   json_object_new_boolean(usable_now));
+            /*
+             * Separated from plain unusability because the remedy differs: a
+             * not-yet-valid certificate was signed against a clock that was
+             * ahead and needs reissuing, while an expired one is ordinary
+             * rotation.
+             */
+            json_object_object_add(pki, "server_cert_not_yet_valid",
+                                   json_object_new_boolean(not_yet_valid));
+            json_object_object_add(pki, "server_cert_reason",
+                json_object_new_string(usable_now ? "" :
+                    (not_yet_valid ?
+                     "not_before_in_future_signed_against_unsynced_clock" :
+                     "outside_validity_window")));
+            /* Clients reject the handshake outright in this state, so the
+             * transport can be listening and still be unreachable. */
+            json_object_object_add(pki, "handshake_will_be_rejected",
+                                   json_object_new_boolean(!usable_now));
+        } else {
+            json_object_object_add(pki, "available", json_object_new_boolean(0));
+            json_object_object_add(pki, "server_cert_reason",
+                json_object_new_string("server_certificate_unreadable"));
+        }
+        json_object_object_add(root, "pki", pki);
+    }
     json_object_object_add(root, "transport", transport);
     json_object_object_add(root, "capabilities", ac_capabilities_json());
     return root;

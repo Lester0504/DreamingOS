@@ -1039,7 +1039,10 @@ html[data-theme-resolved="light"] .log-detail-raw pre {
   .log-center-shell,
   .log-center-shell.is-drawer-open {
     height: auto;
-    min-height: 100dvh;
+    /* Same trap as insights: the stage is already viewport-minus-footer-strip,
+       so a raw 100dvh here overflows it by the strip height. The stage above
+       correctly uses the token; keep the shell consistent with it. */
+    min-height: var(--app-stage-height);
     grid-template-columns: minmax(0, 1fr);
   }
 

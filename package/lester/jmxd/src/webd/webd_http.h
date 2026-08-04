@@ -15,6 +15,12 @@ int http_send_download(int fd, int status, const char *content_type,
 int http_send_file_path(int fd, const char *path, const char *method);
 int http_send_file_path_encoded(int fd, const char *path, const char *method, int accepts_gzip);
 int http_send_json(int fd, int status, struct json_object *resp);
+
+/*
+ * Declare whether the request being served accepts gzip. Call once per request,
+ * before any http_send_json(); it governs Content-Encoding on JSON replies.
+ */
+void webd_http_set_accepts_gzip(int accepts);
 int http_send_json_cookie(int fd, int status, struct json_object *resp,
                           const char *cookie);
 int http_send_sse_header(int fd);

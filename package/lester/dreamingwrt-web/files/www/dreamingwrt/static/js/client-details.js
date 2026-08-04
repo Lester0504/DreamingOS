@@ -239,6 +239,35 @@
       return token ? { ...headers, Authorization: `Bearer ${token}` } : headers;
     }
 
+    /*
+     * 管控规则与能力位的唯一权威来源是 `/api/v1/client_control_rules`。
+     * 原先这一页从 profile 里翻 `control_rules` / `policies` / `qos_rules` 等
+     * 十来个候选键拼列表，既拿不到 `capabilities`，也拿不到 `apply_state` /
+     * `runtime_*` 这些说明规则到底有没有生效的字段。
+     */
+    async function loadControlRules() {
+      try {
+        const response = await fetch('/api/v1/client_control_rules', {
+          credentials: 'same-origin',
+          cache: 'no-store',
+          headers: authHeaders({ Accept: 'application/json' })
+        });
+        if (!response.ok) {
+          page.controlSourceError = response.status === 401 || response.status === 403
+            ? '当前账号无权读取管控规则。'
+            : `读取管控规则失败（HTTP ${response.status}）。`;
+          return;
+        }
+        const json = await response.json();
+        const data = json && json.data && typeof json.data === 'object' ? json.data : json;
+        page.controlCapabilities = data && typeof data.capabilities === 'object' ? data.capabilities : {};
+        page.controlRuleSource = rawList(data && (data.items || data.rules));
+        page.controlSourceError = '';
+      } catch (error) {
+        page.controlSourceError = `读取管控规则失败：${firstText(error && error.message, '未知错误')}`;
+      }
+    }
+
     async function postApiResource(name, url, payload) {
       try {
         const response = await fetch(url, {
@@ -3321,7 +3350,24 @@
       const days = firstText(item.days, item.weekdays, item.week, item.period_days, '一 二 三 四 五 六 日');
       const start = firstText(item.start_time, item.start, item.time_start, item.begin, '00:00');
       const end = firstText(item.end_time, item.end, item.time_end, item.finish, '23:59');
-      const content = firstText(item.content, item.schedule, item.period, item.time_range, `周: ${days}\n${start} ~ ${end}`);
+      /*
+       * 内容列要说清这条规则实际限了什么。原先只拼「周: 一二三…」加时间段，
+       * 看不出上下行限速，也看不出后端到底有没有把它下到数据面。
+       * 后端给了 `up_limit`/`down_limit`（0 表示不限制）以及 `apply_state` /
+       * `apply_reason` / `runtime_applied`，这些才是用户需要的信息。
+       */
+      const rate = (value, unitValue) => {
+        const num = Number(value);
+        if (!Number.isFinite(num) || num <= 0) return '不限';
+        return `${num} ${firstText(unitValue, 'KB/s')}`;
+      };
+      const hasRate = item.up_limit !== undefined || item.down_limit !== undefined;
+      const scheduleText = firstText(item.schedule_mode) === 'always'
+        ? '永久生效'
+        : `周: ${days}  ${start} ~ ${end}`;
+      const content = hasRate
+        ? `${scheduleText}\n上行 ${rate(item.up_limit, item.up_unit)} · 下行 ${rate(item.down_limit, item.down_unit)}`
+        : firstText(item.content, item.schedule, item.period, item.time_range, scheduleText);
       return {
         id: firstText(item.id, item.rule_id, item.uuid, name, index),
         name,
@@ -3329,11 +3375,27 @@
         content,
         note: firstText(item.note, item.remark, item.comment, '--'),
         enabled,
+        applyState: firstText(item.apply_state),
+        applyReason: firstText(item.apply_reason, item.runtime_reason),
+        runtimeApplied: item.runtime_applied === true || item.runtime_apply === true,
         raw: item
       };
     }
 
     function controlRules(profile = {}, client = {}) {
+      /*
+       * 优先用 `/api/v1/client_control_rules` 的真实结果，并按本终端 MAC 过滤：
+       * 那个接口返回全机规则，不过滤会把别的终端的规则显示在这台终端的详情里。
+       * profile 里那堆候选键只在接口尚未返回时兜底，且它们没有运行态字段。
+       */
+      const mac = String(firstText(client.mac, page.detail && page.detail.mac)).toLowerCase();
+      if (Array.isArray(page.controlRuleSource)) {
+        const scoped = page.controlRuleSource.filter((item) => {
+          const target = String(firstText(item && item.mac, item && item.client_mac)).toLowerCase();
+          return !mac || !target || target === mac;
+        });
+        return scoped.map(normalizeControlRule).filter((row) => row.name || row.type);
+      }
       const rows = listFromControlSource(
         profile.control_rules, profile.controls, profile.policies, profile.policy_rules,
         profile.qos_rules, profile.limit_rules, profile.parental_rules,
@@ -3358,6 +3420,64 @@
       </div>`;
     }
 
+    /*
+     * 终端管控的可用范围完全由后端 `webd_client_control_validate_write()` 决定
+     * （`jmxd/src/webd/jmx_app_api.c:13513`）。它对下面每一项都直接返回 409：
+     *
+     *   control_type != 'IP限速'        -> unsupported_control_type
+     *   limit_mode == '共享限速'         -> shared_rate_limit_dataplane_not_implemented
+     *   line 选了任何具体值             -> line_scoped_client_rate_limit_not_implemented
+     *   protocol 不在 TCP/UDP/ICMP/ICMPv6 -> unsupported_l4_protocol
+     *   schedule_mode == 'plan'         -> schedule_plan_reference_not_implemented
+     *
+     * 原来的表单把四种管控类型、共享限速、线路选择、时间计划全都摆出来，
+     * 而且四种类型共用同一套限速字段 —— 选「访问控制」照样让人填上下行限速，
+     * 保存必然 409。用户的说法是准确的：那几个管控「压根都是假的」。
+     *
+     * 现在只呈现真的能生效的东西：能力位由 `/api/v1/client_control_rules` 的
+     * `capabilities` 下发（实测只有 `client_control_rate_limit: true`），
+     * 未开放的类型仍然列出但禁用并写明原因，不再伪装成可配置。
+     */
+    const CONTROL_TYPES = [
+      { value: 'IP限速', label: 'IP限速', capability: 'client_control_rate_limit',
+        detail: '按终端 MAC 在 LAN 桥接口做上下行限速' },
+      { value: '应用管控', label: '应用管控', capability: 'client_control_app_filter',
+        detail: '需要应用识别数据面，后端尚未实现' },
+      { value: '访问控制', label: '访问控制', capability: 'client_control_access_list',
+        detail: '需要按域名或网段的放行/阻断表，后端尚未实现' },
+      { value: '时间管控', label: '时间管控', capability: 'client_control_time_gate',
+        detail: '需要独立的断网调度器，后端尚未实现' }
+    ];
+
+    /* 后端 `webd_control_protocol_runtime_supported()` 只认这四个 L4 协议。 */
+    const CONTROL_PROTOCOLS = ['任意', 'TCP', 'UDP', 'ICMP', 'ICMPv6'];
+
+    /* `webd_control_schedule_mode_supported()` 接受的模式，'plan' 不在其中。 */
+    const CONTROL_SCHEDULE_MODES = [
+      { value: 'always', label: '永久生效' },
+      { value: 'daily', label: '每天' },
+      { value: 'week', label: '按周循环' },
+      { value: 'range', label: '指定时间段' }
+    ];
+
+    function controlCapability(name) {
+      const caps = (page.controlCapabilities && typeof page.controlCapabilities === 'object')
+        ? page.controlCapabilities
+        : {};
+      if (caps[name] === true) return true;
+      if (caps[name] === false) return false;
+      /* 能力位缺失不等于"不支持"，但也不能当成支持。限速是唯一被后端源码确证
+         始终可用的一项，其余在没拿到能力位之前按未开放呈现，避免又出现一个
+         点了必然 409 的控件。 */
+      return name === 'client_control_rate_limit' ? page.controlCapabilities === undefined : false;
+    }
+
+    function controlTypeAvailable(type) {
+      const entry = CONTROL_TYPES.find((item) => item.value === type);
+      if (!entry) return false;
+      return controlCapability(entry.capability);
+    }
+
     function controlDrawer(client, profile) {
       if (!page.controlEditorOpen) return '';
       const draft = page.controlDraft || {};
@@ -3366,6 +3486,13 @@
       const notice = firstText(page.controlNotice);
       const editing = Boolean(firstText(draft.id));
       const editorTitle = editing ? '编辑' : '新增';
+      const activeType = controlTypeAvailable(draft.control_type) ? draft.control_type : 'IP限速';
+      const scheduleMode = CONTROL_SCHEDULE_MODES
+        .some((mode) => mode.value === draft.schedule_mode) ? draft.schedule_mode : 'week';
+      const showDays = scheduleMode === 'week' || scheduleMode === 'range';
+      const showTimes = scheduleMode !== 'always';
+      const unit = (name, value) => ['KB/s', 'MB/s', 'Kbps', 'Mbps']
+        .map((item) => `<option value="${item}" ${firstText(value, 'KB/s') === item ? 'selected' : ''}>${item}</option>`).join('');
       return `<div class="client-control-editor-layer" role="dialog" aria-modal="true" aria-label="${editorTitle}管控规则">
         <button class="client-control-editor-overlay dwrt-kit-sheet-overlay" type="button" data-client-control-close aria-label="关闭${editorTitle}管控"></button>
         <aside class="client-control-editor dwrt-kit-sheet client-stable-glass is-open">
@@ -3374,17 +3501,27 @@
             <input type="hidden" name="mac" value="${escapeHtml(firstText(client.mac, page.detail && page.detail.mac))}">
             ${editing ? `<input type="hidden" name="id" value="${escapeHtml(draft.id)}">` : ''}
             <section class="client-control-form-card">
-              <label class="client-control-field"><span>管控类型 <em>*</em></span><select name="control_type"><option value="IP限速" ${draft.control_type === 'IP限速' ? 'selected' : ''}>IP限速</option><option value="应用管控" ${draft.control_type === '应用管控' ? 'selected' : ''}>应用管控</option><option value="访问控制" ${draft.control_type === '访问控制' ? 'selected' : ''}>访问控制</option><option value="时间管控" ${draft.control_type === '时间管控' ? 'selected' : ''}>时间管控</option></select></label>
-              <label class="client-control-field"><span>名称 <em>*</em></span><input name="name" value="${escapeHtml(firstText(draft.name))}" placeholder="请输入名称"></label>
-              <div class="client-control-field"><span>生效时间 <em>*</em></span><div class="client-control-radio-row"><label><input type="radio" name="schedule_mode" value="plan" ${draft.schedule_mode === 'plan' ? 'checked' : ''}><i></i>时间计划</label><label><input type="radio" name="schedule_mode" value="week" ${draft.schedule_mode !== 'plan' && draft.schedule_mode !== 'range' ? 'checked' : ''}><i></i>按周循环</label><label><input type="radio" name="schedule_mode" value="range" ${draft.schedule_mode === 'range' ? 'checked' : ''}><i></i>时间段</label></div></div>
-              <div class="client-control-field"><span>周期</span><div class="client-control-weekdays">${weekdays.map((day) => `<label class="${selectedDays.has(day) ? 'is-active' : ''}"><input type="checkbox" name="days" value="${day}" ${selectedDays.has(day) ? 'checked' : ''}>${day}</label>`).join('')}</div></div>
-              <div class="client-control-time-range"><input name="start_time" value="${escapeHtml(firstText(draft.start_time, '00:00'))}" placeholder="00:00"><span>→</span><input name="end_time" value="${escapeHtml(firstText(draft.end_time, '23:59'))}" placeholder="23:59"><button type="button" data-client-control-time-clear>×</button></div>
-              <label class="client-control-field"><span>限速模式 <em>*</em></span><select name="limit_mode"><option value="独立限速" ${draft.limit_mode !== '共享限速' ? 'selected' : ''}>独立限速</option><option value="共享限速" ${draft.limit_mode === '共享限速' ? 'selected' : ''}>共享限速</option></select></label>
-              <label class="client-control-field"><span>上行限速 <em>*</em></span><div class="client-control-input-unit"><input name="up_limit" inputmode="decimal" value="${escapeHtml(firstText(draft.up_limit, '0'))}"><select name="up_unit"><option ${firstText(draft.up_unit, 'KB/s') === 'KB/s' ? 'selected' : ''}>KB/s</option><option ${firstText(draft.up_unit) === 'MB/s' ? 'selected' : ''}>MB/s</option><option ${firstText(draft.up_unit) === 'Kbps' ? 'selected' : ''}>Kbps</option><option ${firstText(draft.up_unit) === 'Mbps' ? 'selected' : ''}>Mbps</option></select></div><small>默认0为不限额</small></label>
-              <label class="client-control-field"><span>下行限速 <em>*</em></span><div class="client-control-input-unit"><input name="down_limit" inputmode="decimal" value="${escapeHtml(firstText(draft.down_limit, '0'))}"><select name="down_unit"><option ${firstText(draft.down_unit, 'KB/s') === 'KB/s' ? 'selected' : ''}>KB/s</option><option ${firstText(draft.down_unit) === 'MB/s' ? 'selected' : ''}>MB/s</option><option ${firstText(draft.down_unit) === 'Kbps' ? 'selected' : ''}>Kbps</option><option ${firstText(draft.down_unit) === 'Mbps' ? 'selected' : ''}>Mbps</option></select></div><small>默认0为不限额</small></label>
-              <label class="client-control-field"><span>线路</span><select name="line"><option value="">任意</option>${connectionDefaultLines(profile).map((line) => `<option value="${escapeHtml(line.value)}" ${draft.line === line.value ? 'selected' : ''}>${escapeHtml(line.label)}</option>`).join('')}</select></label>
-              <label class="client-control-field"><span>协议 <em>*</em></span><select name="protocol"><option value="任意">任意</option><option>TCP</option><option>UDP</option><option>ICMP</option></select></label>
-              <label class="client-control-field"><span>备注</span><textarea name="note" rows="4">${escapeHtml(firstText(draft.note))}</textarea></label>
+              <label class="client-control-field"><span>管控类型 <em>*</em></span><select name="control_type" data-client-control-type>${CONTROL_TYPES.map((item) => {
+                const available = controlCapability(item.capability);
+                return `<option value="${escapeHtml(item.value)}" ${activeType === item.value ? 'selected' : ''} ${available ? '' : 'disabled'}>${escapeHtml(item.label)}${available ? '' : '（未开放）'}</option>`;
+              }).join('')}</select></label>
+              <p class="client-control-hint">${escapeHtml(firstText((CONTROL_TYPES.find((item) => item.value === activeType) || {}).detail))}</p>
+              ${CONTROL_TYPES.filter((item) => !controlCapability(item.capability)).length ? `<p class="client-control-hint is-muted">${escapeHtml(CONTROL_TYPES.filter((item) => !controlCapability(item.capability)).map((item) => item.label).join('、'))} 暂无数据面支持，保存会被后端拒绝，因此这里不可选。</p>` : ''}
+              <label class="client-control-field"><span>名称 <em>*</em></span><input name="name" value="${escapeHtml(firstText(draft.name))}" placeholder="请输入名称" maxlength="128" required></label>
+              <label class="client-control-field"><span>生效时间 <em>*</em></span><select name="schedule_mode" data-client-control-schedule>${CONTROL_SCHEDULE_MODES.map((mode) => `<option value="${mode.value}" ${scheduleMode === mode.value ? 'selected' : ''}>${escapeHtml(mode.label)}</option>`).join('')}</select></label>
+              ${showDays ? `<div class="client-control-field"><span>周期</span><div class="client-control-weekdays">${weekdays.map((day) => `<label class="${selectedDays.has(day) ? 'is-active' : ''}"><input type="checkbox" name="days" value="${day}" ${selectedDays.has(day) ? 'checked' : ''}>${day}</label>`).join('')}</div></div>` : ''}
+              ${showTimes ? `<div class="client-control-field"><span>时间范围</span><div class="client-control-time-range"><input name="start_time" value="${escapeHtml(firstText(draft.start_time, '00:00'))}" placeholder="00:00" pattern="[0-9]{1,2}:[0-9]{2}"><span>→</span><input name="end_time" value="${escapeHtml(firstText(draft.end_time, '23:59'))}" placeholder="23:59" pattern="[0-9]{1,2}:[0-9]{2}"></div></div>` : ''}
+              <label class="client-control-field"><span>上行限速 <em>*</em></span><div class="client-control-input-unit"><input name="up_limit" inputmode="decimal" value="${escapeHtml(firstText(draft.up_limit, '0'))}"><select name="up_unit">${unit('up_unit', draft.up_unit)}</select></div></label>
+              <label class="client-control-field"><span>下行限速 <em>*</em></span><div class="client-control-input-unit"><input name="down_limit" inputmode="decimal" value="${escapeHtml(firstText(draft.down_limit, '0'))}"><select name="down_unit">${unit('down_unit', draft.down_unit)}</select></div></label>
+              <p class="client-control-hint">0 表示不限制（后端记为 <code>zero_limit_means_unlimited</code>）。</p>
+              <label class="client-control-field"><span>协议</span><select name="protocol">${CONTROL_PROTOCOLS.map((item) => `<option value="${item}" ${firstText(draft.protocol, '任意') === item ? 'selected' : ''}>${item}</option>`).join('')}</select></label>
+              <label class="client-control-field"><span>备注</span><textarea name="note" rows="4" maxlength="1024">${escapeHtml(firstText(draft.note))}</textarea></label>
+              <input type="hidden" name="limit_mode" value="独立限速">
+              <input type="hidden" name="line" value="">
+              <dl class="client-control-runtime-facts">
+                <div><dt>限速模式</dt><dd>独立限速<small>共享限速没有数据面实现，后端会以 409 拒绝</small></dd></div>
+                <div><dt>作用范围</dt><dd>本终端 MAC · LAN 桥接口<small>线路维度的限速尚未实现，因此不提供线路选择</small></dd></div>
+              </dl>
             </section>
           </form>
           <footer class="client-control-editor-actions dwrt-kit-sheet-footer"><button class="is-primary" type="submit" form="client-control-form">保存</button><button type="button" data-client-control-close>取消</button>${notice ? `<span>${escapeHtml(notice)}</span>` : ''}</footer>

@@ -28,6 +28,9 @@ def test_unsupported_mutations_fail_before_storage_transaction() -> None:
                    "static int nc_dns_service_set_internal(")
     assert 'strcmp(requested_mode, "proxy")' in gate
     assert 'json_object_get_boolean(value)' in gate
+    assert "!= hijack" not in gate
+    assert "!= ecs" not in gate
+    assert "!= ipv6_dns" not in gate
     assert '"dot"' in gate and '"doh"' in gate
     assert "transition_allowed" in gate
     assert "AND protocol=?5 AND group_name=?6 LIMIT 1" in gate
@@ -183,6 +186,33 @@ def test_ai_and_web_use_only_the_canonical_transaction() -> None:
     assert "return 422" in WEBD
 
 
+def test_dns_compat_migration_repairs_legacy_defaults_once() -> None:
+    migration = section(DB, "static int nc_dns_config_compat_migrate_once(",
+                        "/* ══════════════════════════════════════════════════════════════════════\n * Init / Close")
+    assert "NC_DNS_CONFIG_COMPAT_MIGRATION" in migration
+    assert "mode='proxy',hijack_protection=0" in migration
+    assert "edns_client_subnet=0,ipv6_dns=0" in migration
+    assert "INSERT OR IGNORE INTO dns_listen_interface" in migration
+    assert "CASE WHEN id='lan' THEN 0 ELSE 1 END" in migration
+    assert "if (!listener_seeded)" in migration
+    assert "INSERT INTO config_migration" in migration
+
+    init = section(DB, "int jmx_netconfig_db_init(void)",
+                   "static int nc_work_mode_import_uci_once(")
+    assert init.index("jmx_netconfig_migrate_from_uci()") < init.index(
+        "nc_dns_config_compat_migrate_once()")
+
+
+def test_dns_listener_runtime_reasons_distinguish_missing_and_invalid() -> None:
+    listeners = section(DB, "enum nc_dns_listener_state {",
+                        "static int nc_dns_complete_snapshot(")
+    assert "NC_DNS_LISTENER_NOT_CONFIGURED" in listeners
+    assert "NC_DNS_LISTENER_INVALID" in listeners
+    assert '"dns_listen_interface_not_configured"' in listeners
+    assert '"dns_listen_interface_invalid"' in listeners
+    assert "if (total == 0)" in listeners
+
+
 if __name__ == "__main__":
     test_unsupported_mutations_fail_before_storage_transaction()
     test_complete_snapshot_and_resource_validation_are_strict()
@@ -191,4 +221,6 @@ if __name__ == "__main__":
     test_get_and_write_response_do_not_claim_fake_applied_state()
     test_legacy_direct_writes_are_disabled_at_every_formal_entry()
     test_ai_and_web_use_only_the_canonical_transaction()
+    test_dns_compat_migration_repairs_legacy_defaults_once()
+    test_dns_listener_runtime_reasons_distinguish_missing_and_invalid()
     print("ok: DNS service save/apply/readback/rollback and capability contracts")

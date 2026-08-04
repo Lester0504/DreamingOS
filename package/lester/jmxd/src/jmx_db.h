@@ -72,6 +72,13 @@ void jmx_db_add_wan_cumulative_bytes(struct json_object *out, const char *wan_id
                                      int64_t device_tx_bytes);
 
 int jmx_db_write_wan_health(const char *name, int latency_ms, int loss_pct);
+/*
+ * Group many small related writes into one transaction. Nesting-safe: only the
+ * outermost begin/end pair issues BEGIN/COMMIT. Pass commit=0 to roll back.
+ * Callers must pair these on every exit path.
+ */
+int jmx_db_write_batch_begin(void);
+int jmx_db_write_batch_end(int commit);
 
 /* Client liveness evidence, gathered by the caller from the DB row and the
  * runtime client node. Kept separate from the decision so the ghost-client

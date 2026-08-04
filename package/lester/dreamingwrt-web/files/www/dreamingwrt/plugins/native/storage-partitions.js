@@ -1,4 +1,4 @@
-const VERSION = '20260802-sheet-portal-scope-01';
+const VERSION = '20260803-unallocated-alignment-fragment-01';
 const PARTITION_ENDPOINT = '/api/v1/storage/partitions';
 const OVERVIEW_ENDPOINT = '/api/v1/storage/overview?range=1h';
 const MOUNTS_ENDPOINT = '/api/v1/system/mounts';
@@ -51,6 +51,29 @@ export function mount(context = {}) {
 
   function emptyEditor() {
     return { size: '', unit: 'GiB', filesystem: 'ext4', label: '', mountPoint: '', mountOptions: 'defaults' };
+  }
+
+  /* 分区表对齐会在盘尾留下几百 KiB 到 1 MiB 的碎片。后端如实上报为
+   * `unallocated_bytes`，但它建不出分区，所以字节数不等于「可用空间」。
+   * 低于 1 MiB 的区段一律视为碎片：既不画色块，也不作为新建分区的默认容量。 */
+  const MIN_USABLE_EXTENT_BYTES = 1024 ** 2;
+
+  function normalizeExtents(item = {}) {
+    return asArray(item.unallocated_extents, ['free_regions', 'unallocated_regions'])
+      .map((extent) => finite(extent.capacity_bytes, extent.size_bytes, extent.bytes))
+      .filter((bytes) => bytes !== null && bytes > 0);
+  }
+
+  /* 可用容量只认「单个满足最小对齐的区段」的最大值——碎片再多也不能相加，
+   * 它们在盘上并不连续，加起来的数字建不出任何一个分区。
+   * 后端没给 extents 时退回按总字节判断，避免旧固件上功能直接消失。 */
+  function usableUnallocatedBytes(totalBytes, extents) {
+    if (extents.length) {
+      const largest = Math.max(...extents);
+      return largest >= MIN_USABLE_EXTENT_BYTES ? largest : 0;
+    }
+    if (totalBytes === null || totalBytes <= 0) return 0;
+    return totalBytes >= MIN_USABLE_EXTENT_BYTES ? totalBytes : 0;
   }
 
   function firstText(...values) {
@@ -237,6 +260,8 @@ export function mount(context = {}) {
     };
     disk.partitions = asArray(item.partitions, ['volumes']).map((partition, partitionIndex) => normalizePartition(partition, partitionIndex, disk, mounts, discovery));
     disk.unallocatedBytes = finite(item.unallocated_bytes, item.free_unallocated_bytes, item.unallocated);
+    disk.unallocatedExtents = normalizeExtents(item);
+    disk.usableUnallocatedBytes = usableUnallocatedBytes(disk.unallocatedBytes, disk.unallocatedExtents);
     disk.maxPartitions = finite(item.max_partitions, item.partition_limit);
     return disk;
   }
@@ -389,11 +414,22 @@ export function mount(context = {}) {
       const ratio = total && partition.capacityBytes !== null ? Math.max(2, partition.capacityBytes / total * 100) : 8;
       return `<button type="button" style="--partition-ratio:${ratio}" data-partition-detail="${escapeHtml(partition.id)}" aria-label="${escapeHtml(`${partition.name}，${formatBytes(partition.capacityBytes)}`)}" data-dwrt-tooltip="${escapeHtml(`${partition.name}\n${formatBytes(partition.capacityBytes)}\n${partition.filesystem || '文件系统未知'}${partition.mountPoints.length ? `\n${partition.mountPoints.join('、')}` : ''}`)}"><span>${escapeHtml(partition.name)}</span></button>`;
     });
-    if (disk.unallocatedBytes !== null && disk.unallocatedBytes > 0) {
-      const ratio = total ? Math.max(2, disk.unallocatedBytes / total * 100) : 8;
+    /* 只有真正能建分区的区段才画色块。碎片走 `Math.max(2, ...)` 会被抬到 2% 宽度,
+     * 在 32 GiB 盘上把 1007 KiB 画成一块看起来可用的区域。 */
+    if (disk.usableUnallocatedBytes > 0) {
+      const ratio = total ? Math.max(2, disk.usableUnallocatedBytes / total * 100) : 8;
       segments.push(`<span class="is-unallocated" style="--partition-ratio:${ratio}"><span>未分配</span></span>`);
     }
-    return `<section class="storage-partitions-layout" aria-label="分区布局"><header><div><strong>分区布局</strong><span>${disk.partitions.length} 个分区${disk.maxPartitions ? ` / 上限 ${disk.maxPartitions}` : ''}</span></div><span>${disk.unallocatedBytes === null ? '未分配空间待后端提供' : `未分配 ${formatBytes(disk.unallocatedBytes)}`}</span></header><div class="storage-partitions-layout-track">${segments.join('') || '<span class="is-unallocated" style="--partition-ratio:100"><span>未返回分区</span></span>'}</div></section>`;
+    return `<section class="storage-partitions-layout" aria-label="分区布局"><header><div><strong>分区布局</strong><span>${disk.partitions.length} 个分区${disk.maxPartitions ? ` / 上限 ${disk.maxPartitions}` : ''}</span></div><span>${unallocatedSummaryText(disk)}</span></header><div class="storage-partitions-layout-track">${segments.join('') || '<span class="is-unallocated" style="--partition-ratio:100"><span>未返回分区</span></span>'}</div></section>`;
+  }
+
+  /* 三种状态必须分开说：后端没给（未知）、给了但只有对齐碎片（无可用）、有可用容量。
+   * 把后两者都说成「未分配 N」会让用户以为碎片是可以拿来建分区的。 */
+  function unallocatedSummaryText(disk) {
+    if (disk.unallocatedBytes === null) return '未分配空间待后端提供';
+    if (disk.usableUnallocatedBytes > 0) return `未分配 ${formatBytes(disk.usableUnallocatedBytes)}`;
+    if (disk.unallocatedBytes > 0) return `无可用未分配空间（对齐碎片 ${formatBytes(disk.unallocatedBytes)}）`;
+    return '无未分配空间';
   }
 
   function partitionStatus(partition) {
@@ -482,7 +518,7 @@ export function mount(context = {}) {
     const partition = selectedPartition();
     const action = mode === 'create' ? 'create' : 'format';
     const reason = capabilityReason(action, partition);
-    return `<div class="storage-partitions-form"><div class="storage-partitions-form-context"><span class="storage-partitions-disk-icon">${icon('HardDrive', 22)}</span><div><strong>${escapeHtml(mode === 'create' ? disk?.name || '--' : partition?.name || '--')}</strong><span>${escapeHtml(mode === 'create' ? `${disk?.device || '--'} · 未分配 ${formatBytes(disk?.unallocatedBytes)}` : `${partition?.device || '--'} · ${formatBytes(partition?.capacityBytes)}`)}</span></div></div><div class="storage-partitions-field-grid">${mode === 'create' ? field('容量', 'size', state.editor.size, { type: 'number', min: 1, step: 1, description: '不得超过后端预览返回的可分配范围。' }) + field('单位', 'unit', state.editor.unit, { options: [['MiB', 'MiB'], ['GiB', 'GiB'], ['TiB', 'TiB']] }) : ''}${field('文件系统', 'filesystem', state.editor.filesystem, { options: [['ext4', 'EXT4'], ['btrfs', 'Btrfs'], ['xfs', 'XFS'], ['f2fs', 'F2FS'], ['vfat', 'FAT32'], ['exfat', 'exFAT'], ['ntfs', 'NTFS']], description: '可用类型最终由后端按已安装工具返回。' })}${field('卷标', 'label', state.editor.label, { placeholder: '可选', description: '用于在挂载点和文件管理中识别卷。' })}${field('挂载点', 'mountPoint', state.editor.mountPoint, { wide: true, placeholder: '/mnt/data', description: '留空表示只创建或格式化，不自动挂载。' })}</div>${reason ? `<div class="storage-partitions-inline-warning">${escapeHtml(reason)}。当前表单不会写入本地存储，也不会绕过产品 API 调用系统命令。</div>` : ''}</div>`;
+    return `<div class="storage-partitions-form"><div class="storage-partitions-form-context"><span class="storage-partitions-disk-icon">${icon('HardDrive', 22)}</span><div><strong>${escapeHtml(mode === 'create' ? disk?.name || '--' : partition?.name || '--')}</strong><span>${escapeHtml(mode === 'create' ? `${disk?.device || '--'} · ${unallocatedSummaryText(disk || {})}` : `${partition?.device || '--'} · ${formatBytes(partition?.capacityBytes)}`)}</span></div></div><div class="storage-partitions-field-grid">${mode === 'create' ? field('容量', 'size', state.editor.size, { type: 'number', min: 1, step: 1, description: '不得超过后端预览返回的可分配范围。' }) + field('单位', 'unit', state.editor.unit, { options: [['MiB', 'MiB'], ['GiB', 'GiB'], ['TiB', 'TiB']] }) : ''}${field('文件系统', 'filesystem', state.editor.filesystem, { options: [['ext4', 'EXT4'], ['btrfs', 'Btrfs'], ['xfs', 'XFS'], ['f2fs', 'F2FS'], ['vfat', 'FAT32'], ['exfat', 'exFAT'], ['ntfs', 'NTFS']], description: '可用类型最终由后端按已安装工具返回。' })}${field('卷标', 'label', state.editor.label, { placeholder: '可选', description: '用于在挂载点和文件管理中识别卷。' })}${field('挂载点', 'mountPoint', state.editor.mountPoint, { wide: true, placeholder: '/mnt/data', description: '留空表示只创建或格式化，不自动挂载。' })}</div>${reason ? `<div class="storage-partitions-inline-warning">${escapeHtml(reason)}。当前表单不会写入本地存储，也不会绕过产品 API 调用系统命令。</div>` : ''}</div>`;
   }
 
   function sheetTitle() {
@@ -548,7 +584,17 @@ export function mount(context = {}) {
     if (!canTransact('create')) return;
     const disk = selectedDisk();
     state.editor = emptyEditor();
-    if (disk?.unallocatedBytes) state.editor.size = String(Math.max(1, Math.floor(disk.unallocatedBytes / (1024 ** 3))));
+    /* 只在确有可用容量时预填，且按容量量级选单位。原写法 `Math.floor(bytes / 1024**3)`
+     * 对 1007 KiB 算出 0，再被 `Math.max(1, ...)` 抬成 1 GiB —— 预填一个盘上根本
+     * 不存在的容量，提交必然失败。 */
+    const usable = disk?.usableUnallocatedBytes || 0;
+    if (usable >= 1024 ** 3) {
+      state.editor.unit = 'GiB';
+      state.editor.size = String(Math.floor(usable / (1024 ** 3)));
+    } else if (usable > 0) {
+      state.editor.unit = 'MiB';
+      state.editor.size = String(Math.floor(usable / (1024 ** 2)));
+    }
     state.sheet = 'create';
     state.selectedPartitionId = '';
     render();

@@ -229,11 +229,17 @@ static struct component g_components[] = {
     { .name = "dreamingwrt-aegisxd", .path = "/usr/bin/dreamingwrt-aegisxd", .enabled = 1, .stop_timeout_sec = 4 },
     { .name = "dreamingwrt-honeypotd", .path = "/usr/bin/dreamingwrt-honeypotd", .enabled = 0, .stop_timeout_sec = 4 },
     /*
-     * Remote access is opt-in: the component ships disabled and its UCI config
-     * is closed by default, so enabling the service alone does not expose the
-     * router until a relay host and tunnel token are set.
+     * Remote access stays opt-in, but the gate is the UCI config, not whether
+     * the process runs. cloud_tunnel_start() returns immediately in the
+     * disabled/relay_host_missing states without opening a socket, so on a
+     * router that never configured a relay this is an idle ubus service.
+     *
+     * It has to start with the system: with .enabled = 0 an enrolled router
+     * came back from a reboot with the tunnel down and no way to notice, since
+     * the status surface it reports through was gone along with the process.
+     * Remote access that does not survive a reboot is not remote access.
      */
-    { .name = "dreamingos-cloud", .path = "/usr/bin/dreamingos-cloud", .enabled = 0, .critical = 0, .stop_timeout_sec = 6 },
+    { .name = "dreamingos-cloud", .path = "/usr/bin/dreamingos-cloud", .enabled = 1, .critical = 0, .stop_timeout_sec = 6 },
     { .name = "dreamingproxy", .path = "/usr/bin/dreamingproxyd", .alias_name = "dreamingproxyd", .enabled = 0, .stop_timeout_sec = 6 },
 };
 

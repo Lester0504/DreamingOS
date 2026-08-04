@@ -80,15 +80,32 @@ struct json_object *cloud_identity_json(void)
     json_object_object_add(data, "signing_algorithm",
                            json_object_new_string("ed25519"));
     /*
-     * Whether router_id is the contract fingerprint of both keys. A legacy UUID
-     * still routes, but cannot self enroll, and the UI needs to be able to say
-     * so instead of offering a button that can only fail.
+     * The id used on the wire when enrolling. It is always the key fingerprint,
+     * so a legacy UUID router can still enroll without renaming the identity its
+     * paired Apps have pinned. Equal to router_id once that is already derived.
+     */
+    json_object_object_add(data, "relay_router_id",
+                           json_object_new_string(identity->relay_router_id));
+    json_object_object_add(data, "relay_router_id_key_derived",
+                           json_object_new_boolean(identity->relay_router_id[0] != '\0'));
+    /*
+     * router_id_key_derived answers one question for every consumer that reads
+     * it: may this router self enroll. That is now a property of
+     * relay_router_id, which is always the key fingerprint, so reporting false
+     * here on a legacy router would deny a capability the router actually has.
+     *
+     * The literal shape of the local router_id is still reported, under a name
+     * that cannot be mistaken for a capability flag.
      */
     json_object_object_add(data, "router_id_key_derived",
+                           json_object_new_boolean(identity->relay_router_id[0] != '\0'));
+    json_object_object_add(data, "self_enroll_supported",
+                           json_object_new_boolean(identity->relay_router_id[0] != '\0'));
+    json_object_object_add(data, "local_router_id_key_derived",
                            json_object_new_boolean(identity->router_id_is_key_derived));
     if (!identity->router_id_is_key_derived)
         json_object_object_add(data, "router_id_reason",
-                               json_object_new_string("legacy_router_id"));
+                               json_object_new_string("legacy_local_router_id_relay_uses_derived_id"));
     json_object_object_add(data, "fingerprint",
                            json_object_new_string(identity->fingerprint));
     json_object_object_add(root, "data", data);
@@ -129,8 +146,19 @@ struct json_object *cloud_status_json(void)
         json_object_object_add(data, "identity_reason",
                                json_object_new_string("identity_unavailable"));
     if (identity) {
+        /* Same reading as in cloud_identity_json: this flag gates self
+         * enrollment for its consumers, and enrollment now uses the derived id.
+         * local_router_id_key_derived carries the literal shape. */
         json_object_object_add(data, "router_id_key_derived",
+                               json_object_new_boolean(identity->relay_router_id[0] != '\0'));
+        json_object_object_add(data, "local_router_id_key_derived",
                                json_object_new_boolean(identity->router_id_is_key_derived));
+        /* The id the relay knows this router by; differs from router_id only on
+         * routers whose local identity predates key derivation. */
+        json_object_object_add(data, "relay_router_id",
+                               json_object_new_string(identity->relay_router_id));
+        json_object_object_add(data, "self_enroll_supported",
+                               json_object_new_boolean(identity->relay_router_id[0] != '\0'));
         /* Distinguishes "not enrolled yet" from "enrolled but cannot connect",
          * which otherwise look identical from the outside. */
         json_object_object_add(data, "enrolled",
@@ -163,6 +191,29 @@ struct json_object *cloud_status_json(void)
                            json_object_new_int64((int64_t)forwarded));
     json_object_object_add(tunnel, "requests_rejected",
                            json_object_new_int64((int64_t)rejected));
+    /*
+     * Last teardown reason. A periodic reconnect cannot be diagnosed from the
+     * live fields alone: by the time anyone looks, state is "online" again and
+     * connected_since has been reset, so the cause is only visible here.
+     */
+    {
+        char detail[160];
+        int64_t at = 0;
+        int64_t session_ms = 0;
+        uint32_t disconnects = 0;
+
+        cloud_tunnel_last_disconnect(detail, sizeof(detail), &at, &session_ms,
+                                     &disconnects);
+        json_object_object_add(tunnel, "disconnects",
+                               json_object_new_int64((int64_t)disconnects));
+        json_object_object_add(tunnel, "last_disconnect",
+                               detail[0] ? json_object_new_string(detail) : NULL);
+        json_object_object_add(tunnel, "last_disconnect_at",
+                               at > 0 ? json_object_new_int64(at) : NULL);
+        json_object_object_add(tunnel, "last_session_seconds",
+                               session_ms > 0 ?
+                                   json_object_new_int64(session_ms / 1000) : NULL);
+    }
     json_object_object_add(data, "tunnel", tunnel);
 
     /* Report the effective configuration, minus the shared secret. Whether a

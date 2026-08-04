@@ -10,6 +10,8 @@ static void ac_handle_signal(int signo)
 
 int main(int argc, char **argv)
 {
+    struct ac_secrets *secrets = NULL;
+    const char *secrets_key_path;
     (void)argc;
     (void)argv;
 
@@ -21,6 +23,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "[%s] startup failed stage=db_init\n",
                 AC_SERVICE_NAME);
         return 1;
+    }
+    secrets_key_path = getenv("DREAMINGWRT_AC_SECRETS_KEY_PATH");
+    if (!secrets_key_path || !secrets_key_path[0])
+        secrets_key_path = AC_SECRETS_KEY_PATH;
+    if (ac_secrets_open_or_create(g_ac_db, secrets_key_path, &secrets) !=
+            AC_SECRETS_OK) {
+        fprintf(stderr, "[%s] startup failed stage=secrets_init\n",
+                AC_SERVICE_NAME);
+        goto fail_db;
     }
     if (ac_protocol_init() != 0) {
         fprintf(stderr, "[%s] startup failed stage=protocol_init\n",
@@ -54,6 +65,7 @@ int main(int argc, char **argv)
     ac_ubus_stop();
     uloop_done();
     ac_protocol_close();
+    ac_secrets_close(secrets);
     ac_db_close();
     return 0;
 
@@ -64,6 +76,7 @@ fail_uloop:
 fail_protocol:
     ac_protocol_close();
 fail_db:
+    ac_secrets_close(secrets);
     ac_db_close();
     return 1;
 }

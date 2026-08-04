@@ -1083,3 +1083,36 @@ int otad_inventory_add_unknown(const char *path, const char *reason,
     sqlite3_finalize(q);
     return rc == SQLITE_DONE ? 0 : -1;
 }
+
+/*
+ * Force everything written so far all the way onto the disk.
+ *
+ * The operation trail is the only record of who asked for a firmware write and
+ * what was decided, and the write path ends in a reboot. In WAL mode with the
+ * default synchronous setting, a row that was committed a moment earlier can
+ * still be sitting in the write-ahead log when the machine goes down, which is
+ * exactly the case where the record matters most. Truncating the WAL and
+ * fsyncing the database file leaves nothing pending.
+ *
+ * Best effort by design: failing to flush must not abort an upgrade that is
+ * otherwise fine, so the result is reported and the caller decides.
+ */
+int otad_db_persist_now(void)
+{
+    int rc = 0;
+    int fd;
+
+    if (!g_otad_config_db)
+        return -1;
+    if (otad_exec(g_otad_config_db, "PRAGMA wal_checkpoint(TRUNCATE)") != 0)
+        rc = -1;
+    fd = open(OTAD_CONFIG_DB_PATH, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        if (fsync(fd) != 0)
+            rc = -1;
+        close(fd);
+    } else {
+        rc = -1;
+    }
+    return rc;
+}

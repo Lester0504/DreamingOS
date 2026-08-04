@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260804-native-plugin-menu-merge-01';
   const REFRESH_MS = 30000;
   const SEARCH_DEBOUNCE_MS = 650;
   const DEFAULT_PAGE_SIZE = 25;

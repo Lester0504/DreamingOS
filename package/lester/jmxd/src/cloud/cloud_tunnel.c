@@ -19,12 +19,27 @@
 #include "cloud_internal.h"
 
 #include <pthread.h>
+#include <errno.h>
+#include <openssl/err.h>
 
 #define CLOUD_TUNNEL_UPGRADE "dreamingos-relay"
 #define CLOUD_TUNNEL_BACKOFF_MIN_MS 2000
 #define CLOUD_TUNNEL_BACKOFF_MAX_MS 120000
 #define CLOUD_TUNNEL_PING_INTERVAL_MS 45000
-#define CLOUD_TUNNEL_READ_TIMEOUT_MS 60000
+/*
+ * How long a tunnel may go without a readable frame before it is considered
+ * dead. Must stay comfortably above the ping interval: the relay answers each
+ * ping with a pong, so a live connection produces traffic well inside this.
+ *
+ * Deliberately below the relay's own 150s read deadline
+ * (dreamingrelay internal/server/tunnel.go: tunnelIdleTimeout). When both ends
+ * used 150s, whichever noticed first was decided by timing jitter, so a
+ * genuinely idle tunnel produced a race instead of one side cleanly reopening
+ * it. The router is the side that can reconnect, so it should be the side that
+ * gives up first. Two ping intervals still fit inside this with room to spare:
+ * a live connection sees a pong at 45s and 90s.
+ */
+#define CLOUD_TUNNEL_IDLE_LIMIT_MS 105000
 /*
  * How often the authorized-App set is re-read and pushed.
  *
@@ -47,17 +62,76 @@ static struct {
     uint64_t rejected;
     char state[32];
     char reason[64];
+    /*
+     * Why the previous session ended, kept across the reconnect so the cause is
+     * still readable after the fact. A tunnel that drops every couple of minutes
+     * cannot be diagnosed by catching the log in the act, and the live state is
+     * back to "online" seconds later.
+     */
+    char last_disconnect[160];
+    int64_t last_disconnect_at;
+    int64_t last_session_ms;
+    uint32_t disconnects;
     struct cloud_config config;
 } g_tunnel = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .state = "stopped",
 };
 
+/*
+ * Records how a session ended.
+ *
+ * `detail` is expected to already name the loop stage and, where the failure
+ * came from OpenSSL, the ssl_error/errno pair. Both the log line and the status
+ * field get the same text so a report from the UI and a report from syslog
+ * describe the same event.
+ */
+static void cloud_tunnel_note_disconnect(const char *detail, int64_t session_ms)
+{
+    pthread_mutex_lock(&g_tunnel.lock);
+    snprintf(g_tunnel.last_disconnect, sizeof(g_tunnel.last_disconnect), "%s",
+             detail ? detail : "unknown");
+    g_tunnel.last_disconnect_at = cloud_now_s();
+    g_tunnel.last_session_ms = session_ms;
+    g_tunnel.disconnects++;
+    pthread_mutex_unlock(&g_tunnel.lock);
+    fprintf(stderr, "[%s] tunnel closed after %lldms: %s\n", CLOUD_SERVICE_NAME,
+            (long long)session_ms, detail ? detail : "unknown");
+}
+
+void cloud_tunnel_last_disconnect(char *out, size_t size, int64_t *at,
+                                  int64_t *session_ms, uint32_t *count)
+{
+    pthread_mutex_lock(&g_tunnel.lock);
+    if (out && size)
+        snprintf(out, size, "%s", g_tunnel.last_disconnect);
+    if (at)
+        *at = g_tunnel.last_disconnect_at;
+    if (session_ms)
+        *session_ms = g_tunnel.last_session_ms;
+    if (count)
+        *count = g_tunnel.disconnects;
+    pthread_mutex_unlock(&g_tunnel.lock);
+}
+
 static void cloud_tunnel_set_state(const char *state, const char *reason)
 {
     pthread_mutex_lock(&g_tunnel.lock);
     snprintf(g_tunnel.state, sizeof(g_tunnel.state), "%s", state);
     snprintf(g_tunnel.reason, sizeof(g_tunnel.reason), "%s", reason ? reason : "");
+    /*
+     * "online" is the only state in which the tunnel carries traffic, so any
+     * other state must not keep reporting connected. Leaving the flag to the
+     * individual teardown paths was wrong: a connect-phase failure such as
+     * relay_unreachable returns before the session loop's clear, so a tunnel
+     * that had been up once kept reporting connected:true while state said
+     * connecting. Callers read that flag to decide whether remote access works,
+     * so the two must not be able to disagree.
+     */
+    if (strcmp(state, "online")) {
+        g_tunnel.connected = 0;
+        g_tunnel.connected_since = 0;
+    }
     pthread_mutex_unlock(&g_tunnel.lock);
 }
 
@@ -304,6 +378,109 @@ static int cloud_tls_read_exact(SSL *ssl, unsigned char *out, size_t length)
     return 0;
 }
 
+/*
+ * Like cloud_tls_read_exact, but tells an idle timeout apart from a real drop.
+ *
+ * Returns 0 on success, 1 when nothing arrived before SO_RCVTIMEO expired and
+ * no bytes of a frame had been consumed, and -1 on a genuine failure.
+ *
+ * The distinction has to be made here, at the point where SSL_get_error still
+ * describes the operation that just failed. The caller used to re-derive it with
+ * SSL_get_error(ssl, -1) after this function had already consumed the error
+ * state, passing a return value that was never the real one, and then decide
+ * whether to drop the tunnel on the strength of that. That is how a healthy idle
+ * connection ended up being torn down on a timer.
+ *
+ * A timeout partway through a frame is not recoverable: the stream is left
+ * mid-message with no way to resynchronise, so it is reported as a failure.
+ */
+/*
+ * Carries the reason a read failed back to the session loop.
+ *
+ * Without this the loop could only report "the read failed", which is not enough
+ * to tell a peer FIN from an RST from a TLS record error, and those have
+ * different causes and different fixes.
+ */
+struct cloud_read_error {
+    int ssl_error;
+    int sys_errno;
+    unsigned long queued;
+    size_t partial;
+};
+
+static const char *cloud_ssl_error_name(int error)
+{
+    switch (error) {
+    case SSL_ERROR_NONE:
+        return "none";
+    case SSL_ERROR_ZERO_RETURN:
+        return "zero_return";
+    case SSL_ERROR_WANT_READ:
+        return "want_read";
+    case SSL_ERROR_WANT_WRITE:
+        return "want_write";
+    case SSL_ERROR_SYSCALL:
+        return "syscall";
+    case SSL_ERROR_SSL:
+        return "ssl";
+    default:
+        return "other";
+    }
+}
+
+static int cloud_tls_read_exact_idle(SSL *ssl, unsigned char *out, size_t length,
+                                    struct cloud_read_error *failure)
+{
+    size_t received = 0;
+    int64_t started = cloud_monotonic_ms();
+
+    while (received < length) {
+        int got;
+
+        ERR_clear_error();
+        errno = 0;
+        got = SSL_read(ssl, out + received, (int)(length - received));
+        if (got <= 0) {
+            int error = SSL_get_error(ssl, got);
+
+            /*
+             * SO_RCVTIMEO expiry does not have one portable spelling. Depending
+             * on the OpenSSL build a timed-out read inside SSL_read surfaces as
+             * SSL_ERROR_SYSCALL with EAGAIN, or as SSL_ERROR_WANT_READ because
+             * the BIO reports "retry" for a socket that is merely not ready.
+             *
+             * Treating WANT_READ as a bare retry made this loop spin inside
+             * SSL_read for the whole session: the idle branch was never reached,
+             * so no ping was ever sent and no liveness check ever ran. The
+             * observed symptom was a tunnel that died on a fixed timer having
+             * carried zero frames. So the elapsed time decides, not the code:
+             * once the socket timeout has plainly passed with no byte of a frame
+             * in hand, this is an idle timeout regardless of how it was spelled.
+             */
+            if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+                int64_t now = cloud_monotonic_ms();
+
+                if (received == 0 && now >= 0 && started >= 0 &&
+                    now - started >= CLOUD_IO_TIMEOUT_MS)
+                    return 1;
+                continue;
+            }
+            if (received == 0 && error == SSL_ERROR_SYSCALL &&
+                (errno == EAGAIN || errno == EWOULDBLOCK))
+                return 1;
+            if (failure) {
+                failure->ssl_error = error;
+                failure->sys_errno = errno;
+                failure->queued = ERR_peek_last_error();
+                failure->partial = received;
+            }
+            return -1;
+        }
+        received += (size_t)got;
+    }
+    return 0;
+}
+
 int cloud_tls_write_all(SSL *ssl, const unsigned char *data, size_t length)
 {
     size_t sent = 0;
@@ -363,15 +540,13 @@ static int cloud_frame_write(SSL *ssl, struct json_object *frame)
     return cloud_tls_write_all(ssl, (const unsigned char *)text, length);
 }
 
-static int cloud_frame_read(SSL *ssl, struct json_object **out)
+static int cloud_frame_read_body(SSL *ssl, const unsigned char header[4],
+                                 struct json_object **out)
 {
-    unsigned char header[4];
     unsigned char *payload;
     uint32_t length;
     struct json_object *parsed;
 
-    if (cloud_tls_read_exact(ssl, header, sizeof(header)) != 0)
-        return -1;
     length = ((uint32_t)header[0] << 24) | ((uint32_t)header[1] << 16) |
              ((uint32_t)header[2] << 8) | (uint32_t)header[3];
     /* Validate before allocating so a peer cannot make us reserve 4 GiB. */
@@ -394,6 +569,35 @@ static int cloud_frame_read(SSL *ssl, struct json_object **out)
         return -1;
     }
     *out = parsed;
+    return 0;
+}
+
+static int cloud_frame_read(SSL *ssl, struct json_object **out)
+{
+    unsigned char header[4];
+
+    if (cloud_tls_read_exact(ssl, header, sizeof(header)) != 0)
+        return -1;
+    return cloud_frame_read_body(ssl, header, out);
+}
+
+/*
+ * Frame read that reports an idle timeout separately. Returns 0 with a frame,
+ * 1 when the read timed out with nothing pending, or -1 on failure.
+ */
+static int cloud_frame_read_idle(SSL *ssl, struct json_object **out,
+                                 struct cloud_read_error *failure)
+{
+    unsigned char header[4];
+    int rc = cloud_tls_read_exact_idle(ssl, header, sizeof(header), failure);
+
+    if (rc != 0)
+        return rc;
+    if (cloud_frame_read_body(ssl, header, out) != 0) {
+        if (failure)
+            failure->partial = sizeof(header);
+        return -1;
+    }
     return 0;
 }
 
@@ -473,6 +677,45 @@ static struct json_object *cloud_error_frame(const char *request_id,
 }
 
 /*
+ * Verifies an App frame signature against this router's ids.
+ *
+ * The transcript is CONTEXT || router_id || request_id || eph_pub || ciphertext
+ * with no separators, so the router_id string has to match the App's byte for
+ * byte. Two ids can name this router: relay_router_id (derived from both public
+ * keys, what enrollment registered and what the relay routes on) and router_id
+ * (a legacy locally generated UUID on routers that predate the derived scheme).
+ *
+ * Returns 1 when either id verifies. The derived id is tried first since it is
+ * the contract value; the legacy id is a compatibility fallback for Apps that
+ * pinned it before migration. When the two are equal only one check runs.
+ */
+static int cloud_request_signature_valid(const struct cloud_identity *identity,
+                                        const char *request_id,
+                                        const unsigned char *ephemeral,
+                                        const unsigned char *ciphertext,
+                                        size_t ciphertext_length,
+                                        const unsigned char *signature,
+                                        const unsigned char *signing_key)
+{
+    const char *derived = identity->relay_router_id;
+    const char *legacy = identity->router_id;
+
+    if (derived[0] &&
+        cloud_envelope_verify_signature(derived, request_id, ephemeral,
+                                       ciphertext, ciphertext_length,
+                                       signature, signing_key) == 0)
+        return 1;
+
+    if (legacy[0] && (!derived[0] || strcmp(derived, legacy)) &&
+        cloud_envelope_verify_signature(legacy, request_id, ephemeral,
+                                       ciphertext, ciphertext_length,
+                                       signature, signing_key) == 0)
+        return 1;
+
+    return 0;
+}
+
+/*
  * Handles one relay_request frame.
  *
  * Order of checks matters: signature and freshness are verified before the
@@ -538,10 +781,23 @@ static struct json_object *cloud_handle_request(struct json_object *frame)
         goto done;
     }
 
-    if (cloud_envelope_verify_signature(identity->router_id, request_id,
-                                        ephemeral, ciphertext,
-                                        ciphertext_length, signature,
-                                        signing_key) != 0) {
+    /*
+     * The App binds its signature transcript to the router_id it talks to, and
+     * that is the derived id: the relay indexes sessions by the derived id, so
+     * that is the value the App has on the wire and signs over. Verifying
+     * against identity->router_id alone rejected every remote request with
+     * "frame signature is invalid" whenever the local id was still a legacy
+     * UUID, because the two strings differ and the transcript is a bare
+     * concatenation with no length prefixes.
+     *
+     * Both ids are this router's own, so trying the legacy one as a fallback
+     * cannot let another router's frame verify here; it only keeps Apps that
+     * pinned the pre-migration UUID working. Derived id is tried first because
+     * it is what the current contract mandates.
+     */
+    if (!cloud_request_signature_valid(identity, request_id, ephemeral,
+                                       ciphertext, ciphertext_length,
+                                       signature, signing_key)) {
         cloud_tunnel_count(0, 1);
         result = cloud_error_frame(request_id, "app_not_authorized",
                                   "frame signature is invalid");
@@ -772,8 +1028,16 @@ static int cloud_tunnel_hello(SSL *ssl, const struct cloud_config *config)
     json_object_object_add(frame, "version",
                            json_object_new_int(CLOUD_PROTOCOL_VERSION));
     json_object_object_add(frame, "kind", json_object_new_string("tunnel_hello"));
+    /*
+     * The relay looks up the tunnel token by the router_id in this frame, and
+     * enrollment registered it under the derived id, so the two must agree.
+     * Sending the legacy UUID here would authenticate against a token that was
+     * never stored for it and be rejected as tunnel_unauthorized.
+     */
     json_object_object_add(frame, "router_id",
-                           json_object_new_string(identity->router_id));
+                           json_object_new_string(identity->relay_router_id[0] ?
+                                                  identity->relay_router_id :
+                                                  identity->router_id));
     json_object_object_add(frame, "auth_token",
                            json_object_new_string(token));
     OPENSSL_cleanse(token, sizeof(token));
@@ -822,13 +1086,29 @@ static int cloud_tunnel_session(const struct cloud_config *config)
     struct cloud_tls connection;
     int64_t last_ping;
     int64_t last_apps_refresh;
+    /* Last time a frame actually arrived, kept separate from ping bookkeeping so
+     * a dead peer cannot be masked by our own sends. */
+    int64_t last_frame;
     /* Serialized copy of the last pushed set, so an unchanged set costs no
      * frame. Sized for CLOUD_MAX_AUTHORIZED_APPS base64 keys plus separators. */
     char apps_digest[CLOUD_MAX_AUTHORIZED_APPS * 48 + 8];
+    /* Why the loop exited, and when it started, so the teardown can say which
+     * branch fired instead of leaving every drop indistinguishable. */
+    char exit_detail[112];
+    int64_t session_start;
+    /* Frames received and pings sent during this session. Together with the
+     * exit reason these separate an idle timeout from a connection-lifetime cap:
+     * a session that received pongs the whole way through and still died was not
+     * idle, so a keepalive interval cannot be the cause. */
+    unsigned long frames_in;
+    unsigned long pings_out;
 
     memset(&connection, 0, sizeof(connection));
     connection.fd = -1;
     apps_digest[0] = '\0';
+    snprintf(exit_detail, sizeof(exit_detail), "%s", "loop_exit_shutdown");
+    frames_in = 0;
+    pings_out = 0;
 
     cloud_tunnel_set_state("connecting", "");
     if (cloud_tls_connect(config, &connection) != 0)
@@ -845,54 +1125,102 @@ static int cloud_tunnel_session(const struct cloud_config *config)
             CLOUD_SERVICE_NAME, config->host, (unsigned int)config->port);
     last_ping = cloud_monotonic_ms();
     last_apps_refresh = last_ping;
+    last_frame = last_ping;
+    session_start = last_ping;
     /* The hello already carried the current set, so seed the digest without
      * sending a second copy. */
     cloud_tunnel_push_authorized_apps(NULL, apps_digest, sizeof(apps_digest));
 
     while (cloud_tunnel_running()) {
         struct json_object *frame = NULL;
+        struct cloud_read_error failure;
         const char *kind;
         int64_t now;
+        int read_rc;
 
-        if (cloud_frame_read(connection.ssl, &frame) != 0) {
-            /* A read timeout is normal when idle; distinguish it from a real
-             * drop by checking whether a ping is due. */
+        memset(&failure, 0, sizeof(failure));
+        read_rc = cloud_frame_read_idle(connection.ssl, &frame, &failure);
+        if (read_rc < 0) {
+            /*
+             * The distinction that matters here: zero_return is an orderly TLS
+             * close by the relay, syscall with ECONNRESET is the path being cut
+             * mid-connection, and syscall with errno 0 is a FIN without a close
+             * notify, which is what a middlebox aging out the flow looks like.
+             */
+            snprintf(exit_detail, sizeof(exit_detail),
+                     "read_failed ssl_error=%s(%d) errno=%d(%s) queued=0x%lx partial=%zu",
+                     cloud_ssl_error_name(failure.ssl_error), failure.ssl_error,
+                     failure.sys_errno,
+                     failure.sys_errno ? strerror(failure.sys_errno) : "-",
+                     failure.queued, failure.partial);
+            break;
+        }
+        if (read_rc > 0) {
+            /*
+             * Nothing arrived within SO_RCVTIMEO. That is the normal state of an
+             * idle tunnel and must not end it. Send a ping only when one is
+             * actually due, then keep waiting.
+             *
+             * This loop used to tear the tunnel down here whenever its guess
+             * about errno did not hold, which produced a reconnect roughly every
+             * two minutes on a connection that was perfectly healthy. It also
+             * sent a ping on every single timeout, so the ping interval was
+             * effectively the socket timeout rather than the configured one.
+             */
             now = cloud_monotonic_ms();
-            if (now >= 0 && now - last_ping < CLOUD_TUNNEL_READ_TIMEOUT_MS &&
-                SSL_get_error(connection.ssl, -1) == SSL_ERROR_SYSCALL &&
-                (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (now < 0)
+                continue;
+            /*
+             * A peer that has stopped answering must still be noticed. Pings are
+             * answered with pongs, so silence for this long means the connection
+             * is gone even though the socket has not reported an error yet.
+             */
+            if (now - last_frame >= CLOUD_TUNNEL_IDLE_LIMIT_MS) {
+                snprintf(exit_detail, sizeof(exit_detail),
+                         "relay_silent idle_ms=%lld",
+                         (long long)(now - last_frame));
+                cloud_tunnel_set_state("connecting", "relay_silent");
+                break;
+            }
+            if (now - last_ping >= CLOUD_TUNNEL_PING_INTERVAL_MS) {
                 struct json_object *ping = json_object_new_object();
 
-                if (ping) {
-                    json_object_object_add(ping, "protocol",
-                                           json_object_new_string(CLOUD_PROTOCOL));
-                    json_object_object_add(ping, "version",
-                                           json_object_new_int(CLOUD_PROTOCOL_VERSION));
-                    json_object_object_add(ping, "kind",
-                                           json_object_new_string("tunnel_ping"));
-                    if (cloud_frame_write(connection.ssl, ping) == 0)
-                        last_ping = now;
+                if (!ping)
+                    continue;
+                json_object_object_add(ping, "protocol",
+                                       json_object_new_string(CLOUD_PROTOCOL));
+                json_object_object_add(ping, "version",
+                                       json_object_new_int(CLOUD_PROTOCOL_VERSION));
+                json_object_object_add(ping, "kind",
+                                       json_object_new_string("tunnel_ping"));
+                if (cloud_frame_write(connection.ssl, ping) != 0) {
                     json_object_put(ping);
-                    if (last_ping == now) {
-                        /* Also refresh here: an idle tunnel never reaches the
-                         * bottom of the loop, and revocation must not wait for
-                         * the next App request to take effect. */
-                        if (now - last_apps_refresh >=
-                            CLOUD_TUNNEL_APPS_REFRESH_MS) {
-                            last_apps_refresh = now;
-                            if (cloud_tunnel_push_authorized_apps(
-                                    connection.ssl, apps_digest,
-                                    sizeof(apps_digest)) != 0)
-                                break;
-                        }
-                        continue;
-                    }
+                    snprintf(exit_detail, sizeof(exit_detail),
+                             "ping_write_failed errno=%d(%s)", errno,
+                             errno ? strerror(errno) : "-");
+                    break;
+                }
+                json_object_put(ping);
+                last_ping = now;
+                pings_out++;
+            }
+            /* Refresh here too: an idle tunnel never reaches the bottom of the
+             * loop, and revocation must not wait for the next App request. */
+            if (now - last_apps_refresh >= CLOUD_TUNNEL_APPS_REFRESH_MS) {
+                last_apps_refresh = now;
+                if (cloud_tunnel_push_authorized_apps(connection.ssl, apps_digest,
+                                                      sizeof(apps_digest)) != 0) {
+                    snprintf(exit_detail, sizeof(exit_detail),
+                             "apps_push_failed_idle errno=%d(%s)", errno,
+                             errno ? strerror(errno) : "-");
+                    break;
                 }
             }
-            break;
+            continue;
         }
 
         kind = cloud_frame_string(frame, "kind");
+        frames_in++;
         if (!kind) {
             json_object_put(frame);
             continue;
@@ -907,6 +1235,9 @@ static int cloud_tunnel_session(const struct cloud_config *config)
                 json_object_put(response);
                 if (rc != 0) {
                     json_object_put(frame);
+                    snprintf(exit_detail, sizeof(exit_detail),
+                             "response_write_failed errno=%d(%s)", errno,
+                             errno ? strerror(errno) : "-");
                     break;
                 }
             }
@@ -927,16 +1258,37 @@ static int cloud_tunnel_session(const struct cloud_config *config)
         json_object_put(frame);
 
         now = cloud_monotonic_ms();
-        if (now >= 0 && now - last_ping >= CLOUD_TUNNEL_PING_INTERVAL_MS)
+        /*
+         * Traffic is proof of life, so it defers the next ping. This used to
+         * advance last_ping only once the interval had already elapsed, which
+         * meant an active tunnel reported a stale ping age and skewed the idle
+         * branch's arithmetic.
+         */
+        if (now >= 0)
             last_ping = now;
+        if (now >= 0)
+            last_frame = now;
         if (now >= 0 && now - last_apps_refresh >= CLOUD_TUNNEL_APPS_REFRESH_MS) {
             last_apps_refresh = now;
             if (cloud_tunnel_push_authorized_apps(connection.ssl, apps_digest,
-                                                  sizeof(apps_digest)) != 0)
+                                                  sizeof(apps_digest)) != 0) {
+                snprintf(exit_detail, sizeof(exit_detail),
+                         "apps_push_failed_active errno=%d(%s)", errno,
+                         errno ? strerror(errno) : "-");
                 break;
+            }
         }
     }
 
+    {
+        char detail[160];
+
+        snprintf(detail, sizeof(detail), "%s in=%lu pings=%lu", exit_detail,
+                 frames_in, pings_out);
+        cloud_tunnel_note_disconnect(detail,
+                                     session_start ?
+                                         cloud_monotonic_ms() - session_start : 0);
+    }
     cloud_tunnel_set_connected(0);
     cloud_tls_close(&connection);
     return 0;

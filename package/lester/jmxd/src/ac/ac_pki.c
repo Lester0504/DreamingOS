@@ -1009,6 +1009,54 @@ static int ac_pki_time_valid(X509 *certificate)
         X509_cmp_current_time(X509_get0_notAfter(certificate)) > 0;
 }
 
+/*
+ * True when the only thing wrong with a certificate is that it was issued
+ * against a clock that was ahead, so notBefore has not arrived yet.
+ *
+ * This is a real failure mode on this platform, not a hypothetical: sysfixtime
+ * seeds the clock from the newest mtime on disk at boot, which can be hours in
+ * the future, and the controller signs its server certificate long before NTP
+ * corrects the time. The result is a two-year certificate that every AP
+ * correctly refuses, and because the validity check also guards the reissue
+ * path, the controller could not sign its way out of it either.
+ *
+ * Distinguished from plain expiry on purpose. An expired certificate means time
+ * has genuinely passed and reissuing is routine; a not-yet-valid one means the
+ * clock lied when it was signed, and the fix is to sign again now that the
+ * clock is believable.
+ */
+static int ac_pki_not_yet_valid(X509 *certificate)
+{
+    return certificate &&
+        X509_cmp_current_time(X509_get0_notBefore(certificate)) > 0;
+}
+
+/*
+ * Is the clock trustworthy enough to stamp a multi-year certificate with?
+ *
+ * There is no local oracle for the correct time, so this asks a narrower and
+ * answerable question: is the clock consistent with what this installation
+ * already knows. The CA was signed at some point in this machine's real past, so
+ * a current time that precedes the CA's own notBefore cannot be right.
+ *
+ * That catches a clock that came up too early. It does not catch one that came
+ * up ahead, which is the case that actually bit us, and no purely local check
+ * can: a clock reading eight hours in the future looks exactly like a clock that
+ * is right. This is why the reissue path matters as much as this check does. The
+ * pair of them is the fix: refuse to sign when the clock is provably wrong, and
+ * sign again once a bad stamp becomes visible.
+ */
+static int ac_pki_clock_plausible(X509 *ca_certificate)
+{
+    const ASN1_TIME *ca_not_before;
+
+    if (!ca_certificate)
+        return 1;
+    ca_not_before = X509_get0_notBefore(ca_certificate);
+    /* Negative means the CA's start is in the past, which is what it should be. */
+    return ca_not_before && X509_cmp_current_time(ca_not_before) < 0;
+}
+
 static int ac_pki_uri_matches(const ASN1_IA5STRING *value,
                               const char *expected)
 {
@@ -1132,8 +1180,14 @@ static int ac_pki_ca_valid(X509 *certificate, EVP_PKEY *key)
     return valid;
 }
 
-static int ac_pki_server_without_san_valid(X509 *certificate, EVP_PKEY *key,
-                                           X509 *ca_certificate, EVP_PKEY *ca_key)
+/*
+ * Everything about a server certificate except its validity window: it belongs
+ * to this key, was issued by this CA, and carries the right constraints and
+ * usage. Split out so the reissue path can accept a certificate whose only
+ * defect is a bad clock at signing time without loosening any of these.
+ */
+static int ac_pki_server_structure_valid(X509 *certificate, EVP_PKEY *key,
+                                         X509 *ca_certificate, EVP_PKEY *ca_key)
 {
     EVP_PKEY *ca_public = NULL;
     int valid = 0;
@@ -1145,13 +1199,20 @@ static int ac_pki_server_without_san_valid(X509 *certificate, EVP_PKEY *key,
         X509_NAME_cmp(X509_get_issuer_name(certificate),
                       X509_get_subject_name(ca_certificate)) == 0 &&
         X509_verify(certificate, ca_public) == 1 &&
-        ac_pki_time_valid(certificate) &&
         ac_pki_basic_constraints(certificate, 0) &&
         ac_pki_key_usage_exact(certificate, 0, -1) &&
         ac_pki_eku_exact(certificate, NID_server_auth))
         valid = 1;
     EVP_PKEY_free(ca_public);
     return valid;
+}
+
+static int ac_pki_server_without_san_valid(X509 *certificate, EVP_PKEY *key,
+                                           X509 *ca_certificate, EVP_PKEY *ca_key)
+{
+    return ac_pki_server_structure_valid(certificate, key,
+                                         ca_certificate, ca_key) &&
+        ac_pki_time_valid(certificate);
 }
 
 static int ac_pki_server_valid(X509 *certificate, EVP_PKEY *key,
@@ -1303,6 +1364,19 @@ static int ac_pki_material_initialize(struct ac_pki *pki, int dirfd,
                                        pki->ca_fingerprint,
                                        pki->ca_fingerprint_text) != 0)
         return -1;
+    /*
+     * With a trustworthy CA in hand, use it as a floor on the clock before
+     * signing anything. A current time earlier than the CA's own start cannot be
+     * right, and stamping a multi-year certificate from it would bake the error
+     * in. Refusing here is better than issuing a certificate that has to be
+     * repaired later; the not-yet-valid case below covers the direction this
+     * cannot detect.
+     */
+    if (!ac_pki_clock_plausible(pki->ca_cert)) {
+        fprintf(stderr, "[dreamingwrt-ac] refusing to sign: clock reads before "
+                        "the CA's own notBefore, time is not yet trustworthy\n");
+        return -1;
+    }
     pki->server_key = ac_pki_key_load(dirfd, AC_PKI_SERVER_KEY_FILE,
                                       &server_key_missing);
     if (!pki->server_key) {
@@ -1333,10 +1407,28 @@ static int ac_pki_material_initialize(struct ac_pki *pki, int dirfd,
     if (!ac_pki_server_valid(pki->server_cert, pki->server_key,
                              pki->ca_cert, pki->ca_key,
                              pki->controller_id, names)) {
+        /*
+         * A certificate signed against a clock that was ahead is reissued rather
+         * than treated as fatal. The check below would otherwise reject it for
+         * the very reason it needs replacing, since the structural validator
+         * includes the validity window, and the controller would stay stuck
+         * serving a certificate no client will accept.
+         *
+         * Everything except the dates still has to hold: same key, issued by
+         * this CA, correct constraints and usage. Only the time window is
+         * forgiven, and only in the not-yet-valid direction.
+         */
         if (!ac_pki_server_without_san_valid(pki->server_cert,
                                              pki->server_key,
-                                             pki->ca_cert, pki->ca_key))
+                                             pki->ca_cert, pki->ca_key) &&
+            !(ac_pki_not_yet_valid(pki->server_cert) &&
+              ac_pki_server_structure_valid(pki->server_cert,
+                                            pki->server_key,
+                                            pki->ca_cert, pki->ca_key)))
             return -1;
+        if (ac_pki_not_yet_valid(pki->server_cert))
+            fprintf(stderr, "[dreamingwrt-ac] server certificate notBefore is in "
+                            "the future, reissuing against the current clock\n");
         X509_free(pki->server_cert);
         pki->server_cert = ac_pki_server_create(
             pki->server_key, pki->ca_cert, pki->ca_key,

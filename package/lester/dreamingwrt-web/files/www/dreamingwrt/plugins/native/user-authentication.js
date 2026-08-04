@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260804-speed-limit-two-tabs-02';
   const MODULE_CLASS = 'user-authentication-route-host';
   const stage = root?.closest('.console-stage');
   const PAGE_BY_ID = {
@@ -277,8 +277,22 @@ export function mount(context = {}) {
     return `<button class="${cls}" type="button" data-user-auth-action="${escapeHtml(action)}" ${options.disabled ? 'disabled' : ''}>${icon(iconName)}<span>${escapeHtml(label)}</span></button>`;
   }
 
+  /*
+   * 独立的工具栏 header，只给**后面不接表格**的 Tab 用（WEB 认证设置、密码策略、
+   * 通知表单）。凡是后面跟 `tableMarkup()` 的页面，搜索与动作按钮必须走
+   * `tableMarkup({ toolbar })` 收进表格卡自己的 kit 工具栏里，
+   * 不能再在卡片外面浮一条 header —— design.md「Tables」要求计数与操作
+   * 都放在 `.dwrt-kit-table-toolbar` 内，卡片才是数据页的主表面。
+   */
   function toolbarMarkup(options = {}) {
     return `<header class="policy-toolbar user-auth-toolbar"><div class="user-auth-toolbar-leading">${options.leading || (options.search === false ? '' : searchMarkup(options.placeholder))}</div><div class="policy-toolbar-actions">${options.actions || ''}</div></header>`;
+  }
+
+  /* 表格卡内工具栏的右侧控件组：搜索 + 动作按钮，与标题同一行。 */
+  function tableToolbarControls(options = {}) {
+    const leading = options.leading || (options.search === false ? '' : searchMarkup(options.placeholder));
+    if (!leading && !options.actions) return '';
+    return `<div class="user-auth-table-controls">${leading ? `<div class="user-auth-toolbar-leading">${leading}</div>` : ''}${options.actions ? `<div class="policy-toolbar-actions">${options.actions}</div>` : ''}</div>`;
   }
 
   function statusPill(label, active = false, warning = false) {
@@ -301,7 +315,13 @@ export function mount(context = {}) {
   }
 
   function tableMarkup(title, subtitle, headings, rows, empty = '暂无内容', options = {}) {
-    return `<section class="user-auth-main-surface user-auth-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface" data-user-auth-list><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(subtitle)}</span></div><span class="dwrt-kit-table-count">${rows.length} 条</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table user-auth-table"><thead><tr>${options.select ? '<th><input type="checkbox" data-user-auth-select-all aria-label="全选"></th>' : ''}${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody>${state.loading && !state.loaded ? `<tr><td colspan="${headings.length + (options.select ? 1 : 0)}" class="dwrt-kit-table-empty">正在读取用户认证数据</td></tr>` : rows.length ? rows.join('') : `<tr><td colspan="${headings.length + (options.select ? 1 : 0)}" class="dwrt-kit-table-empty">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
+    /*
+     * 搜索与动作按钮进 kit 工具栏，和标题、条数同一行。原先它们在一个独立的
+     * `<header class="policy-toolbar">` 里浮在表格卡**外面**，实测四个页面
+     * （在线用户、账号管理、代拨服务、终端限速）都是这样，看起来像散落在卡片上方。
+     */
+    const controls = options.toolbar || '';
+    return `<section class="user-auth-main-surface user-auth-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface" data-user-auth-list><div class="dwrt-kit-table-toolbar ${controls ? 'user-auth-table-toolbar-rich' : ''}"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(subtitle)}</span></div><span class="dwrt-kit-table-count">${rows.length} 条</span>${controls}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table user-auth-table"><thead><tr>${options.select ? '<th><input type="checkbox" data-user-auth-select-all aria-label="全选"></th>' : ''}${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody>${state.loading && !state.loaded ? `<tr><td colspan="${headings.length + (options.select ? 1 : 0)}" class="dwrt-kit-table-empty">正在读取用户认证数据</td></tr>` : rows.length ? rows.join('') : `<tr><td colspan="${headings.length + (options.select ? 1 : 0)}" class="dwrt-kit-table-empty">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
   }
 
   function matchesQuery(values) {
@@ -360,7 +380,7 @@ export function mount(context = {}) {
       ...asArray(web.post_authorization).map((value, index) => ({ id: `post-${index}`, scope: '认证后限制', value: firstText(value.value, value.cidr, value.domain, value), type: firstText(value.type, '网段') })),
       ...asArray(web.restricted_dns_servers).map((value, index) => ({ id: `dns-${index}`, scope: '受限 DNS', value: firstText(value), type: 'DNS 服务器' }))
     ].filter((row) => matchesQuery([row.scope, row.value, row.type]));
-    return `${toolbarMarkup({ placeholder: '搜索网段、域名或 DNS', actions: actionButton('添加规则', 'add-access', 'plus', { primary: true, disabled: !capability('update_web') }) })}${tableMarkup('访问控制', '认证前放行、认证后限制与受限 DNS', ['范围', '类型', '地址 / 域名', '操作'], rows.map((row) => `<tr><td>${escapeHtml(row.scope)}</td><td>${escapeHtml(row.type)}</td><td><code>${escapeHtml(row.value)}</code></td><td><button class="user-auth-icon-button" type="button" data-user-auth-edit="access" data-user-auth-id="${escapeHtml(row.id)}" disabled aria-label="编辑">${icon('edit')}</button></td></tr>`), '暂无访问控制规则')}`;
+    return `${tableMarkup('访问控制', '认证前放行、认证后限制与受限 DNS', ['范围', '类型', '地址 / 域名', '操作'], rows.map((row) => `<tr><td>${escapeHtml(row.scope)}</td><td>${escapeHtml(row.type)}</td><td><code>${escapeHtml(row.value)}</code></td><td><button class="user-auth-icon-button" type="button" data-user-auth-edit="access" data-user-auth-id="${escapeHtml(row.id)}" disabled aria-label="编辑">${icon('edit')}</button></td></tr>`), '暂无访问控制规则', { toolbar: tableToolbarControls({ placeholder: '搜索网段、域名或 DNS', actions: actionButton('添加规则', 'add-access', 'plus', { primary: true, disabled: !capability('update_web') }) }) })}`;
   }
 
   function renderWeb() {
@@ -402,7 +422,7 @@ export function mount(context = {}) {
 
   function renderOnline() {
     const actions = `${actionButton('导出', 'export-online', 'export')}${actionButton(state.selected.size ? `延长 ${state.selected.size} 人` : '延长授权', 'extend-selected', 'edit', { disabled: !state.selected.size || !capability('extend_session') })}${actionButton(state.selected.size ? `下线 ${state.selected.size} 人` : '批量下线', 'disconnect-selected', 'disconnect', { primary: true, disabled: !state.selected.size || !capability('disconnect') })}`;
-    return `${toolbarMarkup({ placeholder: '搜索账号、姓名、IP、MAC 或接口', actions })}${tableMarkup('在线用户', '当前已通过认证或拨号接入的用户', ['账号', '姓名', '认证类型', 'IP 地址', 'MAC / 地址', '上线时间', '联系方式', '接口', '代拨账号', '备注', '操作'], onlineRows(), '暂无在线认证用户', { select: true })}`;
+    return `${tableMarkup('在线用户', '当前已通过认证或拨号接入的用户', ['账号', '姓名', '认证类型', 'IP 地址', 'MAC / 地址', '上线时间', '联系方式', '接口', '代拨账号', '备注', '操作'], onlineRows(), '暂无在线认证用户', { select: true, toolbar: tableToolbarControls({ placeholder: '搜索账号、姓名、IP、MAC 或接口', actions }) })}`;
   }
 
   function accountCollection() {
@@ -461,7 +481,7 @@ export function mount(context = {}) {
     const batchActions = state.tab === 'accounts' ? `${actionButton(state.selected.size ? `启用 ${state.selected.size} 项` : '批量启用', 'enable-selected', 'preview', { disabled: !state.selected.size || !capability('write_accounts') })}${actionButton(state.selected.size ? `停用 ${state.selected.size} 项` : '批量停用', 'disable-selected', 'disconnect', { disabled: !state.selected.size || !capability('write_accounts') })}` : '';
     const actions = `${batchActions}${voucherActions}${state.tab !== 'ledger' ? actionButton('导入', 'import-accounts', 'import', { disabled: !capability('write_accounts') }) : ''}${actionButton('导出', 'export-accounts', 'export')}${createLabel ? actionButton(createLabel, `add-${state.tab}`, 'plus', { primary: true, disabled: !capability('write_accounts') }) : ''}`;
     const leading = state.tab === 'accounts' || state.tab === 'vouchers' ? `<div class="user-auth-segmented">${(state.tab === 'accounts' ? [['all','全部'],['enabled','已启用'],['disabled','已停用'],['expired','已过期']] : [['all','全部'],['used','已使用'],['unused','未使用'],['expired','已过期']]).map(([id, label]) => `<button type="button" data-user-auth-filter="${id}" class="${state.statusFilter === id ? 'is-active' : ''}">${label}</button>`).join('')}</div>${searchMarkup(state.tab === 'accounts' ? '搜索账号、姓名或备注' : '搜索上网码或备注')}` : searchMarkup(state.tab === 'packages' ? '套餐名称 / 备注' : '搜索账号、人员或描述');
-    return `${toolbarMarkup({ leading, actions })}${tableMarkup(title, subtitle, headings, accountRows(), '暂无内容', { select: true })}`;
+    return `${tableMarkup(title, subtitle, headings, accountRows(), '暂无内容', { select: true, toolbar: tableToolbarControls({ leading, actions }) })}`;
   }
 
   function delegatedRows() {
@@ -476,7 +496,7 @@ export function mount(context = {}) {
   function renderDelegated() {
     const online = state.tab === 'online';
     const actions = `${!online ? actionButton('导入', 'import-delegated', 'import', { disabled: !capability('write_delegated') }) : ''}${actionButton('导出', 'export-delegated', 'export')}${!online ? actionButton('添加', 'add-delegated', 'plus', { primary: true, disabled: !capability('write_delegated') }) : ''}`;
-    return `${toolbarMarkup({ placeholder: online ? '代拨账号 / 备注' : '搜索线路、账号、接口或备注', actions })}${online ? tableMarkup('在线账号列表', '当前代拨连接获得的地址与网关', ['代拨账号', 'IP 地址', '子网掩码', '网关', '被代拨账号', '备注'], delegatedRows(), '暂无在线代拨账号') : tableMarkup('代拨账号管理', '上游拨号账号与下游被代拨账号映射', ['代拨线路名称', '代拨账号', '代拨密码', '代拨接口', '被代拨账号', '状态', '备注', '操作'], delegatedRows(), '暂无代拨服务', { select: true })}`;
+    return `${(() => { const toolbar = tableToolbarControls({ placeholder: online ? '代拨账号 / 备注' : '搜索线路、账号、接口或备注', actions }); return online ? tableMarkup('在线账号列表', '当前代拨连接获得的地址与网关', ['代拨账号', 'IP 地址', '子网掩码', '网关', '被代拨账号', '备注'], delegatedRows(), '暂无在线代拨账号', { toolbar }) : tableMarkup('代拨账号管理', '上游拨号账号与下游被代拨账号映射', ['代拨线路名称', '代拨账号', '代拨密码', '代拨接口', '被代拨账号', '状态', '备注', '操作'], delegatedRows(), '暂无代拨服务', { select: true, toolbar }); })()}`;
   }
 
   function richEditor(value, key) {
@@ -517,7 +537,7 @@ export function mount(context = {}) {
   function renderNotifications() {
     if (state.tab !== 'periodic') return `${toolbarMarkup({ search: false })}${notificationForm(state.tab)}`;
     const actions = actionButton('添加', 'add-periodic', 'plus', { primary: true, disabled: !capability('write_notifications') });
-    return `${toolbarMarkup({ placeholder: '搜索名称、接收对象或备注', actions })}${tableMarkup('定期通知', '按周期和指定时间向认证用户推送页面通知', ['名称', '接收对象', '推送周期', '推送时间', '状态', '备注', '操作'], periodicRows(), '暂无定期通知', { select: true })}`;
+    return `${tableMarkup('定期通知', '按周期和指定时间向认证用户推送页面通知', ['名称', '接收对象', '推送周期', '推送时间', '状态', '备注', '操作'], periodicRows(), '暂无定期通知', { select: true, toolbar: tableToolbarControls({ placeholder: '搜索名称、接收对象或备注', actions }) })}`;
   }
 
   function mainMarkup() {

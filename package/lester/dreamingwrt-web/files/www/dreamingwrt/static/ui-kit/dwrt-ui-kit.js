@@ -407,9 +407,34 @@
     const host = context?.nodeType === 1 ? context : null;
     Array.from(portal.children).forEach((node) => {
       if (!node.matches?.('.dwrt-kit-sheet, [data-dwrt-component="sheet"], [data-dwrt-component="filter-sheet"]')) return;
-      const home = sheetState.get(node)?.portalHome?.parent;
-      // 宿主已脱离文档，或本次重绘的正是它的宿主：这份抽屉已经和页面失联
-      if (!home || !home.isConnected || home === host || host?.contains(home)) disposeSheet(node);
+      const state = sheetState.get(node);
+      const home = state?.portalHome?.parent;
+      // 宿主已脱离文档：这份抽屉确实和页面失联了
+      if (!home || !home.isConnected) { disposeSheet(node); return; }
+      if (home !== host && !host?.contains(home)) return;
+      /*
+       * 到这里说明本次 mountAll 的 context 就是这份抽屉的原宿主。这**不足以**判定
+       * 它是孤儿：`mountSheet()` 会把刚建好的抽屉搬进 portal，此后宿主依旧健在，
+       * 于是"打开抽屉后任何一次 mountAll(root) 都会把它当孤儿销毁"，表现就是
+       * 抽屉一闪即消（实测 1 → 0，涉及抽屉的认证与管控页面几乎全中）。
+       *
+       * 真正的孤儿判据是宿主的**内容被换过**。页面模块关抽屉的惯用手法是重写
+       * 宿主 innerHTML，那会把锚点兄弟节点一起换掉；而单纯的重复 mount 不会。
+       * 所以搬迁时记下宿主当时的首个子节点，用它是否还在原位来区分两者。
+       */
+      const anchor = state.portalHome.hostAnchor;
+      if (anchor) {
+        // 探针还在原位 => 宿主没被重绘，抽屉仍然有效
+        if (anchor.isConnected && anchor.parentElement === home) return;
+        disposeSheet(node);
+        return;
+      }
+      /*
+       * 搬迁时宿主里除了抽屉本身没有别的子节点，拿不到探针。这种情况下无法区分
+       * 重绘与重复 mount，宁可留着：误留一个抽屉用户可以自己关掉，误杀会让
+       * 功能整个不可用（这正是本次修的缺陷）。宿主若真的脱离文档，上面第一条
+       * 判据已经回收过了。
+       */
     });
     pruneSheetPortal();
   }
@@ -428,7 +453,17 @@
     // 原位锚点：优先记录一个稳定的兄弟节点，卸载时据此归位
     state.portalHome = {
       parent: (overlay || sheet).parentElement,
-      before: (overlay || sheet).nextElementSibling === sheet ? sheet.nextElementSibling : (overlay || sheet).nextElementSibling
+      before: (overlay || sheet).nextElementSibling === sheet ? sheet.nextElementSibling : (overlay || sheet).nextElementSibling,
+      /*
+       * 存活探针：搬迁时宿主里的第一个「不是本抽屉、也不是本遮罩」的子节点。
+       * 宿主 innerHTML 被重写时它会被换掉，`reclaimStaleSheets()` 据此判定抽屉
+       * 真的成了孤儿；而重复 mount 不动宿主内容，探针仍在原位，抽屉就不该被销毁。
+       */
+      hostAnchor: (() => {
+        const parent = (overlay || sheet).parentElement;
+        if (!parent) return null;
+        return Array.from(parent.children).find((child) => child !== sheet && child !== overlay) || null;
+      })()
     };
     state.portalScope = scopeClassesFor(sheet);
     applyPortalScope(portal, state.portalScope);

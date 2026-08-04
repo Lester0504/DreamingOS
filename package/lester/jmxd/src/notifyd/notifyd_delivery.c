@@ -145,6 +145,118 @@ static int notifyd_webhook_headers(struct json_object *options, struct curl_slis
     return 1;
 }
 
+#define NOTIFYD_ROUTER_ID_PATH "/etc/dreamingwrt/cloud/router_id"
+
+/* Read the cloud router id written by the enrollment flow.  notifyd has no ubus
+ * dependency on webd, and this file is the same source webd itself uses, so
+ * reading it directly avoids a startup ordering dependency. */
+static int notifyd_router_id_load(char *out, size_t out_len)
+{
+    FILE *fp;
+    size_t n;
+
+    if (!out || out_len == 0)
+        return 0;
+    out[0] = '\0';
+    fp = fopen(NOTIFYD_ROUTER_ID_PATH, "re");
+    if (!fp)
+        return 0;
+    if (!fgets(out, (int)out_len, fp)) {
+        fclose(fp);
+        out[0] = '\0';
+        return 0;
+    }
+    fclose(fp);
+    n = strlen(out);
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' '))
+        out[--n] = '\0';
+    return out[0] != '\0';
+}
+
+/* Map the native notify payload onto the relay ingest contract.  Deliberately a
+ * fixed mapping rather than a template engine: the relay defines exactly one
+ * shape, and a template language here would be a second configuration surface
+ * to validate and get wrong. */
+static char *notifyd_relay_ingest_body(const struct notifyd_outbox_item *item,
+                                       struct json_object *options,
+                                       char *error, size_t error_len)
+{
+    struct json_object *payload;
+    struct json_object *body;
+    const char *router_id;
+    char router_id_buf[128] = "";
+    const char *event;
+    const char *detail_body;
+    char *out = NULL;
+    const char *rendered;
+
+    payload = notifyd_json_parse_or_object(item->payload_json);
+    if (!payload) {
+        notifyd_error_set(error, error_len, "relay_payload_parse_failed");
+        return NULL;
+    }
+    /* An explicit option wins so a test channel can be pointed at a fixed id,
+     * otherwise fall back to the enrolled router id on disk. */
+    router_id = notifyd_json_str(options, "router_id", "");
+    if (!router_id[0] && notifyd_router_id_load(router_id_buf, sizeof(router_id_buf)))
+        router_id = router_id_buf;
+    if (!router_id[0]) {
+        /* Sending without a router id would be rejected with 400 and would still
+         * consume a delivery attempt, so fail before the request. */
+        notifyd_error_set(error, error_len, "relay_router_id_unavailable");
+        json_object_put(payload);
+        return NULL;
+    }
+    event = notifyd_json_str(payload, "event", "");
+    if (!event[0]) {
+        notifyd_error_set(error, error_len, "relay_event_id_missing");
+        json_object_put(payload);
+        return NULL;
+    }
+    body = json_object_new_object();
+    json_object_object_add(body, "router_id", json_object_new_string(router_id));
+    /* The relay's event_id is the catalog identifier, which lives in "event"
+     * here; the payload's own "id" is a per-occurrence hash and must not be
+     * used for subscription matching. */
+    json_object_object_add(body, "event_id", json_object_new_string(event));
+    json_object_object_add(body, "event", json_object_new_string(event));
+    json_object_object_add(body, "occurrence_id",
+        json_object_new_string(notifyd_json_str(payload, "id", "")));
+    json_object_object_add(body, "severity",
+        json_object_new_string(notifyd_json_str(payload, "severity", "info")));
+    json_object_object_add(body, "category",
+        json_object_new_string(notifyd_json_str(payload, "category", "")));
+    json_object_object_add(body, "source",
+        json_object_new_string(notifyd_json_str(payload, "source", "")));
+    json_object_object_add(body, "title",
+        json_object_new_string(notifyd_json_str(payload, "title", "")));
+    /* The native payload has no body field; only 6 keys are always present
+     * (id, severity, category, event, source, title).  Fall back through the
+     * optional text carriers and finally to the title so the relay never gets
+     * an empty body, which it would render as a blank notification. */
+    detail_body = notifyd_json_str(payload, "body",
+                       notifyd_json_str(payload, "message",
+                           notifyd_json_str(payload, "detail_json",
+                               notifyd_json_str(payload, "title", ""))));
+    json_object_object_add(body, "body", json_object_new_string(detail_body));
+    json_object_object_add(body, "body_source",
+        json_object_new_string(notifyd_json_str(payload, "body", "")[0] ? "body" :
+            (notifyd_json_str(payload, "message", "")[0] ? "message" :
+                (notifyd_json_str(payload, "detail_json", "")[0] ? "detail_json" : "title"))));
+    json_object_object_add(body, "dedupe_key",
+        json_object_new_string(notifyd_json_str(payload, "dedupe_key", "")));
+    json_object_object_add(body, "ts",
+        json_object_new_int64(notifyd_json_i64(payload, "ts", notifyd_now_s())));
+    rendered = json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN);
+    if (rendered)
+        out = strdup(rendered);
+    if (!out)
+        notifyd_error_set(error, error_len, "relay_body_render_failed");
+    json_object_put(body);
+    json_object_put(payload);
+    return out;
+}
+
 static int notifyd_deliver_webhook(const struct notifyd_outbox_item *item,
                                    const struct notifyd_channel *channel,
                                    long *http_status, char *error, size_t error_len)
@@ -158,6 +270,8 @@ static int notifyd_deliver_webhook(const struct notifyd_outbox_item *item,
     CURLcode cc;
     long code = 0;
     int ok = 0;
+    char *relay_body = NULL;
+    const char *post_body;
 
     if (!notifyd_url_ok(url)) {
         notifyd_error_set(error, error_len, "invalid_webhook_url");
@@ -178,11 +292,21 @@ static int notifyd_deliver_webhook(const struct notifyd_outbox_item *item,
     }
     if (!notifyd_webhook_headers(options, &headers, error, error_len))
         goto cleanup_curl;
+    /* Opt-in relay ingest shape.  The native payload carries the catalog event in
+     * "event" and a per-occurrence hash in "id", which is the opposite of what
+     * the relay contract calls event_id, so the two cannot be sent as-is. */
+    post_body = item->payload_json;
+    if (notifyd_json_bool(options, "relay_ingest", 0)) {
+        relay_body = notifyd_relay_ingest_body(item, options, error, error_len);
+        if (!relay_body)
+            goto cleanup_curl;
+        post_body = relay_body;
+    }
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, item->payload_json);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(item->payload_json));
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_body);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(post_body));
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)timeout_ms);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -206,6 +330,7 @@ cleanup_curl:
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 done:
+    free(relay_body);
     json_object_put(options);
     return ok;
 }

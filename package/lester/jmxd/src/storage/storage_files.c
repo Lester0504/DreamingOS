@@ -35,6 +35,7 @@
 #define STORAGE_FILES_MAX_SEARCH 128
 #define STORAGE_FILES_MAX_TEXT_BYTES (256U * 1024U)
 #define STORAGE_FILES_MAX_PROBE_BYTES (4U * 1024U * 1024U)
+#define STORAGE_FILES_TRANSACTION_PREFIX ".dreamingwrt-tx-"
 
 enum storage_files_api_code {
     STORAGE_FILES_API_SUCCESS = 2000,
@@ -141,6 +142,124 @@ static int storage_files_option_present(const char *options, const char *wanted)
             break;
         cursor = end + 1;
     }
+    return 0;
+}
+
+/* Files whose contents must never be served even when their filesystem is
+ * browsable.  Opening system disks for browsing is a deliberate product choice,
+ * but credential stores and live databases are not ordinary documents: reading
+ * them yields secrets or a torn snapshot, so they are denied at the server. */
+static int storage_files_secret_basename(const char *name)
+{
+    static const char *const exact[] = {
+        "shadow", "gshadow", "shadow-", "gshadow-",
+        "master.passwd", "sudoers", NULL
+    };
+    static const char *const suffixes[] = {
+        ".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3",
+        ".key", ".pem", ".p8", ".p12", ".pfx", ".jks", ".keystore", NULL
+    };
+    size_t len;
+    int i;
+
+    if (!name || !name[0])
+        return 0;
+    for (i = 0; exact[i]; i++)
+        if (!strcmp(name, exact[i]))
+            return 1;
+    len = strlen(name);
+    for (i = 0; suffixes[i]; i++) {
+        size_t sl = strlen(suffixes[i]);
+
+        if (len > sl && !strcasecmp(name + len - sl, suffixes[i]))
+            return 1;
+    }
+    return 0;
+}
+
+/* Directory subtrees whose file contents are withheld.  Listing is still
+ * allowed so the tree stays navigable; only reading bytes is refused. */
+static int storage_files_secret_path(const char *abs_path)
+{
+    static const char *const prefixes[] = {
+        "/etc/dreamingwrt", "/etc/shadow", "/etc/config",
+        "/etc/ssl/private", "/etc/dropbear", "/etc/ssh",
+        "/root/.ssh", "/data/dreamingwrt", NULL
+    };
+    int i;
+
+    if (!abs_path || !abs_path[0])
+        return 0;
+    for (i = 0; prefixes[i]; i++)
+        if (storage_files_path_prefix(abs_path, prefixes[i]))
+            return 1;
+    return 0;
+}
+
+int storage_files_content_denied(const char *abs_path, const char *basename,
+                                 const char **reason)
+{
+    if (storage_files_secret_path(abs_path)) {
+        if (reason)
+            *reason = "protected_system_path";
+        return 1;
+    }
+    if (storage_files_secret_basename(basename)) {
+        if (reason)
+            *reason = "protected_credential_or_database_file";
+        return 1;
+    }
+    if (reason)
+        *reason = "";
+    return 0;
+}
+
+/* Write/rename deny-list.  The product decision is to let operators browse and
+ * edit ordinary files instead of hiding whole disks, so the compensating control
+ * is that anything able to change how the system boots, authenticates, or
+ * executes code stays read-only here.  File management moves bytes; it must not
+ * become a way to land an executable or rewrite a service definition. */
+int storage_files_write_denied(const char *abs_path, const char **reason)
+{
+    static const char *const exec_prefixes[] = {
+        "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/lib", "/usr/lib",
+        "/etc/init.d", "/etc/rc.d", "/etc/hotplug.d", "/etc/crontabs",
+        "/etc/uci-defaults", "/etc/profile.d", "/boot", "/lib/modules", NULL
+    };
+    const char *base;
+    int i;
+
+    if (!abs_path || !abs_path[0]) {
+        if (reason)
+            *reason = "";
+        return 0;
+    }
+    base = strrchr(abs_path, '/');
+    base = base ? base + 1 : abs_path;
+    if (storage_files_secret_path(abs_path)) {
+        if (reason)
+            *reason = "protected_system_path";
+        return 1;
+    }
+    if (storage_files_secret_basename(base)) {
+        if (reason)
+            *reason = "protected_credential_or_database_file";
+        return 1;
+    }
+    for (i = 0; exec_prefixes[i]; i++)
+        if (storage_files_path_prefix(abs_path, exec_prefixes[i])) {
+            if (reason)
+                *reason = "protected_executable_or_boot_path";
+            return 1;
+        }
+    if (!strcmp(base, "passwd") || !strcmp(base, "group") ||
+        !strcmp(base, "fstab") || !strcmp(base, "inittab")) {
+        if (reason)
+            *reason = "protected_system_account_or_boot_file";
+        return 1;
+    }
+    if (reason)
+        *reason = "";
     return 0;
 }
 
@@ -943,6 +1062,16 @@ struct json_object *jmx_storage_files_content(const char *root_id,
         !relative[0])
         return storage_files_error("invalid_relative_path",
                                    "file path must remain inside the selected storage root");
+    {
+        const char *deny_reason = "";
+        const char *base = strrchr(display, '/');
+
+        /* Refuse before opening: a credential store or live database must not be
+         * served even if every path guard above is satisfied. */
+        if (storage_files_content_denied(display, base ? base + 1 : display,
+                                         &deny_reason))
+            return storage_files_error("content_protected", deny_reason);
+    }
     fd = storage_files_open_regular(root, relative, &initial);
     if (fd < 0)
         return storage_files_error(errno == EXDEV ? "mount_boundary_rejected" :
@@ -1010,4 +1139,438 @@ struct json_object *jmx_storage_files_content(const char *root_id,
     json_object_object_add(data, "truncated", json_object_new_boolean(0));
     free(content);
     return jmx_gen_api_response_data(STORAGE_FILES_API_SUCCESS, data);
+}
+
+static const char *storage_files_json_string(struct json_object *object,
+                                             const char *key)
+{
+    struct json_object *value = NULL;
+
+    if (!object || !json_object_object_get_ex(object, key, &value) || !value ||
+        !json_object_is_type(value, json_type_string))
+        return "";
+    return json_object_get_string(value);
+}
+
+static int storage_files_json_bool(struct json_object *object, const char *key)
+{
+    struct json_object *value = NULL;
+
+    return object && json_object_object_get_ex(object, key, &value) && value &&
+           json_object_is_type(value, json_type_boolean) &&
+           json_object_get_boolean(value);
+}
+
+static int storage_files_safe_name(const char *name)
+{
+    size_t i, length;
+
+    if (!name || !name[0] || !strcmp(name, ".") || !strcmp(name, ".."))
+        return 0;
+    length = strlen(name);
+    if (length > NAME_MAX || !strncmp(name, STORAGE_FILES_TRANSACTION_PREFIX,
+                                      strlen(STORAGE_FILES_TRANSACTION_PREFIX)))
+        return 0;
+    for (i = 0; i < length; i++)
+        if ((unsigned char)name[i] < 0x20 || name[i] == '/' || name[i] == '\\')
+            return 0;
+    return 1;
+}
+
+static int storage_files_join_path(char *out, size_t out_len,
+                                   const char *parent, const char *name)
+{
+    size_t parent_len, name_len;
+    int slash;
+
+    if (!out || out_len < 2 || !parent || !parent[0] || !name || !name[0])
+        return -1;
+    parent_len = strlen(parent);
+    name_len = strlen(name);
+    slash = parent[parent_len - 1] != '/';
+    if (parent_len >= out_len || name_len >= out_len ||
+        parent_len + (size_t)slash > out_len - name_len - 1)
+        return -1;
+    memcpy(out, parent, parent_len);
+    if (slash)
+        out[parent_len++] = '/';
+    memcpy(out + parent_len, name, name_len);
+    out[parent_len + name_len] = 0;
+    return 0;
+}
+
+static void storage_files_etag(const struct stat *st, char *out, size_t out_len)
+{
+    snprintf(out, out_len, "W/\"%llx-%llx-%llx\"",
+             (unsigned long long)st->st_ino,
+             (unsigned long long)st->st_size,
+             (unsigned long long)st->st_mtime);
+}
+
+static struct json_object *storage_files_mutation_result(
+    const char *transaction_id, const char *action, const char *path,
+    int changed, int persisted, int applied, int readback_verified,
+    int rolled_back, int cleanup_pending)
+{
+    struct json_object *data = json_object_new_object();
+
+    json_object_object_add(data, "contract_version",
+                           json_object_new_string("storage-files.v1"));
+    json_object_object_add(data, "transaction_id",
+                           json_object_new_string(transaction_id));
+    json_object_object_add(data, "action", json_object_new_string(action));
+    json_object_object_add(data, "path", json_object_new_string(path));
+    json_object_object_add(data, "changed", json_object_new_boolean(changed));
+    json_object_object_add(data, "persisted", json_object_new_boolean(persisted));
+    json_object_object_add(data, "applied", json_object_new_boolean(applied));
+    json_object_object_add(data, "apply_scope",
+                           json_object_new_string("filesystem_namespace"));
+    json_object_object_add(data, "readback_verified",
+                           json_object_new_boolean(readback_verified));
+    json_object_object_add(data, "rolled_back",
+                           json_object_new_boolean(rolled_back));
+    json_object_object_add(data, "cleanup_pending",
+                           json_object_new_boolean(cleanup_pending));
+    return jmx_gen_api_response_data(STORAGE_FILES_API_SUCCESS, data);
+}
+
+static struct json_object *storage_files_mutation_error(
+    const char *code, const char *message, const char *transaction_id,
+    int changed, int rolled_back)
+{
+    struct json_object *response = storage_files_error(code, message);
+    struct json_object *data = NULL;
+
+    if (json_object_object_get_ex(response, "data", &data) && data) {
+        json_object_object_add(data, "transaction_id",
+                               json_object_new_string(transaction_id));
+        json_object_object_add(data, "changed", json_object_new_boolean(changed));
+        json_object_object_add(data, "persisted", json_object_new_boolean(0));
+        json_object_object_add(data, "applied", json_object_new_boolean(0));
+        json_object_object_add(data, "readback_verified",
+                               json_object_new_boolean(0));
+        json_object_object_add(data, "rolled_back",
+                               json_object_new_boolean(rolled_back));
+    }
+    return response;
+}
+
+static int storage_files_write_all(int fd, const unsigned char *data, size_t len)
+{
+    size_t offset = 0;
+
+    while (offset < len) {
+        ssize_t written = write(fd, data + offset, len - offset);
+
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return -1;
+        offset += (size_t)written;
+    }
+    return 0;
+}
+
+static int storage_files_split_relative(const char *relative, char *parent,
+                                        size_t parent_len, char *name,
+                                        size_t name_len)
+{
+    const char *slash;
+
+    if (!relative || !relative[0])
+        return -1;
+    slash = strrchr(relative, '/');
+    if (!slash) {
+        parent[0] = '\0';
+        return snprintf(name, name_len, "%s", relative) < (int)name_len ? 0 : -1;
+    }
+    if ((size_t)(slash - relative) >= parent_len ||
+        snprintf(name, name_len, "%s", slash + 1) >= (int)name_len)
+        return -1;
+    memcpy(parent, relative, (size_t)(slash - relative));
+    parent[slash - relative] = '\0';
+    return 0;
+}
+
+struct json_object *jmx_storage_files_mutate(struct json_object *payload)
+{
+    struct storage_file_root roots[STORAGE_FILES_MAX_ROOTS];
+    const struct storage_file_root *root;
+    const char *action = storage_files_json_string(payload, "action");
+    const char *root_id = storage_files_json_string(payload, "root_id");
+    const char *path = storage_files_json_string(payload, "path");
+    const char *name = storage_files_json_string(payload, "name");
+    const char *new_name = storage_files_json_string(payload, "new_name");
+    const char *content = storage_files_json_string(payload, "content");
+    const char *expected_etag = storage_files_json_string(payload, "expected_etag");
+    char relative[PATH_MAX], display[PATH_MAX], parent[PATH_MAX], leaf[NAME_MAX + 1];
+    char transaction_id[96], temporary[NAME_MAX + 1], result_path[PATH_MAX];
+    int root_count, parent_fd = -1, temp_fd = -1, changed = 0, rolled_back = 0;
+    struct stat before, after;
+    unsigned int nonce = (unsigned int)time(NULL) ^ (unsigned int)getpid();
+
+    snprintf(transaction_id, sizeof(transaction_id), "storage-%lld-%u",
+             (long long)time(NULL), nonce);
+    if (!payload || !json_object_is_type(payload, json_type_object) ||
+        !storage_files_json_bool(payload, "confirm"))
+        return storage_files_mutation_error("confirmation_required",
+            "confirm=true is required for storage writes", transaction_id, 0, 0);
+    if (strcmp(action, "mkdir") && strcmp(action, "create") &&
+        strcmp(action, "write") && strcmp(action, "rename"))
+        return storage_files_mutation_error("unsupported_action",
+            "only mkdir, create, write and rename are supported", transaction_id, 0, 0);
+    root_count = storage_files_discover_roots(roots, STORAGE_FILES_MAX_ROOTS);
+    if (root_count < 0)
+        return storage_files_mutation_error("mount_inventory_unavailable",
+            "mount inventory is unavailable", transaction_id, 0, 0);
+    root = storage_files_select_root(roots, root_count, root_id, path);
+    if (!root)
+        return storage_files_mutation_error("storage_root_not_found",
+            "storage root is not available", transaction_id, 0, 0);
+    if (root->read_only)
+        return storage_files_mutation_error("storage_root_read_only",
+            "selected storage root is read only", transaction_id, 0, 0);
+    if (storage_files_relative_path(root, path, relative, sizeof(relative),
+                                    display, sizeof(display)) != 0)
+        return storage_files_mutation_error("invalid_relative_path",
+            "path must remain inside the selected storage root", transaction_id, 0, 0);
+    {
+        const char *deny_reason = "";
+        char candidate[PATH_MAX];
+
+        /* Deny writes into protected subtrees, and deny creating a protected
+         * name inside an otherwise writable directory.  Checked here rather than
+         * only at the HTTP layer so the guard holds for any future caller. */
+        if (storage_files_write_denied(display, &deny_reason))
+            return storage_files_mutation_error("write_protected", deny_reason,
+                                                transaction_id, 0, 0);
+        if (name && name[0] &&
+            storage_files_join_path(candidate, sizeof(candidate), display, name) == 0 &&
+            storage_files_write_denied(candidate, &deny_reason))
+            return storage_files_mutation_error("write_protected", deny_reason,
+                                                transaction_id, 0, 0);
+        if (new_name && new_name[0] &&
+            storage_files_join_path(candidate, sizeof(candidate), display, new_name) == 0 &&
+            storage_files_write_denied(candidate, &deny_reason))
+            return storage_files_mutation_error("write_protected", deny_reason,
+                                                transaction_id, 0, 0);
+    }
+
+    if (!strcmp(action, "mkdir") || !strcmp(action, "create")) {
+        if (!storage_files_safe_name(name))
+            return storage_files_mutation_error("invalid_name",
+                "name must be one safe path component", transaction_id, 0, 0);
+        parent_fd = storage_files_open_directory(root, relative);
+        if (parent_fd < 0)
+            return storage_files_mutation_error("directory_unavailable",
+                "parent directory cannot be opened safely", transaction_id, 0, 0);
+        if (storage_files_join_path(result_path, sizeof(result_path), display,
+                                    name) != 0)
+            goto invalid_path;
+        if (!strcmp(action, "mkdir")) {
+            if (mkdirat(parent_fd, name, 0755) != 0)
+                goto mutation_failed;
+            changed = 1;
+            if (fsync(parent_fd) != 0 ||
+                fstatat(parent_fd, name, &after, AT_SYMLINK_NOFOLLOW) != 0 ||
+                !S_ISDIR(after.st_mode) || after.st_dev != root->dev) {
+                rolled_back = unlinkat(parent_fd, name, AT_REMOVEDIR) == 0;
+                fsync(parent_fd);
+                goto mutation_failed;
+            }
+        } else {
+            size_t content_len = strlen(content);
+
+            if (content_len > STORAGE_FILES_MAX_TEXT_BYTES ||
+                !storage_files_utf8_text((const unsigned char *)content, content_len))
+                goto invalid_content;
+            snprintf(temporary, sizeof(temporary), "%s%u",
+                     STORAGE_FILES_TRANSACTION_PREFIX, nonce);
+            temp_fd = openat(parent_fd, temporary,
+                             O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                             0644);
+            if (temp_fd < 0)
+                goto mutation_failed;
+            if (storage_files_write_all(temp_fd,
+                                        (const unsigned char *)content,
+                                        content_len) != 0 || fsync(temp_fd) != 0 ||
+                close(temp_fd) != 0) {
+                temp_fd = -1;
+                unlinkat(parent_fd, temporary, 0);
+                goto mutation_failed;
+            }
+            temp_fd = -1;
+#ifdef __linux__
+            if (syscall(SYS_renameat2, parent_fd, temporary, parent_fd, name,
+                        RENAME_NOREPLACE) != 0) {
+                unlinkat(parent_fd, temporary, 0);
+                goto mutation_failed;
+            }
+            changed = 1;
+            if (fsync(parent_fd) != 0 ||
+                fstatat(parent_fd, name, &after, AT_SYMLINK_NOFOLLOW) != 0 ||
+                !S_ISREG(after.st_mode) || after.st_dev != root->dev ||
+                (uint64_t)after.st_size != content_len) {
+                rolled_back = unlinkat(parent_fd, name, 0) == 0;
+                fsync(parent_fd);
+                goto mutation_failed;
+            }
+#else
+            unlinkat(parent_fd, temporary, 0);
+            errno = ENOTSUP;
+            goto mutation_failed;
+#endif
+        }
+        close(parent_fd);
+        return storage_files_mutation_result(transaction_id, action, result_path,
+                                             1, 1, 1, 1, 0, 0);
+    }
+
+    if (!relative[0] ||
+        storage_files_split_relative(relative, parent, sizeof(parent), leaf,
+                                     sizeof(leaf)) != 0 ||
+        !storage_files_safe_name(leaf))
+        goto invalid_path;
+    parent_fd = storage_files_open_directory(root, parent);
+    if (parent_fd < 0)
+        return storage_files_mutation_error("directory_unavailable",
+            "parent directory cannot be opened safely", transaction_id, 0, 0);
+    if (fstatat(parent_fd, leaf, &before, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(before.st_mode) || before.st_dev != root->dev)
+        goto mutation_failed;
+    if (!strcmp(action, "rename")) {
+        char parent_display[PATH_MAX];
+
+        if (!storage_files_safe_name(new_name))
+            goto invalid_name;
+        if (parent[0]) {
+            if (storage_files_join_path(parent_display, sizeof(parent_display),
+                                        root->path, parent) != 0 ||
+                storage_files_join_path(result_path, sizeof(result_path),
+                                        parent_display, new_name) != 0)
+                goto invalid_path;
+        } else if (storage_files_join_path(result_path, sizeof(result_path),
+                                           root->path, new_name) != 0) {
+            goto invalid_path;
+        }
+#ifdef __linux__
+        if (syscall(SYS_renameat2, parent_fd, leaf, parent_fd, new_name,
+                    RENAME_NOREPLACE) != 0)
+            goto mutation_failed;
+        changed = 1;
+        if (fsync(parent_fd) != 0 ||
+            fstatat(parent_fd, new_name, &after, AT_SYMLINK_NOFOLLOW) != 0 ||
+            after.st_dev != before.st_dev || after.st_ino != before.st_ino) {
+            rolled_back = syscall(SYS_renameat2, parent_fd, new_name, parent_fd,
+                                  leaf, RENAME_NOREPLACE) == 0;
+            fsync(parent_fd);
+            goto mutation_failed;
+        }
+#else
+        errno = ENOTSUP;
+        goto mutation_failed;
+#endif
+        close(parent_fd);
+        return storage_files_mutation_result(transaction_id, action, result_path,
+                                             1, 1, 1, 1, 0, 0);
+    }
+
+    if (!expected_etag[0]) {
+        close(parent_fd);
+        return storage_files_mutation_error("expected_etag_required",
+            "expected_etag is required for replacing text", transaction_id, 0, 0);
+    }
+    {
+        char current_etag[128];
+        size_t content_len = strlen(content);
+
+        storage_files_etag(&before, current_etag, sizeof(current_etag));
+        if (strcmp(current_etag, expected_etag)) {
+            close(parent_fd);
+            return storage_files_mutation_error("revision_conflict",
+                "file changed since it was read", transaction_id, 0, 0);
+        }
+        if (content_len > STORAGE_FILES_MAX_TEXT_BYTES ||
+            !storage_files_utf8_text((const unsigned char *)content, content_len))
+            goto invalid_content;
+        snprintf(temporary, sizeof(temporary), "%s%u", STORAGE_FILES_TRANSACTION_PREFIX,
+                 nonce);
+        temp_fd = openat(parent_fd, temporary,
+                         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                         before.st_mode & 0777);
+        if (temp_fd < 0 ||
+            storage_files_write_all(temp_fd, (const unsigned char *)content,
+                                    content_len) != 0 ||
+            fsync(temp_fd) != 0 || close(temp_fd) != 0) {
+            if (temp_fd >= 0)
+                close(temp_fd);
+            temp_fd = -1;
+            unlinkat(parent_fd, temporary, 0);
+            goto mutation_failed;
+        }
+        temp_fd = -1;
+#ifdef __linux__
+        if (fstatat(parent_fd, leaf, &after, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !storage_files_stat_unchanged(&before, &after) ||
+            syscall(SYS_renameat2, parent_fd, temporary, parent_fd, leaf,
+                    RENAME_EXCHANGE) != 0) {
+            unlinkat(parent_fd, temporary, 0);
+            goto mutation_failed;
+        }
+        changed = 1;
+        if (fsync(parent_fd) != 0 ||
+            fstatat(parent_fd, leaf, &after, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(after.st_mode) || after.st_dev != root->dev ||
+            (uint64_t)after.st_size != content_len) {
+            if (syscall(SYS_renameat2, parent_fd, temporary, parent_fd, leaf,
+                        RENAME_EXCHANGE) == 0) {
+                rolled_back = 1;
+                unlinkat(parent_fd, temporary, 0);
+                fsync(parent_fd);
+            }
+            goto mutation_failed;
+        }
+        if (unlinkat(parent_fd, temporary, 0) != 0) {
+            close(parent_fd);
+            return storage_files_mutation_result(transaction_id, action, display,
+                                                 1, 1, 1, 1, 0, 1);
+        }
+        if (fsync(parent_fd) != 0) {
+            close(parent_fd);
+            return storage_files_mutation_result(transaction_id, action, display,
+                                                 1, 1, 1, 1, 0, 0);
+        }
+#else
+        unlinkat(parent_fd, temporary, 0);
+        errno = ENOTSUP;
+        goto mutation_failed;
+#endif
+    }
+    close(parent_fd);
+    return storage_files_mutation_result(transaction_id, action, display,
+                                         1, 1, 1, 1, 0, 0);
+
+invalid_content:
+    if (parent_fd >= 0)
+        close(parent_fd);
+    return storage_files_mutation_error("invalid_text_content",
+        "content must be UTF-8 text no larger than 256 KiB", transaction_id, 0, 0);
+invalid_name:
+    if (parent_fd >= 0)
+        close(parent_fd);
+    return storage_files_mutation_error("invalid_name",
+        "name must be one safe path component", transaction_id, 0, 0);
+invalid_path:
+    if (parent_fd >= 0)
+        close(parent_fd);
+    return storage_files_mutation_error("invalid_relative_path",
+        "path must remain inside the selected storage root", transaction_id, 0, 0);
+mutation_failed:
+    if (temp_fd >= 0)
+        close(temp_fd);
+    if (parent_fd >= 0)
+        close(parent_fd);
+    return storage_files_mutation_error("filesystem_transaction_failed",
+        "filesystem transaction failed and was not committed", transaction_id,
+        changed, rolled_back);
 }

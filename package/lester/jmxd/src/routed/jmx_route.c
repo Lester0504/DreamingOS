@@ -2246,6 +2246,79 @@ static int route_read_wan_runtime(const char *name, char *device, size_t device_
     return rc == SQLITE_ROW ? 0 : -1;
 }
 
+/* The nexthop the kernel is actually using for a device.
+ *
+ * route_status reported only the gateway registered into the jmx_route module
+ * and route_config_get only the configured value; acceptance found all three
+ * disagreeing with `ip route` (A-013).  /proc/net/route answers this without a
+ * subprocess, which matters because route_status is polled.
+ *
+ * Two passes, because a multi-WAN box does not keep every default route in the
+ * main table.  First a real default route on that device.  Failing that, the
+ * device's /32 on-link route, which on a PPPoE link is the peer address and is
+ * exactly what a p2p nexthop means.  `via_peer` reports which pass matched so
+ * the caller is not told a peer address is a default gateway.
+ */
+static int route_proc_device_nexthop(const char *device, char *out, size_t out_len,
+                                     int *via_peer)
+{
+    FILE *fp;
+    char line[256];
+    char peer[64] = "";
+    int found = 0;
+
+    if (via_peer)
+        *via_peer = 0;
+    if (!out || out_len == 0)
+        return -1;
+    out[0] = '\0';
+    if (!device || !device[0])
+        return -1;
+    fp = fopen("/proc/net/route", "r");
+    if (!fp)
+        return -1;
+    /* Skip the header row. */
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return -1;
+    }
+    while (fgets(line, sizeof(line), fp)) {
+        char iface[64] = "";
+        unsigned long dest = 0, gw = 0, mask = 0;
+        unsigned flags = 0;
+        int refcnt = 0, use = 0, metric = 0;
+        struct in_addr addr;
+
+        if (sscanf(line, "%63s %lx %lx %x %d %d %d %lx",
+                   iface, &dest, &gw, &flags, &refcnt, &use, &metric, &mask) != 8)
+            continue;
+        if (strcmp(iface, device))
+            continue;
+        /* /proc/net/route prints addresses as the in_addr in host byte order,
+         * so the value assigns straight into s_addr. */
+        if (dest == 0 && mask == 0 && gw != 0) {
+            addr.s_addr = (in_addr_t)gw;
+            if (inet_ntop(AF_INET, &addr, out, (socklen_t)out_len)) {
+                found = 1;
+                break;
+            }
+        }
+        if (!peer[0] && mask == 0xFFFFFFFFUL && gw == 0 && dest != 0) {
+            addr.s_addr = (in_addr_t)dest;
+            if (!inet_ntop(AF_INET, &addr, peer, sizeof(peer)))
+                peer[0] = '\0';
+        }
+    }
+    fclose(fp);
+    if (!found && peer[0]) {
+        snprintf(out, out_len, "%s", peer);
+        if (via_peer)
+            *via_peer = 1;
+        found = 1;
+    }
+    return found ? 0 : -1;
+}
+
 static void route_enrich_wan_runtime(struct json_object *w, const char *name)
 {
     char device[64] = "";
@@ -2299,8 +2372,37 @@ static void route_enrich_wan_runtime(struct json_object *w, const char *name)
     json_object_object_add(w, "up_rate", json_object_new_int64(fresh ? tx_rate : 0));
     json_object_object_add(w, "rate_down", json_object_new_int64(fresh ? rx_rate : 0));
     json_object_object_add(w, "rate_up", json_object_new_int64(fresh ? tx_rate : 0));
-    json_object_object_add(w, "down_bytes", json_object_new_int64((int64_t)rx_bytes));
-    json_object_object_add(w, "up_bytes", json_object_new_int64((int64_t)tx_bytes));
+    /* Cumulative bytes go through the shared publisher: the sampled counter is
+     * the runtime device's, and for PPPoE that device is recreated on every
+     * reconnect, so the raw value means "since last connect" (Acceptance
+     * A-013). */
+    jmx_db_add_wan_cumulative_bytes(w, name, (int64_t)rx_bytes, (int64_t)tx_bytes);
+    /* Gateway provenance.  Keep whatever the module reported as
+     * `module_gateway`, and expose the kernel's live nexthop separately so a
+     * caller can tell a stale registration from the route actually in force. */
+    {
+        char live_gw[64] = "";
+        const char *dev = device[0] ? device : NULL;
+        const char *module_gw = route_obj_str(w, "gateway", "");
+        int via_peer = 0;
+
+        if (dev && route_proc_device_nexthop(dev, live_gw, sizeof(live_gw), &via_peer) == 0) {
+            json_object_object_add(w, "module_gateway", json_object_new_string(module_gw));
+            json_object_object_add(w, "kernel_gateway", json_object_new_string(live_gw));
+            json_object_object_add(w, "gateway_source",
+                                   json_object_new_string(via_peer ? "proc_net_route_p2p_peer"
+                                                                  : "proc_net_route_default"));
+            json_object_object_add(w, "gateway_matches_kernel",
+                                   json_object_new_boolean(module_gw && !strcmp(module_gw, live_gw)));
+            /* `gateway` is what callers already read, so make it the value that
+             * is actually routing traffic. */
+            json_object_object_add(w, "gateway", json_object_new_string(live_gw));
+        } else {
+            json_object_object_add(w, "gateway_source",
+                                   json_object_new_string(dev ? "module_registration" : "unknown_device"));
+            json_object_object_add(w, "gateway_matches_kernel", json_object_new_boolean(0));
+        }
+    }
     json_object_object_add(w, "latency", json_object_new_int(latency));
     json_object_object_add(w, "loss", json_object_new_int(loss));
     json_object_object_add(w, "health_measured", json_object_new_boolean(latency >= 0 || loss >= 0));
@@ -2499,6 +2601,9 @@ static struct json_object *route_build_policy_groups(struct json_object *data)
     int64_t total_down = 0;
     int64_t total_up = 0;
     int64_t active_flows = 0;
+    int64_t group_hits = 0;
+    int64_t balance_rules = 0;
+    struct json_object *rules = NULL;
     if (json_object_object_get_ex(data, "wans", &wans) && json_object_is_type(wans, json_type_array)) n = json_object_array_length(wans);
     for (i = 0; i < n; i++) {
         struct json_object *w = json_object_array_get_idx(wans, i), *m = json_object_new_object();
@@ -2517,6 +2622,11 @@ static struct json_object *route_build_policy_groups(struct json_object *data)
         json_object_object_add(m, "down_rate", json_object_new_int64(sample_valid ? down : 0));
         json_object_object_add(m, "up_rate", json_object_new_int64(sample_valid ? up : 0));
         json_object_object_add(m, "active_flows", json_object_new_int64(active));
+        /* Same cumulative kernel counter as the WAN table, not a live count.
+         * It restarts from zero whenever core re-pushes the rule set, which
+         * jmx_route_sync_config() does on every core startup. */
+        json_object_object_add(m, "active_flows_semantics",
+            json_object_new_string("cumulative_per_wan_connection_count_since_rule_push"));
         active_flows += active;
         if (sample_valid) {
             valid_members++;
@@ -2532,7 +2642,31 @@ static struct json_object *route_build_policy_groups(struct json_object *data)
     json_object_object_add(g, "mode", json_object_new_string("weighted"));
     json_object_object_add(g, "members", members);
     json_object_object_add(g, "active_flows", json_object_new_int64(active_flows));
-    json_object_object_add(g, "hit_count", json_object_new_int64(0));
+    /* Was hardcoded 0 while the load-balance rule behind this group reported
+     * six-figure hit_count, which read as "the group never matched anything".
+     * Sum the hits of the rules that actually target this group instead. */
+    if (json_object_object_get_ex(data, "rules", &rules) &&
+        json_object_is_type(rules, json_type_array)) {
+        int ri;
+        int rn = json_object_array_length(rules);
+
+        for (ri = 0; ri < rn; ri++) {
+            struct json_object *r = json_object_array_get_idx(rules, ri);
+            const char *wan_ids = route_obj_str(r, "wan_ids", "");
+
+            /* A rule spanning several WANs is a load-balance rule, i.e. this group. */
+            if (!wan_ids || !strchr(wan_ids, ','))
+                continue;
+            group_hits += route_obj_i64(r, "hit_count", 0);
+            balance_rules++;
+        }
+    }
+    json_object_object_add(g, "hit_count", json_object_new_int64(group_hits));
+    json_object_object_add(g, "hit_count_semantics",
+        json_object_new_string("cumulative_packet_hits_of_load_balance_rules_since_rule_push"));
+    json_object_object_add(g, "hit_count_rule_count", json_object_new_int64(balance_rules));
+    json_object_object_add(g, "active_flows_semantics",
+        json_object_new_string("cumulative_per_wan_connection_count_since_rule_push"));
     json_object_object_add(g, "down_rate", json_object_new_int64(total_down));
     json_object_object_add(g, "up_rate", json_object_new_int64(total_up));
     json_object_object_add(g, "sample_valid", json_object_new_boolean(valid_members > 0));
@@ -2579,6 +2713,142 @@ static struct json_object *route_build_decisions(struct json_object *data)
     return arr;
 }
 
+/* Instantaneous steering counts, read from conntrack fwmarks.
+ *
+ * The kernel's per-WAN "active_conn" in /proc/dreamingwrt/jmx/jmx_route is a
+ * cumulative counter, not a live one: on 30.1 it only ever grows (1860 -> 1868
+ * over five seconds) and the two WAN values sum to 2722 while the whole
+ * conntrack table holds 864 entries. Publishing it as "active_flows" is what
+ * made the UI show a policy ratio of 0.0% against a six-figure denominator.
+ *
+ * conntrack marks do carry the live picture. jmx_route writes
+ * mark = (rule_prio << 16) | wan_id, verified on 30.1: every one of the 905
+ * marked/unmarked entries decoded to a known rule priority and WAN id with zero
+ * leftovers (marks 6553601 -> prio 100/wan 1, 7208962 -> prio 110/wan 2,
+ * 65536001/65536002 -> prio 1000 load-balance, 0 -> unsteered).
+ *
+ * A rule with a non-zero carrier_id is an explicit policy (operator steering);
+ * carrier_id 0 is the default load-balance rule. Counting them separately is
+ * what lets the UI say "policy steered" without lying. */
+struct route_mark_counts {
+    int64_t total;          /* conntrack entries examined */
+    int64_t explicit_steer; /* matched an explicit (carrier) policy rule */
+    int64_t load_balance;   /* matched the default load-balance rule */
+    int64_t unsteered;      /* mark=0, no policy applied */
+    int64_t unknown;        /* marked, but not attributable to a known rule */
+    /* Per-rule live counts, parallel to the enabled-rule table below. */
+    int prio[64];
+    int64_t per_prio[64];
+    int prio_n;
+};
+
+static int route_count_conntrack_marks(struct json_object *data,
+                                       struct route_mark_counts *out)
+{
+    struct json_object *rules = NULL;
+    struct json_object *wans = NULL;
+    /* prio -> carrier_id, small linear table (rule counts are single digits). */
+    struct { int prio; int carrier; } rule_map[64];
+    int rule_map_n = 0;
+    int wan_ids[32];
+    int wan_n = 0;
+    FILE *fp;
+    char line[2048];
+    int i;
+
+    if (!out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    if (!data)
+        return -1;
+
+    if (json_object_object_get_ex(data, "rules", &rules) &&
+        json_object_is_type(rules, json_type_array)) {
+        int n = json_object_array_length(rules);
+
+        for (i = 0; i < n && rule_map_n < (int)(sizeof(rule_map) / sizeof(rule_map[0])); i++) {
+            struct json_object *r = json_object_array_get_idx(rules, i);
+
+            if (!route_obj_int(r, "enabled", 0))
+                continue;
+            rule_map[rule_map_n].prio = route_obj_int(r, "prio", 0);
+            rule_map[rule_map_n].carrier = route_obj_int(r, "carrier_id", 0);
+            rule_map_n++;
+        }
+    }
+    if (json_object_object_get_ex(data, "wans", &wans) &&
+        json_object_is_type(wans, json_type_array)) {
+        int n = json_object_array_length(wans);
+
+        for (i = 0; i < n && wan_n < (int)(sizeof(wan_ids) / sizeof(wan_ids[0])); i++)
+            wan_ids[wan_n++] = route_obj_int(json_object_array_get_idx(wans, i), "id", 0);
+    }
+    if (rule_map_n == 0 || wan_n == 0)
+        return -1;
+    out->prio_n = rule_map_n;
+    for (i = 0; i < rule_map_n; i++) {
+        out->prio[i] = rule_map[i].prio;
+        out->per_prio[i] = 0;
+    }
+
+    fp = fopen("/proc/net/nf_conntrack", "r");
+    if (!fp)
+        return -1;
+    while (fgets(line, sizeof(line), fp)) {
+        const char *m = strstr(line, "mark=");
+        unsigned long mark;
+        int prio;
+        int wan;
+        int carrier = -1;
+        int wan_known = 0;
+
+        out->total++;
+        if (!m) {
+            out->unsteered++;
+            continue;
+        }
+        mark = strtoul(m + 5, NULL, 10);
+        if (mark == 0) {
+            out->unsteered++;
+            continue;
+        }
+        prio = (int)(mark >> 16);
+        wan = (int)(mark & 0xFFFF);
+        {
+            int slot = -1;
+
+            for (i = 0; i < rule_map_n; i++) {
+                if (rule_map[i].prio == prio) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot >= 0)
+                out->per_prio[slot]++;
+        }
+        for (i = 0; i < rule_map_n; i++) {
+            if (rule_map[i].prio == prio) {
+                carrier = rule_map[i].carrier;
+                break;
+            }
+        }
+        for (i = 0; i < wan_n; i++) {
+            if (wan_ids[i] == wan) {
+                wan_known = 1;
+                break;
+            }
+        }
+        if (carrier < 0 || !wan_known)
+            out->unknown++;
+        else if (carrier > 0)
+            out->explicit_steer++;
+        else
+            out->load_balance++;
+    }
+    fclose(fp);
+    return 0;
+}
+
 static void route_enrich_status(struct json_object *data)
 {
     struct json_object *policy = json_object_new_object();
@@ -2590,6 +2860,9 @@ static void route_enrich_status(struct json_object *data)
     int64_t hit_total = 0;
     int64_t last_hit_at = 0;
     int64_t active_flows = 0;
+    int64_t cumulative_conn = 0;
+    struct route_mark_counts marks;
+    int marks_ok;
     const char *counter_reason;
     int main_nondefault_count;
     int main_nondefault_ready;
@@ -2607,8 +2880,8 @@ static void route_enrich_status(struct json_object *data)
         if (json_object_object_get_ex(data, "wans", &wans) &&
             json_object_is_type(wans, json_type_array)) {
             for (i = 0; i < json_object_array_length(wans); i++)
-                active_flows += route_obj_i64(json_object_array_get_idx(wans, i),
-                                              "active_conn", 0);
+                cumulative_conn += route_obj_i64(json_object_array_get_idx(wans, i),
+                                                 "active_conn", 0);
         }
     }
     if (json_object_object_get_ex(data, "rules", &rules) && json_object_is_type(rules, json_type_array)) {
@@ -2623,6 +2896,40 @@ static void route_enrich_status(struct json_object *data)
         }
     }
     available = route_obj_int(data, "available", 0);
+    /* Needs the enriched rules/wans arrays, so it runs after route_enrich_rules(). */
+    marks_ok = route_count_conntrack_marks(data, &marks) == 0;
+    /* active_flows must be a live count to serve as the denominator of a
+     * percentage. When marks are readable that is the conntrack table size;
+     * otherwise fall back to the kernel's cumulative figure and label it. */
+    active_flows = marks_ok ? marks.total : cumulative_conn;
+    /* Fill the per-rule live counts, which route_enrich_rules() could only
+     * default to 0. A rule showing hit_count=104561 next to active_flows=0 was
+     * the specific contradiction acceptance reported. */
+    if (marks_ok && json_object_object_get_ex(data, "rules", &rules) &&
+        json_object_is_type(rules, json_type_array)) {
+        int n = json_object_array_length(rules);
+
+        for (i = 0; i < n; i++) {
+            struct json_object *r = json_object_array_get_idx(rules, i);
+            int prio = route_obj_int(r, "prio", 0);
+            int j;
+
+            for (j = 0; j < marks.prio_n; j++) {
+                if (marks.prio[j] != prio)
+                    continue;
+                json_object_object_del(r, "active_flows");
+                json_object_object_add(r, "active_flows",
+                                       json_object_new_int64(marks.per_prio[j]));
+                json_object_object_add(r, "active_flows_source",
+                                       json_object_new_string("nf_conntrack_fwmark"));
+                json_object_object_add(r, "active_flows_semantics",
+                    json_object_new_string("instantaneous_conntrack_entries_marked_by_this_rule"));
+                json_object_object_add(r, "hit_count_semantics",
+                    json_object_new_string("cumulative_packet_hits_since_rule_push"));
+                break;
+            }
+        }
+    }
     main_nondefault_count = route_main_nondefault_rule_count();
     main_nondefault_ready = main_nondefault_count == 1;
     json_object_object_add(data, "main_nondefault_rule_ready",
@@ -2660,10 +2967,60 @@ static void route_enrich_status(struct json_object *data)
     json_object_object_add(policy, "active_rules", json_object_new_int(rc));
     json_object_object_add(policy, "policy_groups", json_object_new_int(wc > 0 ? 1 : 0));
     json_object_object_add(policy, "active_flows", json_object_new_int64(active_flows));
-    json_object_object_add(policy, "steered_flows", json_object_new_int(0));
-    json_object_object_add(policy, "bypass_flows", json_object_new_int(0));
-    json_object_object_add(policy, "fallback_flows", json_object_new_int(0));
+    /* Instantaneous counts from conntrack fwmarks. steered_flows used to be a
+     * hardcoded 0, which made the UI compute steered/active = 0.0% while the
+     * rules were demonstrably matching (hit_count in the six figures, last hit
+     * seconds ago). When marks cannot be read the fields are null with an
+     * explicit *_supported=false rather than a misleading 0. */
+    if (marks_ok) {
+        json_object_object_add(policy, "steered_flows",
+                               json_object_new_int64(marks.explicit_steer));
+        json_object_object_add(policy, "load_balance_flows",
+                               json_object_new_int64(marks.load_balance));
+        json_object_object_add(policy, "bypass_flows",
+                               json_object_new_int64(marks.unsteered));
+        json_object_object_add(policy, "unattributed_flows",
+                               json_object_new_int64(marks.unknown));
+        json_object_object_add(policy, "fallback_flows",
+                               json_object_new_int64(marks.unknown));
+        json_object_object_add(policy, "steered_flows_supported",
+                               json_object_new_boolean(1));
+        json_object_object_add(policy, "flow_counter_source",
+                               json_object_new_string("nf_conntrack_fwmark"));
+    } else {
+        json_object_object_add(policy, "steered_flows", NULL);
+        json_object_object_add(policy, "load_balance_flows", NULL);
+        json_object_object_add(policy, "bypass_flows", NULL);
+        json_object_object_add(policy, "unattributed_flows", NULL);
+        json_object_object_add(policy, "fallback_flows", NULL);
+        json_object_object_add(policy, "steered_flows_supported",
+                               json_object_new_boolean(0));
+        json_object_object_add(policy, "steered_flows_reason",
+                               json_object_new_string("nf_conntrack_marks_unreadable"));
+        json_object_object_add(policy, "flow_counter_source",
+                               json_object_new_string("unavailable"));
+    }
     json_object_object_add(policy, "hit_total", json_object_new_int64(hit_total));
+    /* Explicit semantics so the UI can word its labels correctly and acceptance
+     * can recompute independently. The three counters answer different
+     * questions and were previously indistinguishable in the payload. */
+    json_object_object_add(policy, "hit_total_semantics",
+        json_object_new_string("cumulative_rule_packet_hits_since_rule_push"));
+    json_object_object_add(policy, "active_flows_semantics",
+        json_object_new_string(marks_ok ? "instantaneous_conntrack_entries"
+                                       : "cumulative_kernel_wan_connections"));
+    json_object_object_add(policy, "steered_flows_semantics",
+        json_object_new_string("instantaneous_conntrack_entries_matching_explicit_carrier_rules"));
+    json_object_object_add(policy, "kernel_cumulative_connections",
+                           json_object_new_int64(cumulative_conn));
+    json_object_object_add(policy, "kernel_cumulative_connections_semantics",
+        json_object_new_string("cumulative_per_wan_connection_count_since_rule_push"));
+    /* Both cumulative counters restart at zero when core re-pushes rules on
+     * startup, so a drop across samples is a restart, not a counter bug. This
+     * is also why the two are numerically equal in steady state: the kernel
+     * increments per-WAN active_conn and per-rule hits on the same event. */
+    json_object_object_add(policy, "cumulative_counter_epoch",
+        json_object_new_string("reset_on_core_rule_push"));
     json_object_object_add(policy, "last_hit_at", last_hit_at > 0 ? json_object_new_int64(last_hit_at) : json_object_new_null());
     json_object_object_add(policy, "counter_source", json_object_new_string(available ? "jmx_route_kernel" : "unavailable"));
     json_object_object_add(policy, "counter_ready", json_object_new_boolean(available != 0));
@@ -2885,6 +3242,23 @@ struct json_object *jmx_api_route_config_get(struct json_object *req_obj)
     json_object_object_add(capabilities, "wan_carrier_source",
                            json_object_new_string(
                                "dreamingwrt.db:net_interfaces.carrier+jmx_isp"));
+    /* `carrier_prefixes` is the operator's *override* list, not the whole
+     * carrier prefix table.  The bulk of the prefixes are loaded straight from
+     * the signature DB (`carrier_prefix`, see jmx_route_load_builtin_carriers)
+     * and never appear here, so an empty array means "no overrides configured",
+     * not "carrier routing unconfigured".  Reading it as the latter caused a
+     * false diagnosis during acceptance (A-013), hence these explicit fields. */
+    json_object_object_add(capabilities, "carrier_prefixes_semantics",
+                           json_object_new_string("user_override_only"));
+    json_object_object_add(capabilities, "carrier_prefix_builtin_source",
+                           json_object_new_string("signature_db:carrier_prefix(enabled=1)"));
+    {
+        int builtin = 0, kwan = 0, krule = 0;
+
+        if (route_kernel_state_counts(&builtin, &kwan, &krule) == 0)
+            json_object_object_add(data, "carrier_prefix_kernel_count",
+                                   json_object_new_int(builtin));
+    }
     json_object_object_add(data, "capabilities", capabilities);
     return route_json_ok(data);
 }

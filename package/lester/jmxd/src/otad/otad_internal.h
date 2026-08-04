@@ -227,6 +227,9 @@ sqlite3_stmt *otad_config_prepare(const char *sql);
 sqlite3_stmt *otad_inventory_prepare(const char *sql);
 int otad_db_init(void);
 void otad_db_close(void);
+/* Flush the operation trail to stable storage. Call before anything that can
+ * take the machine down, such as a slot write or a reboot request. */
+int otad_db_persist_now(void);
 int otad_state_set(const char *key, const char *value);
 int otad_state_get(const char *key, char *out, size_t out_len, const char *def);
 int otad_operation_id_ok(const char *operation_id);

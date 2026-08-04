@@ -191,6 +191,29 @@ static void notifyd_event_ids_json(struct json_object *cap)
     json_object_object_add(cap, "pending_event_ids", pending);
 }
 
+/*
+ * Enqueue used to accept any "event" string, so a typo in a producer's event
+ * constant produced ok:true, exit code 0, and a delivered notification carrying
+ * an id nothing downstream recognises. The producer only ever sees the exit
+ * code, so nothing along the chain could report the mistake.
+ *
+ * Lookup covers pending definitions too: an event whose producer is not wired
+ * up yet is still a real catalog id, and rejecting it would turn "not collected
+ * yet" into "rejected", which is a different and more confusing failure.
+ */
+static const struct notifyd_event_definition *notifyd_event_definition_find(const char *id)
+{
+    size_t i;
+
+    if (!id || !id[0])
+        return NULL;
+    for (i = 0; i < sizeof(notifyd_event_definitions) / sizeof(notifyd_event_definitions[0]); i++) {
+        if (!strcmp(notifyd_event_definitions[i].id, id))
+            return &notifyd_event_definitions[i];
+    }
+    return NULL;
+}
+
 struct json_object *notifyd_event_catalog_json(void)
 {
     static const struct { const char *id; const char *label; } categories[] = {
@@ -1549,6 +1572,27 @@ struct json_object *notifyd_enqueue_event(struct json_object *body)
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("invalid_payload"));
         return resp;
+    }
+    /*
+     * Validated before any route is consulted, so a bad id cannot reach the
+     * outbox. The two failures are reported separately because they need
+     * different fixes: a missing field is a malformed call, an unknown id is
+     * usually a typo'd or stale event constant.
+     */
+    {
+        const char *event_id = notifyd_json_str(body, "event", "");
+
+        if (!event_id[0]) {
+            json_object_object_add(resp, "ok", json_object_new_boolean(0));
+            json_object_object_add(resp, "error", json_object_new_string("event_required"));
+            return resp;
+        }
+        if (!notifyd_event_definition_find(event_id)) {
+            json_object_object_add(resp, "ok", json_object_new_boolean(0));
+            json_object_object_add(resp, "error", json_object_new_string("event_unknown"));
+            json_object_object_add(resp, "event", json_object_new_string(event_id));
+            return resp;
+        }
     }
     st = notifyd_config_prepare("SELECT id,name,enabled,channel_id,min_severity,category,event,source,options_json FROM notifyd_routes WHERE enabled=1 ORDER BY id");
     if (st) {

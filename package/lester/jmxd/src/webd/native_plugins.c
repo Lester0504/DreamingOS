@@ -132,6 +132,54 @@ static int path_has_segment(const char *path, const char *segment)
     return 0;
 }
 
+/*
+ * Split "/api/v1/plugins/native/<id>[/<suffix>]" into the plugin id and the
+ * remaining suffix. Returns 0 on success, -1 when the path does not name a
+ * plugin.
+ *
+ * Both the permission gate and the proxy used to hardcode
+ *   static const char prefix[] = WEBD_NATIVE_API_PREFIX "dreamingproxy";
+ * and then derive the suffix as path + sizeof(prefix) - 1. That offset is a
+ * compile-time constant tied to the length of "dreamingproxy" (13), so any
+ * plugin with a different id length (adguardhome is 11) would have had its
+ * suffix start two bytes past the right place. This helper exists so the two
+ * call sites cannot disagree about where the id ends: if one accepted a path
+ * and the other rejected it, the failure would surface as a confusing 502
+ * rather than a clean 404.
+ *
+ * id_out is bounded and validated with safe_token(), which rejects '/' and any
+ * character outside [A-Za-z0-9._-]. A caller therefore cannot smuggle a path
+ * separator into the id and reach a socket or manifest outside the plugin root.
+ * ".." alone would satisfy safe_token(), so it is rejected explicitly: the id is
+ * interpolated into both a manifest path and a socket path.
+ */
+static int native_split_path(const char *path, char *id_out, size_t id_len,
+                             const char **suffix_out)
+{
+    static const char api_prefix[] = WEBD_NATIVE_API_PREFIX;
+    const size_t api_len = sizeof(api_prefix) - 1;
+    const char *id_start;
+    const char *end;
+    size_t n;
+
+    if (!path || !id_out || !id_len || !suffix_out)
+        return -1;
+    if (strncmp(path, api_prefix, api_len))
+        return -1;
+    id_start = path + api_len;
+    end = strchr(id_start, '/');
+    n = end ? (size_t)(end - id_start) : strlen(id_start);
+    if (!n || n >= id_len)
+        return -1;
+    memcpy(id_out, id_start, n);
+    id_out[n] = '\0';
+    if (!safe_token(id_out, 64) || !strcmp(id_out, "..") || !strcmp(id_out, "."))
+        return -1;
+    *suffix_out = end ? end : "";
+    return 0;
+}
+
+
 static const char *obj_string(struct json_object *obj, const char *key)
 {
     struct json_object *value = NULL;
@@ -229,6 +277,25 @@ static struct json_object *read_manifest(const char *directory_id)
         json_object_object_add(manifest, "capabilities", capabilities);
     }
     return manifest;
+}
+
+/*
+ * A path only names a plugin if that plugin is actually installed with a valid
+ * manifest. Without this check the permission gate would accept any well-formed
+ * id and the proxy would then try to connect to /var/run/<id>/<id>.sock, turning
+ * a typo or a probe into a 502 instead of a clean 404.
+ */
+static int native_plugin_installed(const char *plugin_id)
+{
+    struct json_object *manifest;
+
+    if (!plugin_id || !plugin_id[0])
+        return 0;
+    manifest = read_manifest(plugin_id);
+    if (!manifest)
+        return 0;
+    json_object_put(manifest);
+    return 1;
 }
 
 struct json_object *webd_native_plugins_scan(void)
@@ -341,26 +408,87 @@ void webd_native_plugins_merge_menu(struct json_object *menu)
 
 const char *webd_native_required_permission(const char *method, const char *path)
 {
-    static const char prefix[] = WEBD_NATIVE_API_PREFIX "dreamingproxy";
+    static __thread char permission[128];
+    char plugin_id[80];
+    const char *suffix = NULL;
+    const char *action;
 
-    if (!method || !path || strncmp(path, prefix, sizeof(prefix) - 1) ||
-        (path[sizeof(prefix) - 1] && path[sizeof(prefix) - 1] != '/'))
+    /*
+     * Previously this matched only the compiled-in "dreamingproxy" prefix and
+     * returned NULL for every other plugin. The caller in jmx_app_api.c treats
+     * NULL as "not a plugin route" and skips the proxy entirely, so a correctly
+     * installed plugin such as adguardhome fell through to the plugin-detail
+     * lookup and was reported as "native plugin is not registered" — a
+     * misleading 404, since the plugin was registered and merely could not
+     * obtain a required permission.
+     */
+    if (!method || native_split_path(path, plugin_id, sizeof(plugin_id), &suffix))
         return NULL;
+    if (!native_plugin_installed(plugin_id))
+        return NULL;
+
+    /* Action classification is intentionally identical to the previous
+     * dreamingproxy-only ordering, so existing permission grants keep their
+     * exact meaning: secrets outrank apply, apply outranks operate, and
+     * anything else that writes is "configure". */
     if (!strcmp(method, "GET") || !strcmp(method, "HEAD")) {
-        if (path_has_segment(path, "audit-events") || path_has_segment(path, "diagnostics"))
-            return "dreamingproxy.audit";
-        return "dreamingproxy.read";
+        action = (path_has_segment(path, "audit-events") ||
+                  path_has_segment(path, "diagnostics")) ? "audit" : "read";
+    } else if (path_has_segment(path, "secret") ||
+               path_has_segment(path, "secrets") ||
+               path_has_segment(path, "credentials")) {
+        action = "secrets";
+    } else if (path_has_segment(path, "apply") ||
+               path_has_segment(path, "rollback")) {
+        action = "apply";
+    } else if (path_has_segment(path, "probe") ||
+               path_has_segment(path, "probe-jobs") ||
+               path_has_segment(path, "start") ||
+               path_has_segment(path, "stop") ||
+               path_has_segment(path, "update")) {
+        action = "operate";
+    } else {
+        action = "configure";
     }
-    if (path_has_segment(path, "secret") || path_has_segment(path, "secrets") ||
-        path_has_segment(path, "credentials"))
-        return "dreamingproxy.secrets";
-    if (path_has_segment(path, "apply") || path_has_segment(path, "rollback"))
-        return "dreamingproxy.apply";
-    if (path_has_segment(path, "probe") || path_has_segment(path, "probe-jobs") ||
-        path_has_segment(path, "start") || path_has_segment(path, "stop") ||
-        path_has_segment(path, "update"))
-        return "dreamingproxy.operate";
-    return "dreamingproxy.configure";
+    if (snprintf(permission, sizeof(permission), "%s.%s", plugin_id, action) >=
+        (int)sizeof(permission))
+        return NULL;
+    return permission;
+}
+
+/*
+ * True when a permission names a read-only action. Used for audit risk grading
+ * so it follows the action suffix rather than any particular plugin name.
+ */
+int webd_native_permission_is_readonly(const char *permission)
+{
+    const char *dot;
+
+    if (!permission || !permission[0])
+        return 0;
+    dot = strrchr(permission, '.');
+    if (!dot || !dot[1])
+        return 0;
+    return !strcmp(dot + 1, "read");
+}
+
+/*
+ * Best-effort socket path for the plugin named by a request path, so an error
+ * response can point at the file that actually failed to answer.
+ */
+int webd_native_socket_hint(const char *path, char *out, size_t out_len)
+{
+    char plugin_id[80];
+    const char *suffix = NULL;
+
+    if (!out || !out_len)
+        return -1;
+    if (native_split_path(path, plugin_id, sizeof(plugin_id), &suffix))
+        return -1;
+    if (snprintf(out, out_len, "/var/run/%s/%s.sock", plugin_id, plugin_id) >=
+        (int)out_len)
+        return -1;
+    return 0;
 }
 
 static int wait_fd(int fd, short events, int timeout_ms)
@@ -682,9 +810,8 @@ int webd_native_proxy_json(int client_fd,
                            const char *request_id,
                            struct json_object *permissions)
 {
-    const char *plugin_id = "dreamingproxy";
-    static const char prefix[] = WEBD_NATIVE_API_PREFIX "dreamingproxy";
-    const char *suffix;
+    char plugin_id[80];
+    const char *suffix = NULL;
     char socket_path[256];
     char upstream_path[768];
     char permission_header[1024];
@@ -695,12 +822,18 @@ int webd_native_proxy_json(int client_fd,
     int hlen;
     int rc = -1;
 
+    /*
+     * The id is parsed from the path instead of being compiled in. Deriving the
+     * suffix from the parsed id length is the whole point: the old code used
+     * sizeof(prefix) - 1, a constant sized for "dreamingproxy", so a shorter id
+     * such as "adguardhome" would have started the suffix two bytes late and
+     * silently returned -1, which the caller reports as a 502.
+     */
     if (!safe_proxy_method(method) || !path || body_len > NATIVE_PROXY_BODY_MAX ||
         (body_len && (!body || !valid_json_body(body, body_len))) ||
-        strncmp(path, prefix, sizeof(prefix) - 1) ||
-        (path[sizeof(prefix) - 1] && path[sizeof(prefix) - 1] != '/'))
+        native_split_path(path, plugin_id, sizeof(plugin_id), &suffix) ||
+        !native_plugin_installed(plugin_id))
         return -1;
-    suffix = path + sizeof(prefix) - 1;
     if (*suffix && *suffix != '/')
         return -1;
     if (!*suffix)

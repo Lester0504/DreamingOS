@@ -411,6 +411,20 @@ int jmx_ai_conversation_delete(const char *id);
 /* AI Config */
 struct json_object *jmx_ai_config_get(void);
 int jmx_ai_config_set(struct json_object *cfg);
+/* AI multi-provider (ai_provider / ai_provider_model / ai_dispatch_policy).
+ * Shared return codes: -1 internal, -2 invalid kind/strategy,
+ * -4 invalid_role, -5 invalid_auth_mode, -6 not_found, -7 invalid_field. */
+struct json_object *jmx_ai_providers_list(void);
+struct json_object *jmx_ai_provider_get(const char *id);
+int jmx_ai_provider_create(struct json_object *cfg, char out_id[65]);
+int jmx_ai_provider_update(const char *id, struct json_object *cfg);
+int jmx_ai_provider_delete(const char *id);
+int jmx_ai_provider_check_record(const char *id, int ok, int latency_ms,
+                                 const char *error);
+struct json_object *jmx_ai_provider_models_list(const char *id);
+int jmx_ai_provider_models_replace(const char *id, struct json_object *models);
+struct json_object *jmx_ai_dispatch_policy_get(void);
+int jmx_ai_dispatch_policy_set(struct json_object *cfg);
 struct json_object *jmx_ai_models_get(void);
 struct json_object *jmx_ai_tools_get(void);
 int jmx_ai_tool_authorize(int auth_id, int approve, const char *role);

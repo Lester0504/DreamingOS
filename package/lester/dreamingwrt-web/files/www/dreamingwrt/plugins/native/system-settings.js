@@ -12,7 +12,7 @@ export function mount(context = {}) {
     return { name, ok, data: json?.data ?? json, raw: json, error: ok ? null : new Error(json?.error?.message || json?.message || response.statusText || 'request failed') };
   });
 
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260804-speed-limit-two-tabs-02';
   const MODULE_CLASS = 'system-settings-route-host';
   const ENDPOINT = '/api/v1/system/basic';
   const SAVE_ENDPOINTS = ['/api/v1/system/settings', '/api/v1/save_system_settings'];
@@ -27,8 +27,8 @@ export function mount(context = {}) {
     { id: 'local', label: '本地启动脚本' }
   ];
   const SYSTEM_FLASH_TABS = [
-    { id: 'operations', label: '操作' },
-    { id: 'config', label: '配置' }
+    { id: 'operations', label: '备份' },
+    { id: 'firmware', label: '升级' }
   ];
   const SYSTEM_ADVANCED_TABS = [
     { id: 'performance', label: '性能与诊断' },
@@ -49,8 +49,35 @@ export function mount(context = {}) {
     flashPreservePath: '/etc/sysupgrade.conf',
     flashPreserveLoading: false,
     flashPreserveAvailable: false,
+    // 设备上已有的备份存档。后端 GET /flash/backups 一直返回真实列表，
+    // 之前前端完全没有消费，页面只能靠「最近生成时间」一行兜底。
+    flashBackups: [],
+    flashBackupsLoading: false,
+    flashBackupsLoaded: false,
+    flashBackupsError: '',
+    // undefined = 还没探测过；false = 后端明确不支持（501 / 404）
+    flashBackupsSupported: undefined,
     flashBackupFile: null,
     flashFirmwareFile: null,
+    /*
+     * `GET /flash/capabilities` 是 flash 能力的权威来源（design.md「Capability truth
+     * and failure classification」第 1 条：能力判定只能来自目标端点自身）。旧代码查的
+     * `flash_sysupgrade` / `flash_browser_upload` 两个位后端从未下发过，`=== true`
+     * 对缺失键恒为 false，于是「尚未开放」成了与后端事实无关的死判据。
+     *
+     * 这里把「能力为 true」「能力为 false（附 reason）」「能力未确认（来源请求失败）」
+     * 分成三种状态，未确认时只说没确认，不断言后端未实现。
+     */
+    flashCapabilities: null,
+    flashCapabilitiesLoading: false,
+    flashCapabilitiesLoaded: false,
+    flashCapabilitiesError: '',
+    flashScheduledBackup: null,
+    // 升级流水线：upload_id 由 /uploads/begin 下发，operation_id 由 verify 返回。
+    flashFirmwareUpload: null,
+    flashFirmwareProgress: 0,
+    flashFirmwareOperation: null,
+    flashFirmwarePollTimer: 0,
     signatureUpdateFile: null,
     signatureUpdateStatus: null,
     flashKeepSettings: null,
@@ -68,6 +95,11 @@ export function mount(context = {}) {
     pairTimer: 0,
     pairPollTicks: 0,
     pairPollBusy: false,
+    cloudStatus: null,
+    cloudIdentity: null,
+    cloudStatusError: '',
+    deviceCapabilities: null,
+    deviceIdentity: '',
     qrGeneratorLoading: false,
     qrGeneratorError: '',
     deviceWorking: '',
@@ -702,12 +734,82 @@ export function mount(context = {}) {
   }
 
   function renderSystemFlashTab(data, tab) {
-    if (tab === 'config') return systemFlashConfigPanel(data);
+    if (tab === 'firmware') return systemFlashFirmwarePanel(data);
     return systemFlashOperationsPanel(data);
   }
 
   function flashCapability(name) {
     return (state.data.capabilities || {})[name] === true;
+  }
+
+  /*
+   * `flash/capabilities` 的条目形如 { available, endpoint, method, risk, reason }，
+   * 不是扁平布尔。取不到条目时返回 null，代表"未确认"，与 available:false 区分开。
+   */
+  function flashCap(name) {
+    const caps = state.flashCapabilities;
+    if (!caps || typeof caps !== 'object') return null;
+    const entry = caps[name];
+    if (!entry || typeof entry !== 'object') return null;
+    return { available: entry.available === true, reason: stringOr(entry.reason || '') };
+  }
+
+  function flashCapAvailable(name) {
+    return flashCap(name)?.available === true;
+  }
+
+  /*
+   * 后端 reason 是机器码，这里翻成人话。未收录的 code 原样显示，
+   * 好过吞掉一个我们没预料到的原因。
+   */
+  const FLASH_REASON_TEXT = {
+    no_active_release_key: '尚未配置发布签名公钥，暂不能应用固件。上传与校验不受影响。',
+    otad_status_unavailable: 'otad 未返回状态，能力暂不可确认。',
+    signing_key_unknown: '镜像签名密钥不在信任策略内，暂不能应用固件。',
+    no_schedule_retention_or_snapshot_contract_implemented: '后端尚未实现频率、保留份数与快照合同。'
+  };
+
+  function flashReasonText(reason) {
+    const code = stringOr(reason || '');
+    if (!code) return '';
+    return FLASH_REASON_TEXT[code] || `后端给出的原因：${code}`;
+  }
+
+  /*
+   * 能力来源自身的失败分类（design.md 同节第 3 条）：404/405/501 是接口未实现，
+   * 401 是会话失效，403 是权限不足，5xx 是后端错误，无状态码是网络不可用。
+   * 全部归成一句"后端未开放"会把会话过期说成功能不存在。
+   */
+  function flashCapabilityFailureText(error) {
+    const status = Number(error?.status || 0);
+    const code = stringOr(error?.payload?.error?.code || error?.payload?.code || '');
+    if (code === 'method_not_registered') return '设备固件能力接口尚未接入，控件暂不可用。';
+    if (code === 'source_unavailable') return '固件能力服务暂时不可用，请稍后重试。';
+    if (status === 404 || status === 405 || status === 501) return '设备未实现固件能力接口，控件暂不可用。';
+    if (status === 401) return '会话已失效，请重新登录后再操作固件。';
+    if (status === 403) return '当前账号权限不足，无法读取固件能力。';
+    if (status >= 500) return `设备返回错误（${status}），固件能力暂不可确认。`;
+    if (!status) return '网络不可用，固件能力暂不可确认。';
+    return `固件能力暂不可确认（${status}）。`;
+  }
+
+  /*
+   * 备份类能力位的判据。
+   *
+   * 位已经下发了：`flash/capabilities` 现在显式给出 create_backup / list_backups /
+   * restore_backup / factory_reset，所以这里优先读那份权威来源（第二个参数是新命名）。
+   *
+   * 保留旧的兜底是有意的，用于能力源自身请求失败的情况：那时状态是"未确认"而不是
+   * "不可用"，仍按 `GET /flash/backups` 的真实结果判断，只有后端明确 501 / 404 或把位
+   * 显式置为 false 才认定不可用。原先把"位缺失"当成否定，会把三个能用的按钮永久灰掉。
+   */
+  function flashBackupCapability(name, canonicalName) {
+    const canonical = canonicalName ? flashCap(canonicalName) : null;
+    if (canonical) return canonical.available;
+    const capabilities = state.data.capabilities || {};
+    if (capabilities[name] === true) return true;
+    if (capabilities[name] === false) return false;
+    return state.flashBackupsSupported !== false;
   }
 
   function flashStatusMessage() {
@@ -717,12 +819,23 @@ export function mount(context = {}) {
 
   function systemFlashOperationsPanel(data) {
     const f = data.flash || {};
-    const canCreate = flashCapability('flash_backup_create');
-    const canRestore = flashCapability('flash_backup_restore') && flashCapability('flash_browser_upload');
-    const canUpgrade = flashCapability('flash_sysupgrade') && flashCapability('flash_browser_upload');
-    const canReset = flashCapability('flash_factory_reset');
+    const canCreate = flashBackupCapability('flash_backup_create', 'create_backup');
+    /*
+     * `restore_backup` 现在显式为 true，但它吃的是已 finalized 的 upload_id。
+     * 设备上已有的存档可以直接恢复（见下方存档列表）；从本地文件恢复还需要把备份
+     * 送进暂存区这一步，本次交接单未覆盖，已另挂
+     * `Front-to-Backend-backup-archive-browser-upload.md`。
+     */
+    const canRestore = flashBackupCapability('flash_backup_restore', 'restore_backup');
+    const canReset = flashBackupCapability('flash_factory_reset', 'factory_reset');
+    /*
+     * 从本地文件恢复还差"把备份送进暂存区"这一步：通用上传链支持 upload_type=backup，
+     * 但恢复是覆盖配置并重启的破坏性操作，本次交接单只覆盖固件上传与校验，没有它的
+     * 验收标准，所以这里保持禁用并说清缺什么，不放一个点了只会报错的按钮。
+     * 已另挂 Front-to-Backend-backup-archive-browser-upload.md。
+     */
+    const canRestoreLocalArchive = false;
     const backupFile = state.flashBackupFile;
-    const firmwareFile = state.flashFirmwareFile;
     const busy = Boolean(state.flashWorking);
     return `
       <div class="system-flash-page">
@@ -737,7 +850,7 @@ export function mount(context = {}) {
             action: 'flash-create-backup',
             actionText: state.flashWorking === 'create-backup' ? '正在生成…' : '生成备份',
             disabled: busy || !canCreate,
-            unavailable: !canCreate ? '后端尚未开放备份生成能力' : ''
+            unavailable: !canCreate ? '设备未返回备份接口，生成暂不可用' : ''
           })}
           <section class="system-demo-panel system-flash-action-card is-restore">
             <span class="system-flash-card-icon" aria-hidden="true">${systemSettingsIcon('restore')}</span>
@@ -750,11 +863,47 @@ export function mount(context = {}) {
               <span>${systemSettingsIcon('upload')}<b>${backupFile ? escapeHtml(backupFile.name) : '选择备份存档'}</b></span>
               ${backupFile ? `<em>${escapeHtml(formatBytes(backupFile.size) || '大小未知')}</em>` : ''}
             </label>
-            <button class="glass-btn glass-btn--primary" type="button" data-system-action="flash-restore-backup" ${busy || !backupFile || !canRestore ? 'disabled' : ''}>恢复配置</button>
-            ${!canRestore ? '<small class="system-flash-capability-note">需要后端提供浏览器上传暂存合同后才能恢复。</small>' : ''}
+            <button class="glass-btn glass-btn--primary" type="button" data-system-action="flash-restore-backup" ${busy || !backupFile || !canRestoreLocalArchive ? 'disabled' : ''}>恢复配置</button>
+            ${!canRestoreLocalArchive ? `<small class="system-flash-capability-note">${escapeHtml(canRestore ? '设备已开放恢复接口，但从本地文件恢复还需要备份暂存上传步骤，尚未接入。设备上已有的备份可在下方存档列表直接恢复。' : '设备未开放恢复接口。设备上已有的备份可在下方存档列表直接恢复。')}</small>` : ''}
           </section>
         </div>
 
+        ${systemFlashBackupArchiveCard()}
+        ${systemFlashScheduleCard()}
+        <section class="system-demo-panel system-flash-danger-panel">
+          <span class="system-flash-danger-icon" aria-hidden="true">${systemSettingsIcon('warning')}</span>
+          <div>
+            <strong>恢复出厂设置</strong>
+            <p>清除设备上的自定义配置并重新启动。该操作无法撤销。</p>
+          </div>
+          <button class="glass-btn system-flash-danger-button" type="button" data-system-action="flash-factory-reset" ${busy || !canReset ? 'disabled' : ''}>${state.flashConfirm === 'factory-reset' ? '再次点击确认重置' : '恢复出厂设置'}</button>
+          ${!canReset ? '<small class="system-flash-capability-note">设备未返回恢复出厂设置接口。</small>' : ''}
+        </section>
+      </div>
+    `;
+  }
+
+  /*
+   * 升级页：固件镜像与特征库。两张卡原先都挤在「操作」页里，用户要求按备份 / 升级分开。
+   */
+  function systemFlashFirmwarePanel(data) {
+    const f = data.flash || {};
+    /*
+     * 上传 / 校验 / 应用是三条独立能力，判据分开取。原先一句 canUpgrade 把三者
+     * 绑在一起，应用被签名闸门挡住时连已经可用的上传和校验也一起灰掉了。
+     */
+    const uploadCap = flashCap('upload_firmware');
+    const verifyCap = flashCap('verify_firmware');
+    const applyCap = flashCap('apply_firmware');
+    const capsUnknown = !state.flashCapabilitiesLoaded || !state.flashCapabilities;
+    const canStage = uploadCap?.available === true && verifyCap?.available === true;
+    const firmwareFile = state.flashFirmwareFile;
+    const busy = Boolean(state.flashWorking);
+    const staging = state.flashWorking === 'firmware-upload' || state.flashWorking === 'firmware-verify';
+    return `
+      <div class="system-flash-page">
+        ${state.error ? `<div class="system-inline-error">${escapeHtml(state.error)}</div>` : ''}
+        ${flashStatusMessage()}
         <section class="system-demo-panel system-flash-firmware-panel">
           <div class="system-flash-version-block">
             <span>当前版本</span>
@@ -776,23 +925,134 @@ export function mount(context = {}) {
               <span class="glass-check-box" aria-hidden="true"></span>
               <span>升级时保留当前配置</span>
             </label>
-            <button class="glass-btn glass-btn--primary" type="button" data-system-action="flash-sysupgrade" ${busy || !firmwareFile || !canUpgrade ? 'disabled' : ''}>${state.flashConfirm === 'sysupgrade' ? '再次点击确认升级' : '上传并刷写固件'}</button>
-            ${!canUpgrade ? '<small class="system-flash-capability-note">浏览器上传、固件兼容性校验和升级进度合同尚未开放。</small>' : ''}
+            <button class="glass-btn glass-btn--primary" type="button" data-system-action="flash-upload-verify" ${busy || !firmwareFile || !canStage ? 'disabled' : ''}>${systemFlashStageButtonLabel()}</button>
+            ${systemFlashFirmwareCapabilityNote({ capsUnknown, uploadCap, verifyCap, applyCap, staging })}
           </div>
         </section>
-
-        <section class="system-demo-panel system-flash-danger-panel">
-          <span class="system-flash-danger-icon" aria-hidden="true">${systemSettingsIcon('warning')}</span>
-          <div>
-            <strong>恢复出厂设置</strong>
-            <p>清除设备上的自定义配置并重新启动。该操作无法撤销。</p>
-          </div>
-          <button class="glass-btn system-flash-danger-button" type="button" data-system-action="flash-factory-reset" ${busy || !canReset ? 'disabled' : ''}>${state.flashConfirm === 'factory-reset' ? '再次点击确认重置' : '恢复出厂设置'}</button>
-          ${!canReset ? '<small class="system-flash-capability-note">当前后端未开放恢复出厂设置能力。</small>' : ''}
-        </section>
+        ${systemFlashFirmwareOperationCard(applyCap)}
+        ${systemFlashPreserveCard()}
         ${systemSignatureUpdateCard(data)}
       </div>
     `;
+  }
+
+  /* 上传进度的局部更新：只写按钮文字，不触碰 DOM 结构与 kit 挂载。 */
+  function updateFlashProgressLabel() {
+    const button = root?.querySelector('[data-system-action="flash-upload-verify"]');
+    if (!button) return;
+    const next = systemFlashStageButtonLabel();
+    if (button.textContent !== next) button.textContent = next;
+  }
+
+  function systemFlashStageButtonLabel() {
+    if (state.flashWorking === 'firmware-upload') {
+      const percent = Math.max(0, Math.min(100, Math.round(state.flashFirmwareProgress || 0)));
+      return `上传中… ${percent}%`;
+    }
+    if (state.flashWorking === 'firmware-verify') return '校验中…';
+    return '上传并校验固件';
+  }
+
+  /*
+   * 三种状态各自的文案：能力未确认 / 能力为 false（带 reason）/ 能力为 true。
+   * 「应用被签名闸门挡住」与「功能没做」是不同的事，不能共用一句话。
+   */
+  function systemFlashFirmwareCapabilityNote({ capsUnknown, uploadCap, verifyCap, applyCap, staging }) {
+    if (state.flashCapabilitiesLoading && capsUnknown) {
+      return '<small class="system-flash-capability-note">正在读取设备固件能力…</small>';
+    }
+    if (capsUnknown) {
+      const text = state.flashCapabilitiesError || '固件能力尚未确认。';
+      return `<small class="system-flash-capability-note">${escapeHtml(text)}</small>`;
+    }
+    const notes = [];
+    if (uploadCap?.available !== true) {
+      notes.push(`浏览器上传当前不可用。${flashReasonText(uploadCap?.reason) || '设备未开放上传暂存接口。'}`);
+    }
+    if (uploadCap?.available === true && verifyCap?.available !== true) {
+      notes.push(`固件校验当前不可用。${flashReasonText(verifyCap?.reason) || '设备未开放校验接口。'}`);
+    }
+    if (applyCap?.available !== true) {
+      notes.push(flashReasonText(applyCap?.reason) || '设备暂不能应用固件。');
+    }
+    if (!notes.length && !staging) {
+      notes.push('可以上传并校验固件。校验通过后再决定是否应用。');
+    }
+    if (!notes.length) return '';
+    return notes.map((text) => `<small class="system-flash-capability-note">${escapeHtml(text)}</small>`).join('');
+  }
+
+  const FLASH_OPERATION_STATE_TEXT = {
+    validating: '校验中',
+    verified: '校验通过',
+    preflight_passed: '预检通过',
+    writing: '写入中',
+    rebooting: '等待重启',
+    success: '已完成',
+    failed: '失败',
+    cancelled: '已取消'
+  };
+
+  /*
+   * 校验结果卡。只在真的产生了 operation 之后出现，展示后端给的判定位
+   * （authenticity_verified / target_compatible / policy_passed）与 upload/operation id。
+   * 「应用」按钮的开关只看 apply_firmware.available，不在前端另立一套结论。
+   */
+  function systemFlashFirmwareOperationCard(applyCap) {
+    const upload = state.flashFirmwareUpload;
+    const op = state.flashFirmwareOperation;
+    if (!upload && !op) return '';
+    const state_text = FLASH_OPERATION_STATE_TEXT[stringOr(op?.state || '')] || stringOr(op?.state || '');
+    const canApply = applyCap?.available === true && Boolean(op?.operation_id);
+    const busy = Boolean(state.flashWorking);
+    const rows = [];
+    if (upload?.filename) rows.push(['镜像文件', `${upload.filename}${upload.size_bytes ? ` · ${formatBytes(upload.size_bytes) || ''}` : ''}`]);
+    if (upload?.upload_id) rows.push(['upload_id', upload.upload_id]);
+    if (upload?.sha256) rows.push(['SHA-256', upload.sha256]);
+    if (op?.operation_id) rows.push(['operation_id', op.operation_id]);
+    if (state_text) rows.push(['状态', `${state_text}${Number.isFinite(Number(op?.progress)) ? ` · ${Number(op.progress)}%` : ''}`]);
+    if (op?.to_version) rows.push(['目标版本', op.to_version]);
+    if (op?.target_slot) rows.push(['写入分区', op.target_slot]);
+    const checks = op ? [
+      ['签名可信', op.authenticity_verified],
+      ['机型兼容', op.target_compatible],
+      ['策略通过', op.policy_passed]
+    ].filter((entry) => entry[1] !== undefined && entry[1] !== null) : [];
+    const failure = stringOr(op?.error_message || op?.error_code || '');
+    return `
+      <section class="system-demo-panel system-flash-firmware-operation">
+        <div class="system-demo-panel-title">${systemSettingsIcon('database')}<span>本次升级校验</span></div>
+        <div class="system-signature-meta-grid">
+          ${rows.map(([label, value]) => `<span><b>${escapeHtml(label)}</b><em>${escapeHtml(String(value))}</em></span>`).join('')}
+        </div>
+        ${checks.length ? `<div class="system-mount-progress">${checks.map(([label, ok]) => `<span><i class="${ok === true ? 'ok' : 'warn'}"></i>${escapeHtml(label)}${ok === true ? '' : '：未通过'}</span>`).join('')}</div>` : ''}
+        ${failure ? `<p class="system-signature-note invalid-file">${escapeHtml(failure)}</p>` : ''}
+        <div class="system-flash-firmware-actions">
+          <button class="glass-btn glass-btn--primary" type="button" data-system-action="flash-apply-firmware" ${busy || !canApply ? 'disabled' : ''}>${state.flashConfirm === 'firmware-apply' ? '再次点击确认应用' : '应用固件'}</button>
+          ${applyCap && applyCap.available !== true ? `<small class="system-flash-capability-note">${escapeHtml(flashReasonText(applyCap.reason) || '设备暂不能应用固件。')}</small>` : ''}
+        </div>
+      </section>
+    `;
+  }
+
+  /*
+   * 只替换「本次升级校验」这张卡。容器 `.system-flash-firmware-operation` 是稳定的，
+   * 换掉它内部不会牵动页面其它部分，也不必重跑全局的 kit 挂载与玻璃采样。
+   */
+  function patchFlashOperationCard() {
+    const current = root?.querySelector('.system-flash-firmware-operation');
+    if (!current) { render(); return; }
+    // 焦点落在卡内（例如「应用固件」按钮）时不替换，否则会打断用户操作。
+    if (current.contains(document.activeElement)) return;
+    const applyCap = flashCap('apply_firmware');
+    const markup = systemFlashFirmwareOperationCard(applyCap);
+    if (!markup) { current.remove(); return; }
+    const template = document.createElement('template');
+    template.innerHTML = markup;
+    const next = template.content.firstElementChild;
+    if (!next) return;
+    current.replaceWith(next);
+    ui.mountAll?.(next);
   }
 
   function systemSignatureUpdateCard(data = {}) {
@@ -861,6 +1121,123 @@ export function mount(context = {}) {
     return labels[String(value || '')] || (value ? String(value) : '空闲');
   }
 
+  /*
+   * 设备上已有的备份存档。
+   *
+   * `GET /api/v1/system/flash/backups` 一直返回真实列表（`backup_id`、`created_at`、
+   * `size_bytes`、`status`，以及 manifest 里的 `source_version` 与 `sha256`），
+   * 但前端此前从不请求它，备份页只有一行「最近生成：…」。这里把它接上，并给出三个
+   * 真实动作：下载走后端已给的 `download_url`；恢复直接把该行的 `backup_id` 交给
+   * `restore_backup`（它只要 finalized 的 upload_id，不需要用户先下载再上传）；
+   * 删除走 `DELETE /flash/backups/<id>`。
+   */
+  function systemFlashBackupArchiveCard() {
+    const items = Array.isArray(state.flashBackups) ? state.flashBackups : [];
+    const busy = Boolean(state.flashWorking);
+    let body;
+    if (state.flashBackupsError) {
+      body = `<tr><td colspan="5" class="dwrt-kit-table-empty">${escapeHtml(state.flashBackupsError)}</td></tr>`;
+    } else if (state.flashBackupsLoading && !state.flashBackupsLoaded) {
+      body = '<tr><td colspan="5" class="dwrt-kit-table-empty">正在读取设备上的备份存档…</td></tr>';
+    } else if (!items.length) {
+      body = '<tr><td colspan="5" class="dwrt-kit-table-empty">设备上还没有备份存档。点击上方「生成备份」创建第一份。</td></tr>';
+    } else {
+      body = items.map((item) => systemFlashBackupRow(item, busy)).join('');
+    }
+    return `
+      <section class="dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface system-table-card system-flash-backup-table-card">
+        <div class="dwrt-kit-table-toolbar">
+          <div class="dwrt-kit-table-title">
+            <strong>备份存档</strong>
+            <span>设备上保留的配置备份，可直接恢复、下载或删除</span>
+          </div>
+          <span class="dwrt-kit-table-count">${formatInteger(items.length)} 份</span>
+        </div>
+        <div class="dwrt-kit-table-scroll system-table-scroll" data-system-scroll="flash-backups">
+          <table class="dwrt-kit-table dwrt-kit-ikuai-table" aria-label="备份存档">
+            <thead>
+              <tr>
+                <th scope="col">生成时间</th>
+                <th scope="col">来源版本</th>
+                <th scope="col" class="num">体积</th>
+                <th scope="col">状态</th>
+                <th scope="col">操作</th>
+              </tr>
+            </thead>
+            <tbody>${body}</tbody>
+          </table>
+        </div>
+      </section>
+    `;
+  }
+
+  function systemFlashBackupRow(item = {}, busy) {
+    const id = stringOr(item.backup_id || item.upload_id);
+    const manifest = item.manifest && typeof item.manifest === 'object' ? item.manifest : {};
+    const created = Number(item.created_at || manifest.created_at || 0);
+    const version = stringOr(manifest.source_version) || '--';
+    const size = formatBytes(item.size_bytes || manifest.size_bytes) || '--';
+    const status = stringOr(item.status) === 'finalized' ? '可恢复' : (stringOr(item.status) || '--');
+    const download = stringOr(item.download_url);
+    const working = state.flashWorking === `backup:${id}`;
+    return `
+      <tr data-system-backup-id="${escapeHtml(id)}">
+        <td data-label="生成时间">${escapeHtml(created ? formatTimestamp(created) : '--')}</td>
+        <td data-label="来源版本">${escapeHtml(version)}</td>
+        <td class="num" data-label="体积">${escapeHtml(size)}</td>
+        <td data-label="状态">${escapeHtml(status)}</td>
+        <td data-label="操作">
+          <span class="system-flash-backup-row-actions">
+            ${download ? `<a class="dwrt-kit-button is-quiet" href="${escapeHtml(download)}" download>下载</a>` : ''}
+            <button class="dwrt-kit-button is-quiet" type="button" data-system-action="flash-restore-archive" data-backup-id="${escapeHtml(id)}" ${busy || !id ? 'disabled' : ''}>${state.flashConfirm === `restore-archive:${id}` ? '再次点击确认恢复' : '恢复'}</button>
+            <button class="dwrt-kit-button is-quiet is-danger" type="button" data-system-action="flash-delete-archive" data-backup-id="${escapeHtml(id)}" ${busy || !id ? 'disabled' : ''}>${state.flashConfirm === `delete-archive:${id}` ? '再次点击确认删除' : '删除'}</button>
+            ${working ? '<em>处理中…</em>' : ''}
+          </span>
+        </td>
+      </tr>
+    `;
+  }
+
+  /*
+   * 定时备份与版本快照。
+   *
+   * 后端目前只有一个硬编码的 `auto_backup: true` 字面量（`jmx_netconfig_db.c:28615`），
+   * 没有频率、时刻、保留份数，也没有 schedule 路由。所以这里**不渲染任何点了没反应的
+   * 控件**，只如实说明缺口，等交接单
+   * `Front-to-Backend-flash-backup-capabilities-and-schedule.md` 落地后再补。
+   */
+  function systemFlashScheduleCard() {
+    const schedule = state.data?.flash?.backup_schedule;
+    const hasContract = schedule && typeof schedule === 'object';
+    if (!hasContract) {
+      /*
+       * 能力源现在显式说了定时备份不支持，并给出 reason，所以优先陈述后端的原话。
+       * 保持不放选择器的做法不变：合同没落地，放控件就是放一个点了不生效的东西。
+       */
+      const scheduled = state.flashScheduledBackup;
+      const reason = scheduled && scheduled.supported !== true ? flashReasonText(scheduled.reason) : '';
+      return `
+        <section class="system-demo-panel system-flash-schedule-card">
+          <div class="system-demo-panel-title">${systemSettingsIcon('clock')}<span>定时备份</span></div>
+          <p class="system-flash-schedule-gap">${reason
+            ? `后端明确不支持定时备份：${escapeHtml(reason)}`
+            : '后端尚未提供定时备份合同：当前只上报一个固定的 <code>auto_backup</code> 标记，没有频率、执行时刻与保留份数，也没有版本快照接口。'}合同落地前这里不放选择器，避免出现点了不生效的控件。</p>
+        </section>
+      `;
+    }
+    return `
+      <section class="system-demo-panel system-flash-schedule-card">
+        <div class="system-demo-panel-title">${systemSettingsIcon('clock')}<span>定时备份</span></div>
+        <dl class="system-flash-schedule-facts">
+          <div><dt>状态</dt><dd>${schedule.enabled ? '已启用' : '已关闭'}</dd></div>
+          <div><dt>频率</dt><dd>${escapeHtml(stringOr(schedule.frequency) || '--')}</dd></div>
+          <div><dt>下次执行</dt><dd>${escapeHtml(schedule.next_run_at ? formatTimestamp(schedule.next_run_at) : '--')}</dd></div>
+          <div><dt>保留份数</dt><dd>${escapeHtml(schedule.retain === undefined ? '--' : String(schedule.retain))}</dd></div>
+        </dl>
+      </section>
+    `;
+  }
+
   function systemFlashActionCard({ icon, title, description, meta, action, actionText, disabled, unavailable }) {
     return `
       <section class="system-demo-panel system-flash-action-card is-${escapeHtml(icon)}">
@@ -876,14 +1253,17 @@ export function mount(context = {}) {
     `;
   }
 
-  function systemFlashConfigPanel() {
+  /*
+   * 保留配置清单。原先自成一个「配置」Tab，用户要求删掉那个 Tab。
+   * 但它背后的 `GET/POST /flash/preserve_config` 是通的，而且决定 sysupgrade 保留什么，
+   * 所以并入「升级」页而不是连功能一起删掉。
+   */
+  function systemFlashPreserveCard() {
     const text = state.flashPreserveText;
     const lineCount = Math.max(10, String(text || '').split(/\r?\n/).length);
     const canSave = state.flashPreserveAvailable && !state.flashPreserveLoading;
     return `
-      <div class="system-flash-config-page">
-        ${flashStatusMessage()}
-        <section class="system-demo-panel system-flash-config-panel">
+      <section class="system-demo-panel system-flash-config-panel">
           <header class="system-flash-config-header">
             <div>
               <div class="system-demo-panel-title">${systemSettingsIcon('file')}<span>保留配置清单</span></div>
@@ -899,8 +1279,7 @@ export function mount(context = {}) {
             <span>${state.flashPreserveLoading ? '正在读取保留清单…' : state.flashPreserveAvailable ? '仅绝对路径会被保存。空行和注释不会写入。' : '当前后端没有返回保留清单，编辑器保持只读。'}</span>
             <button class="glass-btn glass-btn--primary" type="button" data-system-action="flash-save-preserve" ${!canSave || state.flashWorking ? 'disabled' : ''}>${state.flashWorking === 'save-preserve' ? '保存中…' : '保存清单'}</button>
           </footer>
-        </section>
-      </div>
+      </section>
     `;
   }
 
@@ -1510,8 +1889,7 @@ export function mount(context = {}) {
           </section>
         </div>
         <div class="system-admin-security-grid">
-          ${systemSecurityBindingPanel(twofa, apiData)}
-          ${systemCloudPairingPanel(data)}
+          ${systemCloudAccessPanel(twofa, apiData)}
         </div>
       </div>
     `;
@@ -1527,20 +1905,54 @@ export function mount(context = {}) {
   }
 
   /*
-   * OTP 与 App 配对合并为单张「安全绑定」卡：两者都是同一件事的两半（谁能登录、
-   * 用什么第二因子），此前分成两张并排面板会让同一主题的状态被卡片边界割开。
-   * 常驻区只保留状态行与单一入口，短流程仍走 Kit 居中对话框（design.md 规则 16）。
+   * 「云端与安全接入」：OTP 绑定、App 配对、云端中继状态与路由器指纹合成一张全宽舱。
+   *
+   * 这几段讲的是同一件事的不同侧面 —— 谁能登录（第二因子）、哪台设备被授权（配对）、
+   * 它从哪条路进来（本地还是云端中继）、凭什么认定对面是这台路由器（指纹）。
+   * 早先拆成「安全绑定」「云平台配对」两张并排卡，两侧内容量天然不等：30.1 实测
+   * 左 423px / 右 608px、列宽 634/468，视觉上像其中一张没写完。
+   * 现在按语义分三段纵向排布，每段用小标题领起、段间发丝线分隔。
+   *
+   * 常驻区仍只给状态与单一入口，短流程走 Kit 居中对话框（design.md 规则 16）；
+   * 云端部分依旧只读 —— 没有可用的注册/启用接口，就不画点了不动的按钮。
    */
-  function systemSecurityBindingPanel(twofa = {}, apiData = {}) {
+  function systemCloudAccessPanel(twofa = {}, apiData = {}) {
     const enabled = Boolean(twofa.twofa_enabled || twofa.enabled);
     const hasPrepared = Boolean(twofa.secret || twofa.otpauth_url);
     const meta = `${Number(twofa.digits || 6)} 位 · ${Number(twofa.period || 30)} 秒刷新 · ${String(twofa.method || 'totp').toUpperCase()}`;
     const devices = Array.isArray(apiData.paired_devices) ? apiData.paired_devices : [];
     const pairedDevices = devices.filter((device) => Number(device?.paired_at || 0) > 0 || String(device?.state || '') === 'paired');
+    const remoteDevices = pairedDevices.filter((device) => Number(device?.last_remote_seen || 0) > 0);
+    const relayDevices = pairedDevices.filter((device) => String(device?.last_access_path || 'local') !== 'local');
+    const lastRemote = remoteDevices.reduce((max, device) => Math.max(max, Number(device.last_remote_seen || 0)), 0);
+    const observed = remoteDevices.length > 0 || relayDevices.length > 0;
+    const status = state.cloudStatus;
+    const identity = state.cloudIdentity;
+    const tunnel = status?.tunnel && typeof status.tunnel === 'object' ? status.tunnel : {};
+    const stage = systemCloudStage(status, remoteDevices.length);
+    const fingerprint = String(identity?.fingerprint || status?.fingerprint || '').trim();
+    const tunnelStateText = status
+      ? (String(tunnel.state || '') ? escapeHtml(String(tunnel.state)) : '未知')
+      : '不可读';
+    const reasonText = systemCloudTunnelReasonText(tunnel.reason);
     return `
-      <section class="system-demo-panel system-admin-security-panel">
-        <div class="system-demo-panel-title">${systemSettingsIcon('shield')}<span>安全绑定</span></div>
-        <div class="system-admin-binding-group">
+      <section class="system-demo-panel system-admin-access-panel">
+        <header class="system-admin-access-header">
+          <div class="system-demo-panel-title">${systemSettingsIcon('cloud')}<span>云端与安全接入</span></div>
+          <em class="system-admin-access-pill ${stage.tone === 'ok' ? 'ready' : 'pending'}">${escapeHtml(stage.title)}</em>
+        </header>
+        <div class="system-admin-access-section">
+          <span class="system-admin-access-legend">云端通道状态</span>
+          <div class="system-admin-cloud-metrics">
+            ${systemCloudMetric('中继注册', status ? (status.enrolled ? '已注册' : '未注册') : '不可读', status ? '来自 cloud/status.enrolled' : '云端状态接口未返回')}
+            ${systemCloudMetric('隧道状态', tunnelStateText, reasonText ? `原因：${reasonText}` : '来自 cloud/status.tunnel.state')}
+            ${systemCloudMetric('已绑定 App', `${pairedDevices.length} 台`, '可用于远程接入的设备总数')}
+            ${systemCloudMetric('走过中继', `${remoteDevices.length} 台`, observed ? `最近 ${lastRemote ? relativeSeconds(lastRemote) : '未知'}` : '暂无远程接入记录')}
+          </div>
+          <p class="system-admin-access-note">${escapeHtml(stage.hint)}</p>
+        </div>
+        <div class="system-admin-access-section">
+          <span class="system-admin-access-legend">安全身份与已绑定设备</span>
           <div class="system-admin-status-row">
             <span class="system-admin-status-light ${enabled ? 'ok' : ''}" aria-hidden="true">${systemSettingsIcon('key')}</span>
             <div>
@@ -1549,9 +1961,7 @@ export function mount(context = {}) {
             </div>
             <button class="system-demo-btn ${enabled ? 'secondary' : 'primary'}" type="button" data-system-action="twofa-open-binding" ${state.twofaWorking ? 'disabled' : ''}>${enabled ? '管理绑定' : '准备绑定'}</button>
           </div>
-          <p class="system-admin-security-note">${enabled ? '登录时需要验证器生成的动态验证码。解绑也会在小窗口中再次验证。' : '扫描二维码并输入动态验证码，请妥善保管密钥。'}</p>
-        </div>
-        <div class="system-admin-binding-group">
+          <p class="system-admin-access-note">${enabled ? '登录时需要验证器生成的动态验证码。解绑也会在小窗口中再次验证。' : '扫描二维码并输入动态验证码，请妥善保管密钥。'}</p>
           <div class="system-admin-status-row">
             <span class="system-admin-status-light ${pairedDevices.length ? 'ok' : ''}" aria-hidden="true">${systemSettingsIcon('phone')}</span>
             <div>
@@ -1564,55 +1974,90 @@ export function mount(context = {}) {
             ${pairedDevices.length ? pairedDevices.map(systemApiDeviceRow).join('') : `<div class="system-api-empty">还没有已绑定 App。</div>`}
           </div>
         </div>
+        <div class="system-admin-access-section">
+          <span class="system-admin-access-legend">路由器硬件身份</span>
+          ${fingerprint ? `
+          <div class="system-admin-cloud-fingerprint">
+            <span>${systemSettingsIcon('shield')}</span>
+            <div>
+              <strong>路由器硬件指纹 <code>${escapeHtml(fingerprint)}</code></strong>
+              <em>与 App 上显示的指纹逐段比对一致，即可确认没有中间人。指纹派生自路由器身份，重置身份后会变化。</em>
+            </div>
+            <button class="system-demo-btn secondary compact-btn system-admin-fingerprint-copy" type="button" data-system-action="cloud-copy-fingerprint" data-system-copy="${escapeHtml(fingerprint)}">${systemSettingsIcon('copy')}<span>复制指纹</span></button>
+          </div>` : `
+          <div class="system-api-empty">云端身份接口未返回路由器指纹，无法在此比对。</div>`}
+          <div class="system-admin-cloud-notice">
+            ${systemSettingsIcon('warning')}
+            <div>
+              <strong>Web 端暂无写入口</strong>
+              <em>云端接口目前只提供只读状态，没有可用的注册与启用接口，因此这里不提供操作按钮。中继接入需在路由器侧配置。</em>
+            </div>
+          </div>
+        </div>
       </section>
     `;
   }
 
   /*
-   * 云平台配对。目前只读，而且刻意不画任何点不动的按钮。
+   * 云平台配对。只读，不画点不动的按钮。
    *
-   * 后端现状（已在 Front-to-Backend-cloud-pairing-api.md 里核实并交接）：
-   * dreamingos-cloud 的 ubus 面只有 status / identity 两个 NOARG 只读方法，webd 没有
-   * 任何 /api/v1/cloud|relay|remote 路由，所以 WebUI 拿不到隧道状态，也没有写入口去
-   * 初始化配对。唯一能在浏览器里读到的真实云端信号来自 /api/v1/auth/devices 的
-   * last_remote_seen / last_access_path：这两列由 dreamingos-cloud 在经中继服务请求时
-   * 回写，因此「有没有设备真的走过远程链路」是可信的，而隧道自身的开关状态不可知。
-   * 这里如实呈现这一点，不猜测、不乐观展示。
+   * 后端现状（2026-08-03 用只读凭据实测，webd 已提供这两条路由）：
+   *   GET /api/v1/cloud/status    -> enrolled / tunnel.state / tunnel.reason /
+   *                                  config.enabled / enrollment.state / registered_app_devices
+   *   GET /api/v1/cloud/identity  -> router_id / fingerprint / 公钥与签名算法
+   *
+   * 因此隧道状态**是可读的**，不必再只靠设备痕迹推断。这里把三层事实分开呈现：
+   *   1. 中继注册 enrolled          —— 路由器有没有在云端注册过
+   *   2. 隧道 tunnel.state + reason —— 关键在于区分「未启用」与「启用了但当前没连上」，
+   *                                    后端刻意把 reason 原样透出来就是为了让前端分开措辞
+   *   3. 远程接入痕迹 last_remote_seen —— 有没有 App 真的走过中继（正常待机也可能为 0）
+   *
+   * 三者各自为真且处置不同：未注册要去注册，未启用要去启用，已启用无痕迹则是正常待机。
+   * 混成一个布尔会让页面读起来像「功能存在但没人用过」，而真实情况可能是中继压根没开。
    */
-  function systemCloudPairingPanel(data = {}) {
-    const apiData = data.api || {};
-    const devices = Array.isArray(apiData.paired_devices) ? apiData.paired_devices : [];
-    const pairedDevices = devices.filter((device) => Number(device?.paired_at || 0) > 0 || String(device?.state || '') === 'paired');
-    const remoteDevices = pairedDevices.filter((device) => Number(device?.last_remote_seen || 0) > 0);
-    const relayDevices = pairedDevices.filter((device) => String(device?.last_access_path || 'local') !== 'local');
-    const lastRemote = remoteDevices.reduce((max, device) => Math.max(max, Number(device.last_remote_seen || 0)), 0);
-    const observed = remoteDevices.length > 0 || relayDevices.length > 0;
-    return `
-      <section class="system-demo-panel system-admin-cloud-panel">
-        <div class="system-demo-panel-title">${systemSettingsIcon('cloud')}<span>云平台配对</span></div>
-        <div class="system-admin-status-row">
-          <span class="system-admin-status-light ${observed ? 'ok' : ''}" aria-hidden="true">${systemSettingsIcon('link')}</span>
-          <div>
-            <strong>${observed ? '已观测到远程接入' : '未观测到远程接入'}</strong>
-            <em>${observed
-              ? escapeHtml(`${remoteDevices.length} 台 App 走过中继${lastRemote ? ` · 最近 ${relativeSeconds(lastRemote)}` : ''}`)
-              : '已绑定的 App 目前都只从本地网络访问'}</em>
-          </div>
-        </div>
-        <div class="system-admin-cloud-metrics">
-          ${systemCloudMetric('已绑定 App', String(pairedDevices.length), '可用于远程接入的设备总数')}
-          ${systemCloudMetric('走过中继', String(remoteDevices.length), observed ? '按后端远程接入审计列统计' : '暂无远程接入记录')}
-          ${systemCloudMetric('最近远程访问', lastRemote ? relativeSeconds(lastRemote) : '无记录', lastRemote ? '来自 last_remote_seen' : 'no_remote_access_recorded')}
-        </div>
-        <div class="system-admin-cloud-notice">
-          ${systemSettingsIcon('warning')}
-          <div>
-            <strong>云端配对入口尚未开放</strong>
-            <em>路由器侧的云端代理只提供只读状态，Web 端没有可用的配对与启用接口，因此这里不提供操作按钮。当前需要由运维在路由器上完成中继接入配置。</em>
-          </div>
-        </div>
-      </section>
-    `;
+  const SYSTEM_CLOUD_TUNNEL_REASONS = {
+    relay_disabled: '中继服务未启用',
+    never_connected: '尚未建立过连接',
+    not_enrolled: '路由器尚未在云端注册',
+    auth_failed: '云端认证失败',
+    network_unreachable: '无法连接云端主机',
+    tls_error: 'TLS 握手失败'
+  };
+
+  function systemCloudTunnelReasonText(reason) {
+    const key = String(reason || '').toLowerCase();
+    if (!key) return '';
+    return SYSTEM_CLOUD_TUNNEL_REASONS[key] || key;
+  }
+
+  /*
+   * 把 status 归成一个四态判定，顺序即优先级：状态不可读 > 未注册 > 隧道未启用 >
+   * 隧道异常 > 已就绪（再按有无远程痕迹分待机/在用）。
+   */
+  function systemCloudStage(status, remoteCount) {
+    if (!status) return { id: 'unknown', tone: '', title: '云端状态不可读', hint: '未能获取 /api/v1/cloud/status，下面的设备统计仍来自本地审计列。' };
+    const tunnel = status.tunnel && typeof status.tunnel === 'object' ? status.tunnel : {};
+    const tunnelState = String(tunnel.state || '').toLowerCase();
+    const reasonText = systemCloudTunnelReasonText(tunnel.reason);
+    const suffix = reasonText ? `（${reasonText}）` : '';
+    if (!status.enrolled) {
+      return {
+        id: 'not-enrolled',
+        tone: 'warn',
+        title: '中继未注册',
+        hint: `路由器还没有在云平台注册${suffix}，App 无法从外网接入。注册需要在路由器侧配置中继接入。`
+      };
+    }
+    if (tunnelState === 'disabled' || tunnelState === 'off') {
+      return { id: 'tunnel-disabled', tone: 'warn', title: '隧道未启用', hint: `已注册，但中继隧道处于关闭状态${suffix}。` };
+    }
+    if (tunnel.connected === false) {
+      return { id: 'tunnel-down', tone: 'warn', title: '隧道已启用但未连接', hint: `隧道配置为启用，当前未与云端建立连接${suffix}。` };
+    }
+    if (remoteCount > 0) {
+      return { id: 'in-use', tone: 'ok', title: '远程接入正常', hint: '隧道已连接，并且已有 App 走过中继。' };
+    }
+    return { id: 'idle', tone: 'ok', title: '隧道已连接，暂无远程接入', hint: '中继就绪，目前所有 App 都从本地网络访问，属正常待机。' };
   }
 
   function systemCloudMetric(label, value, hint) {
@@ -1924,6 +2369,37 @@ export function mount(context = {}) {
     }
   }
 
+  /*
+   * App 设备角色。`GET /api/v1/auth/devices` 的 capabilities 里
+   * `role_write: true` 表示后端支持改角色（PATCH /api/v1/auth/devices/{id}，
+   * 见 Backend-to-Front-readonly-release-audit-answers.md 的 B-0）。
+   *
+   * 为什么必须有这个入口：App 首次 LAN 配对拿到的是 `operator`，而 operator 只有
+   * read + write.low。App 侧任何 MEDIUM 操作（含改这个角色本身）都会被拒，
+   * 于是设备**无法自我提权**，形成死锁。后端明确说这是 Web 端的入口问题、
+   * 不新增接口，由 owner 的 Web 会话来提权。
+   *
+   * 角色与权限分级取自 `/api/v1/system/user-roles` 实测：
+   *   owner    read + low + medium + high
+   *   admin    read + low + medium
+   *   operator read + low
+   *   viewer   read
+   * 这里只给这四个：`user` 也存在但语义与 App 设备无关，不放进来误导。
+   */
+  const SYSTEM_DEVICE_ROLES = [
+    ['owner', 'Owner（完全控制，含高风险操作）'],
+    ['admin', 'Administrator（读 + 中风险管理）'],
+    ['operator', 'Operator（读 + 低风险操作）'],
+    ['viewer', 'Viewer（只读）']
+  ];
+
+  function systemDeviceRoleLabel(role) {
+    const key = String(role || '').toLowerCase();
+    const hit = SYSTEM_DEVICE_ROLES.find(([id]) => id === key);
+    if (hit) return hit[1].replace(/（.*$/, '');
+    return role || '未知角色';
+  }
+
   function systemApiDeviceRow(device = {}) {
     const id = device.id || device.device_id || '';
     const enabled = device.enabled !== false && device.state !== 'disabled';
@@ -1934,11 +2410,25 @@ export function mount(context = {}) {
     const fingerprint = String(device.public_key_fingerprint || '');
     const meta = [
       device.platform,
-      device.role,
       lastSeen ? `上次 ${relativeSeconds(lastSeen)}` : '',
       pairedAt ? `绑定 ${relativeSeconds(pairedAt)}` : '',
       lastRemote ? `远程 ${relativeSeconds(lastRemote)}` : ''
     ].filter(Boolean).join(' · ');
+    /*
+     * 角色下拉只在后端 capabilities 明确说支持时出现；否则退回纯文本，
+     * 不画一个点了没反应的控件。self_device_protection 是后端的自锁保护，
+     * 这里不重复实现，改自己会由后端拒绝并把原因带上来。
+     */
+    const caps = state.deviceCapabilities || {};
+    const canWriteRole = caps.role_write === true;
+    const role = String(device.role || '').toLowerCase();
+    const busy = state.deviceWorking === id;
+    const roleControl = canWriteRole
+      ? `<select class="system-glass-input system-api-role-select" data-system-action="api-device-role" data-api-id="${escapeHtml(id)}" aria-label="${escapeHtml(`${device.name || 'App 设备'} 的角色`)}" ${!id || busy ? 'disabled' : ''}>
+            ${SYSTEM_DEVICE_ROLES.map(([value, label]) => `<option value="${escapeHtml(value)}" ${role === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}
+            ${role && !SYSTEM_DEVICE_ROLES.some(([value]) => value === role) ? `<option value="${escapeHtml(role)}" selected>${escapeHtml(role)}（后端返回的未知角色）</option>` : ''}
+          </select>`
+      : `<span class="system-api-role-static">${escapeHtml(systemDeviceRoleLabel(device.role))}</span>`;
     return `
       <article class="system-api-row ${enabled ? '' : 'disabled'}">
         <span class="system-api-row-icon" aria-hidden="true">${systemSettingsIcon(device.platform === 'android' ? 'android' : 'phone')}</span>
@@ -1947,7 +2437,8 @@ export function mount(context = {}) {
           <em>${escapeHtml(meta || id || '等待后端返回设备信息')}${fingerprint ? ` · <i class="system-api-row-fingerprint">指纹 ${escapeHtml(fingerprint)}</i>` : ''}</em>
         </span>
         <b class="${enabled ? 'good' : ''}">${enabled ? '启用' : '停用'}</b>
-        <button class="system-demo-btn secondary compact-btn" type="button" data-system-action="api-revoke-device" data-api-id="${escapeHtml(id)}" ${!id || state.deviceWorking === id ? 'disabled' : ''}>撤销</button>
+        ${roleControl}
+        <button class="system-demo-btn secondary compact-btn" type="button" data-system-action="api-revoke-device" data-api-id="${escapeHtml(id)}" ${!id || busy ? 'disabled' : ''}>撤销</button>
       </article>
     `;
   }
@@ -2412,7 +2903,9 @@ export function mount(context = {}) {
       state.flashMessage = '';
       state.flashError = '';
       render();
-      if (state.flashTab === 'config' && !state.flashPreserveAvailable && !state.flashPreserveLoading) loadFlashPreserveConfig();
+      if (state.flashTab === 'firmware' && !state.flashPreserveAvailable && !state.flashPreserveLoading) loadFlashPreserveConfig();
+      if (state.flashTab === 'operations' && !state.flashBackupsLoaded && !state.flashBackupsLoading) loadFlashBackups();
+      if (!state.flashCapabilitiesLoaded && !state.flashCapabilitiesLoading) loadFlashCapabilities();
       event.preventDefault();
       return;
     }
@@ -2451,6 +2944,7 @@ export function mount(context = {}) {
     else if (name === 'api-approve-pairing') approveAppPairing();
     else if (name === 'api-cancel-pairing') cancelAppPairing();
     else if (name === 'api-revoke-device') revokeAppDevice(action.dataset.apiId || '');
+    else if (name === 'cloud-copy-fingerprint') copyFingerprintValue(action);
     else if (startupServiceActionFromDataset(name)) handleStartupServiceAction(action.dataset.serviceName || '', startupServiceActionFromDataset(name));
     else if (name === 'mount-generate-config') handleMountOperation('generate');
     else if (name === 'mount-connected-devices') handleMountOperation('connected');
@@ -2458,7 +2952,10 @@ export function mount(context = {}) {
     else if (name === 'mount-add' || name === 'mount-edit' || name === 'mount-delete') handleMountDraftAction(name, action.dataset.mountId || '');
     else if (name === 'flash-create-backup') createFlashBackup();
     else if (name === 'flash-restore-backup') unavailableBrowserFlashUpload('恢复配置');
-    else if (name === 'flash-sysupgrade') unavailableBrowserFlashUpload('固件升级');
+    else if (name === 'flash-restore-archive') restoreFlashArchive(action.dataset.backupId || '');
+    else if (name === 'flash-delete-archive') deleteFlashArchive(action.dataset.backupId || '');
+    else if (name === 'flash-upload-verify') uploadAndVerifyFirmware();
+    else if (name === 'flash-apply-firmware') applyFirmwareOperation();
     else if (name === 'flash-factory-reset') factoryResetFlash();
     else if (name === 'flash-save-preserve') saveFlashPreserveConfig();
     else if (name === 'signature-apply-package') applySignatureUpdate();
@@ -2614,24 +3111,31 @@ export function mount(context = {}) {
   }
 
   async function createFlashBackup() {
-    if (state.flashWorking || !flashCapability('flash_backup_create')) return;
+    // 判据与按钮 disabled 必须同源，否则按钮可点但函数第一行就静默返回。
+    if (state.flashWorking || !flashBackupCapability('flash_backup_create', 'create_backup')) return;
     state.flashWorking = 'create-backup';
     state.flashMessage = '';
     state.flashError = '';
     render();
     try {
       const payload = flashPayload(await postJson('/api/v1/system/flash/create_backup', {}));
-      const path = stringOr(payload.path);
+      const backupId = stringOr(payload.backup_id || payload.upload_id);
+      const downloadUrl = stringOr(payload.download_url);
       const size = formatBytes(payload.size_bytes);
       state.data.flash = {
         ...(state.data.flash || {}),
-        last_backup_at: Number(payload.ts || Math.floor(Date.now() / 1000)),
+        last_backup_at: Number(payload.created_at || payload.ts || Math.floor(Date.now() / 1000)),
         backup_size: size,
-        backup_path: path
+        backup_path: stringOr(payload.path)
       };
-      state.flashMessage = path
-        ? `备份已在设备上生成${size ? `（${size}）` : ''}。后端尚未提供浏览器下载地址：${path}`
-        : '备份已生成，但后端没有返回文件路径或下载地址。';
+      // 后端返回的正是 backup_id 与 download_url（webd_config_backup_create_response），
+      // 之前这里写「后端尚未提供浏览器下载地址」，与事实不符。
+      state.flashMessage = downloadUrl
+        ? `备份已生成${size ? `（${size}）` : ''}，可在下方存档列表下载或直接恢复。`
+        : `备份已生成${size ? `（${size}）` : ''}${backupId ? `，编号 ${backupId}` : ''}，但后端未返回下载地址。`;
+      // 列表要立刻反映新存档，否则用户看不到刚生成的那一份
+      state.flashBackupsLoaded = false;
+      loadFlashBackups();
     } catch (error) {
       state.flashError = error?.message || '生成备份失败';
     } finally {
@@ -2647,8 +3151,207 @@ export function mount(context = {}) {
     render();
   }
 
+  /*
+   * 分片上传到 owner 作用域的暂存区。webd 单请求体上限 4 MiB
+   * （APP_API_MAX_BODY），固件动辄上百 MB，所以必须切片按 offset 追加。
+   * chunk 必须是 application/octet-stream，offset 走 query 且要求精确匹配。
+   */
+  const FLASH_UPLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
+
+  async function uploadStagedFile(file, uploadType) {
+    const begin = flashPayload(await postJson('/api/v1/uploads/begin', {
+      upload_type: uploadType,
+      filename: file.name,
+      expected_size_bytes: file.size
+    }));
+    const uploadId = stringOr(begin.upload_id || '');
+    if (!uploadId) throw new Error('upload_id_missing');
+    let offset = 0;
+    while (offset < file.size) {
+      const end = Math.min(offset + FLASH_UPLOAD_CHUNK_BYTES, file.size);
+      const buffer = await file.slice(offset, end).arrayBuffer();
+      await fetchJson(`/api/v1/uploads/${encodeURIComponent(uploadId)}/chunk?offset=${offset}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: buffer
+      });
+      offset = end;
+      state.flashFirmwareProgress = file.size ? (offset / file.size) * 100 : 100;
+      /*
+       * 只更新按钮上的百分比，不能整页 render()。
+       *
+       * `render()` 会重写整个 `system-settings-layout` 的 innerHTML，然后
+       * `ui.mountAll()` 重挂所有 kit 组件、`scheduleGlassCardsRender()` 重跑玻璃
+       * 采样。分片是 2MiB 一个，一个几十 MB 的镜像要走十几到几十轮，每轮整页重建 ——
+       * 用户看到的就是「上传固件过程中整个页面闪烁」。
+       * 进度唯一的落点是这个按钮的文字，所以只改它。
+       */
+      updateFlashProgressLabel();
+    }
+    /*
+     * 不传 sha256：这套 Web 界面走明文 HTTP，`crypto.subtle` 在非安全上下文下不可用，
+     * 前端算不出摘要。finalize 服务端自己会算并回填，长度已由 expected_size_bytes 卡住。
+     */
+    return flashPayload(await postJson(`/api/v1/uploads/${encodeURIComponent(uploadId)}/finalize`, {}));
+  }
+
+  function flashOperationFromResponse(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    return stringOr(payload.operation_id || '') ? payload : null;
+  }
+
+  /*
+   * 上传 → 校验两步。用户明确要求先跑通这两步，应用一步由 apply_firmware 能力自己把关。
+   */
+  async function uploadAndVerifyFirmware() {
+    const file = state.flashFirmwareFile;
+    if (state.flashWorking || !file) return;
+    if (!flashCapAvailable('upload_firmware') || !flashCapAvailable('verify_firmware')) return;
+    stopFlashOperationPolling();
+    state.flashConfirm = '';
+    state.flashMessage = '';
+    state.flashError = '';
+    state.flashFirmwareUpload = null;
+    state.flashFirmwareOperation = null;
+    state.flashFirmwareProgress = 0;
+    state.flashWorking = 'firmware-upload';
+    render();
+    let meta = null;
+    try {
+      meta = await uploadStagedFile(file, 'firmware');
+      state.flashFirmwareUpload = meta;
+      state.flashMessage = '镜像已上传到设备暂存区，正在校验…';
+    } catch (error) {
+      state.flashWorking = '';
+      state.flashError = `固件上传失败：${flashRequestErrorText(error)}`;
+      render();
+      return;
+    }
+    /*
+     * 转入校验只更新按钮文字，不整页重绘。
+     *
+     * 这里原来是一次 render()，而 verify 请求返回得快时，`finally` 里那次 render()
+     * 紧随其后 —— 实测两次整页重建只隔 7ms，肉眼就是一下明显的抖动。
+     * 这一步的可见变化只有按钮从「上传中… 100%」变成「校验中…」，
+     * 局部改文字就够；结构变化（校验卡出现、按钮解禁）由 `finally` 那次统一收敛。
+     */
+    state.flashWorking = 'firmware-verify';
+    updateFlashProgressLabel();
+    try {
+      // 保留配置的勾选映射到 allow_unpreserved 的反面；auto_reboot 留给"应用"那一步决定。
+      const keepSettings = (state.flashKeepSettings ?? state.data?.flash?.keep_settings) !== false;
+      const verify = flashPayload(await postJson('/api/v1/system/flash/firmware/verify', {
+        upload_id: stringOr(meta.upload_id || ''),
+        allow_unpreserved: !keepSettings,
+        auto_reboot: false
+      }));
+      state.flashFirmwareOperation = flashOperationFromResponse(verify);
+      state.flashMessage = state.flashFirmwareOperation
+        ? '固件校验已完成，结果见下方「本次升级校验」。'
+        : '固件校验已提交，但设备未返回 operation_id。';
+      if (state.flashFirmwareOperation && !isFlashOperationTerminal(state.flashFirmwareOperation)) {
+        startFlashOperationPolling();
+      }
+    } catch (error) {
+      state.flashError = `固件校验未通过：${flashRequestErrorText(error)}`;
+    } finally {
+      state.flashWorking = '';
+      render();
+    }
+  }
+
+  /*
+   * 请求失败文案同样按状态/错误码分类，而不是一律"接口不可用"。
+   */
+  function flashRequestErrorText(error) {
+    const status = Number(error?.status || 0);
+    const code = stringOr(error?.payload?.error?.code || error?.payload?.error || '');
+    const message = stringOr(error?.payload?.error?.message || error?.message || '');
+    if (status === 401) return '会话已失效，请重新登录。';
+    if (status === 403) return '当前账号权限不足。';
+    if (status === 404 || status === 405 || status === 501) return '设备未实现该接口。';
+    if (!status) return message || '网络不可用。';
+    return message || code || `请求失败（${status}）`;
+  }
+
+  function isFlashOperationTerminal(op) {
+    if (!op) return false;
+    if (op.terminal === true) return true;
+    return ['success', 'failed', 'cancelled'].includes(stringOr(op.state || ''));
+  }
+
+  function stopFlashOperationPolling() {
+    if (state.flashFirmwarePollTimer) {
+      window.clearTimeout(state.flashFirmwarePollTimer);
+      state.flashFirmwarePollTimer = 0;
+    }
+  }
+
+  /*
+   * 进度只按后端状态位推进（design.md 同节第 9 条），terminal / state 说停就停，
+   * 不在前端按 progress 数值猜是否结束。
+   */
+  function startFlashOperationPolling() {
+    stopFlashOperationPolling();
+    state.flashFirmwarePollTimer = window.setTimeout(async () => {
+      state.flashFirmwarePollTimer = 0;
+      if (!state.mounted) return;
+      const operationId = stringOr(state.flashFirmwareOperation?.operation_id || '');
+      if (!operationId) return;
+      try {
+        const payload = flashPayload(await fetchJson(`/api/v1/system/flash/firmware/status?operation_id=${encodeURIComponent(operationId)}`));
+        if (!state.mounted) return;
+        if (stringOr(payload.operation_id || '')) state.flashFirmwareOperation = payload;
+        /*
+         * 校验轮询是 3s 一拍，整页 render() 会把布局重写、kit 重挂、玻璃重采样，
+         * 于是整个校验过程页面一直在闪。状态只落在「本次升级校验」这张卡上，
+         * 所以只换这张卡；终态时再走一次完整 render()，让按钮与能力提示一并收敛。
+         */
+        const terminal = isFlashOperationTerminal(state.flashFirmwareOperation);
+        if (terminal) render();
+        else patchFlashOperationCard();
+        if (!terminal) startFlashOperationPolling();
+      } catch (_) {
+        // 单次轮询失败不改判定，也不清掉已有结果；下一拍继续。
+        if (state.mounted) startFlashOperationPolling();
+      }
+    }, 3000);
+  }
+
+  /*
+   * 应用固件。只接受已校验出的 operation_id，后端明确拒绝在这一步传 upload_id。
+   */
+  async function applyFirmwareOperation() {
+    const operationId = stringOr(state.flashFirmwareOperation?.operation_id || '');
+    if (state.flashWorking || !operationId) return;
+    if (!flashCapAvailable('apply_firmware')) return;
+    if (state.flashConfirm !== 'firmware-apply') {
+      state.flashConfirm = 'firmware-apply';
+      state.flashMessage = '应用固件会写入备用分区并可能重启设备，请再次点击确认。';
+      state.flashError = '';
+      render();
+      return;
+    }
+    state.flashConfirm = '';
+    state.flashWorking = 'firmware-apply';
+    state.flashMessage = '';
+    state.flashError = '';
+    render();
+    try {
+      const payload = flashPayload(await postJson('/api/v1/system/flash/firmware/apply', { operation_id: operationId }));
+      if (stringOr(payload.operation_id || '')) state.flashFirmwareOperation = payload;
+      state.flashMessage = '固件应用已提交，进度见下方状态。';
+      if (!isFlashOperationTerminal(state.flashFirmwareOperation)) startFlashOperationPolling();
+    } catch (error) {
+      state.flashError = `固件应用失败：${flashRequestErrorText(error)}`;
+    } finally {
+      state.flashWorking = '';
+      render();
+    }
+  }
+
   async function factoryResetFlash() {
-    if (state.flashWorking || !flashCapability('flash_factory_reset')) return;
+    if (state.flashWorking || !flashBackupCapability('flash_factory_reset', 'factory_reset')) return;
     if (state.flashConfirm !== 'factory-reset') {
       state.flashConfirm = 'factory-reset';
       state.flashMessage = '请再次点击“恢复出厂设置”确认。';
@@ -2666,6 +3369,118 @@ export function mount(context = {}) {
       state.flashMessage = '恢复出厂设置已启动，设备将重新启动。';
     } catch (error) {
       state.flashError = error?.message || '恢复出厂设置失败';
+    } finally {
+      state.flashWorking = '';
+      render();
+    }
+  }
+
+  async function loadFlashBackups() {
+    if (state.flashBackupsLoading) return;
+    state.flashBackupsLoading = true;
+    state.flashBackupsError = '';
+    render();
+    try {
+      const payload = flashPayload(await fetchJson('/api/v1/system/flash/backups'));
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      state.flashBackups = items
+        .filter((item) => item && typeof item === 'object')
+        .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0));
+      state.flashBackupsLoaded = true;
+      state.flashBackupsSupported = true;
+    } catch (error) {
+      state.flashBackups = [];
+      // 只有明确的"路由不存在 / 未实现"才算不支持；401、超时、500 都不是能力判据
+      if (error?.status === 404 || error?.status === 501) state.flashBackupsSupported = false;
+      state.flashBackupsError = `无法读取备份存档：${error?.message || '接口不可用'}`;
+    } finally {
+      state.flashBackupsLoading = false;
+      render();
+    }
+  }
+
+  /*
+   * flash 能力源。这条请求本身就是能力的权威，不能被别的概览接口的能力位挡在前面
+   * （design.md 同节第 2 条：必须先请求目标端点，再依据响应决定渲染）。
+   */
+  async function loadFlashCapabilities() {
+    if (state.flashCapabilitiesLoading) return;
+    state.flashCapabilitiesLoading = true;
+    state.flashCapabilitiesError = '';
+    render();
+    try {
+      const payload = flashPayload(await fetchJson('/api/v1/system/flash/capabilities'));
+      const caps = payload.capabilities;
+      state.flashCapabilities = caps && typeof caps === 'object' ? caps : {};
+      state.flashScheduledBackup = {
+        supported: payload.scheduled_backup_supported === true,
+        reason: stringOr(payload.scheduled_backup_reason || ''),
+        scope: stringOr(payload.backup_scope || ''),
+        storage: stringOr(payload.backup_storage || '')
+      };
+      state.flashCapabilitiesLoaded = true;
+    } catch (error) {
+      // 失败时不写入空能力表：null 表示"未确认"，空对象会被读成"全都不可用"。
+      state.flashCapabilities = null;
+      state.flashCapabilitiesError = flashCapabilityFailureText(error);
+    } finally {
+      state.flashCapabilitiesLoading = false;
+      render();
+    }
+  }
+
+  /*
+   * 从设备上已有的存档恢复。`restore_backup` 只要 finalized 的 upload_id，
+   * 所以不需要先下载再上传。破坏性动作沿用本页既有的"再次点击确认"两段式。
+   */
+  async function restoreFlashArchive(backupId) {
+    const id = stringOr(backupId);
+    if (!id || state.flashWorking) return;
+    if (state.flashConfirm !== `restore-archive:${id}`) {
+      state.flashConfirm = `restore-archive:${id}`;
+      state.flashMessage = '恢复会覆盖当前配置并可能重启设备，请再次点击「恢复」确认。';
+      state.flashError = '';
+      render();
+      return;
+    }
+    state.flashConfirm = '';
+    state.flashWorking = `backup:${id}`;
+    state.flashMessage = '';
+    state.flashError = '';
+    render();
+    try {
+      const payload = flashPayload(await postJson('/api/v1/system/flash/restore_backup', { upload_id: id }));
+      state.flashMessage = stringOr(payload.message)
+        || '恢复已暂存，后端将按 restore-status / restore-confirm 流程继续。';
+    } catch (error) {
+      state.flashError = error?.message || '恢复失败';
+    } finally {
+      state.flashWorking = '';
+      render();
+    }
+  }
+
+  async function deleteFlashArchive(backupId) {
+    const id = stringOr(backupId);
+    if (!id || state.flashWorking) return;
+    if (state.flashConfirm !== `delete-archive:${id}`) {
+      state.flashConfirm = `delete-archive:${id}`;
+      state.flashMessage = '删除后该备份无法恢复，请再次点击「删除」确认。';
+      state.flashError = '';
+      render();
+      return;
+    }
+    state.flashConfirm = '';
+    state.flashWorking = `backup:${id}`;
+    state.flashMessage = '';
+    state.flashError = '';
+    render();
+    try {
+      await fetchJson(`/api/v1/system/flash/backups/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      state.flashBackups = state.flashBackups.filter((item) => stringOr(item.backup_id || item.upload_id) !== id);
+      state.flashMessage = '备份已删除。';
+    } catch (error) {
+      state.flashError = error?.message || '删除备份失败';
     } finally {
       state.flashWorking = '';
       render();
@@ -2817,12 +3632,40 @@ export function mount(context = {}) {
       const payload = result?.data && typeof result.data === 'object' ? result.data : result;
       const devices = Array.isArray(payload?.devices) ? payload.devices : [];
       state.data = mergeSystemSettingsValue(state.data, { api: { paired_devices: devices } });
+      // capabilities 决定角色下拉是否出现，不猜测后端支持什么。
+      state.deviceCapabilities = payload?.capabilities && typeof payload.capabilities === 'object'
+        ? payload.capabilities
+        : {};
+      state.deviceIdentity = String(payload?.current_identity || '');
       state.saveError = '';
       if (shouldRender) render();
     } catch (error) {
       state.saveError = error?.message || 'paired devices unavailable';
       if (shouldRender) refreshSavebarOnly();
     }
+  }
+
+  /*
+   * 云端中继状态与路由器身份。两个接口都是只读 GET，各自失败互不影响：
+   * 拿不到 status 时面板会显示「状态不可读」，而不是假装中继未启用。
+   */
+  async function loadCloudStatus(shouldRender = false) {
+    const results = await Promise.allSettled([
+      fetchJson('/api/v1/cloud/status'),
+      fetchJson('/api/v1/cloud/identity')
+    ]);
+    const unwrap = (entry) => {
+      if (entry.status !== 'fulfilled') return null;
+      const result = entry.value;
+      const payload = result?.data && typeof result.data === 'object' ? result.data : result;
+      return payload && typeof payload === 'object' ? payload : null;
+    };
+    const status = unwrap(results[0]);
+    const identity = unwrap(results[1]);
+    state.cloudStatus = status;
+    state.cloudIdentity = identity;
+    state.cloudStatusError = status ? '' : (results[0].reason?.message || 'cloud status unavailable');
+    if (shouldRender && state.mounted) render();
   }
 
   async function prepareTwofa() {
@@ -2938,6 +3781,72 @@ export function mount(context = {}) {
     }
   }
 
+  /*
+   * 复制路由器指纹。
+   *
+   * 面板走 http://192.168.30.1:12517，**不是安全上下文**，`navigator.clipboard` 在这里
+   * 通常直接不可用，所以必须留 `execCommand('copy')` 兜底，否则按钮点了没反应。
+   * 反馈只改按钮自身的 class（不重绘面板），避免为一次复制触发整页 render。
+   */
+  function copyFingerprintFallback(value) {
+    const text = String(value || '');
+    if (!text) return false;
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.setAttribute('aria-hidden', 'true');
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    textarea.style.top = '0';
+    textarea.style.width = '1px';
+    textarea.style.height = '1px';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    const selection = document.getSelection ? document.getSelection() : null;
+    const ranges = [];
+    if (selection) {
+      for (let index = 0; index < selection.rangeCount; index += 1) ranges.push(selection.getRangeAt(index));
+    }
+    textarea.focus({ preventScroll: true });
+    textarea.select();
+    textarea.setSelectionRange(0, textarea.value.length);
+    let ok = false;
+    try { ok = document.execCommand && document.execCommand('copy'); } catch (_) { ok = false; }
+    document.body.removeChild(textarea);
+    if (selection) {
+      selection.removeAllRanges();
+      ranges.forEach((range) => selection.addRange(range));
+    }
+    return Boolean(ok);
+  }
+
+  async function copyFingerprintValue(button) {
+    const value = String(button?.dataset?.systemCopy || '').trim();
+    if (!value) return;
+    let ok = false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(value);
+        ok = true;
+      }
+    } catch (_) {
+      ok = false;
+    }
+    if (!ok) ok = copyFingerprintFallback(value);
+    const label = button.querySelector('span');
+    if (!label) return;
+    if (button.dataset.systemCopyBusy === '1') return;
+    button.dataset.systemCopyBusy = '1';
+    const original = label.textContent;
+    label.textContent = ok ? '已复制' : '复制失败';
+    button.classList.add(ok ? 'is-copied' : 'is-copy-failed');
+    window.setTimeout(() => {
+      label.textContent = original;
+      button.classList.remove('is-copied', 'is-copy-failed');
+      delete button.dataset.systemCopyBusy;
+    }, ok ? 1100 : 1400);
+  }
+
   async function revokeAppDevice(id) {
     if (!id || state.deviceWorking) return;
     state.deviceWorking = id;
@@ -2968,7 +3877,7 @@ export function mount(context = {}) {
       state.saveError = '';
       render();
       if (page === 'admin') {
-        await Promise.allSettled([loadTwofaStatus(false), loadAppDevices(false)]);
+        await Promise.allSettled([loadTwofaStatus(false), loadAppDevices(false), loadCloudStatus(false)]);
         if (!state.mounted || loadId !== state.seq) return;
         render();
       }
@@ -2983,7 +3892,13 @@ export function mount(context = {}) {
       state.error = result.error?.message || 'system basic source is not available';
       render();
     }
-    if (page === 'flash' && state.flashTab === 'config') loadFlashPreserveConfig();
+    if (page === 'flash' && state.flashTab === 'firmware') loadFlashPreserveConfig();
+    if (page === 'flash' && state.flashTab === 'operations') loadFlashBackups();
+    /*
+     * 能力源和面板一起拉。两个 Tab 都要用它（备份三条 + 固件三条），
+     * 而且它自己就是权威，不等任何概览接口先放行。
+     */
+    if (page === 'flash') loadFlashCapabilities();
   }
 
 
@@ -3109,11 +4024,16 @@ export function mount(context = {}) {
   }
 
   async function fetchJson(url, options = {}) {
+    /*
+     * `...options` 必须在 headers 之前展开：反过来的话调用方一传 headers 就会把整个
+     * headers 对象顶掉，连 authHeaders() 一起丢，请求直接 401。分片上传要自带
+     * Content-Type，正好踩这条。
+     */
     const response = await sessionFetch(`${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(VERSION)}`, {
       credentials: 'same-origin',
       cache: 'no-store',
-      headers: { ...(api.authHeaders ? api.authHeaders() : {}), ...(options.headers || {}) },
-      ...options
+      ...options,
+      headers: { ...(api.authHeaders ? api.authHeaders() : {}), ...(options.headers || {}) }
     });
     const text = await response.text();
     let json = {};
@@ -3177,6 +4097,7 @@ export function mount(context = {}) {
     if (type === 'phone') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.5" width="10" height="19" rx="2"></rect><path d="M10.5 18h3"></path></svg>`;
     if (type === 'android') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="7" width="14" height="12" rx="3"></rect><path d="M8 7 6 4M16 7l2-3M9 12h.01M15 12h.01"></path></svg>`;
     if (type === 'shield') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path><path d="m9 12 2 2 4-5"></path></svg>`;
+    if (type === 'copy') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.2"></rect><path d="M15 5.5A2.5 2.5 0 0 0 12.5 3H6a2.5 2.5 0 0 0-2.5 2.5V13"></path></svg>`;
     if (type === 'key') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="14.5" r="4.5"></circle><path d="M11 11l7-7"></path><path d="M15 5l4 4"></path><path d="M17 7l-2 2"></path></svg>`;
     if (type === 'upload') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="M17 8l-5-5-5 5"></path><path d="M12 3v12"></path></svg>`;
     if (type === 'download') return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="m7 10 5 5 5-5"></path><path d="M12 15V3"></path></svg>`;
@@ -3202,6 +4123,7 @@ export function mount(context = {}) {
       if (state.timer) window.clearTimeout(state.timer);
       if (state.clockTimer) window.clearInterval(state.clockTimer);
       stopPairStatusTimer();
+      stopFlashOperationPolling();
       document.removeEventListener('keydown', onBindingDialogKeydown, true);
       if (root) {
         root.classList.remove(MODULE_CLASS);

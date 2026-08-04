@@ -312,20 +312,23 @@ int cloud_enroll_run(const struct cloud_config *config,
         return -1;
     }
     /*
-     * A legacy UUID router_id cannot self enroll: no signature can make the
-     * relay's fingerprint check pass. Refusing here with a specific code is more
-     * useful than letting the relay answer router_id_mismatch, and rewriting the
-     * id instead would strand every App that already paired with this router.
+     * Enrollment identifies the router by the fingerprint of its two public
+     * keys, which is what the relay recomputes and checks. A legacy UUID
+     * router_id cannot satisfy that check, but the derived id can, and the
+     * router holds the very keys it is derived from, so it can sign for it.
+     *
+     * Earlier this refused outright when router_id was a legacy UUID. That was
+     * an unnecessary dead end: the local identity does not have to be renamed
+     * for the relay to verify a key fingerprint. router_id stays as every
+     * paired App pinned it, and relay_router_id is used on the wire.
      */
-    if (!identity->router_id_is_key_derived) {
-        cloud_enroll_fail(out, 0, "router_id_not_key_derived",
-                          "this router uses a legacy router_id and must be "
-                          "registered statically on the relay");
-        snprintf(out->router_id, sizeof(out->router_id), "%s",
-                 identity->router_id);
+    if (!identity->relay_router_id[0]) {
+        cloud_enroll_fail(out, 0, "relay_router_id_unavailable",
+                          "the relay router_id could not be derived");
         return -1;
     }
-    snprintf(out->router_id, sizeof(out->router_id), "%s", identity->router_id);
+    snprintf(out->router_id, sizeof(out->router_id), "%s",
+             identity->relay_router_id);
 
     if (cloud_base64_encode(identity->public_key, CLOUD_X25519_KEY_LEN,
                             &kex_b64) != 0 ||

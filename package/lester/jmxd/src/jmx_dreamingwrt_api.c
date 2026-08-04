@@ -7,6 +7,7 @@
 #include "jmx_core_watchdog.h"
 #include "jmx_gateway_shadow.h"
 #include "client_protocol_history.h"
+#include "dw_async_query.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -22,6 +23,7 @@
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/random.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -181,6 +183,17 @@ static struct blob_buf dw_b;
  */
 #define DW_UBUS_MAX_MSGLEN      (1024u * 1024u)
 #define DW_UBUS_REPLY_SAFE_BYTES (DW_UBUS_MAX_MSGLEN - (32u * 1024u))
+
+/*
+ * audit_activity_usage matrix cap.  client_usage_by_app grows one row per
+ * matrix_limit, measured at ~1535 bytes/row on 30.1 (600 rows -> 921 KB), so the
+ * old default of 1000 produced a ~1.5 MB reply that ubus dropped outright: the
+ * activity page waited out its full timeout and rendered nothing.  480 rows is
+ * ~737 KB, which leaves room for the accompanying app totals and cap objects.
+ * The old 5000 ceiling was unreachable and is replaced by the same value.
+ */
+#define DW_AUDIT_ACTIVITY_MATRIX_DEFAULT 480
+#define DW_AUDIT_ACTIVITY_MATRIX_MAX     480
 
 static void dw_send_ok(struct ubus_context *ctx, struct ubus_request_data *req);
 static void dw_send_error(struct ubus_context *ctx, struct ubus_request_data *req,
@@ -2594,6 +2607,35 @@ static int dw_audit_flow_backfill_app_from_host(struct json_object *f,
     return 0;
 }
 
+/* A group key that is neither a signature app nor a proto/port fallback is a
+ * resolved hostname, which is a destination rather than an application.  Callers
+ * need that distinction to avoid rendering "down.debian7.com" in an app column. */
+static int dw_audit_identity_looks_like_host(const char *s)
+{
+    const char *p;
+    int has_dot = 0;
+
+    if (!s || !s[0])
+        return 0;
+    if (!strncmp(s, "app:", 4))
+        return 0;
+    /* proto/port fallbacks carry a slash; hostnames do not. */
+    if (strchr(s, '/'))
+        return 0;
+    for (p = s; *p; p++) {
+        if (*p == '.')
+            has_dot = 1;
+        else if (!(isalnum((unsigned char)*p) || *p == '-' || *p == '_'))
+            return 0;
+    }
+    /* Require a dot and a trailing alphabetic label so bare protocol names such
+     * as "https" and numeric literals are not mistaken for hostnames. */
+    if (!has_dot)
+        return 0;
+    p = strrchr(s, '.');
+    return p && isalpha((unsigned char)p[1]);
+}
+
 static void dw_audit_apply_app_identity(struct json_object *o,
                                         const char *group_key,
                                         const char *service,
@@ -2607,6 +2649,9 @@ static void dw_audit_apply_app_identity(struct json_object *o,
     char display[192];
     const char *resolved = app_name;
     struct json_object *category_obj = NULL;
+    const char *identity_kind;
+    const char *identity_source;
+    int named_app;
 
     if (!o)
         return;
@@ -2656,6 +2701,40 @@ static void dw_audit_apply_app_identity(struct json_object *o,
         dw_json_replace_string(o, "category", app_id > 0 ? "application" : "service");
     if (app_id <= 0)
         dw_json_replace_string(o, "family", app_proto ? app_proto : "");
+    /* Report what this identity actually is instead of labelling every row an
+     * application.  DPI coverage is a small fraction of flows, so the remaining
+     * rows are hostnames, proto/port services, or nothing at all. */
+    named_app = app_id > 0 ||
+                (app_name && app_name[0] && !dw_app_name_is_placeholder(app_name));
+    if (named_app) {
+        identity_kind = "application";
+        identity_source = app_id > 0 ? "dpi_signature" : "flow_app_name";
+    } else if (!strcmp(display, "unknown") || !display[0]) {
+        identity_kind = "unknown";
+        identity_source = "none";
+    } else if (dw_audit_identity_looks_like_host(display)) {
+        identity_kind = "host";
+        identity_source = "host_resolution";
+    } else {
+        identity_kind = "service";
+        identity_source = "proto_port";
+    }
+    dw_json_replace_string(o, "identity_kind", identity_kind);
+    dw_json_replace_string(o, "identity_source", identity_source);
+    dw_json_replace_bool(o, "is_application", !strcmp(identity_kind, "application"));
+    dw_json_replace_bool(o, "app_identified", !strcmp(identity_kind, "application"));
+    /* The display string is only a real application name when identity_kind says
+     * so; otherwise it is a destination or service label being shown in its
+     * place, and a caller must not present it as an application. */
+    dw_json_replace_bool(o, "application_name_is_fallback",
+                         strcmp(identity_kind, "application") != 0);
+    dw_json_replace_string(o, "identity_reason",
+                           !strcmp(identity_kind, "application") ? "" :
+                           (!strcmp(identity_kind, "host") ?
+                                "no_dpi_signature_match_hostname_used" :
+                            (!strcmp(identity_kind, "service") ?
+                                "no_dpi_signature_match_proto_port_used" :
+                                "no_dpi_signature_no_hostname")));
 }
 
 static void dw_strip_ip_brackets(char *s)
@@ -3897,6 +3976,7 @@ static struct json_object *dw_build_wans_internal(int refresh_state, int record_
     dw_rate_sample_t global_rate_sample;
     int runtime_wan_count;
     int idx = 1;
+    int batched = 0;
 
     if (!ctx || uci_load(ctx, "network", &pkg) != UCI_OK) {
         if (ctx) uci_free_context(ctx);
@@ -3905,6 +3985,21 @@ static struct json_object *dw_build_wans_internal(int refresh_state, int record_
 
     runtime_wan_count = dw_count_runtime_wans();
     dw_read_realtime_rate_sample(&global_rate_sample);
+
+    /*
+     * Batch the per-WAN state writes into one transaction.
+     *
+     * With refresh_state set, each WAN issues at least five separate autocommit
+     * writes (interface state, daily usage counter, lifetime usage, health
+     * sample, session). Every autocommit statement is its own durable commit, so
+     * on 30.1 this step was measured at up to 5.5 s inside a metrics tick with a
+     * 200 ms budget, while the reads themselves were all under 2 ms. Batching
+     * turns N commits into one and does not change what is written.
+     *
+     * Read-only callers (refresh_state == 0) skip this entirely.
+     */
+    if (refresh_state && jmx_db_write_batch_begin() == 0)
+        batched = 1;
 
     uci_foreach_element(&pkg->sections, e) {
         struct uci_section *s = uci_to_section(e);
@@ -4026,8 +4121,14 @@ static struct json_object *dw_build_wans_internal(int refresh_state, int record_
         }
         json_object_object_add(w, "up_rate", json_object_new_int64(wan_rate_sample.up_rate));
         json_object_object_add(w, "down_rate", json_object_new_int64(wan_rate_sample.down_rate));
-        json_object_object_add(w, "up_bytes", json_object_new_int64((int64_t)tx));
-        json_object_object_add(w, "down_bytes", json_object_new_int64((int64_t)rx));
+        /*
+         * Lifetime totals, not the runtime device counter. PPPoE destroys and
+         * recreates its device on reconnect, so the raw counter restarts at
+         * zero and this view reported "since the last reconnect" as if it were
+         * the total. The helper also publishes device_*_bytes plus the reset
+         * markers, so the per-session number is still available.
+         */
+        jmx_db_add_wan_cumulative_bytes(w, name, (int64_t)rx, (int64_t)tx);
         dw_add_monthly_usage_contract(w, name, 1);
         dw_rate_sample_to_json(w, &wan_rate_sample, 1);
         json_object_object_add(w, "uptime", json_object_new_int64(uptime));
@@ -4053,6 +4154,12 @@ static struct json_object *dw_build_wans_internal(int refresh_state, int record_
         json_object_array_add(arr, w);
         idx++;
     }
+
+    /* Commit the batched WAN writes. If the commit fails the individual writes
+     * are rolled back together; the JSON response still reflects what was
+     * sampled, which is the same behaviour as a failed autocommit write before. */
+    if (batched)
+        (void)jmx_db_write_batch_end(1);
 
     uci_unload(ctx, pkg);
     uci_free_context(ctx);
@@ -4234,8 +4341,9 @@ static struct json_object *dw_build_wans_light(void)
         }
         json_object_object_add(w, "up_rate", json_object_new_int64(wan_rate_sample.up_rate));
         json_object_object_add(w, "down_rate", json_object_new_int64(wan_rate_sample.down_rate));
-        json_object_object_add(w, "up_bytes", json_object_new_int64((int64_t)tx));
-        json_object_object_add(w, "down_bytes", json_object_new_int64((int64_t)rx));
+        /* Same reason as dw_build_wans_internal: report the lifetime total, not
+         * the PPPoE device counter that restarts on every reconnect. */
+        jmx_db_add_wan_cumulative_bytes(w, name, (int64_t)rx, (int64_t)tx);
         dw_add_monthly_usage_contract(w, name, 1);
         dw_rate_sample_to_json(w, &wan_rate_sample, 1);
         json_object_object_add(w, "uptime", json_object_new_int64(uptime));
@@ -11154,7 +11262,7 @@ static struct json_object *dw_realtime_activity_usage_topic(struct json_object *
     int64_t from = dw_realtime_req_i64(req, "ts_from",
                    dw_realtime_req_i64(req, "timestampFrom", to - 86400));
     int top = dw_json_get_int(req, "top", 30);
-    int matrix_limit = dw_json_get_int(req, "matrix_limit", 1000);
+    int matrix_limit = dw_json_get_int(req, "matrix_limit", DW_AUDIT_ACTIVITY_MATRIX_DEFAULT);
     char cache_key[128];
 
     if (from <= 0)
@@ -11166,9 +11274,9 @@ static struct json_object *dw_realtime_activity_usage_topic(struct json_object *
     if (top > 100)
         top = 100;
     if (matrix_limit <= 0)
-        matrix_limit = 1000;
-    if (matrix_limit > 5000)
-        matrix_limit = 5000;
+        matrix_limit = DW_AUDIT_ACTIVITY_MATRIX_DEFAULT;
+    if (matrix_limit > DW_AUDIT_ACTIVITY_MATRIX_MAX)
+        matrix_limit = DW_AUDIT_ACTIVITY_MATRIX_MAX;
     snprintf(cache_key, sizeof(cache_key), "activity_usage:%lld:%lld:%d:%d",
              (long long)(from / 5), (long long)(to / 5), top, matrix_limit);
     {
@@ -11624,8 +11732,14 @@ static struct json_object *dw_realtime_dashboard_throughput_topic(struct json_ob
         json_object_object_add(w, "rx_rate", json_object_new_int64(down_rate));
         json_object_object_add(w, "tx_bytes", json_object_new_int64(tx_bytes));
         json_object_object_add(w, "rx_bytes", json_object_new_int64(rx_bytes));
-        json_object_object_add(w, "up_bytes", json_object_new_int64(tx_bytes));
-        json_object_object_add(w, "down_bytes", json_object_new_int64(rx_bytes));
+        /*
+         * tx_bytes/rx_bytes above stay device-scoped on purpose: this topic is
+         * a throughput sampler and the delta between consecutive samples is
+         * what it exists to report. up_bytes/down_bytes are the cumulative
+         * pair, so they go through the lifetime helper instead of aliasing the
+         * device counter that PPPoE resets on reconnect.
+         */
+        jmx_db_add_wan_cumulative_bytes(w, name, rx_bytes, tx_bytes);
         json_object_object_add(w, "updated_at", json_object_new_int64(state_ts));
         json_object_object_add(w, "sample_at", json_object_new_int64(state_ts));
         json_object_object_add(w, "sample_age_ms", json_object_new_int64(sample_age_ms));
@@ -13074,6 +13188,65 @@ static int dw_handle_db_api(struct ubus_context *ctx, struct ubus_request_data *
     return 0;
 }
 
+/*
+ * Completion for off-loop queries. Runs on the main thread, which is what makes
+ * using the shared dw_b blob buffer here legal.
+ */
+static void dw_async_db_reply(struct ubus_context *ctx,
+                              struct ubus_request_data *req,
+                              struct json_object *out)
+{
+    struct json_object *fallback = NULL;
+
+    if (!out)
+        out = fallback = jmx_gen_api_response_data(API_CODE_ERROR, NULL);
+    if (out)
+        dw_send_json(ctx, req, out);
+    if (fallback)
+        json_object_put(fallback);
+}
+
+/*
+ * Read-only variant of dw_handle_db_api(): runs fn on a worker thread so a slow
+ * audit query stops blocking every other ubus request.
+ *
+ * Only for handlers proven free of writes and of shared mutable state; see
+ * dw_async_query.h. Falls back to running inline whenever the pool cannot take
+ * the job, so behaviour degrades in latency only, never in correctness.
+ */
+static int dw_handle_db_api_async(struct ubus_context *ctx,
+                                  struct ubus_request_data *req,
+                                  struct blob_attr *msg,
+                                  struct json_object *(*fn)(struct json_object *))
+{
+    char *msg_json = NULL;
+    struct json_object *in = NULL;
+    int rc;
+
+    if (!dw_async_query_available())
+        return dw_handle_db_api(ctx, req, msg, fn);
+
+    if (msg)
+        msg_json = blobmsg_format_json(msg, true);
+    if (msg_json)
+        in = json_tokener_parse(msg_json);
+    if (!in)
+        in = json_object_new_object();
+    free(msg_json);
+
+    rc = dw_async_query_submit(ctx, req, in, fn, dw_async_db_reply);
+    if (rc == 0) {
+        /* Ownership of `in` moved to the pool; the worker releases it. */
+        return 0;
+    }
+    /*
+     * Queue full or pool gone: we still own `in`, so drop it and answer
+     * synchronously rather than dropping the request.
+     */
+    json_object_put(in);
+    return dw_handle_db_api(ctx, req, msg, fn);
+}
+
 static int dw_handle_clients_observe(struct ubus_context *ctx, struct ubus_object *obj,
                                      struct ubus_request_data *req, const char *method,
                                      struct blob_attr *msg)
@@ -13301,6 +13474,7 @@ static sqlite3 *g_dw_audit_db = NULL;
 #define DW_AUDIT_FLOWS_MAX_SAMPLE          144
 #define DW_AUDIT_FLOWS_MAX_LIFECYCLE       125
 #define DW_AUDIT_FLOWS_MAX_EVENT_LIFECYCLE  76
+
 #define DW_AUDIT_FLOW_LIFECYCLE_RETENTION_SEC (7 * 86400)
 #define DW_AUDIT_FLOW_EVENT_LIFECYCLE_RETENTION_SEC (3 * 86400)
 #define DW_AUDIT_FLOW_SAMPLE_MAX_DB_ROWS 120000
@@ -13335,6 +13509,20 @@ static int dw_audit_ensure_dir(const char *path, mode_t mode)
 static int dw_audit_exec(sqlite3 *db, const char *sql)
 {
     return sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+}
+
+/*
+ * CLOCK_MONOTONIC milliseconds. Used for latency accounting only, so it must
+ * not be dw_now(): a wall-clock step (sysfixtime, NTP) would otherwise turn a
+ * reported duration negative or wildly large.
+ */
+static int64_t dw_audit_monotonic_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (int64_t)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
 static int dw_audit_table_has_column(sqlite3 *db, const char *table, const char *column)
@@ -13666,11 +13854,81 @@ static const char *dw_url_host_from_url(const char *url, char *host, size_t host
     return host;
 }
 
+/*
+ * Per-worker read-only audit connection.
+ *
+ * Thread-local so each pool worker gets exactly one handle, opened on first
+ * use and closed by dw_audit_db_worker_cleanup() when that worker exits.
+ * SQLITE_OPEN_READONLY is a hard guarantee rather than a convention: off-loop
+ * handlers are only ever allowed to read, and sqlite refuses a write on this
+ * handle even if a future edit forgets that rule.
+ *
+ * nomutex is safe here precisely because the handle never leaves its thread.
+ */
+static __thread sqlite3 *g_dw_audit_db_worker;
+
+static int dw_audit_db_open_worker(sqlite3 **db)
+{
+    struct stat st;
+    sqlite3 *h = NULL;
+
+    if (g_dw_audit_db_worker) {
+        *db = g_dw_audit_db_worker;
+        return 0;
+    }
+    /*
+     * Never create the file from a worker. If the main thread has not built the
+     * schema yet there is nothing to read, and a read-only open of a missing
+     * file would otherwise leave callers guessing.
+     */
+    if (stat(DW_AUDIT_DB_PATH, &st) != 0 || !S_ISREG(st.st_mode))
+        return -1;
+
+    if (sqlite3_open_v2(DW_AUDIT_DB_PATH, &h,
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
+                        NULL) != SQLITE_OK) {
+        LOG_WARN("audit db worker open failed: %s\n",
+                 h ? sqlite3_errmsg(h) : "no handle");
+        if (h)
+            sqlite3_close(h);
+        return -1;
+    }
+    /*
+     * The writer holds WAL write locks in bursts; wait rather than returning
+     * SQLITE_BUSY as a read error. temp_store=MEMORY matches the main handle so
+     * the GROUP BY/ORDER BY temp B-trees do not land on flash.
+     */
+    sqlite3_busy_timeout(h, 3000);
+    (void)dw_audit_exec(h, "PRAGMA temp_store=MEMORY");
+    g_dw_audit_db_worker = h;
+    *db = h;
+    return 0;
+}
+
+static void dw_audit_db_worker_cleanup(void)
+{
+    if (!g_dw_audit_db_worker)
+        return;
+    sqlite3_close(g_dw_audit_db_worker);
+    g_dw_audit_db_worker = NULL;
+}
+
 static int dw_audit_db_open(sqlite3 **db)
 {
     if (!db)
         return -1;
     *db = NULL;
+    /*
+     * Off-loop readers get their own connection. g_dw_audit_db is a
+     * process-wide singleton shared by every audit call site on the main
+     * thread; handing it to a worker would put two threads on one handle and
+     * serialise them behind sqlite's own mutex, which defeats the point of
+     * running off-loop at all. A worker also must not run
+     * dw_audit_view_db_init(): that creates schema and migrates columns, and
+     * those writes belong to the main thread.
+     */
+    if (dw_async_query_on_worker())
+        return dw_audit_db_open_worker(db);
     if (dw_audit_view_db_init() != 0)
         return -1;
     *db = g_dw_audit_db;
@@ -16063,6 +16321,26 @@ static int dw_audit_worker_status_update_url(sqlite3 *db, int ok, int rows,
  * row is written on failure too, otherwise a broken backfill would look
  * identical to one that never ran. */
 #define DW_AUDIT_URL_BACKFILL_BATCH 512
+/*
+ * Live tick instrumentation on 30.1 showed this step peaking at 2814 ms even
+ * with the host pre-filter, against a 200 ms tick budget: the 583 MB audit DB
+ * occasionally serves the anti-join from disk instead of page cache, and the
+ * per-row cost the comment above measures is a median, not a worst case.
+ *
+ * The budget gate in the tick can only decide whether to *start* this step, so
+ * a batch that turns out slow still overruns once it is running. Adapt instead:
+ * shrink the batch when the previous run was slow and grow it back when runs
+ * are cheap, so throughput stays high on a warm cache without the cold-cache
+ * outlier parking the control plane. Floor keeps forward progress against the
+ * ~613 rows/min inflow even while degraded.
+ */
+#define DW_AUDIT_URL_BACKFILL_BATCH_MIN 64
+#define DW_AUDIT_URL_BACKFILL_TARGET_MS 120LL
+
+/* Current adaptive batch, mirrored for core_status so the backpressure is
+ * observable instead of being an invisible internal variable. */
+static int g_dw_audit_url_backfill_batch = DW_AUDIT_URL_BACKFILL_BATCH;
+static int64_t g_dw_audit_url_backfill_last_ms;
 /* Two beats' worth of lifecycle rows: wide enough to absorb a missed tick,
  * narrow enough that the NOT EXISTS anti-join stays on the destroy_ts index. */
 #define DW_AUDIT_URL_BACKFILL_WINDOW_SEC 180
@@ -16072,14 +16350,35 @@ static int dw_audit_url_backfill_tick(void)
     sqlite3 *db = NULL;
     int inserted;
     int64_t since = (int64_t)dw_now() - DW_AUDIT_URL_BACKFILL_WINDOW_SEC;
+    int batch = g_dw_audit_url_backfill_batch;
+    int64_t started_ms;
+    int64_t spent_ms;
 
     if (dw_audit_db_open(&db) != 0 || !db)
         return -1;
 
     if (since < 0)
         since = 0;
+    started_ms = dw_monotonic_ms();
     inserted = dw_audit_url_backfill_from_event_lifecycle_ex(
-        db, DW_AUDIT_URL_BACKFILL_BATCH, 1, since);
+        db, batch, 1, since);
+    spent_ms = dw_monotonic_ms() - started_ms;
+    g_dw_audit_url_backfill_last_ms = spent_ms;
+    /*
+     * Halve on overrun, then creep back up in quarters. Reacting fast to slow
+     * runs and slowly to fast ones keeps a single cold-cache spike from being
+     * immediately undone by the next warm run.
+     */
+    if (spent_ms > DW_AUDIT_URL_BACKFILL_TARGET_MS) {
+        batch /= 2;
+        if (batch < DW_AUDIT_URL_BACKFILL_BATCH_MIN)
+            batch = DW_AUDIT_URL_BACKFILL_BATCH_MIN;
+    } else if (batch < DW_AUDIT_URL_BACKFILL_BATCH) {
+        batch += DW_AUDIT_URL_BACKFILL_BATCH / 4;
+        if (batch > DW_AUDIT_URL_BACKFILL_BATCH)
+            batch = DW_AUDIT_URL_BACKFILL_BATCH;
+    }
+    g_dw_audit_url_backfill_batch = batch;
     if (inserted < 0) {
         const char *err = sqlite3_errmsg(db);
 
@@ -18336,6 +18635,10 @@ static struct json_object *dw_audit_api_flow_app_summary(struct json_object *req
     int64_t private_bytes = 0;
     int returned = 0;
     int rc;
+    int identity_app_groups = 0, identity_host_groups = 0;
+    int identity_service_groups = 0, identity_unknown_groups = 0;
+    int64_t identity_app_flows = 0, identity_host_flows = 0;
+    int64_t identity_service_flows = 0, identity_unknown_flows = 0;
     int event_lifecycle = mode && (!strcasecmp(mode, "event_lifecycle") ||
                                    !strcasecmp(mode, "flow_event_lifecycle") ||
                                    !strcasecmp(mode, "ctnetlink_lifecycle") ||
@@ -18491,7 +18794,11 @@ static struct json_object *dw_audit_api_flow_app_summary(struct json_object *req
         dw_audit_apply_app_identity(o, key, svc, app_proto, dw_sql_text(st, 3),
                                     app_id, app_name,
                                     app_id > 0 ? "audit_flow.destination_app" : "audit_flow.service");
-        dw_json_replace_string(o, "type", "application");
+        /* Keep "type" aligned with identity_kind rather than asserting every row
+         * is an application; the aggregation key falls back to hostname and
+         * proto/port for the large majority of flows. */
+        dw_json_replace_string(o, "type",
+                               dw_json_get_string(o, "identity_kind", "application"));
         dw_json_replace_string(o, "metric_type", "bytes");
         dw_json_replace_string(o, "ranking_basis", event_lifecycle ?
                                "event_lifecycle_flow_bytes" : "historical_flow_bytes");
@@ -18541,6 +18848,25 @@ static struct json_object *dw_audit_api_flow_app_summary(struct json_object *req
         dw_json_replace_string(o, "action", action_block > 0 ? "block" : "allow");
         json_object_array_add(arr, o);
         returned++;
+        /* Track how much of the ranking is genuinely application-identified so
+         * the caller does not have to infer coverage from the row contents. */
+        {
+            const char *kind = dw_json_get_string(o, "identity_kind", "unknown");
+
+            if (!strcmp(kind, "application")) {
+                identity_app_groups++;
+                identity_app_flows += count;
+            } else if (!strcmp(kind, "host")) {
+                identity_host_groups++;
+                identity_host_flows += count;
+            } else if (!strcmp(kind, "service")) {
+                identity_service_groups++;
+                identity_service_flows += count;
+            } else {
+                identity_unknown_groups++;
+                identity_unknown_flows += count;
+            }
+        }
     }
     sqlite3_finalize(st);
     st = NULL;
@@ -18573,6 +18899,24 @@ static struct json_object *dw_audit_api_flow_app_summary(struct json_object *req
 
     json_object_object_add(data, "returned", json_object_new_int(returned));
     json_object_object_add(data, "limit", json_object_new_int(top));
+    /* Identity composition of the ranking.  DPI coverage is low, so a caller
+     * that renders this list as "applications" needs to know how much of it
+     * actually is one. */
+    json_object_object_add(data, "identity_application_groups", json_object_new_int(identity_app_groups));
+    json_object_object_add(data, "identity_host_groups", json_object_new_int(identity_host_groups));
+    json_object_object_add(data, "identity_service_groups", json_object_new_int(identity_service_groups));
+    json_object_object_add(data, "identity_unknown_groups", json_object_new_int(identity_unknown_groups));
+    json_object_object_add(data, "identity_application_flows", json_object_new_int64(identity_app_flows));
+    json_object_object_add(data, "identity_host_flows", json_object_new_int64(identity_host_flows));
+    json_object_object_add(data, "identity_service_flows", json_object_new_int64(identity_service_flows));
+    json_object_object_add(data, "identity_unknown_flows", json_object_new_int64(identity_unknown_flows));
+    json_object_object_add(data, "identity_kind_supported", json_object_new_boolean(1));
+    json_object_object_add(data, "application_identity_partial",
+        json_object_new_boolean(identity_app_groups < returned));
+    json_object_object_add(data, "identity_kinds",
+        json_object_new_string("application|host|service|unknown"));
+    json_object_object_add(data, "identity_sources",
+        json_object_new_string("dpi_signature|flow_app_name|host_resolution|proto_port|none"));
 	    json_object_object_add(data, "flow_rows", json_object_new_int64(flow_rows));
 	    json_object_object_add(data, "flow_bytes", json_object_new_int64(flow_bytes));
 	    json_object_object_add(data, "exact_byte_rows", json_object_new_int64(exact_byte_rows));
@@ -18744,6 +19088,506 @@ static void dw_audit_flow_top_destination_row_to_json(sqlite3_stmt *st,
     json_object_array_add(arr, o);
     if (returned)
         (*returned)++;
+}
+
+/* Window-exact byte aggregation grouped by destination country.  The Cyber Map
+ * samples a bounded number of rows for coordinates; summing bytes over that
+ * sample understates the window by orders of magnitude, so bytes are computed
+ * here in SQL over every matching row instead. */
+static struct json_object *dw_audit_api_flow_geo_summary(struct json_object *req)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    struct json_object *data = json_object_new_object();
+    struct json_object *arr = json_object_new_array();
+    int top = dw_json_get_int(req, "top", dw_json_get_int(req, "limit", 250));
+    int64_t now = (int64_t)dw_now();
+    int64_t from = dw_json_get_int64(req, "ts_from", dw_json_get_int64(req, "timestampFrom", now - 3600));
+    int64_t to = dw_json_get_int64(req, "ts_to", dw_json_get_int64(req, "timestampTo", now));
+    const char *mode = dw_json_get_string(req, "mode", dw_json_get_string(req, "source", "sample"));
+    const char *search = dw_json_get_string(req, "search_text", dw_json_get_string(req, "q", ""));
+    char search_like[256] = "";
+    struct dw_json_filter_values source_mac, mac_filter, source_ip, ip_filter;
+    struct dw_json_filter_values destination_ip, destination_host, host_filter, remote_ip, protocol, service, direction, risk, action;
+    struct dw_json_filter_values exclude_source_mac, exclude_mac_filter, exclude_source_ip, exclude_ip_filter;
+    struct dw_json_filter_values exclude_destination_ip, exclude_destination_host, exclude_host_filter, exclude_remote_ip, exclude_protocol;
+    struct dw_json_filter_values exclude_service, exclude_direction, exclude_risk, exclude_action;
+    struct dw_flow_sql_text_bind binds[384];
+    char where_sql[24576];
+    struct dw_flow_sql_build wb = {
+        .buf = where_sql,
+        .len = sizeof(where_sql),
+        .binds = binds,
+        .bind_max = (int)(sizeof(binds) / sizeof(binds[0])),
+    };
+    const char *external_pred_sql = dw_audit_flow_external_predicate_sql();
+    const char *ts_col = NULL;
+    int event_lifecycle = mode && (!strcasecmp(mode, "event_lifecycle") ||
+                                   !strcasecmp(mode, "flow_event_lifecycle") ||
+                                   !strcasecmp(mode, "ctnetlink_lifecycle") ||
+                                   !strcasecmp(mode, "exact_lifecycle"));
+    int lifecycle = event_lifecycle ? 2 :
+        (mode && (!strcasecmp(mode, "lifecycle") || !strcasecmp(mode, "flow_lifecycle")));
+    int returned = 0;
+    int64_t total_rows = 0;
+    int64_t total_bytes = 0;
+    int64_t exact_byte_rows = 0;
+    int64_t unlocated_rows = 0;
+    int64_t unlocated_bytes = 0;
+    int rc;
+
+    json_object_object_add(data, "items", json_object_get(arr));
+    json_object_object_add(data, "regions", arr);
+    dw_json_get_filter_values(req, "source_mac", &source_mac);
+    dw_json_get_filter_values(req, "mac", &mac_filter);
+    dw_json_filter_values_merge_missing(&source_mac, &mac_filter);
+    dw_json_get_filter_values(req, "source_ip", &source_ip);
+    dw_json_get_filter_values(req, "ip", &ip_filter);
+    dw_json_filter_values_merge_missing(&source_ip, &ip_filter);
+    dw_json_get_filter_values(req, "destination_ip", &destination_ip);
+    dw_json_get_filter_values(req, "destination_host", &destination_host);
+    dw_json_get_filter_values(req, "host", &host_filter);
+    dw_json_filter_values_merge_missing(&destination_host, &host_filter);
+    dw_json_get_filter_values(req, "remote_ip", &remote_ip);
+    dw_json_get_filter_values(req, "protocol", &protocol);
+    dw_json_get_filter_values(req, "service", &service);
+    dw_json_get_filter_values(req, "direction", &direction);
+    dw_json_get_filter_values(req, "risk", &risk);
+    dw_json_get_filter_values(req, "action", &action);
+    dw_json_get_exclude_filter_values(req, "source_mac", &exclude_source_mac);
+    dw_json_get_exclude_filter_values(req, "mac", &exclude_mac_filter);
+    dw_json_filter_values_merge_missing(&exclude_source_mac, &exclude_mac_filter);
+    dw_json_get_exclude_filter_values(req, "source_ip", &exclude_source_ip);
+    dw_json_get_exclude_filter_values(req, "ip", &exclude_ip_filter);
+    dw_json_filter_values_merge_missing(&exclude_source_ip, &exclude_ip_filter);
+    dw_json_get_exclude_filter_values(req, "destination_ip", &exclude_destination_ip);
+    dw_json_get_exclude_filter_values(req, "destination_host", &exclude_destination_host);
+    dw_json_get_exclude_filter_values(req, "host", &exclude_host_filter);
+    dw_json_filter_values_merge_missing(&exclude_destination_host, &exclude_host_filter);
+    dw_json_get_exclude_filter_values(req, "remote_ip", &exclude_remote_ip);
+    dw_json_get_exclude_filter_values(req, "protocol", &exclude_protocol);
+    dw_json_get_exclude_filter_values(req, "service", &exclude_service);
+    dw_json_get_exclude_filter_values(req, "direction", &exclude_direction);
+    dw_json_get_exclude_filter_values(req, "risk", &exclude_risk);
+    dw_json_get_exclude_filter_values(req, "action", &exclude_action);
+    dw_json_filter_values_normalize_action(&action);
+    dw_json_filter_values_normalize_action(&exclude_action);
+    if (top <= 0)
+        top = 250;
+    if (top > 1000)
+        top = 1000;
+    if (from > 100000000000LL)
+        from /= 1000;
+    if (to > 100000000000LL)
+        to /= 1000;
+    if (to <= 0)
+        to = now;
+    if (from <= 0)
+        from = to - 3600;
+    if (from > to) {
+        int64_t t = from;
+        from = to;
+        to = t;
+    }
+    if (!lifecycle && from < to - DW_AUDIT_FLOW_SAMPLE_RETENTION_SEC)
+        lifecycle = 1;
+    ts_col = event_lifecycle ? "destroy_ts" : (lifecycle ? "last_seen" : "ts");
+    if (search && search[0])
+        snprintf(search_like, sizeof(search_like), "%%%s%%", search);
+    dw_audit_flow_build_where(&wb, lifecycle,
+                              &source_mac, &source_ip, &destination_ip, &destination_host, &remote_ip,
+                              &protocol, &service, &direction, &risk, &action,
+                              &exclude_source_mac, &exclude_source_ip,
+                              &exclude_destination_ip, &exclude_destination_host, &exclude_remote_ip,
+                              &exclude_protocol, &exclude_service,
+                              &exclude_direction, &exclude_risk, &exclude_action,
+                              search_like);
+    dw_audit_flow_build_extra_where_from_req(&wb, req);
+    if (wb.truncated) {
+        json_object_object_add(data, "error", json_object_new_string("audit_flow_geo_summary_filter_too_large"));
+        return jmx_gen_api_response_data(API_CODE_ERROR, data);
+    }
+    if (dw_audit_db_open(&db) != 0) {
+        json_object_object_add(data, "error", json_object_new_string("audit_db_unavailable"));
+        return jmx_gen_api_response_data(API_CODE_ERROR, data);
+    }
+
+    {
+        char sql[32768];
+
+        snprintf(sql, sizeof(sql),
+                 "SELECT upper(COALESCE(NULLIF(destination_country_code,''),'')) AS cc,"
+                 "MAX(COALESCE(destination_country_name,'')),"
+                 "COUNT(*),SUM(COALESCE(rx_bytes,0)),SUM(COALESCE(tx_bytes,0)),MAX(%s),"
+                 "%s,"
+                 "COUNT(DISTINCT COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')),"
+                 "SUM(CASE WHEN lower(COALESCE(risk,'')) IN ('high','critical') THEN 1 ELSE 0 END),"
+                 "SUM(CASE WHEN lower(COALESCE(action,'')) IN ('block','blocked','drop','deny') THEN 1 ELSE 0 END)"
+                 "%s AND %s "
+                 "GROUP BY cc ORDER BY SUM(COALESCE(rx_bytes,0)+COALESCE(tx_bytes,0)) DESC,COUNT(*) DESC LIMIT ?",
+                 ts_col, dw_audit_flow_exact_byte_rows_sql(event_lifecycle),
+                 where_sql, external_pred_sql);
+        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+            json_object_object_add(data, "error", json_object_new_string("audit_flow_geo_summary_prepare_failed"));
+            json_object_object_add(data, "sqlite_error", json_object_new_string(sqlite3_errmsg(db)));
+            goto out_error;
+        }
+    }
+    {
+        int p = 1;
+        sqlite3_bind_int64(st, p++, from);
+        sqlite3_bind_int64(st, p++, to);
+        p = dw_flow_sql_bind_text_list(st, p, binds, wb.bind_count);
+        sqlite3_bind_int(st, p++, top);
+    }
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *cc = dw_sql_text(st, 0);
+        int64_t rows = sqlite3_column_int64(st, 2);
+        int64_t rx = sqlite3_column_int64(st, 3);
+        int64_t tx = sqlite3_column_int64(st, 4);
+        struct json_object *o;
+
+        total_rows += rows;
+        total_bytes += rx + tx;
+        exact_byte_rows += sqlite3_column_int64(st, 6);
+        /* Rows whose destination never resolved to a country are still real
+         * traffic; report them separately instead of dropping them so the
+         * per-country totals can be reconciled against the window total. */
+        if (!cc || !cc[0]) {
+            unlocated_rows += rows;
+            unlocated_bytes += rx + tx;
+            continue;
+        }
+        o = json_object_new_object();
+        json_object_object_add(o, "country_code", json_object_new_string(cc));
+        json_object_object_add(o, "country", json_object_new_string(cc));
+        json_object_object_add(o, "country_name", json_object_new_string(dw_sql_text(st, 1)));
+        json_object_object_add(o, "flow_count", json_object_new_int64(rows));
+        json_object_object_add(o, "count", json_object_new_int64(rows));
+        json_object_object_add(o, "rx_bytes", json_object_new_int64(rx));
+        json_object_object_add(o, "tx_bytes", json_object_new_int64(tx));
+        json_object_object_add(o, "bytes", json_object_new_int64(rx + tx));
+        json_object_object_add(o, "bytes_supported", json_object_new_boolean(1));
+        json_object_object_add(o, "last_seen", json_object_new_int64(sqlite3_column_int64(st, 5)));
+        json_object_object_add(o, "exact_byte_rows", json_object_new_int64(sqlite3_column_int64(st, 6)));
+        json_object_object_add(o, "distinct_destination_count", json_object_new_int64(sqlite3_column_int64(st, 7)));
+        json_object_object_add(o, "risk_high_count", json_object_new_int64(sqlite3_column_int64(st, 8)));
+        json_object_object_add(o, "blocked_count", json_object_new_int64(sqlite3_column_int64(st, 9)));
+        json_object_array_add(arr, o);
+        returned++;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (rc != SQLITE_DONE) {
+        json_object_object_add(data, "error", json_object_new_string("audit_flow_geo_summary_step_failed"));
+        json_object_object_add(data, "sqlite_error", json_object_new_string(sqlite3_errmsg(db)));
+        goto out_error;
+    }
+
+    json_object_object_add(data, "returned", json_object_new_int(returned));
+    json_object_object_add(data, "returned_regions", json_object_new_int(returned));
+    json_object_object_add(data, "limit", json_object_new_int(top));
+    json_object_object_add(data, "flow_rows", json_object_new_int64(total_rows));
+    json_object_object_add(data, "window_flow_rows", json_object_new_int64(total_rows));
+    json_object_object_add(data, "flow_bytes", json_object_new_int64(total_bytes));
+    json_object_object_add(data, "window_bytes", json_object_new_int64(total_bytes));
+    json_object_object_add(data, "exact_byte_rows", json_object_new_int64(exact_byte_rows));
+    json_object_object_add(data, "unlocated_flow_rows", json_object_new_int64(unlocated_rows));
+    json_object_object_add(data, "unlocated_bytes", json_object_new_int64(unlocated_bytes));
+    json_object_object_add(data, "geo_attributed_flow_rows", json_object_new_int64(total_rows - unlocated_rows));
+    json_object_object_add(data, "geo_attributed_bytes", json_object_new_int64(total_bytes - unlocated_bytes));
+    json_object_object_add(data, "timestampFrom", json_object_new_int64(from));
+    json_object_object_add(data, "timestampTo", json_object_new_int64(to));
+    json_object_object_add(data, "ts_from", json_object_new_int64(from));
+    json_object_object_add(data, "ts_to", json_object_new_int64(to));
+    json_object_object_add(data, "mode", json_object_new_string(event_lifecycle ?
+        "event_lifecycle" : (lifecycle ? "lifecycle" : "sample")));
+    json_object_object_add(data, "source", json_object_new_string(event_lifecycle ?
+        "audit_flow_event_lifecycle_geo_summary" : "audit_flow_geo_summary"));
+    json_object_object_add(data, "geo_attribution_source",
+        json_object_new_string("audit_flow_destination_country_code_column"));
+    /* Aggregated over every matching row in the window, so these bytes are not
+     * a sample.  Whether each row's own counter is exact still depends on the
+     * accounting mode, which is what byte_accounting_exact reports. */
+    json_object_object_add(data, "window_exact_rows", json_object_new_boolean(1));
+    json_object_object_add(data, "bytes_are_sample_only", json_object_new_boolean(0));
+    json_object_object_add(data, "bytes_supported", json_object_new_boolean(1));
+    json_object_object_add(data, "byte_accounting_exact", json_object_new_boolean(
+        event_lifecycle && total_rows > 0 && exact_byte_rows == total_rows));
+    json_object_object_add(data, "exact_window_bytes", json_object_new_boolean(
+        event_lifecycle && total_rows > 0 && exact_byte_rows == total_rows));
+    json_object_object_add(data, "byte_accounting_partial", json_object_new_boolean(
+        event_lifecycle && exact_byte_rows > 0 && exact_byte_rows < total_rows));
+    json_object_object_add(data, "accounting_source", json_object_new_string(event_lifecycle ?
+        "ctnetlink_destroy_counters" : "audit_flow_sample_or_lifecycle"));
+    /* dw_audit_db_open hands back the process-wide handle; closing it here would
+     * pull the database out from under every other audit method. */
+    return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+
+out_error:
+    if (st)
+        sqlite3_finalize(st);
+    return jmx_gen_api_response_data(API_CODE_ERROR, data);
+}
+
+/*
+ * Distinct destination hosts with their flow counts, over the whole requested
+ * window rather than a transportable page of rows.
+ *
+ * The risk buckets in insights/flows/summary were accumulated by walking the
+ * rows audit_flows returns, and that reply is capped at 76-144 rows by the
+ * ~992 KiB ubus payload limit (see DW_AUDIT_FLOWS_MAX_*). Against a 300k-row
+ * window that is 0.03% coverage, so every bucket except "unknown" read zero.
+ *
+ * Raising those caps is not an option: they are measured against the transport
+ * limit. Risk is decided per destination host, though, and hosts are far fewer
+ * than flows, so shipping (host, flows) pairs lets the caller annotate the
+ * entire window inside one small reply. The row cap stays where it is for the
+ * item list, which genuinely does need whole rows.
+ */
+static struct json_object *dw_audit_api_flow_host_rollup(struct json_object *req)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    struct json_object *data = json_object_new_object();
+    struct json_object *arr = json_object_new_array();
+    int64_t now = (int64_t)dw_now();
+    /*
+     * Timing is reported in the reply, not just logged. This handler is the
+     * slowest of the audit summary calls and its cost splits unevenly between
+     * SQL and reply construction, which is impossible to attribute from the
+     * outside: total latency looked SQL-bound until group_ms and count_ms were
+     * measured separately. Keeping the split in the payload makes a future
+     * regression diagnosable without rebuilding an instrumented binary.
+     */
+    int64_t t_enter_ms = dw_audit_monotonic_ms();
+    int64_t t_open_ms = 0;
+    int64_t t_group_ms = 0;
+    int64_t t_count_ms = 0;
+    int64_t t_mark = 0;
+    int64_t from = dw_json_get_int64(req, "ts_from",
+                       dw_json_get_int64(req, "timestampFrom", now - 3600));
+    int64_t to = dw_json_get_int64(req, "ts_to",
+                     dw_json_get_int64(req, "timestampTo", now));
+    const char *mode = dw_json_get_string(req, "mode",
+                           dw_json_get_string(req, "source", "sample"));
+    /*
+     * Hosts are bounded by how many distinct destinations the window touched,
+     * which is orders of magnitude below the row count, but a pathological
+     * window must still not overflow the reply.
+     *
+     * Measured on 30.1 over a 24h window: 12659 distinct hosts covering all
+     * 271610 rows serialized to 498 KiB, about half the ~992 KiB usable ubus
+     * payload. 20000 keeps full coverage on that shape with headroom to spare,
+     * and the reply reports truncated=true rather than silently undercounting
+     * if a window ever exceeds it. A 4000 default was tried first and truncated
+     * at 94% coverage, which is exactly the silent shortfall being fixed.
+     */
+    int top = dw_json_get_int(req, "top", dw_json_get_int(req, "limit", 20000));
+    const char *external_pred_sql = dw_audit_flow_external_predicate_sql();
+    const char *table = NULL;
+    const char *ts_col = NULL;
+    char sql[2048];
+    /*
+     * Absent mode must resolve exactly as dw_audit_api_flows() resolves it,
+     * which treats "no mode given" as auto and picks event_lifecycle. Defaulting
+     * to the sample table instead made the rollup read 3.4k rows while "total"
+     * counted 271k from event_lifecycle, so coverage reported ~1% even though
+     * the rollup had not truncated anything.
+     */
+    int has_mode = json_object_object_get(req, "mode") != NULL;
+    int has_source = json_object_object_get(req, "source") != NULL;
+    int auto_mode = (!has_mode && !has_source) ||
+                    (mode && (!strcasecmp(mode, "auto") ||
+                              !strcasecmp(mode, "default") ||
+                              !strcasecmp(mode, "best")));
+    int event_lifecycle = mode && (!strcasecmp(mode, "event_lifecycle") ||
+                                   !strcasecmp(mode, "flow_event_lifecycle") ||
+                                   !strcasecmp(mode, "ctnetlink_lifecycle") ||
+                                   !strcasecmp(mode, "exact_lifecycle"));
+    int lifecycle = auto_mode ? 2 : (event_lifecycle ? 2 :
+        (mode && (!strcasecmp(mode, "lifecycle") ||
+                  !strcasecmp(mode, "flow_lifecycle"))));
+    int returned = 0;
+    int64_t counted_flows = 0;
+    int64_t window_rows = 0;
+    /*
+     * rows_seen counts grouped rows the LIMIT actually produced, which is what
+     * decides truncation. "returned" excludes the empty-host bucket, so using
+     * it here would under-report truncation by one whenever that bucket exists.
+     */
+    int rows_seen = 0;
+    int64_t excluded_empty_flows = 0;
+    int excluded_empty_hosts = 0;
+    const char *window_rows_exact_source = "group_sum";
+    int rc;
+
+    if (top <= 0)
+        top = 4000;
+    if (top > 20000)
+        top = 20000;
+    if (to <= 0)
+        to = now;
+    if (from < 0)
+        from = 0;
+
+    json_object_object_add(data, "hosts", arr);
+    json_object_object_add(data, "mode", json_object_new_string(
+        lifecycle == 2 ? "event_lifecycle" : (lifecycle ? "lifecycle" : "sample")));
+    json_object_object_add(data, "ts_from", json_object_new_int64(from));
+    json_object_object_add(data, "ts_to", json_object_new_int64(to));
+
+    if (dw_audit_db_open(&db) != 0 || !db) {
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        json_object_object_add(data, "error",
+                               json_object_new_string("audit_db_unavailable"));
+        return jmx_gen_api_response_data(API_CODE_ERROR, data);
+    }
+    t_open_ms = dw_audit_monotonic_ms() - t_enter_ms;
+
+    if (lifecycle == 2) {
+        table = "audit_flow_event_lifecycle";
+        /*
+         * destroy_ts, matching every other handler that reads this table
+         * (dw_audit_api_flows, _flow_app_summary, _flow_top_summary). This
+         * handler was the sole outlier on last_seen, which is a correctness
+         * hazard rather than a speed one: a caller passing an explicit window
+         * would have been answered from a different column than the flow list
+         * it is annotating.
+         *
+         * It is not a performance fix. Measured on 30.1 over 24h, last_seen
+         * scans and destroy_ts uses a covering index, yet both return the same
+         * 12343 hosts / 271239 flows in ~0.26s, because the retention window
+         * keeps 100% of rows inside 24h so the index prunes nothing. An earlier
+         * note here claimed destroy_ts cut 1612ms to 250ms; that was cold-cache
+         * jitter, and repeated runs do not reproduce it.
+         */
+        ts_col = "destroy_ts";
+    } else if (lifecycle) {
+        table = "audit_flow_lifecycle";
+        ts_col = "last_seen";
+    } else {
+        table = "audit_flow_sample";
+        ts_col = "ts";
+    }
+
+    /*
+     * Grouped on the same coalesce order webd's risk lookup uses for its host
+     * candidate, so a host counted here is the host that would be annotated.
+     *
+     * The empty-host bucket is deliberately NOT dropped in SQL. It is skipped
+     * when building the reply (webd cannot look up reputation for ""), but its
+     * row count is needed to reconstruct the window total without a second
+     * full pass. ORDER BY keeps it wherever its count places it, so the skip
+     * happens in C.
+     */
+    snprintf(sql, sizeof(sql),
+        "SELECT lower(COALESCE(NULLIF(destination_host,''),NULLIF(host,''),"
+        "NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) AS h,"
+        "COUNT(*) FROM %s WHERE %s BETWEEN ?1 AND ?2 AND %s "
+        "GROUP BY h ORDER BY COUNT(*) DESC LIMIT ?3",
+        table, ts_col, external_pred_sql);
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        json_object_object_add(data, "error",
+                               json_object_new_string("host_rollup_query_failed"));
+        return jmx_gen_api_response_data(API_CODE_ERROR, data);
+    }
+    sqlite3_bind_int64(st, 1, from);
+    sqlite3_bind_int64(st, 2, to);
+    sqlite3_bind_int(st, 3, top);
+    t_mark = dw_audit_monotonic_ms();
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *host = (const char *)sqlite3_column_text(st, 0);
+        int64_t flows = sqlite3_column_int64(st, 1);
+        struct json_object *o;
+
+        rows_seen++;
+        if (!host || !host[0]) {
+            excluded_empty_flows += flows;
+            excluded_empty_hosts++;
+            continue;
+        }
+        o = json_object_new_object();
+        json_object_object_add(o, "host",
+                               json_object_new_string(host));
+        json_object_object_add(o, "flows", json_object_new_int64(flows));
+        json_object_array_add(arr, o);
+        counted_flows += flows;
+        returned++;
+    }
+    t_group_ms = dw_audit_monotonic_ms() - t_mark;
+    sqlite3_finalize(st);
+    st = NULL;
+
+    /*
+     * Total window rows, so the caller can state its own coverage honestly
+     * instead of assuming the rollup saw everything.
+     *
+     * Only queried when the group-by actually hit the LIMIT. Below the limit
+     * every qualifying row was folded into some returned host, so the flows
+     * already summed while walking the result set *is* the window total: the
+     * two statements share one WHERE clause, and GROUP BY partitions rather
+     * than filters. The empty-host bucket is the one group not serialized, so
+     * its rows are added back explicitly and reported as hosts_excluded_empty.
+     *
+     * This matters because the second pass is not cheap. Measured on 30.1 over
+     * a 24h/270k-row window, the redundant COUNT(*) cost 606-723ms against
+     * 879-904ms for the group query itself, so it was 40% of a call that never
+     * needed it. Verified equal on that window: counted_flows 270639 ==
+     * window_rows 270639 with truncated=false.
+     */
+    t_mark = dw_audit_monotonic_ms();
+    if (rows_seen >= top) {
+        snprintf(sql, sizeof(sql),
+            "SELECT COUNT(*) FROM %s WHERE %s BETWEEN ?1 AND ?2 AND %s",
+            table, ts_col, external_pred_sql);
+        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, from);
+            sqlite3_bind_int64(st, 2, to);
+            if (sqlite3_step(st) == SQLITE_ROW)
+                window_rows = sqlite3_column_int64(st, 0);
+        }
+        window_rows_exact_source = "count_query";
+    } else {
+        window_rows = counted_flows + excluded_empty_flows;
+        window_rows_exact_source = "group_sum";
+    }
+    t_count_ms = dw_audit_monotonic_ms() - t_mark;
+    if (st)
+        sqlite3_finalize(st);
+
+    json_object_object_add(data, "ok", json_object_new_boolean(1));
+    json_object_object_add(data, "returned", json_object_new_int(returned));
+    json_object_object_add(data, "host_limit", json_object_new_int(top));
+    json_object_object_add(data, "truncated",
+                           json_object_new_boolean(rows_seen >= top));
+    json_object_object_add(data, "counted_flows",
+                           json_object_new_int64(counted_flows));
+    json_object_object_add(data, "window_rows",
+                           json_object_new_int64(window_rows));
+    json_object_object_add(data, "window_rows_source",
+        json_object_new_string(window_rows_exact_source));
+    json_object_object_add(data, "hosts_excluded_empty",
+                           json_object_new_int(excluded_empty_hosts));
+    json_object_object_add(data, "flows_excluded_empty_host",
+                           json_object_new_int64(excluded_empty_flows));
+    json_object_object_add(data, "source",
+        json_object_new_string("audit_db_host_rollup"));
+    {
+        struct json_object *timing = json_object_new_object();
+
+        json_object_object_add(timing, "db_open_ms",
+                               json_object_new_int64(t_open_ms));
+        json_object_object_add(timing, "group_query_ms",
+                               json_object_new_int64(t_group_ms));
+        json_object_object_add(timing, "window_count_ms",
+                               json_object_new_int64(t_count_ms));
+        json_object_object_add(timing, "handler_ms",
+                               json_object_new_int64(dw_audit_monotonic_ms() - t_enter_ms));
+        json_object_object_add(data, "timing", timing);
+    }
+    return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
 }
 
 static struct json_object *dw_audit_api_flow_top_summary(struct json_object *req)
@@ -19227,7 +20071,7 @@ static struct json_object *dw_audit_api_activity_usage_buckets(struct json_objec
     struct json_object *client_usage = json_object_new_array();
     struct json_object *cap = json_object_new_object();
     int top = dw_json_get_int(req, "top", dw_json_get_int(req, "limit", 30));
-    int matrix_limit = dw_json_get_int(req, "matrix_limit", 1000);
+    int matrix_limit = dw_json_get_int(req, "matrix_limit", DW_AUDIT_ACTIVITY_MATRIX_DEFAULT);
     int64_t now = (int64_t)dw_now();
     int64_t from = dw_json_get_int64(req, "ts_from", dw_json_get_int64(req, "timestampFrom", now - 86400));
     int64_t to = dw_json_get_int64(req, "ts_to", dw_json_get_int64(req, "timestampTo", now));
@@ -19287,9 +20131,9 @@ static struct json_object *dw_audit_api_activity_usage_buckets(struct json_objec
     if (top > 100)
         top = 100;
     if (matrix_limit <= 0)
-        matrix_limit = 1000;
-    if (matrix_limit > 5000)
-        matrix_limit = 5000;
+        matrix_limit = DW_AUDIT_ACTIVITY_MATRIX_DEFAULT;
+    if (matrix_limit > DW_AUDIT_ACTIVITY_MATRIX_MAX)
+        matrix_limit = DW_AUDIT_ACTIVITY_MATRIX_MAX;
     if (from > 100000000000LL)
         from /= 1000;
     if (to > 100000000000LL)
@@ -19501,6 +20345,13 @@ static struct json_object *dw_audit_api_activity_usage_buckets(struct json_objec
     json_object_object_add(data, "hit_count", json_object_new_int64(total_flows));
     json_object_object_add(data, "app_count", json_object_new_int(app_count));
     json_object_object_add(data, "client_app_row_count", json_object_new_int(client_rows));
+    /* Same cap reporting as the raw-sample variant, so callers see the effective
+     * matrix bound regardless of which source served the window. */
+    json_object_object_add(data, "matrix_limit", json_object_new_int(matrix_limit));
+    json_object_object_add(data, "matrix_limit_max",
+                           json_object_new_int(DW_AUDIT_ACTIVITY_MATRIX_MAX));
+    json_object_object_add(data, "matrix_truncated",
+                           json_object_new_boolean(client_rows >= matrix_limit));
     json_object_object_add(data, "private_flow_count", json_object_new_int64(private_flows));
     json_object_object_add(data, "private_flow_bytes", json_object_new_int64(private_bytes));
     json_object_object_add(data, "contains_private_or_local_flows", json_object_new_boolean(private_flows > 0));
@@ -19576,7 +20427,7 @@ static struct json_object *dw_audit_api_activity_usage(struct json_object *req)
     struct dw_activity_app_row app_rows[128];
     int app_count = 0;
     int top = dw_json_get_int(req, "top", dw_json_get_int(req, "limit", 30));
-    int matrix_limit = dw_json_get_int(req, "matrix_limit", 1000);
+    int matrix_limit = dw_json_get_int(req, "matrix_limit", DW_AUDIT_ACTIVITY_MATRIX_DEFAULT);
     int64_t now = (int64_t)dw_now();
     int64_t from = dw_json_get_int64(req, "ts_from", dw_json_get_int64(req, "timestampFrom", now - 86400));
     int64_t to = dw_json_get_int64(req, "ts_to", dw_json_get_int64(req, "timestampTo", now));
@@ -19647,9 +20498,9 @@ static struct json_object *dw_audit_api_activity_usage(struct json_object *req)
     if (top > 100)
         top = 100;
     if (matrix_limit <= 0)
-        matrix_limit = 1000;
-    if (matrix_limit > 5000)
-        matrix_limit = 5000;
+        matrix_limit = DW_AUDIT_ACTIVITY_MATRIX_DEFAULT;
+    if (matrix_limit > DW_AUDIT_ACTIVITY_MATRIX_MAX)
+        matrix_limit = DW_AUDIT_ACTIVITY_MATRIX_MAX;
     if (from > 100000000000LL)
         from /= 1000;
     if (to > 100000000000LL)
@@ -19928,6 +20779,13 @@ static struct json_object *dw_audit_api_activity_usage(struct json_object *req)
     json_object_object_add(data, "hit_count", json_object_new_int64(total_flows));
     json_object_object_add(data, "app_count", json_object_new_int(app_count));
     json_object_object_add(data, "client_app_row_count", json_object_new_int((int)json_object_array_length(client_usage)));
+    /* Effective matrix cap, so callers can tell a capped matrix from an
+     * exhausted one instead of inferring it from the row count. */
+    json_object_object_add(data, "matrix_limit", json_object_new_int(matrix_limit));
+    json_object_object_add(data, "matrix_limit_max",
+                           json_object_new_int(DW_AUDIT_ACTIVITY_MATRIX_MAX));
+    json_object_object_add(data, "matrix_truncated",
+        json_object_new_boolean((int)json_object_array_length(client_usage) >= matrix_limit));
     json_object_object_add(data, "private_flow_count", json_object_new_int64(private_flows));
     json_object_object_add(data, "private_flow_bytes", json_object_new_int64(private_bytes));
     json_object_object_add(data, "contains_private_or_local_flows", json_object_new_boolean(private_flows > 0));
@@ -21132,6 +21990,20 @@ static int dw_handle_audit_flows(struct ubus_context *ctx, struct ubus_object *o
     return dw_handle_db_api(ctx, req, msg, dw_audit_api_flows);
 }
 
+static int dw_handle_audit_flow_host_rollup(struct ubus_context *ctx,
+                                            struct ubus_object *obj,
+                                            struct ubus_request_data *req,
+                                            const char *method,
+                                            struct blob_attr *msg)
+{
+    (void)obj; (void)method;
+    /*
+     * Off-loop: the slowest audit read (~850ms on 30.1) and verified free of
+     * writes and shared mutable state.
+     */
+    return dw_handle_db_api_async(ctx, req, msg, dw_audit_api_flow_host_rollup);
+}
+
 static int dw_handle_audit_flow_app_summary(struct ubus_context *ctx, struct ubus_object *obj,
                                             struct ubus_request_data *req, const char *method,
                                             struct blob_attr *msg)
@@ -21145,7 +22017,16 @@ static int dw_handle_audit_flow_top_summary(struct ubus_context *ctx, struct ubu
                                             struct blob_attr *msg)
 {
     (void)obj; (void)method;
-    return dw_handle_db_api(ctx, req, msg, dw_audit_api_flow_top_summary);
+    /* Off-loop: pure read, ~400ms. */
+    return dw_handle_db_api_async(ctx, req, msg, dw_audit_api_flow_top_summary);
+}
+
+static int dw_handle_audit_flow_geo_summary(struct ubus_context *ctx, struct ubus_object *obj,
+                                            struct ubus_request_data *req, const char *method,
+                                            struct blob_attr *msg)
+{
+    (void)obj; (void)method;
+    return dw_handle_db_api(ctx, req, msg, dw_audit_api_flow_geo_summary);
 }
 
 static int dw_handle_audit_activity_usage(struct ubus_context *ctx, struct ubus_object *obj,
@@ -21370,6 +22251,140 @@ static void dw_dhcp_pool_check(void)
     }
 }
 
+/*
+ * _metrics_tick budget accounting.
+ *
+ * core's ubus dispatch is single-threaded, so everything this handler does runs
+ * with the control plane held.  Acceptance caught a single tick holding the loop
+ * for 5171 ms, which pushed unrelated ubus calls into their 30 s timeouts and
+ * showed up as "slow _metrics_tick invoke failed rc=7" plus repeated
+ * "config.db refresh failed".  Worse, jmx_core_watchdog abort()s core once a
+ * stall lasts JMX_CORE_HARD_RECOVER_DEFAULT_MS, so an unbounded tick is a
+ * restart risk, not just a latency one.
+ *
+ * Two rules keep it bounded.  First, the heavy collectors are spread across
+ * separate beats so they can never all land on one tick.  Second, each step is
+ * gated on a remaining wall-clock budget: once the tick has spent
+ * DW_METRICS_TICK_BUDGET_MS the rest is deferred to the next beat instead of
+ * running long.  Deferral is normal operation, not an error, so it is reported
+ * through counters rather than a log line per occurrence.
+ */
+#define DW_METRICS_TICK_BUDGET_MS 200LL
+
+struct dw_metrics_tick_stats {
+    int64_t ticks;
+    int64_t deferrals;
+    int64_t max_ms;
+    int64_t last_ms;
+    int64_t over_budget_ticks;
+    char last_deferred_step[32];
+    int64_t last_deferred_at;
+    /* Slowest single step ever seen, so a tick that overruns can be attributed
+     * to one collector instead of to the tick as a whole. The budget gate can
+     * only stop the next step from starting; it cannot shorten one in flight. */
+    char slowest_step[32];
+    int64_t slowest_step_ms;
+    char last_slow_step[32];
+    int64_t last_slow_step_ms;
+};
+
+static struct dw_metrics_tick_stats g_dw_metrics_tick_stats;
+
+/*
+ * Records one step's wall-clock cost. Called with the monotonic timestamp taken
+ * immediately before the step, so the value covers only that collector.
+ */
+static void dw_metrics_tick_step_done(const char *step, int64_t step_started_ms)
+{
+    int64_t spent = dw_monotonic_ms() - step_started_ms;
+
+    if (spent > g_dw_metrics_tick_stats.slowest_step_ms) {
+        g_dw_metrics_tick_stats.slowest_step_ms = spent;
+        snprintf(g_dw_metrics_tick_stats.slowest_step,
+                 sizeof(g_dw_metrics_tick_stats.slowest_step), "%s",
+                 step ? step : "");
+    }
+    if (spent >= DW_METRICS_TICK_BUDGET_MS) {
+        g_dw_metrics_tick_stats.last_slow_step_ms = spent;
+        snprintf(g_dw_metrics_tick_stats.last_slow_step,
+                 sizeof(g_dw_metrics_tick_stats.last_slow_step), "%s",
+                 step ? step : "");
+    }
+}
+
+/* Times one void collector call and attributes its cost to `step`. */
+#define DW_METRICS_TICK_STEP(step, call) do {           \
+        int64_t _step_started = dw_monotonic_ms();      \
+        call;                                           \
+        dw_metrics_tick_step_done((step), _step_started); \
+    } while (0)
+
+/*
+ * Returns 1 while the tick may still start another step.  Records which step
+ * was skipped first so core_status can name the step that keeps losing the
+ * budget instead of only reporting that something was dropped.
+ */
+static int dw_metrics_tick_budget_ok(int64_t started_ms, const char *step)
+{
+    int64_t spent = dw_monotonic_ms() - started_ms;
+
+    if (spent < DW_METRICS_TICK_BUDGET_MS)
+        return 1;
+    g_dw_metrics_tick_stats.deferrals++;
+    g_dw_metrics_tick_stats.last_deferred_at = (int64_t)dw_now();
+    snprintf(g_dw_metrics_tick_stats.last_deferred_step,
+             sizeof(g_dw_metrics_tick_stats.last_deferred_step), "%s",
+             step ? step : "");
+    return 0;
+}
+
+/*
+ * Exposed through core_status so the tick's own cost is observable. Acceptance
+ * could previously only see the symptom (watchdog stall reports naming
+ * _metrics_tick) with no way to tell which step spent the time.
+ */
+void jmx_dreamingwrt_metrics_tick_append_status(struct json_object *data)
+{
+    struct json_object *o;
+
+    if (!data)
+        return;
+    o = json_object_new_object();
+    if (!o)
+        return;
+    json_object_object_add(o, "budget_ms",
+                           json_object_new_int64(DW_METRICS_TICK_BUDGET_MS));
+    json_object_object_add(o, "ticks",
+                           json_object_new_int64(g_dw_metrics_tick_stats.ticks));
+    json_object_object_add(o, "last_ms",
+                           json_object_new_int64(g_dw_metrics_tick_stats.last_ms));
+    json_object_object_add(o, "max_ms",
+                           json_object_new_int64(g_dw_metrics_tick_stats.max_ms));
+    json_object_object_add(o, "over_budget_ticks",
+        json_object_new_int64(g_dw_metrics_tick_stats.over_budget_ticks));
+    json_object_object_add(o, "deferrals",
+                           json_object_new_int64(g_dw_metrics_tick_stats.deferrals));
+    json_object_object_add(o, "last_deferred_step",
+        json_object_new_string(g_dw_metrics_tick_stats.last_deferred_step));
+    json_object_object_add(o, "last_deferred_at",
+        json_object_new_int64(g_dw_metrics_tick_stats.last_deferred_at));
+    json_object_object_add(o, "slowest_step",
+        json_object_new_string(g_dw_metrics_tick_stats.slowest_step));
+    json_object_object_add(o, "slowest_step_ms",
+        json_object_new_int64(g_dw_metrics_tick_stats.slowest_step_ms));
+    json_object_object_add(o, "last_slow_step",
+        json_object_new_string(g_dw_metrics_tick_stats.last_slow_step));
+    json_object_object_add(o, "last_slow_step_ms",
+        json_object_new_int64(g_dw_metrics_tick_stats.last_slow_step_ms));
+    json_object_object_add(o, "url_backfill_batch",
+        json_object_new_int(g_dw_audit_url_backfill_batch));
+    json_object_object_add(o, "url_backfill_batch_max",
+        json_object_new_int(DW_AUDIT_URL_BACKFILL_BATCH));
+    json_object_object_add(o, "url_backfill_last_ms",
+        json_object_new_int64(g_dw_audit_url_backfill_last_ms));
+    json_object_object_add(data, "metrics_tick", o);
+}
+
 static int dw_handle_metrics_tick(struct ubus_context *ctx, struct ubus_object *obj,
                                   struct ubus_request_data *req, const char *method,
                                   struct blob_attr *msg)
@@ -21384,6 +22399,17 @@ static int dw_handle_metrics_tick(struct ubus_context *ctx, struct ubus_object *
     int topology_history = 0;
     struct jmx_storage_guard_state storage_guard;
     int bulk_writes_allowed;
+    int64_t tick_started_ms = dw_monotonic_ms();
+    int64_t tick_spent_ms;
+    /*
+     * Beat counter for sharding. metricsd drives this handler on a fixed
+     * cadence, so a plain counter is enough to keep the two heaviest collectors
+     * (URL backfill and the topology snapshot) off the same tick.
+     */
+    static uint64_t tick_beat;
+    uint64_t beat = tick_beat++;
+    int run_url_backfill = (beat % 2) == 0;
+    int run_topology = (beat % 2) == 1;
 
     (void)obj;
     (void)method;
@@ -21410,50 +22436,84 @@ static int dw_handle_metrics_tick(struct ubus_context *ctx, struct ubus_object *
         "/", JMX_STORAGE_WRITE_BULK, &storage_guard);
 
     if (wan_health && bulk_writes_allowed)
-        dw_update_wan_health();
+        DW_METRICS_TICK_STEP("wan_health", dw_update_wan_health());
     if (ipv6_load)
-        dw_collect_ipv6_load();
+        DW_METRICS_TICK_STEP("ipv6_load", dw_collect_ipv6_load());
     if (audit_flow_sample && bulk_writes_allowed) {
-        int flow_samples = dw_audit_flow_sample_collect(64);
+        int flow_samples;
         int url_rows;
+        int64_t step_started = dw_monotonic_ms();
 
+        flow_samples = dw_audit_flow_sample_collect(64);
+        dw_metrics_tick_step_done("audit_flow_sample", step_started);
         if (flow_samples < 0)
             LOG_WARN("_metrics_tick: audit flow sample collect failed\n");
 
-        /* URL audit runs right after the sampler on the same beat: the sampler
-         * has just refreshed the host snapshot the backfill reads from. */
-        url_rows = dw_audit_url_backfill_tick();
-        if (url_rows < 0)
-            LOG_WARN("_metrics_tick: audit url backfill failed\n");
+        /*
+         * URL audit still runs right after the sampler, because the sampler has
+         * just refreshed the host snapshot the backfill reads from. It now runs
+         * on every other beat and only with budget left: it is the single most
+         * expensive step here, since rows missing a host each cost a ~3.15 ms
+         * history lookup.
+         */
+        if (run_url_backfill &&
+            dw_metrics_tick_budget_ok(tick_started_ms, "audit_url_backfill")) {
+            step_started = dw_monotonic_ms();
+            url_rows = dw_audit_url_backfill_tick();
+            dw_metrics_tick_step_done("audit_url_backfill", step_started);
+            if (url_rows < 0)
+                LOG_WARN("_metrics_tick: audit url backfill failed\n");
+        }
     }
     if (interface_traffic) {
         if (bulk_writes_allowed)
+            /* Not wrapped in DW_METRICS_TICK_STEP: dw_refresh_wan_state() times
+             * its two halves itself, and an outer timer would always be the
+             * larger of the two and mask which half is actually slow. */
             dw_refresh_wan_state();
-        collect_interface_traffic_rate();
-        dw_client_overview_sample_tick();
-        dw_dhcp_pool_check();
-        if (bulk_writes_allowed)
-            dw_collect_system_health_sample();
+        DW_METRICS_TICK_STEP("interface_traffic", collect_interface_traffic_rate());
+        DW_METRICS_TICK_STEP("client_overview", dw_client_overview_sample_tick());
+        DW_METRICS_TICK_STEP("dhcp_pool", dw_dhcp_pool_check());
+        if (bulk_writes_allowed &&
+            dw_metrics_tick_budget_ok(tick_started_ms, "system_health_sample"))
+            DW_METRICS_TICK_STEP("system_health_sample",
+                                 dw_collect_system_health_sample());
     }
-    if (flush_health && bulk_writes_allowed &&
-        jmx_db_flush_health_buckets() < 0) {
-        LOG_WARN("_metrics_tick: flush_health failed\n");
-        return UBUS_STATUS_SYSTEM_ERROR;
+    if (flush_health && bulk_writes_allowed) {
+        int64_t step_started = dw_monotonic_ms();
+        int flush_rc = jmx_db_flush_health_buckets();
+
+        dw_metrics_tick_step_done("flush_health", step_started);
+        if (flush_rc < 0) {
+            LOG_WARN("_metrics_tick: flush_health failed\n");
+            return UBUS_STATUS_SYSTEM_ERROR;
+        }
     }
     if (wan_profiles && bulk_writes_allowed)
-        dw_update_wan_profiles();
-    if (topology_history && bulk_writes_allowed) {
-        struct json_object *snapshot = jmx_dreamingwrt_topology_infrastructure_get();
+        DW_METRICS_TICK_STEP("wan_profiles", dw_update_wan_profiles());
+    if (topology_history && bulk_writes_allowed && run_topology &&
+        dw_metrics_tick_budget_ok(tick_started_ms, "topology_history")) {
+        int64_t step_started = dw_monotonic_ms();
+        struct json_object *snapshot;
         struct json_object *capture_result = NULL;
 
+        snapshot = jmx_dreamingwrt_topology_infrastructure_get();
         if (!snapshot || jmx_topology_history_capture(snapshot, 0, &capture_result) != 0)
             LOG_WARN("_metrics_tick: topology history capture failed\n");
+        dw_metrics_tick_step_done("topology_history", step_started);
         if (snapshot)
             json_object_put(snapshot);
         if (capture_result)
             json_object_put(capture_result);
     }
 
+    tick_spent_ms = dw_monotonic_ms() - tick_started_ms;
+    g_dw_metrics_tick_stats.ticks++;
+    g_dw_metrics_tick_stats.last_ms = tick_spent_ms;
+    if (tick_spent_ms > g_dw_metrics_tick_stats.max_ms)
+        g_dw_metrics_tick_stats.max_ms = tick_spent_ms;
+    if (tick_spent_ms > DW_METRICS_TICK_BUDGET_MS)
+        g_dw_metrics_tick_stats.over_budget_ticks++;
     dw_send_ok(ctx, req);
     return 0;
 }
@@ -21752,14 +22812,25 @@ static void dw_write_wan_activity_samples_from_state(void)
 void dw_refresh_wan_state(void)
 {
     struct json_object *wans;
+    int64_t step_started;
 
     if (!jmx_storage_guard_allow("/", JMX_STORAGE_WRITE_BULK, NULL))
         return;
+    /*
+     * Split into two measured halves. Tick instrumentation showed wan_state as
+     * the slowest step at 1762 ms, well past the tick budget, but the step does
+     * two very different things: it rebuilds the WAN objects (UCI plus per-WAN
+     * DB state writes) and then appends activity samples. Attributing them
+     * separately is what makes the remaining cost actionable.
+     */
+    step_started = dw_monotonic_ms();
     wans = dw_build_wans_internal(1, 0);
-
+    dw_metrics_tick_step_done("wan_state.build_wans", step_started);
     if (wans)
         json_object_put(wans);
+    step_started = dw_monotonic_ms();
     dw_write_wan_activity_samples_from_state();
+    dw_metrics_tick_step_done("wan_state.activity_samples", step_started);
 }
 
 /* called from metricsd: refresh WAN session + health bucket + activity sample */
@@ -23357,12 +24428,29 @@ static int dw_is_valid_mac(const char *s)
     return s[17] == '\0';
 }
 
-static void dw_generate_mac(char *out, size_t len)
+/*
+ * Builds a locally-administered MAC for a virtual interface.
+ *
+ * Not a secret, so this is about collision avoidance rather than
+ * unpredictability. rand() without seeding returns the same sequence on every
+ * boot, and the remaining three bytes came from time(NULL), so two devices
+ * creating an interface in the same second produced identical addresses. Five
+ * random bytes from getrandom() removes both problems; on failure the caller is
+ * told rather than handed a guessable address.
+ *
+ * Returns 0 on success, -1 when no strong randomness is available.
+ */
+static int dw_generate_mac(char *out, size_t len)
 {
-    unsigned int r1 = (unsigned int)rand();
-    unsigned int r2 = (unsigned int)time(NULL);
-    if (!out || len == 0) return;
-    snprintf(out, len, "02:%02x:%02x:%02x:%02x:%02x", r1 & 0xff, (r1 >> 8) & 0xff, r2 & 0xff, (r2 >> 8) & 0xff, (r2 >> 16) & 0xff);
+    unsigned char r[5];
+
+    if (!out || len == 0) return -1;
+    out[0] = '\0';
+    if (getrandom(r, sizeof(r), 0) != (ssize_t)sizeof(r))
+        return -1;
+    /* 02: marks the address locally administered and unicast. */
+    snprintf(out, len, "02:%02x:%02x:%02x:%02x:%02x", r[0], r[1], r[2], r[3], r[4]);
+    return 0;
 }
 
 /* ── wan_set: configure WAN main interface (SQLite source of truth) ── */
@@ -23508,7 +24596,15 @@ static int dw_handle_hybrid_line_add(struct ubus_context *ctx, struct ubus_objec
         int vid = dw_json_get_int(payload, "vlan_id", atoi(dw_json_get_string(payload, "vlan_id", "0")));
         if (vid < 1 || vid > 4094) { json_object_object_add(data, "error", json_object_new_string("vlan_id must be 1-4094")); goto done; }
     }
-    if (!mac[0]) { dw_generate_mac(gen_mac, sizeof(gen_mac)); json_object_object_add(payload, "mac", json_object_new_string(gen_mac)); mac = gen_mac; }
+    if (!mac[0]) {
+        if (dw_generate_mac(gen_mac, sizeof(gen_mac)) != 0) {
+            json_object_object_add(data, "error",
+                json_object_new_string("mac_generation_unavailable"));
+            goto done;
+        }
+        json_object_object_add(payload, "mac", json_object_new_string(gen_mac));
+        mac = gen_mac;
+    }
     if (mac[0] && !dw_is_valid_mac(mac)) { json_object_object_add(data, "error", json_object_new_string("invalid mac")); goto done; }
     snprintf(idbuf, sizeof(idbuf), "line_%s_%s", parent, name);
     if (!dw_json_get_string(payload, "id", "")[0]) json_object_object_add(payload, "id", json_object_new_string(idbuf));
@@ -29489,6 +30585,173 @@ static int dw_handle_ai_models_get(struct ubus_context *ctx, struct ubus_object 
         struct ubus_request_data *req, const char *method, struct blob_attr *msg)
 { (void)obj; (void)method; (void)msg; struct json_object *r = jmx_ai_models_get(); dw_send_json(ctx, req, r); json_object_put(r); return 0; }
 
+/* ── AI multi-provider ── */
+
+static void dw_ai_provider_send_rc(struct ubus_context *ctx,
+                                   struct ubus_request_data *req, int rc)
+{
+    struct json_object *data, *r;
+    const char *error, *message;
+
+    switch (rc) {
+    case -2: error = "invalid_provider_kind";
+             message = "provider is not a supported kind"; break;
+    case -4: error = "invalid_role";
+             message = "role must be primary or standby"; break;
+    case -5: error = "invalid_auth_mode";
+             message = "auth_mode must be api_key or oauth"; break;
+    case -6: error = "provider_not_found";
+             message = "provider id does not exist"; break;
+    case -7: error = "invalid_field";
+             message = "priority, weight or failover parameter out of range"; break;
+    default:
+        dw_send_error(ctx, req, 500, "ai_provider operation failed");
+        return;
+    }
+    data = json_object_new_object();
+    json_object_object_add(data, "ok", json_object_new_boolean(0));
+    json_object_object_add(data, "error", json_object_new_string(error));
+    json_object_object_add(data, "message", json_object_new_string(message));
+    r = jmx_gen_api_response_data(API_CODE_ERROR, data);
+    dw_send_json(ctx, req, r);
+    json_object_put(r);
+}
+
+static int dw_handle_ai_providers_list(struct ubus_context *ctx, struct ubus_object *obj,
+        struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{ (void)obj; (void)method; (void)msg; dw_send_owned_json(ctx, req, jmx_ai_providers_list()); return 0; }
+
+static int dw_handle_ai_provider_get(struct ubus_context *ctx, struct ubus_object *obj,
+        struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    struct blob_attr *tb[1];
+    struct json_object *r;
+    (void)obj; (void)method;
+    if (blobmsg_parse(dw_str_policy, 1, tb, blob_data(msg), blob_len(msg)))
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    r = jmx_ai_provider_get(tb[0] ? blobmsg_get_string(tb[0]) : "");
+    if (!r) {
+        dw_ai_provider_send_rc(ctx, req, -6);
+        return 0;
+    }
+    dw_send_owned_json(ctx, req, r);
+    return 0;
+}
+
+static int dw_handle_ai_provider_create(struct ubus_context *ctx, struct ubus_object *obj,
+        struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    char id[65] = "";
+    int rc;
+
+    (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    rc = jmx_ai_provider_create(payload, id);
+    if (rc != 0) {
+        dw_ai_provider_send_rc(ctx, req, rc);
+    } else {
+        struct json_object *r = jmx_ai_provider_get(id);
+        if (!r) dw_send_error(ctx, req, 500, "ai_provider_get failed after create");
+        else dw_send_owned_json(ctx, req, r);
+    }
+    if (in) json_object_put(in);
+    if (msg_json) free(msg_json);
+    return 0;
+}
+
+static int dw_handle_ai_provider_update(struct ubus_context *ctx, struct ubus_object *obj,
+        struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    const char *id;
+    int rc;
+
+    (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    id = dw_json_get_string(payload, "id", "");
+    rc = jmx_ai_provider_update(id, payload);
+    if (rc != 0) {
+        dw_ai_provider_send_rc(ctx, req, rc);
+    } else {
+        struct json_object *r = jmx_ai_provider_get(id);
+        if (!r) dw_send_error(ctx, req, 500, "ai_provider_get failed after update");
+        else dw_send_owned_json(ctx, req, r);
+    }
+    if (in) json_object_put(in);
+    if (msg_json) free(msg_json);
+    return 0;
+}
+
+static int dw_handle_ai_provider_delete(struct ubus_context *ctx, struct ubus_object *obj,
+        struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    struct blob_attr *tb[1];
+    int rc;
+    (void)obj; (void)method;
+    if (blobmsg_parse(dw_str_policy, 1, tb, blob_data(msg), blob_len(msg)))
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    rc = jmx_ai_provider_delete(tb[0] ? blobmsg_get_string(tb[0]) : "");
+    if (rc != 0) dw_ai_provider_send_rc(ctx, req, rc);
+    else dw_send_ok(ctx, req);
+    return 0;
+}
+
+static int dw_handle_ai_provider_models_get(struct ubus_context *ctx, struct ubus_object *obj,
+        struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    struct blob_attr *tb[1];
+    struct json_object *r;
+    (void)obj; (void)method;
+    if (blobmsg_parse(dw_str_policy, 1, tb, blob_data(msg), blob_len(msg)))
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    r = jmx_ai_provider_models_list(tb[0] ? blobmsg_get_string(tb[0]) : "");
+    if (!r) {
+        dw_ai_provider_send_rc(ctx, req, -6);
+        return 0;
+    }
+    dw_send_owned_json(ctx, req, r);
+    return 0;
+}
+
+static int dw_handle_ai_dispatch_policy_get(struct ubus_context *ctx, struct ubus_object *obj,
+        struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{ (void)obj; (void)method; (void)msg; dw_send_owned_json(ctx, req, jmx_ai_dispatch_policy_get()); return 0; }
+
+static int dw_handle_ai_dispatch_policy_set(struct ubus_context *ctx, struct ubus_object *obj,
+        struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    int rc;
+
+    (void)obj; (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    rc = jmx_ai_dispatch_policy_set(payload);
+    if (rc == -2) {
+        struct json_object *data = json_object_new_object(), *r;
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        json_object_object_add(data, "error", json_object_new_string("invalid_strategy"));
+        json_object_object_add(data, "message",
+            json_object_new_string("strategy must be single, failover or load_balance"));
+        r = jmx_gen_api_response_data(API_CODE_ERROR, data);
+        dw_send_json(ctx, req, r);
+        json_object_put(r);
+    } else if (rc != 0) {
+        dw_ai_provider_send_rc(ctx, req, rc);
+    } else {
+        dw_send_owned_json(ctx, req, jmx_ai_dispatch_policy_get());
+    }
+    if (in) json_object_put(in);
+    if (msg_json) free(msg_json);
+    return 0;
+}
+
 static int dw_handle_ai_tools_get(struct ubus_context *ctx, struct ubus_object *obj,
         struct ubus_request_data *req, const char *method, struct blob_attr *msg)
 { (void)obj; (void)method; (void)msg; struct json_object *r = jmx_ai_tools_get(); dw_send_json(ctx, req, r); json_object_put(r); return 0; }
@@ -29855,8 +31118,10 @@ static struct ubus_method dw_methods[] = {
     UBUS_METHOD("audit_urls", dw_handle_audit_urls, dw_empty_policy),
     UBUS_METHOD("audit_apps", dw_handle_audit_apps, dw_empty_policy),
     UBUS_METHOD("audit_flows", dw_handle_audit_flows, dw_empty_policy),
+    UBUS_METHOD("audit_flow_host_rollup", dw_handle_audit_flow_host_rollup, dw_empty_policy),
     UBUS_METHOD("audit_flow_app_summary", dw_handle_audit_flow_app_summary, dw_empty_policy),
     UBUS_METHOD("audit_flow_top_summary", dw_handle_audit_flow_top_summary, dw_empty_policy),
+    UBUS_METHOD("audit_flow_geo_summary", dw_handle_audit_flow_geo_summary, dw_empty_policy),
     UBUS_METHOD("audit_activity_usage", dw_handle_audit_activity_usage, dw_empty_policy),
     UBUS_METHOD("audit_migrate_legacy", dw_handle_audit_migrate_legacy, dw_empty_policy),
     UBUS_METHOD("audit_flow_ingest", dw_handle_audit_flow_ingest, dw_empty_policy),
@@ -30155,6 +31420,14 @@ static struct ubus_method dw_methods[] = {
     /* AI Assistant */
     UBUS_METHOD("ai_config_get", dw_handle_ai_config_get, dw_empty_policy),
     UBUS_METHOD("ai_config_set", dw_handle_ai_config_set, dw_empty_policy),
+    UBUS_METHOD("ai_providers_list", dw_handle_ai_providers_list, dw_empty_policy),
+    UBUS_METHOD("ai_provider_get", dw_handle_ai_provider_get, dw_str_policy),
+    UBUS_METHOD("ai_provider_create", dw_handle_ai_provider_create, dw_empty_policy),
+    UBUS_METHOD("ai_provider_update", dw_handle_ai_provider_update, dw_empty_policy),
+    UBUS_METHOD("ai_provider_delete", dw_handle_ai_provider_delete, dw_str_policy),
+    UBUS_METHOD("ai_provider_models_get", dw_handle_ai_provider_models_get, dw_str_policy),
+    UBUS_METHOD("ai_dispatch_policy_get", dw_handle_ai_dispatch_policy_get, dw_empty_policy),
+    UBUS_METHOD("ai_dispatch_policy_set", dw_handle_ai_dispatch_policy_set, dw_empty_policy),
     UBUS_METHOD("ai_models_get", dw_handle_ai_models_get, dw_empty_policy),
     UBUS_METHOD("ai_tools_get", dw_handle_ai_tools_get, dw_empty_policy),
     UBUS_METHOD("ai_chat", dw_handle_ai_chat, dw_empty_policy),
@@ -30236,6 +31509,19 @@ int dreamingwrt_ubus_register(struct ubus_context *ctx)
     if (!ctx)
         return -1;
     dw_install_core_dispatcher();
+    /*
+     * Start the off-loop read pool here: this runs on the main thread after
+     * uloop_init() and before any request can arrive, and these ubus objects
+     * are its only users. A failure is not fatal; every handler falls back to
+     * running inline, which is the pre-existing behaviour.
+     *
+     * Two workers, not more: the audit reads are disk and page-cache bound on a
+     * single sqlite file, so extra threads add contention rather than
+     * throughput. It is enough for the concurrent fetches webd issues.
+     */
+    dw_async_query_set_thread_cleanup(dw_audit_db_worker_cleanup);
+    if (dw_async_query_init(2) != 0)
+        LOG_WARN("audit async pool unavailable, queries run inline\n");
     ret = ubus_add_object(ctx, &dw_object);
     if (ret != 0) {
         LOG_ERROR("Failed to publish object 'dreamingwrt': %s\n", ubus_strerror(ret));
@@ -30255,6 +31541,12 @@ void dreamingwrt_ubus_unregister(struct ubus_context *ctx)
 {
     if (!ctx)
         return;
+    /*
+     * Stop the pool before removing the objects: dw_async_query_stop() drains
+     * jobs that already finished, and those completions still need a live ubus
+     * object to reply against.
+     */
+    dw_async_query_stop();
     if (dw_alias_object.id)
         ubus_remove_object(ctx, &dw_alias_object);
     if (dw_object.id)

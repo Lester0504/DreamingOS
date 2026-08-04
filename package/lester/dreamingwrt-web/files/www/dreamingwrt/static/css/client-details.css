@@ -876,11 +876,19 @@
 .client-detail-list strong {
   color: var(--app-text);
   font-size: 13px;
+  /* Values here are machine strings: a global IPv6 address, a long vendor name,
+     an SSID. They carry no spaces, so the default overflow-wrap leaves them as
+     one unbreakable run that spills past the cell and reads as eaten text.
+     Breaking anywhere is right for identifiers, which are read in full. */
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .client-detail-list span {
   color: var(--app-text-muted);
   font-size: 11px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .client-detail-kpi-grid {
@@ -1082,9 +1090,19 @@
     0 8px 18px rgba(2,8,18,0.08);
 }
 
+/* The table declares a min-width wide enough for every column (14 columns is
+   1988px), so the host must be allowed to be narrower than its content or the
+   table pushes the panel and the whole drawer sideways instead of scrolling.
+   A grid item defaults to min-width: auto, which refuses to shrink. */
+.client-connection-table-host {
+  min-width: 0;
+  max-width: 100%;
+}
+
 .client-connection-table-scroll {
   width: 100%;
   min-width: 0;
+  max-width: 100%;
   max-height: min(58vh, 620px);
   overflow: auto;
   border-radius: 16px;

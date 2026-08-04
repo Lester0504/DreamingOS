@@ -2,6 +2,9 @@
 /* DreamingWrt aegisxd: security intelligence and policy control-plane daemon. */
 #include "aegisxd_internal.h"
 
+extern void aegisxd_feed_scheduler_start(void);
+extern void aegisxd_feed_scheduler_stop(void);
+
 static void aegisxd_handle_signal(int signo)
 {
     (void)signo;
@@ -35,6 +38,13 @@ int main(int argc, char **argv)
         curl_global_cleanup();
         return rc;
     }
+    if (argc >= 2 && !strcmp(argv[1], "--pcdn-sync-worker")) {
+        const char *job_id = argc >= 3 ? argv[2] : "";
+        int rc = aegisxd_pcdn_sync_worker_main(job_id);
+
+        curl_global_cleanup();
+        return rc;
+    }
     if (aegisxd_db_init() != 0)
         goto fail_curl;
     uloop_init();
@@ -46,11 +56,13 @@ int main(int argc, char **argv)
     if (aegisxd_honeypot_reconcile() != 0)
         fprintf(stderr, "[dreamingwrt-aegisxd] honeypot runtime reconciliation failed\n");
     aegisxd_hit_producer_start();
+    aegisxd_feed_scheduler_start();
 
     fprintf(stderr, "[dreamingwrt-aegisxd] started config=%s db=%s dataplane=disabled\n",
             AEGISXD_CONFIG_DB_PATH, AEGISXD_DB_PATH);
     uloop_run();
 
+    aegisxd_feed_scheduler_stop();
     aegisxd_hit_producer_stop();
     aegisxd_ubus_stop();
     uloop_done();

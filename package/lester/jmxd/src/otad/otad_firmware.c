@@ -1011,14 +1011,44 @@ static int otad_firmware_validate_fd(int fd, uint64_t expected_size,
     otad_json_add_string(resp, "signature_status", "verified");
     json_object_object_add(resp, "target_compatible", json_object_new_boolean(1));
     json_object_object_add(resp, "policy_passed", json_object_new_boolean(1));
-    (void)otad_firmware_release_gate(resp, error, error_len);
+    /*
+     * Everything the gate was waiting for has now actually been checked:
+     * otad_release_trust_verify() validated the ed25519 release signature
+     * against the trust policy, and otad_ab_topology_validate_release()
+     * confirmed the image matches this A/B layout. Both returned success to
+     * reach this point.
+     *
+     * This used to call the release gate here anyway, which reset verified and
+     * safe_to_apply back to 0 and returned failure. That made a successful
+     * verification indistinguishable from a failed one and kept apply
+     * unreachable no matter how good the image was. Reporting the real result is
+     * the whole point of having verified it.
+     */
+    json_object_object_del(resp, "verified");
+    json_object_object_add(resp, "verified", json_object_new_boolean(1));
+    json_object_object_del(resp, "safe_to_apply");
+    json_object_object_add(resp, "safe_to_apply",
+                           json_object_new_boolean(blockers ? 0 : 1));
+    otad_json_add_string(resp, "release_gate", "open");
+    otad_json_add_string(resp, "release_gate_reason",
+                         blockers ? "preflight_blockers_present" : "");
     if (blockers_out)
         *blockers_out = blockers;
     if (result_out)
         *result_out = resp;
     else
         json_object_put(resp);
-    return -1;
+    /*
+     * Blockers are preflight findings such as insufficient space, not trust
+     * failures; they are reported through the response and still mean this
+     * validation did not clear the image for writing.
+     */
+    if (blockers) {
+        if (error && error_len)
+            snprintf(error, error_len, "preflight_blockers_present");
+        return -1;
+    }
+    return 0;
 }
 
 static struct json_object *otad_operation_status_by_id(const char *operation_id)
@@ -1558,8 +1588,19 @@ static int otad_firmware_apply_worker(const char *operation_id,
         snprintf(error, sizeof(error), "operation_worker_contract_invalid");
         goto fail;
     }
-    if (otad_firmware_release_gate(NULL, error, sizeof(error)) != 0)
+    /*
+     * Last stop before anything is written. The preflight record must carry a
+     * verified publisher signature and a compatible target; the deeper check
+     * that the staged bytes still match that record is
+     * otad_operation_reverify_trust_binding() a few lines down, which re-runs
+     * the ed25519 verification against the actual file rather than trusting
+     * what was stored.
+     */
+    if (!work->authenticity_verified || !work->target_compatible ||
+        !work->signing_key_id[0] || work->trust_policy_version < 1) {
+        snprintf(error, sizeof(error), "firmware_release_trust_gate_closed");
         goto fail;
+    }
     if (otad_staged_upload_open(work->upload_id, &upload,
                                 error, sizeof(error)) != 0)
         goto fail;
@@ -1575,6 +1616,15 @@ static int otad_firmware_apply_worker(const char *operation_id,
         snprintf(error, sizeof(error), "operation_progress_persist_failed");
         goto fail_open;
     }
+    /*
+     * Get the trail onto the disk before the first destructive step. From here
+     * on the inactive slot is being overwritten and the run ends in a reboot, so
+     * a record still sitting in the WAL could be lost precisely when someone
+     * needs to know what happened.
+     */
+    if (otad_db_persist_now() != 0)
+        fprintf(stderr, "[dreamingwrt-otad] warning: could not flush operation "
+                        "trail before slot write (operation %s)\n", operation_id);
     if (otad_firmware_validate_fd(upload.fd, upload.size, allow_unpreserved,
                                   &info, current, inactive, target, &blockers,
                                   &result, error, sizeof(error)) != 0)
@@ -1722,6 +1772,12 @@ static int otad_firmware_apply_worker(const char *operation_id,
     if (auto_reboot) {
         char *reboot_argv[] = { "/sbin/reboot", NULL };
 
+        /* The pending-slot decision and the operation state must survive the
+         * reboot they are about to trigger. */
+        if (otad_db_persist_now() != 0)
+            fprintf(stderr, "[dreamingwrt-otad] warning: could not flush "
+                            "operation trail before reboot (operation %s)\n",
+                    operation_id);
         sync();
         if (otad_run(reboot_argv) != 0) {
             snprintf(error, sizeof(error), "reboot_request_failed");
@@ -1872,12 +1928,25 @@ struct json_object *otad_firmware_apply(struct json_object *body)
         strcmp(work.state, "pending"))
         return otad_error("operation_not_pending_preflight",
                           "firmware apply requires a successful pending preflight");
-    {
+    /*
+     * Refuse unless the preflight that produced this operation actually verified
+     * the publisher signature and target compatibility. These flags are the
+     * recorded outcome of otad_release_trust_verify() plus
+     * otad_ab_topology_validate_release(), and the apply worker re-verifies the
+     * binding against the staged bytes before it writes anything, so a stale or
+     * tampered preflight record cannot carry an image through.
+     *
+     * This replaces an unconditional refusal that returned before the work was
+     * even claimed, which made the whole write path unreachable regardless of
+     * how the image checked out.
+     */
+    if (!work.authenticity_verified || !work.target_compatible ||
+        !work.signing_key_id[0] || work.trust_policy_version < 1) {
         struct json_object *resp = otad_firmware_release_gate_error();
 
         (void)otad_operation_update(operation_id, "failed", 100,
                                     "firmware_release_trust_gate_closed",
-                                    "firmware apply is disabled until publisher authenticity and target compatibility are verified",
+                                    "firmware apply requires a preflight that verified publisher authenticity and target compatibility",
                                     resp);
         otad_json_add_string(resp, "operation_id", operation_id);
         return resp;

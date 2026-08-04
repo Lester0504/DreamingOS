@@ -2,6 +2,7 @@
 
 import gzip
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +70,71 @@ def test_style_supports_tab_header_and_overview() -> None:
     assert "grid-template-rows: auto auto;" in STYLE
 
 
+def test_master_switch_only_on_advanced_tab() -> None:
+    # 用户 2026-08-04：「启用 llm 服务不用在每一页都显示，在高级设置页面显示就够了」。
+    # 总开关是全局状态，跟着每个 Tab 复现一遍只是重复占位 —— 概览页的「接入状态」卡
+    # 已经说明了同一件事。这里钉住它在 settingsView 里带 advanced 条件。
+    view = MODULE[MODULE.index("function settingsView"):MODULE.index("const SETTINGS_TABS")]
+    assert "settingsMasterCard()" in view
+    assert "tab === 'advanced' ? settingsMasterCard() : ''" in view, view
+    assert "tab === 'overview' ? settingsOverviewCards() : ''" in view
+
+
+def test_advanced_collapses_when_service_disabled() -> None:
+    # demo 2 的停用态：关掉总开关时配置主体收起成占位说明。停用时这些参数保存了也不
+    # 生效，摆满一屏可编辑字段会让人以为改了就有用。总开关本身仍要渲染，否则关掉之后
+    # 就没有入口再打开。
+    advanced = MODULE[MODULE.index("function settingsAdvancedSection"):MODULE.index("function settingsFooter")]
+    assert "if (!state.config.enabled)" in advanced
+    assert "ai-dormant-chamber" in advanced
+    assert advanced.index("if (!state.config.enabled)") < advanced.index('data-ai-config="temperature"')
+    assert ".ai-dormant-chamber" in STYLE and ".ai-dormant-body" in STYLE
+
+
+def test_provider_tab_shows_single_configured_provider_without_fake_multi_controls() -> None:
+    # demo 1 的「已配置的供应商」只渲染真实存在的那一个。
+    # 2026-08-04 用只读凭据实测 30.1：
+    #   GET /api/v1/ai/providers        -> 404
+    #   GET /api/v1/ai/dispatch-policy  -> 404
+    #   GET /api/v1/ai/config           -> 200，单条，capabilities 里没有任何
+    #                                      multi_provider / dispatch / strategy 位
+    # `ai_config` 锁死 WHERE id=1，物理上只能存一个供应商。所以 demo 里的调度策略
+    # 切换器与多卡阵列**不能实现**，画出来点了没反应就是假控件。
+    # 切片必须**只覆盖调用方**：`settingsConfiguredProvider` 的函数定义就在
+    # settingsProviderSection 与 settingsAdvancedSection 之间，若把定义也圈进来，
+    # 光是那行 `function settingsConfiguredProvider(` 就能让断言通过 ——
+    # 删掉调用点也照样绿。实测过这个假阳性，所以在定义处截断。
+    provider = MODULE[
+        MODULE.index("function settingsProviderSection"):MODULE.index("function settingsConfiguredProvider")
+    ]
+    assert "${settingsConfiguredProvider()}" in provider, "供应商页必须真的渲染已配置供应商卡"
+    configured = MODULE[MODULE.index("function settingsConfiguredProvider"):MODULE.index("function settingsAdvancedSection")]
+    assert "ai-configured-card" in configured
+    assert "未测试" in configured
+    assert "只保存一个供应商" in configured
+    # 不得真的去调这两条不存在的路由。判据要限定在**代码**里，不能裸串匹配整个文件：
+    # 上面那段注释如实记录了实测到的 404，把它一起判成违规就是假阳性。
+    code_lines = [
+        line for line in MODULE.splitlines()
+        if not line.lstrip().startswith(("*", "//", "/*"))
+    ]
+    code = "\n".join(code_lines)
+    for dead_route in ("/api/v1/ai/providers", "/api/v1/ai/dispatch-policy"):
+        assert dead_route not in code, dead_route
+    for selector in (".ai-configured-card", ".ai-configured-badge", ".ai-configured-models"):
+        assert selector in STYLE, selector
+
+
+def test_provider_check_state_is_session_scoped_and_labelled_as_such() -> None:
+    # 联通状态与延迟来自本次会话的测试连接，不是后端持久记录：后端没有 last_check_* 列
+    # （那是多供应商契约里的设计，代码未实现），所以文案必须说清来源。
+    assert "providerCheck: { state: 'unknown'" in MODULE
+    configured = MODULE[MODULE.index("function settingsConfiguredProvider"):MODULE.index("function settingsAdvancedSection")]
+    assert "非后端持久记录" in configured or "刷新页面后需重新测试" in configured
+    test_fn = MODULE[MODULE.index("async function testProvider"):MODULE.index("async function saveConfig")]
+    assert test_fn.count("state.providerCheck") >= 2, test_fn.count("state.providerCheck")
+
+
 def test_llm_menu_entry_still_targets_this_module() -> None:
     menu = json.loads(MENU_PATH.read_text())
     system = next(item for item in menu["items"] if item["id"] == "system")
@@ -108,10 +174,49 @@ def test_cache_version_reflects_the_tab_refactor() -> None:
     assert len(found) == 1
     item = found[0]
     assert item["module"] == "native/ai-assistant.js"
-    assert item["module_version"] == "20260802-ui-batch-01"
-    assert item["style_version"] == "20260802-ui-batch-01"
+    # Pin main.json to the module's own VERSION rather than to a literal key: a literal
+    # goes stale on every legitimate bump and trains people to "fix" the test instead of
+    # the cache key. The invariant that actually matters is that the two agree.
+    module_src = (WWW / "plugins/native/ai-assistant.js").read_text()
+    version = re.search(r"const VERSION = '([^']+)'", module_src).group(1)
+    assert item["module_version"] == version
+    assert item["style_version"] == version
     shell = (WWW / "static/js/menu-shell.js").read_text()
     assert "/plugins/native/ai-assistant.js" not in shell.split("shellVersioned")[1][:600]
+
+
+# Acceptance打回：「启用 LLM 服务」总开关卡占满整屏。根因是 .ai-master-card 挂了
+# .dwrt-kit-page-surface，而该类含 height: 100%，且它的父级 .ai-settings-card 已经是
+# page-surface，于是内层小卡继承 100% 高度撑满一屏。page-surface 是页面级容器类，
+# 卡片只应取 .dwrt-kit-glass-surface 作材质。
+def test_master_switch_card_is_not_a_page_surface() -> None:
+    src = (WWW / "plugins/native/ai-assistant.js").read_text()
+    master = [line for line in src.splitlines() if "ai-master-card" in line and "<section" in line]
+    assert master, "找不到 .ai-master-card 的渲染行"
+    for line in master:
+        assert "dwrt-kit-page-surface" not in line, (
+            "ai-master-card 不得使用 dwrt-kit-page-surface（height:100% 会让它占满整屏）"
+        )
+        assert "dwrt-kit-glass-surface" in line, "ai-master-card 仍需 glass-surface 材质"
+
+
+# 同一页面里只允许一个 page-surface 生效。ai-assistant 的三处分别属于互斥的
+# 聊天/历史/设置标签页，任何新增都必须先确认不会嵌套。
+def test_page_surface_usage_stays_bounded() -> None:
+    src = (WWW / "plugins/native/ai-assistant.js").read_text()
+    assert src.count("dwrt-kit-page-surface") == 3, (
+        "ai-assistant 的 page-surface 数量变化了，请确认没有把它挂到卡片上或造成嵌套"
+    )
+
+
+# ui-kit 侧留一句说明，挡住下一次误用。
+def test_ui_kit_documents_page_surface_height() -> None:
+    css = (WWW / "static/ui-kit/dwrt-ui-kit.css").read_text()
+    head = css.split(".dwrt-kit-page-surface {")[0]
+    note = head[-400:]
+    assert "height: 100%" in note and "卡片" in note, (
+        "dwrt-kit-page-surface 上方需保留注释，说明它含 height:100% 且不得用于卡片"
+    )
 
 
 if __name__ == "__main__":

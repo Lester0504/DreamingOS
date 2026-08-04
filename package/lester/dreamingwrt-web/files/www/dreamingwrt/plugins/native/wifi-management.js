@@ -1,4 +1,4 @@
-const VERSION = '20260802-sheet-portal-scope-01';
+const VERSION = '20260804-wifi-telemetry-reason-01';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -160,7 +160,10 @@ export function mount(context = {}) {
     return {
       ts: 0,
       capabilities: { wifi: false, runtime_status: false, radio_runtime: false, radio_update: false, scan: false },
-      summary: { clients: 0, station_count: 0, interface_count: 0, phy_count: 0, avg_signal: null, avg_utilization: 0, avg_retry_rate: 0, worst_noise: null },
+      // Unknown is null, not 0: the backend distinguishes "no telemetry yet"
+      // (null plus a *_reason) from a real zero, and seeding these at 0 made the
+      // pre-load skeleton claim zero clients as if it were measured.
+      summary: { clients: null, station_count: null, interface_count: null, phy_count: null, avg_signal: null, avg_utilization: null, avg_retry_rate: null, worst_noise: null },
       managedAps: [], radios: [], ssids: [], stations: [], interference: [], connectivityEvents: [],
       environment: { channelSurvey: { samples: [], reason: 'not_loaded' }, neighborScan: { samples: [], reason: 'not_loaded' }, spectralFft: { samples: [], reason: 'not_loaded' } },
       runtime: { available: false, reason: 'not_loaded' }
@@ -1275,7 +1278,14 @@ export function mount(context = {}) {
     channel_survey_not_reported: 'AP 未上报信道调查',
     channel_utilization_not_sampled: '未采样信道利用率',
     noise_floor_not_reported_by_driver: '驱动未上报噪声底',
-    tx_power_mode_not_exposed_by_driver_or_uci: '驱动与配置均未提供功率模式'
+    tx_power_mode_not_exposed_by_driver_or_uci: '驱动与配置均未提供功率模式',
+    // The backend deliberately returns null plus a reason instead of 0 so the UI
+    // can tell "no data yet" apart from "genuinely zero clients". These two codes
+    // arrive on summary.station_count / summary.clients when the managed AP has
+    // not reported recently, which read as an unexplained blank before.
+    telemetry_stale: '数据已过期，等待 AP 上报',
+    managed_aps_offline_stale_or_without_snapshot: '受管 AP 离线，指标待其上线后恢复',
+    no_phy_detected: '本机无无线网卡，仅作为控制器'
   };
 
   function radioMetricNote(reason) {
@@ -1333,8 +1343,30 @@ export function mount(context = {}) {
     return `<div class="airview-radio-table policy-stable-glass" data-dwrt-component="data-table"><div class="wifi-table-scroll"><table><thead><tr><th class="airview-select-column"><input type="checkbox" data-airview-radio-select-all ${selectedVisible.length === radios.length ? 'checked' : ''} aria-label="选择全部射频"></th><th>名称</th><th>频段</th><th>信道</th><th>信道宽度</th><th>Tx 功率</th><th>客户端</th><th>平均信号</th><th>过去 24 小时</th><th>平均干扰</th></tr></thead><tbody>${radios.map((radio) => `<tr data-airview-radio-row="${escapeHtml(radio.id)}" class="${state.selectedRadios.has(radio.id) ? 'is-selected' : ''}" tabindex="0"><td class="airview-select-column"><input type="checkbox" data-airview-radio-select="${escapeHtml(radio.id)}" ${state.selectedRadios.has(radio.id) ? 'checked' : ''} aria-label="选择 ${escapeHtml(radio.ap)} ${escapeHtml(bandLabel(radio.band))}"></td><td><span class="airview-ap-cell">${deviceImage(radio)}<span><strong${radio.ap !== clipLabel(radio.ap) ? ` title="${escapeHtml(radio.ap)}"` : ''}>${escapeHtml(clipLabel(radio.ap))}</strong>${radio.model && radio.model !== radio.ap ? `<small${radio.model !== clipLabel(radio.model) ? ` title="${escapeHtml(radio.model)}"` : ''}>${escapeHtml(clipLabel(radio.model))}</small>` : ''}</span></span></td><td>${escapeHtml(bandLabel(radio.band))}</td><td>${radio.channel || '--'}</td><td>${radio.width || '--'}</td><td>${radio.tx_power_mode ? escapeHtml(radio.tx_power_mode) : radio.tx_power ? `${radio.tx_power} dBm` : '--'}</td><td>${radio.clients === null ? '--' : radio.clients}</td><td>${radio.avg_signal || '--'}</td><td>${radio.past_24h || '--'}</td><td>${radio.avg_interference === null ? '--' : `${radio.avg_interference}%`}</td></tr>`).join('')}</tbody></table></div></div>`;
   }
 
+  /* Client, signal and 24h columns come back blank whenever the managed AP has
+     not reported, which looked like the backend was missing the feature. The
+     payload already says why, so the cause is stated once at the top instead of
+     leaving the user to guess from a table full of dashes. Ordered most specific
+     first: no local radio at all, then AP offline, then merely stale telemetry. */
+  function telemetryNotice() {
+    const summary = state.status.summary || {};
+    const runtime = state.status.runtime || {};
+    const managed = state.status.managedAps || [];
+    const onlineCount = managed.filter((ap) => ap && ap.online).length;
+    const noLocalPhy = Number(summary.phy_count) === 0 && !state.status.radios.length;
+    const apOffline = managed.length > 0 && onlineCount === 0;
+    const stale = summary.station_count === null || summary.clients === null;
+    let text = '';
+    if (noLocalPhy && !managed.length) text = radioMetricNote('no_phy_detected');
+    else if (apOffline) text = radioMetricNote('managed_aps_offline_stale_or_without_snapshot');
+    else if (stale) text = radioMetricNote(firstText(summary.station_count_reason, summary.clients_reason, 'telemetry_stale'));
+    else if (runtime.available === false && runtime.reason) text = radioMetricNote(runtime.reason);
+    if (!text) return '';
+    return `<div class="wifi-notice is-warn" data-wifi-telemetry-notice>${icon('info')}<span>${escapeHtml(text)}</span></div>`;
+  }
+
   function statusPage() {
-    return `<div class="wifi-management-shell airview-shell">${state.error ? `<div class="wifi-notice is-error">${icon('info')}<span>${escapeHtml(state.error)}</span></div>` : ''}${state.notice ? `<div class="wifi-notice ${state.noticeTone ? `is-${state.noticeTone}` : ''}">${icon('info')}<span>${escapeHtml(state.notice)}</span></div>` : ''}<div class="airview-layout">${airviewSidebar()}<main class="airview-results" data-airview-results>${radioResults()}</main></div>${radioSheet()}${apDetailsSheet()}</div>`;
+    return `<div class="wifi-management-shell airview-shell">${state.error ? `<div class="wifi-notice is-error">${icon('info')}<span>${escapeHtml(state.error)}</span></div>` : ''}${state.notice ? `<div class="wifi-notice ${state.noticeTone ? `is-${state.noticeTone}` : ''}">${icon('info')}<span>${escapeHtml(state.notice)}</span></div>` : ''}${telemetryNotice()}<div class="airview-layout">${airviewSidebar()}<main class="airview-results" data-airview-results>${radioResults()}</main></div>${radioSheet()}${apDetailsSheet()}</div>`;
   }
 
   function render() {

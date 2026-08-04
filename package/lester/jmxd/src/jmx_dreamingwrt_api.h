@@ -28,6 +28,9 @@ struct json_object *jmx_dreamingwrt_topology_flow_get(void);
 struct json_object *jmx_dreamingwrt_topology_infrastructure_get(void);
 struct json_object *jmx_dreamingwrt_realtime_snapshot_get(struct json_object *req);
 
+/* Appends _metrics_tick cost/deferral counters to a core_status payload. */
+void jmx_dreamingwrt_metrics_tick_append_status(struct json_object *data);
+
 /* Work mode APIs (jmx_dreamingwrt_work_mode.c) */
 struct json_object *dw_work_mode_get(struct json_object *req);
 struct json_object *dw_work_mode_preview(struct json_object *req);

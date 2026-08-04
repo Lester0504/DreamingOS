@@ -5,12 +5,11 @@ export function mount(context = {}) {
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
   const formatBytes = utils.formatBytes || fallbackFormatBytes;
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260804-disk-charts-moved-01';
   const MODULE_CLASS = 'storage-overview-route-host';
   const stage = root?.closest('.console-stage');
   const RANGE_LABELS = { '1h': '近一小时', '1d': '近一天', '7d': '近七天' };
   const RANGE_ALIASES = { '1h': '1h', '1d': '1d', '7d': '1w' };
-  const COLORS = ['#56a8ff', '#54d69a', '#f1ba55', '#ef7888', '#ad8cff', '#54c9d4'];
   const state = {
     mounted: true,
     seq: 0,
@@ -20,9 +19,6 @@ export function mount(context = {}) {
     error: '',
     range: '1h',
     data: emptyData(),
-    charts: new Map(),
-    hiddenDisks: new Set(),
-    resizeObserver: null,
     pollTimer: 0
   };
 
@@ -230,21 +226,8 @@ export function mount(context = {}) {
       : `<section class="dwrt-kit-overview-grid storage-overview-summary">${cards.map((card) => `<article class="dwrt-kit-overview-card is-${card.tone}"><div class="dwrt-kit-overview-content"><span class="dwrt-kit-overview-label">${card.label}</span><strong>${card.value}</strong><small>${card.detail}</small></div><span class="dwrt-kit-overview-icon">${card.icon}</span></article>`).join('')}</section>`;
   }
 
-  function metricAvailable(metric) {
-    const keys = metric === 'usage' ? ['usage'] : metric === 'io' ? ['read', 'write'] : ['readLatency', 'writeLatency'];
-    return state.data.history.some((point) => keys.some((key) => point[key] !== null));
-  }
 
-  function legendMarkup(metric) {
-    if (!metricAvailable(metric)) return '';
-    return `<div class="storage-chart-legend" role="group" aria-label="磁盘显示控制">${state.data.disks.map((disk, index) => `<button type="button" data-storage-disk="${escapeHtml(disk.id)}" aria-pressed="${state.hiddenDisks.has(disk.id) ? 'false' : 'true'}"><i style="--disk-color:${COLORS[index % COLORS.length]}"></i><span>${escapeHtml(disk.name)}</span></button>`).join('')}</div>`;
-  }
 
-  function chartCard(metric, title, subtitle, iconName) {
-    const available = metricAvailable(metric);
-    const empty = metric === 'usage' ? '暂无磁盘占用率历史' : metric === 'io' ? '后端尚未提供逐盘读写 I/O 历史' : '后端尚未提供逐盘读写延迟历史';
-    return `<article class="storage-chart-card dwrt-kit-glass-surface"><header><span class="storage-chart-icon">${icon(iconName)}</span><div><strong>${escapeHtml(title)}</strong><small>${escapeHtml(subtitle)}</small></div>${legendMarkup(metric)}</header><div class="storage-chart-body">${available ? `<div class="storage-chart" data-storage-chart="${metric}" role="img" aria-label="${escapeHtml(title)}"></div>` : `<div class="storage-chart-empty">${icon(iconName)}<strong>${escapeHtml(empty)}</strong><span>接口补齐后会自动按磁盘绘制，并支持显示或隐藏对应磁盘。</span></div>`}</div></article>`;
-  }
 
   function smartMarkup() {
     const rows = state.data.smart.length ? state.data.smart : state.data.disks.filter((disk) => disk.smartStatus || disk.temperature !== null);
@@ -253,19 +236,17 @@ export function mount(context = {}) {
 
   function render() {
     if (!root) return;
-    disposeCharts();
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', MODULE_CLASS);
     const notice = state.error ? `<div class="storage-overview-notice">${escapeHtml(state.error)}</div>` : '';
-    root.innerHTML = `<section class="storage-overview-shell"><header class="storage-overview-toolbar"><div class="storage-range" role="group" aria-label="历史范围">${Object.entries(RANGE_LABELS).map(([id, label]) => `<button type="button" data-storage-range="${id}" class="${state.range === id ? 'is-active' : ''}">${label}</button>`).join('')}</div></header><main class="storage-overview-scroll">${notice}${summaryMarkup()}<section class="storage-chart-grid">${chartCard('usage', '磁盘占用率变化', '各磁盘已用容量百分比', 'usage')}${chartCard('io', '磁盘 I/O 变化', '各磁盘读取与写入速率', 'io')}${chartCard('latency', '读写延迟变化', '各磁盘读取与写入等待时间', 'latency')}</section>${smartMarkup()}</main></section>`;
+    /* 用户第 14 条：I/O 与读写延迟两张图搬到监控中心 - 系统健康（那边是时序图
+       的归属地，且有范围/峰值工具栏），占用率变化整张删除。范围按钮随之删除：
+       概览剩下的容量卡与 SMART 表都不是时序数据，范围对它们没有意义。 */
+    root.innerHTML = `<section class="storage-overview-shell"><main class="storage-overview-scroll">${notice}${summaryMarkup()}${smartMarkup()}</main></section>`;
     ui.mountAll?.(root);
-    requestAnimationFrame(renderCharts);
   }
 
-  function chartTimes() {
-    return [...new Set(state.data.history.map((point) => point.ts).filter((value) => value !== null))].sort((a, b) => a - b);
-  }
 
   function formatTime(value) {
     const raw = Number(value);
@@ -275,69 +256,8 @@ export function mount(context = {}) {
     return new Intl.DateTimeFormat('zh-CN', { ...options, hour12: false }).format(date);
   }
 
-  function seriesFor(metric, times) {
-    const definitions = metric === 'usage'
-      ? [['usage', '占用率', '%']]
-      : metric === 'io'
-        ? [['read', '读取', 'B/s'], ['write', '写入', 'B/s']]
-        : [['readLatency', '读取', 'ms'], ['writeLatency', '写入', 'ms']];
-    return state.data.disks.flatMap((disk, diskIndex) => definitions.map(([key, label], kindIndex) => {
-      const byTime = new Map(state.data.history.filter((point) => point.diskId === disk.id).map((point) => [point.ts, point[key]]));
-      const color = COLORS[diskIndex % COLORS.length];
-      return {
-        name: `${disk.name} ${label}`,
-        type: 'line',
-        data: times.map((time) => byTime.get(time) ?? null),
-        connectNulls: false,
-        showSymbol: false,
-        smooth: 0.24,
-        animation: false,
-        symbol: 'none',
-        lineStyle: { width: 2, color, type: kindIndex ? 'dashed' : 'solid', opacity: kindIndex ? 0.72 : 1 },
-        itemStyle: { color },
-        emphasis: { focus: 'series', lineStyle: { width: 3 } },
-        silent: state.hiddenDisks.has(disk.id),
-        selected: !state.hiddenDisks.has(disk.id),
-        lineStyleOverride: undefined,
-        _diskId: disk.id,
-        _unit: definitions[0][2]
-      };
-    })).filter((series) => !state.hiddenDisks.has(series._diskId));
-  }
 
-  async function ensureEcharts() {
-    if (window.echarts) return window.echarts;
-    const existing = document.querySelector('script[src^="/static/vendor/echarts.min.js"]');
-    return new Promise((resolve, reject) => {
-      const script = existing || document.createElement('script');
-      script.addEventListener('load', () => window.echarts ? resolve(window.echarts) : reject(new Error('ECharts 不可用')), { once: true });
-      script.addEventListener('error', reject, { once: true });
-      if (!existing) { script.src = `/static/vendor/echarts.min.js?v=${VERSION}`; script.async = true; document.head.appendChild(script); }
-    });
-  }
 
-  async function renderCharts() {
-    if (!state.mounted) return;
-    let echarts;
-    try { echarts = await ensureEcharts(); } catch (_) { return; }
-    if (!state.mounted) return;
-    const times = chartTimes();
-    root?.querySelectorAll('[data-storage-chart]').forEach((node) => {
-      const metric = node.dataset.storageChart;
-      const series = seriesFor(metric, times);
-      let chart = state.charts.get(metric);
-      if (!chart || chart.isDisposed?.()) { chart = echarts.init(node, null, { renderer: 'canvas', useDirtyRect: true }); state.charts.set(metric, chart); }
-      chart.setOption({
-        animation: false,
-        grid: { left: 54, right: 20, top: 20, bottom: 42, containLabel: false },
-        tooltip: { trigger: 'axis', appendToBody: true, backgroundColor: 'rgba(17,27,42,.94)', borderColor: 'rgba(255,255,255,.18)', textStyle: { color: '#f7f9fd', fontSize: 11 }, valueFormatter: (value) => metric === 'io' ? formatBytes(value) + '/s' : metric === 'usage' ? `${Number(value).toFixed(1)}%` : `${Number(value).toFixed(1)} ms` },
-        xAxis: { type: 'category', boundaryGap: false, data: times.map(formatTime), axisLine: { lineStyle: { color: 'rgba(145,160,181,.24)' } }, axisTick: { show: false }, axisLabel: { color: 'rgba(145,160,181,.92)', fontSize: 10, hideOverlap: true } },
-        yAxis: { type: 'value', min: 0, max: metric === 'usage' ? 100 : undefined, axisLine: { show: false }, axisTick: { show: false }, axisLabel: { color: 'rgba(145,160,181,.92)', fontSize: 10, formatter: (value) => metric === 'io' ? compactBytes(value) + '/s' : metric === 'usage' ? `${value}%` : `${value}ms` }, splitLine: { lineStyle: { color: 'rgba(145,160,181,.13)', type: 'dashed' } } },
-        series
-      }, { notMerge: true, lazyUpdate: true });
-      chart.resize();
-    });
-  }
 
   function fallbackFormatBytes(value) {
     const bytes = Math.max(0, Number(value) || 0);
@@ -351,27 +271,9 @@ export function mount(context = {}) {
     return fallbackFormatBytes(value).replace(' ', '');
   }
 
-  function disposeCharts() {
-    state.charts.forEach((chart) => { try { chart.dispose(); } catch (_) {} });
-    state.charts.clear();
-  }
 
-  function onClick(event) {
-    const range = event.target.closest('[data-storage-range]');
-    if (range && RANGE_LABELS[range.dataset.storageRange] && state.range !== range.dataset.storageRange) { state.range = range.dataset.storageRange; disposeCharts(); load(); return; }
-    const disk = event.target.closest('[data-storage-disk]');
-    if (disk) {
-      const id = disk.dataset.storageDisk;
-      if (state.hiddenDisks.has(id)) state.hiddenDisks.delete(id); else state.hiddenDisks.add(id);
-      root?.querySelectorAll(`[data-storage-disk="${CSS.escape(id)}"]`).forEach((button) => button.setAttribute('aria-pressed', state.hiddenDisks.has(id) ? 'false' : 'true'));
-      renderCharts();
-    }
-  }
 
-  root?.addEventListener('click', onClick);
   stage?.classList.add('is-storage-overview');
-  state.resizeObserver = new ResizeObserver(() => state.charts.forEach((chart) => chart.resize()));
-  if (root) state.resizeObserver.observe(root);
   render();
   load();
   startPolling();
@@ -382,9 +284,6 @@ export function mount(context = {}) {
       state.mounted = false;
       state.seq += 1;
       stopPolling();
-      root?.removeEventListener('click', onClick);
-      state.resizeObserver?.disconnect();
-      disposeCharts();
       root?.replaceChildren();
       root?.classList.remove('route-workspace', MODULE_CLASS);
       stage?.classList.remove('is-storage-overview');

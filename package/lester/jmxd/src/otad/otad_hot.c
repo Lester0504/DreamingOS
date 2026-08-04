@@ -590,8 +590,15 @@ static void hot_release_trust_fields(struct json_object *resp,
     json_object_object_add(resp, "policy_passed", json_object_new_boolean(0));
     json_object_object_add(resp, "safe_to_apply_now", json_object_new_boolean(0));
     otad_json_add_string(resp, "release_gate", "closed");
+    /*
+     * Distinct from the full firmware path on purpose. Full firmware apply is
+     * implemented and now gated on real trust state. Hot update's writer is
+     * still compiled out (#if 0 in hot_apply_files), so no trust configuration
+     * makes this reachable, and saying "trust gate closed" would send an
+     * operator to provision keys that cannot help.
+     */
     otad_json_add_string(resp, "release_gate_reason",
-                         "hot_update_release_trust_gate_closed");
+                         "hot_update_writer_disabled_in_build");
 }
 
 static struct json_object *hot_release_trust_error(const char *message,

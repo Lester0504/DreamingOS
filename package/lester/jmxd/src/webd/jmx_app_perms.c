@@ -58,6 +58,14 @@ static const struct route_risk g_route_risks[] = {
     { "/terminal",                     "GET,HEAD,POST", JMX_RISK_MEDIUM },
     { "/api/v1/auth/pair/approve",     "POST", JMX_RISK_HIGH },
     /*
+     * API-Key management. Creating a credential that can drive this router is
+     * an owner-level act, and the subtree is closed to the API-Key channel
+     * itself by a separate hard gate in webd_api_keys.c.
+     */
+    { "/api/v1/auth/api-keys",         "GET",  JMX_RISK_MEDIUM },
+    { "/api/v1/auth/api-keys",         "POST,PUT,PATCH,DELETE", JMX_RISK_HIGH },
+    { "/api/v1/auth/api-keys/",        "POST,PUT,PATCH,DELETE", JMX_RISK_HIGH },
+    /*
      * Cloud relay. Reading identity and status is harmless routing metadata, but
      * the writes decide whether this router is reachable from the internet and
      * which credential it uses, so they are owner-only rather than falling
@@ -90,11 +98,28 @@ static const struct route_risk g_route_risks[] = {
     { "/api/v1/system/mounts/generate-config",   "POST,PUT", JMX_RISK_HIGH },
     { "/api/v1/system/mounts/mount-connected",   "POST,PUT", JMX_RISK_HIGH },
     { "/api/v1/system/flash/restore_backup",     "POST,PUT", JMX_RISK_HIGH },
+    /*
+     * Read-only inventory of what the flash surface can do. Deliberately LOW:
+     * the UI has to know whether a control is worth showing before it has the
+     * rights to use it, and this exposes capability names and gate reasons only,
+     * no configuration or firmware content. Declared explicitly so a broader
+     * flash prefix added later cannot silently promote it to HIGH and put the
+     * UI back to guessing.
+     */
+    { "/api/v1/system/flash/capabilities",       "GET", JMX_RISK_LOW },
     { "/api/v1/system/flash/restore-status",     "GET", JMX_RISK_HIGH },
     { "/api/v1/system/flash/restore-confirm",    "POST", JMX_RISK_HIGH },
     { "/api/v1/system/flash/restore-rollback",   "POST", JMX_RISK_HIGH },
     { "/api/v1/system/flash/create_backup",      "POST,PUT", JMX_RISK_HIGH },
     { "/api/v1/system/flash/backups",            "", JMX_RISK_HIGH },
+    /*
+     * Scheduled-backup retention and schedule. Declared explicitly rather than
+     * left to the fallback: "backup-policy" is not a prefix of "backups", so an
+     * undeclared write would land on the MEDIUM default, and changing how often a
+     * router backs itself up belongs with the other flash writes at HIGH. The GET
+     * stays HIGH too, since it exposes the configured schedule.
+     */
+    { "/api/v1/system/flash/backup-policy",      "", JMX_RISK_HIGH },
     { "/api/v1/system/flash/signature-update/validate", "POST", JMX_RISK_HIGH },
     { "/api/v1/system/flash/signature-update/apply",    "POST", JMX_RISK_HIGH },
     { "/api/v1/system/flash/signature-update/status",   "GET",  JMX_RISK_HIGH },
@@ -161,7 +186,9 @@ static const struct route_risk g_route_risks[] = {
     { "/api/v1/container_service/lxc/templates", "GET", JMX_RISK_LOW },
     { "/api/v1/storage/overview",            "GET", JMX_RISK_LOW },
     { "/api/v1/storage/files",               "GET", JMX_RISK_LOW },
-    { "/api/v1/storage/files/content",       "GET", JMX_RISK_LOW },
+    /* Returns file bytes rather than an inventory, so it is not a low-risk read
+     * once system filesystems are browsable. */
+    { "/api/v1/storage/files/content",       "GET", JMX_RISK_MEDIUM },
     { "/api/v1/storage/file-services",       "GET", JMX_RISK_LOW },
     { "/api/v1/storage/partitions",          "GET", JMX_RISK_LOW },
     { "/api/v1/storage/raid/scan",           "POST", JMX_RISK_MEDIUM },
@@ -291,6 +318,15 @@ static const struct route_risk g_route_risks[] = {
 
     /* AI control-plane writes can authorize or execute tools */
     { "/api/v1/ai/config",          "POST,PUT", JMX_RISK_MEDIUM },
+    /* Provider rows hold API credentials; deleting one or repointing the
+     * dispatch policy changes which upstream every AI request reaches. */
+    { "/api/v1/ai/providers",       "GET", JMX_RISK_LOW },
+    { "/api/v1/ai/providers",       "POST", JMX_RISK_MEDIUM },
+    { "/api/v1/ai/providers/",      "GET", JMX_RISK_LOW },
+    { "/api/v1/ai/providers/",      "POST,PUT,PATCH", JMX_RISK_MEDIUM },
+    { "/api/v1/ai/providers/",      "DELETE", JMX_RISK_HIGH },
+    { "/api/v1/ai/dispatch-policy", "GET", JMX_RISK_LOW },
+    { "/api/v1/ai/dispatch-policy", "POST,PUT", JMX_RISK_MEDIUM },
     { "/api/v1/ai/tool-authorize",  "POST,PUT", JMX_RISK_MEDIUM },
     { "/api/v1/ai/tool-authorizations/", "POST", JMX_RISK_MEDIUM },
     { "/api/v1/ai/tool-call",       "POST,PUT", JMX_RISK_MEDIUM },
@@ -630,6 +666,96 @@ static const struct route_risk g_route_risks[] = {
 
     /* Native plugins apply their own scoped RBAC after authentication. */
     { "/api/v1/plugins/native/dreamingproxy", "GET,HEAD,POST,PUT,PATCH,DELETE", JMX_RISK_LOW },
+
+    /*
+     * Writes that previously reached only the MEDIUM fallback below.
+     *
+     * The fallback direction was already safe (unlisted writes require
+     * admin/owner, not fail-open), so these entries do not close a hole so much
+     * as stop system-wide and destructive operations from being classified the
+     * same as an ordinary settings edit. Levels follow the precedents already in
+     * this table: whole-device or whole-subsystem apply/reset is HIGH, ordinary
+     * scoped config writes stay MEDIUM.
+     *
+     * Deliberately NOT listed: /api/v1/auth/login, /api/v1/auth/refresh,
+     * /api/v1/auth/pair/init and /api/v1/auth/pair/confirm. Those are answered
+     * before the authentication gate in the dispatcher, so jmx_perm_route_risk()
+     * is never consulted for them. Adding rows here would look protective while
+     * changing nothing, and classifying login as a write would be actively
+     * misleading.
+     */
+
+    /* Whole-subsystem apply/reset: comparable to network/lans and
+     * network/gateway-ports/apply, which are already HIGH. */
+    { "/api/v1/network/global/apply",      "POST,PUT", JMX_RISK_HIGH },
+    { "/api/v1/network/global",            "POST,PUT", JMX_RISK_HIGH },
+    { "/api/v1/services/multicast/apply",  "POST,PUT", JMX_RISK_HIGH },
+    { "/api/v1/system/work-mode",          "POST,PUT", JMX_RISK_HIGH },
+    { "/api/v1/system/storage/prune",      "POST,PUT", JMX_RISK_HIGH },
+    { "/api/v1/save_system_settings",      "POST,PUT,PATCH", JMX_RISK_HIGH },
+    { "/api/v1/system/settings",           "POST,PUT,PATCH", JMX_RISK_HIGH },
+    /* Installs/removes plugin code, i.e. new code paths inside webd. */
+    { "/api/v1/plugins",                   "POST,PUT", JMX_RISK_HIGH },
+    { "/api/v1/plugins/",                  "POST,PUT", JMX_RISK_HIGH },
+    { "/api/v1/plugins/native/",           "POST,PUT", JMX_RISK_HIGH },
+
+    /* Scoped config writes: same shape as the MEDIUM services rows above. */
+    { "/api/v1/services/multicast",        "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/network/hybrid-lines",      "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/device/config/lan",         "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/client_override",           "POST,PUT,PATCH", JMX_RISK_MEDIUM },
+    { "/api/v1/client_control_rules",      "POST", JMX_RISK_MEDIUM },
+    { "/api/v1/logs/channels",             "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/logs/warning-rules",        "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/ai/models",                 "POST", JMX_RISK_MEDIUM },
+    { "/api/v1/ai/tools",                  "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/insights/map/local-locations", "POST,PUT,PATCH", JMX_RISK_MEDIUM },
+
+    /* Transaction submitters: staged config, apply is gated separately. */
+    { "/api/v1/wifi/transactions",         "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/port-manager/transactions", "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/topology/port-manager/transactions", "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/bulk-ip/transactions",      "POST", JMX_RISK_MEDIUM },
+    { "/api/v1/bulk-ip/reserve",           "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/bulk-ip/delete",            "POST", JMX_RISK_MEDIUM },
+    { "/api/v1/bulk-ip/refresh",           "POST", JMX_RISK_MEDIUM },
+    { "/api/v1/bulk-ip",                   "POST", JMX_RISK_MEDIUM },
+
+    /* Destructive on live state: drops client connections / clears history. */
+    { "/api/v1/client_connections/close",  "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/client_connections/clear",  "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/logs/clear",                "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/tasks/",                    "DELETE",   JMX_RISK_MEDIUM },
+
+    /*
+     * Read-shaped operations that only accept POST because the query does not
+     * fit in a URL. Kept MEDIUM rather than LOW on purpose: they are not
+     * side-effect-free from the router's point of view (diagnostics spawn probes
+     * and consume uplink; speedtest saturates it), so viewer/AI roles should not
+     * be able to trigger them.
+     */
+    { "/api/v1/diagnostics/ping",          "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/diagnostics/traceroute",    "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/diagnostics/nslookup",      "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/diagnostics/speedtest",     "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/network/probe",             "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/logs/query",                "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/logs/events/search",        "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/logs/events",               "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/insights/activity/app-traffic-rate", "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/topology/node_detail",      "POST,PUT", JMX_RISK_MEDIUM },
+    { "/api/v1/topology/node",             "POST,PUT", JMX_RISK_MEDIUM },
+
+    /* Ingest endpoints: accept externally-shaped data into the audit pipeline. */
+    { "/api/v1/aegis/ingest-suricata-eve", "POST", JMX_RISK_MEDIUM },
+    { "/api/v1/aegis/suricata/eve/ingest", "POST", JMX_RISK_MEDIUM },
+    { "/api/v1/fingerprint_upload",        "POST", JMX_RISK_MEDIUM },
+    { "/api/v1/logs/syslog/queue",         "POST", JMX_RISK_MEDIUM },
+    { "/api/v1/flowd/nft-revision",        "POST", JMX_RISK_MEDIUM },
+
+    /* Post-auth 2FA state reads exposed over POST; enable/disable are already
+     * listed above as MEDIUM and keep their own stricter rows. */
+    { "/api/v1/auth/2fa/status",           "POST", JMX_RISK_LOW },
 
     /* End of explicit table; unknown writes fall back to medium below. */
     { NULL, NULL, JMX_RISK_LOW }

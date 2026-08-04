@@ -440,6 +440,12 @@ int ac_enrollment_transcript_build(
     unsigned char **out, size_t *out_len);
 
 int ac_pki_init(struct ac_pki **out);
+/* Server certificate validity window, so status can show an unusable
+ * certificate instead of leaving it to be found with openssl by hand. */
+int ac_transport_server_certificate_window(int64_t *not_before,
+                                           int64_t *not_after,
+                                           int *usable_now,
+                                           int *not_yet_valid);
 void ac_pki_free(struct ac_pki *pki);
 const char *ac_pki_controller_id(const struct ac_pki *pki);
 const char *ac_pki_ca_key_id(const struct ac_pki *pki);

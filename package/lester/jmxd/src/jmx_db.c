@@ -158,6 +158,54 @@ static int db_commit(void) { return db_exec("COMMIT;"); }
 static void db_rollback(void) { db_exec("ROLLBACK;"); }
 static int64_t now_s(void) { return (int64_t)time(NULL); }
 
+/*
+ * Opt-in write batching for callers that issue many small related writes in one
+ * pass.
+ *
+ * The WAN refresh in dw_build_wans_internal() performs at least five separate
+ * autocommit writes per WAN (interface state, daily usage counter, lifetime
+ * usage, health sample, session). Each autocommit statement is its own durable
+ * transaction, so on a 45 MB database with a multi-megabyte WAL the pass is
+ * dominated by commit latency rather than by the queries themselves; measured
+ * on 30.1 it reached 5.5 s inside the metrics tick, against a 200 ms budget.
+ * Grouping the pass into one transaction turns N commits into one.
+ *
+ * Kept as a depth counter so it is safe if a caller is already inside a
+ * transaction, or if two batched regions nest: only the outermost pair issues
+ * BEGIN/COMMIT. Callers must pair begin/end on every exit path.
+ */
+static int g_db_batch_depth;
+
+int jmx_db_write_batch_begin(void)
+{
+    if (g_db_batch_depth > 0) {
+        g_db_batch_depth++;
+        return 0;
+    }
+    if (db_begin() != 0)
+        return -1;
+    g_db_batch_depth = 1;
+    return 0;
+}
+
+int jmx_db_write_batch_end(int commit)
+{
+    int rc = 0;
+
+    if (g_db_batch_depth <= 0)
+        return -1;
+    if (--g_db_batch_depth > 0)
+        return 0;
+    if (commit) {
+        rc = db_commit();
+        if (rc != 0)
+            db_rollback();
+    } else {
+        db_rollback();
+    }
+    return rc;
+}
+
 static int64_t db_read_system_uptime_sec(void)
 {
     FILE *fp;
@@ -492,6 +540,11 @@ static void db_add_ipv6_contract(struct json_object *o, const char *raw_json,
     json_object_object_add(o, "lan_ipv6", json_object_new_string(lan));
     json_object_object_add(o, "ipv6_link_local", json_object_new_string(link_local));
     json_object_object_add(o, "link_local_ipv6", json_object_new_string(link_local));
+    /* The single-value fields cannot express a dual-prefix client, so state how
+     * they were picked instead of leaving the consumer to guess. ipv6_addrs is
+     * the complete list; these are a convenience view over it. */
+    json_object_object_add(o, "ipv6_primary_rule",
+                           json_object_new_string("global_first_then_ula_then_link_local"));
     if (parsed)
         json_object_put(parsed);
 }
@@ -934,6 +987,35 @@ static int db_text_has_any(const char *text, const char **needles)
 static int db_value_is_oui_only_signal(const char *key, const char *source)
 {
     return key && source && !strcmp(key, "vendor") && !strcmp(source, "oui");
+}
+
+/*
+ * Generic-router placeholder for iKuaiOS devices.
+ *
+ * The fingerprint gallery has no iKuai-specific asset, so client_profile
+ * substitutes the generic router icon (device 3797) and flags it as a fallback.
+ * The list serializer used to skip that step entirely, which is why the same
+ * device arrived with an image from /api/v1/client_profile and with empty
+ * image fields from /api/v1/clients. Keep this predicate identical to
+ * webd_ikuai_router_identity() in webd/jmx_app_api.c; two divergent copies is
+ * the defect this is fixing.
+ */
+#define DB_GENERIC_ROUTER_WEB_IMAGE \
+    "/luci-static/dreamingwrt/fingerprint/images/engine-0/3797/257x257.png"
+
+static int db_ikuai_router_identity(const char *vendor,
+                                    const char *device_type,
+                                    const char *model)
+{
+    char text[768];
+
+    snprintf(text, sizeof(text), "%s %s %s",
+             vendor ? vendor : "",
+             device_type ? device_type : "",
+             model ? model : "");
+    for (char *p = text; *p; p++)
+        *p = (char)tolower((unsigned char)*p);
+    return strstr(text, "ikuai") && strstr(text, "router");
 }
 
 static int db_vendor_is_virtual_nic(const char *vendor)
@@ -4451,11 +4533,27 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
     add_col_text(o, "parent_mac", st, 43);
     add_col_text(o, "parent_id", st, 44);
     add_col_text(o, "port", st, 45);
-    db_add_ipv6_contract(o, ipv6_json,
-                         runtime ? runtime->ipv6_addrs : "",
-                         runtime ? runtime->ipv6_global : "",
-                         runtime ? runtime->ipv6_lan : "",
-                         runtime ? runtime->ipv6_link_local : "");
+    /* When the in-memory collector has IPv6 evidence for this MAC it is the
+     * authoritative view of what the client holds *right now*, so it replaces
+     * the stored row instead of being unioned with it. Unioning kept addresses
+     * from a withdrawn ISP prefix in the response forever: client_network_state
+     * .ipv6_json is only overwritten when the incoming value is non-empty
+     * (see db_upsert_network_state), so an address that disappeared from the
+     * neighbour table was never removed from the stored copy, and merging the
+     * two republished it beside the live one. The stored row remains the
+     * fallback for a client the collector has not observed this round. */
+    if (runtime && runtime->ipv6_addrs[0])
+        db_add_ipv6_contract(o, NULL,
+                             runtime->ipv6_addrs,
+                             runtime->ipv6_global,
+                             runtime->ipv6_lan,
+                             runtime->ipv6_link_local);
+    else
+        db_add_ipv6_contract(o, ipv6_json, "", "", "", "");
+    json_object_object_add(o, "ipv6_source",
+                           json_object_new_string(runtime && runtime->ipv6_addrs[0] ?
+                                                  "client_runtime" :
+                                                  "client_network_state"));
     json_object_object_add(o, "signal", json_object_new_int(sqlite3_column_int(st, 24)));
     json_object_object_add(o, "tx_rate", json_object_new_int64(tx_rate));
     json_object_object_add(o, "rx_rate", json_object_new_int64(rx_rate));
@@ -4551,35 +4649,43 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
     json_object_object_add(fp, "vendor_name", json_object_new_string(resolved_vendor));
     json_object_object_add(fp, "device_name", json_object_new_string(resolved_model));
     json_object_object_add(fp, "model_source", json_object_new_string(model_source));
-    json_object_object_add(fp, "image",
-                           json_object_new_string(fp_image && fp_image[0] ?
-                                                  (const char *)fp_image : ""));
-    json_object_object_add(fp, "detected_image",
-                           json_object_new_string(fp_image && fp_image[0] ?
-                                                  (const char *)fp_image : ""));
-    json_object_object_add(fp, "effective_image",
-                           json_object_new_string(custom_icon && custom_icon[0] ?
-                                                  (const char *)custom_icon :
-                                                  (fp_image && fp_image[0] ?
-                                                   (const char *)fp_image : "")));
-    json_object_object_add(o, "fingerprint", fp);
+    /* One image resolution for the whole row, so /api/v1/clients agrees with
+     * client_profile.basic instead of resolving the same device twice with
+     * different rules. detected_image stays the raw fingerprint hit; the
+     * effective image may be an override or a fallback placeholder. */
+    {
+        const char *detected = (fp_image && fp_image[0]) ? (const char *)fp_image : "";
+        const char *override_image = (custom_icon && custom_icon[0]) ?
+                                     (const char *)custom_icon : "";
+        const char *image = override_image[0] ? override_image : detected;
+        const char *image_source = override_image[0] ? "override" :
+                                   (detected[0] ? "fingerprint" : "none");
+        int image_fallback = 0;
+        const char *image_fallback_reason = "";
 
-    json_object_object_add(o, "detected_image",
-                           json_object_new_string(fp_image && fp_image[0] ?
-                                                  (const char *)fp_image : ""));
-    json_object_object_add(o, "image",
-                           json_object_new_string(custom_icon && custom_icon[0] ?
-                                                  (const char *)custom_icon :
-                                                  (fp_image && fp_image[0] ?
-                                                   (const char *)fp_image : "")));
-    json_object_object_add(o, "image_url",
-                           json_object_new_string(custom_icon && custom_icon[0] ?
-                                                  (const char *)custom_icon :
-                                                  (fp_image && fp_image[0] ?
-                                                   (const char *)fp_image : "")));
-    json_object_object_add(o, "image_source", json_object_new_string(
-        custom_icon && custom_icon[0] ? "override" :
-        (fp_image && fp_image[0] ? "fingerprint" : "none")));
+        if (!image[0] && db_ikuai_router_identity(resolved_vendor, resolved_type,
+                                                  resolved_model)) {
+            image = DB_GENERIC_ROUTER_WEB_IMAGE;
+            image_source = "fallback";
+            image_fallback = 1;
+            image_fallback_reason = "generic_router_icon_for_ikuai";
+        }
+
+        json_object_object_add(fp, "image", json_object_new_string(detected));
+        json_object_object_add(fp, "detected_image", json_object_new_string(detected));
+        json_object_object_add(fp, "effective_image", json_object_new_string(image));
+        json_object_object_add(o, "fingerprint", fp);
+
+        json_object_object_add(o, "detected_image", json_object_new_string(detected));
+        json_object_object_add(o, "image", json_object_new_string(image));
+        json_object_object_add(o, "image_url", json_object_new_string(image));
+        json_object_object_add(o, "effective_image", json_object_new_string(image));
+        json_object_object_add(o, "image_source", json_object_new_string(image_source));
+        json_object_object_add(o, "image_fallback",
+                               json_object_new_boolean(image_fallback));
+        json_object_object_add(o, "image_fallback_reason",
+                               json_object_new_string(image_fallback_reason));
+    }
     {
         struct json_object *override_fields = json_object_new_array();
         if (custom_name && custom_name[0])

@@ -118,6 +118,33 @@ static const char *ai_json_string(struct json_object *obj, const char *key,
     return fallback ? fallback : "";
 }
 
+/*
+ * Length-independent comparison for secret material.
+ *
+ * strcmp() returns at the first differing byte, so comparing a resume token with
+ * it leaks the token byte by byte through response timing. The resume token
+ * names a file an unfinished tool call can be continued from, so treating it as
+ * a secret is the right default even though the window is short.
+ */
+static int ai_ct_str_equal(const char *a, const char *b)
+{
+    size_t alen, blen, i, n;
+    unsigned char diff = 0;
+
+    if (!a || !b)
+        return 0;
+    alen = strlen(a);
+    blen = strlen(b);
+    n = alen > blen ? alen : blen;
+    for (i = 0; i < n; i++) {
+        unsigned char ac = i < alen ? (unsigned char)a[i] : 0;
+        unsigned char bc = i < blen ? (unsigned char)b[i] : 0;
+
+        diff |= (unsigned char)(ac ^ bc);
+    }
+    return diff == 0 && alen == blen;
+}
+
 static int ai_contains_i(const char *text, const char *needle)
 {
     size_t n = needle ? strlen(needle) : 0;
@@ -597,6 +624,483 @@ static int ai_url_ok(const char *url)
 {
     return url && (!strncasecmp(url, "https://", 8) ||
                    !strncasecmp(url, "http://", 7));
+}
+
+/* ── Multi-provider dispatch ────────────────────────────────────────────────
+ * ai_config remains the global default (temperature / max_tokens /
+ * system_prompt / tool_policy). Per-provider credentials live in ai_provider,
+ * and ai_dispatch_policy decides which of them a request actually uses.
+ */
+#define AI_DISPATCH_MAX_CANDIDATES 8
+
+struct ai_dispatch_candidate {
+    char id[65];
+    struct ai_config cfg;
+};
+
+struct ai_dispatch_plan {
+    char strategy[16];
+    int failover_timeout_ms;
+    int failover_max_attempts;
+    int count;
+    struct ai_dispatch_candidate items[AI_DISPATCH_MAX_CANDIDATES];
+};
+
+static void ai_dispatch_plan_clear(struct ai_dispatch_plan *plan)
+{
+    if (!plan)
+        return;
+    for (int i = 0; i < AI_DISPATCH_MAX_CANDIDATES; i++)
+        memset(plan->items[i].cfg.api_key, 0, sizeof(plan->items[i].cfg.api_key));
+    memset(plan, 0, sizeof(*plan));
+}
+
+/* Session-level defaults still come from ai_config; only the provider identity
+ * and its credentials are overridden per candidate. */
+static void ai_dispatch_apply_defaults(struct ai_config *cfg,
+                                       const struct ai_config *defaults)
+{
+    cfg->temperature = defaults->temperature;
+    cfg->max_tokens = defaults->max_tokens;
+    snprintf(cfg->system_prompt, sizeof(cfg->system_prompt), "%s",
+             defaults->system_prompt);
+    snprintf(cfg->tool_policy, sizeof(cfg->tool_policy), "%s",
+             defaults->tool_policy);
+}
+
+static void ai_dispatch_resolve_oauth(struct ai_config *cfg)
+{
+    if (strcmp(cfg->auth_mode, "oauth"))
+        return;
+    memset(cfg->api_key, 0, sizeof(cfg->api_key));
+    if (webd_ai_oauth_access_token(cfg->provider, cfg->api_key,
+                                   sizeof(cfg->api_key), cfg->oauth_project,
+                                   sizeof(cfg->oauth_project), &(int64_t){0}) != 0)
+        cfg->api_key[0] = 0;
+}
+
+static int ai_dispatch_weight_pick(sqlite3 *db, int total_weight)
+{
+    sqlite3_stmt *st = NULL;
+    int cursor = 0;
+
+    if (total_weight <= 0)
+        return 0;
+    if (sqlite3_prepare_v2(db, "SELECT lb_cursor FROM ai_dispatch_policy WHERE id=1",
+                           -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW)
+        cursor = sqlite3_column_int(st, 0);
+    if (st) sqlite3_finalize(st);
+    if (cursor < 0)
+        cursor = 0;
+    return cursor % total_weight;
+}
+
+/* The cursor must survive the request: webd forks per request, so an in-memory
+ * counter would hand every request to the first provider. */
+static void ai_dispatch_cursor_advance(void)
+{
+    sqlite3 *db = NULL;
+
+    if (sqlite3_open_v2(AI_CONFIG_DB, &db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK)
+        return;
+    sqlite3_busy_timeout(db, 3000);
+    sqlite3_exec(db, "UPDATE ai_dispatch_policy SET lb_cursor=lb_cursor+1 WHERE id=1",
+                 NULL, NULL, NULL);
+    sqlite3_close(db);
+}
+
+/*
+ * Build the ordered candidate list for this request.
+ * Returns 0 with plan->count > 0 on success, 1 when no ai_provider rows exist
+ * (caller falls back to the legacy single ai_config path), -1 on error.
+ */
+static int ai_dispatch_plan_load(struct ai_dispatch_plan *plan,
+                                 const struct ai_config *defaults)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+    int rows = 0;
+
+    if (!plan || !defaults)
+        return -1;
+    ai_dispatch_plan_clear(plan);
+    snprintf(plan->strategy, sizeof(plan->strategy), "single");
+    plan->failover_timeout_ms = 20000;
+    plan->failover_max_attempts = 2;
+
+    if (sqlite3_open_v2(AI_CONFIG_DB, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_busy_timeout(db, 3000);
+
+    if (sqlite3_prepare_v2(db,
+        "SELECT strategy,failover_timeout_ms,failover_max_attempts "
+        "FROM ai_dispatch_policy WHERE id=1", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        snprintf(plan->strategy, sizeof(plan->strategy), "%s", ai_text(st, 0));
+        if (sqlite3_column_int(st, 1) > 0)
+            plan->failover_timeout_ms = sqlite3_column_int(st, 1);
+        if (sqlite3_column_int(st, 2) > 0)
+            plan->failover_max_attempts = sqlite3_column_int(st, 2);
+    }
+    if (st) sqlite3_finalize(st);
+    st = NULL;
+
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM ai_provider", -1, &st, NULL)
+            == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+        rows = sqlite3_column_int(st, 0);
+    if (st) sqlite3_finalize(st);
+    st = NULL;
+    if (rows == 0) {
+        sqlite3_close(db);
+        return 1;
+    }
+
+    if (!strcmp(plan->strategy, "single")) {
+        if (sqlite3_prepare_v2(db,
+            "SELECT id,provider,api_base,api_key,auth_mode,default_model,"
+            "reasoning_effort,reasoning_api_shape FROM ai_provider "
+            "WHERE enabled=1 AND role='primary' ORDER BY priority,id LIMIT 1",
+            -1, &st, NULL) != SQLITE_OK)
+            goto done;
+    } else if (!strcmp(plan->strategy, "failover")) {
+        if (sqlite3_prepare_v2(db,
+            "SELECT id,provider,api_base,api_key,auth_mode,default_model,"
+            "reasoning_effort,reasoning_api_shape FROM ai_provider "
+            "WHERE enabled=1 ORDER BY priority,id LIMIT ?1",
+            -1, &st, NULL) != SQLITE_OK)
+            goto done;
+        sqlite3_bind_int(st, 1, plan->failover_max_attempts > AI_DISPATCH_MAX_CANDIDATES ?
+                                AI_DISPATCH_MAX_CANDIDATES : plan->failover_max_attempts);
+    } else {
+        /* load_balance: weighted round-robin over the enabled set, rotated by
+         * the persisted cursor so consecutive requests really do spread out. */
+        int total_weight = 0, offset = 0, seen = 0;
+
+        if (sqlite3_prepare_v2(db,
+            "SELECT COALESCE(SUM(weight),0) FROM ai_provider WHERE enabled=1",
+            -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+            total_weight = sqlite3_column_int(st, 0);
+        if (st) sqlite3_finalize(st);
+        st = NULL;
+        if (total_weight <= 0) {
+            rc = 0;
+            goto done;
+        }
+        offset = ai_dispatch_weight_pick(db, total_weight);
+        if (sqlite3_prepare_v2(db,
+            "SELECT id,provider,api_base,api_key,auth_mode,default_model,"
+            "reasoning_effort,reasoning_api_shape,weight FROM ai_provider "
+            "WHERE enabled=1 ORDER BY priority,id", -1, &st, NULL) != SQLITE_OK)
+            goto done;
+        while (sqlite3_step(st) == SQLITE_ROW &&
+               plan->count < AI_DISPATCH_MAX_CANDIDATES) {
+            int weight = sqlite3_column_int(st, 8);
+            if (weight < 1) weight = 1;
+            /* Pick the bucket the cursor lands in first; remaining providers
+             * stay in the list as fallbacks in priority order. */
+            if (plan->count == 0 && seen + weight <= offset) {
+                seen += weight;
+                continue;
+            }
+            struct ai_dispatch_candidate *c = &plan->items[plan->count];
+            memset(c, 0, sizeof(*c));
+            snprintf(c->id, sizeof(c->id), "%s", ai_text(st, 0));
+            snprintf(c->cfg.provider, sizeof(c->cfg.provider), "%s", ai_text(st, 1));
+            snprintf(c->cfg.api_base, sizeof(c->cfg.api_base), "%s", ai_text(st, 2));
+            snprintf(c->cfg.api_key, sizeof(c->cfg.api_key), "%s", ai_text(st, 3));
+            snprintf(c->cfg.auth_mode, sizeof(c->cfg.auth_mode), "%s", ai_text(st, 4));
+            snprintf(c->cfg.model, sizeof(c->cfg.model), "%s", ai_text(st, 5));
+            snprintf(c->cfg.reasoning_effort, sizeof(c->cfg.reasoning_effort), "%s",
+                     ai_text(st, 6));
+            snprintf(c->cfg.api_shape, sizeof(c->cfg.api_shape), "%s", ai_text(st, 7));
+            c->cfg.enabled = 1;
+            ai_dispatch_apply_defaults(&c->cfg, defaults);
+            ai_dispatch_resolve_oauth(&c->cfg);
+            plan->count++;
+        }
+        sqlite3_finalize(st);
+        st = NULL;
+        ai_dispatch_cursor_advance();
+        rc = 0;
+        goto done;
+    }
+
+    while (sqlite3_step(st) == SQLITE_ROW &&
+           plan->count < AI_DISPATCH_MAX_CANDIDATES) {
+        struct ai_dispatch_candidate *c = &plan->items[plan->count];
+        memset(c, 0, sizeof(*c));
+        snprintf(c->id, sizeof(c->id), "%s", ai_text(st, 0));
+        snprintf(c->cfg.provider, sizeof(c->cfg.provider), "%s", ai_text(st, 1));
+        snprintf(c->cfg.api_base, sizeof(c->cfg.api_base), "%s", ai_text(st, 2));
+        snprintf(c->cfg.api_key, sizeof(c->cfg.api_key), "%s", ai_text(st, 3));
+        snprintf(c->cfg.auth_mode, sizeof(c->cfg.auth_mode), "%s", ai_text(st, 4));
+        snprintf(c->cfg.model, sizeof(c->cfg.model), "%s", ai_text(st, 5));
+        snprintf(c->cfg.reasoning_effort, sizeof(c->cfg.reasoning_effort), "%s",
+                 ai_text(st, 6));
+        snprintf(c->cfg.api_shape, sizeof(c->cfg.api_shape), "%s", ai_text(st, 7));
+        c->cfg.enabled = 1;
+        ai_dispatch_apply_defaults(&c->cfg, defaults);
+        ai_dispatch_resolve_oauth(&c->cfg);
+        plan->count++;
+    }
+    rc = 0;
+done:
+    if (st) sqlite3_finalize(st);
+    if (db) sqlite3_close(db);
+    return rc;
+}
+
+/*
+ * Which failures justify moving to the next provider.
+ * 401/403 are deliberately excluded: a wrong key is a configuration error, and
+ * failing over on it just burns the next provider's quota for the same reason.
+ */
+static int ai_dispatch_should_failover(const struct ai_result *result)
+{
+    if (!result)
+        return 0;
+    if (result->curl_code == CURLE_OPERATION_TIMEDOUT ||
+        result->curl_code == CURLE_COULDNT_CONNECT ||
+        result->curl_code == CURLE_COULDNT_RESOLVE_HOST ||
+        result->curl_code == CURLE_SSL_CONNECT_ERROR ||
+        result->curl_code == CURLE_PEER_FAILED_VERIFICATION)
+        return 1;
+    if (result->curl_code != CURLE_OK)
+        return 0;
+    if (result->provider_status == 401 || result->provider_status == 403)
+        return 0;
+    return result->provider_status == 429 || result->provider_status >= 500;
+}
+
+static const char *ai_dispatch_error_kind(const struct ai_result *result)
+{
+    if (!result)
+        return "invalid_response";
+    switch (result->curl_code) {
+    case CURLE_OPERATION_TIMEDOUT: return "timeout";
+    case CURLE_COULDNT_RESOLVE_HOST: return "dns_failed";
+    case CURLE_COULDNT_CONNECT: return "tcp_refused";
+    case CURLE_SSL_CONNECT_ERROR:
+    case CURLE_PEER_FAILED_VERIFICATION: return "tls_failed";
+    default: break;
+    }
+    if (result->curl_code != CURLE_OK)
+        return "invalid_response";
+    if (result->provider_status == 401) return "http_401";
+    if (result->provider_status == 403) return "http_403";
+    if (result->provider_status == 429) return "http_429";
+    if (result->provider_status >= 500) return "http_5xx";
+    if (result->provider_status >= 200 && result->provider_status < 300)
+        return "invalid_response";
+    return "invalid_response";
+}
+
+/*
+ * Resolve the configuration a request should actually use.
+ *
+ * Order of precedence:
+ *   1. ai_provider rows exist  -> dispatch policy decides (single/failover/lb)
+ *   2. no ai_provider rows     -> legacy single ai_config row
+ *
+ * `plan` is filled so a caller that wants failover can walk the remaining
+ * candidates; callers that only need one provider can ignore it.
+ * Returns 0 when *cfg is usable, -1 when nothing is configured, and
+ * -2 when providers exist but no enabled primary does (single strategy).
+ */
+static int ai_dispatch_select(struct ai_config *cfg,
+                              struct ai_dispatch_plan *plan,
+                              char provider_id[65])
+{
+    struct ai_config defaults;
+    int load_rc, plan_rc;
+
+    if (!cfg || !plan)
+        return -1;
+    if (provider_id) provider_id[0] = '\0';
+    load_rc = ai_config_load(&defaults);
+    if (load_rc < 0)
+        return -1;
+    plan_rc = ai_dispatch_plan_load(plan, &defaults);
+    if (plan_rc == 1 || plan_rc < 0) {
+        /* No provider table content: keep the historical single-config path. */
+        ai_dispatch_plan_clear(plan);
+        if (load_rc != 0 || !ai_config_ready(&defaults)) {
+            memset(defaults.api_key, 0, sizeof(defaults.api_key));
+            return -1;
+        }
+        *cfg = defaults;
+        memset(defaults.api_key, 0, sizeof(defaults.api_key));
+        return 0;
+    }
+    memset(defaults.api_key, 0, sizeof(defaults.api_key));
+    if (plan->count == 0)
+        return !strcmp(plan->strategy, "single") ? -2 : -1;
+    /* For single there is exactly one legitimate answer, so an incomplete
+     * primary is an error rather than a reason to use someone else. The other
+     * strategies may skip a half-configured row and start at the next one. */
+    if (!strcmp(plan->strategy, "single")) {
+        *cfg = plan->items[0].cfg;
+        if (provider_id)
+            snprintf(provider_id, 65, "%s", plan->items[0].id);
+        return ai_config_ready(cfg) ? 0 : -2;
+    }
+    for (int i = 0; i < plan->count; i++) {
+        if (!ai_config_ready(&plan->items[i].cfg))
+            continue;
+        *cfg = plan->items[i].cfg;
+        if (provider_id)
+            snprintf(provider_id, 65, "%s", plan->items[i].id);
+        return 0;
+    }
+    return -1;
+}
+
+static struct json_object *ai_dispatch_not_configured(int rc, int *http_status)
+{
+    if (rc == -2) {
+        if (http_status) *http_status = 422;
+        return ai_error("primary_required",
+                        "dispatch strategy 'single' needs an enabled primary provider",
+                        422, 0, NULL, NULL);
+    }
+    if (http_status) *http_status = 503;
+    return ai_error("provider_not_configured",
+                    "AI provider is disabled or incomplete", 503, 0, NULL, NULL);
+}
+
+/* Load one provider row by id, layered on the ai_config session defaults.
+ * Returns 0 on success, -1 when the id does not exist. */
+
+/*
+ * webd links only WEBD_OBJS, which does not include jmx_netconfig_db.o, so the
+ * jmx_ai_provider_* helpers are not callable from here. These two writes talk
+ * to config.db directly, the same way the rest of this file already reads it.
+ */
+static int ai_provider_record_check(const char *id, int ok, int latency_ms,
+                                    const char *error)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+
+    if (!id || !id[0])
+        return -1;
+    if (sqlite3_open_v2(AI_CONFIG_DB, &db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_busy_timeout(db, 3000);
+    if (sqlite3_prepare_v2(db,
+        "UPDATE ai_provider SET last_check_ts=?2,last_check_ok=?3,"
+        "last_check_latency_ms=?4,last_check_error=?5 WHERE id=?1",
+        -1, &st, NULL) != SQLITE_OK)
+        goto done;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int(st, 3, ok ? 1 : 0);
+    sqlite3_bind_int(st, 4, latency_ms);
+    sqlite3_bind_text(st, 5, error ? error : "", -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
+done:
+    if (st) sqlite3_finalize(st);
+    sqlite3_close(db);
+    return rc;
+}
+
+static int ai_provider_cache_models(const char *id, struct json_object *models)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+    sqlite3_int64 now = (sqlite3_int64)time(NULL);
+
+    if (!id || !id[0] || !models || !json_object_is_type(models, json_type_array))
+        return -1;
+    if (sqlite3_open_v2(AI_CONFIG_DB, &db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_busy_timeout(db, 3000);
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK)
+        goto close_db;
+    if (sqlite3_prepare_v2(db, "DELETE FROM ai_provider_model WHERE provider_id=?1",
+                           -1, &st, NULL) != SQLITE_OK)
+        goto rollback;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_DONE)
+        goto rollback;
+    sqlite3_finalize(st);
+    st = NULL;
+    for (size_t i = 0; i < json_object_array_length(models); i++) {
+        struct json_object *item = json_object_array_get_idx(models, i);
+        const char *model_id = item && json_object_is_type(item, json_type_string) ?
+                               json_object_get_string(item) : NULL;
+        if (!model_id || !model_id[0])
+            continue;
+        if (sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO ai_provider_model"
+            "(provider_id,model_id,display_name,synced_at) VALUES(?1,?2,'',?3)",
+            -1, &st, NULL) != SQLITE_OK)
+            goto rollback;
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, model_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 3, now);
+        if (sqlite3_step(st) != SQLITE_DONE)
+            goto rollback;
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+    goto close_db;
+rollback:
+    if (st) sqlite3_finalize(st);
+    st = NULL;
+    sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+close_db:
+    if (st) sqlite3_finalize(st);
+    sqlite3_close(db);
+    return rc;
+}
+
+static int ai_provider_config_by_id(const char *id, struct ai_config *cfg)
+{
+    struct ai_config defaults;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+
+    if (!id || !id[0] || !cfg)
+        return -1;
+    memset(cfg, 0, sizeof(*cfg));
+    if (ai_config_load(&defaults) < 0)
+        return -1;
+    if (sqlite3_open_v2(AI_CONFIG_DB, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK)
+        goto done;
+    sqlite3_busy_timeout(db, 3000);
+    if (sqlite3_prepare_v2(db,
+        "SELECT provider,api_base,api_key,auth_mode,default_model,"
+        "reasoning_effort,reasoning_api_shape,enabled FROM ai_provider WHERE id=?1",
+        -1, &st, NULL) != SQLITE_OK)
+        goto done;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_ROW)
+        goto done;
+    snprintf(cfg->provider, sizeof(cfg->provider), "%s", ai_text(st, 0));
+    snprintf(cfg->api_base, sizeof(cfg->api_base), "%s", ai_text(st, 1));
+    snprintf(cfg->api_key, sizeof(cfg->api_key), "%s", ai_text(st, 2));
+    snprintf(cfg->auth_mode, sizeof(cfg->auth_mode), "%s", ai_text(st, 3));
+    snprintf(cfg->model, sizeof(cfg->model), "%s", ai_text(st, 4));
+    snprintf(cfg->reasoning_effort, sizeof(cfg->reasoning_effort), "%s", ai_text(st, 5));
+    snprintf(cfg->api_shape, sizeof(cfg->api_shape), "%s", ai_text(st, 6));
+    /* A disabled provider can still be tested; dispatch is what honors
+     * `enabled`. Testing before enabling is the normal setup order. */
+    cfg->enabled = 1;
+    ai_dispatch_apply_defaults(cfg, &defaults);
+    ai_dispatch_resolve_oauth(cfg);
+    rc = 0;
+done:
+    if (st) sqlite3_finalize(st);
+    if (db) sqlite3_close(db);
+    memset(defaults.api_key, 0, sizeof(defaults.api_key));
+    return rc;
 }
 
 static int ai_ends_with(const char *s, const char *suffix)
@@ -3440,10 +3944,20 @@ int webd_ai_runtime_stream(int fd, struct json_object *body, const char *actor)
     if (!body || !json_object_is_type(body, json_type_object))
         return ai_stream_send_error(fd, ai_error("invalid_request",
             "JSON request body is required", 400, 0, NULL, NULL), 400);
-    if (ai_config_load(&cfg) != 0 || !ai_config_ready(&cfg)) {
-        memset(cfg.api_key, 0, sizeof(cfg.api_key));
-        return ai_stream_send_error(fd, ai_error("provider_not_configured",
-            "AI provider is disabled or incomplete", 503, 0, NULL, NULL), 503);
+    {
+        struct ai_dispatch_plan dispatch;
+        int select_rc = ai_dispatch_select(&cfg, &dispatch, NULL);
+        int status = select_rc == -2 ? 422 : 503;
+        struct json_object *err = NULL;
+
+        /* A stream cannot switch providers mid-flight: emitted tokens cannot be
+         * taken back, so a retry would duplicate content. Pick one and stay. */
+        ai_dispatch_plan_clear(&dispatch);
+        if (select_rc != 0) {
+            memset(cfg.api_key, 0, sizeof(cfg.api_key));
+            err = ai_dispatch_not_configured(select_rc, NULL);
+            return ai_stream_send_error(fd, err, status);
+        }
     }
     {
         const char *model = ai_json_string(body, "model", "");
@@ -4104,7 +4618,7 @@ static struct json_object *ai_resume_state_load(const char *token)
         return NULL;
     state = json_object_from_file(path);
     if (!state || !json_object_is_type(state, json_type_object) ||
-        strcmp(ai_json_string(state, "resume_token", ""), token)) {
+        !ai_ct_str_equal(ai_json_string(state, "resume_token", ""), token)) {
         if (state) json_object_put(state);
         return NULL;
     }
@@ -5129,6 +5643,9 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
     struct json_object *messages = NULL, *data = NULL, *root;
     struct json_object *all_executed = NULL;
     struct json_object *all_pending = NULL;
+    struct ai_dispatch_plan dispatch;
+    struct json_object *dispatch_attempts = NULL;
+    char dispatch_provider_id[65] = "";
     char validation[256] = "";
     char conversation_id[128];
     size_t prompt_bytes = 0;
@@ -5140,11 +5657,13 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
     if (http_status) *http_status = 400;
     if (!body || !json_object_is_type(body, json_type_object))
         return ai_error("invalid_request", "JSON request body is required", 400, 0, NULL, NULL);
-    if (ai_config_load(&cfg) != 0 || !ai_config_ready(&cfg)) {
-        if (http_status) *http_status = 503;
-        memset(cfg.api_key, 0, sizeof(cfg.api_key));
-        return ai_error("provider_not_configured",
-                        "AI provider is disabled or incomplete", 503, 0, NULL, NULL);
+    {
+        int select_rc = ai_dispatch_select(&cfg, &dispatch, dispatch_provider_id);
+        if (select_rc != 0) {
+            ai_dispatch_plan_clear(&dispatch);
+            memset(cfg.api_key, 0, sizeof(cfg.api_key));
+            return ai_dispatch_not_configured(select_rc, http_status);
+        }
     }
     {
         const char *requested_model = ai_json_string(body, "model", "");
@@ -5152,6 +5671,7 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
         if (requested_model[0]) {
             if (!ai_value_ok(requested_model, sizeof(cfg.model) - 1)) {
                 memset(cfg.api_key, 0, sizeof(cfg.api_key));
+                ai_dispatch_plan_clear(&dispatch);
                 return ai_error("invalid_request", "model is invalid", 400, 0, NULL, NULL);
             }
             snprintf(cfg.model, sizeof(cfg.model), "%s", requested_model);
@@ -5163,6 +5683,7 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
                  strcmp(requested_effort, "medium") && strcmp(requested_effort, "high") &&
                  strcmp(requested_effort, "xhigh"))) {
                 memset(cfg.api_key, 0, sizeof(cfg.api_key));
+                ai_dispatch_plan_clear(&dispatch);
                 return ai_error("invalid_request", "reasoning_effort is invalid", 400, 0, NULL, NULL);
             }
             snprintf(cfg.reasoning_effort, sizeof(cfg.reasoning_effort), "%s", requested_effort);
@@ -5195,6 +5716,7 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
             else
                 json_object_put(details);
             memset(cfg.api_key, 0, sizeof(cfg.api_key));
+            ai_dispatch_plan_clear(&dispatch);
             if (http_status) *http_status = 409;
             return error;
         }
@@ -5204,6 +5726,7 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
         ai_audit(actor, "ai.chat", &cfg, conversation_id,
                  ai_now_ms() - started, "rate_limited");
         memset(cfg.api_key, 0, sizeof(cfg.api_key));
+        ai_dispatch_plan_clear(&dispatch);
         return ai_error("rate_limited", "AI request rate limit exceeded",
                         429, 0, NULL, NULL);
     }
@@ -5213,6 +5736,7 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
         ai_audit(actor, "ai.chat", &cfg, conversation_id,
                  ai_now_ms() - started, "concurrency_limited");
         memset(cfg.api_key, 0, sizeof(cfg.api_key));
+        ai_dispatch_plan_clear(&dispatch);
         return ai_error("ai_busy", "AI runtime concurrency limit reached",
                         429, 0, NULL, NULL);
     }
@@ -5223,6 +5747,7 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
         ai_audit(actor, "ai.chat", &cfg, conversation_id,
                  ai_now_ms() - started, "validation_failed");
         memset(cfg.api_key, 0, sizeof(cfg.api_key));
+        ai_dispatch_plan_clear(&dispatch);
         return ai_error(strstr(validation, "exceeds") ? "context_too_large" :
                         "invalid_request", validation,
                         http_status ? *http_status : 400, 0, NULL, NULL);
@@ -5235,6 +5760,7 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
         json_object_put(messages);
         close(slot);
         memset(cfg.api_key, 0, sizeof(cfg.api_key));
+        ai_dispatch_plan_clear(&dispatch);
         if (http_status) *http_status = 500;
         return ai_error("allocation_failed", "AI tool loop allocation failed",
                         500, 0, NULL, NULL);
@@ -5242,6 +5768,41 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
     for (tool_rounds = 0; tool_rounds <= AI_MAX_TOOL_ROUNDS; tool_rounds++) {
         struct json_object *tool_calls = NULL;
         data = ai_call_chat(&cfg, messages, 0, &result);
+        /* Failover only on the first round: once a later round has run, tool
+         * results are already bound to the provider that produced them. */
+        if (!data && tool_rounds == 0 && !strcmp(dispatch.strategy, "failover")) {
+            /* Resume after whichever candidate was actually used, not blindly
+             * from index 1: ai_dispatch_select() may have skipped incomplete
+             * rows when it picked the first provider. */
+            int start = 0;
+            while (start < dispatch.count &&
+                   strcmp(dispatch.items[start].id, dispatch_provider_id))
+                start++;
+            for (int next = start + 1; next < dispatch.count && !data; next++) {
+                if (!ai_dispatch_should_failover(&result))
+                    break;
+                if (!dispatch_attempts)
+                    dispatch_attempts = json_object_new_array();
+                {
+                    struct json_object *attempt = json_object_new_object();
+                    json_object_object_add(attempt, "provider_id",
+                        json_object_new_string(dispatch_provider_id));
+                    json_object_object_add(attempt, "provider",
+                        json_object_new_string(cfg.provider));
+                    json_object_object_add(attempt, "error_kind",
+                        json_object_new_string(ai_dispatch_error_kind(&result)));
+                    json_object_array_add(dispatch_attempts, attempt);
+                }
+                memset(cfg.api_key, 0, sizeof(cfg.api_key));
+                cfg = dispatch.items[next].cfg;
+                snprintf(dispatch_provider_id, sizeof(dispatch_provider_id), "%s",
+                         dispatch.items[next].id);
+                if (!ai_config_ready(&cfg))
+                    continue;
+                memset(&result, 0, sizeof(result));
+                data = ai_call_chat(&cfg, messages, 0, &result);
+            }
+        }
         if (!data) break;
         if (!json_object_object_get_ex(data, "tool_calls", &tool_calls) || !tool_calls ||
             !json_object_is_type(tool_calls, json_type_array) ||
@@ -5305,17 +5866,43 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
     json_object_put(messages);
     if (!data) {
         const char *code = ai_error_code(&result, &status);
+        struct json_object *failed = ai_error(code, "AI provider request failed", status,
+                        result.provider_status, result.provider_code,
+                        result.provider_message);
+        struct json_object *error_obj = NULL;
+
         close(slot);
         ai_audit(actor, "ai.chat", &cfg, conversation_id,
                  ai_now_ms() - started, code);
         memset(cfg.api_key, 0, sizeof(cfg.api_key));
+        ai_dispatch_plan_clear(&dispatch);
         json_object_put(all_executed);
         json_object_put(all_pending);
         if (http_status) *http_status = status;
-        return ai_error(code, "AI provider request failed", status,
-                        result.provider_status, result.provider_code,
-                        result.provider_message);
+        /* Report every provider that was tried and why it failed, so a
+         * failover run is auditable instead of a single opaque error. */
+        if (dispatch_attempts &&
+            json_object_object_get_ex(failed, "error", &error_obj) && error_obj) {
+            struct json_object *details = NULL;
+            if (!json_object_object_get_ex(error_obj, "details", &details) || !details) {
+                details = json_object_new_object();
+                json_object_object_add(error_obj, "details", details);
+            }
+            json_object_object_add(details, "attempts", dispatch_attempts);
+            json_object_object_add(details, "provider_id",
+                                   json_object_new_string(dispatch_provider_id));
+        } else if (dispatch_attempts) {
+            json_object_put(dispatch_attempts);
+        }
+        return failed;
     }
+    if (dispatch_attempts)
+        json_object_object_add(data, "dispatch_attempts", dispatch_attempts);
+    if (dispatch_provider_id[0])
+        json_object_object_add(data, "provider_id",
+                               json_object_new_string(dispatch_provider_id));
+    json_object_object_add(data, "dispatch_strategy",
+                           json_object_new_string(dispatch.strategy));
     json_object_object_add(data, "conversation_id",
                            json_object_new_string(conversation_id));
     json_object_object_add(data, "prompt_bytes",
@@ -5341,6 +5928,7 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
         ai_audit(actor, "ai.chat", &cfg, conversation_id,
                  ai_now_ms() - started, "conversation_history_save_failed");
         memset(cfg.api_key, 0, sizeof(cfg.api_key));
+        ai_dispatch_plan_clear(&dispatch);
         json_object_put(all_executed);
         json_object_put(all_pending);
         if (http_status) *http_status = 500;
@@ -5353,27 +5941,54 @@ struct json_object *webd_ai_runtime_chat(struct json_object *body,
     ai_audit(actor, "ai.chat", &cfg, conversation_id,
              ai_now_ms() - started, "success");
     memset(cfg.api_key, 0, sizeof(cfg.api_key));
+    ai_dispatch_plan_clear(&dispatch);
     json_object_put(all_executed);
     json_object_put(all_pending);
     if (http_status) *http_status = 200;
     return root;
 }
 
-struct json_object *webd_ai_runtime_provider_test(const char *actor,
-                                                  int *http_status)
+/*
+ * provider_id == NULL tests whatever the dispatch policy would use right now;
+ * a non-empty id tests that one row and records the result on it.
+ */
+struct json_object *webd_ai_runtime_provider_test_id(const char *provider_id,
+                                                     const char *actor,
+                                                     int *http_status)
 {
     struct ai_config cfg;
     struct ai_result result = {};
     struct json_object *messages = json_object_new_array(), *data, *root;
     int slot, status = 400;
+    char resolved_id[65] = "";
     int64_t started = ai_now_ms();
 
     if (http_status) *http_status = 503;
-    if (ai_config_load(&cfg) != 0 || !ai_config_ready(&cfg)) {
-        json_object_put(messages);
-        memset(cfg.api_key, 0, sizeof(cfg.api_key));
-        return ai_error("provider_not_configured",
-                        "AI provider is disabled or incomplete", 503, 0, NULL, NULL);
+    if (provider_id && provider_id[0]) {
+        if (ai_provider_config_by_id(provider_id, &cfg) != 0) {
+            json_object_put(messages);
+            if (http_status) *http_status = 404;
+            return ai_error("provider_not_found", "provider id does not exist",
+                            404, 0, NULL, NULL);
+        }
+        snprintf(resolved_id, sizeof(resolved_id), "%s", provider_id);
+        if (!ai_config_ready(&cfg)) {
+            json_object_put(messages);
+            memset(cfg.api_key, 0, sizeof(cfg.api_key));
+            ai_provider_record_check(resolved_id, 0, -1, "provider_not_configured");
+            return ai_error("provider_not_configured",
+                            "provider credentials or model are incomplete",
+                            503, 0, NULL, NULL);
+        }
+    } else {
+        struct ai_dispatch_plan dispatch;
+        int select_rc = ai_dispatch_select(&cfg, &dispatch, resolved_id);
+        ai_dispatch_plan_clear(&dispatch);
+        if (select_rc != 0) {
+            json_object_put(messages);
+            memset(cfg.api_key, 0, sizeof(cfg.api_key));
+            return ai_dispatch_not_configured(select_rc, http_status);
+        }
     }
     ai_add_message(messages, "user", "Reply with OK.", &(size_t){0}, NULL);
     slot = ai_acquire_slot();
@@ -5388,28 +6003,65 @@ struct json_object *webd_ai_runtime_provider_test(const char *actor,
     close(slot);
     if (!data) {
         const char *code = ai_error_code(&result, &status);
+        struct json_object *failed;
+        const char *kind = ai_dispatch_error_kind(&result);
+
         ai_audit(actor, "ai.provider.test", &cfg, cfg.model,
                  ai_now_ms() - started, code);
+        if (resolved_id[0])
+            ai_provider_record_check(resolved_id, 0, -1, kind);
         memset(cfg.api_key, 0, sizeof(cfg.api_key));
         if (http_status) *http_status = status;
-        return ai_error(code, "AI provider connection test failed", status,
-                        result.provider_status, result.provider_code,
-                        result.provider_message);
+        failed = ai_error(code, "AI provider connection test failed", status,
+                          result.provider_status, result.provider_code,
+                          result.provider_message);
+        {
+            struct json_object *error_obj = NULL, *details = NULL;
+            if (json_object_object_get_ex(failed, "error", &error_obj) && error_obj) {
+                if (!json_object_object_get_ex(error_obj, "details", &details) || !details) {
+                    details = json_object_new_object();
+                    json_object_object_add(error_obj, "details", details);
+                }
+                json_object_object_add(details, "error_kind",
+                                       json_object_new_string(kind));
+                /* Unmeasurable latency is null, never 0. */
+                json_object_object_add(details, "latency_ms", NULL);
+                if (resolved_id[0])
+                    json_object_object_add(details, "provider_id",
+                                           json_object_new_string(resolved_id));
+            }
+        }
+        return failed;
     }
     json_object_put(data);
     data = json_object_new_object();
     json_object_object_add(data, "reachable", json_object_new_boolean(1));
     json_object_object_add(data, "authenticated", json_object_new_boolean(1));
+    json_object_object_add(data, "ok", json_object_new_boolean(1));
     json_object_object_add(data, "provider", json_object_new_string(cfg.provider));
     json_object_object_add(data, "model", json_object_new_string(cfg.model));
+    json_object_object_add(data, "model_probed", json_object_new_string(cfg.model));
+    json_object_object_add(data, "checked_at", json_object_new_int64(time(NULL)));
+    if (resolved_id[0])
+        json_object_object_add(data, "provider_id",
+                               json_object_new_string(resolved_id));
     json_object_object_add(data, "latency_ms",
                            json_object_new_int64(ai_now_ms() - started));
     root = ai_success(data, "webd.ai.provider_test");
     ai_audit(actor, "ai.provider.test", &cfg, cfg.model,
              ai_now_ms() - started, "success");
+    if (resolved_id[0])
+        ai_provider_record_check(resolved_id, 1,
+                                     (int)(ai_now_ms() - started), "");
     memset(cfg.api_key, 0, sizeof(cfg.api_key));
     if (http_status) *http_status = 200;
     return root;
+}
+
+struct json_object *webd_ai_runtime_provider_test(const char *actor,
+                                                  int *http_status)
+{
+    return webd_ai_runtime_provider_test_id(NULL, actor, http_status);
 }
 
 static struct json_object *ai_model_explicit_value(struct json_object *item,
@@ -5508,22 +6160,41 @@ static struct json_object *ai_model_detail(struct json_object *item, const char 
     return out;
 }
 
-struct json_object *webd_ai_runtime_models(const char *actor,
-                                           int *http_status)
+struct json_object *webd_ai_runtime_models_id(const char *provider_id,
+                                              const char *actor,
+                                              int *http_status)
 {
     struct ai_config cfg;
     struct ai_result result = {};
     struct json_object *response = NULL, *provider_models = NULL;
     struct json_object *data, *models, *model_details;
     char endpoint[768];
+    char resolved_id[65] = "";
     int status = 400;
     int64_t started = ai_now_ms();
 
     if (http_status) *http_status = 503;
-    if (ai_config_load(&cfg) != 0 || !ai_config_ready(&cfg)) {
-        memset(cfg.api_key, 0, sizeof(cfg.api_key));
-        return ai_error("provider_not_configured",
-                        "AI provider is disabled or incomplete", 503, 0, NULL, NULL);
+    if (provider_id && provider_id[0]) {
+        if (ai_provider_config_by_id(provider_id, &cfg) != 0) {
+            if (http_status) *http_status = 404;
+            return ai_error("provider_not_found", "provider id does not exist",
+                            404, 0, NULL, NULL);
+        }
+        snprintf(resolved_id, sizeof(resolved_id), "%s", provider_id);
+        if (!ai_config_ready(&cfg)) {
+            memset(cfg.api_key, 0, sizeof(cfg.api_key));
+            return ai_error("provider_not_configured",
+                            "provider credentials or model are incomplete",
+                            503, 0, NULL, NULL);
+        }
+    } else {
+        struct ai_dispatch_plan dispatch;
+        int select_rc = ai_dispatch_select(&cfg, &dispatch, resolved_id);
+        ai_dispatch_plan_clear(&dispatch);
+        if (select_rc != 0) {
+            memset(cfg.api_key, 0, sizeof(cfg.api_key));
+            return ai_dispatch_not_configured(select_rc, http_status);
+        }
     }
     if (ai_endpoint(&cfg, "models", endpoint, sizeof(endpoint)) != 0) {
         memset(cfg.api_key, 0, sizeof(cfg.api_key));
@@ -5573,6 +6244,15 @@ struct json_object *webd_ai_runtime_models(const char *actor,
     json_object_object_add(data, "provider", json_object_new_string(cfg.provider));
     json_object_object_add(data, "configured_model", json_object_new_string(cfg.model));
     json_object_object_add(data, "provider_synced", json_object_new_boolean(1));
+    /* Cache the list so model_count / models_synced_at on the provider row
+     * reflect a real sync instead of staying at "never synced". */
+    if (resolved_id[0]) {
+        json_object_object_add(data, "provider_id",
+                               json_object_new_string(resolved_id));
+        json_object_object_add(data, "models_cached",
+            json_object_new_boolean(ai_provider_cache_models(resolved_id,
+                                                                   models) == 0));
+    }
     json_object_object_add(data, "latency_ms",
                            json_object_new_int64(ai_now_ms() - started));
     json_object_put(response);
@@ -5581,6 +6261,12 @@ struct json_object *webd_ai_runtime_models(const char *actor,
     memset(cfg.api_key, 0, sizeof(cfg.api_key));
     if (http_status) *http_status = 200;
     return ai_success(data, "webd.ai.models");
+}
+
+struct json_object *webd_ai_runtime_models(const char *actor,
+                                           int *http_status)
+{
+    return webd_ai_runtime_models_id(NULL, actor, http_status);
 }
 
 void webd_ai_runtime_attach_capabilities(struct json_object *response)
@@ -5601,6 +6287,30 @@ void webd_ai_runtime_attach_capabilities(struct json_object *response)
     json_object_object_add(caps, "provider_test", json_object_new_boolean(1));
     json_object_object_add(caps, "provider_models_sync",
                            json_object_new_boolean(ready));
+    /* The frontend renders the strategy switcher and the provider list only
+     * when these are true, so they must not be advertised ahead of the routes. */
+    json_object_object_add(caps, "multi_provider", json_object_new_boolean(1));
+    json_object_object_add(caps, "ai_multi_provider", json_object_new_boolean(1));
+    json_object_object_add(caps, "provider_last_check_persisted",
+                           json_object_new_boolean(1));
+    json_object_object_add(caps, "providers_endpoint",
+                           json_object_new_string("/api/v1/ai/providers"));
+    json_object_object_add(caps, "dispatch_policy_endpoint",
+                           json_object_new_string("/api/v1/ai/dispatch-policy"));
+    {
+        struct json_object *strategies = json_object_new_array();
+        json_object_array_add(strategies, json_object_new_string("single"));
+        json_object_array_add(strategies, json_object_new_string("failover"));
+        json_object_array_add(strategies, json_object_new_string("load_balance"));
+        json_object_object_add(caps, "dispatch_strategies", strategies);
+    }
+    {
+        struct json_object *strategies = json_object_new_array();
+        json_object_array_add(strategies, json_object_new_string("single"));
+        json_object_array_add(strategies, json_object_new_string("failover"));
+        json_object_array_add(strategies, json_object_new_string("load_balance"));
+        json_object_object_add(caps, "ai_dispatch_strategies", strategies);
+    }
     json_object_object_add(caps, "streaming", json_object_new_boolean(1));
     json_object_object_add(caps, "streaming_ready", json_object_new_boolean(ready));
     json_object_object_add(caps, "streaming_endpoint",

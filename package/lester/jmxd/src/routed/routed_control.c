@@ -17,6 +17,7 @@
 #include <uci.h>
 
 #include "routed_control.h"
+#include "gateway_ports.h"
 
 #define ROUTED_DB_PATH "/etc/dreamingwrt/config.db"
 #define ROUTED_OBJECT_NAME "dreamingwrt.routed"
@@ -1580,6 +1581,9 @@ static int routed_handle(struct ubus_context *ctx, struct ubus_object *obj,
     else if (!strcmp(method, "policy_rules_reorder")) resp = routed_reorder(ctx, body);
     else if (!strcmp(method, "runtime_resolve")) resp = routed_runtime_resolve(body);
     else if (!strcmp(method, "external_policies")) resp = routed_external_json();
+    else if (!strcmp(method, "gateway_ports_get")) resp = gateway_ports_get(ctx);
+    else if (!strcmp(method, "gateway_ports_preview")) resp = gateway_ports_preview(ctx, body);
+    else if (!strcmp(method, "gateway_ports_apply")) resp = gateway_ports_apply(ctx, body);
     else resp = routed_error("unsupported_operation", "unsupported routed operation", 400);
     routed_send(ctx, req, resp);
     json_object_put(resp);
@@ -1610,6 +1614,9 @@ static const struct ubus_method routed_methods[] = {
     ROUTED_METHOD("policy_rules_reorder"),
     ROUTED_METHOD("runtime_resolve"),
     ROUTED_METHOD("external_policies"),
+    ROUTED_METHOD("gateway_ports_get"),
+    ROUTED_METHOD("gateway_ports_preview"),
+    ROUTED_METHOD("gateway_ports_apply"),
 };
 
 #undef ROUTED_METHOD

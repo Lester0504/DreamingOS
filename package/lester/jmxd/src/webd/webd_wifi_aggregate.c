@@ -230,6 +230,28 @@ static void wifi_replace_null(struct json_object *obj, const char *key)
     json_object_object_add(obj, key, json_object_new_null());
 }
 
+/*
+ * Copies one air-stats counter from the collector's block onto the radio.
+ *
+ * A measured 0 and an unread counter are different facts and must stay
+ * different: apd already reports `Total PER = 0` as 0 and a firmware-disabled
+ * counter as null with a reason, so this only forwards what it found. Turning a
+ * null into 0 here would invent a measurement.
+ */
+static void wifi_air_stat_copy(struct json_object *radio,
+                               struct json_object *air, const char *key)
+{
+    struct json_object *value = wifi_child(air, key);
+
+    json_object_object_del(radio, key);
+    if (value && (json_object_is_type(value, json_type_int) ||
+                  json_object_is_type(value, json_type_double))) {
+        json_object_object_add(radio, key, json_object_get(value));
+        return;
+    }
+    json_object_object_add(radio, key, json_object_new_null());
+}
+
 /* The survey reason is produced by apd (`iw survey dump`). Promote it verbatim
  * so the UI shows why a driver withheld the sample instead of a generic text. */
 static const char *wifi_survey_absence_reason(struct json_object *survey,
@@ -807,6 +829,16 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
             struct json_object *survey = wifi_child_object(radio, "survey");
             struct json_object *utilization = wifi_child(survey, "utilization_pct");
             struct json_object *noise = wifi_child(survey, "noise_dbm");
+            struct json_object *air = wifi_child_object(survey, "air_stats");
+            /*
+             * apd rewrites the survey source to `apstats_radio` when `iw survey
+             * dump` came back empty and the vendor counters supplied the sample
+             * instead. Publishing a hardcoded "iw_survey" regardless was the
+             * same class of defect that started this investigation: a reported
+             * source that had produced no data made an empty page look like an
+             * empty environment. So the actual source is forwarded.
+             */
+            const char *survey_source = wifi_string(survey, "source", "iw_survey");
 
             if (utilization && json_object_is_type(utilization, json_type_double) &&
                 json_object_get_double(utilization) >= 0.0 &&
@@ -821,7 +853,8 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
                 json_object_object_del(radio, "channel_utilization");
                 json_object_object_add(radio, "channel_utilization",
                                        json_object_new_double(pct));
-                wifi_replace_string(radio, "channel_utilization_source", "iw_survey");
+                wifi_replace_string(radio, "channel_utilization_source",
+                                    survey_source);
             } else {
                 wifi_replace_null(radio, "channel_utilization_pct");
                 wifi_replace_null(radio, "channel_utilization");
@@ -839,7 +872,7 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
                 json_object_object_add(radio, "noise_dbm",
                                        json_object_new_double(
                                            json_object_get_double(noise)));
-                wifi_replace_string(radio, "noise_source", "iw_survey");
+                wifi_replace_string(radio, "noise_source", survey_source);
             } else {
                 wifi_replace_null(radio, "noise_dbm");
                 wifi_replace_string(radio, "noise_source",
@@ -849,6 +882,71 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
                     wifi_survey_absence_reason(survey,
                                                "channel_survey_not_reported",
                                                "noise_floor_not_reported_by_driver"));
+            }
+            /*
+             * Air statistics are collected onto the survey object, but the
+             * wireless page reads them at `radio.air_stats`, so the block is
+             * republished there. Without this the vendor collector works and the
+             * table still shows nothing.
+             */
+            if (air) {
+                static const char *const counters[] = {
+                    "tx_packets", "tx_bytes", "rx_packets", "rx_bytes",
+                    "tx_failures", "dropped", "retries", "rx_phy_errors",
+                    "rx_crc_errors", "total_per_pct", "retry_rate_pct",
+                    "self_bss_util_pct", "obss_util_pct", "noise_floor_dbm",
+                    NULL
+                };
+                struct json_object *published = json_object_new_object();
+                size_t i;
+
+                if (published) {
+                    for (i = 0; counters[i]; i++)
+                        wifi_air_stat_copy(published, air, counters[i]);
+                    /* Provenance travels with the numbers: a table that cannot
+                     * say where a figure came from cannot be audited. */
+                    wifi_replace_string(published, "source",
+                                        wifi_string(air, "source", ""));
+                    wifi_replace_bool(published, "available",
+                                      wifi_bool(air, "available", 0));
+                    wifi_replace_string(published, "interface",
+                                        wifi_string(air, "interface", ""));
+                    wifi_replace_string(published, "reason",
+                                        wifi_string(air, "reason", ""));
+                    /*
+                     * Radio-level `apstats` prints no Retries line, so `retries`
+                     * is null here. tx_failures is deliberately NOT copied into
+                     * it: a transmit failure is not a retry, and relabelling one
+                     * as the other would put a real number under a heading it
+                     * does not belong to. The UI shows a dash, which is true.
+                     */
+                    wifi_replace_bool(published,
+                                      "firmware_disabled_channel_utilization",
+                        wifi_bool(air, "firmware_disabled_channel_utilization", 0));
+                    wifi_replace_bool(published, "firmware_disabled_throughput",
+                        wifi_bool(air, "firmware_disabled_throughput", 0));
+                    json_object_object_del(radio, "air_stats");
+                    json_object_object_add(radio, "air_stats", published);
+                }
+                /* The page also reads a flat `retry_rate`. */
+                json_object_object_del(radio, "retry_rate");
+                {
+                    struct json_object *rate = wifi_child(air, "retry_rate_pct");
+
+                    if (rate && (json_object_is_type(rate, json_type_double) ||
+                                 json_object_is_type(rate, json_type_int)))
+                        json_object_object_add(radio, "retry_rate",
+                                               json_object_get(rate));
+                    else
+                        json_object_object_add(radio, "retry_rate",
+                                               json_object_new_null());
+                }
+            } else {
+                wifi_replace_null(radio, "air_stats");
+                wifi_replace_null(radio, "retry_rate");
+                wifi_replace_string(radio, "air_stats_reason",
+                                    survey ? "air_statistics_not_collected" :
+                                             "channel_survey_not_reported");
             }
         }
         wifi_replace_null(radio, "avg_interference_pct");

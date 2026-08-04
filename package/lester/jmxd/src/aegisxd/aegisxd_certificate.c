@@ -514,8 +514,62 @@ static int certificate_record_load(struct aegisxd_ca_record *record)
     return rc == SQLITE_ROW ? 0 : -1;
 }
 
+/*
+ * Is the certificate inside its validity window right now?
+ *
+ * certificate_files_valid() previously checked the file mode, the key match and
+ * the CA constraint but never the dates, so a CA whose notBefore had not
+ * arrived was reported "active" and kept in service. Every TLS peer would
+ * correctly reject anything it signed while the state row claimed the CA was
+ * healthy.
+ */
+static int certificate_time_valid(X509 *certificate)
+{
+    return certificate &&
+        X509_cmp_current_time(X509_get0_notBefore(certificate)) < 0 &&
+        X509_cmp_current_time(X509_get0_notAfter(certificate)) > 0;
+}
+
+/*
+ * True when the certificate's only fault is that it was signed against a clock
+ * running ahead, so notBefore is still in the future.
+ *
+ * Same failure mode ac_pki.c already handles, and it is specific to this
+ * platform rather than hypothetical: sysfixtime seeds the boot clock from the
+ * newest mtime found on disk, which can be hours ahead, and certificate_ca_generate()
+ * stamps notBefore at "now - 300s". 300 seconds of slack does nothing against a
+ * multi-hour skew (measured at +3.9h on 30.1), so the CA is born unusable and
+ * stays that way until the clock catches up.
+ *
+ * Kept distinct from expiry on purpose: an expired CA means time really passed,
+ * while a not-yet-valid one means the clock lied at signing time, and the two
+ * warrant different reasons in the state row.
+ */
+static int certificate_not_yet_valid(X509 *certificate)
+{
+    return certificate &&
+        X509_cmp_current_time(X509_get0_notBefore(certificate)) > 0;
+}
+
+static int certificate_files_state(const struct aegisxd_ca_record *record,
+                                   int require_key,
+                                   int *not_yet_valid_out);
+
 static int certificate_files_valid(const struct aegisxd_ca_record *record,
                                    int require_key)
+{
+    return certificate_files_state(record, require_key, NULL);
+}
+
+/*
+ * Shared implementation. When not_yet_valid_out is non-NULL the caller wants to
+ * tell "structurally sound but stamped by a clock that was ahead" apart from
+ * "broken", because the former is repairable by signing again and the latter is
+ * not.
+ */
+static int certificate_files_state(const struct aegisxd_ca_record *record,
+                                   int require_key,
+                                   int *not_yet_valid_out)
 {
     char key_path[AEGISXD_MAX_PATH];
     char cert_path[AEGISXD_MAX_PATH];
@@ -524,7 +578,10 @@ static int certificate_files_valid(const struct aegisxd_ca_record *record,
     X509 *certificate = NULL;
     struct stat status;
     int valid = 0;
+    int structure_ok = 0;
 
+    if (not_yet_valid_out)
+        *not_yet_valid_out = 0;
     if (!record || record->generation <= 0 ||
         certificate_paths(record->generation, key_path, sizeof(key_path),
                           cert_path, sizeof(cert_path)) != 0 ||
@@ -536,7 +593,7 @@ static int certificate_files_valid(const struct aegisxd_ca_record *record,
     BIO_free(bio);
     bio = NULL;
     if (!require_key) {
-        valid = 1;
+        structure_ok = 1;
         goto done;
     }
     if (lstat(key_path, &status) != 0 || !S_ISREG(status.st_mode) ||
@@ -545,8 +602,17 @@ static int certificate_files_valid(const struct aegisxd_ca_record *record,
         !(key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL)) ||
         X509_check_private_key(certificate, key) != 1)
         goto done;
-    valid = 1;
+    structure_ok = 1;
 done:
+    /*
+     * Time is judged only once the structure holds, so a malformed file is never
+     * misreported as a clock problem.
+     */
+    if (structure_ok) {
+        valid = certificate_time_valid(certificate);
+        if (!valid && not_yet_valid_out)
+            *not_yet_valid_out = certificate_not_yet_valid(certificate);
+    }
     BIO_free(bio);
     EVP_PKEY_free(key);
     X509_free(certificate);
@@ -669,8 +735,9 @@ static int certificate_transition_distributions(int generation, const char *stat
 static struct json_object *certificate_record_json(const struct aegisxd_ca_record *record)
 {
     struct json_object *object = json_object_new_object();
+    int not_yet_valid = 0;
     int active = record && !strcmp(record->state, "active") &&
-                 certificate_files_valid(record, 1);
+                 certificate_files_state(record, 1, &not_yet_valid);
 
     json_object_object_add(object, "ok", json_object_new_boolean(1));
     aegisxd_json_add_string(object, "service", "dreamingwrt-aegisxd");
@@ -679,6 +746,18 @@ static struct json_object *certificate_record_json(const struct aegisxd_ca_recor
     json_object_object_add(object, "present",
                            json_object_new_boolean(record && record->generation > 0));
     json_object_object_add(object, "active", json_object_new_boolean(active));
+    /*
+     * Without this, a CA rejected purely because the signing clock was ahead is
+     * indistinguishable from a corrupt one: both report active=false. The
+     * remedy differs, so the reason is published.
+     */
+    json_object_object_add(object, "not_yet_valid",
+                           json_object_new_boolean(not_yet_valid));
+    aegisxd_json_add_string(object, "inactive_reason",
+                            active ? "" :
+                            (not_yet_valid ? "signed_against_future_clock" :
+                             (record && record->generation > 0 ?
+                              "certificate_unusable" : "absent")));
     json_object_object_add(object, "generation",
                            json_object_new_int(record ? record->generation : 0));
     aegisxd_json_add_string(object, "state", record ? record->state : "absent");

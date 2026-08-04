@@ -51,6 +51,12 @@
 #ifndef APD_IW_PATH
 #define APD_IW_PATH ""
 #endif
+#ifndef APD_WLANCONFIG_PATH
+#define APD_WLANCONFIG_PATH ""
+#endif
+#ifndef APD_APSTATS_PATH
+#define APD_APSTATS_PATH ""
+#endif
 #ifndef APD_HOSTAPD_LOCAL_DIR
 #define APD_HOSTAPD_LOCAL_DIR "/var/run/dreamingwrt-apd"
 #endif
@@ -468,9 +474,15 @@ static int apd_survey_collect_raw(const char *path, const char *interface,
     apd_command_result_free(&result);
     return rc == 0 && sample->complete ? 0 : -1;
 }
+
 #endif
 
-#ifdef APD_NEIGHBOR_SCAN_STANDALONE_TEST
+/* The channel-catalog block below is compiled for both the neighbor-scan
+ * and the survey standalone fixtures, so both need json-c declarations;
+ * guarding the include on neighbor-scan alone left the survey fixture
+ * compiling that block with implicit declarations. */
+#if defined(APD_NEIGHBOR_SCAN_STANDALONE_TEST) || \
+    defined(APD_SURVEY_STANDALONE_TEST)
 #include <json-c/json.h>
 #endif
 
@@ -1182,6 +1194,20 @@ static int apd_neighbor_scan_stderr_errno(const char *stderr_text)
     return 0;
 }
 
+/* The errno that iw prints is a Linux kernel ABI number, not a value from
+ * the compiling host's <errno.h>.  On the OpenWrt target the two happen to
+ * agree, but comparing the wire number against host constants silently
+ * misclassifies every failure when the file is compiled anywhere the
+ * numbering differs (macOS: EOPNOTSUPP is 102, ENETDOWN is 50).  Pin the
+ * Linux values so the mapping is decided by the evidence iw produced. */
+#define APD_NL80211_EPERM 1
+#define APD_NL80211_ENODEV 19
+#define APD_NL80211_EINVAL 22
+#define APD_NL80211_EBUSY 16
+#define APD_NL80211_EACCES 13
+#define APD_NL80211_EOPNOTSUPP 95
+#define APD_NL80211_ENETDOWN 100
+
 /* Split the former catch-all "iw_neighbor_scan_failed_or_unsupported" into
  * diagnosable reasons.  "not supported" is only claimed on proven
  * EOPNOTSUPP/ENOTSUP evidence; everything unproven stays a command
@@ -1197,40 +1223,37 @@ static const char *apd_neighbor_scan_failure_reason(
     if (err == 0) {
         /* Textual fallback for iw builds that omit the errno suffix. */
         if (strstr(stderr_text, "not supported"))
-            err = EOPNOTSUPP;
+            err = APD_NL80211_EOPNOTSUPP;
         else if (strstr(stderr_text, "busy"))
-            err = EBUSY;
+            err = APD_NL80211_EBUSY;
         else if (strstr(stderr_text, "Network is down"))
-            err = ENETDOWN;
+            err = APD_NL80211_ENETDOWN;
         else if (strstr(stderr_text, "not permitted") ||
                  strstr(stderr_text, "Permission denied"))
-            err = EPERM;
+            err = APD_NL80211_EPERM;
         else if (strstr(stderr_text, "Invalid argument"))
-            err = EINVAL;
+            err = APD_NL80211_EINVAL;
         else if (strstr(stderr_text, "No such device"))
-            err = ENODEV;
+            err = APD_NL80211_ENODEV;
     }
     switch (err) {
-    case EOPNOTSUPP:
-#if ENOTSUP != EOPNOTSUPP
-    case ENOTSUP:
-#endif
+    case APD_NL80211_EOPNOTSUPP:
         reason = "iw_neighbor_scan_not_supported";
         break;
-    case EBUSY:
+    case APD_NL80211_EBUSY:
         reason = "iw_neighbor_scan_interface_busy";
         break;
-    case ENETDOWN:
+    case APD_NL80211_ENETDOWN:
         reason = "iw_neighbor_scan_interface_down";
         break;
-    case EPERM:
-    case EACCES:
+    case APD_NL80211_EPERM:
+    case APD_NL80211_EACCES:
         reason = "iw_neighbor_scan_permission_denied";
         break;
-    case EINVAL:
+    case APD_NL80211_EINVAL:
         reason = "iw_neighbor_scan_driver_rejected";
         break;
-    case ENODEV:
+    case APD_NL80211_ENODEV:
         reason = "iw_neighbor_scan_interface_missing";
         break;
     default:
@@ -1454,11 +1477,756 @@ done:
 
 #if !defined(APD_NEIGHBOR_SCAN_STANDALONE_TEST) || \
     defined(APD_SURVEY_STANDALONE_TEST)
+/* QCA/Atheros vendor drivers answer `iw ... survey dump` with an empty body and
+ * `iw ... station dump` with zero stations even while clients are associated;
+ * `wlanconfig`/`apstats` carry the same data there. These collectors are the
+ * fallback path only: the caller tries the nl80211 tool first and drops here
+ * when it yielded no data, so a driver where `iw` works keeps using `iw`.
+ * The decision is driven by "did we get data", never by "does the binary
+ * exist", because on 31.31 `iw` is present and `iw dev` works while its
+ * station and survey subcommands return nothing. */
+#define APD_VENDOR_STATION_LIMIT 128U
+
+struct apd_vendor_station {
+    char mac[18];
+    char mode[40];
+    int aid;
+    int channel;
+    int rssi;
+    int min_rssi;
+    int max_rssi;
+    int idle_ms;
+    unsigned int tx_rate_kbps;
+    unsigned int rx_rate_kbps;
+    int tx_nss;
+    int rx_nss;
+    int has_rssi;
+    int has_min_rssi;
+    int has_max_rssi;
+    int has_tx_rate;
+    int has_rx_rate;
+    int has_tx_nss;
+    int has_rx_nss;
+    int has_channel;
+    int has_idle;
+};
+
+struct apd_vendor_station_set {
+    struct apd_vendor_station items[APD_VENDOR_STATION_LIMIT];
+    size_t count;
+    int truncated;
+    char reason[APD_SURVEY_REASON_LEN + 1];
+};
+
+static const char *apd_find_wlanconfig(void)
+{
+    static const char *const paths[] = {
+        "/usr/sbin/wlanconfig", "/usr/bin/wlanconfig", "/sbin/wlanconfig", NULL
+    };
+    size_t i;
+
+    if (APD_WLANCONFIG_PATH[0] && access(APD_WLANCONFIG_PATH, X_OK) == 0)
+        return APD_WLANCONFIG_PATH;
+    for (i = 0; paths[i]; i++) {
+        if (access(paths[i], X_OK) == 0)
+            return paths[i];
+    }
+    return NULL;
+}
+
+/* `wlanconfig` prints rates as `433M`, `292M`, occasionally `1.5G` or a bare
+ * `54`. Normalise to kbps so the JSON contract stays a single integer unit
+ * instead of leaking a vendor-formatted string to the frontend. */
+static int apd_vendor_parse_rate_kbps(const char *token, unsigned int *out)
+{
+    double value = 0.0;
+    char *end = NULL;
+
+    if (!token || !token[0] || !out)
+        return -1;
+    errno = 0;
+    value = strtod(token, &end);
+    if (errno != 0 || end == token || value < 0.0 || value > 1.0e7)
+        return -1;
+    if (end && (*end == 'M' || *end == 'm'))
+        value *= 1000.0;
+    else if (end && (*end == 'G' || *end == 'g'))
+        value *= 1000000.0;
+    else if (end && (*end == 'K' || *end == 'k'))
+        ;
+    else if (end && *end && *end != ' ' && *end != '\t')
+        return -1;
+    else
+        value *= 1000.0;
+    if (value <= 0.0 || value > 1.0e9)
+        return -1;
+    *out = (unsigned int)(value + 0.5);
+    return 0;
+}
+
+static int apd_vendor_parse_int_token(const char *token, long minimum,
+                                      long maximum, int *out)
+{
+    long parsed = 0;
+    char *end = NULL;
+
+    if (!token || !token[0] || !out)
+        return -1;
+    errno = 0;
+    parsed = strtol(token, &end, 10);
+    if (errno != 0 || end == token || parsed < minimum || parsed > maximum)
+        return -1;
+    if (end && *end && *end != ' ' && *end != '\t')
+        return -1;
+    *out = (int)parsed;
+    return 0;
+}
+
+static int apd_vendor_valid_mac(const char *value)
+{
+    size_t i;
+
+    if (!value)
+        return 0;
+    for (i = 0; i < 17; i++) {
+        if ((i % 3) == 2) {
+            if (value[i] != ':')
+                return 0;
+            continue;
+        }
+        if (!isxdigit((unsigned char)value[i]))
+            return 0;
+    }
+    return value[17] == '\0';
+}
+
+/* Column layout of `wlanconfig <if> list`:
+ * ADDR AID CHAN TXRATE RXRATE RSSI MINRSSI MAXRSSI IDLE ... MODE RXNSS TXNSS PSMODE
+ * Fields after IDLE vary between driver builds, so MODE is located by content
+ * (the token starts with IEEE80211_MODE_) and the two NSS values are read from
+ * the positions immediately following it. They are not the trailing tokens:
+ * PSMODE follows TXNSS on real hardware. */
+static void apd_vendor_parse_station_line(const char *line,
+                                          struct apd_vendor_station_set *set)
+{
+    struct apd_vendor_station station;
+    char buffer[512];
+    char *tokens[48];
+    size_t token_count = 0;
+    char *cursor = NULL;
+    char *saved = NULL;
+    size_t mode_index = 0;
+    int have_mode = 0;
+
+    if (!line || !set || set->count >= APD_VENDOR_STATION_LIMIT)
+        return;
+    if (snprintf(buffer, sizeof(buffer), "%s", line) >= (int)sizeof(buffer))
+        return;
+    cursor = strtok_r(buffer, " \t", &saved);
+    while (cursor && token_count < (sizeof(tokens) / sizeof(tokens[0]))) {
+        tokens[token_count++] = cursor;
+        cursor = strtok_r(NULL, " \t", &saved);
+    }
+    if (token_count < 6 || !apd_vendor_valid_mac(tokens[0]))
+        return;
+
+    memset(&station, 0, sizeof(station));
+    snprintf(station.mac, sizeof(station.mac), "%s", tokens[0]);
+    if (apd_vendor_parse_int_token(tokens[1], 0, 4096, &station.aid) != 0)
+        station.aid = 0;
+    if (apd_vendor_parse_int_token(tokens[2], 1, 200, &station.channel) == 0)
+        station.has_channel = 1;
+    if (apd_vendor_parse_rate_kbps(tokens[3], &station.tx_rate_kbps) == 0)
+        station.has_tx_rate = 1;
+    if (apd_vendor_parse_rate_kbps(tokens[4], &station.rx_rate_kbps) == 0)
+        station.has_rx_rate = 1;
+    if (apd_vendor_parse_int_token(tokens[5], -127, 127, &station.rssi) == 0)
+        station.has_rssi = 1;
+    if (token_count > 6 &&
+        apd_vendor_parse_int_token(tokens[6], -127, 127, &station.min_rssi) == 0)
+        station.has_min_rssi = 1;
+    if (token_count > 7 &&
+        apd_vendor_parse_int_token(tokens[7], -127, 127, &station.max_rssi) == 0)
+        station.has_max_rssi = 1;
+    if (token_count > 8 &&
+        apd_vendor_parse_int_token(tokens[8], 0, 1000000, &station.idle_ms) == 0)
+        station.has_idle = 1;
+
+    for (size_t i = 9; i < token_count; i++) {
+        if (!strncmp(tokens[i], "IEEE80211_MODE_", 15)) {
+            snprintf(station.mode, sizeof(station.mode), "%s", tokens[i]);
+            mode_index = i;
+            have_mode = 1;
+            break;
+        }
+    }
+    /*
+     * RXNSS/TXNSS are the two columns immediately after MODE.
+     *
+     * They are located relative to MODE rather than from the end of the line,
+     * because MODE is not the last field on real hardware: ath11 emits
+     * `MODE RXNSS TXNSS PSMODE`, so the final two tokens are TXNSS and PSMODE.
+     * PSMODE is 0 for a station that is not power-saving, 0 falls outside the
+     * 1..8 range a spatial-stream count may take, and the paired check below
+     * then discarded both values together -- which is why MIMO read as "--" on
+     * a driver that was reporting it correctly all along.
+     *
+     * Locating by offset from MODE is also what this function's own header
+     * comment promises: fields after IDLE vary between driver builds, so they
+     * are found by content and not by counting from either end.
+     */
+    if (have_mode && token_count > mode_index + 2) {
+        int rx_nss = 0;
+        int tx_nss = 0;
+
+        if (apd_vendor_parse_int_token(tokens[mode_index + 1], 1, 8,
+                                      &rx_nss) == 0 &&
+            apd_vendor_parse_int_token(tokens[mode_index + 2], 1, 8,
+                                      &tx_nss) == 0) {
+            station.rx_nss = rx_nss;
+            station.tx_nss = tx_nss;
+            station.has_rx_nss = 1;
+            station.has_tx_nss = 1;
+        }
+    }
+    set->items[set->count++] = station;
+}
+
+static int apd_vendor_station_collect(const char *path, const char *interface,
+                                      struct apd_vendor_station_set *set)
+{
+    struct apd_command_result result = { 0 };
+    char *line = NULL;
+    char *saved = NULL;
+
+    if (!set)
+        return -1;
+    memset(set, 0, sizeof(*set));
+    if (!path || !path[0]) {
+        snprintf(set->reason, sizeof(set->reason), "%s",
+                 "wlanconfig_binary_unavailable");
+        return -1;
+    }
+    if (!interface || !interface[0]) {
+        snprintf(set->reason, sizeof(set->reason), "%s",
+                 "wlanconfig_interface_unavailable");
+        return -1;
+    }
+    if (!apd_survey_safe_interface_name(interface)) {
+        snprintf(set->reason, sizeof(set->reason), "%s",
+                 "wlanconfig_interface_invalid");
+        return -1;
+    }
+    {
+        char *const argv[] = {
+            (char *)path, (char *)interface, "list", NULL
+        };
+
+        if (apd_readonly_command(path, argv, &result) != 0) {
+            snprintf(set->reason, sizeof(set->reason), "%s",
+                     result.timed_out ? "wlanconfig_timeout" :
+                                        "wlanconfig_failed_or_unsupported");
+            apd_command_result_free(&result);
+            return -1;
+        }
+    }
+    if (!result.text || !result.length) {
+        snprintf(set->reason, sizeof(set->reason), "%s",
+                 "wlanconfig_no_output");
+        apd_command_result_free(&result);
+        return -1;
+    }
+    if (result.output_limited)
+        set->truncated = 1;
+    line = strtok_r(result.text, "\n", &saved);
+    while (line) {
+        char *trimmed = apd_survey_trim(line);
+
+        if (trimmed && trimmed[0] && strncmp(trimmed, "ADDR", 4) != 0) {
+            if (set->count >= APD_VENDOR_STATION_LIMIT) {
+                set->truncated = 1;
+                break;
+            }
+            apd_vendor_parse_station_line(trimmed, set);
+        }
+        line = strtok_r(NULL, "\n", &saved);
+    }
+    apd_command_result_free(&result);
+    if (!set->count) {
+        snprintf(set->reason, sizeof(set->reason), "%s",
+                 "wlanconfig_no_stations");
+        return -1;
+    }
+    return 0;
+}
+
+/* Airtime counters from the QCA `apstats` tool.
+ *
+ * Same shape as the station fallback above and for the same reason: on these
+ * drivers `iw ... survey dump` returns an empty body, so channel airtime has to
+ * come from the vendor tool. Radio level (`apstats -r -i wifiN`) is the level
+ * that matches one wiphy; AP level would sum every radio on the box.
+ *
+ * Two properties of the real output drive the parsing:
+ *   - Metrics the firmware refuses to compute print the literal `<DISABLED>`
+ *     (`Channel Utilization`, `Throughput`, `PER over configured period`).
+ *     Those must surface as unavailable, never as 0, because a 0 reads as a
+ *     measurement. `Total PER (%) = 0` on the same AP is a real measured zero
+ *     and is reported as 0.
+ *   - Labels carry their unit inline (`Average Tx Rate (kbps)`), and the
+ *     per-AC blocks repeat indented sub-keys under a parent label, so matching
+ *     is done on the full label up to `=` rather than a prefix. */
+#define APD_AIRTIME_LABEL_LEN 64U
+
+struct apd_airtime_stats {
+    uint64_t tx_packets;
+    uint64_t tx_bytes;
+    uint64_t rx_packets;
+    uint64_t rx_bytes;
+    uint64_t tx_failures;
+    uint64_t tx_dropped;
+    uint64_t retries;
+    uint64_t rx_phy_errors;
+    uint64_t rx_crc_errors;
+    int total_per_pct;
+    int self_bss_util_pct;
+    int obss_util_pct;
+    int noise_floor_dbm;
+    int has_tx_packets;
+    int has_tx_bytes;
+    int has_rx_packets;
+    int has_rx_bytes;
+    int has_tx_failures;
+    int has_tx_dropped;
+    int has_retries;
+    int has_rx_phy_errors;
+    int has_rx_crc_errors;
+    int has_total_per;
+    int has_self_bss_util;
+    int has_obss_util;
+    int has_noise_floor;
+    /* Distinguishes "the firmware disabled this counter" from "this build of
+     * apstats never printed the label", so the reason can say which. */
+    int channel_util_disabled;
+    int throughput_disabled;
+    char reason[APD_SURVEY_REASON_LEN + 1];
+};
+
+static const char *apd_find_apstats(void)
+{
+    static const char *const paths[] = {
+        "/usr/sbin/apstats", "/usr/bin/apstats", "/sbin/apstats", NULL
+    };
+    size_t i;
+
+    if (APD_APSTATS_PATH[0] && access(APD_APSTATS_PATH, X_OK) == 0)
+        return APD_APSTATS_PATH;
+    for (i = 0; paths[i]; i++) {
+        if (access(paths[i], X_OK) == 0)
+            return paths[i];
+    }
+    return NULL;
+}
+
+/* Splits `Label (unit)   = value` into label and value. Returns -1 when the
+ * line carries no `=`, which covers the banners and per-AC section headers. */
+static int apd_airtime_split_line(char *line, char **label_out, char **value_out)
+{
+    char *separator;
+    char *label;
+    char *value;
+
+    if (!line || !label_out || !value_out)
+        return -1;
+    separator = strchr(line, '=');
+    if (!separator)
+        return -1;
+    *separator = '\0';
+    label = apd_survey_trim(line);
+    value = apd_survey_trim(separator + 1);
+    if (!label || !label[0] || !value || !value[0])
+        return -1;
+    *label_out = label;
+    *value_out = value;
+    return 0;
+}
+
+static int apd_airtime_parse_u64(const char *value, uint64_t *out)
+{
+    unsigned long long parsed;
+    char *end = NULL;
+
+    if (!value || !value[0] || !out)
+        return -1;
+    errno = 0;
+    parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == value)
+        return -1;
+    while (end && (*end == ' ' || *end == '\t'))
+        end++;
+    if (end && *end)
+        return -1;
+    *out = (uint64_t)parsed;
+    return 0;
+}
+
+static int apd_airtime_parse_int(const char *value, long minimum, long maximum,
+                                 int *out)
+{
+    long parsed;
+    char *end = NULL;
+
+    if (!value || !value[0] || !out)
+        return -1;
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || parsed < minimum || parsed > maximum)
+        return -1;
+    while (end && (*end == ' ' || *end == '\t'))
+        end++;
+    if (end && *end)
+        return -1;
+    *out = (int)parsed;
+    return 0;
+}
+
+/* `<DISABLED>` is the firmware saying it does not compute the counter. */
+static int apd_airtime_value_disabled(const char *value)
+{
+    return value && !strcmp(value, "<DISABLED>");
+}
+
+static void apd_airtime_apply_u64(const char *value, uint64_t *slot, int *has)
+{
+    uint64_t parsed = 0;
+
+    if (apd_airtime_parse_u64(value, &parsed) != 0)
+        return;
+    *slot = parsed;
+    *has = 1;
+}
+
+static void apd_airtime_apply_int(const char *value, long minimum, long maximum,
+                                  int *slot, int *has)
+{
+    int parsed = 0;
+
+    if (apd_airtime_parse_int(value, minimum, maximum, &parsed) != 0)
+        return;
+    *slot = parsed;
+    *has = 1;
+}
+
+static void apd_airtime_parse_line(char *line, struct apd_airtime_stats *stats)
+{
+    char *label = NULL;
+    char *value = NULL;
+
+    if (!stats || apd_airtime_split_line(line, &label, &value) != 0)
+        return;
+    /* Indented per-AC rows ("Best effort", "Voice", ...) repeat under a parent
+     * label such as "Tx Data Packets per AC:". Exact full-label matching below
+     * already makes a sub-row name match nothing, so this guard is redundant
+     * today -- it is kept because it is what stops a future prefix or
+     * substring match from silently letting an AC row overwrite a radio total.
+     * The caller strips leading space, so the rows are rejected by name. */
+    if (!strcmp(label, "Best effort") || !strcmp(label, "Background") ||
+        !strcmp(label, "Video") || !strcmp(label, "Voice"))
+        return;
+
+    if (!strcmp(label, "Channel Utilization (0-255)") ||
+        !strcmp(label, "Resource Utilization (0-255)")) {
+        if (apd_airtime_value_disabled(value))
+            stats->channel_util_disabled = 1;
+        return;
+    }
+    if (!strcmp(label, "Throughput (kbps)")) {
+        if (apd_airtime_value_disabled(value))
+            stats->throughput_disabled = 1;
+        return;
+    }
+    if (!strcmp(label, "Tx Data Packets"))
+        apd_airtime_apply_u64(value, &stats->tx_packets, &stats->has_tx_packets);
+    else if (!strcmp(label, "Tx Data Bytes"))
+        apd_airtime_apply_u64(value, &stats->tx_bytes, &stats->has_tx_bytes);
+    else if (!strcmp(label, "Rx Data Packets"))
+        apd_airtime_apply_u64(value, &stats->rx_packets, &stats->has_rx_packets);
+    else if (!strcmp(label, "Rx Data Bytes"))
+        apd_airtime_apply_u64(value, &stats->rx_bytes, &stats->has_rx_bytes);
+    else if (!strcmp(label, "Tx failures"))
+        apd_airtime_apply_u64(value, &stats->tx_failures,
+                              &stats->has_tx_failures);
+    else if (!strcmp(label, "Tx Dropped"))
+        apd_airtime_apply_u64(value, &stats->tx_dropped,
+                              &stats->has_tx_dropped);
+    else if (!strcmp(label, "Retries"))
+        apd_airtime_apply_u64(value, &stats->retries, &stats->has_retries);
+    else if (!strcmp(label, "Rx PHY errors"))
+        apd_airtime_apply_u64(value, &stats->rx_phy_errors,
+                              &stats->has_rx_phy_errors);
+    else if (!strcmp(label, "Rx CRC errors"))
+        apd_airtime_apply_u64(value, &stats->rx_crc_errors,
+                              &stats->has_rx_crc_errors);
+    else if (!strcmp(label, "Total PER (%)"))
+        apd_airtime_apply_int(value, 0, 100, &stats->total_per_pct,
+                              &stats->has_total_per);
+    else if (!strcmp(label, "Self BSS chan util"))
+        apd_airtime_apply_int(value, 0, 100, &stats->self_bss_util_pct,
+                              &stats->has_self_bss_util);
+    else if (!strcmp(label, "OBSS chan util"))
+        apd_airtime_apply_int(value, 0, 100, &stats->obss_util_pct,
+                              &stats->has_obss_util);
+    else if (!strcmp(label,
+                     "lithium_cycle_cnt: Chan NF (BDF averaged NF_dBm)"))
+        apd_airtime_apply_int(value, -127, 0, &stats->noise_floor_dbm,
+                              &stats->has_noise_floor);
+}
+
+/* Resolves the radio netdev (`wifiN`) that owns a wiphy index. `apstats -r`
+ * wants that name, not a VAP: sysfs marks it with ARPHRD type 801 while VAPs
+ * are plain type 1, so it is identified by content rather than by an assumed
+ * `wifi%u` spelling. */
+#define APD_ARPHRD_IEEE80211_RADIO 801
+
+static int apd_airtime_radio_netdev(unsigned int wiphy_index, char *out,
+                                    size_t out_size)
+{
+    DIR *directory = opendir(APD_NET_CLASS_PATH);
+    struct dirent *entry;
+    int found = 0;
+
+    if (!directory)
+        return -1;
+    if (!out || out_size == 0) {
+        closedir(directory);
+        return -1;
+    }
+    while ((entry = readdir(directory)) != NULL) {
+        char path[PATH_MAX];
+        unsigned int observed = 0;
+        unsigned int type = 0;
+        size_t name_len = strlen(entry->d_name);
+
+        if (entry->d_name[0] == '.' || name_len >= out_size)
+            continue;
+        if (snprintf(path, sizeof(path), "%s/%s/phy80211/index",
+                     APD_NET_CLASS_PATH, entry->d_name) >= (int)sizeof(path) ||
+            apd_neighbor_read_uint_file(path, &observed) != 0 ||
+            observed != wiphy_index)
+            continue;
+        if (snprintf(path, sizeof(path), "%s/%s/type", APD_NET_CLASS_PATH,
+                     entry->d_name) >= (int)sizeof(path) ||
+            apd_neighbor_read_uint_file(path, &type) != 0 ||
+            type != APD_ARPHRD_IEEE80211_RADIO)
+            continue;
+        if (found) {
+            found = -1;
+            break;
+        }
+        memcpy(out, entry->d_name, name_len + 1);
+        found = 1;
+    }
+    closedir(directory);
+    return found == 1 ? 0 : -1;
+}
+
+static int apd_airtime_collect(const char *path, const char *radio_netdev,
+                               struct apd_airtime_stats *stats)
+{
+    struct apd_command_result result = { 0 };
+    char *line = NULL;
+    char *saved = NULL;
+    int parsed_any;
+
+    if (!stats)
+        return -1;
+    memset(stats, 0, sizeof(*stats));
+    if (!path || !path[0]) {
+        snprintf(stats->reason, sizeof(stats->reason), "%s",
+                 "apstats_binary_unavailable");
+        return -1;
+    }
+    if (!radio_netdev || !radio_netdev[0]) {
+        snprintf(stats->reason, sizeof(stats->reason), "%s",
+                 "apstats_radio_netdev_unavailable");
+        return -1;
+    }
+    if (!apd_survey_safe_interface_name(radio_netdev)) {
+        snprintf(stats->reason, sizeof(stats->reason), "%s",
+                 "apstats_radio_netdev_invalid");
+        return -1;
+    }
+    {
+        char *const argv[] = {
+            (char *)path, "-r", "-i", (char *)radio_netdev, NULL
+        };
+
+        if (apd_readonly_command(path, argv, &result) != 0) {
+            snprintf(stats->reason, sizeof(stats->reason), "%s",
+                     result.timed_out ? "apstats_timeout" :
+                                        "apstats_failed_or_unsupported");
+            apd_command_result_free(&result);
+            return -1;
+        }
+    }
+    if (!result.text || !result.length) {
+        snprintf(stats->reason, sizeof(stats->reason), "%s",
+                 "apstats_no_output");
+        apd_command_result_free(&result);
+        return -1;
+    }
+    line = strtok_r(result.text, "\n", &saved);
+    while (line) {
+        char *trimmed = apd_survey_trim(line);
+
+        if (trimmed && trimmed[0])
+            apd_airtime_parse_line(trimmed, stats);
+        line = strtok_r(NULL, "\n", &saved);
+    }
+    apd_command_result_free(&result);
+    /* The verdict is whether any counter was actually read, not whether the
+     * binary ran: a truncated or unexpected build yields zero fields and must
+     * report unavailable instead of a page of zeros. */
+    parsed_any = stats->has_tx_packets || stats->has_rx_packets ||
+                 stats->has_tx_failures || stats->has_retries ||
+                 stats->has_total_per || stats->has_rx_phy_errors;
+    if (!parsed_any) {
+        snprintf(stats->reason, sizeof(stats->reason), "%s",
+                 "apstats_no_counters_parsed");
+        return -1;
+    }
+    return 0;
+}
+
+/* Retry rate as a percentage of offered frames. `Retries` is VAP level, so at
+ * radio level this derives from Tx failures over Tx packets, which is what the
+ * frontend's retry-rate metric reads. Returns -1 when the inputs are missing or the
+ * denominator is zero, so the caller emits null rather than 0. */
+static int apd_airtime_retry_pct(const struct apd_airtime_stats *stats,
+                                 double *out)
+{
+    uint64_t failures;
+
+    if (!stats || !out || !stats->has_tx_packets || stats->tx_packets == 0)
+        return -1;
+    if (!stats->has_retries && !stats->has_tx_failures)
+        return -1;
+    failures = stats->has_retries ? stats->retries : stats->tx_failures;
+    if (failures > stats->tx_packets)
+        return -1;
+    *out = (double)failures * 100.0 / (double)stats->tx_packets;
+    return 0;
+}
+
+/* Channel utilization from the two chan-util counters apstats does report.
+ * `Channel Utilization (0-255)` is `<DISABLED>` on real hardware, but
+ * `Self BSS chan util` + `OBSS chan util` are live percentages. */
+static int apd_airtime_utilization_pct(const struct apd_airtime_stats *stats,
+                                       double *out)
+{
+    int total;
+
+    if (!stats || !out || !stats->has_self_bss_util || !stats->has_obss_util)
+        return -1;
+    total = stats->self_bss_util_pct + stats->obss_util_pct;
+    if (total < 0)
+        return -1;
+    if (total > 100)
+        total = 100;
+    *out = (double)total;
+    return 0;
+}
+
+static void apd_airtime_add_u64(struct json_object *object, const char *name,
+                                int present, uint64_t value)
+{
+    json_object_object_add(object, name,
+                           present ? json_object_new_int64((int64_t)value) :
+                                     json_object_new_null());
+}
+
+/* Emits the `air_stats` block plus the derived airtime metrics. Every absent
+ * counter is null with a reason; nothing is defaulted to 0. */
+static struct json_object *apd_airtime_json(const struct apd_airtime_stats *stats,
+                                            int available,
+                                            const char *radio_netdev)
+{
+    struct json_object *air = json_object_new_object();
+    double value = 0.0;
+
+    if (!air)
+        return NULL;
+    json_object_object_add(air, "source", available ?
+        json_object_new_string("apstats_radio") : json_object_new_null());
+    json_object_object_add(air, "available", json_object_new_boolean(available));
+    json_object_object_add(air, "interface", radio_netdev && radio_netdev[0] ?
+        json_object_new_string(radio_netdev) : json_object_new_null());
+    json_object_object_add(air, "reason",
+        (!available && stats && stats->reason[0]) ?
+        json_object_new_string(stats->reason) : json_object_new_null());
+    if (!available || !stats) {
+        static const char *const fields[] = {
+            "tx_packets", "tx_bytes", "rx_packets", "rx_bytes", "tx_failures",
+            "dropped", "retries", "rx_phy_errors", "rx_crc_errors",
+            "total_per_pct", "retry_rate_pct", "utilization_pct",
+            "self_bss_util_pct", "obss_util_pct", "noise_floor_dbm", NULL
+        };
+        size_t i;
+
+        for (i = 0; fields[i]; i++)
+            json_object_object_add(air, fields[i], json_object_new_null());
+        return air;
+    }
+    apd_airtime_add_u64(air, "tx_packets", stats->has_tx_packets,
+                        stats->tx_packets);
+    apd_airtime_add_u64(air, "tx_bytes", stats->has_tx_bytes, stats->tx_bytes);
+    apd_airtime_add_u64(air, "rx_packets", stats->has_rx_packets,
+                        stats->rx_packets);
+    apd_airtime_add_u64(air, "rx_bytes", stats->has_rx_bytes, stats->rx_bytes);
+    apd_airtime_add_u64(air, "tx_failures", stats->has_tx_failures,
+                        stats->tx_failures);
+    apd_airtime_add_u64(air, "dropped", stats->has_tx_dropped,
+                        stats->tx_dropped);
+    apd_airtime_add_u64(air, "retries", stats->has_retries, stats->retries);
+    apd_airtime_add_u64(air, "rx_phy_errors", stats->has_rx_phy_errors,
+                        stats->rx_phy_errors);
+    apd_airtime_add_u64(air, "rx_crc_errors", stats->has_rx_crc_errors,
+                        stats->rx_crc_errors);
+    /* A measured 0 is reported as 0; only an unread counter becomes null. */
+    json_object_object_add(air, "total_per_pct", stats->has_total_per ?
+        json_object_new_int(stats->total_per_pct) : json_object_new_null());
+    json_object_object_add(air, "self_bss_util_pct", stats->has_self_bss_util ?
+        json_object_new_int(stats->self_bss_util_pct) : json_object_new_null());
+    json_object_object_add(air, "obss_util_pct", stats->has_obss_util ?
+        json_object_new_int(stats->obss_util_pct) : json_object_new_null());
+    json_object_object_add(air, "noise_floor_dbm", stats->has_noise_floor ?
+        json_object_new_int(stats->noise_floor_dbm) : json_object_new_null());
+    if (apd_airtime_retry_pct(stats, &value) == 0)
+        json_object_object_add(air, "retry_rate_pct",
+                               json_object_new_double(value));
+    else
+        json_object_object_add(air, "retry_rate_pct", json_object_new_null());
+    if (apd_airtime_utilization_pct(stats, &value) == 0)
+        json_object_object_add(air, "utilization_pct",
+                               json_object_new_double(value));
+    else
+        json_object_object_add(air, "utilization_pct", json_object_new_null());
+    /* Names which counters the firmware itself refuses to compute, so the UI
+     * can say "not measured" instead of implying the collector failed. */
+    json_object_object_add(air, "firmware_disabled_channel_utilization",
+                           json_object_new_boolean(stats->channel_util_disabled));
+    json_object_object_add(air, "firmware_disabled_throughput",
+                           json_object_new_boolean(stats->throughput_disabled));
+    return air;
+}
+
 static int apd_survey_scan_collect(const char *path, const char *radio_id,
                                    struct json_object **out)
 {
     struct apd_command_result inventory = { 0 };
-    struct apd_neighbor_target target;
+    /* Zeroed up front: the early `goto result` paths run before the radio
+     * mapping is resolved, and the station emitter reads target.interface. */
+    struct apd_neighbor_target target = { 0 };
     struct apd_survey_sample raw;
     struct json_object *root = NULL;
     struct json_object *items = NULL;
@@ -1468,6 +2236,15 @@ static int apd_survey_scan_collect(const char *path, const char *radio_id,
     double utilization_pct = 0.0;
     int complete = 0;
     int rc = -1;
+    const char *station_source = "";
+    const char *station_reason = "";
+    struct apd_vendor_station_set vendor_stations = { 0 };
+    struct json_object *stations = NULL;
+    int have_vendor_stations = 0;
+    struct apd_airtime_stats airtime;
+    char airtime_netdev[IFNAMSIZ] = { 0 };
+    int have_airtime = 0;
+    int airtime_attempted = 0;
 
     if (!out)
         return -1;
@@ -1500,6 +2277,31 @@ static int apd_survey_scan_collect(const char *path, const char *radio_id,
         goto result;
     }
     memset(&raw, 0, sizeof(raw));
+    /* Station inventory is collected independently of the survey sample: on QCA
+     * drivers `survey dump` is empty while stations are still readable through
+     * `wlanconfig`, so a survey failure must not suppress station data. */
+    memset(&vendor_stations, 0, sizeof(vendor_stations));
+    if (apd_vendor_station_collect(apd_find_wlanconfig(), target.interface,
+                                   &vendor_stations) == 0) {
+        have_vendor_stations = 1;
+        station_source = "wlanconfig_list";
+    } else {
+        station_reason = vendor_stations.reason[0] ? vendor_stations.reason :
+                                                    "wlanconfig_unavailable";
+    }
+    /* Airtime counters follow the same rule as stations: the survey sample
+     * below stays the main source, and this vendor path only supplies what an
+     * empty `survey dump` cannot. Collected before the survey bails out so a
+     * missing survey does not also suppress airtime. */
+    memset(&airtime, 0, sizeof(airtime));
+    airtime_attempted = 1;
+    if (apd_airtime_radio_netdev(target.wiphy_index, airtime_netdev,
+                                 sizeof(airtime_netdev)) != 0)
+        snprintf(airtime.reason, sizeof(airtime.reason), "%s",
+                 "apstats_radio_netdev_unresolved");
+    else if (apd_airtime_collect(apd_find_apstats(), airtime_netdev,
+                                 &airtime) == 0)
+        have_airtime = 1;
     if (apd_survey_collect_raw(path, target.interface, target.frequency_mhz,
                                &raw) != 0 || !raw.complete) {
         reason = raw.reason[0] ? raw.reason : reason;
@@ -1549,6 +2351,81 @@ static int apd_survey_scan_collect(const char *path, const char *radio_id,
     complete = 1;
     rc = 0;
 result:
+    if (have_vendor_stations) {
+        stations = json_object_new_array();
+        if (stations) {
+            for (size_t i = 0; i < vendor_stations.count; i++) {
+                const struct apd_vendor_station *st = &vendor_stations.items[i];
+                struct json_object *entry = json_object_new_object();
+
+                if (!entry)
+                    break;
+                json_object_object_add(entry, "mac",
+                                       json_object_new_string(st->mac));
+                json_object_object_add(entry, "source",
+                                       json_object_new_string("wlanconfig_list"));
+                json_object_object_add(entry, "interface",
+                                       json_object_new_string(target.interface));
+                json_object_object_add(entry, "radio_id",
+                    json_object_new_string(radio_id ? radio_id : ""));
+                json_object_object_add(entry, "aid",
+                                       json_object_new_int(st->aid));
+                json_object_object_add(entry, "channel", st->has_channel ?
+                    json_object_new_int(st->channel) : json_object_new_null());
+                json_object_object_add(entry, "rssi_dbm", st->has_rssi ?
+                    json_object_new_int(st->rssi) : json_object_new_null());
+                json_object_object_add(entry, "min_rssi_dbm", st->has_min_rssi ?
+                    json_object_new_int(st->min_rssi) : json_object_new_null());
+                json_object_object_add(entry, "max_rssi_dbm", st->has_max_rssi ?
+                    json_object_new_int(st->max_rssi) : json_object_new_null());
+                json_object_object_add(entry, "tx_rate_kbps", st->has_tx_rate ?
+                    json_object_new_int64((int64_t)st->tx_rate_kbps) :
+                    json_object_new_null());
+                json_object_object_add(entry, "rx_rate_kbps", st->has_rx_rate ?
+                    json_object_new_int64((int64_t)st->rx_rate_kbps) :
+                    json_object_new_null());
+                json_object_object_add(entry, "tx_nss", st->has_tx_nss ?
+                    json_object_new_int(st->tx_nss) : json_object_new_null());
+                json_object_object_add(entry, "rx_nss", st->has_rx_nss ?
+                    json_object_new_int(st->rx_nss) : json_object_new_null());
+                json_object_object_add(entry, "idle_ms", st->has_idle ?
+                    json_object_new_int(st->idle_ms) : json_object_new_null());
+                json_object_object_add(entry, "wifi_standard", st->mode[0] ?
+                    json_object_new_string(st->mode) : json_object_new_null());
+                json_object_array_add(stations, entry);
+            }
+            json_object_object_add(root, "stations", stations);
+            stations = NULL;
+        }
+    } else {
+        json_object_object_add(root, "stations", json_object_new_array());
+    }
+    json_object_object_add(root, "station_count",
+        json_object_new_int((int)(have_vendor_stations ?
+                                  vendor_stations.count : 0)));
+    json_object_object_add(root, "station_truncated",
+        json_object_new_boolean(have_vendor_stations &&
+                                vendor_stations.truncated));
+    /* Report the source that actually produced data, not the one we tried
+     * first. An unqualified "iw station dump" here is what misled acceptance. */
+    json_object_object_add(root, "station_source", station_source[0] ?
+        json_object_new_string(station_source) : json_object_new_null());
+    json_object_object_add(root, "station_reason", station_reason[0] ?
+        json_object_new_string(station_reason) : json_object_new_null());
+    /* Airtime block travels beside the survey items so the aggregator can read
+     * it per radio. `air_stats` is the key the wireless page already consumes. */
+    if (airtime_attempted) {
+        struct json_object *air = apd_airtime_json(&airtime, have_airtime,
+                                                  airtime_netdev);
+
+        if (air)
+            json_object_object_add(root, "air_stats", air);
+        json_object_object_add(root, "airtime_source", have_airtime ?
+            json_object_new_string("apstats_radio") : json_object_new_null());
+        json_object_object_add(root, "airtime_reason",
+            (!have_airtime && airtime.reason[0]) ?
+            json_object_new_string(airtime.reason) : json_object_new_null());
+    }
     json_object_object_add(root, "ok", json_object_new_boolean(complete));
     json_object_object_add(root, "complete", json_object_new_boolean(complete));
     json_object_object_add(root, "error_code",
@@ -1560,6 +2437,7 @@ result:
 done:
     apd_command_result_free(&inventory);
     json_object_put(sample);
+    json_object_put(stations);
     json_object_put(items);
     json_object_put(root);
     return rc;
@@ -3120,7 +3998,9 @@ static void apd_survey_json_nullable_u64(struct json_object *object,
 static struct json_object *apd_survey_json(const char *path,
                                            const char *interface,
                                            int target_frequency,
-                                           int64_t sample_time)
+                                           int64_t sample_time,
+                                           unsigned int wiphy_index,
+                                           int have_wiphy_index)
 {
     struct apd_survey_sample sample;
     struct json_object *survey = json_object_new_object();
@@ -3168,6 +4048,47 @@ static struct json_object *apd_survey_json(const char *path,
     else
         json_object_object_add(survey, "utilization_pct",
                                json_object_new_null());
+    /* Vendor airtime fallback. The survey above stays the main source: this
+     * only takes over when the survey produced no sample, and it never
+     * overwrites a survey-derived value. */
+    if (have_wiphy_index) {
+        struct apd_airtime_stats stats;
+        char radio_netdev[IFNAMSIZ] = { 0 };
+        int available = 0;
+        double vendor_pct = 0.0;
+
+        memset(&stats, 0, sizeof(stats));
+        if (apd_airtime_radio_netdev(wiphy_index, radio_netdev,
+                                     sizeof(radio_netdev)) != 0)
+            snprintf(stats.reason, sizeof(stats.reason), "%s",
+                     "apstats_radio_netdev_unresolved");
+        else if (apd_airtime_collect(apd_find_apstats(), radio_netdev,
+                                     &stats) == 0)
+            available = 1;
+        {
+            struct json_object *air = apd_airtime_json(&stats, available,
+                                                       radio_netdev);
+
+            if (air)
+                json_object_object_add(survey, "air_stats", air);
+        }
+        if (available && !sample.complete &&
+            apd_airtime_utilization_pct(&stats, &vendor_pct) == 0) {
+            json_object_object_del(survey, "utilization_pct");
+            json_object_object_add(survey, "utilization_pct",
+                                   json_object_new_double(vendor_pct));
+            json_object_object_del(survey, "source");
+            json_object_object_add(survey, "source",
+                                   json_object_new_string("apstats_radio"));
+        }
+        if (available && !sample.has_noise && stats.has_noise_floor) {
+            json_object_object_del(survey, "noise_dbm");
+            json_object_object_add(survey, "noise_dbm",
+                json_object_new_int(stats.noise_floor_dbm));
+            json_object_object_add(survey, "noise_source",
+                json_object_new_string("apstats_radio"));
+        }
+    }
     return survey;
 }
 
@@ -3190,11 +4111,23 @@ static void apd_collect_radio_surveys(const char *path,
         const char *invalid_interface_name = NULL;
         int target_frequency = 0;
         size_t j;
+        struct json_object *radio_id = NULL;
+        unsigned int wiphy_index = 0;
+        int have_wiphy_index = 0;
+
+        /* Radio ids are `phyN`; the airtime fallback needs that index to find
+         * the matching radio netdev in sysfs. */
+        if (json_object_object_get_ex(radio, "id", &radio_id) &&
+            json_object_is_type(radio_id, json_type_string) &&
+            apd_neighbor_radio_id(json_object_get_string(radio_id),
+                                  &wiphy_index) == 0)
+            have_wiphy_index = 1;
 
         if (!json_object_object_get_ex(radio, "interfaces", &interfaces) ||
             !json_object_object_get_ex(radio, "frequency_mhz", &frequency) ||
             !json_object_is_type(frequency, json_type_int)) {
-            survey = apd_survey_json(path, NULL, 0, sample_time);
+            survey = apd_survey_json(path, NULL, 0, sample_time, wiphy_index,
+                                     have_wiphy_index);
             json_object_object_add(radio, "survey", survey);
             survey_count++;
             continue;
@@ -3219,10 +4152,12 @@ static void apd_collect_radio_surveys(const char *path,
         }
         if (!interface_name) {
             survey = apd_survey_json(path, invalid_interface_name,
-                                     target_frequency, sample_time);
+                                     target_frequency, sample_time,
+                                     wiphy_index, have_wiphy_index);
         } else {
             survey = apd_survey_json(path, interface_name, target_frequency,
-                                     sample_time);
+                                     sample_time, wiphy_index,
+                                     have_wiphy_index);
         }
         if (!survey)
             continue;

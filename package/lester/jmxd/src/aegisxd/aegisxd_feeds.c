@@ -5,11 +5,22 @@ struct aegisxd_download_ctx {
     FILE *fp;
     uint64_t written;
     uint64_t max_bytes;
+    char job_id[128];
+    char feed_id[128];
+    int completed_feeds;
+    int total_feeds;
     char etag[AEGISXD_MAX_TEXT];
     char last_modified[AEGISXD_MAX_TEXT];
     char content_type[AEGISXD_MAX_TEXT];
     char error[AEGISXD_MAX_TEXT];
 };
+
+#define AEGISXD_FEED_INTERVAL_HOURS 24
+#define AEGISXD_FEED_SCHEDULER_FIRST_MS 30000
+#define AEGISXD_FEED_SCHEDULER_POLL_MS 300000
+#define AEGISXD_FEED_RETRY_SEC 3600
+
+static struct uloop_timeout g_feed_scheduler_timer;
 
 static const struct aegisxd_feed_manifest g_builtin_feeds[] = {
     {
@@ -172,6 +183,71 @@ void aegisxd_job_record_pid(const char *job_id, pid_t pid)
     sqlite3_bind_text(st, 2, job_id, -1, SQLITE_TRANSIENT);
     sqlite3_step(st);
     sqlite3_finalize(st);
+}
+
+void aegisxd_job_record_progress(const char *job_id, const char *phase,
+                                 const char *feed_id, int completed_feeds,
+                                 int total_feeds, uint64_t bytes_done,
+                                 uint64_t bytes_total, uint64_t items_done,
+                                 int force)
+{
+    static char last_job_id[128];
+    static int64_t last_update_at;
+    struct json_object *result;
+    struct json_object *progress;
+    sqlite3_stmt *st;
+    const char *json_s;
+    int64_t now = aegisxd_now_s();
+
+    if (!job_id || !job_id[0] || !g_aegisxd_db)
+        return;
+    if (strcmp(last_job_id, job_id)) {
+        snprintf(last_job_id, sizeof(last_job_id), "%s", job_id);
+        last_update_at = 0;
+    }
+    if (!force && now <= last_update_at)
+        return;
+
+    result = json_object_new_object();
+    progress = json_object_new_object();
+    json_object_object_add(result, "ok", json_object_new_boolean(1));
+    aegisxd_json_add_string(result, "state", "running");
+    json_object_object_add(result, "running", json_object_new_boolean(1));
+    aegisxd_json_add_string(progress, "phase", phase ? phase : "working");
+    aegisxd_json_add_string(progress, "current_feed", feed_id ? feed_id : "");
+    json_object_object_add(progress, "completed_feeds",
+                           json_object_new_int(completed_feeds));
+    json_object_object_add(progress, "total_feeds", json_object_new_int(total_feeds));
+    json_object_object_add(progress, "bytes_done",
+                           json_object_new_int64((int64_t)bytes_done));
+    json_object_object_add(progress, "bytes_total",
+                           json_object_new_int64((int64_t)bytes_total));
+    json_object_object_add(progress, "items_done",
+                           json_object_new_int64((int64_t)items_done));
+    if (bytes_total > 0) {
+        int percent = bytes_done >= bytes_total ? 100 :
+                      (int)((bytes_done * 100U) / bytes_total);
+
+        json_object_object_add(progress, "percent", json_object_new_int(percent));
+        json_object_object_add(progress, "percent_known", json_object_new_boolean(1));
+    } else {
+        json_object_object_add(progress, "percent", json_object_new_int(0));
+        json_object_object_add(progress, "percent_known", json_object_new_boolean(0));
+    }
+    json_object_object_add(progress, "updated_at", json_object_new_int64(now));
+    json_object_object_add(result, "progress", progress);
+    json_s = json_object_to_json_string_ext(result, JSON_C_TO_STRING_PLAIN);
+
+    st = aegisxd_prepare(
+        "UPDATE aegis_job_state SET result_json=? WHERE job_id=? AND state='running'");
+    if (st) {
+        sqlite3_bind_text(st, 1, json_s ? json_s : "{}", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, job_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_DONE)
+            last_update_at = now;
+        sqlite3_finalize(st);
+    }
+    json_object_put(result);
 }
 
 void aegisxd_job_record_finish(const char *job_id, struct json_object *result)
@@ -388,8 +464,28 @@ static size_t aegisxd_curl_write_cb(char *ptr, size_t size, size_t nmemb, void *
     return len;
 }
 
+static int aegisxd_curl_progress_cb(void *userdata, curl_off_t download_total,
+                                    curl_off_t download_now, curl_off_t upload_total,
+                                    curl_off_t upload_now)
+{
+    struct aegisxd_download_ctx *ctx = userdata;
+
+    (void)upload_total;
+    (void)upload_now;
+    if (!ctx)
+        return 0;
+    aegisxd_job_record_progress(ctx->job_id, "download", ctx->feed_id,
+                                ctx->completed_feeds, ctx->total_feeds,
+                                download_now > 0 ? (uint64_t)download_now : ctx->written,
+                                download_total > 0 ? (uint64_t)download_total : 0,
+                                0, 0);
+    return 0;
+}
+
 static int aegisxd_download_feed(const struct aegisxd_feed_manifest *f,
-                                 const char *tmp_path, struct aegisxd_download_ctx *ctx)
+                                 const char *tmp_path, struct aegisxd_download_ctx *ctx,
+                                 const char *job_id, int completed_feeds,
+                                 int total_feeds)
 {
     CURL *curl;
     CURLcode cc;
@@ -400,6 +496,10 @@ static int aegisxd_download_feed(const struct aegisxd_feed_manifest *f,
         return -1;
     memset(ctx, 0, sizeof(*ctx));
     ctx->max_bytes = f->max_bytes ? f->max_bytes : AEGISXD_MAX_FEED_BYTES;
+    snprintf(ctx->job_id, sizeof(ctx->job_id), "%s", job_id ? job_id : "");
+    snprintf(ctx->feed_id, sizeof(ctx->feed_id), "%s", f->feed_id);
+    ctx->completed_feeds = completed_feeds;
+    ctx->total_feeds = total_feeds;
     if (f->connect_timeout_sec > 0)
         connect_timeout = f->connect_timeout_sec;
     if (f->timeout_sec > 0)
@@ -427,6 +527,9 @@ static int aegisxd_download_feed(const struct aegisxd_feed_manifest *f,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, ctx);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, aegisxd_curl_header_cb);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, ctx);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, aegisxd_curl_progress_cb);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, ctx);
     cc = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
     fclose(ctx->fp);
@@ -504,6 +607,8 @@ static struct json_object *aegisxd_feed_meta_json(const struct aegisxd_feed_mani
     json_object_object_add(meta, "connect_timeout_sec", json_object_new_int(f && f->connect_timeout_sec > 0 ? f->connect_timeout_sec : 15));
     json_object_object_add(meta, "timeout_sec", json_object_new_int(f && f->timeout_sec > 0 ? f->timeout_sec : 120));
     json_object_object_add(meta, "estimated_item_count", json_object_new_int(item_count));
+    json_object_object_add(meta, "interval_hours",
+                           json_object_new_int(AEGISXD_FEED_INTERVAL_HOURS));
     if (f && !strcmp(f->format, "suricata_tar_gz"))
         aegisxd_json_add_string(meta, "parse_status", "downloaded_not_imported");
     else
@@ -575,7 +680,8 @@ static void aegisxd_record_feed_error(const struct aegisxd_feed_manifest *f, con
 }
 
 static struct json_object *aegisxd_update_one_feed(const struct aegisxd_feed_manifest *f,
-                                                   int dry_run)
+                                                   int dry_run, const char *job_id,
+                                                   int completed_feeds, int total_feeds)
 {
     struct json_object *result = json_object_new_object();
     struct json_object *meta = NULL;
@@ -600,7 +706,10 @@ static struct json_object *aegisxd_update_one_feed(const struct aegisxd_feed_man
     snprintf(tmp_path, sizeof(tmp_path), "%s/%s.tmp", AEGISXD_FEED_DIR, f->feed_id);
     snprintf(artifact_path, sizeof(artifact_path), "%s/%s.feed", AEGISXD_FEED_DIR, f->feed_id);
     unlink(tmp_path);
-    if (aegisxd_download_feed(f, tmp_path, &ctx) != 0) {
+    aegisxd_job_record_progress(job_id, "download", f->feed_id, completed_feeds,
+                                total_feeds, 0, 0, 0, 1);
+    if (aegisxd_download_feed(f, tmp_path, &ctx, job_id, completed_feeds,
+                             total_feeds) != 0) {
         json_object_object_add(result, "ok", json_object_new_boolean(0));
         aegisxd_json_add_string(result, "error", ctx.error[0] ? ctx.error : "download_failed");
         json_object_object_add(result, "downloaded_bytes", json_object_new_int64((int64_t)ctx.written));
@@ -610,6 +719,8 @@ static struct json_object *aegisxd_update_one_feed(const struct aegisxd_feed_man
         aegisxd_record_feed_error(f, ctx.error[0] ? ctx.error : "download_failed");
         return result;
     }
+    aegisxd_job_record_progress(job_id, "verify", f->feed_id, completed_feeds,
+                                total_feeds, ctx.written, ctx.written, 0, 1);
     if (aegisxd_sha256_file(tmp_path, sha256) != 0) {
         unlink(tmp_path);
         json_object_object_add(result, "ok", json_object_new_boolean(0));
@@ -643,6 +754,9 @@ static struct json_object *aegisxd_update_one_feed(const struct aegisxd_feed_man
     json_object_object_add(result, "dry_run", json_object_new_boolean(dry_run));
     json_object_object_add(result, "auto_import", json_object_new_boolean(!dry_run && ok));
     if (!dry_run && ok) {
+        aegisxd_job_record_progress(job_id, "import", f->feed_id, completed_feeds,
+                                    total_feeds, ctx.written, ctx.written,
+                                    (uint64_t)item_count, 1);
         struct json_object *import_result = aegisxd_import_feed_id(f->feed_id);
         struct json_object *import_ok = NULL;
         int imported_ok = json_object_object_get_ex(import_result, "ok", &import_ok) &&
@@ -660,7 +774,8 @@ static struct json_object *aegisxd_update_one_feed(const struct aegisxd_feed_man
     return result;
 }
 
-static struct json_object *aegisxd_feed_update_run(struct json_object *body)
+static struct json_object *aegisxd_feed_update_run(struct json_object *body,
+                                                   const char *job_id)
 {
     struct json_object *resp = json_object_new_object();
     struct json_object *results = json_object_new_array();
@@ -678,7 +793,8 @@ static struct json_object *aegisxd_feed_update_run(struct json_object *body)
     json_object_object_add(resp, "dataplane_changed", json_object_new_boolean(0));
 
     if (feed_id && feed_id[0]) {
-        struct json_object *r = aegisxd_update_one_feed(aegisxd_find_builtin_feed(feed_id), dry_run);
+        struct json_object *r = aegisxd_update_one_feed(aegisxd_find_builtin_feed(feed_id),
+                                                        dry_run, job_id, 0, 1);
         struct json_object *okv = NULL;
 
         if (json_object_object_get_ex(r, "ok", &okv) && json_object_get_boolean(okv))
@@ -686,9 +802,13 @@ static struct json_object *aegisxd_feed_update_run(struct json_object *body)
         else
             fail_count++;
         json_object_array_add(results, r);
+        aegisxd_job_record_progress(job_id, "feed_complete", feed_id, 1, 1,
+                                    0, 0, 0, 1);
     } else {
         for (i = 0; i < ARRAY_SIZE(g_builtin_feeds); i++) {
-            struct json_object *r = aegisxd_update_one_feed(&g_builtin_feeds[i], dry_run);
+            struct json_object *r = aegisxd_update_one_feed(&g_builtin_feeds[i], dry_run,
+                                                            job_id, (int)i,
+                                                            (int)ARRAY_SIZE(g_builtin_feeds));
             struct json_object *okv = NULL;
 
             if (json_object_object_get_ex(r, "ok", &okv) && json_object_get_boolean(okv))
@@ -696,6 +816,9 @@ static struct json_object *aegisxd_feed_update_run(struct json_object *body)
             else
                 fail_count++;
             json_object_array_add(results, r);
+            aegisxd_job_record_progress(job_id, "feed_complete",
+                                        g_builtin_feeds[i].feed_id, (int)i + 1,
+                                        (int)ARRAY_SIZE(g_builtin_feeds), 0, 0, 0, 1);
         }
     }
 
@@ -720,7 +843,7 @@ int aegisxd_feed_update_worker_main(const char *job_id, const char *feed_id, int
         if (feed_id && feed_id[0])
             aegisxd_json_add_string(body, "feed_id", feed_id);
         json_object_object_add(body, "dry_run", json_object_new_boolean(dry_run));
-        result = aegisxd_feed_update_run(body);
+        result = aegisxd_feed_update_run(body, job_id);
         json_object_put(body);
     }
     ok = aegisxd_job_result_ok(result);
@@ -741,7 +864,7 @@ struct json_object *aegisxd_feed_update_start(struct json_object *body)
     pid_t pid;
 
     if (!background)
-        return aegisxd_feed_update_run(body);
+        return aegisxd_feed_update_run(body, NULL);
     if (aegisxd_job_running_count() > 0) {
         struct json_object *resp = aegisxd_error("job_already_running",
             "another aegis feed job is already running");
@@ -789,4 +912,115 @@ struct json_object *aegisxd_feed_update_start(struct json_object *body)
         json_object_object_add(resp, "dataplane_changed", json_object_new_boolean(0));
         return resp;
     }
+}
+
+/* A restart-stable hash keeps routers from updating every feed at the same instant. */
+uint32_t aegisxd_feed_splay_seconds(const char *feed_id, uint32_t window_seconds)
+{
+    const unsigned char *p = (const unsigned char *)(feed_id ? feed_id : "");
+    uint32_t hash = 2166136261U;
+
+    while (*p) {
+        hash ^= *p++;
+        hash *= 16777619U;
+    }
+    return window_seconds > 0 ? hash % window_seconds : 0;
+}
+
+int64_t aegisxd_feed_next_due_at(const char *feed_id, int64_t last_success_at,
+                                 int64_t updated_at, int interval_hours,
+                                 int previous_attempt_failed)
+{
+    int64_t interval;
+    int64_t base;
+    uint32_t window;
+    int64_t due;
+
+    if (interval_hours < 1 || interval_hours > 720)
+        interval_hours = AEGISXD_FEED_INTERVAL_HOURS;
+    interval = (int64_t)interval_hours * 3600;
+    window = (uint32_t)(interval / 12);
+    if (window < 60)
+        window = 60;
+    if (window > 3600)
+        window = 3600;
+    base = last_success_at > 0 ? last_success_at + interval : updated_at;
+    due = base + (int64_t)aegisxd_feed_splay_seconds(feed_id, window);
+    if (previous_attempt_failed && updated_at + AEGISXD_FEED_RETRY_SEC > due)
+        due = updated_at + AEGISXD_FEED_RETRY_SEC;
+    return due;
+}
+
+static int aegisxd_feed_interval_hours(const char *meta_json)
+{
+    struct json_object *meta;
+    struct json_object *value = NULL;
+    int hours = AEGISXD_FEED_INTERVAL_HOURS;
+
+    meta = json_tokener_parse(meta_json ? meta_json : "{}");
+    if (meta && json_object_object_get_ex(meta, "interval_hours", &value))
+        hours = json_object_get_int(value);
+    if (meta)
+        json_object_put(meta);
+    if (hours < 1 || hours > 720)
+        hours = AEGISXD_FEED_INTERVAL_HOURS;
+    return hours;
+}
+
+static void aegisxd_feed_scheduler_tick(struct uloop_timeout *timer)
+{
+    sqlite3_stmt *st;
+    int64_t now = aegisxd_now_s();
+    int64_t earliest_due = INT64_MAX;
+    char due_feed[128] = "";
+
+    (void)timer;
+    if (aegisxd_job_running_count() > 0)
+        goto rearm;
+    st = aegisxd_prepare(
+        "SELECT feed_id,last_success_at,updated_at,last_error,meta_json "
+        "FROM aegis_feeds WHERE enabled=1 ORDER BY feed_id");
+    if (!st)
+        goto rearm;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *feed_id = aegisxd_sqlite_text(st, 0, "");
+        int64_t due;
+
+        if (!aegisxd_find_builtin_feed(feed_id))
+            continue;
+        due = aegisxd_feed_next_due_at(
+            feed_id, sqlite3_column_int64(st, 1), sqlite3_column_int64(st, 2),
+            aegisxd_feed_interval_hours(aegisxd_sqlite_text(st, 4, "{}")),
+            aegisxd_sqlite_text(st, 3, "")[0] != '\0');
+        if (due < earliest_due) {
+            earliest_due = due;
+            snprintf(due_feed, sizeof(due_feed), "%s", feed_id);
+        }
+    }
+    sqlite3_finalize(st);
+    if (due_feed[0] && earliest_due <= now) {
+        struct json_object *body = json_object_new_object();
+        struct json_object *result;
+
+        aegisxd_json_add_string(body, "feed_id", due_feed);
+        json_object_object_add(body, "dry_run", json_object_new_boolean(0));
+        json_object_object_add(body, "background", json_object_new_boolean(1));
+        result = aegisxd_feed_update_start(body);
+        json_object_put(result);
+        json_object_put(body);
+    }
+
+rearm:
+    uloop_timeout_set(&g_feed_scheduler_timer, AEGISXD_FEED_SCHEDULER_POLL_MS);
+}
+
+void aegisxd_feed_scheduler_start(void)
+{
+    g_feed_scheduler_timer.cb = aegisxd_feed_scheduler_tick;
+    uloop_timeout_set(&g_feed_scheduler_timer, AEGISXD_FEED_SCHEDULER_FIRST_MS);
+}
+
+void aegisxd_feed_scheduler_stop(void)
+{
+    uloop_timeout_cancel(&g_feed_scheduler_timer);
 }

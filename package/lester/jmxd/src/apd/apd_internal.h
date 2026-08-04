@@ -178,6 +178,7 @@ struct apd_enrollment_metadata {
 
 int64_t apd_now_s(void);
 const char *apd_db_path(void);
+int apd_config_restart_recover_default(int *recovered);
 const char *apd_identity_key_path(void);
 int apd_db_init(void);
 void apd_db_close(void);

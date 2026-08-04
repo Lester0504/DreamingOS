@@ -112,13 +112,22 @@ static int nc_irq_affinity_any_writable(void);
 static int nc_adv_recover_pending_publish(void);
 
 static sqlite3 *g_netconfig_db = NULL;
+/*
+ * Set when advanced-routing publish recovery could not complete at startup.
+ * Reads stay available; this records that the publish path is not trustworthy so
+ * the capability surface can report it rather than failing silently later.
+ */
+static int g_nc_adv_recovery_failed = 0;
 static char g_netconfig_db_path[256] = JMX_NETCONFIG_DB_PATH_DEFAULT;
 
 #define NC_WORK_MODE_UCI_MIGRATION "work_mode_uci_v1"
 #define NC_JMX_USER_UCI_MIGRATION "jmx_user_uci_v1"
+#define NC_DNS_CONFIG_COMPAT_MIGRATION "dns_config_compat_v1"
+#define NC_AI_MULTI_PROVIDER_MIGRATION "ai_multi_provider_v1"
 
 static int nc_work_mode_import_uci_once(void);
 static int nc_jmx_user_import_uci_once(void);
+static int nc_dns_config_compat_migrate_once(void);
 static void nc_netctl_db_init(void);
 static void nc_wifi_db_init(void);
 
@@ -1991,6 +2000,88 @@ static int jmx_netconfig_migrate_from_uci(void)
     return 0;
 }
 
+static int nc_dns_config_compat_migrate_once(void)
+{
+    sqlite3_stmt *st = NULL;
+    int changed = 0;
+    int enabled = 0;
+    int has_listener = 0;
+    int listener_seeded = 0;
+
+    if (nc_prepare(&st,
+        "SELECT 1 FROM config_migration WHERE name=?1 AND status='done'") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, NC_DNS_CONFIG_COMPAT_MIGRATION, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        sqlite3_finalize(st);
+        return 0;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+
+    if (nc_exec("BEGIN IMMEDIATE") != 0)
+        return -1;
+    if (nc_prepare(&st,
+        "UPDATE dns_service SET mode='proxy',hijack_protection=0,"
+        "edns_client_subnet=0,ipv6_dns=0 WHERE id=1 AND "
+        "(COALESCE(mode,'')<>'proxy' OR hijack_protection<>0 OR "
+        "edns_client_subnet<>0 OR ipv6_dns<>0)") != 0)
+        goto rollback;
+    if (nc_step_done(st) != 0)
+        goto rollback;
+    changed += sqlite3_changes(g_netconfig_db);
+    sqlite3_finalize(st);
+    st = NULL;
+
+    if (nc_prepare(&st,
+        "SELECT enabled,EXISTS(SELECT 1 FROM dns_listen_interface WHERE service_id=1) "
+        "FROM dns_service WHERE id=1") != 0)
+        goto rollback;
+    if (sqlite3_step(st) != SQLITE_ROW)
+        goto rollback;
+    enabled = sqlite3_column_int(st, 0);
+    has_listener = sqlite3_column_int(st, 1);
+    sqlite3_finalize(st);
+    st = NULL;
+
+    if (enabled && !has_listener) {
+        if (nc_prepare(&st,
+            "INSERT OR IGNORE INTO dns_listen_interface(service_id,lan_id) "
+            "SELECT 1,id FROM lan WHERE enabled=1 "
+            "ORDER BY CASE WHEN id='lan' THEN 0 ELSE 1 END,id LIMIT 1") != 0)
+            goto rollback;
+        if (nc_step_done(st) != 0)
+            goto rollback;
+        listener_seeded = sqlite3_changes(g_netconfig_db);
+        changed += listener_seeded;
+        sqlite3_finalize(st);
+        st = NULL;
+
+        /* LAN import can complete later in boot. Keep this migration pending
+         * until a usable default listener can be seeded. */
+        if (!listener_seeded)
+            return nc_exec("COMMIT");
+    }
+
+    if (nc_prepare(&st,
+        "INSERT INTO config_migration(name,status,source,imported_rows,imported_at,detail) "
+        "VALUES(?1,'done','config.db:dns_service+lan',?2,?3,"
+        "'unsupported_fields_cleared_listener_compat_checked')") != 0)
+        goto rollback;
+    sqlite3_bind_text(st, 1, NC_DNS_CONFIG_COMPAT_MIGRATION, -1, SQLITE_STATIC);
+    sqlite3_bind_int(st, 2, changed);
+    sqlite3_bind_int64(st, 3, nc_now_s());
+    if (nc_step_done(st) != 0)
+        goto rollback;
+    sqlite3_finalize(st);
+    return nc_exec("COMMIT");
+
+rollback:
+    if (st) sqlite3_finalize(st);
+    nc_exec("ROLLBACK");
+    return -1;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * Init / Close
  * ══════════════════════════════════════════════════════════════════════ */
@@ -2000,9 +2091,25 @@ int jmx_netconfig_db_init(void)
     int rc;
     if (g_netconfig_db) return 0;
     nc_mkdirs();
+    /*
+     * A failed recovery is recorded, not fatal.
+     *
+     * This used to return -1, which meant sqlite was never even opened and every
+     * netconfig reader -- gateway ports, physical ports, wan_list, lan_config --
+     * answered "source unavailable" while the process reported itself healthy.
+     * The blast radius of refusing to start was far larger than the risk being
+     * defended against, which is a tampered advanced-routing publish artifact.
+     *
+     * The write path still fails closed: callers that publish artifacts check
+     * their own trust conditions, and g_nc_adv_recovery_failed lets the
+     * capability surface say so instead of pretending nothing happened.
+     */
     if (nc_adv_recover_pending_publish() != 0) {
-        LOG_ERROR("advanced routing publish recovery failed; refusing database startup\n");
-        return -1;
+        g_nc_adv_recovery_failed = 1;
+        LOG_WARN("advanced routing publish recovery failed; continuing with the "
+                 "read path available and advanced-routing publish disabled\n");
+    } else {
+        g_nc_adv_recovery_failed = 0;
     }
     rc = sqlite3_open(g_netconfig_db_path, &g_netconfig_db);
     if (rc != SQLITE_OK) {
@@ -2024,6 +2131,8 @@ int jmx_netconfig_db_init(void)
     if (nc_jmx_user_import_uci_once() != 0)
         goto fail;
     if (jmx_netconfig_migrate_from_uci() != 0)
+        goto fail;
+    if (nc_dns_config_compat_migrate_once() != 0)
         goto fail;
     return 0;
 fail:
@@ -7843,7 +7952,14 @@ static void nc_wan_merge_runtime(const char *wan_id, const char *ifname, struct 
     FILE *fp;
     char *buf = NULL;
 
-    if (!ifname || !ifname[0]) {
+    /*
+     * ifname is read back from the wan table and interpolated into the popen()
+     * command below, so it is validated here rather than trusted: a stored name
+     * carrying shell metacharacters would otherwise execute. An invalid name
+     * takes the same empty-runtime path as a missing one, which the caller
+     * already handles.
+     */
+    if (!ifname || !ifname[0] || !nc_valid_name(ifname)) {
         struct json_object *rt = json_object_new_object();
         json_object_object_add(rt, "online", json_object_new_boolean(0));
         json_object_object_add(rt, "ipv4", json_object_new_string(""));
@@ -8213,8 +8329,11 @@ struct json_object *jmx_netconfig_bond_status(const char *wan_id)
 
                 if (strncmp(line, "Bonding Mode: ", 14) == 0) {
                     json_object_object_add(data, "runtime_mode", json_object_new_string(line + 14));
-                } else if (strncmp(line, "Transmit Hash Policy: ", 21) == 0) {
-                    json_object_object_add(data, "runtime_hash_policy", json_object_new_string(line + 21));
+                /* 21 stopped one byte before the literal's trailing space, so
+                 * line+21 began on that space and runtime_hash_policy carried a
+                 * leading blank (" layer2+3" instead of "layer2+3"). */
+                } else if (strncmp(line, "Transmit Hash Policy: ", 22) == 0) {
+                    json_object_object_add(data, "runtime_hash_policy", json_object_new_string(line + 22));
                 } else if (strncmp(line, "MII Status: ", 12) == 0) {
                     snprintf(mii_status, sizeof(mii_status), "%s", line + 12);
                     json_object_object_add(data, "mii_status", json_object_new_string(mii_status));
@@ -8493,6 +8612,14 @@ struct json_object *jmx_netconfig_capabilities(void)
     /* ── AI ── */
 
     json_object_object_add(data, "ai_config", json_object_new_boolean(1));
+    json_object_object_add(data, "ai_multi_provider", json_object_new_boolean(1));
+    {
+        struct json_object *strategies = json_object_new_array();
+        json_object_array_add(strategies, json_object_new_string("single"));
+        json_object_array_add(strategies, json_object_new_string("failover"));
+        json_object_array_add(strategies, json_object_new_string("load_balance"));
+        json_object_object_add(data, "ai_dispatch_strategies", strategies);
+    }
     json_object_object_add(data, "model_list", json_object_new_boolean(1));
     json_object_object_add(data, "chat", json_object_new_boolean(1));
     json_object_object_add(data, "tool_call", json_object_new_boolean(1));
@@ -11388,24 +11515,36 @@ static int nc_dns_runtime_ready(int port, int wait_for_ready);
 static int nc_dnsmasq_restart(const char *log_path);
 static int nc_dnsmasq_restart_wait(const char *log_path);
 
-static int nc_dns_stored_listeners_valid(int enabled)
+enum nc_dns_listener_state {
+    NC_DNS_LISTENER_UNAVAILABLE = -2,
+    NC_DNS_LISTENER_INVALID = -1,
+    NC_DNS_LISTENER_NOT_CONFIGURED = 0,
+    NC_DNS_LISTENER_VALID = 1,
+};
+
+static int nc_dns_stored_listener_state(int enabled)
 {
     sqlite3_stmt *st = NULL;
     int total = 0, valid = 0;
 
     if (!enabled)
-        return 1;
+        return NC_DNS_LISTENER_VALID;
     if (nc_prepare(&st,
         "SELECT COUNT(*),SUM(CASE WHEN l.id IS NOT NULL AND l.enabled=1 THEN 1 ELSE 0 END) "
         "FROM dns_listen_interface d LEFT JOIN lan l ON l.id=d.lan_id "
         "WHERE d.service_id=1") != 0)
-        return 0;
+        return NC_DNS_LISTENER_UNAVAILABLE;
     if (sqlite3_step(st) == SQLITE_ROW) {
         total = sqlite3_column_int(st, 0);
         valid = sqlite3_column_int(st, 1);
+    } else {
+        sqlite3_finalize(st);
+        return NC_DNS_LISTENER_UNAVAILABLE;
     }
     sqlite3_finalize(st);
-    return total > 0 && total == valid;
+    if (total == 0)
+        return NC_DNS_LISTENER_NOT_CONFIGURED;
+    return total == valid ? NC_DNS_LISTENER_VALID : NC_DNS_LISTENER_INVALID;
 }
 
 static int nc_dns_config_degraded_reason(char *reason, size_t reason_len)
@@ -11413,6 +11552,7 @@ static int nc_dns_config_degraded_reason(char *reason, size_t reason_len)
     sqlite3_stmt *st = NULL;
     int degraded = 0;
     int enabled = 0;
+    int listener_state;
 
     if (reason && reason_len) reason[0] = '\0';
     if (nc_prepare(&st,
@@ -11438,10 +11578,16 @@ static int nc_dns_config_degraded_reason(char *reason, size_t reason_len)
     st = NULL;
     if (degraded)
         return degraded;
-    if (!nc_dns_stored_listeners_valid(enabled)) {
+    listener_state = nc_dns_stored_listener_state(enabled);
+    if (listener_state != NC_DNS_LISTENER_VALID) {
         degraded = 1;
         if (reason && reason_len)
-            snprintf(reason, reason_len, "dns_listen_interface_invalid");
+            snprintf(reason, reason_len, "%s",
+                listener_state == NC_DNS_LISTENER_NOT_CONFIGURED ?
+                    "dns_listen_interface_not_configured" :
+                listener_state == NC_DNS_LISTENER_INVALID ?
+                    "dns_listen_interface_invalid" :
+                    "dns_runtime_state_unavailable");
     }
     if (degraded)
         return degraded;
@@ -11967,41 +12113,24 @@ static int nc_dns_request_capability_check(struct json_object *cfg)
     sqlite3_stmt *st = NULL;
     struct json_object *value = NULL;
     struct json_object *arr = NULL;
-    const char *mode = "proxy";
-    int hijack = 0, ecs = 0, ipv6_dns = 0;
     int i, n;
 
     if (!cfg || jmx_netconfig_db_init() != 0)
         return -1;
-    if (nc_prepare(&st,
-        "SELECT mode,hijack_protection,edns_client_subnet,ipv6_dns FROM dns_service WHERE id=1") != 0)
-        return -1;
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        const char *stored_mode = (const char *)sqlite3_column_text(st, 0);
-        mode = stored_mode && stored_mode[0] ? stored_mode : "proxy";
-        hijack = sqlite3_column_int(st, 1);
-        ecs = sqlite3_column_int(st, 2);
-        ipv6_dns = sqlite3_column_int(st, 3);
-    }
-    if (json_object_object_get_ex(cfg, "mode", &value) && value &&
-        strcmp(json_object_get_string(value), mode)) {
+    if (json_object_object_get_ex(cfg, "mode", &value) && value) {
         const char *requested_mode = json_object_get_string(value);
         if (!requested_mode || strcmp(requested_mode, "proxy")) {
-            sqlite3_finalize(st);
             return -3;
         }
     }
     if ((json_object_object_get_ex(cfg, "hijack_protection", &value) && value &&
-         json_object_get_boolean(value) != hijack && json_object_get_boolean(value)) ||
+         json_object_get_boolean(value)) ||
         (json_object_object_get_ex(cfg, "edns_client_subnet", &value) && value &&
-         json_object_get_boolean(value) != ecs && json_object_get_boolean(value)) ||
+         json_object_get_boolean(value)) ||
         (json_object_object_get_ex(cfg, "ipv6_dns", &value) && value &&
-         json_object_get_boolean(value) != ipv6_dns && json_object_get_boolean(value))) {
-        sqlite3_finalize(st);
+         json_object_get_boolean(value))) {
         return -3;
     }
-    sqlite3_finalize(st);
-    st = NULL;
 
     if (json_object_object_get_ex(cfg, "upstreams", &arr) && arr &&
         json_object_is_type(arr, json_type_array)) {
@@ -13629,6 +13758,15 @@ static int nc_dns_route_wan_runtime(const char *wan_id, unsigned *route_id,
 	int rc = -1;
 
 	if (!wan_id || !route_id || !fwmark || !table_id || !l3_device || !l3_len)
+		return -1;
+	/*
+	 * wan_id is pasted into a popen() shell command below, so a name holding
+	 * ; | ` $() or whitespace would execute. The routed writer now rejects
+	 * such names, but this check is kept independent of it: a row written by
+	 * an older build, or any future writer that forgets to validate, must not
+	 * turn into command execution here.
+	 */
+	if (!nc_valid_name(wan_id))
 		return -1;
 	l3_device[0] = '\0';
 	if (nc_prepare(&st, "SELECT id,fwmark,table_id FROM route_wan WHERE name=?1") != 0)
@@ -16385,7 +16523,53 @@ done:
     json_object_object_add(q,"configured_enabled",json_object_new_boolean(nc_json_bool_def(q,"enabled",0)));
     json_object_object_add(q,"runtime_applied",json_object_new_boolean(0));
     json_object_object_add(q,"runtime_reason",json_object_new_string("dataplane_apply_executor_missing"));
-    json_object_object_add(status,"active_flows",json_object_new_int(nc_vpn_count_table("flow_runtime_hits","WHERE ts > strftime('%s','now')-300")));json_object_object_add(status,"shaped_flows",json_object_new_int(0));json_object_object_add(status,"steered_flows",json_object_new_int(0));json_object_object_add(status,"fallback_flows",json_object_new_int(0));json_object_object_add(status,"queue_delay_ms",json_object_new_int(0));json_object_object_add(status,"dropped_packets",json_object_new_int64(0));
+    /*
+     * Flow status counters.
+     *
+     * shaped_flows, steered_flows, fallback_flows, queue_delay_ms and
+     * dropped_packets used to be literal 0 here. The UI divides
+     * steered_flows / active_flows, so it rendered a confident "policy steering
+     * 0.0%" while the rules were demonstrably matching. A hardcoded 0 is worse
+     * than no answer, because it is indistinguishable from a real measurement of
+     * zero.
+     *
+     * These are reported as null with an explicit *_supported flag and reason
+     * instead. This is the same convention the QoS and global blocks just above
+     * already use (runtime_applied=false / dataplane_apply_executor_missing), so
+     * a client can tell "not measured" from "measured as zero".
+     *
+     * Why not compute them here: the real per-class steering counts live in
+     * routed's conntrack fwmark reader (routed/jmx_route.c, route_count_conntrack_marks()),
+     * which is static and needs that module's rule payload as input. Exporting it
+     * would mean editing routed/, which is outside this change; the route_status
+     * path already publishes the real numbers. Duplicating the mark parsing here
+     * would create a second implementation free to drift from the first.
+     */
+    json_object_object_add(status, "active_flows",
+        json_object_new_int(nc_vpn_count_table("flow_runtime_hits",
+                                               "WHERE ts > strftime('%s','now')-300")));
+    json_object_object_add(status, "active_flows_semantics",
+        json_object_new_string("flow_runtime_hit_rows_last_300s"));
+
+    /* Shaping/queueing: no data source at all while the dataplane apply executor
+     * is missing, which is the same reason the QoS block reports above. */
+    json_object_object_add(status, "shaped_flows", NULL);
+    json_object_object_add(status, "queue_delay_ms", NULL);
+    json_object_object_add(status, "dropped_packets", NULL);
+    json_object_object_add(status, "shaped_flows_supported",
+                           json_object_new_boolean(0));
+    json_object_object_add(status, "shaped_flows_reason",
+        json_object_new_string("dataplane_apply_executor_missing"));
+
+    /* Steering: measured, but by routed rather than here. */
+    json_object_object_add(status, "steered_flows", NULL);
+    json_object_object_add(status, "fallback_flows", NULL);
+    json_object_object_add(status, "steered_flows_supported",
+                           json_object_new_boolean(0));
+    json_object_object_add(status, "steered_flows_reason",
+        json_object_new_string("counted_by_routed_use_route_status"));
+    json_object_object_add(status, "steered_flows_source",
+        json_object_new_string("dreamingwrt.routed route_status policy.steered_flows"));
 
     /* Smart mode */
     { struct json_object *smart = json_object_new_object();
@@ -17263,18 +17447,38 @@ static int nc_fw_uci_int(FILE *fp, const char *keyword, int value)
     return nc_fw_uci_value(fp, keyword, buf);
 }
 
-static int nc_fw_artifact_open(int *dirfd_out, char *tmp_name, size_t tmp_len)
+/*
+ * Reasons are reported separately from the failure itself because the caller
+ * used to collapse every outcome into write_failed = 1. "/etc/config is not a
+ * trustworthy directory" and "the filesystem refused the write" need different
+ * operator responses, and the first one is silent otherwise: a group-writable
+ * /etc/config makes every preview fail with no indication of why.
+ */
+#define NC_FW_ARTIFACT_REASON_DIR_UNTRUSTED "firewall_artifact_directory_untrusted"
+#define NC_FW_ARTIFACT_REASON_DIR_OPEN      "firewall_artifact_directory_open_failed"
+#define NC_FW_ARTIFACT_REASON_CREATE        "firewall_artifact_create_failed"
+#define NC_FW_ARTIFACT_REASON_WRITE         "firewall_artifact_write_failed"
+
+static int nc_fw_artifact_open(int *dirfd_out, char *tmp_name, size_t tmp_len,
+                               const char **reason_out)
 {
     struct stat st;
     int dirfd, fd = -1;
 
-    if (!dirfd_out || !tmp_name || tmp_len == 0)
+    if (!dirfd_out || !tmp_name || tmp_len == 0) {
+        if (reason_out) *reason_out = NC_FW_ARTIFACT_REASON_CREATE;
         return -1;
+    }
     *dirfd_out = -1;
     dirfd = open("/etc/config", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (dirfd < 0 || fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+    if (dirfd < 0) {
+        if (reason_out) *reason_out = NC_FW_ARTIFACT_REASON_DIR_OPEN;
+        return -1;
+    }
+    if (fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode) ||
         st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
-        if (dirfd >= 0) close(dirfd);
+        close(dirfd);
+        if (reason_out) *reason_out = NC_FW_ARTIFACT_REASON_DIR_UNTRUSTED;
         return -1;
     }
     for (int attempt = 0; attempt < 32; attempt++) {
@@ -17286,7 +17490,11 @@ static int nc_fw_artifact_open(int *dirfd_out, char *tmp_name, size_t tmp_len)
         if (fd >= 0) break;
         if (errno != EEXIST) break;
     }
-    if (fd < 0) { close(dirfd); return -1; }
+    if (fd < 0) {
+        close(dirfd);
+        if (reason_out) *reason_out = NC_FW_ARTIFACT_REASON_CREATE;
+        return -1;
+    }
     *dirfd_out = dirfd;
     return fd;
 }
@@ -17302,6 +17510,7 @@ struct json_object *jmx_firewall_service_apply(struct json_object *cfg)
     int dirfd = -1, fd = -1, dry = nc_json_bool_def(cfg, "dry_run", 0);
     int artifact_generated = 0, validated = dry ? 0 : 1, write_failed = 0;
     int step_rc = SQLITE_DONE;
+    const char *write_reason = NULL;
 
     if (jmx_netconfig_db_init() != 0) {
         json_object_object_add(data, "ok", json_object_new_boolean(0));
@@ -17316,9 +17525,12 @@ struct json_object *jmx_firewall_service_apply(struct json_object *cfg)
     json_object_object_add(summary, "ipsets", json_object_new_int(nc_vpn_count_table("firewall_ipset", "")));
 
     if (!dry) {
-        fd = nc_fw_artifact_open(&dirfd, tmp_name, sizeof(tmp_name));
+        fd = nc_fw_artifact_open(&dirfd, tmp_name, sizeof(tmp_name), &write_reason);
         if (fd < 0 || !(fp = fdopen(fd, "w"))) {
-            if (fd >= 0) close(fd);
+            if (fd >= 0) {
+                close(fd);
+                write_reason = NC_FW_ARTIFACT_REASON_CREATE;
+            }
             write_failed = 1;
             goto artifact_done;
         }
@@ -17401,7 +17613,20 @@ artifact_done:
     json_object_object_add(data,"readback_verified",json_object_new_boolean(0));
     json_object_object_add(data,"applied",json_object_new_boolean(0));
     json_object_object_add(data,"runtime_reason",json_object_new_string("firewall4_transaction_executor_pending"));
-    if(!dry&&(!validated||write_failed)){json_object_object_add(data,"error",json_object_new_string(!validated?"firewall_artifact_validation_failed":"firewall_artifact_write_failed"));json_object_object_add(data,"message",json_object_new_string("firewall preview artifact was not published"));}
+    if(!dry&&(!validated||write_failed)){
+        /*
+         * "error" intentionally keeps its original two values: the frontend
+         * matches on them. The specific cause goes in write_failure_reason.
+         */
+        json_object_object_add(data,"error",
+            json_object_new_string(!validated ? "firewall_artifact_validation_failed"
+                                              : NC_FW_ARTIFACT_REASON_WRITE));
+        json_object_object_add(data,"message",json_object_new_string("firewall preview artifact was not published"));
+        if(validated&&write_failed)
+            json_object_object_add(data,"write_failure_reason",
+                json_object_new_string(write_reason ? write_reason
+                                                    : NC_FW_ARTIFACT_REASON_WRITE));
+    }
     json_object_object_add(data,"summary",summary);json_object_object_add(data,"warnings",warnings);
     return jmx_gen_api_response_data((dry||(validated&&artifact_generated))?API_CODE_SUCCESS:API_CODE_ERROR,data);
 }
@@ -19135,11 +19360,21 @@ static void nc_wifi_status_attach_runtime(struct json_object *data)
     json_object_object_add(runtime, "iwinfo_available", json_object_new_boolean(iwinfo_available));
     json_object_object_add(runtime, "radio_source", json_object_new_string("/sys/class/ieee80211"));
     json_object_object_add(runtime, "interface_source", json_object_new_string("iw dev"));
-    json_object_object_add(runtime, "station_source", json_object_new_string("iw station dump"));
+    /* Report the source that actually produced stations. Naming a tool that
+     * returned nothing reads as "the source works and there are no clients",
+     * which is the misreading this field caused on QCA drivers. When `iw` runs
+     * but yields no stations, the source is unresolved, not confirmed. */
+    json_object_object_add(runtime, "station_source",
+        station_count > 0 ? json_object_new_string("iw station dump") :
+                            json_object_new_null());
+    json_object_object_add(runtime, "station_source_attempted",
+                           json_object_new_string("iw station dump"));
     json_object_object_add(runtime, "complete", json_object_new_boolean(phy_count > 0 && iw_available));
     json_object_object_add(runtime, "reason", json_object_new_string(
         phy_count <= 0 ? "no_phy_detected" :
-        (!iw_available ? "iw_unavailable" : "iw_runtime_station_mapping_available")));
+        (!iw_available ? "iw_unavailable" :
+         (station_count > 0 ? "iw_runtime_station_mapping_available" :
+                             "iw_station_dump_returned_no_stations"))));
     json_object_object_add(runtime, "interfaces", interfaces);
     json_object_object_add(runtime, "radios", json_object_get(runtime_radios));
 
@@ -19148,9 +19383,14 @@ static void nc_wifi_status_attach_runtime(struct json_object *data)
     json_object_object_add(summary, "interface_count", json_object_new_int(if_count));
     json_object_object_add(summary, "phy_count", json_object_new_int(phy_count));
     json_object_object_add(summary, "avg_signal", signal_samples > 0 ? json_object_new_int(avg_signal) : json_object_new_null());
-    json_object_object_add(summary, "avg_utilization", json_object_new_int(0));
-    json_object_object_add(summary, "avg_retry_rate", json_object_new_double(0));
-    json_object_object_add(summary, "worst_noise", json_object_new_int(0));
+    /* These three need channel-survey evidence this chain never collects.
+     * A literal 0 reads as "measured zero utilization"; null plus a reason
+     * says "not measured", which is the truth here. */
+    json_object_object_add(summary, "avg_utilization", json_object_new_null());
+    json_object_object_add(summary, "avg_retry_rate", json_object_new_null());
+    json_object_object_add(summary, "worst_noise", json_object_new_null());
+    json_object_object_add(summary, "airtime_reason",
+                           json_object_new_string("local_survey_source_unavailable"));
     json_object_object_add(summary, "source", json_object_new_string("iw_runtime+config_db"));
 
     json_object_object_add(data, "summary", summary);
@@ -19939,11 +20179,38 @@ struct nc_adv_artifact {
     ((st).st_uid == NC_ADV_TRUSTED_UID && \
      ((st).st_mode & (S_IWGRP | S_IWOTH)) == 0)
 #endif
+/*
+ * Predicate for the directories *above* the target.
+ *
+ * An ancestor only has to be a root-owned directory. Requiring the full
+ * NC_ADV_DIR_IS_TRUSTED test on every ancestor made a group-writable /etc
+ * (0775, which is what OpenWrt ships) fail the walk, and because the caller
+ * refused to start the whole netconfig database on failure, every read endpoint
+ * went silently empty. Six other trust checks in this file validate only their
+ * final directory; this one walking the entire parent chain was the outlier.
+ *
+ * The traversal itself still uses O_NOFOLLOW at each level, so the protection
+ * that actually matters here -- no symlink may be substituted part-way along the
+ * path -- is unchanged.
+ */
+#ifndef NC_ADV_ANCESTOR_IS_TRUSTED
+#define NC_ADV_ANCESTOR_IS_TRUSTED(st) ((st).st_uid == NC_ADV_TRUSTED_UID)
+#endif
 #ifndef NC_ADV_FAULT_POINT
 #define NC_ADV_FAULT_POINT(point) ((void)0)
 #endif
 #ifndef NC_ADV_FSYNC_DIR
 #define NC_ADV_FSYNC_DIR(fd) fsync(fd)
+#endif
+/*
+ * The traversal always starts here. Production is "/", and the walk below is
+ * byte-identical with that value. It exists as a macro so the permission tests
+ * can root the walk inside a temporary directory: the failure this check guards
+ * against needs group-writable ancestors, which a build machine does not have
+ * and a test cannot create above /tmp.
+ */
+#ifndef NC_ADV_TRUST_ROOT
+#define NC_ADV_TRUST_ROOT "/"
 #endif
 
 struct nc_adv_artifact_spec {
@@ -19994,10 +20261,10 @@ static int nc_adv_open_trusted_dir(const char *path)
 
     if (!path || path[0] != '/')
         return -1;
-    fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    fd = open(NC_ADV_TRUST_ROOT, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0 || fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
-        !NC_ADV_DIR_IS_TRUSTED(st))
-        return -1;
+        !NC_ADV_ANCESTOR_IS_TRUSTED(st))
+        goto fail;
     cursor = path + 1;
     while (*cursor) {
         const char *slash = strchr(cursor, '/');
@@ -20017,11 +20284,17 @@ static int nc_adv_open_trusted_dir(const char *path)
         }
         close(fd);
         fd = nextfd;
-        if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
-            !NC_ADV_DIR_IS_TRUSTED(st))
-            goto fail;
         cursor = slash ? slash + 1 : cursor + len;
+        /*
+         * Ancestors are checked loosely, the destination strictly. Which one
+         * this is depends on whether any component remains.
+         */
+        if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+            !(*cursor ? NC_ADV_ANCESTOR_IS_TRUSTED(st)
+                      : NC_ADV_DIR_IS_TRUSTED(st)))
+            goto fail;
     }
+    /* Re-checked because a path with a trailing slash leaves the loop early. */
     if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
         !NC_ADV_DIR_IS_TRUSTED(st))
         goto fail;
@@ -25254,11 +25527,27 @@ struct json_object *jmx_log_center_event_search(struct json_object *cfg)
     int limit = nc_json_int_def(cfg, "limit", 100);
     if(limit < 1) limit = 1; if(limit > 500) limit = 500;
 
-    char sql[1024] = "SELECT id,ts,type,level,source,event,category,target,detail,raw FROM log_event WHERE 1=1";
-    if(q[0]) { char tmp[256]; snprintf(tmp, sizeof(tmp), " AND (event LIKE '%%%s%%' OR detail LIKE '%%%s%%' OR category LIKE '%%%s%%')", q, q, q); strncat(sql, tmp, sizeof(sql)-strlen(sql)-1); }
-    if(type_filter[0]) { char tmp[128]; snprintf(tmp, sizeof(tmp), " AND type='%s'", type_filter); strncat(sql, tmp, sizeof(sql)-strlen(sql)-1); }
-    if(level_filter[0]) { char tmp[128]; snprintf(tmp, sizeof(tmp), " AND level='%s'", level_filter); strncat(sql, tmp, sizeof(sql)-strlen(sql)-1); }
-    if(source_filter[0]) { char tmp[128]; snprintf(tmp, sizeof(tmp), " AND source='%s'", source_filter); strncat(sql, tmp, sizeof(sql)-strlen(sql)-1); }
+    /*
+     * There is no "raw" column on log_event (see the CREATE TABLE and the
+     * sibling query above), so this SELECT never prepared and the function
+     * silently returned an empty result for every request, filters or not.
+     * nc_prepare() logs the failure but the caller only sees count=0, which is
+     * indistinguishable from "no matching events".
+     */
+    char sql[1024] = "SELECT id,ts,type,level,source,event,category,target,detail FROM log_event WHERE 1=1";
+    /*
+     * These four values come straight from the HTTP body via
+     * POST /api/v1/logs/events/search and used to be pasted into the SQL text,
+     * which let a caller close the quote and append their own clauses. Bind them
+     * as parameters instead; the placeholders below are filled in bind order
+     * after prepare, so the SQL shape is fixed no matter what the caller sends.
+     * ts_from/ts_to/limit stay inline: they are numeric and range-clamped.
+     */
+    char q_like[256];
+    if(q[0]) { strncat(sql, " AND (event LIKE ?1 OR detail LIKE ?1 OR category LIKE ?1)", sizeof(sql)-strlen(sql)-1); }
+    if(type_filter[0]) { strncat(sql, " AND type=?2", sizeof(sql)-strlen(sql)-1); }
+    if(level_filter[0]) { strncat(sql, " AND level=?3", sizeof(sql)-strlen(sql)-1); }
+    if(source_filter[0]) { strncat(sql, " AND source=?4", sizeof(sql)-strlen(sql)-1); }
     if(ts_from > 0) { char tmp[64]; snprintf(tmp, sizeof(tmp), " AND ts>=%lld", (long long)ts_from); strncat(sql, tmp, sizeof(sql)-strlen(sql)-1); }
     if(ts_to > 0) { char tmp[64]; snprintf(tmp, sizeof(tmp), " AND ts<=%lld", (long long)ts_to); strncat(sql, tmp, sizeof(sql)-strlen(sql)-1); }
     { char tmp[64]; snprintf(tmp, sizeof(tmp), " ORDER BY ts DESC LIMIT %d", limit); strncat(sql, tmp, sizeof(sql)-strlen(sql)-1); }
@@ -25266,6 +25555,22 @@ struct json_object *jmx_log_center_event_search(struct json_object *cfg)
     sqlite3_stmt *st = NULL;
     struct json_object *arr = json_object_new_array();
     if(nc_prepare(&st, sql)==0) {
+        /*
+         * Numbered placeholders keep bind indices stable even when a filter is
+         * absent, so binding an unused index is harmless rather than shifting
+         * the others. The % wildcards live in the bound value, not in the SQL,
+         * which is what makes a query containing % or _ or a quote inert.
+         */
+        if(q[0]) {
+            snprintf(q_like, sizeof(q_like), "%%%s%%", q);
+            sqlite3_bind_text(st, 1, q_like, -1, SQLITE_TRANSIENT);
+        }
+        if(type_filter[0])
+            sqlite3_bind_text(st, 2, type_filter, -1, SQLITE_TRANSIENT);
+        if(level_filter[0])
+            sqlite3_bind_text(st, 3, level_filter, -1, SQLITE_TRANSIENT);
+        if(source_filter[0])
+            sqlite3_bind_text(st, 4, source_filter, -1, SQLITE_TRANSIENT);
         while(sqlite3_step(st)==SQLITE_ROW) {
             struct json_object *o = json_object_new_object();
             nc_add_text(o, "id", st, 0);
@@ -27847,27 +28152,51 @@ static int nc_admin_password_complexity_ok(const char *pw)
     return (has_upper + has_lower + has_digit + has_special) >= 3;
 }
 
-static void nc_random_hex(char *out, int len)
+/*
+ * Strong-random hex, used for the PBKDF2 salt of web user password hashes.
+ *
+ * Returns 0 on success and -1 when strong randomness is unavailable, in which
+ * case the buffer is cleared and the caller must abort. There is deliberately no
+ * weak fallback: this used to drop to srand(time(NULL)) + rand() whenever
+ * fopen("/dev/urandom") failed, which is reachable through fd exhaustion or an
+ * early-boot /dev, and silent. A salt an attacker can predict from the account
+ * creation time removes the point of salting, because password hashes can then
+ * be precomputed.
+ *
+ * The old loop also ignored fgetc() failure: EOF is -1 and -1 & 0xf is 15, so a
+ * failed read silently produced 'f' for every byte.
+ */
+static int nc_random_hex(char *out, int len)
 {
     static const char hex[] = "0123456789abcdef";
-    FILE *fp;
-    int i;
+    unsigned char buf[64];
+    int produced = 0;
 
     if (!out || len <= 0)
-        return;
-    fp = fopen("/dev/urandom", "r");
-    if (fp) {
-        for (i = 0; i < len; i++) {
-            int c = fgetc(fp);
-            out[i] = hex[c & 0xf];
+        return -1;
+    out[0] = '\0';
+    while (produced < len) {
+        size_t want = (size_t)(len - produced + 1) / 2;
+        ssize_t got;
+        size_t i;
+
+        if (want > sizeof(buf))
+            want = sizeof(buf);
+        got = getrandom(buf, want, 0);
+        if (got <= 0) {
+            if (got < 0 && errno == EINTR)
+                continue;
+            memset(out, 0, (size_t)len + 1);
+            return -1;
         }
-        fclose(fp);
-    } else {
-        srand((unsigned int)time(NULL));
-        for (i = 0; i < len; i++)
-            out[i] = hex[rand() & 0xf];
+        for (i = 0; i < (size_t)got && produced < len; i++) {
+            out[produced++] = hex[(buf[i] >> 4) & 0xf];
+            if (produced < len)
+                out[produced++] = hex[buf[i] & 0xf];
+        }
     }
     out[len] = '\0';
+    return 0;
 }
 
 static int nc_hex_val(char c)
@@ -27921,7 +28250,9 @@ static int nc_web_password_hash(const char *password, char *out, size_t out_len)
 
     if (!password || !password[0] || !out || out_len == 0)
         return -1;
-    nc_random_hex(salt_hex, NC_WEBD_SALT_HEX_LEN);
+    /* Refuse to hash rather than salt with a predictable value. */
+    if (nc_random_hex(salt_hex, NC_WEBD_SALT_HEX_LEN) != 0)
+        return -1;
     if (nc_hex_to_bytes(salt_hex, salt, sizeof(salt)) != 0)
         return -1;
     if (PKCS5_PBKDF2_HMAC(password, strlen(password), salt, sizeof(salt),
@@ -29816,6 +30147,141 @@ struct json_object *jmx_signature_db_fingerprint_rules(struct json_object *cfg)
 /* ═══════════════════════════════════════════════════════════════════════════
  * AI Conversation History
  * ═══════════════════════════════════════════════════════════════════════════ */
+static const char *nc_text_or_empty(sqlite3_stmt *st, int col)
+{
+    const char *v = st ? (const char *)sqlite3_column_text(st, col) : NULL;
+    return v ? v : "";
+}
+
+static int nc_ai_provider_id_new(char out[33])
+{
+    if (!out)
+        return -1;
+    if (nc_random_hex(out, 32) != 0) {
+        snprintf(out, 33, "%016llx%016llx",
+                 (unsigned long long)nc_now_s(),
+                 (unsigned long long)(uintptr_t)out);
+        return 0;
+    }
+    return 0;
+}
+
+/*
+ * One-way, idempotent move of the single ai_config row into ai_provider.
+ * ai_config is deliberately kept: it still holds the session-level defaults
+ * (temperature / max_tokens / system_prompt / tool_policy) and the old
+ * /api/v1/ai/config readers (iOS app, web) must keep working.
+ */
+static int nc_ai_multi_provider_migrate_once(void)
+{
+    sqlite3_stmt *st = NULL;
+    char id[33] = "";
+    int have_legacy = 0;
+    int provider_rows = 0;
+    int imported = 0;
+
+    if (nc_prepare(&st,
+        "SELECT 1 FROM config_migration WHERE name=?1 AND status='done'") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, NC_AI_MULTI_PROVIDER_MIGRATION, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        sqlite3_finalize(st);
+        return 0;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+
+    if (nc_txn_begin() != 0)
+        return -1;
+
+    if (nc_prepare(&st, "SELECT COUNT(*) FROM ai_provider") != 0)
+        goto rollback;
+    if (sqlite3_step(st) == SQLITE_ROW)
+        provider_rows = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    st = NULL;
+
+    if (provider_rows == 0) {
+        if (nc_prepare(&st,
+            "SELECT provider,api_base,api_key,model,enabled,reasoning_effort,"
+            "reasoning_api_shape,auth_mode FROM ai_config WHERE id=1") != 0)
+            goto rollback;
+        have_legacy = sqlite3_step(st) == SQLITE_ROW;
+        if (have_legacy) {
+            const char *provider = nc_text_or_empty(st, 0);
+            const char *api_base = nc_text_or_empty(st, 1);
+            const char *api_key = nc_text_or_empty(st, 2);
+            const char *model = nc_text_or_empty(st, 3);
+            int enabled = sqlite3_column_int(st, 4);
+            const char *effort = nc_text_or_empty(st, 5);
+            const char *shape = nc_text_or_empty(st, 6);
+            const char *auth_mode = nc_text_or_empty(st, 7);
+            sqlite3_stmt *ins = NULL;
+
+            nc_ai_provider_id_new(id);
+            if (nc_prepare(&ins,
+                "INSERT INTO ai_provider(id,provider,display_name,api_base,api_key,"
+                "auth_mode,default_model,role,priority,weight,enabled,"
+                "reasoning_effort,reasoning_api_shape,updated_at) "
+                "VALUES(?1,?2,'',?3,?4,?5,?6,'primary',0,1,?7,?8,?9,?10)") != 0) {
+                sqlite3_finalize(st);
+                st = NULL;
+                goto rollback;
+            }
+            sqlite3_bind_text(ins, 1, id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 2, provider, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 3, api_base, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 4, api_key, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 5, auth_mode[0] ? auth_mode : "api_key", -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 6, model, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(ins, 7, enabled ? 1 : 0);
+            sqlite3_bind_text(ins, 8, effort[0] ? effort : "auto", -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 9, shape[0] ? shape : "chat_completions", -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(ins, 10, nc_now_s());
+            if (nc_step_done(ins) != 0) {
+                sqlite3_finalize(ins);
+                sqlite3_finalize(st);
+                st = NULL;
+                goto rollback;
+            }
+            imported = sqlite3_changes(g_netconfig_db);
+            sqlite3_finalize(ins);
+        }
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+
+    if (nc_prepare(&st,
+        "INSERT OR IGNORE INTO ai_dispatch_policy(id,strategy,updated_at) "
+        "VALUES(1,'single',?1)") != 0)
+        goto rollback;
+    sqlite3_bind_int64(st, 1, nc_now_s());
+    if (nc_step_done(st) != 0)
+        goto rollback;
+    sqlite3_finalize(st);
+    st = NULL;
+
+    if (nc_prepare(&st,
+        "INSERT INTO config_migration(name,status,source,imported_rows,imported_at,detail) "
+        "VALUES(?1,'done','config.db:ai_config',?2,?3,?4)") != 0)
+        goto rollback;
+    sqlite3_bind_text(st, 1, NC_AI_MULTI_PROVIDER_MIGRATION, -1, SQLITE_STATIC);
+    sqlite3_bind_int(st, 2, imported);
+    sqlite3_bind_int64(st, 3, nc_now_s());
+    sqlite3_bind_text(st, 4, imported ? "ai_config_row_promoted_to_primary_provider" :
+                                        "no_legacy_ai_config_row", -1, SQLITE_STATIC);
+    if (nc_step_done(st) != 0)
+        goto rollback;
+    sqlite3_finalize(st);
+    st = NULL;
+    return nc_txn_end(0);
+
+rollback:
+    if (st) sqlite3_finalize(st);
+    nc_txn_end(-1);
+    return -1;
+}
+
 static void nc_ai_db_init(void)
 {
     nc_exec("CREATE TABLE IF NOT EXISTS ai_conversation ("
@@ -29892,6 +30358,52 @@ static void nc_ai_db_init(void)
             "ON ai_tool_auth(conversation_id,tool_call_id) WHERE tool_call_id<>''");
     nc_exec("CREATE INDEX IF NOT EXISTS ai_tool_auth_status_idx "
             "ON ai_tool_auth(status,created_at)");
+    /* Multi-provider: ai_config stays as the global default (temperature,
+     * max_tokens, system_prompt, tool_policy); per-provider credentials and
+     * the dispatch strategy live in the tables below. */
+    nc_exec("CREATE TABLE IF NOT EXISTS ai_provider ("
+        "id TEXT PRIMARY KEY,"
+        "provider TEXT NOT NULL DEFAULT 'openai',"
+        "display_name TEXT NOT NULL DEFAULT '',"
+        "api_base TEXT NOT NULL DEFAULT '',"
+        "api_key TEXT NOT NULL DEFAULT '',"
+        "auth_mode TEXT NOT NULL DEFAULT 'api_key',"
+        "default_model TEXT NOT NULL DEFAULT '',"
+        "role TEXT NOT NULL DEFAULT 'standby',"
+        "priority INTEGER NOT NULL DEFAULT 100,"
+        "weight INTEGER NOT NULL DEFAULT 1,"
+        "enabled INTEGER NOT NULL DEFAULT 0,"
+        "reasoning_effort TEXT NOT NULL DEFAULT 'auto',"
+        "reasoning_api_shape TEXT NOT NULL DEFAULT 'chat_completions',"
+        "last_check_ts INTEGER NOT NULL DEFAULT 0,"
+        "last_check_ok INTEGER NOT NULL DEFAULT -1,"
+        "last_check_latency_ms INTEGER NOT NULL DEFAULT -1,"
+        "last_check_error TEXT NOT NULL DEFAULT '',"
+        "updated_at INTEGER NOT NULL DEFAULT 0"
+    ")");
+    nc_exec("CREATE INDEX IF NOT EXISTS ai_provider_dispatch_idx "
+            "ON ai_provider(enabled,priority,id)");
+    nc_exec("CREATE TABLE IF NOT EXISTS ai_provider_model ("
+        "provider_id TEXT NOT NULL,"
+        "model_id TEXT NOT NULL,"
+        "display_name TEXT NOT NULL DEFAULT '',"
+        "synced_at INTEGER NOT NULL DEFAULT 0,"
+        "PRIMARY KEY (provider_id,model_id)"
+    ")");
+    nc_exec("CREATE TABLE IF NOT EXISTS ai_dispatch_policy ("
+        "id INTEGER PRIMARY KEY CHECK (id = 1),"
+        "strategy TEXT NOT NULL DEFAULT 'single',"
+        "failover_timeout_ms INTEGER NOT NULL DEFAULT 20000,"
+        "failover_max_attempts INTEGER NOT NULL DEFAULT 2,"
+        /* webd is fork-per-request, so a purely in-memory round-robin cursor
+         * would reset every request and load_balance would always pick the
+         * first provider. The cursor has to be persisted to be real. */
+        "lb_cursor INTEGER NOT NULL DEFAULT 0,"
+        "updated_at INTEGER NOT NULL DEFAULT 0"
+    ")");
+    nc_add_column_if_missing("ai_dispatch_policy", "lb_cursor",
+                             "INTEGER NOT NULL DEFAULT 0");
+    nc_ai_multi_provider_migrate_once();
 }
 
 /* ═══ AI Config CRUD ═══ */
@@ -30077,6 +30589,696 @@ int jmx_ai_config_set(struct json_object *cfg)
         }
     }
     return rc;
+}
+
+/* ═══ AI Multi-Provider CRUD ═══ */
+
+static int nc_ai_provider_kind_ok(const char *provider)
+{
+    static const char *kinds[] = {
+        "openai", "anthropic", "claude", "gemini", "google-gemini", "deepseek",
+        "qwen", "moonshot", "kimi", "kimi-code", "kimi_code", "custom",
+        "openai-compatible", "openai_compatible", NULL
+    };
+    if (!provider || !provider[0])
+        return 0;
+    for (int i = 0; kinds[i]; i++) {
+        if (!strcasecmp(provider, kinds[i]))
+            return 1;
+    }
+    return 0;
+}
+
+static int nc_ai_strategy_ok(const char *strategy)
+{
+    return strategy && (!strcmp(strategy, "single") ||
+                        !strcmp(strategy, "failover") ||
+                        !strcmp(strategy, "load_balance"));
+}
+
+static int nc_ai_provider_id_ok(const char *id)
+{
+    size_t n = id ? strlen(id) : 0;
+    if (n == 0 || n > 64)
+        return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!isalnum((unsigned char)id[i]) && id[i] != '-' && id[i] != '_')
+            return 0;
+    }
+    return 1;
+}
+
+/* Never echo a stored key back. Hint is first 3 + last 4; anything shorter
+ * than 12 chars degrades to "***" so a short key cannot be reconstructed. */
+static void nc_ai_key_hint(const char *key, char *out, size_t out_len)
+{
+    size_t n = key ? strlen(key) : 0;
+    if (!out || out_len == 0)
+        return;
+    if (n == 0) {
+        out[0] = '\0';
+        return;
+    }
+    if (n < 12) {
+        snprintf(out, out_len, "***");
+        return;
+    }
+    snprintf(out, out_len, "%.3s...%s", key, key + n - 4);
+}
+
+static void nc_ai_provider_row_json(struct json_object *o, sqlite3_stmt *st)
+{
+    const char *key = nc_text_or_empty(st, 4);
+    char hint[64] = "";
+    struct json_object *last = json_object_new_object();
+    int64_t synced_at = sqlite3_column_int64(st, 18);
+
+    json_object_object_add(o, "id", json_object_new_string(nc_text_or_empty(st, 0)));
+    json_object_object_add(o, "provider", json_object_new_string(nc_text_or_empty(st, 1)));
+    json_object_object_add(o, "display_name", json_object_new_string(nc_text_or_empty(st, 2)));
+    json_object_object_add(o, "api_base", json_object_new_string(nc_text_or_empty(st, 3)));
+    json_object_object_add(o, "api_key_set", json_object_new_boolean(key[0] ? 1 : 0));
+    nc_ai_key_hint(key, hint, sizeof(hint));
+    json_object_object_add(o, "api_key_hint", json_object_new_string(hint));
+    json_object_object_add(o, "auth_mode", json_object_new_string(nc_text_or_empty(st, 5)));
+    json_object_object_add(o, "default_model", json_object_new_string(nc_text_or_empty(st, 6)));
+    json_object_object_add(o, "role", json_object_new_string(nc_text_or_empty(st, 7)));
+    json_object_object_add(o, "priority", json_object_new_int(sqlite3_column_int(st, 8)));
+    json_object_object_add(o, "weight", json_object_new_int(sqlite3_column_int(st, 9)));
+    json_object_object_add(o, "enabled", json_object_new_boolean(sqlite3_column_int(st, 10)));
+    json_object_object_add(o, "reasoning_effort", json_object_new_string(nc_text_or_empty(st, 11)));
+    json_object_object_add(o, "reasoning_api_shape", json_object_new_string(nc_text_or_empty(st, 12)));
+    json_object_object_add(o, "model_count", json_object_new_int(sqlite3_column_int(st, 17)));
+    json_object_object_add(o, "models_synced_at",
+                          synced_at > 0 ? json_object_new_int64(synced_at) : NULL);
+    /* last_check_ok is -1 until the provider has actually been tested. Report
+     * that as null rather than false, so the UI can distinguish "never tested"
+     * from "tested and failed". */
+    if (sqlite3_column_int(st, 14) < 0) {
+        json_object_object_add(last, "ok", NULL);
+        json_object_object_add(last, "latency_ms", NULL);
+        json_object_object_add(last, "checked_at", NULL);
+        json_object_object_add(last, "error", json_object_new_string(""));
+    } else {
+        int latency = sqlite3_column_int(st, 15);
+        json_object_object_add(last, "ok",
+                               json_object_new_boolean(sqlite3_column_int(st, 14) ? 1 : 0));
+        json_object_object_add(last, "latency_ms",
+                               latency >= 0 ? json_object_new_int(latency) : NULL);
+        json_object_object_add(last, "checked_at",
+                               json_object_new_int64(sqlite3_column_int64(st, 13)));
+        json_object_object_add(last, "error", json_object_new_string(nc_text_or_empty(st, 16)));
+    }
+    json_object_object_add(o, "last_check", last);
+    json_object_object_add(o, "updated_at", json_object_new_int64(sqlite3_column_int64(st, 19)));
+}
+
+#define NC_AI_PROVIDER_SELECT \
+    "SELECT p.id,p.provider,p.display_name,p.api_base,p.api_key,p.auth_mode," \
+    "p.default_model,p.role,p.priority,p.weight,p.enabled,p.reasoning_effort," \
+    "p.reasoning_api_shape,p.last_check_ts,p.last_check_ok,p.last_check_latency_ms," \
+    "p.last_check_error," \
+    "(SELECT COUNT(*) FROM ai_provider_model m WHERE m.provider_id=p.id)," \
+    "(SELECT MAX(m.synced_at) FROM ai_provider_model m WHERE m.provider_id=p.id)," \
+    "p.updated_at FROM ai_provider p "
+
+struct json_object *jmx_ai_providers_list(void)
+{
+    struct json_object *data = json_object_new_object();
+    struct json_object *arr = json_object_new_array();
+    sqlite3_stmt *st = NULL;
+
+    if (jmx_netconfig_db_init() != 0) {
+        json_object_object_add(data, "providers", arr);
+        return jmx_gen_api_response_data(API_CODE_ERROR, data);
+    }
+    nc_ai_db_init();
+    if (nc_prepare(&st, NC_AI_PROVIDER_SELECT
+                   "ORDER BY p.priority,p.id") == 0) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            struct json_object *o = json_object_new_object();
+            nc_ai_provider_row_json(o, st);
+            json_object_array_add(arr, o);
+        }
+        sqlite3_finalize(st);
+    }
+    json_object_object_add(data, "providers", arr);
+    json_object_object_add(data, "count", json_object_new_int(json_object_array_length(arr)));
+    json_object_object_add(data, "ts", json_object_new_int64(nc_now_s()));
+    return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+}
+
+struct json_object *jmx_ai_provider_get(const char *id)
+{
+    struct json_object *data = NULL;
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+
+    if (!nc_ai_provider_id_ok(id) || jmx_netconfig_db_init() != 0)
+        return NULL;
+    nc_ai_db_init();
+    if (nc_prepare(&st, NC_AI_PROVIDER_SELECT "WHERE p.id=?1") == 0) {
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            data = json_object_new_object();
+            nc_ai_provider_row_json(data, st);
+            found = 1;
+        }
+        sqlite3_finalize(st);
+    }
+    if (!found)
+        return NULL;
+    return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+}
+
+/*
+ * Return codes shared by create/update:
+ *  -1 internal, -2 invalid_provider_kind, -3 conflicting_api_key_action,
+ *  -4 invalid_role, -5 invalid_auth_mode, -6 provider_not_found,
+ *  -7 invalid_field
+ */
+static int nc_ai_provider_validate_common(struct json_object *cfg, int creating)
+{
+    struct json_object *v = NULL;
+    const char *s;
+
+    if (json_object_object_get_ex(cfg, "provider", &v) && v) {
+        if (!json_object_is_type(v, json_type_string) ||
+            !nc_ai_provider_kind_ok(json_object_get_string(v)))
+            return -2;
+    } else if (creating) {
+        return -2;
+    }
+    if (json_object_object_get_ex(cfg, "auth_mode", &v) && v) {
+        if (!json_object_is_type(v, json_type_string))
+            return -5;
+        s = json_object_get_string(v);
+        if (strcmp(s, "api_key") && strcmp(s, "oauth"))
+            return -5;
+    }
+    if (json_object_object_get_ex(cfg, "role", &v) && v) {
+        if (!json_object_is_type(v, json_type_string))
+            return -4;
+        s = json_object_get_string(v);
+        if (strcmp(s, "primary") && strcmp(s, "standby"))
+            return -4;
+    }
+    if (json_object_object_get_ex(cfg, "priority", &v) && v) {
+        if (!json_object_is_type(v, json_type_int) ||
+            json_object_get_int(v) < 0 || json_object_get_int(v) > 10000)
+            return -7;
+    }
+    if (json_object_object_get_ex(cfg, "weight", &v) && v) {
+        if (!json_object_is_type(v, json_type_int) ||
+            json_object_get_int(v) < 1 || json_object_get_int(v) > 1000)
+            return -7;
+    }
+    return 0;
+}
+
+/* Only one primary is allowed; promoting one demotes the others. */
+static int nc_ai_provider_demote_others(const char *id)
+{
+    sqlite3_stmt *st = NULL;
+    int rc;
+
+    if (nc_prepare(&st, "UPDATE ai_provider SET role='standby',updated_at=?2 "
+                        "WHERE role='primary' AND id<>?1") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, nc_now_s());
+    rc = nc_step_done(st);
+    sqlite3_finalize(st);
+    return rc;
+}
+
+int jmx_ai_provider_create(struct json_object *cfg, char out_id[65])
+{
+    sqlite3_stmt *st = NULL;
+    char id[33] = "";
+    int rc = -1, vrc;
+    const char *role;
+
+    if (!cfg || jmx_netconfig_db_init() != 0)
+        return -1;
+    nc_ai_db_init();
+    vrc = nc_ai_provider_validate_common(cfg, 1);
+    if (vrc != 0)
+        return vrc;
+    if (nc_ai_provider_id_new(id) != 0)
+        return -1;
+    role = nc_json_str_def(cfg, "role", "standby");
+    if (nc_txn_begin() != 0)
+        return -1;
+    if (nc_prepare(&st,
+        "INSERT INTO ai_provider(id,provider,display_name,api_base,api_key,auth_mode,"
+        "default_model,role,priority,weight,enabled,reasoning_effort,"
+        "reasoning_api_shape,updated_at) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)") != 0)
+        goto out;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, nc_json_str_def(cfg, "provider", "openai"), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, nc_json_str_def(cfg, "display_name", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, nc_json_str_def(cfg, "api_base", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, nc_json_str_def(cfg, "api_key", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, nc_json_str_def(cfg, "auth_mode", "api_key"), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, nc_json_str_def(cfg, "default_model", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, role, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 9, nc_json_int_def(cfg, "priority", 100));
+    sqlite3_bind_int(st, 10, nc_json_int_def(cfg, "weight", 1));
+    sqlite3_bind_int(st, 11, nc_json_bool_def(cfg, "enabled", 0) ? 1 : 0);
+    sqlite3_bind_text(st, 12, nc_json_str_def(cfg, "reasoning_effort", "auto"), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 13, nc_json_str_def(cfg, "reasoning_api_shape", "chat_completions"), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 14, nc_now_s());
+    if (nc_step_done(st) != 0)
+        goto out;
+    sqlite3_finalize(st);
+    st = NULL;
+    if (!strcmp(role, "primary") && nc_ai_provider_demote_others(id) != 0)
+        goto out;
+    rc = 0;
+    if (out_id)
+        snprintf(out_id, 65, "%s", id);
+out:
+    if (st) sqlite3_finalize(st);
+    return nc_txn_end(rc);
+}
+
+/*
+ * Partial update. A field that is absent from the payload keeps its stored
+ * value; this is why every column gets its own guarded UPDATE instead of one
+ * blanket statement. `api_key` absent means keep, empty string means clear.
+ */
+int jmx_ai_provider_update(const char *id, struct json_object *cfg)
+{
+    static const struct { const char *key; const char *column; } text_fields[] = {
+        { "provider", "provider" },
+        { "display_name", "display_name" },
+        { "api_base", "api_base" },
+        { "auth_mode", "auth_mode" },
+        { "default_model", "default_model" },
+        { "reasoning_effort", "reasoning_effort" },
+        { "reasoning_api_shape", "reasoning_api_shape" },
+        { NULL, NULL }
+    };
+    static const struct { const char *key; const char *column; } int_fields[] = {
+        { "priority", "priority" },
+        { "weight", "weight" },
+        { NULL, NULL }
+    };
+    sqlite3_stmt *st = NULL;
+    struct json_object *v = NULL;
+    int rc = -1, vrc, exists = 0;
+    char sql[160];
+
+    if (!nc_ai_provider_id_ok(id) || !cfg || jmx_netconfig_db_init() != 0)
+        return -1;
+    nc_ai_db_init();
+    vrc = nc_ai_provider_validate_common(cfg, 0);
+    if (vrc != 0)
+        return vrc;
+    if (nc_prepare(&st, "SELECT 1 FROM ai_provider WHERE id=?1") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    exists = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    st = NULL;
+    if (!exists)
+        return -6;
+
+    if (nc_txn_begin() != 0)
+        return -1;
+    for (int i = 0; text_fields[i].key; i++) {
+        if (!json_object_object_get_ex(cfg, text_fields[i].key, &v) || !v ||
+            !json_object_is_type(v, json_type_string))
+            continue;
+        snprintf(sql, sizeof(sql), "UPDATE ai_provider SET %s=?2 WHERE id=?1",
+                 text_fields[i].column);
+        if (nc_prepare(&st, sql) != 0)
+            goto out;
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, json_object_get_string(v), -1, SQLITE_TRANSIENT);
+        if (nc_step_done(st) != 0)
+            goto out;
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    for (int i = 0; int_fields[i].key; i++) {
+        if (!json_object_object_get_ex(cfg, int_fields[i].key, &v) || !v ||
+            !json_object_is_type(v, json_type_int))
+            continue;
+        snprintf(sql, sizeof(sql), "UPDATE ai_provider SET %s=?2 WHERE id=?1",
+                 int_fields[i].column);
+        if (nc_prepare(&st, sql) != 0)
+            goto out;
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, json_object_get_int(v));
+        if (nc_step_done(st) != 0)
+            goto out;
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (json_object_object_get_ex(cfg, "enabled", &v) && v) {
+        if (nc_prepare(&st, "UPDATE ai_provider SET enabled=?2 WHERE id=?1") != 0)
+            goto out;
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, json_object_get_boolean(v) ? 1 : 0);
+        if (nc_step_done(st) != 0)
+            goto out;
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (json_object_object_get_ex(cfg, "api_key", &v) && v &&
+        json_object_is_type(v, json_type_string)) {
+        if (nc_prepare(&st, "UPDATE ai_provider SET api_key=?2 WHERE id=?1") != 0)
+            goto out;
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, json_object_get_string(v), -1, SQLITE_TRANSIENT);
+        if (nc_step_done(st) != 0)
+            goto out;
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (json_object_object_get_ex(cfg, "role", &v) && v &&
+        json_object_is_type(v, json_type_string)) {
+        const char *role = json_object_get_string(v);
+        if (nc_prepare(&st, "UPDATE ai_provider SET role=?2 WHERE id=?1") != 0)
+            goto out;
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, role, -1, SQLITE_TRANSIENT);
+        if (nc_step_done(st) != 0)
+            goto out;
+        sqlite3_finalize(st);
+        st = NULL;
+        if (!strcmp(role, "primary") && nc_ai_provider_demote_others(id) != 0)
+            goto out;
+    }
+    if (nc_prepare(&st, "UPDATE ai_provider SET updated_at=?2 WHERE id=?1") != 0)
+        goto out;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, nc_now_s());
+    if (nc_step_done(st) != 0)
+        goto out;
+    sqlite3_finalize(st);
+    st = NULL;
+    rc = 0;
+out:
+    if (st) sqlite3_finalize(st);
+    return nc_txn_end(rc);
+}
+
+int jmx_ai_provider_delete(const char *id)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = -1, removed = 0;
+
+    if (!nc_ai_provider_id_ok(id) || jmx_netconfig_db_init() != 0)
+        return -1;
+    nc_ai_db_init();
+    if (nc_txn_begin() != 0)
+        return -1;
+    if (nc_prepare(&st, "DELETE FROM ai_provider WHERE id=?1") != 0)
+        goto out;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    if (nc_step_done(st) != 0)
+        goto out;
+    removed = sqlite3_changes(g_netconfig_db);
+    sqlite3_finalize(st);
+    st = NULL;
+    if (!removed) {
+        rc = -6;
+        goto out;
+    }
+    if (nc_prepare(&st, "DELETE FROM ai_provider_model WHERE provider_id=?1") != 0)
+        goto out;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    if (nc_step_done(st) != 0)
+        goto out;
+    sqlite3_finalize(st);
+    st = NULL;
+    rc = 0;
+out:
+    if (st) sqlite3_finalize(st);
+    if (rc == -6) {
+        nc_txn_end(-1);
+        return -6;
+    }
+    return nc_txn_end(rc);
+}
+
+int jmx_ai_provider_check_record(const char *id, int ok, int latency_ms,
+                                 const char *error)
+{
+    sqlite3_stmt *st = NULL;
+    int rc;
+
+    if (!nc_ai_provider_id_ok(id) || jmx_netconfig_db_init() != 0)
+        return -1;
+    nc_ai_db_init();
+    if (nc_prepare(&st,
+        "UPDATE ai_provider SET last_check_ts=?2,last_check_ok=?3,"
+        "last_check_latency_ms=?4,last_check_error=?5 WHERE id=?1") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, nc_now_s());
+    sqlite3_bind_int(st, 3, ok ? 1 : 0);
+    sqlite3_bind_int(st, 4, latency_ms);
+    sqlite3_bind_text(st, 5, error ? error : "", -1, SQLITE_TRANSIENT);
+    rc = nc_step_done(st);
+    sqlite3_finalize(st);
+    return rc;
+}
+
+struct json_object *jmx_ai_provider_models_list(const char *id)
+{
+    struct json_object *data = json_object_new_object();
+    struct json_object *arr = json_object_new_array();
+    sqlite3_stmt *st = NULL;
+    int64_t synced_at = 0;
+
+    if (!nc_ai_provider_id_ok(id) || jmx_netconfig_db_init() != 0) {
+        json_object_put(data);
+        json_object_put(arr);
+        return NULL;
+    }
+    nc_ai_db_init();
+    if (nc_prepare(&st, "SELECT 1 FROM ai_provider WHERE id=?1") == 0) {
+        int exists;
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        exists = sqlite3_step(st) == SQLITE_ROW;
+        sqlite3_finalize(st);
+        st = NULL;
+        if (!exists) {
+            json_object_put(data);
+            json_object_put(arr);
+            return NULL;
+        }
+    }
+    if (nc_prepare(&st, "SELECT model_id,display_name,synced_at FROM ai_provider_model "
+                        "WHERE provider_id=?1 ORDER BY model_id") == 0) {
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            struct json_object *o = json_object_new_object();
+            int64_t ts = sqlite3_column_int64(st, 2);
+            json_object_object_add(o, "id", json_object_new_string(nc_text_or_empty(st, 0)));
+            json_object_object_add(o, "display_name", json_object_new_string(nc_text_or_empty(st, 1)));
+            json_object_object_add(o, "synced_at", json_object_new_int64(ts));
+            if (ts > synced_at) synced_at = ts;
+            json_object_array_add(arr, o);
+        }
+        sqlite3_finalize(st);
+    }
+    json_object_object_add(data, "provider_id", json_object_new_string(id));
+    json_object_object_add(data, "models", arr);
+    json_object_object_add(data, "model_count", json_object_new_int(json_object_array_length(arr)));
+    json_object_object_add(data, "models_synced_at",
+                          synced_at > 0 ? json_object_new_int64(synced_at) : NULL);
+    return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+}
+
+int jmx_ai_provider_models_replace(const char *id, struct json_object *models)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = -1, n;
+    int64_t now = nc_now_s();
+
+    if (!nc_ai_provider_id_ok(id) || !models ||
+        !json_object_is_type(models, json_type_array) ||
+        jmx_netconfig_db_init() != 0)
+        return -1;
+    nc_ai_db_init();
+    if (nc_txn_begin() != 0)
+        return -1;
+    if (nc_prepare(&st, "DELETE FROM ai_provider_model WHERE provider_id=?1") != 0)
+        goto out;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    if (nc_step_done(st) != 0)
+        goto out;
+    sqlite3_finalize(st);
+    st = NULL;
+    n = json_object_array_length(models);
+    for (int i = 0; i < n; i++) {
+        struct json_object *item = json_object_array_get_idx(models, i);
+        const char *model_id = NULL, *display = "";
+
+        if (item && json_object_is_type(item, json_type_string)) {
+            model_id = json_object_get_string(item);
+        } else if (item && json_object_is_type(item, json_type_object)) {
+            model_id = nc_json_str_def(item, "id", "");
+            display = nc_json_str_def(item, "display_name", "");
+        }
+        if (!model_id || !model_id[0])
+            continue;
+        if (nc_prepare(&st, "INSERT OR REPLACE INTO ai_provider_model"
+                            "(provider_id,model_id,display_name,synced_at) "
+                            "VALUES(?1,?2,?3,?4)") != 0)
+            goto out;
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, model_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, display, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 4, now);
+        if (nc_step_done(st) != 0)
+            goto out;
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    rc = 0;
+out:
+    if (st) sqlite3_finalize(st);
+    return nc_txn_end(rc);
+}
+
+struct json_object *jmx_ai_dispatch_policy_get(void)
+{
+    struct json_object *data = json_object_new_object();
+    sqlite3_stmt *st = NULL;
+    struct json_object *strategies = json_object_new_array();
+
+    json_object_object_add(data, "strategy", json_object_new_string("single"));
+    json_object_object_add(data, "failover_timeout_ms", json_object_new_int(20000));
+    json_object_object_add(data, "failover_max_attempts", json_object_new_int(2));
+    json_object_object_add(data, "updated_at", json_object_new_int64(0));
+    if (jmx_netconfig_db_init() != 0)
+        goto done;
+    nc_ai_db_init();
+    if (nc_prepare(&st, "SELECT strategy,failover_timeout_ms,failover_max_attempts,"
+                        "updated_at FROM ai_dispatch_policy WHERE id=1") == 0) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            json_object_object_add(data, "strategy",
+                                   json_object_new_string(nc_text_or_empty(st, 0)));
+            json_object_object_add(data, "failover_timeout_ms",
+                                   json_object_new_int(sqlite3_column_int(st, 1)));
+            json_object_object_add(data, "failover_max_attempts",
+                                   json_object_new_int(sqlite3_column_int(st, 2)));
+            json_object_object_add(data, "updated_at",
+                                   json_object_new_int64(sqlite3_column_int64(st, 3)));
+        }
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (nc_prepare(&st, "SELECT COUNT(*),SUM(enabled),"
+                        "SUM(CASE WHEN role='primary' AND enabled=1 THEN 1 ELSE 0 END) "
+                        "FROM ai_provider") == 0) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            json_object_object_add(data, "provider_count",
+                                   json_object_new_int(sqlite3_column_int(st, 0)));
+            json_object_object_add(data, "enabled_provider_count",
+                                   json_object_new_int(sqlite3_column_int(st, 1)));
+            json_object_object_add(data, "primary_ready",
+                                   json_object_new_boolean(sqlite3_column_int(st, 2) > 0));
+        }
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+done:
+    json_object_array_add(strategies, json_object_new_string("single"));
+    json_object_array_add(strategies, json_object_new_string("failover"));
+    json_object_array_add(strategies, json_object_new_string("load_balance"));
+    json_object_object_add(data, "available_strategies", strategies);
+    json_object_object_add(data, "ts", json_object_new_int64(nc_now_s()));
+    return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+}
+
+/* -2 invalid_strategy, -7 invalid_field */
+int jmx_ai_dispatch_policy_set(struct json_object *cfg)
+{
+    sqlite3_stmt *st = NULL;
+    struct json_object *v = NULL;
+    const char *strategy = NULL;
+    int timeout_ms = -1, max_attempts = -1;
+    int rc = -1;
+
+    if (!cfg || jmx_netconfig_db_init() != 0)
+        return -1;
+    nc_ai_db_init();
+    if (json_object_object_get_ex(cfg, "strategy", &v) && v) {
+        if (!json_object_is_type(v, json_type_string) ||
+            !nc_ai_strategy_ok(json_object_get_string(v)))
+            return -2;
+        strategy = json_object_get_string(v);
+    }
+    if (json_object_object_get_ex(cfg, "failover_timeout_ms", &v) && v) {
+        if (!json_object_is_type(v, json_type_int))
+            return -7;
+        timeout_ms = json_object_get_int(v);
+        if (timeout_ms < 1000 || timeout_ms > 120000)
+            return -7;
+    }
+    if (json_object_object_get_ex(cfg, "failover_max_attempts", &v) && v) {
+        if (!json_object_is_type(v, json_type_int))
+            return -7;
+        max_attempts = json_object_get_int(v);
+        if (max_attempts < 1 || max_attempts > 5)
+            return -7;
+    }
+    if (nc_txn_begin() != 0)
+        return -1;
+    if (nc_prepare(&st, "INSERT OR IGNORE INTO ai_dispatch_policy(id,updated_at) "
+                        "VALUES(1,?1)") != 0)
+        goto out;
+    sqlite3_bind_int64(st, 1, nc_now_s());
+    if (nc_step_done(st) != 0)
+        goto out;
+    sqlite3_finalize(st);
+    st = NULL;
+    if (strategy) {
+        if (nc_prepare(&st, "UPDATE ai_dispatch_policy SET strategy=?1 WHERE id=1") != 0)
+            goto out;
+        sqlite3_bind_text(st, 1, strategy, -1, SQLITE_TRANSIENT);
+        if (nc_step_done(st) != 0)
+            goto out;
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (timeout_ms > 0) {
+        if (nc_prepare(&st, "UPDATE ai_dispatch_policy SET failover_timeout_ms=?1 WHERE id=1") != 0)
+            goto out;
+        sqlite3_bind_int(st, 1, timeout_ms);
+        if (nc_step_done(st) != 0)
+            goto out;
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (max_attempts > 0) {
+        if (nc_prepare(&st, "UPDATE ai_dispatch_policy SET failover_max_attempts=?1 WHERE id=1") != 0)
+            goto out;
+        sqlite3_bind_int(st, 1, max_attempts);
+        if (nc_step_done(st) != 0)
+            goto out;
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (nc_prepare(&st, "UPDATE ai_dispatch_policy SET updated_at=?1 WHERE id=1") != 0)
+        goto out;
+    sqlite3_bind_int64(st, 1, nc_now_s());
+    if (nc_step_done(st) != 0)
+        goto out;
+    sqlite3_finalize(st);
+    st = NULL;
+    rc = 0;
+out:
+    if (st) sqlite3_finalize(st);
+    return nc_txn_end(rc);
 }
 
 /* ═══ AI Tool Registry ═══ */

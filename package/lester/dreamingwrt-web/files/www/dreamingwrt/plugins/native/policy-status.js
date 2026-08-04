@@ -7,7 +7,7 @@ export function mount(context = {}) {
   const formatBytes = utils.formatBytes || ((value) => `${Math.max(0, Number(value) || 0)} B`);
   const formatRate = utils.formatRate || ((value) => `${Math.max(0, Number(value) || 0)} B/s`);
   const formatInteger = utils.formatInteger || ((value) => Math.round(Number(value) || 0).toLocaleString());
-  const VERSION = '20260731-policy-runtime-evidence-01';
+  const VERSION = '20260803-policy-flow-semantics-02';
   const REFRESH_MS = 5000;
   const WS_RECONCILE_MS = 30000;
   const ROUTE_STATUS_TOPIC = 'route.status';
@@ -314,21 +314,47 @@ export function mount(context = {}) {
     const candidateDecisions = decisions.filter((item) => item.candidate === true && item.verified !== true && item.policy_hit !== true).length;
     const verifiedDecisions = decisions.filter((item) => item.verified === true && item.policy_hit === true).length;
     const lastHit = optionalNumber(status.last_hit_at, route.last_hit_at, ...runtimeRules.map((item) => item.last_hit));
-    const unsteeredFlows = activeFlows === null || steeredFlows === null
-      ? null
-      : Math.max(0, activeFlows - steeredFlows);
+    /*
+     * 分流口径（Backend-to-Front-route-status-steering-fields.md）：
+     * 后端现在把瞬时量与累计量分开并自描述，前端必须跟着分开，否则文案继续误导。
+     *
+     * 瞬时量（来自 conntrack fwmark）：active / steered / load_balance / bypass / unattributed
+     * 累计量（core 推规则时会清零）：hit_total / kernel_cumulative_connections
+     *
+     * 两组**不可互为分母**。占比只能用瞬时量算，即 steered / active。
+     *
+     * 降级契约：conntrack 不可读时 steered/load_balance/bypass 是 `null` 而不是 0，
+     * 必须显示「不可用」——显示 0 会又回到「看起来一条都没分流」的误导。
+     * 所以下面一律用 optionalNumber 保留 null，不做 `|| 0` 兜底。
+     */
+    const steeredFlowsSupported = optionalBoolean(status.steered_flows_supported, route.steered_flows_supported);
+    const loadBalanceFlows = optionalNumber(status.load_balance_flows, route.load_balance_flows);
+    const unattributedFlows = optionalNumber(status.unattributed_flows, route.unattributed_flows);
+    const bypassFlows = optionalNumber(status.bypass_flows, status.bypass_connections, route.bypass_flows);
+    // 未分流 = bypass（后端直接给），旧固件没有该字段时才退回 active - steered。
+    const unsteeredFlows = bypassFlows !== null
+      ? bypassFlows
+      : (activeFlows === null || steeredFlows === null ? null : Math.max(0, activeFlows - steeredFlows));
     return {
       available: fullRuntime ? route.available !== false : state.sourceReady.wans && outlets.length > 0,
       activeFlows,
       steeredFlows,
+      // 瞬时 / 瞬时。分母用 hit_total 会得到无意义的比值。
       steerPercent: activeFlows && steeredFlows !== null ? steeredFlows / activeFlows * 100 : null,
+      steeredFlowsSupported,
+      steeredFlowsReason: firstText(status.steered_flows_reason, route.steered_flows_reason),
+      loadBalanceFlows,
+      unattributedFlows,
+      flowCounterSource: firstText(status.flow_counter_source, route.flow_counter_source),
+      kernelCumulativeConnections: optionalNumber(status.kernel_cumulative_connections, route.kernel_cumulative_connections),
+      cumulativeCounterEpoch: firstText(status.cumulative_counter_epoch, route.cumulative_counter_epoch),
       unsteeredFlows,
       activeRules: optionalNumber(
         status.active_rules,
         route.rule_count,
         state.sourceReady.policies || fullRuntime ? runtimeRules.filter((item) => item.enabled).length : null
       ),
-      bypassFlows: optionalNumber(status.bypass_flows, status.bypass_connections, route.bypass_flows),
+      bypassFlows,
       fallbackFlows: optionalNumber(status.fallback_flows, status.fallback_connections, route.fallback_flows),
       hitTotal,
       counterAvailable,
@@ -381,6 +407,14 @@ export function mount(context = {}) {
     return labels[value] || value || '后端未提供可验证的计数来源';
   }
 
+  /* 瞬时分流计数的降级原因，来自 status.steered_flows_reason。 */
+  function steeredReasonLabel(value) {
+    const labels = {
+      nf_conntrack_marks_unreadable: 'conntrack 标记不可读'
+    };
+    return labels[value] || value || '后端未说明原因';
+  }
+
   function statusBadge(label, tone = 'muted') {
     return ui.statusBadgeMarkup?.(label, tone) || window.DWRT_UI_KIT?.statusBadgeMarkup?.(label, tone) || `<span class="policy-status-evidence-badge is-${escapeHtml(tone)}">${escapeHtml(label)}</span>`;
   }
@@ -396,13 +430,74 @@ export function mount(context = {}) {
   }
 
   function overviewMarkup(data) {
+    /*
+     * 分流卡片的副标题原本是一句话塞三个数：
+     *   `N 条规则 · 当前 M 条 · 内核聚合 K 次`
+     * 三个数里前两个是**瞬时值**（近 300 秒活跃流），第三个是**历史累计**
+     * （各规则 hit_count 之和，来自内核计数器）。并列在同一行、量级又差几个数量级,
+     * 读者无法分辨时间维度——用户就是这么问出「我选了按运营商分流，怎么可能是 0」的。
+     *
+     * 「内核聚合」描述的是实现机制（内核态计数器聚合），不是用户关心的事实,
+     * 这个词在中文里既不指向"规则命中"也不指向"累计"。改为「累计命中」。
+     *
+     * 瞬时为 0 而累计命中很大，本身就是异常信号：规则明显生效过，但当前一条都没匹配。
+     * 与其让用户自己怀疑，不如显式说出来。
+     * （0.0% 的数据侧根因在后端把 `steered_flows` 写死为 0,
+     *  见 Handoff/Acceptance-to-Backend-steered-flows-hardcoded-zero.md，非本卡片可修。）
+     */
+
+    return overviewCards(data);
+  }
+
+  /* 瞬时段与累计段分开写，累计段降级为脚注语气，并在两者矛盾时给出解释。 */
+  function policyDetailText(data) {
+    /*
+     * conntrack 不可读时后端给 null 并附 steered_flows_reason。
+     * 这一态必须说「不可用」，不能落到下面任何一条含数字的分支——
+     * 显示 0 会让用户以为「一条都没分流」，而真实情况是「没量到」。
+     */
+    if (data.steeredFlowsSupported === false || data.steeredFlows === null) {
+      const reason = steeredReasonLabel(data.steeredFlowsReason);
+      return `${displayInteger(data.activeRules)} 条规则 · 分流计数不可用（${reason}）`;
+    }
+    const instant = `${displayInteger(data.activeRules)} 条规则 · 当前 ${displayInteger(data.steeredFlows)} 条活跃`;
+    if (!data.counterAvailable) return `${instant} · 命中未采集`;
+    const cumulative = `规则累计命中 ${displayInteger(data.hitTotal)} 次`;
+    if (data.steeredFlows === 0 && number(data.hitTotal) > 0) {
+      return `${instant}（当前无活跃分流连接，但${cumulative}）`;
+    }
+    return `${instant} · ${cumulative}`;
+  }
+
+  /* 瞬时 0 + 累计非 0 是需要用户注意的矛盾态，不能报成 ok 的绿色。 */
+  function policyTone(data) {
+    if (data.steeredFlowsSupported === false || data.steeredFlows === null) return 'warn';
+    if (!data.counterAvailable) return 'warn';
+    if (data.steeredFlows === 0 && number(data.hitTotal) > 0) return 'warn';
+    return 'ok';
+  }
+
+  /*
+   * 「未分流」= bypass_flows，即未被任何规则打标的连接。负载均衡命中的连接
+   * 既不算显式分流也不算未分流，必须单独点出来，否则 30.1 上 683 条负载均衡
+   * 连接完全看不见，用户只看到 65 条显式分流，会以为分流基本没生效。
+   *
+   * 与 policyDetailText 同理：这个函数必须同时被首次渲染和轮询补丁复用，
+   * 只改一处会让下一个轮询周期把旧措辞写回 DOM。
+   */
+  function unsteeredDetailText(data) {
+    if (data.loadBalanceFlows === null) return '当前未匹配显式分流';
+    return `未匹配任何规则 · 负载均衡另计 ${displayInteger(data.loadBalanceFlows)} 条`;
+  }
+
+  function overviewCards(data) {
     const fallbackValue = data.bypassFlows === null && data.fallbackFlows === null
       ? '--'
       : `${displayInteger(data.bypassFlows)} / ${displayInteger(data.fallbackFlows)}`;
     const items = [
       { key: 'active', label: '活跃连接', value: displayInteger(data.activeFlows), detail: data.available ? '当前连接总数' : '未启用', tone: 'info', icon: icon('connections') },
-      { key: 'policy', label: '策略分流', value: displayPercent(data.steerPercent), detail: `${displayInteger(data.activeRules)} 条规则 · 当前 ${displayInteger(data.steeredFlows)} 条 · ${data.counterAvailable ? `内核聚合 ${displayInteger(data.hitTotal)} 次` : '命中未采集'}`, tone: data.counterAvailable ? 'ok' : 'warn', icon: icon('target') },
-      { key: 'unsteered', label: '未分流连接', value: displayInteger(data.unsteeredFlows), detail: '当前未匹配显式分流', tone: 'neutral', icon: icon('rules') },
+      { key: 'policy', label: '策略分流', value: displayPercent(data.steerPercent), detail: policyDetailText(data), tone: policyTone(data), icon: icon('target') },
+      { key: 'unsteered', label: '未分流连接', value: displayInteger(data.unsteeredFlows), detail: unsteeredDetailText(data), tone: 'neutral', icon: icon('rules') },
       { key: 'fallback', label: '旁路回退', value: fallbackValue, detail: data.fullRuntime ? '实时运行态' : '等待完整运行态', tone: 'warn', icon: icon('fallback') }
     ];
     if (typeof ui.overviewCardsMarkup === 'function') return ui.overviewCardsMarkup(items, { label: '分流状态概览', className: 'policy-status-summary' });
@@ -583,8 +678,10 @@ export function mount(context = {}) {
     const fallback = data.bypassFlows === null && data.fallbackFlows === null ? '--' : `${displayInteger(data.bypassFlows)} / ${displayInteger(data.fallbackFlows)}`;
     const values = {
       active: [displayInteger(data.activeFlows), data.available ? '当前连接总数' : '未启用'],
-      policy: [displayPercent(data.steerPercent), `${displayInteger(data.activeRules)} 条规则 · 当前 ${displayInteger(data.steeredFlows)} 条 · ${data.counterAvailable ? `内核聚合 ${displayInteger(data.hitTotal)} 次` : '命中未采集'}`],
-      unsteered: [displayInteger(data.unsteeredFlows), '当前未匹配显式分流'],
+      /* 轮询补丁必须复用同一个措辞函数。这里原本抄了一份 `overviewMarkup()` 的文案,
+       * 只改渲染那一处的话，下一个轮询周期就会把旧措辞写回 DOM。 */
+      policy: [displayPercent(data.steerPercent), policyDetailText(data)],
+      unsteered: [displayInteger(data.unsteeredFlows), unsteeredDetailText(data)],
       fallback: [fallback, data.fullRuntime ? '实时运行态' : '等待完整运行态']
     };
     Object.entries(values).forEach(([key, pair]) => {
@@ -593,6 +690,14 @@ export function mount(context = {}) {
       if (value) value.textContent = pair[0];
       if (detail) detail.textContent = pair[1];
     });
+    /* 语气必须跟着文案一起变。只改文字的话，矛盾态（瞬时 0 + 累计非 0）
+     * 会在轮询后显示成一张绿色卡片配一句警示语。 */
+    const policyCard = root.querySelector('[data-dwrt-overview-card="policy"]') ||
+      root.querySelector('[data-dwrt-overview-detail="policy"]')?.closest('.dwrt-kit-overview-card');
+    if (policyCard) {
+      policyCard.classList.remove('is-neutral', 'is-info', 'is-ok', 'is-warn', 'is-bad');
+      policyCard.classList.add(`is-${policyTone(state.data)}`);
+    }
   }
 
   function patchDynamic(options = {}) {

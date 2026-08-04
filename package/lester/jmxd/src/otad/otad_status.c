@@ -250,25 +250,63 @@ struct json_object *otad_status_json(void)
     json_object_object_add(resp, "degraded", json_object_new_boolean(degraded));
     json_object_object_add(resp, "last_error", json_object_new_string(last_error));
     json_object_object_add(resp, "updated_at", json_object_new_int64(updated_at));
-    json_object_object_add(resp, "apply_enabled", json_object_new_boolean(0));
     json_object_object_add(resp, "full_firmware_validate_enabled", json_object_new_boolean(1));
-    json_object_object_add(resp, "full_firmware_apply_enabled", json_object_new_boolean(0));
-    json_object_object_add(resp, "hot_update_apply_enabled", json_object_new_boolean(0));
-    json_object_object_add(resp, "slot_write_enabled", json_object_new_boolean(0));
     {
         struct json_object *trust = otad_release_trust_status();
         int trust_ready = otad_json_bool(trust, "ready", 0);
+        /*
+         * Writing a slot needs three independent things to hold, so all three
+         * are read rather than assumed: a usable trust policy with an active
+         * signing key, an A/B layout proven by read-only probing, and a
+         * bootloader state that can be steered and rolled back.
+         *
+         * These were hard zeros before, with a reason that blamed the trust
+         * policy no matter what. That sent operators to provision keys against
+         * a gate that would not have opened either way, and it hid which
+         * precondition was actually missing.
+         */
+        int slot_write_ready = trust_ready && topology_supported && rollback_ready;
+        const char *gate_reason =
+            !trust_ready ? otad_json_str(trust, "reason", "release_trust_unavailable") :
+            (!topology_supported ? "ab_topology_readonly_evidence_incomplete" :
+             (!rollback_ready ? "bootloader_slot_state_not_rollback_capable" : ""));
 
+        json_object_object_add(resp, "apply_enabled",
+                               json_object_new_boolean(slot_write_ready));
+        json_object_object_add(resp, "full_firmware_apply_enabled",
+                               json_object_new_boolean(slot_write_ready));
+        /* Stays closed: the hot update writer is compiled out, see below. */
+        json_object_object_add(resp, "hot_update_apply_enabled",
+                               json_object_new_boolean(0));
+        json_object_object_add(resp, "slot_write_enabled",
+                               json_object_new_boolean(slot_write_ready));
         json_object_object_add(resp, "firmware_authenticity_verifier_ready",
                                json_object_new_boolean(trust_ready));
         json_object_object_add(resp, "firmware_target_matcher_ready",
                                json_object_new_boolean(1));
         json_object_object_add(resp, "firmware_release_trust", trust);
+        /*
+         * The full firmware write path is implemented: signature verification,
+         * inactive-slot write with SHA256 readback, fsck, one-shot pending boot
+         * and automatic fallback all exist in otad_firmware.c. What used to be
+         * missing was permission to reach it, not the code.
+         *
+         * Hot update is a different story and must not be reported as the same:
+         * its writer is still compiled out, so it stays unavailable no matter
+         * how the trust policy is configured.
+         */
+        json_object_object_add(resp, "full_firmware_apply_implemented",
+                               json_object_new_boolean(1));
+        json_object_object_add(resp, "hot_update_apply_implemented",
+                               json_object_new_boolean(0));
+        otad_json_add_string(resp, "full_firmware_apply_reason", gate_reason);
+        otad_json_add_string(resp, "hot_update_apply_reason",
+                             "hot_update_writer_disabled_in_build");
+        if (!trust_ready)
+            otad_json_add_string(resp, "release_trust_setup_reason",
+                                 otad_json_str(trust, "reason",
+                                               "trust_policy_unavailable"));
     }
-    json_object_object_add(resp, "full_firmware_apply_reason",
-                           json_object_new_string("release_trust_gate_closed"));
-    json_object_object_add(resp, "hot_update_apply_reason",
-                           json_object_new_string("hot_update_release_trust_gate_closed"));
     json_object_object_add(resp, "rollback_enabled",
                            json_object_new_boolean(rollback_ready));
     otad_json_add_string(resp, "rollback_reason", rollback_ready ? "" :

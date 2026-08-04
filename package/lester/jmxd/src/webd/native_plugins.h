@@ -10,6 +10,10 @@
 struct json_object *webd_native_plugins_scan(void);
 void webd_native_plugins_merge_menu(struct json_object *menu);
 const char *webd_native_required_permission(const char *method, const char *path);
+/* Read-only check on a permission's action suffix, for audit risk grading. */
+int webd_native_permission_is_readonly(const char *permission);
+/* Socket path of the plugin named by a request path, for error reporting. */
+int webd_native_socket_hint(const char *path, char *out, size_t out_len);
 int webd_native_proxy_json(int client_fd,
                            const char *method,
                            const char *path,

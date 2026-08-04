@@ -1035,6 +1035,10 @@ html[data-theme-resolved="light"] .dwrt-risk-meter {
   }
 }
 
+/* 页面级容器专用：含 height: 100%，会把自身撑满可用高度。
+   只允许每个页面/标签页用一次，且必须是最外层的滚动或布局容器。
+   卡片、面板、行内块请只用 .dwrt-kit-glass-surface 取材质，
+   否则嵌在已撑满的父级里会继承 100% 高度而占满整屏。 */
 .dwrt-kit-page-surface {
   position: relative;
   width: 100%;

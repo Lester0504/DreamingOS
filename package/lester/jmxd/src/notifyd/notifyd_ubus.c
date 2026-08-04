@@ -162,13 +162,33 @@ static int notifyd_handle_enqueue(struct ubus_context *ctx, struct ubus_object *
 {
     struct json_object *body = notifyd_json_from_blob(msg);
     struct json_object *resp;
+    int status = UBUS_STATUS_OK;
     (void)obj; (void)method;
 
     resp = notifyd_enqueue_event(notifyd_payload_or_self(body));
+    /*
+     * A rejected event must also fail at the ubus layer. Producers invoke this
+     * through `ubus call` and can only observe the exit code, so returning
+     * UBUS_STATUS_OK alongside ok:false made a rejection indistinguishable from
+     * a successful enqueue. The response body still carries the specific reason.
+     */
+    {
+        struct json_object *error = NULL;
+
+        if (resp && json_object_object_get_ex(resp, "error", &error) &&
+            json_object_is_type(error, json_type_string)) {
+            const char *reason = json_object_get_string(error);
+
+            if (!strcmp(reason, "event_required") || !strcmp(reason, "invalid_payload"))
+                status = UBUS_STATUS_INVALID_ARGUMENT;
+            else if (!strcmp(reason, "event_unknown"))
+                status = UBUS_STATUS_NOT_FOUND;
+        }
+    }
     notifyd_send_json(ctx, req, resp);
     json_object_put(resp);
     json_object_put(body);
-    return UBUS_STATUS_OK;
+    return status;
 }
 
 static int notifyd_handle_test_send(struct ubus_context *ctx, struct ubus_object *obj,

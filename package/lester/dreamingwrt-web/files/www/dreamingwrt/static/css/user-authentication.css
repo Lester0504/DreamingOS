@@ -286,6 +286,77 @@
 .user-auth-device-screen .user-auth-portal-box { width: min(72%, 560px); }
 
 .user-auth-toolbar { min-height: 52px; justify-content: space-between; }
+
+/*
+ * 表格卡内的工具栏控件组。搜索与动作按钮原先在一个独立 `<header>` 里浮在
+ * 表格卡外面（实测在线用户 / 账号管理 / 代拨服务 / 终端限速四页都是），
+ * 现在收进 `.dwrt-kit-table-toolbar`，与标题、条数同一行。
+ * kit 那层是 `display:flex; justify-content:space-between`，所以控件组靠
+ * `margin-left:auto` 贴右，标题留在左边。
+ */
+.dwrt-kit-table-toolbar.user-auth-table-toolbar-rich {
+  flex-wrap: wrap;
+  row-gap: 10px;
+  /* design.md 要求表格工具栏保持 48-58px，不许为了塞控件把它撑成高头部。 */
+  min-height: 52px;
+  padding-block: 8px;
+}
+
+.user-auth-table-controls {
+  min-width: 0;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.user-auth-table-controls .user-auth-toolbar-leading {
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.user-auth-table-controls .policy-toolbar-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+/*
+ * 卡内控件比独立工具栏矮一档，避免把 48px 的 kit 工具栏顶高（实测顶到 65px）。
+ * 搜索框的高度来自 kit 的 `--dwrt-search-size`，而
+ * `.dwrt-kit-expand-search[data-dwrt-expand-search="true"]` 比这里更具体，
+ * 硬写 height 压不住它，也会让内部图标与输入框比例失调。改变量才是正路。
+ */
+.user-auth-table-controls {
+  --dwrt-search-size: 36px;
+}
+
+.user-auth-table-controls .policy-filter-button,
+.user-auth-table-controls .policy-create-button {
+  height: 36px;
+}
+
+.user-auth-table-controls .policy-search-main {
+  width: min(280px, 26vw);
+}
+
+.user-auth-table-controls .user-auth-segmented button {
+  height: 30px;
+}
+
+/* 窄视口：控件组换行独占一行，不要把标题挤成一列。 */
+@media (max-width: 1180px) {
+  .user-auth-table-controls {
+    width: 100%;
+    margin-left: 0;
+    justify-content: space-between;
+  }
+
+  .user-auth-table-controls .policy-search-main {
+    width: min(220px, 40vw);
+  }
+}
 .user-auth-toolbar-leading { min-width: 0; display: flex; align-items: center; gap: 10px; }
 .user-auth-toolbar .policy-toolbar-actions { flex: 0 0 auto; gap: 9px; }
 .user-auth-toolbar .policy-filter-button,
@@ -326,7 +397,34 @@
 .user-auth-table td { white-space: nowrap; }
 .user-auth-table td { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 .user-auth-table code { color: var(--app-text-secondary, var(--app-text)); font-size: 12px; }
-.user-auth-row-actions { display: inline-flex; align-items: center; gap: 5px; }
+/*
+ * 动作区用固定轨道而不是 inline-flex 自动宽度。按钮内容一变（启停图标切换、
+ * 或 disabled 态下 tooltip 文本变化）自动宽度就会重算，整行随之位移，
+ * 表现为「点一下就跳」。grid 的轨道数由按钮数决定，与内容无关。
+ */
+.user-auth-row-actions {
+  display: inline-grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 32px;
+  align-items: center;
+  justify-content: start;
+  gap: 5px;
+}
+
+/* 图标按钮的几何锁死，避免 SVG 或字形差异改变尺寸。 */
+.user-auth-row-actions .user-auth-icon-button {
+  width: 32px;
+  min-width: 32px;
+  max-width: 32px;
+  height: 32px;
+  padding: 0;
+  flex: 0 0 auto;
+}
+
+.user-auth-row-actions .user-auth-icon-button svg {
+  width: 18px;
+  height: 18px;
+}
 
 .user-auth-icon-button {
   width: 32px;
@@ -557,6 +655,40 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
 /* Client rate-limit page: same workbench, table, Sheet and sampled material as authentication. */
 .client-speed-limit-route-host { min-height: 0; }
 .client-speed-shell { min-height: 0; height: 100%; grid-template-rows: auto minmax(0, 1fr); }
+/*
+ * `.user-auth-workbench` 的基线是 `grid-template-rows: minmax(0, 1fr)`，只为「页面里
+ * 只有一张表格」写的。本页的提示条是条件出现的第二个子项：一旦出现，网格会给它开一条
+ * 隐式行、同样按 1fr 分配，于是一行文字的提示条被拉到与表格等高 —— 30.1 实测 618px，
+ * 表格被从 y=19 推到 y=654，用户点完启停按钮，那一行就从光标底下跑掉 635px，
+ * 表现就是「按钮点一下他就跳」。
+ *
+ * 注意 `.user-auth-notice` 自带的 `flex: 0 0 auto` 在网格父级里是无效声明，挡不住这件事；
+ * 必须把这一层改成弹性列，才能让提示条按内容高度、表格吃掉剩余空间。
+ * 用 flex 而不是补一条固定行模板，是因为提示条会出现和消失，固定行数的网格一旦子节点
+ * 数量变化就又会算错。
+ */
+.client-speed-shell > .user-auth-workbench { display: flex; flex-direction: column; }
+.client-speed-shell > .user-auth-workbench > .user-auth-notice { flex: 0 0 auto; }
+.client-speed-shell > .user-auth-workbench > .client-speed-table-card { flex: 1 1 auto; min-height: 0; }
+/* IP 占位卡按内容高度，不吃剩余空间：它只有三段文字，撑满整屏会显得像加载失败。 */
+.client-speed-shell > .user-auth-workbench > .client-speed-ip-card { flex: 0 0 auto; min-height: 0; }
+.client-speed-header { flex: 0 0 auto; min-width: 0; }
+.client-speed-tabs { width: max-content; max-width: 100%; }
+
+.client-speed-ip-card { min-width: 0; padding: 0; }
+.client-speed-ip-body {
+  min-width: 0;
+  display: grid;
+  justify-items: start;
+  gap: 9px;
+  padding: 20px 22px;
+}
+.client-speed-ip-body > svg { width: 24px; height: 24px; color: #7fb2ff; }
+.client-speed-ip-body > strong { color: var(--app-text); font-size: 14px; font-weight: 820; }
+.client-speed-ip-body > p { margin: 0; max-width: 78ch; color: var(--app-text-muted); font-size: 12px; font-weight: 620; line-height: 1.6; overflow-wrap: anywhere; }
+.client-speed-ip-body > p > b { color: var(--app-text-secondary); font-weight: 800; }
+.client-speed-ip-body code { border-radius: 5px; padding: 1px 5px; background: var(--dwrt-control-material, rgba(255,255,255,.07)); font-size: 11px; }
+.client-speed-ip-hint { color: var(--app-text-secondary) !important; }
 .client-speed-toolbar { flex: 0 0 auto; }
 .client-speed-toolbar .user-auth-toolbar-leading { flex: 1 1 auto; flex-wrap: wrap; }
 .client-speed-table-card { min-height: 0; }
@@ -591,4 +723,201 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
 @media (max-width: 700px) {
   .client-speed-toolbar .user-auth-toolbar-leading { min-width: max-content; flex-wrap: nowrap; }
   .client-speed-weekdays > div { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+
+/* Client network control (MAC deny) page: same workbench, table, Sheet and sampled material. */
+.client-network-control-route-host { min-height: 0; }
+/* 只有 shell 自己撑满视口高度；卡片一律 min-height:0，避免任一卡片被拉满整屏。 */
+.cnc-shell { min-height: 0; height: 100%; }
+/* 模式卡与能力说明卡按内容高度，表格卡吃掉剩余空间并在内部滚动。 */
+.cnc-workbench { min-width: 0; min-height: 0; display: grid; gap: 12px; grid-template-rows: auto auto minmax(0, 1fr) auto; align-content: start; }
+/*
+ * 网格项默认 min-width:auto，会被表格的 min-content 撑开：实测移动端表格卡宽 499px
+ * 而外层 shell 只有 322px，整卡连工具栏一起溢出视口。显式给 0 下限，让宽度回到容器，
+ * 横向滚动交给表格自己的 .dwrt-kit-table-scroll。
+ */
+.cnc-workbench > * { min-width: 0; }
+.cnc-workbench > [data-cnc-notice] { grid-row: auto; }
+.cnc-mode-card { min-height: 0; display: grid; gap: 12px; padding: 14px 16px; }
+.cnc-mode-head { min-width: 0; display: flex; gap: 10px; align-items: flex-start; }
+.cnc-mode-icon { flex: 0 0 auto; width: 28px; height: 28px; display: grid; place-items: center; border-radius: 8px; color: #7fb2ff; background: rgba(47,126,234,.14); }
+.cnc-mode-icon svg { width: 17px; height: 17px; }
+.cnc-mode-head strong { display: block; font-size: 13px; font-weight: 760; }
+.cnc-mode-head small { display: block; margin-top: 2px; color: var(--app-text-muted); font-size: 11px; line-height: 1.45; }
+.cnc-mode-options { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.cnc-mode-option { min-width: 0; display: flex; gap: 9px; align-items: flex-start; padding: 10px 12px; border-radius: 8px; background: var(--dwrt-control-material, rgba(255,255,255,.05)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.09); cursor: pointer; }
+.cnc-mode-option.is-active { box-shadow: inset 0 0 0 1px rgba(47,126,234,.55); }
+.cnc-mode-option.is-disabled { cursor: not-allowed; opacity: .62; }
+.cnc-mode-option input { flex: 0 0 auto; margin-top: 2px; }
+.cnc-mode-option span { min-width: 0; display: grid; gap: 2px; }
+.cnc-mode-option strong { font-size: 12px; font-weight: 740; }
+/* 原因文本可能很长（后端 reason 原文），必须换行而不是溢出卡片。 */
+.cnc-mode-option small { color: var(--app-text-muted); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+/*
+ * `.user-auth-table-card` 只声明了 grid-template-rows，隐式列因此按 max-content 计算：
+ * 实测这张卡宽 322px 而隐式列被工具栏撑到 499px，工具栏、计数、搜索框和表格滚动区
+ * 一起越出卡片右边界（移动端表现为整片内容压出屏幕）。显式钉死单列宽度即可，
+ * 表格自身的横向滚动仍由 .dwrt-kit-table-scroll 承担。
+ */
+.cnc-table-card { min-width: 0; min-height: 0; grid-template-columns: minmax(0, 100%); }
+.cnc-table-card > * { min-width: 0; }
+.cnc-table-controls { min-width: 0; flex: 1 1 auto; flex-wrap: wrap; row-gap: 8px; }
+.cnc-table-controls .user-auth-toolbar-leading { min-width: 0; flex: 1 1 auto; flex-wrap: wrap; row-gap: 8px; }
+/* 4 个筛选按钮 + 搜索框在窄视口放不下一行，允许分段控件自己换行。 */
+.cnc-table-controls .user-auth-segmented { flex-wrap: wrap; }
+.cnc-table-controls .policy-toolbar-actions { min-width: 0; flex: 0 1 auto; }
+/* 新建按钮的文字在极窄视口可省略，但按钮本身不许越界。 */
+.cnc-table-controls .policy-create-button { min-width: 0; max-width: 100%; }
+.cnc-table-controls .policy-create-button span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cnc-table th:nth-child(1) { width: 15%; }
+.cnc-table th:nth-child(2) { width: 34%; }
+.cnc-table th:nth-child(3) { width: 26%; }
+.cnc-table th:nth-child(4) { width: 13%; }
+/* 操作列定宽：启停图标在两态间切换时整行不位移。 */
+.cnc-table th:nth-child(5) { width: 116px; }
+/*
+ * 不要给 <td> 设 display:grid/flex。那会把单元格从表格布局里摘出去，同一行的
+ * 单元格不再并排：实测第 3 格（备注）与第 4、5 格垂直堆叠，备注格横跨 383px
+ * 盖在操作按钮上方，按钮点不动（Playwright 报 "cnc-remark intercepts pointer
+ * events"）。要多行内容就在单元格内部套一个块级容器，让 td 保持 table-cell。
+ */
+.cnc-table td { vertical-align: middle; }
+.cnc-stack { min-width: 0; display: grid; gap: 3px; }
+.cnc-client strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cnc-client code { font-size: inherit; }
+.cnc-client span,
+.cnc-table td small { display: block; min-width: 0; color: var(--app-text-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cnc-remark { min-width: 0; color: var(--app-text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cnc-actions-inner { display: flex; gap: 4px; align-items: center; justify-content: flex-end; }
+.cnc-status { width: max-content; display: inline-flex; padding: 3px 7px; border-radius: 999px; font-size: 10px; font-weight: 760; }
+.cnc-status.is-success { color: #5ee59b; background: rgba(38,174,99,.12); }
+.cnc-status.is-warning { color: #f2c66d; background: rgba(211,150,42,.12); }
+.cnc-status.is-error { color: #ff8a94; background: rgba(211,51,72,.12); }
+.cnc-capability-card { min-height: 0; display: grid; gap: 6px; padding: 12px 16px; }
+.cnc-capability-card strong { font-size: 12px; font-weight: 740; }
+.cnc-capability-card ul { margin: 0; padding-left: 16px; display: grid; gap: 3px; }
+.cnc-capability-card li { color: var(--app-text-muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.cnc-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }
+.cnc-source-switch { display: grid; gap: 5px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cnc-source-switch button { min-width: 0; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; color: var(--app-text-muted); background: var(--dwrt-control-material, rgba(255,255,255,.07)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.1); font-size: 11px; font-weight: 700; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cnc-source-switch button.is-active { color: #fff; background: rgba(47,126,234,.78); }
+
+@media (max-width: 700px) {
+  .cnc-mode-options { grid-template-columns: minmax(0, 1fr); }
+  /*
+   * 这里不能照搬终端限速页的 `min-width: max-content; flex-wrap: nowrap`：
+   * 那会把工具栏钉在内容宽度上，实测右边界到 541px 而视口只有 390px，
+   * 搜索框、操作区和新建按钮一起压出屏幕。窄屏就该换行。
+   */
+  .cnc-table-controls { justify-content: space-between; }
+  .cnc-table-controls .policy-search-main { width: 100%; }
+}
+
+/* APP filter page: same workbench, table, Sheet and sampled material as authentication. */
+.app-filter-route-host { min-height: 0; }
+.app-filter-shell { min-height: 0; height: 100%; grid-template-rows: auto minmax(0, 1fr); }
+/*
+ * `.user-auth-workbench` 的基线是 `grid-template-rows: minmax(0, 1fr)`，那是给
+ * 「只有一张表格」的页面写的。本页在表格之上还有一张覆盖率卡，如果沿用基线，
+ * 两个子项都会被拉伸去填满高度 —— 实测覆盖率卡被撑到 694px，两行标题里被塞进
+ * 189px 的空白。这里显式声明行模板：卡片按内容高度，表格吃掉剩余空间。
+ */
+/* 提示条是条件出现的第三个子项，所以用弹性列而不是固定行数的网格，避免多一个
+   子节点就把行模板算错。表格吃掉剩余高度，其余按内容高度。 */
+.app-filter-shell > .user-auth-workbench { display: flex; flex-direction: column; }
+.app-filter-shell > .user-auth-workbench > .user-auth-notice,
+.app-filter-shell > .user-auth-workbench > .app-filter-coverage { flex: 0 0 auto; }
+.app-filter-shell > .user-auth-workbench > .app-filter-table-card { flex: 1 1 auto; min-height: 0; }
+.app-filter-table-card { min-height: 0; }
+/* 表格与滚动层都要允许比内容窄，否则宽表把卡片顶宽、滚动容器永不滚动。 */
+.app-filter-table-card,
+.app-filter-table-card .dwrt-kit-table-scroll { min-width: 0; }
+.app-filter-table th:nth-child(1) { width: 17%; }
+.app-filter-table th:nth-child(2) { width: 24%; }
+.app-filter-table th:nth-child(3) { width: 16%; }
+.app-filter-table th:nth-child(4) { width: 15%; }
+.app-filter-table th:nth-child(5) { width: 10%; }
+.app-filter-table th:nth-child(6) { width: 13%; }
+.app-filter-table th:nth-child(7) { width: 112px; }
+.app-filter-cell,
+.app-filter-runtime { min-width: 0; display: grid; gap: 3px; }
+.app-filter-cell span,
+.app-filter-runtime small { min-width: 0; color: var(--app-text-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-filter-cell strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-filter-runtime .dwrt-kit-status-badge { width: max-content; }
+.app-filter-status { width: max-content; display: inline-flex; padding: 3px 7px; border-radius: 999px; font-size: 10px; font-weight: 760; }
+.app-filter-status.is-success { color: #5ee59b; background: rgba(38,174,99,.12); }
+.app-filter-status.is-warning { color: #f2c66d; background: rgba(211,150,42,.12); }
+.app-filter-status.is-error { color: #ff8a94; background: rgba(211,51,72,.12); }
+
+.app-filter-apps { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.app-filter-app-chip { min-width: 0; max-width: 100%; display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px 2px 4px; border-radius: 7px; background: var(--dwrt-control-material, rgba(255,255,255,.07)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.09); font-size: 10px; }
+.app-filter-app-chip img { flex: 0 0 auto; width: 14px; height: 14px; border-radius: 4px; object-fit: contain; }
+.app-filter-app-chip b { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 620; }
+.app-filter-app-more { flex: 0 0 auto; color: var(--app-text-muted); font-size: 10px; font-weight: 700; }
+.app-filter-app-empty { color: var(--app-text-muted); font-size: 10px; }
+
+.app-filter-coverage { display: grid; gap: 10px; padding: 14px 16px; border-radius: 8px; }
+.app-filter-coverage-head { display: grid; gap: 2px; }
+.app-filter-coverage-head strong { color: var(--app-text); font-size: 13px; }
+.app-filter-coverage-head span { color: var(--app-text-muted); font-size: 11px; }
+.app-filter-coverage-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.app-filter-coverage-metrics > div { min-width: 0; display: grid; gap: 2px; padding: 9px 11px; border-radius: 8px; background: var(--dwrt-control-material, rgba(255,255,255,.05)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); }
+.app-filter-coverage-metrics b { color: var(--app-text); font-size: 17px; font-weight: 720; }
+.app-filter-coverage-metrics span { min-width: 0; color: var(--app-text-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-filter-coverage-note { margin: 0; color: var(--app-text-muted); font-size: 11px; line-height: 1.55; }
+
+/* 抽屉里有应用库列表与多时段表单，用 wide 档；宽度只引用 Kit 的四个变量。 */
+.dwrt-kit-sheet.app-filter-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-wide); }
+.app-filter-drawer-section { display: grid; gap: 9px; padding: 13px 14px; border-radius: 8px; background: var(--dwrt-control-material, rgba(255,255,255,.045)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); }
+.app-filter-drawer-section-head { display: grid; gap: 3px; }
+.app-filter-drawer-section-head strong { color: var(--app-text); font-size: 12px; }
+.app-filter-drawer-section-head small { color: var(--app-text-muted); font-size: 11px; line-height: 1.5; }
+.app-filter-inline-search { display: flex; align-items: center; gap: 7px; height: 34px; padding: 0 11px; border-radius: 8px; background: var(--dwrt-control-material, rgba(255,255,255,.07)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.1); }
+.app-filter-inline-search svg { flex: 0 0 auto; width: 15px; height: 15px; color: var(--app-text-muted); }
+.app-filter-inline-search input { flex: 1 1 auto; min-width: 0; border: 0; background: none; color: var(--app-text); font: inherit; outline: none; }
+.app-filter-catalog-meta { color: var(--app-text-muted); font-size: 11px; }
+.app-filter-catalog { max-height: 268px; overflow: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(196px, 1fr)); gap: 5px; }
+.app-filter-catalog label { min-width: 0; display: flex; align-items: center; gap: 7px; padding: 7px 9px; border-radius: 7px; background: rgba(255,255,255,.035); box-shadow: inset 0 0 0 1px rgba(255,255,255,.07); cursor: pointer; }
+.app-filter-catalog label.is-active { background: rgba(47,126,234,.16); box-shadow: inset 0 0 0 1px rgba(47,126,234,.5); }
+.app-filter-catalog input { position: absolute; opacity: 0; pointer-events: none; }
+.app-filter-checkmark { flex: 0 0 auto; width: 14px; height: 14px; border-radius: 4px; box-shadow: inset 0 0 0 1px rgba(255,255,255,.28); }
+.app-filter-catalog label.is-active .app-filter-checkmark { background: #2f7eea center/10px 10px no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='3.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m5 13 4.5 4.5L19 7'/%3E%3C/svg%3E"); box-shadow: none; }
+.app-filter-catalog img,
+.app-filter-app-placeholder { flex: 0 0 auto; width: 18px; height: 18px; border-radius: 5px; object-fit: contain; }
+.app-filter-app-placeholder { background: rgba(255,255,255,.08); }
+.app-filter-catalog b { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--app-text); font-size: 11px; font-weight: 640; }
+.app-filter-catalog small { flex: 0 0 auto; max-width: 62px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--app-text-muted); font-size: 10px; }
+.app-filter-catalog-empty { padding: 18px; border-radius: 7px; background: rgba(255,255,255,.035); color: var(--app-text-muted); font-size: 11px; text-align: center; }
+.app-filter-selected { display: grid; gap: 7px; }
+.app-filter-selected-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.app-filter-selected-head strong { color: var(--app-text); font-size: 11px; }
+.app-filter-selected-head span { color: var(--app-text-muted); font-size: 10px; }
+.app-filter-selected-list { display: flex; flex-wrap: wrap; gap: 5px; }
+.app-filter-selected-chip { min-width: 0; max-width: 100%; display: inline-flex; align-items: center; gap: 5px; padding: 3px 4px 3px 6px; border-radius: 7px; background: rgba(47,126,234,.16); box-shadow: inset 0 0 0 1px rgba(47,126,234,.42); font-size: 10px; }
+.app-filter-selected-chip img { flex: 0 0 auto; width: 14px; height: 14px; border-radius: 4px; object-fit: contain; }
+.app-filter-selected-chip b { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--app-text); font-weight: 620; }
+.app-filter-selected-chip button { flex: 0 0 auto; width: 16px; height: 16px; display: grid; place-items: center; border: 0; border-radius: 5px; background: rgba(255,255,255,.1); color: var(--app-text); font-size: 11px; line-height: 1; cursor: pointer; }
+.app-filter-selected-empty { padding: 11px; border-radius: 7px; background: rgba(255,255,255,.035); color: var(--app-text-muted); font-size: 11px; }
+
+.app-filter-ranges { display: grid; gap: 8px; }
+.app-filter-range { display: grid; gap: 7px; padding: 9px 10px; border-radius: 7px; background: rgba(255,255,255,.035); box-shadow: inset 0 0 0 1px rgba(255,255,255,.07); }
+.app-filter-weekdays { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 5px; }
+.app-filter-weekdays label { height: 30px; display: grid; place-items: center; border-radius: 7px; color: var(--app-text-muted); background: var(--dwrt-control-material, rgba(255,255,255,.07)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.1); font-size: 11px; cursor: pointer; }
+.app-filter-weekdays label.is-active { color: #fff; background: rgba(47,126,234,.78); }
+.app-filter-weekdays input { position: absolute; opacity: 0; pointer-events: none; }
+.app-filter-range-times { display: flex; align-items: end; gap: 8px; }
+.app-filter-range-times .user-auth-field { flex: 1 1 auto; min-width: 0; }
+.app-filter-range-remove { flex: 0 0 auto; width: 32px; height: 32px; display: grid; place-items: center; border: 0; border-radius: 7px; background: rgba(211,51,72,.16); color: #ff8a94; font-size: 14px; cursor: pointer; }
+.app-filter-range-add { justify-self: start; padding: 6px 11px; border: 0; border-radius: 7px; background: var(--dwrt-control-material, rgba(255,255,255,.07)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.1); color: var(--app-text); font-size: 11px; cursor: pointer; }
+
+@media (max-width: 1100px) {
+  .app-filter-coverage-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 700px) {
+  .app-filter-table-controls .user-auth-toolbar-leading { min-width: max-content; flex-wrap: nowrap; }
+  .app-filter-catalog { grid-template-columns: minmax(0, 1fr); max-height: 218px; }
+  .app-filter-weekdays { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .app-filter-coverage-metrics { grid-template-columns: minmax(0, 1fr); }
 }

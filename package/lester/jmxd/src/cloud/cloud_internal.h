@@ -139,6 +139,14 @@ struct cloud_identity {
     /* 1 when router_id is the contract fingerprint of both public keys, 0 when
      * it is a legacy locally generated UUID that cannot self enroll. */
     int router_id_is_key_derived;
+    /*
+     * The contract-form id derived from both public keys, always populated even
+     * when router_id is a legacy UUID. Enrollment must use this one: the relay
+     * verifies the id against the key fingerprint, while router_id stays as the
+     * value every paired App has already pinned. Equal to router_id whenever
+     * router_id_is_key_derived is set.
+     */
+    char relay_router_id[CLOUD_ROUTER_ID_MAX + 1];
 };
 
 /*
@@ -314,6 +322,13 @@ const char *cloud_tunnel_state(void);
 const char *cloud_tunnel_reason(void);
 int64_t cloud_tunnel_connected_since(void);
 void cloud_tunnel_counters(uint64_t *forwarded, uint64_t *rejected);
+/*
+ * Why the previous session ended. Reported in status because a tunnel that drops
+ * periodically is back to "online" within seconds, so the live state never shows
+ * the cause. Any out parameter may be NULL.
+ */
+void cloud_tunnel_last_disconnect(char *out, size_t size, int64_t *at,
+                                  int64_t *session_ms, uint32_t *count);
 
 /* ── self enrollment (cloud_enroll.c) ───────────────────────────── */
 

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "flowd_internal.h"
+#include "wan_sla_tx.h"
 
 static int flowd_send_json(struct ubus_context *ctx, struct ubus_request_data *req,
                            struct json_object *obj)
@@ -487,6 +488,36 @@ static int flowd_handle_wan_health_delete(struct ubus_context *ctx, struct ubus_
     json_object_put(resp);
     json_object_put(body);
     return UBUS_STATUS_OK;
+}
+
+static int flowd_handle_wan_sla_list(struct ubus_context *ctx, struct ubus_object *obj,
+                                     struct ubus_request_data *req, const char *method,
+                                     struct blob_attr *msg)
+{
+    struct json_object *body = flowd_json_from_blob(msg);
+    struct json_object *resp = flowd_wan_sla_list(flowd_payload_or_self(body));
+    (void)obj; (void)method; flowd_send_json(ctx, req, resp);
+    json_object_put(resp); json_object_put(body); return UBUS_STATUS_OK;
+}
+
+static int flowd_handle_wan_sla_preview(struct ubus_context *ctx, struct ubus_object *obj,
+                                        struct ubus_request_data *req, const char *method,
+                                        struct blob_attr *msg)
+{
+    struct json_object *body = flowd_json_from_blob(msg);
+    struct json_object *resp = flowd_wan_sla_preview(flowd_payload_or_self(body));
+    (void)obj; (void)method; flowd_send_json(ctx, req, resp);
+    json_object_put(resp); json_object_put(body); return UBUS_STATUS_OK;
+}
+
+static int flowd_handle_wan_sla_commit(struct ubus_context *ctx, struct ubus_object *obj,
+                                       struct ubus_request_data *req, const char *method,
+                                       struct blob_attr *msg)
+{
+    struct json_object *body = flowd_json_from_blob(msg);
+    struct json_object *resp = flowd_wan_sla_commit(flowd_payload_or_self(body));
+    (void)obj; (void)method; flowd_send_json(ctx, req, resp);
+    json_object_put(resp); json_object_put(body); return UBUS_STATUS_OK;
 }
 
 static int flowd_handle_split_rules_get(struct ubus_context *ctx, struct ubus_object *obj,
@@ -1025,6 +1056,9 @@ static const struct ubus_method flowd_methods[] = {
     UBUS_METHOD("wan_health_get", flowd_handle_wan_health_get, flowd_any_policy),
     UBUS_METHOD("wan_health_set", flowd_handle_wan_health_set, flowd_any_policy),
     UBUS_METHOD("wan_health_delete", flowd_handle_wan_health_delete, flowd_any_policy),
+    UBUS_METHOD("wan_sla_list", flowd_handle_wan_sla_list, flowd_any_policy),
+    UBUS_METHOD("wan_sla_preview", flowd_handle_wan_sla_preview, flowd_any_policy),
+    UBUS_METHOD("wan_sla_commit", flowd_handle_wan_sla_commit, flowd_any_policy),
     UBUS_METHOD("split_rules_get", flowd_handle_split_rules_get, flowd_any_policy),
     UBUS_METHOD("split_rule_set", flowd_handle_split_rule_set, flowd_any_policy),
     UBUS_METHOD("split_rule_delete", flowd_handle_split_rule_delete, flowd_any_policy),

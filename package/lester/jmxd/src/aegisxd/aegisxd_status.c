@@ -530,6 +530,58 @@ static void aegisxd_add_ids_ips_runtime_fields(struct json_object *o,
     aegisxd_json_add_string(o, "ids_ips_runtime_package", "suricata");
 }
 
+/* Per-feed fetch health.  The service-wide last_error cannot say which feed
+ * failed, so callers had no way to tell one unreachable blocklist from a broken
+ * engine.  Counters are reported alongside so the caller can judge severity. */
+static struct json_object *aegisxd_feed_health_json(int *total, int *failing,
+                                                    int *never_succeeded)
+{
+    struct json_object *arr = json_object_new_array();
+    sqlite3_stmt *st;
+
+    if (total)
+        *total = 0;
+    if (failing)
+        *failing = 0;
+    if (never_succeeded)
+        *never_succeeded = 0;
+    st = aegisxd_prepare(
+        "SELECT feed_id,name,kind,url,enabled,last_success_at,last_error,item_count "
+        "FROM aegis_feeds ORDER BY feed_id");
+    if (!st)
+        return arr;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        struct json_object *o = json_object_new_object();
+        const char *err = aegisxd_sqlite_text(st, 6, "");
+        int64_t success_at = sqlite3_column_int64(st, 5);
+        int enabled = sqlite3_column_int(st, 4);
+
+        aegisxd_json_add_string(o, "feed_id", aegisxd_sqlite_text(st, 0, ""));
+        aegisxd_json_add_string(o, "name", aegisxd_sqlite_text(st, 1, ""));
+        aegisxd_json_add_string(o, "kind", aegisxd_sqlite_text(st, 2, ""));
+        aegisxd_json_add_string(o, "url", aegisxd_sqlite_text(st, 3, ""));
+        json_object_object_add(o, "enabled", json_object_new_boolean(enabled));
+        json_object_object_add(o, "last_success_at", json_object_new_int64(success_at));
+        aegisxd_json_add_string(o, "last_error", err);
+        json_object_object_add(o, "item_count", json_object_new_int(sqlite3_column_int(st, 7)));
+        json_object_object_add(o, "healthy", json_object_new_boolean(!err[0] && success_at > 0));
+        json_object_object_add(o, "failing", json_object_new_boolean(err[0] != '\0'));
+        /* Never fetched even once, so this feed contributes nothing at all
+         * rather than merely being stale. */
+        json_object_object_add(o, "never_succeeded", json_object_new_boolean(success_at <= 0));
+        aegisxd_json_add_string(o, "failure_reason", err);
+        json_object_array_add(arr, o);
+        if (total)
+            (*total)++;
+        if (err[0] && failing)
+            (*failing)++;
+        if (success_at <= 0 && never_succeeded)
+            (*never_succeeded)++;
+    }
+    sqlite3_finalize(st);
+    return arr;
+}
+
 static int aegisxd_feed_rows(void)
 {
     sqlite3_stmt *st;
@@ -851,6 +903,10 @@ struct json_object *aegisxd_status_json(void)
     int settings_ok;
     int ok;
     int degraded;
+    struct json_object *feed_health;
+    int feeds_total = 0;
+    int feeds_failing = 0;
+    int feeds_never_succeeded = 0;
 
     settings_ok = aegisxd_settings_load(&settings) == 0;
     ok = aegisxd_status_contract_load(state, sizeof(state), last_error, sizeof(last_error),
@@ -858,7 +914,14 @@ struct json_object *aegisxd_status_json(void)
     ok = ok && settings_ok;
     if (!ok && !last_error[0])
         snprintf(last_error, sizeof(last_error), "%s", "status_query_failed");
-    degraded = !ok || last_error[0] || !strcmp(state, "failed") || !strcmp(state, "error");
+    feed_health = aegisxd_feed_health_json(&feeds_total, &feeds_failing,
+                                           &feeds_never_succeeded);
+    /* A single feed that cannot be fetched is a per-feed fault, not a service
+     * fault.  Previously any non-empty last_error anywhere pulled the whole
+     * service to degraded, which hid the difference between "one blocklist is
+     * unreachable" and "the engine is broken". */
+    degraded = !ok || !strcmp(state, "failed") || !strcmp(state, "error") ||
+               (feeds_total > 0 && feeds_failing >= feeds_total);
     json_object_object_add(resp, "ok", json_object_new_boolean(ok));
     aegisxd_json_add_string(resp, "service", "dreamingwrt-aegisxd");
     aegisxd_json_add_string(resp, "version", WORKER_STATUS_VERSION);
@@ -866,6 +929,21 @@ struct json_object *aegisxd_status_json(void)
     aegisxd_json_add_string(resp, "state", degraded ? "degraded" : state);
     json_object_object_add(resp, "degraded", json_object_new_boolean(degraded));
     aegisxd_json_add_string(resp, "last_error", last_error);
+    json_object_object_add(resp, "feed_health", feed_health);
+    json_object_object_add(resp, "feeds_total", json_object_new_int(feeds_total));
+    json_object_object_add(resp, "feeds_failing", json_object_new_int(feeds_failing));
+    json_object_object_add(resp, "feeds_healthy",
+                           json_object_new_int(feeds_total - feeds_failing));
+    json_object_object_add(resp, "feeds_never_succeeded",
+                           json_object_new_int(feeds_never_succeeded));
+    /* last_error is retained for compatibility but is only one of possibly
+     * several faults; feed_health carries the per-feed detail. */
+    json_object_object_add(resp, "last_error_is_service_wide",
+                           json_object_new_boolean(feeds_total > 0 &&
+                                                   feeds_failing >= feeds_total));
+    aegisxd_json_add_string(resp, "feed_degradation_scope",
+                            feeds_failing <= 0 ? "none" :
+                            (feeds_failing >= feeds_total ? "all_feeds" : "partial_feeds"));
     json_object_object_add(resp, "updated_at", json_object_new_int64(updated_at));
     json_object_object_add(resp, "schema_version", json_object_new_int(schema_version));
     aegisxd_json_add_string(resp, "schema_source", "aegis.db:aegis_state.schema_version");

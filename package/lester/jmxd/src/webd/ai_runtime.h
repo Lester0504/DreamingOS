@@ -14,8 +14,14 @@ struct json_object *webd_ai_runtime_cancel(const char *response_id,
                                            int *http_status);
 struct json_object *webd_ai_runtime_provider_test(const char *actor,
                                                   int *http_status);
+struct json_object *webd_ai_runtime_provider_test_id(const char *provider_id,
+                                                     const char *actor,
+                                                     int *http_status);
 struct json_object *webd_ai_runtime_models(const char *actor,
                                            int *http_status);
+struct json_object *webd_ai_runtime_models_id(const char *provider_id,
+                                              const char *actor,
+                                              int *http_status);
 struct json_object *webd_ai_attachment_create(struct json_object *body,
                                               const char *actor,
                                               int *http_status);

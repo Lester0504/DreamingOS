@@ -254,6 +254,7 @@ struct json_object *jmx_core_status_json(void)
     json_object_object_add(data, "last_error_code", json_object_new_int(snap.last_error_code));
     json_object_object_add(data, "source", json_object_new_string("dreamingwrt-core"));
     jmx_core_watchdog_append_status(data);
+    jmx_dreamingwrt_metrics_tick_append_status(data);
     return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
 }
 

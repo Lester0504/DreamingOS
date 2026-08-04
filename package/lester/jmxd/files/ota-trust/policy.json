@@ -1,9 +1,18 @@
 {
   "schema_version": 1,
-  "policy_version": 1,
+  "policy_version": 2,
   "minimum_security_epoch": 1,
   "allow_security_epoch_downgrade": false,
   "allow_build_downgrade": false,
   "allow_same_build": false,
-  "keys": []
+  "keys": [
+    {
+      "key_id": "dwrt-release-2026",
+      "status": "active",
+      "algorithm": "ed25519",
+      "not_before": 0,
+      "not_after": 0,
+      "comment": "Release signing key. The public half belongs at keys/dwrt-release-2026.pem on the device; the private half stays on the build host and must never be committed or shipped."
+    }
+  ]
 }

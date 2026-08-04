@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN" data-theme-resolved="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>system-flash-backup-fixture-01</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-control-material.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/system-settings.css">
+  <style>
+    :root {
+      --app-menu-glass-width: 48px;
+      --app-radius-card: 24px;
+      --app-radius-panel: 18px;
+      --app-radius-control: 12px;
+      --app-page-gap: 16px;
+      --app-text: rgb(239 245 252);
+      --app-text-secondary: rgb(214 224 238);
+      --app-text-muted: rgb(177 193 213);
+      --app-accent: rgb(46 139 255);
+      --color-text-primary: var(--app-text);
+      --color-text-secondary: var(--app-text-secondary);
+      --color-text-muted: var(--app-text-muted);
+      --color-accent: var(--app-accent);
+      --color-on-accent: white;
+      --color-danger: rgb(239 86 99);
+      --color-warning: rgb(238 177 52);
+      --color-border-control: rgb(255 255 255 / .2);
+      --color-border-subtle: rgb(255 255 255 / .12);
+      --color-surface-control: rgb(255 255 255 / .06);
+      --color-surface-stable: rgb(12 20 32 / .55);
+      --color-surface-dense: rgb(10 16 25 / .78);
+      --dwrt-glass-ink: var(--app-text);
+      --dwrt-glass-text: var(--app-text-secondary);
+      --dwrt-glass-muted: var(--app-text-muted);
+      --dwrt-kit-text: var(--app-text);
+      --dwrt-kit-muted: var(--app-text-muted);
+    }
+    html, body { width: 100%; height: 100%; margin: 0; }
+    body { color: var(--app-text); background: linear-gradient(135deg, rgb(17 48 79), rgb(80 44 29)); font-family: system-ui, sans-serif; }
+    .console-stage { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; overflow: auto; }
+  </style>
+</head>
+<body>
+  <main class="console-stage"><div class="route-preview" id="routePreview"></div></main>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/lucide.min.js"></script>
+  <script src="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script type="module">
+    import { mount } from '../../files/www/dreamingwrt/plugins/native/system-settings.js';
+
+    const root = document.getElementById('routePreview');
+    try { localStorage.setItem('dwrt.system.flash.tab', 'operations'); } catch (_) {}
+
+    // Shape mirrors /api/v1/system/basic. Note the three backup capability bits are
+    // deliberately absent: that is exactly what the device reports today.
+    const basic = {
+      general: { version: "DISTRIB_DESCRIPTION='Dreaming OS 26.08'" },
+      flash: { current_firmware: "DISTRIB_DESCRIPTION='Dreaming OS 26.08'", build_time: '2026-08-01 03:12', keep_settings: true, last_backup_at: 1785200000, auto_backup: true },
+      capabilities: { flash_browser_upload: true, flash_sysupgrade: false }
+    };
+
+    // Shape mirrors webd_config_backup_list_response(): upload meta + manifest.
+    const backups = {
+      items: [
+        {
+          upload_id: 'bk-2026080301', backup_id: 'bk-2026080301', upload_type: 'backup',
+          origin: 'config_backup', filename: 'config-20260803.dwbk', status: 'finalized',
+          size_bytes: 2411724, created_at: 1785300000, updated_at: 1785300000,
+          download_url: '/api/v1/system/flash/backups/bk-2026080301/download',
+          manifest: { format: 'dwrt-config-backup-v1', product: 'DreamingWrt', schema: '31', source_version: 'Dreaming OS 26.08', sha256: 'a'.repeat(64), size_bytes: 2411724, created_at: 1785300000 }
+        },
+        {
+          upload_id: 'bk-2026080201', backup_id: 'bk-2026080201', upload_type: 'backup',
+          origin: 'config_backup', filename: 'config-20260802.dwbk', status: 'finalized',
+          size_bytes: 2398112, created_at: 1785210000, updated_at: 1785210000,
+          download_url: '/api/v1/system/flash/backups/bk-2026080201/download',
+          manifest: { format: 'dwrt-config-backup-v1', product: 'DreamingWrt', schema: '31', source_version: 'Dreaming OS 26.07', sha256: 'b'.repeat(64), size_bytes: 2398112, created_at: 1785210000 }
+        }
+      ],
+      total: 2
+    };
+
+    const calls = [];
+    const json = (data, status = 200) => new Response(JSON.stringify({ ok: true, data }), { status, headers: { 'content-type': 'application/json' } });
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = async (url, init = {}) => {
+      const target = String(url).split('?')[0];
+      calls.push({ path: target, method: (init.method || 'GET').toUpperCase() });
+      if (target === '/api/v1/system/basic') return json(basic);
+      if (target === '/api/v1/system/flash/backups' && (init.method || 'GET').toUpperCase() === 'GET') return json(backups);
+      if (target.startsWith('/api/v1/system/flash/backups/') && (init.method || '').toUpperCase() === 'DELETE') return json({ deleted: true });
+      if (target === '/api/v1/system/flash/restore_backup') return json({ message: '恢复已暂存，等待确认。' });
+      if (target === '/api/v1/system/flash/create_backup') return json({ backup_id: 'bk-new', download_url: '/api/v1/system/flash/backups/bk-new/download', size_bytes: 2400000, created_at: 1785400000 });
+      if (target === '/api/v1/system/flash/preserve_config') return json({ path: '/etc/sysupgrade.conf', items: ['/etc/dropbear', '/etc/dreamingwrt'] });
+      return json({});
+    };
+
+    const ui = {
+      mountAll: node => window.DWRT_UI_KIT.mountAll(node),
+      lucideIcon: (...args) => window.DWRT_UI_KIT.lucideIcon(...args),
+      statusBadgeMarkup: (...args) => window.DWRT_UI_KIT.statusBadgeMarkup(...args),
+      overviewCardsMarkup: (...args) => window.DWRT_UI_KIT.overviewCardsMarkup(...args),
+      floatingSavebarMarkup: (...args) => window.DWRT_UI_KIT.floatingSavebarMarkup(...args),
+      confirmationMarkup: (...args) => window.DWRT_UI_KIT.confirmationMarkup(...args),
+      scheduleAdaptiveForegroundSample: () => {}
+    };
+    const utils = { escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]) };
+
+    let instance = mount({ root, item: { id: 'system-flash' }, path: '#/system/flash', ui, utils });
+
+    window.FLASH_FIXTURE = {
+      async ready() {
+        for (let index = 0; index < 160; index += 1) {
+          if (root.querySelector('.system-flash-tabs')) return true;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        return false;
+      },
+      tabs() {
+        return Array.from(root.querySelectorAll('[data-system-flash-tab]')).map(node => ({ id: node.dataset.systemFlashTab, label: node.textContent.trim(), active: node.classList.contains('is-active') }));
+      },
+      async switchTab(id) {
+        root.querySelector(`[data-system-flash-tab="${id}"]`)?.click();
+        await new Promise(resolve => setTimeout(resolve, 260));
+        return true;
+      },
+      backupRows() {
+        return Array.from(root.querySelectorAll('[data-system-backup-id]')).map(row => ({
+          id: row.dataset.systemBackupId,
+          cells: Array.from(row.querySelectorAll('td')).map(cell => cell.textContent.trim()),
+          actions: Array.from(row.querySelectorAll('[data-system-action], a[download]')).map(node => node.dataset.systemAction || 'download')
+        }));
+      },
+      calls() { return calls.slice(); },
+      text() { return root.textContent || ''; },
+      async click(action, backupId) {
+        const selector = backupId ? `[data-system-action="${action}"][data-backup-id="${backupId}"]` : `[data-system-action="${action}"]`;
+        root.querySelector(selector)?.click();
+        await new Promise(resolve => setTimeout(resolve, 220));
+        return root.querySelector('.system-flash-status')?.textContent.trim() || '';
+      },
+      unmount() { instance?.unmount?.(); instance = null; }
+    };
+  </script>
+</body>
+</html>

@@ -18,9 +18,12 @@
 #include <libubox/utils.h>
 #include <libubus.h>
 #include "jmx_core_watchdog.h"
+#include "dw_async_query.h"
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <linux/netlink.h>
 #include <linux/socket.h>
 #include <sys/socket.h>
@@ -33,6 +36,7 @@
 #include "jmx_config.h"
 #include <uci.h>
 #include "jmx.h"
+#include "jmx_exec.h"
 #include "jmx_db.h"
 #include "jmx_utils.h"
 #include "jmx_netconfig_db.h"
@@ -68,11 +72,13 @@
 #endif
 
 extern jmx_status_t g_jmx_status;
-extern void reload_oaf_rule(void);
 
 
 #define MAX_INTERFACE_TRAFFIC_POINTS 30
 #define INTERFACE_TRAFFIC_INTERVAL 2  
+#define JMX_UBUS_EXEC_TIMEOUT_MS 5000
+#define JMX_UBUS_TEMPINFO_MAX_OUTPUT 4096U
+#define JMX_UBUS_BOARD_MAX_OUTPUT 8192U
 
 typedef struct interface_traffic_node {
     struct list_head list;
@@ -110,12 +116,55 @@ void ubus_response_json(struct ubus_context *ctx, struct ubus_request_data *req,
     blob_buf_free(&b_buf);
 }
 
-void reload_oaf_rule(){
-    system("/usr/bin/oaf_rule reload");
+static int jmx_ubus_exec_succeeded(const struct jmx_exec_result *result)
+{
+    return result && !result->timed_out && !result->truncated &&
+           result->term_signal == 0 && result->exit_code == 0;
+}
+
+static int jmx_ubus_exec_capture(const char *path, char *const argv[],
+                                 size_t output_limit, char *output,
+                                 size_t output_len)
+{
+    struct jmx_exec_result result;
+    int rc = -1;
+
+    if (!output || output_len == 0 || output_limit == 0 ||
+        output_limit >= output_len)
+        return -1;
+    output[0] = '\0';
+    if (jmx_exec_capture(path, argv, output_limit,
+                         JMX_UBUS_EXEC_TIMEOUT_MS, &result) != 0)
+        return -1;
+    if (jmx_ubus_exec_succeeded(&result) && result.output &&
+        result.output_len < output_len) {
+        memcpy(output, result.output, result.output_len + 1);
+        str_trim(output);
+        rc = 0;
+    }
+    jmx_exec_result_free(&result);
+    return rc;
+}
+
+void reload_oaf_rule(void)
+{
+    char *argv[] = { "/usr/bin/oaf_rule", "reload", NULL };
+    struct jmx_exec_result result;
+
+    if (jmx_exec_wait(argv[0], argv, JMX_UBUS_EXEC_TIMEOUT_MS, &result) != 0) {
+        LOG_ERROR("failed to execute oaf rule reload\n");
+        return;
+    }
+    if (!jmx_ubus_exec_succeeded(&result))
+        LOG_ERROR("oaf rule reload failed: exit=%d signal=%d timeout=%d\n",
+                  result.exit_code, result.term_signal, result.timed_out);
+    jmx_exec_result_free(&result);
 }
 
 static const char *lookup_signature_app(unsigned int app_id, char *name, size_t name_len,
                                         char *icon, size_t icon_len);
+static int read_file_buf(const char *file, char *buf, int len);
+static int read_unsigned_file(const char *path, unsigned long long *value);
 
 static const char *jmx_safe_app_name(int appid)
 {
@@ -970,18 +1019,20 @@ struct json_object *jmx_api_get_all_users(struct json_object *req_obj) {
 
 struct json_object *jmx_api_get_oaf_status(struct json_object *req_obj) {
     struct json_object *data_obj = json_object_new_object();
-    char result[128] = {0};
+    unsigned long long enabled_value = 0;
     char kernel_version[128] = {0};
+    struct utsname uts;
     int enable = 0;
-    int ret = 0;
     int engine_status = 0;
+
+    (void)req_obj;
     
-    ret = exec_with_result_line("cat /proc/sys/oaf/enable", result, sizeof(result));
-    if (strlen(result) == 0) {
+    if (read_unsigned_file("/proc/sys/oaf/enable", &enabled_value) != 0 ||
+        enabled_value > INT_MAX) {
         engine_status = 0;
         enable = 0;
     } else {
-        enable = atoi(result);
+        enable = (int)enabled_value;
         engine_status = 1;
     }
     
@@ -989,16 +1040,16 @@ struct json_object *jmx_api_get_oaf_status(struct json_object *req_obj) {
     json_object_object_add(data_obj, "version", json_object_new_string(OAF_VERSION));
     json_object_object_add(data_obj, "engine_status", json_object_new_int(engine_status));
     
-    ret = exec_with_result_line("cat /proc/sys/oaf/version", kernel_version, sizeof(kernel_version));
-    if (ret >= 0) {
+    if (read_file_buf("/proc/sys/oaf/version", kernel_version,
+                      sizeof(kernel_version)) > 0) {
         json_object_object_add(data_obj, "engine_version", json_object_new_string(kernel_version));
     } else {
         json_object_object_add(data_obj, "engine_version", json_object_new_string(""));
     }
     
-    ret = exec_with_result_line("uname -r", kernel_version, sizeof(kernel_version));
-    if (ret >= 0) {
-        json_object_object_add(data_obj, "kernel_version", json_object_new_string(kernel_version));
+    if (uname(&uts) == 0) {
+        json_object_object_add(data_obj, "kernel_version",
+                               json_object_new_string(uts.release));
     } else {
         json_object_object_add(data_obj, "kernel_version", json_object_new_string(""));
     }
@@ -1131,8 +1182,13 @@ static char *get_model(void) {
 
     if (strcmp(model, "Unknown") == 0) {
         char buf[256] = {0};
-        if (exec_with_result_line("cat /proc/device-tree/model 2>/dev/null || cat /tmp/sysinfo/board_name 2>/dev/null || echo Unknown", buf, sizeof(buf)) == 0 && strlen(buf) > 0) {
-            strncpy(model, buf, sizeof(model) - 1);
+        if ((read_file_buf("/proc/device-tree/model", buf, sizeof(buf)) > 0 ||
+             read_file_buf("/tmp/sysinfo/board_name", buf, sizeof(buf)) > 0) &&
+            buf[0] != '\0') {
+            size_t model_len = strnlen(buf, sizeof(model) - 1);
+
+            memcpy(model, buf, model_len);
+            model[model_len] = '\0';
         }
     }
     
@@ -1259,38 +1315,26 @@ static int parse_tempinfo_output(char *output, int *cpu_temp, int *wifi_temp) {
     return -1;
 }
 
+static int get_tempinfo_values(int *cpu_temp, int *wifi_temp)
+{
+    char output[JMX_UBUS_TEMPINFO_MAX_OUTPUT + 1] = {0};
+    char *argv[] = { "/sbin/tempinfo", NULL };
+
+    if (jmx_ubus_exec_capture(argv[0], argv,
+                              JMX_UBUS_TEMPINFO_MAX_OUTPUT,
+                              output, sizeof(output)) != 0)
+        return -1;
+    return parse_tempinfo_output(output, cpu_temp, wifi_temp);
+}
+
 
 static int get_cpu_temperature(void) {
     int cpu_temp = -1;
     int wifi_temp = -1; 
     int i;
 
-    if (access("/sbin/tempinfo", F_OK) == 0) {
-        FILE *fp = popen("/sbin/tempinfo", "r");
-        if (fp) {
-            char output[256] = {0};
-            char line[256] = {0};
-            size_t total_read = 0;
-            
-
-            while (fgets(line, sizeof(line), fp) != NULL && total_read < sizeof(output) - 1) {
-                size_t line_len = strlen(line);
-                if (total_read + line_len < sizeof(output) - 1) {
-                    strncpy(output + total_read, line, line_len);
-                    total_read += line_len;
-                    output[total_read] = '\0';
-                } else {
-                    break;
-                }
-            }
-            pclose(fp);
-            
-
-            if (parse_tempinfo_output(output, &cpu_temp, &wifi_temp) == 0 && cpu_temp > 0) {
-                return cpu_temp;
-            }
-        }
-    }
+    if (get_tempinfo_values(&cpu_temp, &wifi_temp) == 0 && cpu_temp > 0)
+        return cpu_temp;
     
 
     char temp_buf[64] = {0};
@@ -1391,32 +1435,8 @@ static int get_wifi_temperature(void) {
     int wifi_temp = -1;
     int i;
 
-    if (access("/sbin/tempinfo", F_OK) == 0) {
-        FILE *fp = popen("/sbin/tempinfo", "r");
-        if (fp) {
-            char output[256] = {0};
-            char line[256] = {0};
-            size_t total_read = 0;
-            
-
-            while (fgets(line, sizeof(line), fp) != NULL && total_read < sizeof(output) - 1) {
-                size_t line_len = strlen(line);
-                if (total_read + line_len < sizeof(output) - 1) {
-                    strncpy(output + total_read, line, line_len);
-                    total_read += line_len;
-                    output[total_read] = '\0';
-                } else {
-                    break;
-                }
-            }
-            pclose(fp);
-            
-
-            if (parse_tempinfo_output(output, &cpu_temp, &wifi_temp) == 0 && wifi_temp > 0) {
-                return wifi_temp;
-            }
-        }
-    }
+    if (get_tempinfo_values(&cpu_temp, &wifi_temp) == 0 && wifi_temp > 0)
+        return wifi_temp;
     
 
     char temp_buf[64] = {0};
@@ -1544,29 +1564,14 @@ static int get_cpu_model_name(char *model_name, size_t len) {
 
 
 static int get_cpu_model_name_from_ubus(char *model_name, size_t len) {
+    char ubus_output[JMX_UBUS_BOARD_MAX_OUTPUT + 1] = {0};
+    char *argv[] = { "/bin/ubus", "call", "system", "board", NULL };
 
-    FILE *ubus_fp = popen("ubus call system board 2>/dev/null", "r");
-    if (!ubus_fp) {
-        LOG_ERROR("get_cpu_model_name_from_ubus: failed to call ubus system board\n");
+    if (jmx_ubus_exec_capture(argv[0], argv, JMX_UBUS_BOARD_MAX_OUTPUT,
+                              ubus_output, sizeof(ubus_output)) != 0) {
+        LOG_ERROR("get_cpu_model_name_from_ubus: ubus system board failed\n");
         return -1;
     }
-    
-
-    char ubus_output[2048] = {0};
-    size_t total_read = 0;
-    char line_buf[256] = {0};
-    
-    while (fgets(line_buf, sizeof(line_buf), ubus_fp) && total_read < sizeof(ubus_output) - 1) {
-        size_t line_len = strlen(line_buf);
-        if (total_read + line_len < sizeof(ubus_output) - 1) {
-            memcpy(ubus_output + total_read, line_buf, line_len);
-            total_read += line_len;
-            ubus_output[total_read] = '\0';
-        } else {
-            break;
-        }
-    }
-    pclose(ubus_fp);
     
     if (strlen(ubus_output) == 0) {
         LOG_ERROR("get_cpu_model_name_from_ubus: ubus output is empty\n");
@@ -1675,11 +1680,95 @@ static int get_os_release_field(const char *field_name, char *value, size_t len)
     return 0;
 }
 
+static int read_kernel_release(char *output, size_t output_len)
+{
+    struct utsname uts;
+
+    if (!output || output_len == 0 || uname(&uts) != 0 ||
+        strlen(uts.release) >= output_len)
+        return -1;
+    memcpy(output, uts.release, strlen(uts.release) + 1);
+    return 0;
+}
+
+static int read_memory_kb(int *total_kb, int *used_kb)
+{
+    FILE *fp;
+    char key[64];
+    unsigned long long value;
+    unsigned long long total = 0, available = 0, free_kb = 0;
+    unsigned long long buffers = 0, cached = 0, reclaimable = 0, shmem = 0;
+
+    if (!total_kb || !used_kb)
+        return -1;
+    fp = fopen("/proc/meminfo", "r");
+    if (!fp)
+        return -1;
+    while (fscanf(fp, "%63s %llu kB", key, &value) == 2) {
+        if (!strcmp(key, "MemTotal:")) total = value;
+        else if (!strcmp(key, "MemAvailable:")) available = value;
+        else if (!strcmp(key, "MemFree:")) free_kb = value;
+        else if (!strcmp(key, "Buffers:")) buffers = value;
+        else if (!strcmp(key, "Cached:")) cached = value;
+        else if (!strcmp(key, "SReclaimable:")) reclaimable = value;
+        else if (!strcmp(key, "Shmem:")) shmem = value;
+    }
+    int read_failed = ferror(fp);
+    int close_failed = fclose(fp) != 0;
+
+    if (read_failed || close_failed || total == 0 || total > INT_MAX)
+        return -1;
+    if (available == 0) {
+        available = free_kb + buffers + cached + reclaimable;
+        available = available > shmem ? available - shmem : 0;
+    }
+    if (available > total)
+        available = total;
+    *total_kb = (int)total;
+    *used_kb = (int)(total - available);
+    return 0;
+}
+
+static int read_unsigned_file(const char *path, unsigned long long *value)
+{
+    char buffer[128];
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (!value || read_file_buf(path, buffer, sizeof(buffer)) <= 0)
+        return -1;
+    errno = 0;
+    parsed = strtoull(buffer, &end, 10);
+    if (errno != 0 || end == buffer || *end != '\0')
+        return -1;
+    *value = parsed;
+    return 0;
+}
+
+static void add_storage_stat(struct json_object *storage_obj,
+                             const char *name, const char *path)
+{
+    struct json_object *item = json_object_new_object();
+    struct statvfs vfs;
+    uint64_t total_kb = 0, used_kb = 0;
+
+    if (statvfs(path, &vfs) == 0 && vfs.f_frsize != 0 &&
+        vfs.f_bfree <= vfs.f_blocks) {
+        total_kb = (uint64_t)vfs.f_blocks * (uint64_t)vfs.f_frsize / 1024U;
+        used_kb = (uint64_t)(vfs.f_blocks - vfs.f_bfree) *
+                  (uint64_t)vfs.f_frsize / 1024U;
+    }
+    if (total_kb > INT64_MAX) total_kb = INT64_MAX;
+    if (used_kb > INT64_MAX) used_kb = INT64_MAX;
+    json_object_object_add(item, "total_kb", json_object_new_int64((int64_t)total_kb));
+    json_object_object_add(item, "used_kb", json_object_new_int64((int64_t)used_kb));
+    json_object_object_add(storage_obj, name, item);
+}
+
 
 static struct json_object *get_dashboard_system_status(void) {
     struct json_object *system_status = json_object_new_object();
     char buf[256] = {0};
-    char result[128] = {0};
 	int hour;
     
 
@@ -1736,8 +1825,7 @@ static struct json_object *get_dashboard_system_status(void) {
     
 
     memset(buf, 0, sizeof(buf));
-    if (exec_with_result_line("uname -r", buf, sizeof(buf)) == 0 && strlen(buf) > 0) {
-        str_trim(buf);
+    if (read_kernel_release(buf, sizeof(buf)) == 0) {
         json_object_object_add(system_status, "kernel_version", json_object_new_string(buf));
     } else {
         json_object_object_add(system_status, "kernel_version", json_object_new_string("Unknown"));
@@ -1748,23 +1836,15 @@ static struct json_object *get_dashboard_system_status(void) {
     json_object_object_add(system_status, "uptime", json_object_new_int(uptime));
     
 
-    memset(result, 0, sizeof(result));
     int total_mem_kb = 0;
     int used_mem_kb = 0;
-    if (exec_with_result_line("free | grep Mem | awk '{print $2}'", result, sizeof(result)) == 0) {
-        total_mem_kb = atoi(result);
-    }
-    memset(result, 0, sizeof(result));
-    if (exec_with_result_line("free | grep Mem | awk '{print $3}'", result, sizeof(result)) == 0) {
-        used_mem_kb = atoi(result);
-    }
+    (void)read_memory_kb(&total_mem_kb, &used_mem_kb);
     
 
     json_object_object_add(system_status, "total_mem", json_object_new_int(total_mem_kb));
     json_object_object_add(system_status, "used_mem", json_object_new_int(used_mem_kb));
     
 
-    memset(result, 0, sizeof(result));
     int cpu_usage = get_cpu_usage_percent();
 
     snprintf(buf, sizeof(buf), "%d", cpu_usage);
@@ -1772,11 +1852,11 @@ static struct json_object *get_dashboard_system_status(void) {
     json_object_object_add(system_status, "cpu_percent", json_object_new_int(cpu_usage));
 
     int connections = 0;
-    memset(result, 0, sizeof(result));
+    unsigned long long connection_count = 0;
 
-    if (exec_with_result_line("cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null", result, sizeof(result)) == 0) {
-        connections = atoi(result);
-    }
+    if (read_unsigned_file("/proc/sys/net/netfilter/nf_conntrack_count",
+                           &connection_count) == 0 && connection_count <= INT_MAX)
+        connections = (int)connection_count;
     json_object_object_add(system_status, "connections", json_object_new_int(connections));
     
     
@@ -1793,75 +1873,9 @@ static struct json_object *get_dashboard_system_status(void) {
     
 
     struct json_object *storage_obj = json_object_new_object();
-    FILE *df_fp = popen("df -k", "r");
-    if (df_fp) {
-        char line[512];
-        int found_tmp = 0, found_root = 0, found_boot = 0;
-        
-
-        if (fgets(line, sizeof(line), df_fp)) {
-
-            while (fgets(line, sizeof(line), df_fp)) {
-                char filesystem[256] = {0};
-                unsigned long long total_kb = 0, used_kb = 0;
-                unsigned long long available_kb = 0;  // 仅用于解析，不返回
-                int use_percent = 0;  // 仅用于解析，不返回
-                char mount_point[256] = {0};
-                
-
-
-                if (sscanf(line, "%255s %llu %llu %llu %d%% %255s", 
-                          filesystem, &total_kb, &used_kb, &available_kb, &use_percent, mount_point) >= 6) {
-
-                    if (strcmp(mount_point, "/tmp") == 0 && !found_tmp) {
-                        struct json_object *tmp_obj = json_object_new_object();
-                        json_object_object_add(tmp_obj, "total_kb", json_object_new_int64(total_kb));
-                        json_object_object_add(tmp_obj, "used_kb", json_object_new_int64(used_kb));
-                        json_object_object_add(storage_obj, "tmp", tmp_obj);
-                        found_tmp = 1;
-                    } else if (strcmp(mount_point, "/") == 0 && !found_root) {
-                        struct json_object *root_obj = json_object_new_object();
-                        json_object_object_add(root_obj, "total_kb", json_object_new_int64(total_kb));
-                        json_object_object_add(root_obj, "used_kb", json_object_new_int64(used_kb));
-                        json_object_object_add(storage_obj, "root", root_obj);
-                        found_root = 1;
-                    } else if (strcmp(mount_point, "/boot") == 0 && !found_boot) {
-                        struct json_object *boot_obj = json_object_new_object();
-                        json_object_object_add(boot_obj, "total_kb", json_object_new_int64(total_kb));
-                        json_object_object_add(boot_obj, "used_kb", json_object_new_int64(used_kb));
-                        json_object_object_add(storage_obj, "boot", boot_obj);
-                        found_boot = 1;
-                    }
-                }
-                
-
-                if (found_tmp && found_root && found_boot) {
-                    break;
-                }
-            }
-        }
-        pclose(df_fp);
-    }
-    
-
-    if (!json_object_object_get(storage_obj, "tmp")) {
-        struct json_object *tmp_obj = json_object_new_object();
-        json_object_object_add(tmp_obj, "total_kb", json_object_new_int64(0));
-        json_object_object_add(tmp_obj, "used_kb", json_object_new_int64(0));
-        json_object_object_add(storage_obj, "tmp", tmp_obj);
-    }
-    if (!json_object_object_get(storage_obj, "root")) {
-        struct json_object *root_obj = json_object_new_object();
-        json_object_object_add(root_obj, "total_kb", json_object_new_int64(0));
-        json_object_object_add(root_obj, "used_kb", json_object_new_int64(0));
-        json_object_object_add(storage_obj, "root", root_obj);
-    }
-    if (!json_object_object_get(storage_obj, "boot")) {
-        struct json_object *boot_obj = json_object_new_object();
-        json_object_object_add(boot_obj, "total_kb", json_object_new_int64(0));
-        json_object_object_add(boot_obj, "used_kb", json_object_new_int64(0));
-        json_object_object_add(storage_obj, "boot", boot_obj);
-    }
+    add_storage_stat(storage_obj, "tmp", "/tmp");
+    add_storage_stat(storage_obj, "root", "/");
+    add_storage_stat(storage_obj, "boot", "/boot");
     
     json_object_object_add(system_status, "storage", storage_obj);
     
@@ -5249,6 +5263,10 @@ static struct json_object *jmx_api_bulk_ip_get(struct json_object *req_obj)
 { (void)req_obj; return jmx_bulk_ip_get(); }
 static struct json_object *jmx_api_bulk_ip_set(struct json_object *req_obj)
 { struct json_object *data=json_object_new_object(); int rc=jmx_bulk_ip_set(req_obj); json_object_object_add(data,"ok",json_object_new_boolean(rc==0)); json_object_object_add(data,"saved",json_object_new_boolean(rc==0)); return jmx_gen_api_response_data(rc==0?API_CODE_SUCCESS:API_CODE_ERROR,data); }
+static struct json_object *jmx_api_bulk_ip_transaction(struct json_object *req_obj)
+{ return jmx_bulk_ip_transaction(req_obj); }
+static struct json_object *jmx_api_bulk_ip_refresh(struct json_object *req_obj)
+{ return jmx_bulk_ip_refresh(req_obj); }
 static struct json_object *jmx_api_bulk_ip_import(struct json_object *req_obj)
 { return jmx_bulk_ip_import(req_obj); }
 static struct json_object *jmx_api_bulk_ip_export(struct json_object *req_obj)
@@ -5537,6 +5555,8 @@ static jmx_api_node_t jmx_api_node_list[] = {
 
     {"dreamingwrt_bulk_ip", jmx_api_bulk_ip_get},
     {"dreamingwrt_bulk_ip_set", jmx_api_bulk_ip_set},
+    {"dreamingwrt_bulk_ip_transaction", jmx_api_bulk_ip_transaction},
+    {"dreamingwrt_bulk_ip_refresh", jmx_api_bulk_ip_refresh},
     {"dreamingwrt_bulk_ip_import", jmx_api_bulk_ip_import},
     {"dreamingwrt_bulk_ip_export", jmx_api_bulk_ip_export},
     {"dreamingwrt_multicast_service", jmx_api_multicast_service_get},
@@ -5896,6 +5916,12 @@ static void jmx_ubus_reconnect_cb(struct uloop_timeout *t)
 static void jmx_ubus_connection_lost(struct ubus_context *ctx)
 {
     LOG_ERROR("ubus connection lost; scheduling reconnect\n");
+    /*
+     * Invalidate deferred off-loop queries first. Their ubus_request_data was
+     * copied from the connection that just died; replying after reconnect would
+     * target a closed (possibly reused) descriptor.
+     */
+    dw_async_query_connection_lost();
     if (ctx)
         uloop_fd_delete(&ctx->sock);
     if (!jmx_ubus_reconnect_timer.pending)

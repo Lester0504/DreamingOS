@@ -157,6 +157,38 @@ static int route_string_ok(const char *value, size_t max_len)
     return value && strlen(value) < max_len;
 }
 
+/*
+ * Length-only validation is not enough for the fields that end up as shell
+ * words. A WAN name stored here is later interpolated into a popen() command
+ * ("ubus -S call network.interface.<name> status") in
+ * jmx_netconfig_db.c:nc_dns_route_wan_runtime(), so a name containing ; | ` or
+ * $() would run as a command. Restrict the identifier-like fields to the same
+ * character class jmx_netconfig_db.c:nc_valid_name() already enforces on the
+ * netconfig side.
+ *
+ * Deliberately scoped to identifiers only: this must keep accepting the names
+ * real deployments already use (verified on a live box: "wan", "wan2", plus UCI
+ * interfaces such as "wan6", "vpn0", "client1", and dotted VLAN forms like
+ * "eth0.100"), and must NOT be applied to free-text fields like a rule's
+ * display name, where spaces and punctuation are legitimate.
+ */
+static int route_identifier_ok(const char *value, size_t max_len)
+{
+    size_t i;
+
+    if (!route_string_ok(value, max_len))
+        return 0;
+    for (i = 0; value[i]; i++) {
+        char c = value[i];
+
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
 static int route_ipv4_ok(const char *value)
 {
     struct in_addr address;
@@ -383,7 +415,11 @@ invalid_all_down:
         health_mode = route_json_string(wan, "health_mode", "");
         check_host = route_json_string(wan, "check_host", "");
         check_url = route_json_string(wan, "check_url", "");
-        if (!route_string_ok(name, 64) || !name[0] || !route_string_ok(ifname, 64) ||
+        /* name and ifname are identifiers that reach a shell command; check for
+         * character content, not just length. check_host/check_url stay
+         * length-checked here because they are validated where they are used. */
+        if (!route_identifier_ok(name, 64) || !name[0] ||
+            !route_identifier_ok(ifname, 64) ||
             !route_string_ok(gateway, 64) || !route_ipv4_ok(gateway) ||
             !route_string_ok(health_mode, 32) || !route_string_ok(check_host, 128) ||
             !route_string_ok(check_url, 128)) {

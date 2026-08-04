@@ -31,6 +31,8 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/sslerr.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
@@ -262,6 +264,63 @@ static void ac_transport_log_stage(const char *event, const char *stage)
     if (event && stage)
         fprintf(stderr, "[%s] transport event=%s stage=%s\n",
                 AC_SERVICE_NAME, event, stage);
+}
+
+/*
+ * Same line plus why it failed.
+ *
+ * The stage alone said "tls_handshake" and stopped there, so working out that
+ * APs were refusing a certificate whose notBefore was in the future needed a
+ * manual openssl s_client run against the controller. The reason is available at
+ * the point of failure; not printing it just moves the work to whoever is
+ * debugging at the time.
+ */
+static void ac_transport_log_stage_reason(const char *event, const char *stage,
+                                          const char *reason)
+{
+    if (!event || !stage)
+        return;
+    if (!reason || !reason[0]) {
+        ac_transport_log_stage(event, stage);
+        return;
+    }
+    fprintf(stderr, "[%s] transport event=%s stage=%s reason=%s\n",
+            AC_SERVICE_NAME, event, stage, reason);
+}
+
+/*
+ * A short reason for a failed handshake, favouring the causes that are actually
+ * actionable. Our own certificate being outside its validity window is checked
+ * first because it takes down every AP at once and looks like a network fault.
+ */
+static const char *ac_transport_handshake_reason(SSL *ssl)
+{
+    unsigned long queued = ERR_peek_last_error();
+    X509 *own;
+
+    own = ssl ? SSL_get_certificate(ssl) : NULL;
+    if (own) {
+        if (X509_cmp_current_time(X509_get0_notBefore(own)) > 0)
+            return "server_certificate_not_yet_valid_clock_was_ahead_when_signed";
+        if (X509_cmp_current_time(X509_get0_notAfter(own)) < 0)
+            return "server_certificate_expired";
+    }
+    if (queued) {
+        int reason = ERR_GET_REASON(queued);
+
+        switch (reason) {
+        case SSL_R_CERTIFICATE_VERIFY_FAILED:
+            return "peer_rejected_our_certificate_or_we_rejected_theirs";
+        case SSL_R_UNSUPPORTED_PROTOCOL:
+            return "protocol_version_mismatch";
+        case SSL_R_NO_SHARED_CIPHER:
+            return "no_shared_cipher";
+        default:
+            break;
+        }
+        return ERR_reason_error_string(queued);
+    }
+    return "peer_closed_during_handshake";
 }
 
 static void ac_transport_set_reason(const char *reason)
@@ -2392,11 +2451,13 @@ static void ac_connection_run(int fd)
     }
     if (ap_control_ssl_handshake(ssl, 1, AP_CONTROL_IO_TIMEOUT_MS) !=
             AP_CONTROL_WIRE_OK) {
-        ac_transport_log_stage("connection_rejected", "tls_handshake");
+        ac_transport_log_stage_reason("connection_rejected", "tls_handshake",
+                                      ac_transport_handshake_reason(ssl));
         goto done;
     }
     if (SSL_get_verify_result(ssl) != X509_V_OK) {
-        ac_transport_log_stage("connection_rejected", "tls_verify");
+        ac_transport_log_stage_reason("connection_rejected", "tls_verify",
+            X509_verify_cert_error_string(SSL_get_verify_result(ssl)));
         goto done;
     }
     if (!ap_control_ssl_selected_alpn(ssl)) {
@@ -2835,6 +2896,52 @@ int ac_transport_port(void)
     port = g_ac_transport.listening ? g_ac_transport.port : 0;
     pthread_mutex_unlock(&g_ac_transport.lock);
     return port;
+}
+
+/*
+ * Report the server certificate's validity window and whether it is usable now.
+ *
+ * Added because an AP outage caused by a certificate whose notBefore sat eight
+ * hours in the future took a manual openssl s_client against the controller to
+ * diagnose: status said the transport was listening, which was true, and said
+ * nothing about the certificate being unusable. The dates belong in status so
+ * this is visible instead of deduced.
+ */
+int ac_transport_server_certificate_window(int64_t *not_before,
+                                           int64_t *not_after,
+                                           int *usable_now,
+                                           int *not_yet_valid)
+{
+    X509 *certificate = NULL;
+    struct tm before_tm;
+    struct tm after_tm;
+    int rc = -1;
+
+    pthread_mutex_lock(&g_ac_transport.pki_lock);
+    if (g_ac_transport.pki)
+        certificate = ac_pki_server_certificate_dup(g_ac_transport.pki);
+    pthread_mutex_unlock(&g_ac_transport.pki_lock);
+    if (!certificate)
+        return -1;
+    memset(&before_tm, 0, sizeof(before_tm));
+    memset(&after_tm, 0, sizeof(after_tm));
+    if (ASN1_TIME_to_tm(X509_get0_notBefore(certificate), &before_tm) == 1 &&
+        ASN1_TIME_to_tm(X509_get0_notAfter(certificate), &after_tm) == 1) {
+        if (not_before)
+            *not_before = (int64_t)timegm(&before_tm);
+        if (not_after)
+            *not_after = (int64_t)timegm(&after_tm);
+        if (not_yet_valid)
+            *not_yet_valid =
+                X509_cmp_current_time(X509_get0_notBefore(certificate)) > 0;
+        if (usable_now)
+            *usable_now =
+                X509_cmp_current_time(X509_get0_notBefore(certificate)) < 0 &&
+                X509_cmp_current_time(X509_get0_notAfter(certificate)) > 0;
+        rc = 0;
+    }
+    X509_free(certificate);
+    return rc;
 }
 
 const char *ac_transport_controller_id(void)
