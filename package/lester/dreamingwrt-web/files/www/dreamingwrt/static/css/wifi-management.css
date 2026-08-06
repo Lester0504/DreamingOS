@@ -1693,6 +1693,183 @@
   border: 0;
 }
 
+/* ── AP 管理 Tab ──
+ * 只写几何与排版：卡片材质来自 .wifi-config-surface 上的 .dwrt-kit-glass-surface，
+ * 状态胶囊沿用 Kit 的 .dwrt-kit-status-badge，圆角只取四档 token。
+ */
+.wifi-ap-search {
+  flex: 0 1 260px;
+  min-width: 0;
+}
+
+.wifi-ap-search > input {
+  width: 100%;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--wifi-soft-line);
+  border-radius: var(--app-radius-compact);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+}
+
+.wifi-ap-search > input:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--wifi-accent) 60%, transparent);
+  outline-offset: 1px;
+}
+
+.wifi-ap-name-cell,
+.wifi-ap-model-cell,
+.wifi-ap-runtime {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.wifi-ap-name-cell small,
+.wifi-ap-model-cell small,
+.wifi-ap-runtime small {
+  color: var(--wifi-muted);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.wifi-ap-seen { white-space: nowrap; }
+
+.wifi-pairing-card .wifi-notice { margin-bottom: 12px; }
+
+.wifi-pairing-secret {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  margin-bottom: 12px;
+  border: 1px solid color-mix(in srgb, var(--wifi-warn) 34%, transparent);
+  border-radius: var(--app-radius-panel);
+}
+
+.wifi-pairing-secret > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.wifi-pairing-secret span { color: var(--wifi-muted); font-size: 11px; }
+
+.wifi-pairing-secret code {
+  padding: 8px 10px;
+  border: 1px solid var(--wifi-soft-line);
+  border-radius: var(--app-radius-compact);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.wifi-pairing-secret-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+
+.wifi-pairing-secret-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.wifi-token-id {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.wifi-pairing-card td small {
+  display: block;
+  color: var(--wifi-muted);
+  font-size: 11px;
+}
+
+.wifi-token-revoke {
+  height: 28px;
+  padding: 0 12px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.wifi-ap-gated-list {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.wifi-ap-gated-list > li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--wifi-soft-line);
+  border-radius: var(--app-radius-compact);
+  font-size: 12px;
+}
+
+.wifi-ap-gated-list code {
+  color: var(--wifi-muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.wifi-ap-sheet-facts {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--wifi-soft-line);
+}
+
+.wifi-ap-sheet-facts > strong { font-size: 12px; font-weight: 650; }
+
+.wifi-ap-sheet-facts dl {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0 0;
+}
+
+.wifi-ap-sheet-facts dl > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.wifi-ap-sheet-facts dt { color: var(--wifi-muted); font-size: 12px; }
+
+.wifi-ap-sheet-facts dd {
+  margin: 0;
+  font-size: 12px;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.wifi-ap-sheet-note {
+  margin-top: 14px;
+  color: var(--wifi-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* 两个 AP 抽屉字段很少（编辑只有两项，生成配对码三项），按交接单取 460px 标准宽，
+ * 不用 .wifi-sheet 默认的 620px 表单宽。双类提权以压过 .wifi-sheet 的 width。 */
+.wifi-sheet.wifi-ap-sheet,
+.wifi-sheet.wifi-token-sheet {
+  width: var(--dwrt-kit-sheet-width-standard);
+}
+
 @media (max-width: 980px) {
   .wifi-speed-layout,
   .wifi-unifi-setting-grid,
@@ -1789,6 +1966,14 @@
 
 @media (max-width: 460px) {
   .airview-top-actions .policy-filter-button span { display: none; }
+  /* 表头换成两行，搜索框独占一行，避免标题与输入框互相挤压。 */
+  .wifi-ap-inventory .wifi-panel-heading {
+    flex-wrap: wrap;
+    padding: 10px 16px;
+  }
+  .wifi-ap-search { flex: 1 1 100%; }
+  .wifi-ap-sheet-facts dl > div { flex-direction: column; gap: 2px; }
+  .wifi-ap-sheet-facts dd { text-align: left; }
   .airview-top-actions .policy-filter-button { width: 38px; min-width: 38px; padding: 0; justify-content: center; }
   .wifi-section-head { align-items: flex-start; }
   .wifi-radio-options.compact { justify-content: flex-start; }

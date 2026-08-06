@@ -127,6 +127,44 @@ static int nc_setup_is_initialized(void)
     return initialized;
 }
 
+/*
+ * Shared "this router is already set up" refusal for the setup write paths.
+ *
+ * The HTTP layer already refuses these with the same `wizard_already_initialized`
+ * error, but every one of these functions is also registered on ubus, so a
+ * caller that reaches ubus directly bypassed the only copy of the check. The
+ * guard belongs next to the data it protects rather than only in the transport
+ * in front of it. Returns NULL when the write may proceed, so a caller can
+ * simply forward a non-NULL result.
+ *
+ * The error string is deliberately identical to the HTTP one: an existing
+ * client that already handles that code keeps working unchanged.
+ */
+static struct json_object *nc_setup_guard_initialized(struct json_object *cfg,
+                                                      struct json_object *d)
+{
+    if (!nc_setup_is_initialized())
+        return NULL;
+    /*
+     * webd sets this after its own 409 gate has already decided the caller may
+     * write to an initialized device (an authenticated session re-running the
+     * wizard is legitimate). Trusting it here is what keeps this guard from
+     * changing the HTTP contract: the point of the check is the ubus caller
+     * that never passed through any gate, and such a caller has no reason to
+     * set it.
+     */
+    if (cfg && nc_json_bool_def(cfg, "caller_authorized_initialized_write", 0))
+        return NULL;
+    if (!d)
+        d = json_object_new_object();
+    json_object_object_add(d, "ok", json_object_new_boolean(0));
+    json_object_object_add(d, "error",
+                           json_object_new_string("wizard_already_initialized"));
+    json_object_object_add(d, "message", json_object_new_string(
+        "setup writes require an uninitialized router; use reset_wizard to return an initialized device to the wizard"));
+    return nc_setup_response(API_CODE_ERROR, d);
+}
+
 static int nc_setup_save_draft(const char *kind, struct json_object *payload)
 {
     sqlite3_stmt *st = NULL;
@@ -367,6 +405,75 @@ static struct json_object *nc_setup_device_json(void)
     return dev;
 }
 
+static int nc_setup_web_user_count(int *known, int *table_exists, const char **error);
+
+/*
+ * Explains what this endpoint's "initialized" actually means, and answers the
+ * only question a caller really has: should the console be gated behind the
+ * wizard?
+ *
+ * /api/v1/setup/status and /api/v1/session/init both publish a boolean named
+ * "initialized" with different meanings - wizard completion here, login
+ * capability there. On a device provisioned by jmctl or a direct database write
+ * an account exists while setup_state was never touched, so the two disagree
+ * and look like a defect. Both values are correct; the shared name is the
+ * problem, and a consumer comparing them cannot tell which one gates the UI.
+ *
+ * The gate follows login capability, not wizard completion: a device with an
+ * account is usable. An unfinished wizard is something to offer, not a reason
+ * to hide a working console behind a first-run screen - and forcing a wizard on
+ * a configured device risks it being walked through and overwriting live config.
+ */
+static void nc_setup_add_gate_contract(struct json_object *d, int wizard_done)
+{
+    int users_known = 0;
+    int table_exists = 0;
+    const char *users_error = "";
+    int users = nc_setup_web_user_count(&users_known, &table_exists, &users_error);
+    int login_capable = users_known && users > 0;
+
+    json_object_object_add(d, "initialized_scope",
+                           json_object_new_string("setup_wizard_completion"));
+    json_object_object_add(d, "initialized_meaning",
+        json_object_new_string("the_setup_wizard_ran_to_completion_not_whether_the_device_is_usable"));
+    json_object_object_add(d, "initialized_source",
+                           json_object_new_string("config.db:setup_state.initialized"));
+
+    /* Login capability, read here so a caller does not have to join two
+     * endpoints to answer one question. */
+    json_object_object_add(d, "login_capable", json_object_new_boolean(login_capable));
+    json_object_object_add(d, "web_user_count",
+                           json_object_new_int(users_known ? users : 0));
+    json_object_object_add(d, "web_user_count_known",
+                           json_object_new_boolean(users_known));
+    if (!users_known)
+        json_object_object_add(d, "web_user_count_error",
+                               json_object_new_string(users_error ? users_error : ""));
+
+    /*
+     * The authoritative gate. Only force the wizard when the device cannot be
+     * logged into at all. wizard_required stays as it was for compatibility,
+     * but it answers "is the wizard unfinished", which is a different question.
+     */
+    json_object_object_add(d, "setup_gate_required",
+                           json_object_new_boolean(users_known && !login_capable));
+    json_object_object_add(d, "setup_gate_authority",
+                           json_object_new_string("login_capability_web_user_count"));
+    json_object_object_add(d, "setup_gate_reason",
+        json_object_new_string(!users_known ? "web_user_count_unknown_gate_undecidable" :
+                               (login_capable ?
+                                "device_has_accounts_and_is_usable_do_not_force_wizard" :
+                                "no_account_exists_initial_setup_required")));
+    /* The case behind this whole ticket: usable device, wizard never finished. */
+    json_object_object_add(d, "provisioned_outside_wizard",
+                           json_object_new_boolean(login_capable && !wizard_done));
+    if (login_capable && !wizard_done)
+        json_object_object_add(d, "provisioned_outside_wizard_note",
+            json_object_new_string("accounts_exist_but_setup_state_was_never_completed_wizard_may_be_offered_not_forced"));
+    json_object_object_add(d, "login_capability_source",
+                           json_object_new_string("/api/v1/session/init"));
+}
+
 static void nc_setup_add_state_json(struct json_object *d)
 {
     sqlite3_stmt *st = NULL;
@@ -375,10 +482,21 @@ static void nc_setup_add_state_json(struct json_object *d)
     if (nc_prepare(&st, "SELECT initialized,initialized_at,initialized_version,completed_by,assist_mode,current_step,setup_id,started_at,last_apply_id,last_apply_state,last_apply_error,last_apply_at,last_test_ok,last_test_json FROM setup_state WHERE id=1") == 0 && sqlite3_step(st) == SQLITE_ROW) {
         initialized = sqlite3_column_int(st, 0);
         json_object_object_add(d, "initialized", json_object_new_boolean(initialized));
+        json_object_object_add(d, "wizard_completed", json_object_new_boolean(initialized));
         json_object_object_add(d, "first_run", json_object_new_boolean(!initialized));
         json_object_object_add(d, "router_setup_initialized", json_object_new_boolean(initialized));
         json_object_object_add(d, "wizard_required", json_object_new_boolean(!initialized));
-        json_object_object_add(d, "can_reset_wizard", json_object_new_boolean(initialized));
+        /*
+         * Reset is offered whenever the wizard state can be rolled back to
+         * `intro`, which jmx_setup_reset_wizard() permits on an uninitialized
+         * device too -- it only asks for the extra confirm_reset_initialized
+         * flag once initialized is set. Reporting `initialized` here claimed the
+         * opposite, and on an install that never reached setup_finish that left
+         * the UI with no way forward (finish unreachable) and no way back (reset
+         * hidden). Verified on 30.1: reset_wizard with confirm=true returned
+         * reset:true while this field still said false.
+         */
+        json_object_object_add(d, "can_reset_wizard", json_object_new_boolean(1));
         json_object_object_add(d, "initialized_at", json_object_new_int64(sqlite3_column_int64(st, 1)));
         nc_add_text(d, "initialized_version", st, 2);
         nc_add_text(d, "completed_by", st, 3);
@@ -396,15 +514,22 @@ static void nc_setup_add_state_json(struct json_object *d)
         json_object_object_add(d, "last_test_ok", json_object_new_boolean(sqlite3_column_int(st, 12)));
         json_object_object_add(d, "last_test", nc_json_parse_object_or_empty((const char *)sqlite3_column_text(st, 13)));
         sqlite3_finalize(st);
+        nc_setup_add_gate_contract(d, initialized);
         return;
     }
     if (st)
         sqlite3_finalize(st);
     json_object_object_add(d, "initialized", json_object_new_boolean(0));
+    json_object_object_add(d, "wizard_completed", json_object_new_boolean(0));
     json_object_object_add(d, "first_run", json_object_new_boolean(1));
     json_object_object_add(d, "router_setup_initialized", json_object_new_boolean(0));
     json_object_object_add(d, "wizard_required", json_object_new_boolean(1));
-    json_object_object_add(d, "can_reset_wizard", json_object_new_boolean(0));
+    /*
+     * The row is unreadable here, so nothing is known about the wizard. Reset
+     * stays offered because it is the recovery path out of exactly this state,
+     * and it cannot lose a completed configuration it could not read.
+     */
+    json_object_object_add(d, "can_reset_wizard", json_object_new_boolean(1));
     json_object_object_add(d, "initialized_at", json_object_new_int64(0));
     json_object_object_add(d, "initialized_version", json_object_new_string(""));
     json_object_object_add(d, "completed_by", json_object_new_string(""));
@@ -413,6 +538,10 @@ static void nc_setup_add_state_json(struct json_object *d)
     json_object_object_add(d, "setup_finished_by", json_object_new_string(""));
     json_object_object_add(d, "assist_mode", json_object_new_string("manual"));
     json_object_object_add(d, "current_step", json_object_new_string("intro"));
+    /* Same contract on the unreadable-row path, so a consumer never has to
+     * handle these fields being absent. wizard_done is 0 here because nothing
+     * about the wizard could be read. */
+    nc_setup_add_gate_contract(d, 0);
 }
 
 static int nc_setup_table_exists_checked(const char *name, int *exists_out)
@@ -2147,6 +2276,9 @@ struct json_object *jmx_setup_status(struct json_object *cfg)
     int web_users_table_exists = 0;
     const char *web_users_error = "";
     int web_users = 0;
+    int internet = 0;
+    int wizard_completed = 0;
+    int config_ready = 0;
 
     (void)cfg;
     if (jmx_netconfig_db_init() != 0)
@@ -2160,7 +2292,40 @@ struct json_object *jmx_setup_status(struct json_object *cfg)
     json_object_object_add(d, "web_users_error", json_object_new_string(web_users_known ? "" : (web_users_error ? web_users_error : "web_users_query_failed")));
     json_object_object_add(d, "device", nc_setup_device_json());
     json_object_object_add(d, "main_asset", json_object_new_string("/luci-static/dreamingwrt/setup/device.png"));
-    json_object_object_add(d, "internet", json_object_new_boolean(nc_setup_cmd_success("ping -c 1 -W 1 223.5.5.5 >/dev/null 2>&1 || ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1")));
+    internet = nc_setup_cmd_success("ping -c 1 -W 1 223.5.5.5 >/dev/null 2>&1 || ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1");
+    json_object_object_add(d, "internet", json_object_new_boolean(internet));
+    /*
+     * `config_ready` and `wizard_completed` are deliberately two different
+     * questions, because on real installs they disagree.
+     *
+     * The install path never runs the wizard, so `initialized` (now also
+     * published as `wizard_completed`) stays 0 on a router that has been
+     * serving traffic for months with an admin account and a working WAN. A
+     * single flag standing for both "the wizard finished" and "this box is
+     * configured" is what made a fully configured device report first_run=true
+     * and, before the webd gate was added, kept the anonymous setup write
+     * channel open on it.
+     *
+     * So: `wizard_completed` answers "did anyone walk the wizard to the end",
+     * and is only ever set by setup_finish. `config_ready` answers "is this box
+     * actually usable", inferred from observable facts -- somebody can log in,
+     * and either the wizard completed or the device has working upstream
+     * connectivity. Consumers that mean "do not treat this as a brand-new
+     * device" should read `config_ready`; only the wizard UI should read
+     * `wizard_completed`.
+     *
+     * config_ready deliberately requires web_users_known: an unreadable user
+     * table must not be reported as a configured device.
+     *
+     * Published on setup_status only, not on setup_progress/setup_finish, which
+     * share nc_setup_add_state_json(): deriving it costs a web_users query and a
+     * connectivity probe, and progress is polled during the wizard. Consumers
+     * that need it should read setup_status. `wizard_completed` has no such cost
+     * and is published everywhere the state block appears.
+     */
+    wizard_completed = nc_json_bool_def(d, "initialized", 0);
+    config_ready = web_users_known && web_users > 0 && (wizard_completed || internet);
+    json_object_object_add(d, "config_ready", json_object_new_boolean(config_ready));
     json_object_object_add(d, "wan_link", json_object_new_string("unknown"));
     json_object_object_add(d, "supported_wifi", json_object_new_boolean(nc_setup_wifi_capability("wifi")));
     json_object_object_add(d, "backup_available", json_object_new_boolean(access("/etc/dreamingwrt/backup", R_OK) == 0));
@@ -2223,9 +2388,22 @@ struct json_object *jmx_setup_save_device(struct json_object *cfg)
     struct json_object *safe = json_object_new_object();
     const char *admin_username = nc_json_str_def(cfg, "admin_username", "root");
     int has_admin_password = nc_json_str_def(cfg, "admin_password", "")[0] != 0;
+    struct json_object *guard;
 
     if (jmx_netconfig_db_init() != 0 || !cfg)
         return nc_setup_response(API_CODE_ERROR, d);
+    /*
+     * Guarded ahead of the drafts below: this path can carry an admin
+     * credential, so it is the least acceptable one to leave reachable on a
+     * router that is already in service.
+     */
+    guard = nc_setup_guard_initialized(cfg, d);
+    if (guard) {
+        json_object_put(payload);
+        json_object_put(general);
+        json_object_put(safe);
+        return guard;
+    }
     json_object_object_add(general, "hostname", json_object_new_string(nc_json_str_def(cfg, "hostname", "")));
     json_object_object_add(general, "description", json_object_new_string(nc_json_str_def(cfg, "description", nc_json_str_def(cfg, "remark", ""))));
     json_object_object_add(general, "note", json_object_new_string(nc_json_str_def(cfg, "note", "")));
@@ -2265,9 +2443,13 @@ struct json_object *jmx_setup_save_wan(struct json_object *cfg)
     struct json_object *d = json_object_new_object();
     struct json_object *wan;
     struct json_object *errors;
+    struct json_object *guard;
 
     if (jmx_netconfig_db_init() != 0 || !cfg)
         return nc_setup_response(API_CODE_ERROR, d);
+    guard = nc_setup_guard_initialized(cfg, d);
+    if (guard)
+        return guard;
     wan = nc_setup_normalize_wan(cfg);
     errors = jmx_netconfig_wan_validate(wan);
     if (errors) {
@@ -2364,9 +2546,13 @@ struct json_object *jmx_setup_save_lan(struct json_object *cfg)
     struct json_object *d = json_object_new_object();
     struct json_object *lan;
     struct json_object *errors;
+    struct json_object *guard;
 
     if (jmx_netconfig_db_init() != 0 || !cfg)
         return nc_setup_response(API_CODE_ERROR, d);
+    guard = nc_setup_guard_initialized(cfg, d);
+    if (guard)
+        return guard;
     lan = nc_setup_normalize_lan(cfg);
     errors = jmx_netconfig_lan_validate(lan);
     if (errors) {
@@ -2425,10 +2611,19 @@ struct json_object *jmx_setup_apply(struct json_object *cfg)
     int has_wifi;
     int wifi_save_supported;
     int wifi_apply_supported;
+    struct json_object *guard;
 
-    (void)cfg;
     if (jmx_netconfig_db_init() != 0)
         return nc_setup_response(API_CODE_ERROR, d);
+    /*
+     * This is the write that reaches the live network configuration, so it is
+     * the one an accidental `ubus call` on a working router would hurt most.
+     */
+    guard = nc_setup_guard_initialized(cfg, d);
+    if (guard) {
+        json_object_put(steps);
+        return guard;
+    }
     device = nc_setup_load_draft("device");
     wan = nc_setup_load_draft("wan");
     lan = nc_setup_load_draft("lan");
@@ -2657,10 +2852,56 @@ struct json_object *jmx_setup_finish(struct json_object *cfg)
     const char *completed_by = cfg ? nc_json_str_def(cfg, "completed_by", nc_json_str_def(cfg, "actor", "setup")) : "setup";
     char version[96] = "";
     int can_finish = 0;
+    int adopt_existing = 0;
     char tsbuf[32];
 
     if (jmx_netconfig_db_init() != 0)
         return nc_setup_response(API_CODE_ERROR, d);
+    /*
+     * Convergence path for devices that were configured without ever walking
+     * the wizard.
+     *
+     * The five conditions below describe a wizard run: a draft was applied, the
+     * WAN test passed, and the apply happened during this session. An install
+     * that never started the wizard satisfies none of them and can therefore
+     * never record completion, which leaves `initialized` at 0 forever on a
+     * router that is demonstrably in service. That is the state 30.1 was found
+     * in: two web users, working WAN, current_step still 'intro'.
+     *
+     * `adopt_existing` lets such a device record what is already true instead of
+     * pretending a wizard ran. It is not a way to skip the wizard on a new box:
+     * it requires the caller to have proved an identity (the same vouch webd
+     * attaches after its own gate) and requires the configuration to actually be
+     * in place -- a login exists and upstream works. A genuinely fresh device
+     * has no users and no internet, so it cannot take this path, and an
+     * anonymous ubus caller cannot either.
+     *
+     * The wizard itself never sets this flag; it goes through the normal
+     * conditions below.
+     */
+    if (cfg && nc_json_bool_def(cfg, "adopt_existing_config", 0) &&
+        nc_json_bool_def(cfg, "caller_authorized_initialized_write", 0)) {
+        int users_known = 0;
+        int users = nc_setup_web_user_count(&users_known, NULL, NULL);
+
+        if (!users_known || users <= 0) {
+            json_object_object_add(d, "ok", json_object_new_boolean(0));
+            json_object_object_add(d, "error",
+                json_object_new_string("adopt_requires_existing_config"));
+            json_object_object_add(d, "message", json_object_new_string(
+                "adopting an existing configuration requires a web login to already exist"));
+            return nc_setup_response(API_CODE_ERROR, d);
+        }
+        if (!nc_setup_cmd_success("ping -c 1 -W 1 223.5.5.5 >/dev/null 2>&1 || ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1")) {
+            json_object_object_add(d, "ok", json_object_new_boolean(0));
+            json_object_object_add(d, "error",
+                json_object_new_string("adopt_requires_working_upstream"));
+            json_object_object_add(d, "message", json_object_new_string(
+                "adopting an existing configuration requires working upstream connectivity"));
+            return nc_setup_response(API_CODE_ERROR, d);
+        }
+        adopt_existing = 1;
+    }
     if (nc_exec("BEGIN IMMEDIATE") != 0)
         return nc_setup_response(API_CODE_ERROR, nc_setup_state_error("finish_begin"));
     if (nc_prepare(&st, "SELECT initialized,last_apply_state,last_test_ok,last_apply_at,started_at,setup_version FROM setup_state WHERE id=1") == 0) {
@@ -2671,10 +2912,11 @@ struct json_object *jmx_setup_finish(struct json_object *cfg)
             snprintf(version, sizeof(version), "%s",
                      nc_sql_text(st, 5)[0] ? nc_sql_text(st, 5) : OAF_VERSION);
             can_finish = !sqlite3_column_int(st, 0) &&
-                !strcmp(nc_sql_text(st, 1), "ready") &&
-                sqlite3_column_int(st, 2) &&
-                last_apply_at > 0 &&
-                (started_at <= 0 || last_apply_at >= started_at);
+                (adopt_existing ||
+                 (!strcmp(nc_sql_text(st, 1), "ready") &&
+                  sqlite3_column_int(st, 2) &&
+                  last_apply_at > 0 &&
+                  (started_at <= 0 || last_apply_at >= started_at)));
         }
         sqlite3_finalize(st);
     }
@@ -2735,6 +2977,23 @@ struct json_object *jmx_setup_reset_wizard(struct json_object *cfg)
     }
     if (jmx_netconfig_db_init() != 0)
         return nc_setup_response(API_CODE_ERROR, d);
+    /*
+     * Returning an in-service router to the wizard is this method's whole
+     * purpose, so it cannot simply refuse when initialized the way the other
+     * setup writes do. It asks for a second, differently named flag instead:
+     * `confirm` alone is easy to carry over from an unrelated call or to type
+     * while debugging, and the consequence here is a router that stops serving
+     * its own configuration. An uninitialized device is unaffected.
+     */
+    if (nc_setup_is_initialized() &&
+        !nc_json_bool_def(cfg, "confirm_reset_initialized", 0)) {
+        json_object_object_add(d, "ok", json_object_new_boolean(0));
+        json_object_object_add(d, "error",
+            json_object_new_string("confirm_reset_initialized_required"));
+        json_object_object_add(d, "message", json_object_new_string(
+            "this router is already initialized; resetting it to the wizard needs confirm_reset_initialized=true"));
+        return nc_setup_response(API_CODE_ERROR, d);
+    }
     if (nc_exec("UPDATE setup_state SET initialized=0,initialized_at=0,initialized_version='',completed_by='',current_step='intro',last_apply_state='idle',last_apply_error='',last_test_ok=0,last_test_json='{}',updated_at=strftime('%s','now') WHERE id=1") != 0 ||
         nc_sqlite_changes() <= 0 ||
         nc_setup_set_meta("setup.initialized", "0") != 0 ||

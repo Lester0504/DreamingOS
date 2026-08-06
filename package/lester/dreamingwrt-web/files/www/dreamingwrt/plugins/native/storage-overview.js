@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
   const formatBytes = utils.formatBytes || fallbackFormatBytes;
-  const VERSION = '20260804-disk-charts-moved-01';
+  const VERSION = '20260805-storage-layout-toolbar-03';
   const MODULE_CLASS = 'storage-overview-route-host';
   const stage = root?.closest('.console-stage');
   const RANGE_LABELS = { '1h': '近一小时', '1d': '近一天', '7d': '近七天' };

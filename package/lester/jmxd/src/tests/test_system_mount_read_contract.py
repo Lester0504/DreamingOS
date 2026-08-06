@@ -46,7 +46,11 @@ int main(int argc, char **argv) {
     snprintf(text, sizeof(text),
         "17 1 8:1 / / rw,noatime - ext4 /dev/root rw\n"
         "18 17 0:23 / %s rw,nosuid,nodev - tmpfs tmpfs rw\n"
-        "19 17 8:5 /persist/data /mnt/codex-read-contract rw,noatime - ext4 /dev/sda5 rw\n",
+        "19 17 8:5 /persist/data /mnt/codex-read-contract rw,noatime - ext4 /dev/sda5 rw\n"
+        "20 17 8:5 / /data rw,noatime - ext4 /dev/sda5 rw\n"
+        "21 17 8:5 /persist/etc/config /etc/config rw,noatime - ext4 /dev/sda5 rw\n"
+        "22 17 8:5 /persist/data/inner /mnt/codex-read-contract/inner rw,noatime - ext4 /dev/sda5 rw\n"
+        "23 17 8:6 /persist/other /mnt/other-device rw,noatime - ext4 /dev/sda6 rw\n",
         escaped);
     write_text(mountinfo, text);
     snprintf(fstab, sizeof(fstab), "%s/fstab", argv[1]);
@@ -68,18 +72,50 @@ int main(int argc, char **argv) {
     opts.mountinfo_path = mountinfo; opts.fstab_path = fstab;
     assert(jmx_system_mount_read(&opts, runtime, 16, &runtime_count,
                                  config, 16, &config_count, err, sizeof(err)) == 0);
-    assert(runtime_count == 3 && config_count == 2);
+    assert(runtime_count == 7 && config_count == 2);
     assert(!strcmp(runtime[0].fstype, "ext4") && !strcmp(runtime[0].target, "/"));
     assert(!strcmp(runtime[1].target, target) && !strcmp(runtime[1].fstype, "tmpfs"));
     assert(runtime[1].stat_ok && runtime[1].size_bytes > 0);
     for (i = 0; i < runtime_count; i++) {
         if (runtime[i].bind_mount) {
             found_bind = 1;
-            assert(strstr(runtime[i].source, "[/persist/data]") != NULL);
+            assert(strchr(runtime[i].source, '[') != NULL);
         }
         if (runtime[i].configured) found_configured_runtime = 1;
     }
     assert(found_bind && found_configured_runtime);
+    /*
+     * 绑定挂载必须按 mountinfo 的 root 字段置位，且能追溯到宿主挂载点。
+     * 判据是同设备上 root 为最长前缀的那条，所以嵌套绑定挂载的宿主是上一层绑定挂载，
+     * 而不是整卷挂载 —— 这一条同时挡住"拿整卷挂载一律当宿主"的偷懒实现。
+     */
+    {
+        const struct jmx_system_mount_runtime_entry *whole = NULL, *bind_data = NULL,
+                                                   *bind_cfg = NULL, *nested = NULL,
+                                                   *other_dev = NULL;
+
+        for (i = 0; i < runtime_count; i++) {
+            if (!strcmp(runtime[i].target, "/data")) whole = &runtime[i];
+            else if (!strcmp(runtime[i].target, "/mnt/codex-read-contract")) bind_data = &runtime[i];
+            else if (!strcmp(runtime[i].target, "/etc/config")) bind_cfg = &runtime[i];
+            else if (!strcmp(runtime[i].target, "/mnt/codex-read-contract/inner")) nested = &runtime[i];
+            else if (!strcmp(runtime[i].target, "/mnt/other-device")) other_dev = &runtime[i];
+        }
+        assert(whole && bind_data && bind_cfg && nested && other_dev);
+        /* root 为 "/" 的整卷挂载不是绑定挂载，也没有宿主。 */
+        assert(!whole->bind_mount && !whole->bind_host_target[0]);
+        /* root 为 /persist/... 的都是绑定挂载。 */
+        assert(bind_data->bind_mount && bind_cfg->bind_mount && nested->bind_mount);
+        /* 同设备的整卷挂载是一层绑定挂载的宿主。 */
+        assert(!strcmp(bind_data->bind_host_target, "/data"));
+        assert(!strcmp(bind_cfg->bind_host_target, "/data"));
+        /* 嵌套绑定挂载的宿主是最长前缀那条，不是 /data。 */
+        assert(!strcmp(nested->bind_host_target, "/mnt/codex-read-contract"));
+        /* 宿主判定不得跨设备：8:6 上没有整卷挂载，故留空。 */
+        assert(other_dev->bind_mount && !other_dev->bind_host_target[0]);
+        /* 绑定挂载与宿主共享同一份容量数字，这是 capacity_is_host_filesystem 的由来。 */
+        assert(bind_cfg->size_bytes == 0 || bind_cfg->size_bytes == whole->size_bytes);
+    }
     assert(!strcmp(config[0].section, "safe"));
     assert(!strcmp(config[0].source, "/dev/sda5"));
     assert(!strcmp(config[0].fstype, "ext4"));

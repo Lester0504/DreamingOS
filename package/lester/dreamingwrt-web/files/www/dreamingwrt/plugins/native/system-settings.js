@@ -12,7 +12,7 @@ export function mount(context = {}) {
     return { name, ok, data: json?.data ?? json, raw: json, error: ok ? null : new Error(json?.error?.message || json?.message || response.statusText || 'request failed') };
   });
 
-  const VERSION = '20260804-speed-limit-two-tabs-02';
+  const VERSION = '20260805-mount-capacity-units-01';
   const MODULE_CLASS = 'system-settings-route-host';
   const ENDPOINT = '/api/v1/system/basic';
   const SAVE_ENDPOINTS = ['/api/v1/system/settings', '/api/v1/save_system_settings'];
@@ -30,6 +30,13 @@ export function mount(context = {}) {
     { id: 'operations', label: '备份' },
     { id: 'firmware', label: '升级' }
   ];
+  /* 后端 `schedule.weekday` 是 0-6，周日=0（`webd_backup_policy_set_response` 的校验）。 */
+  const SYSTEM_BACKUP_WEEKDAYS = [
+    [0, '周日'], [1, '周一'], [2, '周二'], [3, '周三'],
+    [4, '周四'], [5, '周五'], [6, '周六']
+  ];
+  /* 能力源实测 `backup_scope: config.db`，写死人话说明而不是把机器码直接摊给用户。 */
+  const SYSTEM_BACKUP_SCOPE_TEXT = '系统配置数据库';
   const SYSTEM_ADVANCED_TABS = [
     { id: 'performance', label: '性能与诊断' },
     { id: 'alg', label: 'ALG 设置' },
@@ -73,6 +80,16 @@ export function mount(context = {}) {
     flashCapabilitiesLoaded: false,
     flashCapabilitiesError: '',
     flashScheduledBackup: null,
+    /*
+     * `GET /flash/backup-policy` 的当前值。它是 high risk 路由，viewer 会 403 ——
+     * 读不到当前值不等于不能写，所以这里把"没读到"（null + error 文案）与"读到了"
+     * 分开存，控件照渲染。draft 只存用户改动过的字段，避免把没碰过的字段也发给后端。
+     */
+    flashBackupPolicy: null,
+    flashBackupPolicyLoading: false,
+    flashBackupPolicyLoaded: false,
+    flashBackupPolicyError: '',
+    flashSchedulePolicyDraft: null,
     // 升级流水线：upload_id 由 /uploads/begin 下发，operation_id 由 verify 返回。
     flashFirmwareUpload: null,
     flashFirmwareProgress: 0,
@@ -766,7 +783,12 @@ export function mount(context = {}) {
     no_active_release_key: '尚未配置发布签名公钥，暂不能应用固件。上传与校验不受影响。',
     otad_status_unavailable: 'otad 未返回状态，能力暂不可确认。',
     signing_key_unknown: '镜像签名密钥不在信任策略内，暂不能应用固件。',
-    no_schedule_retention_or_snapshot_contract_implemented: '后端尚未实现频率、保留份数与快照合同。'
+    /*
+     * `no_schedule_retention_or_snapshot_contract_implemented` 后端已不再下发（合同已落地，
+     * `test_scheduled_backup_retention_contract.py:87` 反向断言它必须消失），故不再收录。
+     * 定时备份现在唯一的阻塞原因是备份存储不可用。
+     */
+    backup_store_unavailable: '设备的备份存储当前不可用，定时备份与备份列表都无法工作。'
   };
 
   function flashReasonText(reason) {
@@ -1199,43 +1221,162 @@ export function mount(context = {}) {
   }
 
   /*
-   * 定时备份与版本快照。
+   * 定时备份。
    *
-   * 后端目前只有一个硬编码的 `auto_backup: true` 字面量（`jmx_netconfig_db.c:28615`），
-   * 没有频率、时刻、保留份数，也没有 schedule 路由。所以这里**不渲染任何点了没反应的
-   * 控件**，只如实说明缺口，等交接单
-   * `Front-to-Backend-flash-backup-capabilities-and-schedule.md` 落地后再补。
+   * 判据只看能力位（design.md 第 29 条）。原先判的是
+   * `state.data.flash.backup_schedule` —— 后端从来不下发这个键，所以 `hasContract`
+   * 恒 false，必然落进否认分支；而 `supported === true` 时 reason 是空串，于是
+   * **后端支持得越干净，页面越坚定地显示"尚未提供"**。判据换成
+   * `scheduled_backup.available` / `scheduled_backup_supported` 之后，后端补任何能力
+   * 这张卡都会跟着变，不必再改一次字段名。
+   *
+   * 三态：可用 → 渲染控件；显式不可用（有 reason）→ 陈述后端原话；能力源读取失败 →
+   * 说明读取失败，与"后端不支持"分开。
    */
   function systemFlashScheduleCard() {
-    const schedule = state.data?.flash?.backup_schedule;
-    const hasContract = schedule && typeof schedule === 'object';
-    if (!hasContract) {
-      /*
-       * 能力源现在显式说了定时备份不支持，并给出 reason，所以优先陈述后端的原话。
-       * 保持不放选择器的做法不变：合同没落地，放控件就是放一个点了不生效的东西。
-       */
-      const scheduled = state.flashScheduledBackup;
-      const reason = scheduled && scheduled.supported !== true ? flashReasonText(scheduled.reason) : '';
+    const title = `<div class="system-demo-panel-title">${systemSettingsIcon('clock')}<span>定时备份</span></div>`;
+    const cap = flashCap('scheduled_backup');
+    const scheduled = state.flashScheduledBackup;
+    /*
+     * 能力未确认（能力源请求失败）与 available:false 是两件事。flashCap 取不到条目返回
+     * null，此时若扁平位也没读到，就只说没确认，不断言后端未实现。
+     */
+    if (!cap && !scheduled) {
       return `
         <section class="system-demo-panel system-flash-schedule-card">
-          <div class="system-demo-panel-title">${systemSettingsIcon('clock')}<span>定时备份</span></div>
-          <p class="system-flash-schedule-gap">${reason
-            ? `后端明确不支持定时备份：${escapeHtml(reason)}`
-            : '后端尚未提供定时备份合同：当前只上报一个固定的 <code>auto_backup</code> 标记，没有频率、执行时刻与保留份数，也没有版本快照接口。'}合同落地前这里不放选择器，避免出现点了不生效的控件。</p>
+          ${title}
+          <p class="system-flash-schedule-gap">${escapeHtml(state.flashCapabilitiesError
+            || '定时备份能力尚未确认，正在读取设备能力。')} 这不代表设备不支持定时备份，只是当前读不到能力信息。</p>
         </section>
       `;
     }
+    const available = cap ? cap.available : scheduled?.supported === true;
+    if (!available) {
+      const reason = flashReasonText(cap?.reason || scheduled?.reason || '');
+      return `
+        <section class="system-demo-panel system-flash-schedule-card">
+          ${title}
+          <p class="system-flash-schedule-gap">${reason
+            ? `设备当前不支持定时备份：${escapeHtml(reason)}`
+            : '设备当前不支持定时备份，后端未给出具体原因。'} 能力恢复后此处会自动出现频率、执行时刻与保留份数控件。</p>
+        </section>
+      `;
+    }
+    return systemFlashScheduleForm(title);
+  }
+
+  /*
+   * 合同已就绪时的真实控件。范围一律取后端下发的 retention_min / retention_max，
+   * 不硬编码 1~64：写死上下限就等于把后端改了范围之后的页面变成谎话。
+   */
+  function systemFlashScheduleForm(title) {
+    const policy = state.flashBackupPolicy;
+    const caps = state.flashCapabilities || {};
+    const draft = state.flashSchedulePolicyDraft || {};
+    const min = finiteNumber(policy?.retention_min ?? caps.retention_min ?? state.flashScheduledBackup?.retentionMin, 1);
+    const max = finiteNumber(policy?.retention_max ?? caps.retention_max ?? state.flashScheduledBackup?.retentionMax, min);
+    const currentCount = finiteNumber(policy?.retention_count ?? state.flashScheduledBackup?.retentionCount, min);
+    const count = finiteNumber(draft.retention_count, currentCount);
+    const schedule = policy?.schedule && typeof policy.schedule === 'object' ? policy.schedule : null;
+    const enabled = draft.enabled === undefined ? schedule?.enabled === true : draft.enabled === true;
+    const frequency = stringOr(draft.frequency ?? schedule?.frequency) || 'daily';
+    const hour = finiteNumber(draft.hour ?? schedule?.hour, 3);
+    const minute = finiteNumber(draft.minute ?? schedule?.minute, 0);
+    const weekday = finiteNumber(draft.weekday ?? schedule?.weekday, 0);
+    const fullBehavior = stringOr(policy?.retention_full_behavior ?? caps.retention_full_behavior ?? state.flashScheduledBackup?.retentionFullBehavior);
+    const configured = (policy ? policy.retention_configured : state.flashScheduledBackup?.retentionConfigured) === true;
+    const busy = state.flashWorking === 'save-backup-policy';
+    const options = [];
+    for (let value = min; value <= max; value += 1) options.push(value);
+    /*
+     * `GET /backup-policy` 是 high risk，viewer 会 403。读不到当前值不等于不能写，
+     * 所以控件照渲染，只如实说明当前值读不到。
+     */
+    const readNote = state.flashBackupPolicyError
+      ? `<p class="system-flash-schedule-gap">${escapeHtml(state.flashBackupPolicyError)} 控件仍可用，保存会写入设备；下面显示的是默认值，不一定是设备当前生效的设置。</p>`
+      : '';
+    const retentionNote = fullBehavior === 'reject_new'
+      ? '达到上限后设备会拒绝新建备份，需要先删除旧备份才能继续，不会自动覆盖最旧的一份。'
+      : `满额行为由后端决定：${escapeHtml(fullBehavior || '未说明')}。`;
+    /*
+     * `at_limit` 是后端算好的当下结论，不要在前端拿 backup_count 和 retention 再比一遍：
+     * 两边算法一旦分叉，页面就会说"还能备份"而设备正在拒绝。
+     */
+    const atLimit = policy?.at_limit === true;
+    const backupCount = finiteNumber(policy?.backup_count, NaN);
+    const limitNote = atLimit
+      ? `<p class="system-flash-schedule-gap">当前已达保留上限${Number.isFinite(backupCount) ? `（${escapeHtml(String(backupCount))}/${escapeHtml(String(currentCount))}）` : ''}，设备现在会拒绝新建备份（含定时备份）。请先在上方存档列表删除旧备份，或把保留份数调高。</p>`
+      : '';
+    const lastRun = policy?.last_scheduled_run && typeof policy.last_scheduled_run === 'object'
+      ? policy.last_scheduled_run : null;
     return `
       <section class="system-demo-panel system-flash-schedule-card">
-        <div class="system-demo-panel-title">${systemSettingsIcon('clock')}<span>定时备份</span></div>
-        <dl class="system-flash-schedule-facts">
-          <div><dt>状态</dt><dd>${schedule.enabled ? '已启用' : '已关闭'}</dd></div>
-          <div><dt>频率</dt><dd>${escapeHtml(stringOr(schedule.frequency) || '--')}</dd></div>
-          <div><dt>下次执行</dt><dd>${escapeHtml(schedule.next_run_at ? formatTimestamp(schedule.next_run_at) : '--')}</dd></div>
-          <div><dt>保留份数</dt><dd>${escapeHtml(schedule.retain === undefined ? '--' : String(schedule.retain))}</dd></div>
-        </dl>
+        ${title}
+        ${readNote}
+        <div class="system-flash-schedule-row">
+          <span class="system-flash-schedule-row-copy">
+            <strong>启用定时备份</strong>
+            <em>按下面的频率与时刻自动生成配置备份（范围 ${escapeHtml(String(SYSTEM_BACKUP_SCOPE_TEXT))}）。</em>
+          </span>
+          <label class="system-ios-switch dwrt-switch ${enabled ? 'on' : ''}">
+            <input type="checkbox" ${enabled ? 'checked' : ''} data-system-schedule-field="enabled">
+            <span class="dwrt-slider" aria-hidden="true"></span>
+          </label>
+        </div>
+        <div class="system-flash-schedule-fields ${enabled ? '' : 'is-idle'}">
+          <label class="system-flash-schedule-field">
+            <span>频率</span>
+            <select class="system-glass-input" data-native-select="true" data-system-schedule-field="frequency">
+              <option value="daily" ${frequency === 'weekly' ? '' : 'selected'}>每天</option>
+              <option value="weekly" ${frequency === 'weekly' ? 'selected' : ''}>每周</option>
+            </select>
+          </label>
+          ${frequency === 'weekly' ? `
+            <label class="system-flash-schedule-field">
+              <span>星期</span>
+              <select class="system-glass-input" data-native-select="true" data-system-schedule-field="weekday">
+                ${SYSTEM_BACKUP_WEEKDAYS.map(([value, text]) => `<option value="${value}" ${weekday === value ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}
+              </select>
+            </label>
+          ` : ''}
+          <label class="system-flash-schedule-field">
+            <span>执行时刻</span>
+            <span class="system-flash-schedule-time">
+              <select class="system-glass-input" data-native-select="true" data-system-schedule-field="hour" aria-label="小时">
+                ${Array.from({ length: 24 }, (_, value) => `<option value="${value}" ${hour === value ? 'selected' : ''}>${String(value).padStart(2, '0')}</option>`).join('')}
+              </select>
+              <b aria-hidden="true">:</b>
+              <select class="system-glass-input" data-native-select="true" data-system-schedule-field="minute" aria-label="分钟">
+                ${Array.from({ length: 12 }, (_, index) => index * 5).map((value) => `<option value="${value}" ${minute === value ? 'selected' : ''}>${String(value).padStart(2, '0')}</option>`).join('')}
+                ${minute % 5 ? `<option value="${minute}" selected>${String(minute).padStart(2, '0')}</option>` : ''}
+              </select>
+            </span>
+          </label>
+          <label class="system-flash-schedule-field">
+            <span>保留份数</span>
+            <select class="system-glass-input" data-native-select="true" data-system-schedule-field="retention_count">
+              ${options.map((value) => `<option value="${value}" ${count === value ? 'selected' : ''}>${value}</option>`).join('')}
+            </select>
+          </label>
+        </div>
+        <p class="system-flash-schedule-gap">保留份数可选 ${escapeHtml(String(min))} ~ ${escapeHtml(String(max))}（范围由设备下发）${configured ? '' : '，当前 ' + escapeHtml(String(currentCount)) + ' 是设备默认值，尚未由你设置过'}。 ${retentionNote}</p>
+        ${limitNote}
+        ${lastRun ? `<p class="system-flash-schedule-gap">最近一次定时备份：${escapeHtml(formatTimestamp(lastRun.at) || '--')} · ${escapeHtml(systemBackupRunResultText(lastRun))}</p>` : ''}
+        <p class="system-flash-schedule-gap">版本快照仍未开放：设备只提供频率、执行时刻与保留份数，没有快照接口，所以这里不放快照控件。上面这些设置是真实生效的。</p>
+        <footer class="system-flash-schedule-footer">
+          <button class="glass-btn glass-btn--primary" type="button" data-system-action="flash-save-backup-policy" ${busy || state.flashWorking ? 'disabled' : ''}>${busy ? '保存中…' : '保存定时备份设置'}</button>
+        </footer>
       </section>
     `;
+  }
+
+  function systemBackupRunResultText(run) {
+    const result = stringOr(run?.result);
+    const error = stringOr(run?.error);
+    if (result === 'ok') return '成功';
+    if (result === 'skipped') return `已跳过${error ? `（${error}）` : '（保留份数已满，需先删除旧备份）'}`;
+    if (result === 'failed') return `失败${error ? `（${error}）` : ''}`;
+    return result || '结果未知';
   }
 
   function systemFlashActionCard({ icon, title, description, meta, action, actionText, disabled, unavailable }) {
@@ -1641,8 +1782,8 @@ export function mount(context = {}) {
   function systemMountsPanel(data) {
     const mounts = data.mounts || {};
     const points = Array.isArray(mounts.points) ? mounts.points : [];
-    const mounted = dedupeMountPoints(points.filter((point) => String(point.status || '').toLowerCase() === 'mounted' || point.mounted === true));
-    const configured = dedupeMountPoints(points);
+    const mounted = foldBindMounts(dedupeMountPoints(points.filter((point) => String(point.status || '').toLowerCase() === 'mounted' || point.mounted === true)));
+    const configured = foldBindMounts(dedupeMountPoints(points));
     const error = state.error ? `<div class="system-inline-error">${escapeHtml(state.error)}</div>` : '';
     return `
       <div class="system-page-workspace system-mount-page">
@@ -1700,11 +1841,13 @@ export function mount(context = {}) {
 
   function systemMountedCard(point = {}) {
     const percent = clampPercent(point.used_percent ?? point.use_percent ?? point.usage_percent);
-    const used = formatMountSize(point.used || point.used_size) || formatBytes(point.used_bytes);
-    const available = formatMountSize(point.available || point.avail || point.free) || formatBytes(point.available_bytes || point.free_bytes);
+    const used = mountBytesText(point.used_bytes, point.used, point.used_size);
+    const available = mountBytesText(point.available_bytes, point.free_bytes, point.available, point.avail, point.free);
+    const size = mountBytesText(point.size_bytes, point.size);
     const device = point.device || point.id || point.uuid || '未知设备';
     const mount = point.mount || point.mount_point || point.target || '-';
     const fs = mountFilesystem(point);
+    const hosted = mountBindHosts(point);
     return `
       <article class="system-mount-card ${point.status && String(point.status).toLowerCase() !== 'mounted' ? 'is-muted' : ''}">
         <div class="system-mount-card-head">
@@ -1713,9 +1856,10 @@ export function mount(context = {}) {
         </div>
         <div class="system-mount-usage-info">
           <span>已使用 ${percent}%</span>
-          <span>${escapeHtml(available ? `可用 ${available}` : (used ? `已用 ${used}` : (formatMountSize(point.size) ? `容量 ${formatMountSize(point.size)}` : '-')))}</span>
+          <span>${escapeHtml(available ? `可用 ${available}` : (used ? `已用 ${used}` : (size ? `容量 ${size}` : '-')))}</span>
         </div>
         <div class="system-mount-progress"><i class="${percent >= 75 ? 'warn' : percent >= 45 ? 'ok' : ''}" style="width:${percent}%"></i></div>
+        ${hosted}
         <div class="system-mount-card-actions">
           <button class="system-mount-text-danger" type="button" ${isSystemMount(point) ? 'disabled' : ''} data-system-action="mount-unmount" data-mount-id="${escapeHtml(mountActionId(point))}">${isSystemMount(point) ? '系统分区不可卸载' : '卸载分区'}</button>
         </div>
@@ -1725,7 +1869,7 @@ export function mount(context = {}) {
 
   function systemMountConfigRow(point = {}, index = 0) {
     const enabled = point.enabled !== false && point.status !== 'missing';
-    const size = formatMountSize(point.size) || formatBytes(point.size_bytes);
+    const size = mountBytesText(point.size_bytes, point.size);
     const device = point.device || point.source || '未知设备';
     const fs = mountFilesystem(point);
     const mount = point.mount || point.mount_point || point.target || '-';
@@ -1757,6 +1901,98 @@ export function mount(context = {}) {
     return stringOr(point.fs || point.fstype || point.filesystem || point.filesystem_type);
   }
 
+  /*
+   * 绑定挂载不是独立卷，不能和宿主并列成行。
+   *
+   * sda5 上有 1 条整卷挂载（`/data`）和 15 条 persist 绑定挂载，后端给的容量三件套
+   * 是同一个文件系统的同一份数字（`capacity_is_host_filesystem: true`）。并列渲染的
+   * 结果是「十几行各自 19.5 GB 的 sda5」，读起来像有 16 个卷。所以按
+   * `bind_host_target` 把绑定挂载折叠到宿主那张卡里，宿主不在列表时才让它独立成行
+   * （否则会把真实存在的挂载藏掉）。
+   */
+  function mountIsBind(point = {}) {
+    return point.bind_mount === true || String(point.origin || '').toLowerCase() === 'bind';
+  }
+
+  function mountBindHostTarget(point = {}) {
+    return stringOr(point.bind_host_target || point.bind_host_mount || point.bind_source_mount);
+  }
+
+  function mountTargetOf(point = {}) {
+    return stringOr(point.mount || point.mount_point || point.target);
+  }
+
+  /* `root` 是否为 `path` 的路径前缀，按 `/` 分界（否则 `/persist/etc` 会错配 `/persist/etcetera`）。 */
+  function mountRootIsPrefix(root, path) {
+    if (!root || !path || root[0] !== '/' || path[0] !== '/') return false;
+    if (root === '/') return true;
+    if (!path.startsWith(root)) return false;
+    const rest = path.slice(root.length);
+    return rest === '' || rest[0] === '/';
+  }
+
+  /*
+   * 后端未下发 `bind_host_target` 时（contract v2 的旧 webd）就地推导宿主：同一 `device`
+   * 上 `root` 为本条 root 前缀且最长的那条。判据与后端一致，取最长前缀而不是直接取整卷
+   * 挂载，因为宿主自身也可能是一层绑定挂载。这样折叠不必等后端先部署。
+   */
+  function mountDerivedHostTarget(point, points) {
+    const root = stringOr(point.root);
+    const device = stringOr(point.device || point.source);
+    if (!root || !device || root === '/') return '';
+    let best = null;
+    points.forEach((other) => {
+      if (other === point) return;
+      if (stringOr(other.device || other.source) !== device) return;
+      const otherRoot = stringOr(other.root);
+      if (!otherRoot || otherRoot.length >= root.length) return;
+      if (!mountRootIsPrefix(otherRoot, root)) return;
+      if (!best || otherRoot.length > stringOr(best.root).length) best = other;
+    });
+    return best ? mountTargetOf(best) : '';
+  }
+
+  /* 把绑定挂载挂到宿主条目上，返回仍需独立渲染的挂载列表。 */
+  function foldBindMounts(points = []) {
+    const list = Array.isArray(points) ? points : [];
+    const byTarget = new Map();
+    list.forEach((point) => {
+      const target = mountTargetOf(point);
+      if (target && !byTarget.has(target)) byTarget.set(target, point);
+    });
+    const children = new Map();
+    const out = [];
+    list.forEach((point) => {
+      const host = mountIsBind(point)
+        ? (mountBindHostTarget(point) || mountDerivedHostTarget(point, list))
+        : '';
+      if (host && byTarget.has(host) && byTarget.get(host) !== point) {
+        if (!children.has(host)) children.set(host, []);
+        children.get(host).push(point);
+        return;
+      }
+      out.push(point);
+    });
+    return out.map((point) => {
+      const kids = children.get(mountTargetOf(point));
+      return kids && kids.length ? { ...point, bind_children: kids } : point;
+    });
+  }
+
+  /* 宿主卡片里的折叠摘要行。只列挂载路径，容量不重复 —— 它就是宿主那一份。 */
+  function mountBindHosts(point = {}) {
+    const kids = Array.isArray(point.bind_children) ? point.bind_children : [];
+    if (!kids.length) return '';
+    const paths = kids.map((kid) => mountTargetOf(kid)).filter(Boolean);
+    if (!paths.length) return '';
+    return `
+        <div class="system-mount-bind-list">
+          <span class="system-mount-bind-label">${escapeHtml(`绑定挂载 ${paths.length} 处 · 与本卷共享容量`)}</span>
+          <span class="system-mount-bind-paths">${paths.map((path) => `<code>${escapeHtml(path)}</code>`).join('')}</span>
+        </div>
+    `;
+  }
+
   function dedupeMountPoints(points = []) {
     const seen = new Set();
     const out = [];
@@ -1774,14 +2010,27 @@ export function mount(context = {}) {
     return out;
   }
 
-  function formatMountSize(value) {
-    if (value === undefined || value === null || value === '') return '';
-    const text = String(value).trim();
-    if (!text) return '';
-    if (/[a-zA-Z]/.test(text)) return text;
-    const n = Number(text);
-    if (!Number.isFinite(n) || n <= 0) return text;
-    return formatBytes(n * 1024);
+  /*
+   * 挂载点容量一律按字节走 `formatBytes`，不再按"是不是纯数字"猜单位。
+   *
+   * 原先这里有个 `formatMountSize()`，把纯数字当 KB 再乘 1024。但
+   * `system/mounts` 的 `size` / `used` / `available` 与对应的 `*_bytes` 是同一个字节值
+   * （后端 `jmx_system.c` 里 `size` 就是 `size_bytes` 的别名），于是 sda5 的
+   * 20886798336 B 被多乘一次 1024，19.5 GB 显示成 19.5 TB。用字段值猜单位注定要错，
+   * 所以判据换成字段名：只认 `*_bytes` 语义的字节数，带单位的字符串原样透传。
+   */
+  function mountBytesText(...values) {
+    for (const value of values) {
+      if (value === undefined || value === null || value === '') continue;
+      const text = String(value).trim();
+      if (!text) continue;
+      /* 后端若给了带单位的字符串（如 "19.5G"），它已是人类可读值，不要再换算。 */
+      if (/[a-zA-Z]/.test(text)) return text;
+      const n = Number(text);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      return formatBytes(n);
+    }
+    return '';
   }
 
   function statusText(status) {
@@ -2648,6 +2897,9 @@ export function mount(context = {}) {
     root.querySelectorAll('[data-system-signature-upload]').forEach((el) => {
       el.addEventListener('change', onSignatureUpdateFileSelect);
     });
+    root.querySelectorAll('[data-system-schedule-field]').forEach((el) => {
+      el.addEventListener('change', onFlashScheduleFieldChange);
+    });
   }
 
   function captureSystemFocus() {
@@ -2696,6 +2948,25 @@ export function mount(context = {}) {
   function onFlashKeepSettingsChange(event) {
     state.flashKeepSettings = Boolean(event.currentTarget?.checked);
     state.flashConfirm = '';
+  }
+
+  /*
+   * 定时备份字段只写 draft，不直接改 flashBackupPolicy：后者是设备的真实回报，
+   * 用未保存的输入覆盖它会让"当前生效值"变成谎话。频率切换要 rerender，因为
+   * 每周才出现星期选择器。
+   */
+  function onFlashScheduleFieldChange(event) {
+    const el = event.currentTarget;
+    const field = stringOr(el?.dataset?.systemScheduleField);
+    if (!field) return;
+    const draft = { ...(state.flashSchedulePolicyDraft || {}) };
+    if (field === 'enabled') draft.enabled = Boolean(el.checked);
+    else if (field === 'frequency') draft.frequency = stringOr(el.value) || 'daily';
+    else draft[field] = finiteNumber(el.value, 0);
+    state.flashSchedulePolicyDraft = draft;
+    state.flashMessage = '';
+    state.flashError = '';
+    render();
   }
 
   function onSignatureUpdateFileSelect(event) {
@@ -2905,6 +3176,7 @@ export function mount(context = {}) {
       render();
       if (state.flashTab === 'firmware' && !state.flashPreserveAvailable && !state.flashPreserveLoading) loadFlashPreserveConfig();
       if (state.flashTab === 'operations' && !state.flashBackupsLoaded && !state.flashBackupsLoading) loadFlashBackups();
+      if (state.flashTab === 'operations' && !state.flashBackupPolicyLoaded && !state.flashBackupPolicyLoading) loadFlashBackupPolicy();
       if (!state.flashCapabilitiesLoaded && !state.flashCapabilitiesLoading) loadFlashCapabilities();
       event.preventDefault();
       return;
@@ -2958,6 +3230,7 @@ export function mount(context = {}) {
     else if (name === 'flash-apply-firmware') applyFirmwareOperation();
     else if (name === 'flash-factory-reset') factoryResetFlash();
     else if (name === 'flash-save-preserve') saveFlashPreserveConfig();
+    else if (name === 'flash-save-backup-policy') saveFlashBackupPolicy();
     else if (name === 'signature-apply-package') applySignatureUpdate();
     else if (name === 'advanced-kernel-restore-defaults') restoreAdvancedKernelDefaults();
   }
@@ -3136,6 +3409,9 @@ export function mount(context = {}) {
       // 列表要立刻反映新存档，否则用户看不到刚生成的那一份
       state.flashBackupsLoaded = false;
       loadFlashBackups();
+      // 新存档会改变 backup_count / at_limit，定时备份卡的满额说明要跟着更新
+      state.flashBackupPolicyLoaded = false;
+      loadFlashBackupPolicy();
     } catch (error) {
       state.flashError = error?.message || '生成备份失败';
     } finally {
@@ -3416,7 +3692,17 @@ export function mount(context = {}) {
         supported: payload.scheduled_backup_supported === true,
         reason: stringOr(payload.scheduled_backup_reason || ''),
         scope: stringOr(payload.backup_scope || ''),
-        storage: stringOr(payload.backup_storage || '')
+        storage: stringOr(payload.backup_storage || ''),
+        /*
+         * 保留策略的范围与满额行为也在能力源里，控件的取值范围必须来自这里而不是硬编码：
+         * 写死 1~64 之后后端一改范围，页面显示的就是假话。
+         */
+        retentionPolicy: stringOr(payload.retention_policy || ''),
+        retentionFullBehavior: stringOr(payload.retention_full_behavior || ''),
+        retentionCount: finiteNumber(payload.retention_count, NaN),
+        retentionMin: finiteNumber(payload.retention_min, NaN),
+        retentionMax: finiteNumber(payload.retention_max, NaN),
+        retentionConfigured: payload.retention_configured === true
       };
       state.flashCapabilitiesLoaded = true;
     } catch (error) {
@@ -3427,6 +3713,109 @@ export function mount(context = {}) {
       state.flashCapabilitiesLoading = false;
       render();
     }
+  }
+
+  /*
+   * 定时备份策略的当前值。这条路由是 high risk（`jmx_app_perms.c:122`），viewer 读会 403。
+   * 403/401 只说明"当前账号读不到当前值"，不是"功能不可用"，所以失败时不清能力位、
+   * 不改渲染判据，只记一句读取说明；控件继续按能力位渲染。
+   */
+  async function loadFlashBackupPolicy() {
+    if (state.flashBackupPolicyLoading) return;
+    state.flashBackupPolicyLoading = true;
+    state.flashBackupPolicyError = '';
+    render();
+    try {
+      const payload = flashPayload(await fetchJson('/api/v1/system/flash/backup-policy'));
+      state.flashBackupPolicy = payload && typeof payload === 'object' ? payload : null;
+      state.flashBackupPolicyLoaded = true;
+    } catch (error) {
+      state.flashBackupPolicy = null;
+      state.flashBackupPolicyError = flashBackupPolicyReadFailureText(error);
+    } finally {
+      state.flashBackupPolicyLoading = false;
+      render();
+    }
+  }
+
+  function flashBackupPolicyReadFailureText(error) {
+    const status = Number(error?.status || 0);
+    if (status === 403) return '当前账号权限不足，读不到定时备份的当前设置（该接口为高危权限）。';
+    if (status === 401) return '会话已失效，定时备份当前设置未能读取，请重新登录。';
+    if (status === 404 || status === 405 || status === 501) return '设备未实现定时备份策略读取接口。';
+    if (status >= 500) return `设备返回错误（${status}），定时备份当前设置未能读取。`;
+    if (!status) return '网络不可用，定时备份当前设置未能读取。';
+    return `定时备份当前设置未能读取（${status}）。`;
+  }
+
+  /*
+   * 保存定时备份策略。后端接受 `{ retention_count, schedule: {...} }`，两部分都可单独提交，
+   * 但都不给会 400 `nothing_to_update`，所以这里始终把两部分一起发。
+   *
+   * 它只写调度与保留数字，不删任何既有备份（`webd_backup_retention_set` 只落一个数字），
+   * 所以不套规则 17 的危险操作确认弹窗；但保存失败必须原样呈现后端原因，不能吞掉。
+   */
+  async function saveFlashBackupPolicy() {
+    if (state.flashWorking || !flashScheduledBackupAvailable()) return;
+    const body = flashBackupPolicyRequestBody();
+    if (!body) {
+      state.flashError = '定时备份设置不完整，未提交。';
+      render();
+      return;
+    }
+    state.flashWorking = 'save-backup-policy';
+    state.flashMessage = '';
+    state.flashError = '';
+    render();
+    try {
+      const payload = flashPayload(await postJson('/api/v1/system/flash/backup-policy', body));
+      state.flashBackupPolicy = payload && typeof payload === 'object' ? payload : state.flashBackupPolicy;
+      state.flashBackupPolicyLoaded = true;
+      state.flashBackupPolicyError = '';
+      state.flashSchedulePolicyDraft = null;
+      state.flashMessage = body.schedule?.enabled
+        ? '定时备份设置已保存，设备会按该频率与时刻自动备份。'
+        : '定时备份设置已保存，当前为关闭状态，保留份数仍然生效。';
+    } catch (error) {
+      const code = stringOr(error?.payload?.error?.code || error?.payload?.code || '');
+      state.flashError = `定时备份设置保存失败：${error?.message || '接口不可用'}${code ? `（${code}）` : ''}`;
+    } finally {
+      state.flashWorking = '';
+      render();
+    }
+  }
+
+  function flashScheduledBackupAvailable() {
+    const cap = flashCap('scheduled_backup');
+    if (cap) return cap.available;
+    return state.flashScheduledBackup?.supported === true;
+  }
+
+  /*
+   * 请求体按后端校验规则组装：frequency 只接受 daily / weekly，hour 0-23、minute 0-59、
+   * weekday 0-6，越界后端 400 拒绝而不是夹取，所以这里先自查一遍再发。
+   */
+  function flashBackupPolicyRequestBody() {
+    const caps = state.flashCapabilities || {};
+    const policy = state.flashBackupPolicy;
+    const draft = state.flashSchedulePolicyDraft || {};
+    const schedule = policy?.schedule && typeof policy.schedule === 'object' ? policy.schedule : null;
+    const min = finiteNumber(policy?.retention_min ?? caps.retention_min ?? state.flashScheduledBackup?.retentionMin, 1);
+    const max = finiteNumber(policy?.retention_max ?? caps.retention_max ?? state.flashScheduledBackup?.retentionMax, min);
+    const current = finiteNumber(policy?.retention_count ?? state.flashScheduledBackup?.retentionCount, min);
+    const retention = finiteNumber(draft.retention_count, current);
+    const frequency = stringOr(draft.frequency ?? schedule?.frequency) || 'daily';
+    const hour = finiteNumber(draft.hour ?? schedule?.hour, 3);
+    const minute = finiteNumber(draft.minute ?? schedule?.minute, 0);
+    const weekday = finiteNumber(draft.weekday ?? schedule?.weekday, 0);
+    const enabled = draft.enabled === undefined ? schedule?.enabled === true : draft.enabled === true;
+    if (!(retention >= min && retention <= max)) return null;
+    if (frequency !== 'daily' && frequency !== 'weekly') return null;
+    if (!(hour >= 0 && hour <= 23) || !(minute >= 0 && minute <= 59) || !(weekday >= 0 && weekday <= 6)) return null;
+    return {
+      retention_count: retention,
+      schedule: { enabled, frequency, hour, minute, weekday }
+    };
   }
 
   /*
@@ -3894,6 +4283,8 @@ export function mount(context = {}) {
     }
     if (page === 'flash' && state.flashTab === 'firmware') loadFlashPreserveConfig();
     if (page === 'flash' && state.flashTab === 'operations') loadFlashBackups();
+    /* 定时备份卡的当前值。403 不影响控件渲染，只影响"当前值"的展示。 */
+    if (page === 'flash' && state.flashTab === 'operations') loadFlashBackupPolicy();
     /*
      * 能力源和面板一起拉。两个 Tab 都要用它（备份三条 + 固件三条），
      * 而且它自己就是权威，不等任何概览接口先放行。

@@ -10,7 +10,7 @@ export function mount(context = {}) {
     return { name, ok: response.ok && json?.ok !== false, data: json?.data ?? json, raw: json };
   });
 
-  const VERSION = '20260802-sheet-portal-scope-01';
+  const VERSION = '20260805-page-tabs-tier-02';
   const POLICY_ENDPOINT = '/api/v1/policy-engine/policy-table';
   const ROUTING_ENDPOINT = '/api/v1/routing';
   const RESOURCE_ENDPOINTS = {
@@ -220,14 +220,31 @@ export function mount(context = {}) {
     const query = state.query.trim().toLowerCase();
     return !query || values.join(' ').toLowerCase().includes(query);
   }
+  /*
+   * 页面级 tab 必须挂 `dwrt-kit-page-tabs`，不能只挂 `dwrt-kit-tabs`。
+   * 前者才带页面档几何（高 62px、每个 tab 最小 132px、内边距 6px，见
+   * dwrt-ui-kit.css:970）；只挂后者会得到一排明显更小、更贴上的 tab，
+   * 与策略引擎其它页面（policy-objects 等）不一致 —— 这是被打回的原因。
+   * `role="tab"` 与 `data-value` 是 kit 药丸滑块定位所需，一并补齐。
+   */
   function tabsMarkup() {
-    return `<nav class="routing-page-tabs dwrt-kit-tabs" data-dwrt-component="tabs" aria-label="路由管理视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${TABS.map(([id, label]) => `<button class="dwrt-kit-tab ${state.tab === id ? 'is-active' : ''}" type="button" data-routing-tab="${id}" aria-selected="${state.tab === id}">${label}</button>`).join('')}</nav>`;
+    return `<nav class="routing-page-tabs dwrt-kit-tabs dwrt-kit-page-tabs" data-dwrt-component="tabs" aria-label="路由管理视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${TABS.map(([id, label]) => `<button class="dwrt-kit-tab ${state.tab === id ? 'is-active' : ''}" type="button" role="tab" data-routing-tab="${id}" data-value="${id}" aria-selected="${state.tab === id ? 'true' : 'false'}">${label}</button>`).join('')}</nav>`;
   }
   function toolbarMarkup() {
+    /* Tabs only. The heading used to repeat "路由表" and print "配置版本 19" right
+       under the shell's own 策略引擎 / 路由表 breadcrumb, so the page said its own
+       name twice and pushed the tabs down to y=175 (measured on 30.1). The search
+       box and the create button moved into the table card's toolbar, next to the
+       rows they act on. */
+    return `<header class="routing-page-toolbar">${tabsMarkup()}</header>`;
+  }
+  /* Rendered inside the table card, so it is re-created with the card and must be
+     re-bound each time (see bindEvents). */
+  function tableControlsMarkup() {
     const creatable = ['tables', 'objects', 'cross'].includes(state.tab);
     const labels = { tables: '新建路由表', objects: '新建路由对象', cross: '新建服务' };
     const capability = { tables: 'table_crud', objects: 'object_crud', cross: 'cross_service_config_crud' }[state.tab];
-    return `<header class="routing-page-toolbar"><div class="routing-page-heading"><strong>路由表</strong><span>${state.revision === null ? '路由配置与解析' : `配置版本 ${escapeHtml(state.revision)}`}</span></div>${tabsMarkup()}<div class="routing-page-actions"><label class="routing-search" data-dwrt-component="expand-search">${icon('search')}<input type="search" data-routing-search value="${escapeHtml(state.query)}" placeholder="搜索当前视图" aria-label="搜索当前视图"></label>${creatable ? `<button class="dwrt-kit-button routing-create-button" data-dwrt-component="button" data-variant="primary" type="button" data-routing-create="${state.tab}" ${cap(capability) ? '' : 'disabled'}>${icon('plus')}<span>${labels[state.tab]}</span></button>` : ''}</div></header>`;
+    return `<div class="routing-table-controls"><label class="routing-search" data-dwrt-component="expand-search">${icon('search')}<input type="search" data-routing-search value="${escapeHtml(state.query)}" placeholder="搜索当前视图" aria-label="搜索当前视图"></label>${creatable ? `<button class="dwrt-kit-button routing-create-button" data-dwrt-component="button" data-variant="primary" type="button" data-routing-create="${state.tab}" ${cap(capability) ? '' : 'disabled'}>${icon('plus')}<span>${labels[state.tab]}</span></button>` : ''}</div>`;
   }
   function noticeMarkup(message = state.notice, tone = 'warning') {
     if (!message) return '';
@@ -236,27 +253,30 @@ export function mount(context = {}) {
   function capabilityBanner(message, tone = 'warning') {
     return `<section class="routing-capability-banner is-${tone}" data-dwrt-component="state-panel"><strong>${tone === 'danger' ? '功能不可用' : '能力说明'}</strong><span>${escapeHtml(message)}</span></section>`;
   }
-  function tableShell(title, meta, headings, rows, empty, className = '') {
-    return `<section class="routing-resource-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface ${className}" data-dwrt-component="data-table"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(meta)}</span></div></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr>${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody>${state.loading ? `<tr><td class="dwrt-kit-table-empty" colspan="${headings.length}">正在读取真实配置</td></tr>` : rows.length ? rows.join('') : `<tr><td class="dwrt-kit-table-empty" colspan="${headings.length}">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
+  /* `controls` is opt-in: several tabs render more than one table (运行解析 shows the
+     resolve panel plus 外部策略), and the search box belongs to the tab's primary
+     table only -- duplicating it would give the same query two inputs. */
+  function tableShell(title, meta, headings, rows, empty, className = '', controls = '') {
+    return `<section class="routing-resource-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface ${className}" data-dwrt-component="data-table"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(meta)}</span></div>${controls}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr>${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody>${state.loading ? `<tr><td class="dwrt-kit-table-empty" colspan="${headings.length}">正在读取真实配置</td></tr>` : rows.length ? rows.join('') : `<tr><td class="dwrt-kit-table-empty" colspan="${headings.length}">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
   }
   function actionButton(kind, item, readOnly = false) {
     return `<button class="routing-row-action" type="button" data-routing-open="${escapeHtml(kind)}" data-routing-id="${escapeHtml(item.id)}" aria-label="${readOnly ? '查看' : '编辑'} ${escapeHtml(item.name)}">${icon(readOnly ? 'eye' : 'edit')}</button>`;
   }
   function policiesMarkup() {
     const rows = state.policies.filter((item) => matchesQuery([item.name, item.typeLabel, item.source, item.destination, item.target, item.interface, item.table])).map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><span class="routing-kind is-${item.type}">${escapeHtml(item.typeLabel)}</span></td><td><strong>${escapeHtml(item.name)}</strong>${item.comment ? `<small>${escapeHtml(item.comment)}</small>` : ''}</td><td>${escapeHtml(item.source)}</td><td>${escapeHtml(item.destination)}</td><td>${escapeHtml(item.target)}</td><td>${escapeHtml(item.interface)}</td><td><span class="routing-table-pill">${escapeHtml(item.table)}</span></td><td>${item.priority || '--'}</td><td>${item.type === 'pbr' ? item.hits : '--'}</td><td>${item.type === 'pbr' ? escapeHtml(formatTime(item.lastHit)) : '--'}</td><td>${actionButton('policy', item, true)}</td></tr>`);
-    return `${capabilityBanner('静态路由与 PBR 在此仅作统一索引；创建、修改和删除继续由“策略表”作为唯一写入口。', 'info')}${state.errors.policies ? capabilityBanner(`路由策略读取失败：${state.errors.policies}`, 'danger') : ''}${tableShell('路由策略', `${rows.length} 条 · 只读索引`, ['状态', '类型', '名称', '源', '目标网络', '下一跳 / 目标', '接口', '路由表', '跃点 / 优先级', '命中', '最后命中', '详情'], rows, state.errors.policies || '没有路由策略', 'is-policy-table')}`;
+    return `${capabilityBanner('静态路由与 PBR 在此仅作统一索引；创建、修改和删除继续由“策略表”作为唯一写入口。', 'info')}${state.errors.policies ? capabilityBanner(`路由策略读取失败：${state.errors.policies}`, 'danger') : ''}${tableShell('路由策略', `${rows.length} 条 · 只读索引`, ['状态', '类型', '名称', '源', '目标网络', '下一跳 / 目标', '接口', '路由表', '跃点 / 优先级', '命中', '最后命中', '详情'], rows, state.errors.policies || '没有路由策略', 'is-policy-table', tableControlsMarkup())}`;
   }
   function tablesMarkup() {
     const writable = cap('table_crud');
     const items = state.tables.filter((item) => matchesQuery([item.id, item.name, item.role, item.gateway, item.table_id]));
     const rows = items.map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></td><td>${item.table_id}</td><td>${escapeHtml(item.role || '--')}</td><td>${escapeHtml(item.gateway || '--')}</td><td>${item.metric}</td><td>${item.ref_count}</td><td>${actionButton('table', item, !writable)}</td></tr>`);
-    return `${!writable ? capabilityBanner('后端未明确声明 table_crud，路由表保持只读。', 'danger') : ''}${state.errors.tables ? capabilityBanner(`路由表读取失败：${state.errors.tables}`, 'danger') : ''}${tableShell('自定义路由表', `${items.length} 个 · ${writable ? '真实 CRUD' : '只读'}`, ['状态', '名称 / ID', 'Table ID', '角色', '网关', 'Metric', '引用', '操作'], rows, state.errors.tables || '没有自定义路由表')}`;
+    return `${!writable ? capabilityBanner('后端未明确声明 table_crud，路由表保持只读。', 'danger') : ''}${state.errors.tables ? capabilityBanner(`路由表读取失败：${state.errors.tables}`, 'danger') : ''}${tableShell('自定义路由表', `${items.length} 个 · ${writable ? '真实 CRUD' : '只读'}`, ['状态', '名称 / ID', 'Table ID', '角色', '网关', 'Metric', '引用', '操作'], rows, state.errors.tables || '没有自定义路由表', '', tableControlsMarkup())}`;
   }
   function objectsMarkup() {
     const writable = cap('object_crud');
     const items = state.objects.filter((item) => matchesQuery([item.id, item.name, item.type, item.family, item.value, item.comment, ...item.members.map((member) => firstText(member.value, member.label))]));
     const rows = items.map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></td><td>${escapeHtml(item.type)}</td><td>${escapeHtml(item.family)}</td><td><span class="routing-cell-ellipsis" title="${escapeHtml(item.value || '')}">${escapeHtml(item.value || '--')}</span></td><td>${item.members.length}</td><td>${item.ref_count}</td><td>${actionButton('object', item, !writable)}</td></tr>`);
-    return `${capabilityBanner('这里的对象只属于路由子系统，不冒充跨防火墙、SQM 与 flowd 的通用策略对象。', 'info')}${!writable ? capabilityBanner('后端未明确声明 object_crud，路由对象保持只读。', 'danger') : ''}${state.errors.objects ? capabilityBanner(`路由对象读取失败：${state.errors.objects}`, 'danger') : ''}${tableShell('路由对象', `${items.length} 个 · ${writable ? '真实 CRUD' : '只读'}`, ['状态', '名称 / ID', '类型', '地址族', '值', '成员', '引用', '操作'], rows, state.errors.objects || '没有路由对象')}`;
+    return `${capabilityBanner('这里的对象只属于路由子系统，不冒充跨防火墙、SQM 与 flowd 的通用策略对象。', 'info')}${!writable ? capabilityBanner('后端未明确声明 object_crud，路由对象保持只读。', 'danger') : ''}${state.errors.objects ? capabilityBanner(`路由对象读取失败：${state.errors.objects}`, 'danger') : ''}${tableShell('路由对象', `${items.length} 个 · ${writable ? '真实 CRUD' : '只读'}`, ['状态', '名称 / ID', '类型', '地址族', '值', '成员', '引用', '操作'], rows, state.errors.objects || '没有路由对象', '', tableControlsMarkup())}`;
   }
   function crossMarkup() {
     const writable = cap('cross_service_config_crud');
@@ -264,7 +284,7 @@ export function mount(context = {}) {
     const reason = firstText(state.capabilities.cross_service_runtime_reason, 'runtime_consumer_not_implemented');
     const items = state.crossServices.filter((item) => matchesQuery([item.id, item.name, item.service_type, item.server_ip, item.scope, item.listen_port, item.version, item.remark]));
     const rows = items.map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></td><td>${escapeHtml(item.service_type)}</td><td>${escapeHtml(item.server_ip || '--')}</td><td>${escapeHtml(item.scope || '--')}</td><td>${escapeHtml(item.listen_port || '--')}</td><td>${runtime && item.runtime_supported ? statusBadge('运行已接入', 'success') : statusBadge('仅配置', 'warning')}</td><td>${actionButton('cross', item, !writable)}</td></tr>`);
-    return `${!runtime ? capabilityBanner(`配置可以保存，但运行消费者尚未实现（${reason}）；页面不会把“保存成功”显示为服务已生效。`, 'warning') : ''}${!writable ? capabilityBanner('后端未明确声明 cross_service_config_crud，跨三层服务保持只读。', 'danger') : ''}${state.errors.cross ? capabilityBanner(`跨三层服务读取失败：${state.errors.cross}`, 'danger') : ''}${tableShell('跨三层服务', `${items.length} 项 · ${runtime ? '配置与运行' : '配置态'}`, ['状态', '名称 / ID', '服务类型', '服务器', '作用域', '监听端口', '运行态', '操作'], rows, state.errors.cross || '没有跨三层服务')}`;
+    return `${!runtime ? capabilityBanner(`仅限本页“跨三层服务”：配置可以保存，但运行消费者尚未实现（${reason}），页面不会把“保存成功”显示为服务已生效。路由策略、路由表与路由对象不受此限制。`, 'warning') : ''}${!writable ? capabilityBanner('后端未明确声明 cross_service_config_crud，跨三层服务保持只读。', 'danger') : ''}${state.errors.cross ? capabilityBanner(`跨三层服务读取失败：${state.errors.cross}`, 'danger') : ''}${tableShell('跨三层服务', `${items.length} 项 · ${runtime ? '配置与运行' : '配置态'}`, ['状态', '名称 / ID', '服务类型', '服务器', '作用域', '监听端口', '运行态', '操作'], rows, state.errors.cross || '没有跨三层服务', '', tableControlsMarkup())}`;
   }
   function resolutionMarkup() {
     if (!state.resolution) return '<div class="routing-runtime-empty">选择路由表或策略规则后执行解析。</div>';
@@ -277,7 +297,7 @@ export function mount(context = {}) {
     const options = state.resolveMode === 'rule' ? pbr.map((item) => [item.id, item.name]) : [['main', 'main (254)'], ...state.tables.map((item) => [item.id, `${item.name} (${item.table_id})`])];
     const external = state.externalPolicies.filter((item) => matchesQuery([item.id, item.name, item.source, item.section_type, item.path]));
     const rows = external.map((item) => `<tr><td><strong>${escapeHtml(item.name || item.id)}</strong><small>${escapeHtml(item.id)}</small></td><td>${escapeHtml(item.source || '--')}</td><td>${escapeHtml(item.section_type || '--')}</td><td><span class="routing-cell-ellipsis" title="${escapeHtml(item.path || '')}">${escapeHtml(item.path || '--')}</span></td><td>${statusBadge('只读', 'muted')}</td></tr>`);
-    return `<section class="routing-runtime-layout"><section class="routing-runtime-panel" data-dwrt-component="surface"><header><div><strong>运行解析</strong><span>验证配置如何解析到路由表</span></div>${statusBadge(canResolve ? '可用' : '不可用', canResolve ? 'success' : 'error')}</header>${!canResolve ? capabilityBanner('后端未明确声明 runtime_resolve，解析入口已关闭。', 'danger') : ''}<div class="routing-resolve-controls"><label><span>解析方式</span><select data-routing-resolve-mode ${canResolve ? '' : 'disabled'}><option value="table" ${state.resolveMode === 'table' ? 'selected' : ''}>按路由表</option><option value="rule" ${state.resolveMode === 'rule' ? 'selected' : ''}>按策略规则</option></select></label><label><span>${state.resolveMode === 'rule' ? '策略规则' : '路由表'}</span><select data-routing-resolve-value ${canResolve ? '' : 'disabled'}><option value="">请选择</option>${options.map(([value, label]) => `<option value="${escapeHtml(value)}" ${state.resolveValue === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label><button class="dwrt-kit-button" data-dwrt-component="async-button" data-variant="primary" type="button" data-routing-resolve ${canResolve && state.resolveValue && !state.resolving ? '' : 'disabled'}>${state.resolving ? '正在解析' : '执行解析'}</button></div>${resolutionMarkup()}${capabilityBanner('解析结果是配置级解析，不代表逐 flow 的 conntrack 命中或实际选路证明。', 'info')}</section>${state.errors.external ? capabilityBanner(`外部策略读取失败：${state.errors.external}`, 'danger') : ''}${tableShell('外部策略', `${external.length} 条 · pbr / mwan3 只读发现`, ['名称 / ID', '来源', '类型', '配置路径', '权限'], rows, state.errors.external || '没有发现外部策略', 'is-external-table')}</section>`;
+    return `<section class="routing-runtime-layout"><section class="routing-runtime-panel" data-dwrt-component="surface"><header><div><strong>运行解析</strong><span>验证配置如何解析到路由表</span></div>${statusBadge(canResolve ? '可用' : '不可用', canResolve ? 'success' : 'error')}</header>${!canResolve ? capabilityBanner('后端未明确声明 runtime_resolve，解析入口已关闭。', 'danger') : ''}<div class="routing-resolve-controls"><label><span>解析方式</span><select data-routing-resolve-mode ${canResolve ? '' : 'disabled'}><option value="table" ${state.resolveMode === 'table' ? 'selected' : ''}>按路由表</option><option value="rule" ${state.resolveMode === 'rule' ? 'selected' : ''}>按策略规则</option></select></label><label><span>${state.resolveMode === 'rule' ? '策略规则' : '路由表'}</span><select data-routing-resolve-value ${canResolve ? '' : 'disabled'}><option value="">请选择</option>${options.map(([value, label]) => `<option value="${escapeHtml(value)}" ${state.resolveValue === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label><button class="dwrt-kit-button" data-dwrt-component="async-button" data-variant="primary" type="button" data-routing-resolve ${canResolve && state.resolveValue && !state.resolving ? '' : 'disabled'}>${state.resolving ? '正在解析' : '执行解析'}</button></div>${resolutionMarkup()}${capabilityBanner('解析结果是配置级解析，不代表逐 flow 的 conntrack 命中或实际选路证明。', 'info')}</section>${state.errors.external ? capabilityBanner(`外部策略读取失败：${state.errors.external}`, 'danger') : ''}${tableShell('外部策略', `${external.length} 条 · pbr / mwan3 只读发现`, ['名称 / ID', '来源', '类型', '配置路径', '权限'], rows, state.errors.external || '没有发现外部策略', 'is-external-table', tableControlsMarkup())}</section>`;
   }
   function contentMarkup() {
     if (state.tab === 'tables') return tablesMarkup();

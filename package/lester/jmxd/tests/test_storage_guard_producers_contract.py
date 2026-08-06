@@ -36,14 +36,75 @@ def body(source: str, name: str) -> str:
     raise AssertionError(f"unterminated function: {name}")
 
 
+def strip_comments(source: str) -> str:
+    """Remove /* */ and // comments, keeping newlines so line structure survives.
+
+    The guard assertions below care about which statement sits under which
+    condition, not about how the file is commented. Matching raw text made an
+    explanatory comment inserted between `if (bulk_writes_allowed)` and
+    `dw_refresh_wan_state();` fail the contract while the guarded semantics were
+    unchanged. Comments are stripped before those assertions run.
+    """
+    out = []
+    index = 0
+    length = len(source)
+    while index < length:
+        pair = source[index:index + 2]
+        if pair == "/*":
+            end = source.find("*/", index + 2)
+            if end == -1:
+                break
+            # Preserve newlines so a stripped block comment does not join lines.
+            out.append("\n" * source.count("\n", index, end))
+            index = end + 2
+        elif pair == "//":
+            end = source.find("\n", index)
+            if end == -1:
+                break
+            index = end
+        elif source[index] in "\"'":
+            quote = source[index]
+            out.append(source[index])
+            index += 1
+            while index < length:
+                if source[index] == "\\":
+                    out.append(source[index:index + 2])
+                    index += 2
+                    continue
+                out.append(source[index])
+                index += 1
+                if source[index - 1] == quote:
+                    break
+        else:
+            out.append(source[index])
+            index += 1
+    return "".join(out)
+
+
+def guarded_statement(tick: str, condition: str, statement: str) -> bool:
+    """True when `statement` is the statement controlled by `if (condition)`.
+
+    Asserts structure rather than layout: comments are removed and whitespace
+    between the condition and its statement is collapsed, so reformatting or
+    annotating the call site cannot break the contract. A guard that is actually
+    removed still fails, which is the property worth protecting.
+    """
+    cleaned = strip_comments(tick)
+    pattern = re.escape(f"if ({condition})") + r"\s*" + re.escape(statement)
+    return re.search(pattern, cleaned) is not None
+
+
 def test_core_keeps_live_sampling_but_suppresses_history_writes() -> None:
     tick = body(CORE, "dw_handle_metrics_tick")
     assert 'jmx_storage_guard_allow(' in tick
     assert "if (wan_health && bulk_writes_allowed)" in tick
-    assert "if (bulk_writes_allowed)\n            dw_refresh_wan_state();" in tick
-    assert "collect_interface_traffic_rate();" in tick
-    assert "dw_client_overview_sample_tick();" in tick
-    assert "if (ipv6_load)\n        dw_collect_ipv6_load();" in tick
+    assert guarded_statement(tick, "bulk_writes_allowed", "dw_refresh_wan_state();")
+    # Live sampling must keep running under storage pressure. These are now
+    # wrapped in DW_METRICS_TICK_STEP for per-step timing, so assert the call is
+    # present rather than that it ends in a bare semicolon.
+    assert "collect_interface_traffic_rate()" in tick
+    assert "dw_client_overview_sample_tick()" in tick
+    assert guarded_statement(tick, "ipv6_load", "DW_METRICS_TICK_STEP(\"ipv6_load\"")
     assert "flush_health && bulk_writes_allowed" in tick
     assert "wan_profiles && bulk_writes_allowed" in tick
 

@@ -6,10 +6,13 @@
 }
 
 .terminal-group-shell {
-  grid-template-rows: auto minmax(0, 1fr);
+  /* One flow child now that the toolbar header is gone: the card. Leaving the old
+     `auto minmax(0,1fr)` template put the card in the leading `auto` row, so it
+     took its content height while the 1fr row sat empty. Row count follows child
+     count (design.md rule 11). */
+  grid-template-rows: minmax(0, 1fr);
 }
 
-.terminal-group-toolbar-actions svg,
 .terminal-group-table-meta svg,
 .terminal-group-actions svg,
 .terminal-group-member-row svg {
@@ -23,7 +26,7 @@
   stroke-linejoin: round;
 }
 
-.terminal-group-toolbar-actions .terminal-group-export-csv {
+.terminal-group-table-controls .terminal-group-export-csv {
   min-width: 48px;
   padding-inline: 13px;
 }
@@ -42,8 +45,16 @@
   min-width: 0;
 }
 
-.terminal-group-table-toolbar .dwrt-kit-table-title span.is-warning {
+/* 条数徽标移到了工具栏最左侧，页面标题与「数据源：…」副文本已删除，
+   所以警告色跟着落到徽标上（原选择器指向已不存在的 .dwrt-kit-table-title）。 */
+.terminal-group-table-count.is-warning {
   color: color-mix(in srgb, #ffc64d 82%, var(--app-text) 18%);
+}
+
+/* 徽标贴左、控件靠右：徽标不参与收缩，避免长报错把控件挤出卡片。 */
+.terminal-group-table-count {
+  min-width: 0;
+  margin-right: auto;
 }
 
 .terminal-group-table-meta {
@@ -51,6 +62,26 @@
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+/* Search + import/export/create, now inside the table toolbar instead of a separate
+   header band above the card. */
+.terminal-group-table-controls {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.terminal-group-table-controls svg {
+  width: 17px;
+  height: 17px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .terminal-group-table-meta > button,
@@ -144,7 +175,14 @@
 }
 
 .terminal-group-drawer {
-  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-wide);
+  /*
+   * 与 AI 抽屉一致的标准档（460px）。用户 2026-08-05 明确要求策略引擎抽屉宽度
+   * 对齐 AI 抽屉，这条指令优先于「按内容形态选档」的默认判断。
+   * 我先前按内容形态取了 620px 的 -form 档，理由是正文有「可用终端 / 已选成员」
+   * 双栏选择器；460px 下双栏会各自只剩 210px 左右，所以选择器改为按容器宽度
+   * 自适应收成单栏（见 .terminal-group-member-picker），两栏改为上下排列。
+   */
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   --dwrt-kit-sheet-z: 70;
 }
 
@@ -217,19 +255,24 @@
 }
 
 .terminal-group-member-picker {
-  height: min(58dvh, 570px);
-  min-height: 340px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  overflow: hidden;
+  /*
+   * 460px 抽屉下这里只能是单栏（一栏放下终端名 + IP/MAC 的实测下限是 260px，
+   * 两栏放不进 460 减去内边距后的可用宽），所以两个面板上下排列。
+   * 不再写死总高度：上下排列后固定高度会把两个列表各压到一半、行数不够看，
+   * 交给抽屉正文自己滚动，每个面板保留一个可用的最小高度。
+   */
+  grid-template-columns: minmax(0, 1fr);
   border: 1px solid rgba(255,255,255,0.12);
   border-radius: var(--app-radius-panel, 18px);
   background: rgba(8,14,26,0.11);
+  overflow: hidden;
 }
 
 .terminal-group-member-pane {
   min-width: 0;
-  min-height: 0;
+  /* 上下排列后每个面板要自己撑出可用行数；写 0 会被内容压成一两行。 */
+  min-height: 232px;
   display: grid;
   grid-template-rows: auto auto auto minmax(0, 1fr);
   gap: 10px;
@@ -238,7 +281,8 @@
 
 .terminal-group-member-pane + .terminal-group-member-pane {
   grid-template-rows: auto minmax(0, 1fr);
-  border-left: 1px solid rgba(255,255,255,0.10);
+  /* 单栏上下排列，分隔线相应改为上边框（左边框在纵向排列里画不到位置上）。 */
+  border-top: 1px solid rgba(255,255,255,0.10);
 }
 
 .terminal-group-member-pane > header {
@@ -434,19 +478,23 @@ button.terminal-group-member-row {
 }
 
 @media (max-width: 980px) {
-  .terminal-group-toolbar { align-items: stretch; }
-  .terminal-group-toolbar-actions { flex-wrap: wrap; }
-  .terminal-group-member-picker { grid-template-columns: minmax(0, 1fr); height: auto; max-height: none; }
-  .terminal-group-member-pane { min-height: 360px; }
-  .terminal-group-member-pane + .terminal-group-member-pane { border-top: 1px solid rgba(255,255,255,0.10); border-left: 0; }
+  /* The toolbar is a card row now, so it wraps rather than stretching a page header. */
+  .terminal-group-table-toolbar { align-items: center; flex-wrap: wrap; }
+  .terminal-group-table-controls { flex-wrap: wrap; }
+  /* 选择器已在所有宽度下都是单栏（抽屉固定 460px），这里不再需要重复声明
+     列数与分隔线方向；只保留窄屏下更高的面板高度。 */
+  .terminal-group-member-pane { min-height: 300px; }
 }
 
 @media (max-width: 680px) {
   .terminal-group-fields { grid-template-columns: minmax(0, 1fr); }
-  .terminal-group-toolbar-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .terminal-group-toolbar-actions .policy-filter-button,
-  .terminal-group-toolbar-actions .policy-create-button { width: 100%; padding-inline: 10px; }
-  .terminal-group-table-meta .dwrt-kit-table-count { display: none; }
+  .terminal-group-table-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .terminal-group-table-controls .policy-filter-button,
+  .terminal-group-table-controls .policy-create-button { width: 100%; padding-inline: 10px; }
+  .terminal-group-table-controls .terminal-group-table-search { grid-column: 1 / -1; }
+  /* 徽标不再是 .terminal-group-table-meta 的子节点，旧选择器已失效。
+     窄屏下仍然隐藏它，把宽度让给搜索与操作按钮。 */
+  .terminal-group-table-count { display: none; }
   .terminal-group-drawer-footer { align-items: stretch; flex-direction: column; }
   .terminal-group-drawer-footer > div { width: 100%; }
   .terminal-group-drawer-footer > div button { flex: 1 1 0; }

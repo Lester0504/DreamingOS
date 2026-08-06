@@ -115,6 +115,12 @@ struct jmx_system_mount_runtime_entry {
     char device[JMX_SYSTEM_MOUNT_SOURCE_MAX];
     char root[JMX_SYSTEM_MOUNT_TARGET_MAX];
     char target[JMX_SYSTEM_MOUNT_TARGET_MAX];
+    /*
+     * 绑定挂载的宿主挂载点（同 major:minor 上 root 为该条 root 前缀且最长的那条，
+     * 通常是整卷挂载 `/data`）。整卷挂载自身留空。前端据此把绑定挂载折叠到宿主之下，
+     * 而不是把同一个文件系统并列成十几行各自 19.5 GB 的"独立卷"。
+     */
+    char bind_host_target[JMX_SYSTEM_MOUNT_TARGET_MAX];
     char fstype[JMX_SYSTEM_MOUNT_FSTYPE_MAX];
     char options[JMX_SYSTEM_MOUNT_OPTIONS_MAX];
     unsigned int major_num;

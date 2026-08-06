@@ -88,9 +88,47 @@ def test_static_route_persists_user_name_and_comment() -> None:
     assert 'display_name' in ROUTED and 'comment' in ROUTED
 
 
+def test_object_crud_scopes_are_distinguishable_across_components() -> None:
+    """routed object_crud=1 and policy-engine objects_crud=0 describe different
+    resources. Each side must publish its scope so a client can tell them apart
+    instead of picking one and calling the other wrong."""
+    assert '"object_crud_scope", json_object_new_string("routed:route_object")' in ROUTED
+    assert '"object_crud_write_endpoint", json_object_new_string("/api/v1/routing/objects")' in ROUTED
+    assert '"composite_object_crud", json_object_new_boolean(0)' in ROUTED
+    assert '"composite_object_crud_owner", json_object_new_string("policy_engine")' in ROUTED
+
+    assert '"objects_crud_scope",' in WEBD
+    assert '"policy_engine:composite_object"' in WEBD
+    assert '"route_object_crud", json_object_new_boolean(1)' in WEBD
+    assert '"route_object_crud_owner", json_object_new_string("routed")' in WEBD
+    assert '"route_object_write_endpoint",' in WEBD
+    # The composite read_only flag must not read as "all objects are read only".
+    assert '"read_only_scope", "policy_engine:composite_object"' in WEBD
+    assert '"legacy_route_objects_read_only", json_object_new_boolean(0)' in WEBD
+    assert '"legacy_route_objects_write_endpoint", "/api/v1/routing/objects"' in WEBD
+
+
+def test_runtime_reason_is_scoped_per_resource_not_whole_page() -> None:
+    """runtime_consumer_not_implemented applies to cross_services only. It was being
+    rendered as a whole-page verdict for the routing table, so routed now scopes it
+    and publishes per-resource reasons plus the writable resource list."""
+    assert '"cross_service_runtime_reason_scope",' in ROUTED
+    assert 'json_object_new_string("cross_services")' in ROUTED
+    assert '"resource_reasons", reasons' in ROUTED
+    assert '"cross_services_runtime",' in ROUTED
+    assert '"writable_resources", writable' in ROUTED
+    reasons = ROUTED[ROUTED.index('struct json_object *reasons = json_object_new_object();'):]
+    reasons = reasons[:reasons.index('json_object_object_add(o, "resource_reasons", reasons);')]
+    # Tables and objects are writable, so they must not carry a blocking reason.
+    assert '"tables"' not in reasons
+    assert '"objects"' not in reasons
+
+
 if __name__ == "__main__":
     test_snapshot_has_one_authoritative_static_route_source()
     test_independent_resources_and_runtime_boundaries_are_explicit()
     test_rest_routes_use_routed_and_are_permissioned()
     test_static_route_persists_user_name_and_comment()
-    print("ok: routed authoritative UCI projection, resources, runtime boundaries, REST, RBAC, name/comment")
+    test_object_crud_scopes_are_distinguishable_across_components()
+    test_runtime_reason_is_scoped_per_resource_not_whole_page()
+    print("ok: routed authoritative UCI projection, resources, runtime boundaries, REST, RBAC, name/comment, capability scopes")

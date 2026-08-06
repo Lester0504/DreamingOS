@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260805-storage-layout-toolbar-03';
   const MODULE_CLASS = 'storage-raid-route-host';
   const stage = root?.closest('.console-stage');
   const ENDPOINT = '/api/v1/storage/raid';
@@ -298,7 +298,7 @@ export function mount(context = {}) {
   }
 
   function toolbarMarkup() {
-    return `<header class="policy-toolbar raid-toolbar"><label class="policy-search policy-search-main raid-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-raid-search value="${escapeHtml(state.query)}" placeholder="搜索名称、设备、成员或挂载点"></label><div class="policy-toolbar-actions"><button class="policy-filter-button" type="button" data-raid-scan>${icon('scan')}<span>扫描恢复 RAID</span></button><button class="policy-create-button" type="button" data-raid-create>${icon('plus')}<span>创建 RAID</span></button></div></header>`;
+    return `<div class="raid-table-actions"><label class="policy-search policy-search-main raid-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-raid-search value="${escapeHtml(state.query)}" placeholder="搜索名称、设备、成员或挂载点"></label><div class="policy-toolbar-actions"><button class="policy-filter-button" type="button" data-raid-scan>${icon('scan')}<span>扫描恢复 RAID</span></button><button class="policy-create-button" type="button" data-raid-create>${icon('plus')}<span>创建 RAID</span></button></div></div>`;
   }
 
   function emptyText() {
@@ -321,7 +321,7 @@ export function mount(context = {}) {
       const mount = [item.filesystem, item.mount_point].filter(Boolean).join(' · ') || '--';
       return `<tr data-raid-row="${escapeHtml(item.id)}"><td>${statusMarkup(item)}</td><td><button class="raid-name-button" type="button" data-raid-detail="${escapeHtml(item.id)}"><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.device || '--')}</small></button></td><td>${escapeHtml(level.label)}</td><td>${formatBytes(item.size_bytes)}</td><td>${memberMarkup(item)}</td><td><span class="raid-mount-cell" data-dwrt-tooltip="${escapeHtml(mount)}">${escapeHtml(mount)}</span></td><td><span class="raid-note-cell" data-dwrt-tooltip="${escapeHtml(item.note || '--')}">${escapeHtml(item.note || '--')}</span></td><td><button class="raid-icon-button" type="button" data-raid-detail="${escapeHtml(item.id)}" aria-label="查看 RAID 详情" data-dwrt-tooltip="详情">${icon('edit')}</button></td></tr>`;
     });
-    return `<section class="raid-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>RAID 阵列</strong><span>磁盘成员、阵列健康、同步进度与挂载状态</span></div><span class="dwrt-kit-table-count">${rows.length} 条</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table raid-table"><thead><tr><th>状态</th><th>RAID 名称 / 设备</th><th>RAID 类型</th><th>容量</th><th>磁盘成员</th><th>挂载信息</th><th>备注</th><th>操作</th></tr></thead><tbody>${rows.length ? rows.join('') : `<tr><td colspan="8" class="dwrt-kit-table-empty">${escapeHtml(emptyText())}</td></tr>`}</tbody></table></div></section>`;
+    return `<section class="raid-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>RAID 阵列</strong></div><span class="dwrt-kit-table-count">${rows.length} 条</span>${toolbarMarkup()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table raid-table"><thead><tr><th>状态</th><th>RAID 名称 / 设备</th><th>RAID 类型</th><th>容量</th><th>磁盘成员</th><th>挂载信息</th><th>备注</th><th>操作</th></tr></thead><tbody>${rows.length ? rows.join('') : `<tr><td colspan="8" class="dwrt-kit-table-empty">${escapeHtml(emptyText())}</td></tr>`}</tbody></table></div></section>`;
   }
 
   function noticeMarkup() {
@@ -414,7 +414,7 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', MODULE_CLASS);
-    root.innerHTML = `<section class="raid-shell">${noticeMarkup()}<main class="raid-workbench">${toolbarMarkup()}${tableMarkup()}</main>${drawerMarkup()}</section>`;
+    root.innerHTML = `<section class="raid-shell">${noticeMarkup()}<main class="raid-workbench">${tableMarkup()}</main>${drawerMarkup()}</section>`;
     ui.mountAll?.(root);
   }
 

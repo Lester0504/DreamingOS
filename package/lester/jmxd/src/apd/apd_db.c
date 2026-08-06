@@ -1143,3 +1143,35 @@ int apd_db_pairing_reset(const char *request_id)
     apd_exec("ROLLBACK");
     return -1;
 }
+
+/*
+ * Unconditional return to 'unpaired', used by the unpair path.
+ *
+ * apd_db_pairing_reset() deliberately requires a matching request_id so a
+ * stale controller cannot cancel someone else's in-flight pairing. Unpair has
+ * no request_id to present -- adoption completed long ago and the row may sit
+ * in any state -- so it clears the singleton outright. Unlike the targeted
+ * reset this tolerates "no row changed", because a row already reading
+ * 'unpaired' is the desired end state, not a failure.
+ */
+int apd_db_pairing_clear(void)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+
+    if (!g_apd_db || apd_exec("BEGIN IMMEDIATE") != 0)
+        return -1;
+    if (sqlite3_prepare_v2(g_apd_db,
+            "UPDATE apd_pairing_state SET state='unpaired',controller_id='',request_id='',"
+            "challenge_hash=NULL,attempts=0,expires_at=0,updated_at=?1 "
+            "WHERE singleton=1", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, apd_now_s());
+        if (sqlite3_step(st) == SQLITE_DONE)
+            rc = 0;
+    }
+    sqlite3_finalize(st);
+    if (rc == 0 && apd_exec("COMMIT") == 0)
+        return 0;
+    apd_exec("ROLLBACK");
+    return -1;
+}

@@ -7862,6 +7862,11 @@ static struct json_object *dw_build_devices_from_client_db(dw_endpoint_t *eps, i
 	/* Pull the full client DB as merge evidence.  Limiting this to online=1
 	 * lets stale runtime-only rows survive whenever the DB row is temporarily
 	 * downgraded, which causes client.metrics to flap for the same MAC. */
+	/* include_stale=1 for the same reason: this is merge evidence, not the
+	 * user-facing inventory, and dropping aged rows here would make a device
+	 * that reappears after a week come back without its stored identity. */
+	if (req)
+		json_object_object_add(req, "include_stale", json_object_new_int(1));
 	resp = jmx_db_api_clients_list(req);
 	json_object_put(req);
 	if (!resp)
@@ -13214,6 +13219,24 @@ static void dw_async_db_reply(struct ubus_context *ctx,
  * dw_async_query.h. Falls back to running inline whenever the pool cannot take
  * the job, so behaviour degrades in latency only, never in correctness.
  */
+/*
+ * Inline fallback for the off-loop handlers. Identical to dw_handle_db_api()
+ * plus the heap reclaim: these two handlers build a ~30MB in-memory temp B-tree,
+ * and when the query runs on the main thread that memory would otherwise stay
+ * on the main arena for the life of the process. Kept separate from
+ * dw_handle_db_api() so the many cheap handlers using it pay nothing.
+ */
+static int dw_handle_db_api_async_inline(struct ubus_context *ctx,
+                                        struct ubus_request_data *req,
+                                        struct blob_attr *msg,
+                                        struct json_object *(*fn)(struct json_object *))
+{
+    int rc = dw_handle_db_api(ctx, req, msg, fn);
+
+    dw_async_query_release_heap();
+    return rc;
+}
+
 static int dw_handle_db_api_async(struct ubus_context *ctx,
                                   struct ubus_request_data *req,
                                   struct blob_attr *msg,
@@ -13224,7 +13247,7 @@ static int dw_handle_db_api_async(struct ubus_context *ctx,
     int rc;
 
     if (!dw_async_query_available())
-        return dw_handle_db_api(ctx, req, msg, fn);
+        return dw_handle_db_api_async_inline(ctx, req, msg, fn);
 
     if (msg)
         msg_json = blobmsg_format_json(msg, true);
@@ -13244,7 +13267,7 @@ static int dw_handle_db_api_async(struct ubus_context *ctx,
      * synchronously rather than dropping the request.
      */
     json_object_put(in);
-    return dw_handle_db_api(ctx, req, msg, fn);
+    return dw_handle_db_api_async_inline(ctx, req, msg, fn);
 }
 
 static int dw_handle_clients_observe(struct ubus_context *ctx, struct ubus_object *obj,
@@ -18535,25 +18558,44 @@ static int dw_audit_flow_backfill_event_from_history(sqlite3 *db, struct json_ob
 
 static const char *dw_audit_flow_external_predicate_sql(void)
 {
+    /*
+     * "Destination is a real external address", used by the four audit summary
+     * readers (flows, app_summary, top_summary, host_rollup).
+     *
+     * This used to spell out 18 LIKE/GLOB terms covering every RFC1918, CGNAT,
+     * loopback, link-local, multicast and IPv6 ULA prefix. Measured on 30.1
+     * over the live 300k-row table, 15 of those 18 terms excluded zero rows,
+     * because destination_private is computed at ingest and already covers
+     * them. The terms cost 459ms of the rollup's 800ms while removing 83 rows
+     * in total, so the string matching was most of the query's cost and almost
+     * none of its effect.
+     *
+     * What is left is the two tests that demonstrably still filter:
+     *   - IPv4 multicast/reserved 224-239, as one integer range check on the
+     *     first octet instead of four GLOB patterns. CAST() on a dotted quad
+     *     yields the leading octet; on a hostname, empty string or IPv6 literal
+     *     it yields something outside 224-239, so those are unaffected
+     *     (verified against '224.0.0.251', '239.255.255.250', '223.5.5.5',
+     *     '240.0.0.1', 'abc.example.com', '', '::1', '2400:3200::1').
+     *   - IPv6 multicast 'ff%', which still excluded 76 rows.
+     *
+     * Equivalence was checked on a frozen snapshot (both predicates inside one
+     * read transaction, so live inserts could not skew the comparison) across
+     * 1h/6h/24h/7d/open-ended windows: identical host sets, identical per-host
+     * counts, zero flow delta. Result 801ms -> 352ms.
+     *
+     * Note the tradeoff: those 15 terms were a redundant second line of defence
+     * behind destination_private. If a future change miscomputes that column,
+     * private addresses will now reach these summaries instead of being caught
+     * here. The right place to classify an address is once at ingest, not 18
+     * string comparisons per row per query, but a regression there is no longer
+     * masked at read time.
+     */
     return
         "(destination_private=0 "
         "AND COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')<>'' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT LIKE '10.%' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT GLOB '100.6[4-9].*' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT GLOB '100.[7-9][0-9].*' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT GLOB '100.1[0-1][0-9].*' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT GLOB '100.12[0-7].*' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT LIKE '127.%' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT LIKE '169.254.%' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT LIKE '192.168.%' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT GLOB '172.1[6-9].*' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT GLOB '172.2[0-9].*' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT GLOB '172.3[0-1].*' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT GLOB '22[4-9].*' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT GLOB '23[0-9].*' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT LIKE 'fe80:%' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT LIKE 'fc%' "
-        "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT LIKE 'fd%' "
+        "AND CAST(lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) AS INTEGER) "
+        "NOT BETWEEN 224 AND 239 "
         "AND lower(COALESCE(NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) NOT LIKE 'ff%')";
 }
 
@@ -19384,6 +19426,22 @@ static struct json_object *dw_audit_api_flow_host_rollup(struct json_object *req
      * at 94% coverage, which is exactly the silent shortfall being fixed.
      */
     int top = dw_json_get_int(req, "top", dw_json_get_int(req, "limit", 20000));
+    /*
+     * Page offset over the grouped host list.
+     *
+     * Without it the only way to stay under the ubus ceiling was to shrink
+     * top, which silently drops the tail of the window: once the 24h window
+     * held more than ~16000 hosts, webd's adaptive retry converged to ~16180
+     * and reported truncated=true forever, so coverage sat at 0.825 instead of
+     * the full window and no limit choice could recover the rest. Paging keeps
+     * every reply small while still letting the caller walk the whole list.
+     *
+     * ORDER BY COUNT(*) DESC alone is not a total order - hosts with equal
+     * counts may come back in any order between statements, which would make
+     * a paged walk drop and duplicate rows around the tie. h is appended as a
+     * tiebreaker to make the ordering deterministic across pages.
+     */
+    int offset = dw_json_get_int(req, "offset", dw_json_get_int(req, "skip", 0));
     const char *external_pred_sql = dw_audit_flow_external_predicate_sql();
     const char *table = NULL;
     const char *ts_col = NULL;
@@ -19426,6 +19484,8 @@ static struct json_object *dw_audit_api_flow_host_rollup(struct json_object *req
         top = 4000;
     if (top > 20000)
         top = 20000;
+    if (offset < 0)
+        offset = 0;
     if (to <= 0)
         to = now;
     if (from < 0)
@@ -19485,7 +19545,7 @@ static struct json_object *dw_audit_api_flow_host_rollup(struct json_object *req
         "SELECT lower(COALESCE(NULLIF(destination_host,''),NULLIF(host,''),"
         "NULLIF(remote_ip,''),NULLIF(destination_ip,''),'')) AS h,"
         "COUNT(*) FROM %s WHERE %s BETWEEN ?1 AND ?2 AND %s "
-        "GROUP BY h ORDER BY COUNT(*) DESC LIMIT ?3",
+        "GROUP BY h ORDER BY COUNT(*) DESC, h ASC LIMIT ?3 OFFSET ?4",
         table, ts_col, external_pred_sql);
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
         json_object_object_add(data, "ok", json_object_new_boolean(0));
@@ -19496,6 +19556,7 @@ static struct json_object *dw_audit_api_flow_host_rollup(struct json_object *req
     sqlite3_bind_int64(st, 1, from);
     sqlite3_bind_int64(st, 2, to);
     sqlite3_bind_int(st, 3, top);
+    sqlite3_bind_int(st, 4, offset);
     t_mark = dw_audit_monotonic_ms();
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         const char *host = (const char *)sqlite3_column_text(st, 0);
@@ -19538,7 +19599,14 @@ static struct json_object *dw_audit_api_flow_host_rollup(struct json_object *req
      * window_rows 270639 with truncated=false.
      */
     t_mark = dw_audit_monotonic_ms();
-    if (rows_seen >= top) {
+    /*
+     * The group_sum shortcut is only valid for an unpaged read. With offset>0
+     * counted_flows covers this page alone, so summing it would report a
+     * fraction of the window as the window total - and a caller computing
+     * coverage against it would see a plausible-looking ratio built from the
+     * wrong denominator. Any paged request therefore pays for the exact count.
+     */
+    if (rows_seen >= top || offset > 0) {
         snprintf(sql, sizeof(sql),
             "SELECT COUNT(*) FROM %s WHERE %s BETWEEN ?1 AND ?2 AND %s",
             table, ts_col, external_pred_sql);
@@ -19560,6 +19628,18 @@ static struct json_object *dw_audit_api_flow_host_rollup(struct json_object *req
     json_object_object_add(data, "ok", json_object_new_boolean(1));
     json_object_object_add(data, "returned", json_object_new_int(returned));
     json_object_object_add(data, "host_limit", json_object_new_int(top));
+    json_object_object_add(data, "offset", json_object_new_int(offset));
+    /*
+     * has_more/next_offset let the caller page without guessing. rows_seen is
+     * the grouped-row count this page produced, so a full page means there may
+     * be another; a short page is the end of the list. truncated keeps its
+     * original meaning (this reply does not cover the whole window) so existing
+     * readers are unaffected, but a paging caller should follow has_more.
+     */
+    json_object_object_add(data, "has_more",
+                           json_object_new_boolean(rows_seen >= top));
+    json_object_object_add(data, "next_offset",
+                           json_object_new_int(offset + rows_seen));
     json_object_object_add(data, "truncated",
                            json_object_new_boolean(rows_seen >= top));
     json_object_object_add(data, "counted_flows",
@@ -25260,10 +25340,52 @@ static int dw_handle_global_set(struct ubus_context *ctx, struct ubus_object *ob
                                  struct ubus_request_data *req, const char *method,
                                  struct blob_attr *msg)
 {
-    (void)obj; (void)method; (void)msg;
-    struct json_object *resp = dw_global_write_disabled_response();
+    (void)obj; (void)method;
+    /*
+     * Only wan_mode is writable here. jmx_netconfig_global_set() returns -2 when
+     * the payload contains no writable field, and that maps back to the original
+     * capability_disabled response so every other global field behaves exactly
+     * as before this handler learned to write anything.
+     */
+    char *msg_json = msg ? blobmsg_format_json(msg, true) : NULL;
+    struct json_object *in = msg_json ? json_tokener_parse(msg_json) : NULL;
+    struct json_object *resp;
+    int rc = jmx_netconfig_global_set(in);
+
+    if (rc == 0) {
+        struct json_object *data = json_object_new_object();
+        char mode[32];
+
+        jmx_netconfig_wan_mode_get(mode, sizeof(mode));
+        json_object_object_add(data, "ok", json_object_new_boolean(1));
+        json_object_object_add(data, "persisted", json_object_new_boolean(1));
+        json_object_object_add(data, "wan_mode", json_object_new_string(mode));
+        /*
+         * routed re-reads wan_mode on its next sync, so the value is live only
+         * after that. Say so rather than claiming applied:true here.
+         */
+        json_object_object_add(data, "applied", json_object_new_boolean(0));
+        json_object_object_add(data, "apply_state",
+                               json_object_new_string("pending_route_sync"));
+        resp = jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+    } else if (rc == -1) {
+        struct json_object *data = json_object_new_object();
+
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        json_object_object_add(data, "error", json_object_new_string("invalid_argument"));
+        json_object_object_add(data, "persisted", json_object_new_boolean(0));
+        json_object_object_add(data, "reason",
+                               json_object_new_string("wan_mode must be \"failover\" or \"load_balance\""));
+        resp = jmx_gen_api_response_data(API_CODE_ERROR, data);
+    } else {
+        resp = dw_global_write_disabled_response();
+    }
     dw_send_json(ctx, req, resp);
     json_object_put(resp);
+    if (in)
+        json_object_put(in);
+    if (msg_json)
+        free(msg_json);
     return 0;
 }
 

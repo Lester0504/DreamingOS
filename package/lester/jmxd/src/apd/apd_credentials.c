@@ -126,6 +126,21 @@ enum apd_credentials_activate_result {
     APD_CREDENTIALS_ACTIVATE_BOOTSTRAP_REMOVE_FAILED = -8,
     APD_CREDENTIALS_ACTIVATE_METADATA_COMMIT_FAILED = -9,
 };
+
+struct apd_credentials_unpair_report {
+    int certificate_removed;
+    int enrollment_removed;
+    int bootstrap_removed;
+};
+
+enum apd_credentials_unpair_result {
+    APD_CREDENTIALS_UNPAIR_OK = 0,
+    APD_CREDENTIALS_UNPAIR_LOCK_FAILED = -1,
+    APD_CREDENTIALS_UNPAIR_CERTIFICATE_FAILED = -2,
+    APD_CREDENTIALS_UNPAIR_METADATA_FAILED = -3,
+    APD_CREDENTIALS_UNPAIR_BOOTSTRAP_FAILED = -4,
+};
+int apd_credentials_unpair(struct apd_credentials_unpair_report *out);
 #endif
 
 enum apd_json_value_type {
@@ -1603,8 +1618,18 @@ int apd_credentials_validate_startup(struct apd_enrollment_metadata *out)
     return rc;
 }
 
-static int apd_credentials_bootstrap_remove_locked(
-    const struct apd_credentials_lock *lock)
+/*
+ * Overwrites a credential file with zeros, then unlinks it and syncs the
+ * parent directory. Removal must not leave readable key material behind on
+ * flash, so the shred happens before the unlink rather than after.
+ *
+ * Sets *removed to 1 when a file was actually destroyed and to 0 when it was
+ * already absent, so callers can report what they really did instead of
+ * claiming a deletion that never happened.
+ */
+static int apd_credentials_file_destroy_locked(
+    const struct apd_credentials_lock *lock, const char *name,
+    size_t maximum, int *removed)
 {
     unsigned char zeros[4096];
     char path[PATH_MAX];
@@ -1613,9 +1638,11 @@ static int apd_credentials_bootstrap_remove_locked(
     int fd;
     int rc = -1;
 
+    if (removed)
+        *removed = 0;
     memset(zeros, 0, sizeof(zeros));
-    if (apd_credentials_path(path, sizeof(path), lock->directory,
-                             APD_CREDENTIALS_BOOTSTRAP_FILE) != 0)
+    if (!lock || !name ||
+        apd_credentials_path(path, sizeof(path), lock->directory, name) != 0)
         goto done;
     fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
@@ -1623,8 +1650,7 @@ static int apd_credentials_bootstrap_remove_locked(
             rc = 0;
         goto done;
     }
-    if (apd_credentials_file_status(fd, 0600, APD_CREDENTIALS_JSON_MAX,
-                                    &status) != 0)
+    if (apd_credentials_file_status(fd, 0600, maximum, &status) != 0)
         goto close_file;
     while (offset < status.st_size) {
         size_t amount = (size_t)(status.st_size - offset);
@@ -1639,6 +1665,8 @@ static int apd_credentials_bootstrap_remove_locked(
     fd = -1;
     if (unlink(path) != 0 || apd_credentials_parent_sync(lock->directory) != 0)
         goto done;
+    if (removed)
+        *removed = 1;
     rc = 0;
     goto done;
 close_file:
@@ -1646,6 +1674,13 @@ close_file:
 done:
     OPENSSL_cleanse(zeros, sizeof(zeros));
     return rc;
+}
+
+static int apd_credentials_bootstrap_remove_locked(
+    const struct apd_credentials_lock *lock)
+{
+    return apd_credentials_file_destroy_locked(
+        lock, APD_CREDENTIALS_BOOTSTRAP_FILE, APD_CREDENTIALS_JSON_MAX, NULL);
 }
 
 int apd_credentials_activate(
@@ -1751,5 +1786,58 @@ done:
     OPENSSL_cleanse(certificate_fingerprint_copy,
                     sizeof(certificate_fingerprint_copy));
     OPENSSL_cleanse(fingerprint, sizeof(fingerprint));
+    return rc;
+}
+
+/*
+ * Reverses adoption: destroys the client certificate, the enrollment sidecar
+ * and any leftover bootstrap file under the same lock the store/activate
+ * paths take, so an unpair cannot interleave with a credential write.
+ *
+ * Order matters. The certificate goes first: a surviving certificate with no
+ * enrollment.json is an orphan that validate_startup rejects anyway, whereas
+ * surviving metadata pointing at a deleted certificate would look adopted to
+ * a reader that only parses the sidecar.
+ *
+ * Absent files are not an error. Unpair is the operation an operator reaches
+ * for precisely when state is inconsistent, so it converges on "not adopted"
+ * instead of refusing because one file was already gone.
+ */
+int apd_credentials_unpair(struct apd_credentials_unpair_report *out)
+{
+    struct apd_credentials_lock lock;
+    int rc = APD_CREDENTIALS_UNPAIR_LOCK_FAILED;
+
+    if (out)
+        memset(out, 0, sizeof(*out));
+    if (apd_credentials_lock_open(&lock) != 0)
+        return rc;
+
+    rc = APD_CREDENTIALS_UNPAIR_CERTIFICATE_FAILED;
+    if (apd_credentials_file_destroy_locked(
+            &lock, APD_CREDENTIALS_CERT_FILE, APD_CREDENTIALS_CERT_MAX,
+            out ? &out->certificate_removed : NULL) != 0)
+        goto done;
+
+    rc = APD_CREDENTIALS_UNPAIR_METADATA_FAILED;
+    if (apd_credentials_file_destroy_locked(
+            &lock, APD_CREDENTIALS_METADATA_FILE, APD_CREDENTIALS_JSON_MAX,
+            out ? &out->enrollment_removed : NULL) != 0)
+        goto done;
+
+    /*
+     * A bootstrap file only exists before activation completes, so it is
+     * usually already gone. Removing it keeps a stale one-shot token from
+     * being replayed by the next transport cycle.
+     */
+    rc = APD_CREDENTIALS_UNPAIR_BOOTSTRAP_FAILED;
+    if (apd_credentials_file_destroy_locked(
+            &lock, APD_CREDENTIALS_BOOTSTRAP_FILE, APD_CREDENTIALS_JSON_MAX,
+            out ? &out->bootstrap_removed : NULL) != 0)
+        goto done;
+
+    rc = APD_CREDENTIALS_UNPAIR_OK;
+done:
+    apd_credentials_lock_close(&lock);
     return rc;
 }

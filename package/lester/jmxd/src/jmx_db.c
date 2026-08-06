@@ -430,9 +430,43 @@ static int db_ipv6_is_loopback(const char *addr)
     return addr && (!strcmp(addr, "::1") || !strcasecmp(addr, "0:0:0:0:0:0:0:1"));
 }
 
+/*
+ * The IPv6 mirror of the 0.0.0.0 problem. :: is the unspecified address, which
+ * the kernel client table reports for a MAC it has no IPv6 evidence for; it is
+ * not an address the device holds. It was passing db_ipv6_usable() because only
+ * ::1 was screened, so a client with no IPv6 published ipv6 = "::" alongside a
+ * one-element ipv6_addrs list, which reads as "has IPv6" to every consumer.
+ */
+static int db_ipv6_is_unspecified(const char *addr)
+{
+    return addr && (!strcmp(addr, "::") || !strcmp(addr, "0:0:0:0:0:0:0:0"));
+}
+
 static int db_ipv6_usable(const char *addr)
 {
-    return addr && addr[0] && strchr(addr, ':') && !db_ipv6_is_loopback(addr);
+    return addr && addr[0] && strchr(addr, ':') &&
+           !db_ipv6_is_loopback(addr) && !db_ipv6_is_unspecified(addr);
+}
+
+/*
+ * An IPv4 address the client actually holds. 0.0.0.0 is the "no address"
+ * sentinel the collectors store when a MAC was only ever seen over IPv6, and
+ * it must never be published as if it were a real address: consumers use the
+ * ip field as a jump target, a flow-attribution key and a display value, and
+ * a placeholder there reads as a misconfigured device rather than as an absent
+ * lease. The same value is already treated as empty when rows are merged
+ * (dw_merge_device_runtime_evidence) and when flows are attributed
+ * (dw_flow_ip_usable), so the output side is the only place that still leaked it.
+ */
+static int db_ipv4_usable(const char *addr)
+{
+    if (!addr || !addr[0])
+        return 0;
+    if (!strcmp(addr, "0.0.0.0") || !strcmp(addr, "255.255.255.255"))
+        return 0;
+    if (!strncmp(addr, "127.", 4))
+        return 0;
+    return strchr(addr, '.') != NULL;
 }
 
 static void db_ipv6_array_add_unique(struct json_object *arr, const char *addr)
@@ -1720,7 +1754,13 @@ static int db_upsert_network_state(int64_t client_id, struct json_object *ns)
         ipv6_json = json_object_to_json_string(ipv6);
     if (db_prepare(&st, sql) != 0) return -1;
     sqlite3_bind_int64(st, 1, client_id);
-    bind_text_or_null(st, 2, json_s(ns, "ip", ""));
+    /* Bind the 0.0.0.0 sentinel as NULL, not as a value. bind_text_or_null only
+     * screens the empty string, so the placeholder used to be stored as a real
+     * address and then pinned there forever by the COALESCE above: once written,
+     * no later observation could clear it, because a client with no IPv4 never
+     * supplies a replacement. An IPv6-only client is the case that exposed this. */
+    bind_text_or_null(st, 2, db_ipv4_usable(json_s(ns, "ip", "")) ?
+                             json_s(ns, "ip", "") : "");
     sqlite3_bind_text(st, 3, ipv6_json, -1, SQLITE_TRANSIENT);
     bind_text_or_null(st, 4, json_s(ns, "interface", ""));
     bind_text_or_null(st, 5, json_s(ns, "network", ""));
@@ -4311,6 +4351,26 @@ static int db_signal_model_from_evidence(const char *raw_json,
     return 0;
 }
 
+/*
+ * True when the MAC has the locally-administered bit set, i.e. it is randomized
+ * and carries no OUI.
+ *
+ * Acceptance hit this with ea:6a:9a:62:3d:96: 0xea & 0x02 is set, so no vendor
+ * lookup can ever succeed and the device looks anonymous rather than absent.
+ * Reported as a plain fact so nothing downstream has to re-derive it from the
+ * string.
+ */
+static int db_mac_is_locally_administered(const char *mac)
+{
+    unsigned int first = 0;
+
+    if (!mac || !mac[0])
+        return 0;
+    if (sscanf(mac, "%2x", &first) != 1)
+        return 0;
+    return (first & 0x02) != 0;
+}
+
 static struct json_object *db_row_to_client(sqlite3_stmt *st)
 {
     struct json_object *o = json_object_new_object();
@@ -4458,13 +4518,49 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
                                     sizeof(online_duration_source));
 
     add_col_text(o, "mac", st, 1);
+    /* Locally-administered bit: a randomized MAC carries no OUI, so no vendor
+     * database can ever name it and no fingerprint can pin it to a model. The
+     * flag is stated as a fact about the address so the UI can say "randomized"
+     * instead of leaving the user to read an unknown vendor as an intruder. The
+     * label itself belongs to the frontend; this only supplies the bit. */
+    json_object_object_add(o, "mac_randomized",
+                           json_object_new_boolean(
+                               db_mac_is_locally_administered(
+                                   (const char *)sqlite3_column_text(st, 1))));
     add_col_text(o, "hostname", st, 2);
     add_col_text(o, "display_name", st, 3);
     add_col_text(o, "custom_name", st, 11);
-    json_object_object_add(o, "name", json_object_new_string(
-        custom_name && custom_name[0] ? (const char *)custom_name :
-        (display_name && display_name[0] ? (const char *)display_name :
-        (hostname && hostname[0] ? (const char *)hostname : (const char *)sqlite3_column_text(st, 1)))));
+    /* Name resolution, with the rule published rather than implied. The last
+     * step is the MAC itself, which is why a randomized-MAC client shows an
+     * address as its name: there is no hostname, no fingerprint and no user
+     * label to use. Saying "the name you see is the MAC, and here is why"
+     * lets the UI substitute a friendlier label instead of guessing whether
+     * the string it received is a real device name. */
+    {
+        const char *resolved_name;
+        const char *name_source;
+
+        if (custom_name && custom_name[0]) {
+            resolved_name = (const char *)custom_name;
+            name_source = "custom_name";
+        } else if (display_name && display_name[0]) {
+            resolved_name = (const char *)display_name;
+            name_source = "display_name";
+        } else if (hostname && hostname[0]) {
+            resolved_name = (const char *)hostname;
+            name_source = "hostname";
+        } else {
+            resolved_name = (const char *)sqlite3_column_text(st, 1);
+            name_source = "mac_fallback";
+        }
+        json_object_object_add(o, "name",
+                               json_object_new_string(resolved_name ? resolved_name : ""));
+        json_object_object_add(o, "name_source", json_object_new_string(name_source));
+        json_object_object_add(o, "name_fallback_rule",
+            json_object_new_string("custom_name_then_display_name_then_hostname_then_mac"));
+        json_object_object_add(o, "name_is_placeholder",
+                               json_object_new_boolean(!strcmp(name_source, "mac_fallback")));
+    }
     /* Resolve vendor: prefer custom_vendor, then client_fingerprints vendor_name (col 40), then clients.vendor (col 4) */
     const unsigned char *fp_vendor = sqlite3_column_text(st, 40);
     const unsigned char *fp_image = sqlite3_column_text(st, 42);
@@ -4506,6 +4602,25 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
     /* col 40/41 already contain vendor_name/device_type from client_fingerprints subquery in client_select_sql.
      * If type is still unknown, fall back to dev_cat mapping (already done above). No extra DB lookup needed. */
     json_object_object_add(o, "type", json_object_new_string(resolved_type));
+    /* A bare "unknown" makes the consumer guess whether identification failed,
+     * is still pending, or the device is genuinely unidentifiable. State which
+     * one it is. A randomized MAC carries no OUI, so vendor and model lookups
+     * cannot succeed at all - that is a permanent limit, not a pending result. */
+    if (!strcmp(resolved_type, "unknown")) {
+        int randomized = db_mac_is_locally_administered(
+                             (const char *)sqlite3_column_text(st, 1));
+        const char *has_fp = (const char *)sqlite3_column_text(st, 38);
+
+        json_object_object_add(o, "type_reason", json_object_new_string(
+            randomized ? "randomized_mac_no_oui_and_no_fingerprint_evidence" :
+            (has_fp && has_fp[0] ? "fingerprint_evidence_inconclusive" :
+                                   "no_fingerprint_evidence_collected")));
+        json_object_object_add(o, "type_identifiable",
+                               json_object_new_boolean(!randomized));
+    } else {
+        json_object_object_add(o, "type_reason", json_object_new_string(""));
+        json_object_object_add(o, "type_identifiable", json_object_new_boolean(1));
+    }
     json_object_object_add(o, "vendor_name", json_object_new_string(resolved_vendor));
     db_signal_model_from_evidence(fp_raw_json, resolved_model, sizeof(resolved_model),
                                   model_source, sizeof(model_source));
@@ -4513,7 +4628,6 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
     json_object_object_add(o, "device_name", json_object_new_string(resolved_model));
     json_object_object_add(o, "model_source", json_object_new_string(model_source));
     add_col_text(o, "os_name", st, 7);
-    json_object_object_add(o, "is_wired", json_object_new_boolean(sqlite3_column_int(st, 8) != 0));
     json_object_object_add(o, "first_seen", json_object_new_int64(sqlite3_column_int64(st, 9)));
     json_object_object_add(o, "last_seen", json_object_new_int64(last_seen));
     json_object_object_add(o, "last_seen_age", json_object_new_int64(last_seen_age));
@@ -4524,11 +4638,105 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
     json_object_object_add(o, "pinned", json_object_new_boolean(sqlite3_column_int(st, 15) != 0));
     json_object_object_add(o, "hidden", json_object_new_boolean(sqlite3_column_int(st, 16) != 0));
     add_col_text(o, "note", st, 17);
-    add_col_text(o, "ip", st, 18);
+    /* IPv4 contract. The stored column carries 0.0.0.0 for a client that has
+     * only ever been seen over IPv6, so the key is published empty and the
+     * absence is stated in ipv4_available/ipv4_reason instead of being encoded
+     * as a placeholder address. The key itself is kept (never deleted) because
+     * the Web module and the iOS App both read client.ip unconditionally. */
+    {
+        char ip_buf[8192];
+        const char *stored_ip = db_sqlite_safe_text(st, 18, ip_buf, sizeof(ip_buf));
+        const char *effective_ip = db_ipv4_usable(stored_ip) ? stored_ip : "";
+        const char *ipv4_source = "";
+        const char *ipv4_reason = "";
+        int stored_placeholder = stored_ip[0] && !db_ipv4_usable(stored_ip);
+        int has_ipv6 = (runtime && runtime->ipv6_addrs[0]) ||
+                       (ipv6_json && strchr(ipv6_json, ':') != NULL);
+
+        if (!effective_ip[0] && runtime && db_ipv4_usable(runtime->ip)) {
+            effective_ip = runtime->ip;
+            ipv4_source = "client_runtime";
+        } else if (effective_ip[0]) {
+            ipv4_source = "client_network_state";
+        }
+        if (!effective_ip[0]) {
+            if (has_ipv6)
+                ipv4_reason = "ipv6_only_client_no_ipv4_address_observed";
+            else if (online)
+                ipv4_reason = "no_ipv4_address_observed_for_mac";
+            else
+                ipv4_reason = "offline_no_ipv4_address_recorded";
+        }
+        json_object_object_add(o, "ip", json_object_new_string(effective_ip));
+        json_object_object_add(o, "ipv4", json_object_new_string(effective_ip));
+        json_object_object_add(o, "ipv4_available",
+                               json_object_new_boolean(effective_ip[0] != '\0'));
+        json_object_object_add(o, "ipv4_reason", json_object_new_string(ipv4_reason));
+        json_object_object_add(o, "ipv4_source", json_object_new_string(ipv4_source));
+        /* Diagnostic: says the row in client_network_state still holds the
+         * sentinel, so a future reader does not mistake the empty output for a
+         * missing database column. */
+        json_object_object_add(o, "ipv4_stored_placeholder",
+                               json_object_new_boolean(stored_placeholder));
+    }
     add_col_text(o, "interface", st, 19);
     add_col_text(o, "network", st, 20);
     add_col_text(o, "ssid", st, 21);
-    add_col_text(o, "link_type", st, 22);
+    /* link_type stays "unknown" when neither the wireless station table nor
+     * the switch port map claimed this MAC. Publish the reason so the UI can
+     * say "attachment unknown" rather than rendering an empty medium icon, and
+     * so acceptance can tell a collection gap from an unidentifiable device. */
+    {
+        char lt_buf[8192];
+        const char *link_type = db_sqlite_safe_text(st, 22, lt_buf, sizeof(lt_buf));
+        const char *ssid = (const char *)sqlite3_column_text(st, 21);
+        int signal = sqlite3_column_int(st, 24);
+        int unknown = !link_type[0] || !strcmp(link_type, "unknown");
+
+        json_object_object_add(o, "link_type", json_object_new_string(link_type));
+        if (unknown)
+            json_object_object_add(o, "link_type_reason", json_object_new_string(
+                (ssid && ssid[0]) || signal ?
+                    "wireless_evidence_present_but_medium_not_classified" :
+                    "no_wireless_station_entry_and_no_switch_port_evidence"));
+        else
+            json_object_object_add(o, "link_type_reason", json_object_new_string(""));
+
+        /*
+         * is_wired is derived from link_type rather than read from
+         * clients.is_wired.
+         *
+         * That column has never been written by anything: the only writer is
+         * jmx_db_api_clients_observe(), which binds json_i(req, "is_wired", 0),
+         * and no caller anywhere in the tree passes the key - so the stored
+         * value was 0 for every row ever created. The field therefore reported
+         * "not wired" for all 8 clients on 30.1 while link_type said "wired"
+         * for 7 of them, and a consumer comparing the two saw the record
+         * contradict itself.
+         *
+         * link_type is the authoritative medium: it is populated from the
+         * wireless station table and the switch port map. is_wired is published
+         * as a convenience view over it, plus a source field so the derivation
+         * is not a hidden assumption.
+         *
+         * When the medium is unknown, is_wired is false and
+         * is_wired_known is false: "we did not determine the medium" must not
+         * read as "we determined it is wireless". A consumer that needs the
+         * three-state answer reads is_wired_known first.
+         */
+        {
+            int wired = !unknown && (!strcmp(link_type, "wired") ||
+                                     !strcmp(link_type, "ethernet"));
+
+            json_object_object_add(o, "is_wired", json_object_new_boolean(wired));
+            json_object_object_add(o, "is_wired_known",
+                                   json_object_new_boolean(!unknown));
+            json_object_object_add(o, "is_wired_source",
+                                   json_object_new_string(unknown ?
+                                       "undetermined_link_type" :
+                                       "derived_from_link_type"));
+        }
+    }
     add_col_text(o, "link_speed", st, 23);
     add_col_text(o, "parent_mac", st, 43);
     add_col_text(o, "parent_id", st, 44);
@@ -4716,6 +4924,42 @@ static const char *client_select_sql =
     "COALESCE(n.parent_mac,''),COALESCE(n.parent_id,''),COALESCE(n.port,''),COALESCE(n.ipv6_json,'[]'),COALESCE(n.updated_at,0) "
     "FROM clients c LEFT JOIN client_overrides o ON o.client_id=c.client_id LEFT JOIN client_network_state n ON n.client_id=c.client_id LEFT JOIN client_fingerprint f ON f.client_id=c.client_id";
 
+/*
+ * True when an offline client row is old enough to drop out of the default
+ * inventory.
+ *
+ * Anything the user has touched is exempt: a pinned device, a renamed one, or
+ * one carrying a note is there on purpose, and silently removing it after a
+ * week would look like data loss. A row with no usable last_seen is treated as
+ * stale, because that is what an entry observed once and never resolved looks
+ * like.
+ *
+ * The caller must have decided the row is offline; this only judges age.
+ */
+int jmx_db_client_row_stale(struct json_object *client, int64_t now,
+                            int64_t retention_sec)
+{
+    int64_t last_seen;
+    int64_t age;
+
+    if (!client || retention_sec <= 0)
+        return 0;
+    if (json_i(client, "pinned", 0))
+        return 0;
+    if (json_s(client, "custom_name", "")[0])
+        return 0;
+    if (json_s(client, "note", "")[0])
+        return 0;
+
+    last_seen = json_i64(client, "last_seen", 0);
+    if (last_seen <= 0)
+        return 1;
+    age = now - last_seen;
+    if (age < 0)
+        return 0;
+    return age > retention_sec;
+}
+
 struct json_object *jmx_db_api_clients_observe(struct json_object *req)
 {
     struct json_object *data = json_object_new_object();
@@ -4818,6 +5062,7 @@ struct json_object *jmx_db_api_clients_list(struct json_object *req)
 {
     struct json_object *data = json_object_new_object();
     struct json_object *arr = json_object_new_array();
+    struct json_object *cap = json_object_new_object();
     sqlite3_stmt *st = NULL;
     char sql[4096];
     int bind = 1;
@@ -4825,6 +5070,21 @@ struct json_object *jmx_db_api_clients_list(struct json_object *req)
     const char *type = json_s(req, "type", "");
     const char *vendor = json_s(req, "vendor", "");
     int online = json_i(req, "online", -1);
+    /* Offline rows used to live in this list forever, so a router that had been
+     * up for three weeks answered with 23 offline entries against 3 live ones -
+     * mostly randomized MACs that each held a DHCP lease once. Age them out of
+     * the default view. The rows stay in the DB and stay reachable through
+     * /api/v1/clients/{mac} and include_stale=1; this only decides what the
+     * inventory shows by default. */
+    int include_stale = json_i(req, "include_stale", 0) != 0;
+    int64_t retention_sec = JMX_DB_CLIENT_STALE_RETENTION_SEC;
+    int64_t now = now_s();
+    int stale_hidden = 0;
+
+    /* Caller-supplied retention, in days, for tests and for a future setting.
+     * Anything <= 0 keeps the built-in constant. */
+    if (json_i(req, "stale_days", 0) > 0)
+        retention_sec = (int64_t)json_i(req, "stale_days", 0) * 86400;
 
     if (jmx_db_init() != 0) return jmx_gen_api_response_data(API_CODE_ERROR, data);
     snprintf(sql, sizeof(sql), "%s WHERE COALESCE(o.hidden,0)=0", client_select_sql);
@@ -4852,11 +5112,33 @@ struct json_object *jmx_db_api_clients_list(struct json_object *req)
             json_object_put(client);
             continue;
         }
+        if (!include_stale && !json_i(client, "online", 0) &&
+            jmx_db_client_row_stale(client, now, retention_sec)) {
+            stale_hidden++;
+            json_object_put(client);
+            continue;
+        }
         json_object_array_add(arr, client);
     }
     sqlite3_finalize(st);
     json_object_object_add(data, "clients", arr);
     json_object_object_add(data, "total", json_object_new_int(json_object_array_length(arr)));
+    /* Self-describe the filter so the UI does not have to guess why a MAC it
+     * saw yesterday is gone, and so acceptance can read the retention off the
+     * response instead of the source. */
+    json_object_object_add(data, "stale_hidden", json_object_new_int(stale_hidden));
+    json_object_object_add(data, "stale_retention_sec", json_object_new_int64(retention_sec));
+    json_object_object_add(data, "stale_filter_applied",
+                           json_object_new_boolean(!include_stale));
+    json_object_object_add(cap, "stale_offline_retention", json_object_new_boolean(1));
+    json_object_object_add(cap, "stale_retention_sec", json_object_new_int64(retention_sec));
+    json_object_object_add(cap, "stale_retention_days",
+                           json_object_new_int64(retention_sec / 86400));
+    json_object_object_add(cap, "include_stale_param", json_object_new_string("include_stale"));
+    json_object_object_add(cap, "stale_days_param", json_object_new_string("stale_days"));
+    json_object_object_add(cap, "stale_exempt",
+                           json_object_new_string("pinned,custom_name,note"));
+    json_object_object_add(data, "capabilities", cap);
     return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
 }
 

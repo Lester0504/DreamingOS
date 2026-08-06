@@ -38,6 +38,16 @@ static void metrics_warn_throttled_at(const char *msg, int rc, unsigned int fail
 {
     time_t now = time(NULL);
 
+    /*
+     * Skip the first failure. rc=7 is UBUS_STATUS_TIMEOUT and its usual cause
+     * here is core restarting, so its ubus object is briefly gone; the next tick
+     * succeeds. stderr from these daemons is filed under daemon.err by the
+     * supervisor, which turned a self-healing blip into a recurring
+     * error-severity report. A fault that does not recover still gets logged,
+     * because failures keeps climbing past 1.
+     */
+    if (failures <= 1)
+        return;
     if (now - *last_warn < 30)
         return;
     *last_warn = now;

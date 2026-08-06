@@ -66,7 +66,9 @@
 }
 
 .ai-global-host {
-  --ai-drawer-width: min(460px, 100vw);
+  /* 引用 kit 的标准档而不是复写它的值：460px 与标准档相同，但写成字面量时
+     kit 调整档位这里不会跟随（DESIGN.md 规则 7）。 */
+  --ai-drawer-width: var(--dwrt-kit-sheet-width-standard, min(460px, 100vw));
   --ai-drawer-radius: min(var(--app-radius-card, 22px), 22px);
   color: var(--ai-ink);
   contain: layout style;
@@ -554,6 +556,250 @@
   font-style: normal;
   font-weight: 720;
 }
+
+/*
+ * 停用态占位（demo 2）。总开关关闭时配置主体收起成一条说明，
+ * 不再摆一屏保存了也不生效的字段。
+ */
+.ai-dormant-chamber { justify-items: center; }
+
+.ai-dormant-body {
+  min-width: 0;
+  display: grid;
+  justify-items: center;
+  gap: 7px;
+  padding: 18px 16px;
+  text-align: center;
+}
+
+.ai-dormant-body > svg { width: 26px; height: 26px; color: var(--ai-muted); opacity: .6; }
+.ai-dormant-body > strong { color: var(--ai-ink); font-size: 13px; font-weight: 820; }
+.ai-dormant-body > small { max-width: 52ch; color: var(--ai-muted); font-size: 11.5px; font-weight: 620; line-height: 1.55; }
+
+/*
+ * 已配置的供应商（demo 1 下半部分）。后端只有一条 AI 配置，所以只有一张卡；
+ * demo 里的多卡阵列与调度策略切换器没有接口支撑，未实现。
+ */
+.ai-configured-section { min-width: 0; display: grid; gap: 10px; }
+.ai-configured-heading { margin: 0; color: var(--ai-ink); font-size: 13px; font-weight: 820; }
+/* 「当前共 N 个」跟在标题后面，权重压低，不与标题争视觉层级。 */
+.ai-configured-count { margin-left: 8px; color: var(--ai-muted); font-size: 11px; font-style: normal; font-weight: 620; }
+
+/*
+ * 全局调度策略条（demo 1 顶部）。左侧文案 + 右侧药丸切换器，窄屏换行。
+ * 材质走本页既有的 `--ai-ink` 混色与 `--app-radius-control`，
+ * 不采用 demo 的 `blur(50px)` / `border-radius: 32px`。
+ */
+.ai-strategy-bar {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 15px;
+  border-radius: var(--app-radius-control, 10px);
+  background: color-mix(in srgb, var(--ai-ink) 3.5%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ai-ink) 10%, transparent);
+}
+
+.ai-strategy-copy { min-width: 0; display: grid; gap: 3px; }
+.ai-strategy-copy > strong { color: var(--ai-ink); font-size: 13px; font-weight: 820; }
+.ai-strategy-copy > small { min-width: 0; color: var(--ai-muted); font-size: 11px; font-weight: 620; overflow-wrap: anywhere; }
+.ai-strategy-bar > .ai-configured-note,
+.ai-strategy-bar > .ai-configured-error { margin: 0; }
+.ai-strategy-hint { margin: 0; }
+
+/* 药丸式切换器。轨道与按钮都是 999px，符合 design.md radius scale 对 pill 的规定。 */
+.ai-strategy-switcher {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding: 3px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ai-ink) 6%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ai-ink) 9%, transparent);
+}
+
+.ai-strategy-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 15px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ai-muted);
+  font-size: 12px;
+  font-weight: 760;
+  cursor: pointer;
+  transition: background 180ms ease, color 180ms ease;
+}
+
+.ai-strategy-pill:hover:not(:disabled) { background: var(--dwrt-interactive-hover-bg); color: var(--ai-ink); }
+.ai-strategy-pill.is-active { background: rgba(31,120,216,0.22); color: var(--ai-ink); box-shadow: inset 0 0 0 1px rgba(94,199,255,0.3); }
+.ai-strategy-pill:disabled { cursor: default; opacity: 0.6; }
+.ai-strategy-pill > svg { width: 14px; height: 14px; }
+
+/*
+ * 已配置供应商列表。自适应列而非写死列数：列数固定时窄屏会横向溢出，
+ * `minmax(0, 1fr)` 保证子项可收缩（design.md Page spacing 第 3 条）。
+ */
+.ai-provider-list {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 10px;
+}
+
+.ai-provider-row {
+  min-width: 0;
+  /*
+   * 弹性列而非写死行数的 grid：错误提示那一行是条件出现的，
+   * 行模板会随之算错（design.md 第 11 条）。
+   * 同一行里内容少的卡片会被拉到同行最高者的高度（1600px 实测三张都是 257px），
+   * 用 `margin-top: auto` 把动作栏推到底边，多出来的空间落在动作栏之上而不是中间。
+   */
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 14px 15px;
+  border-radius: var(--app-radius-control, 10px);
+  background: color-mix(in srgb, var(--ai-ink) 3.5%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ai-ink) 10%, transparent);
+}
+
+.ai-provider-row > * { flex: 0 0 auto; }
+.ai-provider-row > .ai-provider-row-actions { margin-top: auto; }
+
+.ai-provider-row-actions,
+.ai-provider-draft-actions {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ai-provider-draft-actions { justify-content: flex-end; }
+.ai-provider-row-actions > button { flex: 0 0 auto; }
+.ai-danger-button { color: var(--app-danger, rgb(255, 122, 132)); }
+.ai-danger-button:hover:not(:disabled) { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-danger, rgb(255,122,132)) 34%, transparent); }
+
+/* 空态：真实的「还没有配置」，不是「接口缺失」。 */
+.ai-provider-empty {
+  min-width: 0;
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 26px 18px;
+  border-radius: var(--app-radius-control, 10px);
+  background: color-mix(in srgb, var(--ai-ink) 3%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ai-ink) 9%, transparent);
+  text-align: center;
+}
+
+.ai-provider-empty > svg { width: 22px; height: 22px; color: var(--ai-muted); opacity: 0.7; }
+.ai-provider-empty > strong { color: var(--ai-ink); font-size: 13px; font-weight: 800; }
+.ai-provider-empty > small { max-width: 46ch; color: var(--ai-muted); font-size: 11.5px; font-weight: 620; }
+
+.ai-configured-card {
+  min-width: 0;
+  display: grid;
+  gap: 11px;
+  padding: 14px 15px;
+  border-radius: var(--app-radius-control, 10px);
+  background: color-mix(in srgb, var(--ai-ink) 3.5%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ai-ink) 10%, transparent);
+}
+
+/* 品牌标 + 标题 + 状态徽标；标题列显式给 0 下限，长端点串不会把徽标顶出卡片。 */
+.ai-configured-head {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+}
+
+.ai-configured-mark {
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  min-width: 46px;
+  height: 30px;
+  padding: 0 9px;
+  border-radius: 8px;
+  color: #64d2ff;
+  background: color-mix(in srgb, #1f78d8 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, #5ec7ff 26%, transparent);
+  font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 760;
+}
+
+.ai-configured-title { min-width: 0; display: grid; gap: 2px; }
+.ai-configured-title > strong { min-width: 0; overflow: hidden; color: var(--ai-ink); text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 820; }
+.ai-configured-title > small { min-width: 0; overflow: hidden; color: var(--ai-muted); text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 620; }
+
+.ai-configured-badge {
+  flex: 0 0 auto;
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0 10px;
+  color: var(--ai-muted);
+  background: color-mix(in srgb, var(--ai-ink) 8%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ai-ink) 16%, transparent);
+  font-size: 10.5px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.ai-configured-badge.is-ok { color: var(--app-success, rgb(50, 201, 111)); background: color-mix(in srgb, var(--app-success, rgb(50,201,111)) 12%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-success, rgb(50,201,111)) 28%, transparent); }
+.ai-configured-badge.is-warn { color: var(--app-warning, rgb(255, 196, 64)); background: color-mix(in srgb, var(--app-warning, rgb(255,196,64)) 12%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-warning, rgb(255,196,64)) 28%, transparent); }
+.ai-configured-badge.is-error { color: var(--app-danger, rgb(255, 122, 132)); background: color-mix(in srgb, var(--app-danger, rgb(255,122,132)) 12%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-danger, rgb(255,122,132)) 28%, transparent); }
+.ai-configured-badge.is-info { color: #64d2ff; background: color-mix(in srgb, #1f78d8 13%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, #5ec7ff 26%, transparent); }
+
+.ai-configured-models {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--ai-ink) 4%, transparent);
+}
+
+.ai-configured-models > span { min-width: 0; color: var(--ai-muted); font-size: 11.5px; font-weight: 620; overflow-wrap: anywhere; }
+.ai-configured-models > b { flex: 0 0 auto; color: #64d2ff; font-size: 11.5px; font-weight: 820; white-space: nowrap; }
+
+.ai-configured-error,
+.ai-configured-note,
+.ai-configured-capability {
+  margin: 0;
+  min-width: 0;
+  color: var(--ai-muted);
+  font-size: 11px;
+  font-weight: 620;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.ai-configured-error,
+.ai-configured-capability {
+  display: grid;
+  grid-template-columns: 15px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+}
+
+.ai-configured-error > svg,
+.ai-configured-capability > svg { width: 15px; height: 15px; }
+.ai-configured-error { color: var(--app-danger, rgb(255, 122, 132)); }
 
 @media (max-width: 760px) {
   .ai-master-card { align-items: flex-start; flex-direction: column; gap: 14px; }
@@ -1471,9 +1717,30 @@
 
 .ai-provider-button:hover { background: var(--dwrt-interactive-hover-bg); border-color: var(--dwrt-interactive-hover-border); color: var(--ai-ink); }
 .ai-provider-button.is-active { border-color: rgba(94,199,255,0.31); background: rgba(31,120,216,0.13); color: var(--ai-ink); }
-.ai-provider-button strong { min-width: 0; overflow: hidden; color: var(--ai-ink); text-overflow: ellipsis; white-space: nowrap; font: inherit; font-size: 12px; font-weight: 800; }
-.ai-provider-mark { grid-column: 1 / -1; color: var(--ai-muted); font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.ai-provider-button > svg { width: 15px; height: 15px; color: #64d2ff; }
+/*
+ * 三行磁贴必须**显式指定行列**，否则选中项会比其他项高一截。
+ * 原因：`.ai-provider-mark` 与 `.ai-provider-hint` 都 `grid-column: 1 / -1`，
+ * 选中态多出来的对勾 svg 按自动流就被挤到第四行 —— 30.1 实测选中项 96px、
+ * 其余 76px，同一排磁贴高低不齐。把对勾钉在第二行第二列（品牌名右侧）即可对齐。
+ */
+.ai-provider-button strong { grid-column: 1; grid-row: 2; min-width: 0; overflow: hidden; color: var(--ai-ink); text-overflow: ellipsis; white-space: nowrap; font: inherit; font-size: 12px; font-weight: 800; }
+.ai-provider-mark { grid-column: 1 / -1; grid-row: 1; color: var(--ai-muted); font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+/*
+ * 品牌副标题（demo 1 磁贴里的 `.sub`）。占满整行放在品牌名下面，
+ * 单行截断：品牌名与副标题都可能较长，任其换行会让同一排磁贴高度不齐。
+ */
+.ai-provider-hint {
+  grid-column: 1 / -1;
+  grid-row: 3;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ai-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 620;
+}
+.ai-provider-button > svg { grid-column: 2; grid-row: 2; width: 15px; height: 15px; color: #64d2ff; }
 
 .ai-settings-grid {
   min-width: 0;
@@ -1700,6 +1967,10 @@ html[data-theme-resolved="light"] .ai-assistant-route-host {
   .ai-field-wide { grid-column: auto; }
   .ai-settings-footer { align-items: flex-start; flex-direction: column; }
   .ai-settings-actions { width: 100%; justify-content: flex-end; }
+  /* 策略条在窄屏改为纵向：药丸横排放不下时会被挤到 <60px，读不出档位名。 */
+  .ai-strategy-bar { align-items: stretch; flex-direction: column; }
+  .ai-strategy-switcher { width: 100%; }
+  .ai-strategy-pill { flex: 1 1 auto; justify-content: center; padding: 0 10px; }
 }
 
 @media (max-width: 480px) {
@@ -1722,6 +1993,11 @@ html[data-theme-resolved="light"] .ai-assistant-route-host {
   .ai-oauth-card-footer .ai-secondary-button { width: 100%; }
   .ai-settings-actions { flex-direction: column; align-items: stretch; }
   .ai-primary-button, .ai-secondary-button { width: 100%; }
+  /* 390px：三档药丸各占一行，四个行内动作按钮拉满宽度（沿用上面同类做法）。 */
+  .ai-strategy-switcher { border-radius: var(--app-radius-control, 12px); }
+  .ai-strategy-pill { flex: 1 1 100%; }
+  .ai-provider-row-actions > button,
+  .ai-provider-draft-actions > button { width: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {

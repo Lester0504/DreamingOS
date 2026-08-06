@@ -605,7 +605,8 @@
 .global-filter-drawer,
 .global-columns-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }
 .global-settings-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form); }
-.global-port-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form); }
+/* 端口详情与批量端口配置也是单列表单，收敛到标准档（与 AI 抽屉 460px 对齐）。 */
+.global-port-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }
 .global-resource-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-wide); }
 .global-drawer .dwrt-kit-sheet-header span { display: block; color: var(--app-text-muted); font-size: 10px; font-weight: 760; }
 .global-drawer .dwrt-kit-sheet-header strong { display: block; margin-top: 2px; font-size: 17px; }
@@ -782,7 +783,8 @@
 .global-port-summary strong { color: var(--app-text); font-size: 17px; font-weight: 780; }
 .global-port-summary span { color: var(--app-text-muted); font-size: 11px; }
 
-.global-detail-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; }
+/* 自适应而非视口断点：抽屉固定 460px，桌面端命中不到下面那条 max-width 规则。 */
+.global-detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 8px; }
 .global-detail-grid > span { min-width: 0; min-height: 56px; display: grid; align-content: center; gap: 3px; border-radius: 10px; background: rgba(255,255,255,.035); box-shadow: inset 0 0 0 1px rgba(255,255,255,.065); padding: 9px 11px; }
 .global-detail-grid small { color: var(--app-text-muted); font-size: 9px; }
 .global-detail-grid strong { overflow: hidden; color: var(--app-text-secondary); font-size: 11px; font-weight: 720; text-overflow: ellipsis; white-space: nowrap; }

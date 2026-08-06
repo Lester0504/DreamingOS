@@ -52,7 +52,15 @@ static int pcdn_domain_ok(const char *domain)
     return dots > 0 && label > 0 && domain[n - 1] != '-';
 }
 
-int aegisxd_pcdn_parse_line(char *line, char *out, size_t out_len)
+static int pcdn_reject(const char **reason, const char *why)
+{
+    if (reason)
+        *reason = why;
+    return -1;
+}
+
+int aegisxd_pcdn_parse_line_ex(char *line, char *out, size_t out_len,
+                               const char **reason)
 {
     char *domain;
     char *end;
@@ -60,17 +68,22 @@ int aegisxd_pcdn_parse_line(char *line, char *out, size_t out_len)
     unsigned char addr[sizeof(struct in6_addr)];
 
     if (!line || !out || out_len < AEGISXD_PCDN_DOMAIN_BUFSZ)
-        return -1;
+        return pcdn_reject(reason, "bad_parser_arguments");
     out[0] = '\0';
     pcdn_trim(line);
     if (!line[0] || line[0] == '#' || line[0] == '!')
         return 0;
 
     /* Exceptions, regexes, URLs and wildcard filters are not executable input. */
-    if (!strncmp(line, "@@", 2) || line[0] == '/' || strstr(line, "://") ||
-        strchr(line, '*') || strchr(line, '?') || strchr(line, '[') ||
+    if (!strncmp(line, "@@", 2))
+        return pcdn_reject(reason, "exception_rule_unsupported");
+    if (line[0] == '/')
+        return pcdn_reject(reason, "regex_rule_unsupported");
+    if (strstr(line, "://"))
+        return pcdn_reject(reason, "url_rule_unsupported");
+    if (strchr(line, '*') || strchr(line, '?') || strchr(line, '[') ||
         strchr(line, ']') || strchr(line, '{') || strchr(line, '}'))
-        return -1;
+        return pcdn_reject(reason, "wildcard_rule_unsupported");
 
     domain = line;
     if (!strncmp(domain, "||", 2)) {
@@ -90,7 +103,7 @@ int aegisxd_pcdn_parse_line(char *line, char *out, size_t out_len)
                 while (*domain && isspace((unsigned char)*domain))
                     domain++;
                 if (!domain[0])
-                    return -1;
+                    return pcdn_reject(reason, "hosts_line_without_domain");
             }
         }
     }
@@ -105,9 +118,16 @@ int aegisxd_pcdn_parse_line(char *line, char *out, size_t out_len)
         *--end = '\0';
     for (char *p = domain; *p; p++)
         *p = (char)tolower((unsigned char)*p);
-    if (!pcdn_domain_ok(domain) || inet_pton(AF_INET, domain, addr) == 1 ||
+    if (inet_pton(AF_INET, domain, addr) == 1 ||
         inet_pton(AF_INET6, domain, addr) == 1)
-        return -1;
+        return pcdn_reject(reason, "bare_ip_not_a_domain");
+    if (!pcdn_domain_ok(domain))
+        return pcdn_reject(reason, "invalid_domain_syntax");
     snprintf(out, out_len, "%s", domain);
     return 1;
+}
+
+int aegisxd_pcdn_parse_line(char *line, char *out, size_t out_len)
+{
+    return aegisxd_pcdn_parse_line_ex(line, out, out_len, NULL);
 }

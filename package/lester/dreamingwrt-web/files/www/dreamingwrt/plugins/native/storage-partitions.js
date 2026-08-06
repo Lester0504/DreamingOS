@@ -1,4 +1,4 @@
-const VERSION = '20260803-unallocated-alignment-fragment-01';
+const VERSION = '20260805-storage-layout-toolbar-03';
 const PARTITION_ENDPOINT = '/api/v1/storage/partitions';
 const OVERVIEW_ENDPOINT = '/api/v1/storage/overview?range=1h';
 const MOUNTS_ENDPOINT = '/api/v1/system/mounts';

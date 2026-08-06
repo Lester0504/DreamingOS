@@ -387,9 +387,33 @@ export function mount(context = {}) {
   }
 
   function replaceMarkup(host, markup) {
+    /*
+     * 先把已经被搬进传送门的抽屉收回来，再交给 kit 卸载。
+     *
+     * kit 的 mountAll() 会把 `.dwrt-kit-sheet` 连同遮罩搬到 body 直属的
+     * #dwrtKitSheetPortal，而 kit 的 unmount(host) 只在 host 内部查找抽屉。
+     * 抽屉搬走之后 host 里空无一物，unmountSheet() 永远不会执行，于是抽屉和那层
+     * `is-open` 遮罩永久留在传送门里 —— 关闭抽屉后遮罩仍盖在页面上吞掉所有点击，
+     * 用户必须刷新才能继续操作。实测关闭后 `elementFromPoint(700,450)` 返回的
+     * 就是 `dwrt-kit-sheet-overlay is-open`。
+     */
+    reclaimPortaledSheets(host);
     window.DWRT_UI_KIT?.unmount?.(host);
     host.replaceChildren(document.createRange().createContextualFragment(markup));
+    /* 打归属标记：抽屉一旦被搬进传送门，就只能靠这个标记认回自己的那几个节点。 */
+    host.querySelectorAll('.dwrt-kit-sheet, .dwrt-kit-sheet-overlay')
+      .forEach((node) => { node.dataset.regionOverlayOwned = ''; });
     ui.mountAll?.(host);
+  }
+
+  /* 把本宿主搬出去的抽屉与遮罩接回来，让 kit 的 unmount 能够看到它们。 */
+  function reclaimPortaledSheets(host) {
+    const portal = document.getElementById('dwrtKitSheetPortal');
+    if (!portal) return;
+    portal.querySelectorAll('.dwrt-kit-sheet, .dwrt-kit-sheet-overlay').forEach((node) => {
+      if (node.dataset.regionOverlayOwned === undefined) return;
+      host.append(node);
+    });
   }
 
   function renderPage() {

@@ -188,6 +188,7 @@ static int trust_device_identity(struct otad_target_identity *identity)
     char *release = NULL;
     size_t release_len = 0;
     char distrib_target[128] = "";
+    char sysinfo_path[OTAD_MAX_PATH];
     char *slash;
 
     if (!identity || uname(&uts) != 0)
@@ -196,7 +197,7 @@ static int trust_device_identity(struct otad_target_identity *identity)
     snprintf(identity->architecture, sizeof(identity->architecture), "%s", uts.machine);
     if (!strcmp(identity->architecture, "amd64"))
         snprintf(identity->architecture, sizeof(identity->architecture), "x86_64");
-    if (otad_file_read_all("/etc/openwrt_release", &release, &release_len,
+    if (otad_file_read_all(OTAD_OPENWRT_RELEASE_PATH, &release, &release_len,
                            64 * 1024) != 0 ||
         trust_release_assignment(release, "DISTRIB_TARGET", distrib_target,
                                  sizeof(distrib_target)) != 0) {
@@ -210,13 +211,21 @@ static int trust_device_identity(struct otad_target_identity *identity)
     *slash++ = '\0';
     snprintf(identity->target, sizeof(identity->target), "%s", distrib_target);
     snprintf(identity->subtarget, sizeof(identity->subtarget), "%s", slash);
-    trust_read_first_line("/tmp/sysinfo/board_name", identity->board,
-                          sizeof(identity->board));
-    trust_read_first_line("/tmp/sysinfo/model", identity->model,
-                          sizeof(identity->model));
+    snprintf(sysinfo_path, sizeof(sysinfo_path), "%s/board_name", OTAD_SYSINFO_DIR);
+    trust_read_first_line(sysinfo_path, identity->board, sizeof(identity->board));
+    snprintf(sysinfo_path, sizeof(sysinfo_path), "%s/model", OTAD_SYSINFO_DIR);
+    trust_read_first_line(sysinfo_path, identity->model, sizeof(identity->model));
     if (!identity->board[0])
         snprintf(identity->board, sizeof(identity->board), "%s", identity->subtarget);
-#if defined(__GLIBC__)
+    /*
+     * OTAD_IDENTITY_LIBC exists so the verifier can be exercised on a host that
+     * is neither glibc nor musl. Device builds never set it and keep the same
+     * detection as before; without a value the identity stays unavailable, which
+     * fails the trust check closed.
+     */
+#ifdef OTAD_IDENTITY_LIBC
+    snprintf(identity->libc, sizeof(identity->libc), "%s", OTAD_IDENTITY_LIBC);
+#elif defined(__GLIBC__)
     snprintf(identity->libc, sizeof(identity->libc), "glibc");
 #elif defined(__MUSL__)
     snprintf(identity->libc, sizeof(identity->libc), "musl");
@@ -441,6 +450,24 @@ static struct json_object *trust_outer_statement(struct json_object *firmware_in
     return copy;
 }
 
+static struct json_object *trust_hot_statement(struct json_object *manifest)
+{
+    const char *text;
+    struct json_object *copy;
+
+    text = json_object_to_json_string_ext(manifest, JSON_C_TO_STRING_PLAIN);
+    copy = text ? json_tokener_parse(text) : NULL;
+    if (!copy || !json_object_is_type(copy, json_type_object)) {
+        if (copy)
+            json_object_put(copy);
+        return NULL;
+    }
+    json_object_object_del(copy, "release_signature");
+    json_object_object_add(copy, "statement_type",
+                           json_object_new_string(OTAD_HOT_STATEMENT_TYPE));
+    return copy;
+}
+
 static int trust_current_release_policy(struct json_object *policy,
                                         int candidate_epoch, const char *candidate_build,
                                         int *current_epoch_out,
@@ -630,6 +657,220 @@ int otad_release_trust_verify(int firmware_fd, uint64_t firmware_size,
     if (trust_current_release_policy(policy, candidate_epoch,
                                      otad_json_str(firmware_info, "build_id", ""),
                                      &current_epoch, error, error_len) != 0)
+        goto out;
+    json_object_object_add(evidence, "candidate_security_epoch",
+                           json_object_new_int(candidate_epoch));
+    json_object_object_add(evidence, "current_security_epoch",
+                           json_object_new_int(current_epoch));
+    json_object_object_del(evidence, "authenticity_verified");
+    json_object_object_add(evidence, "authenticity_verified", json_object_new_boolean(1));
+    json_object_object_del(evidence, "target_compatible");
+    json_object_object_add(evidence, "target_compatible", json_object_new_boolean(1));
+    json_object_object_del(evidence, "policy_passed");
+    json_object_object_add(evidence, "policy_passed", json_object_new_boolean(1));
+    otad_json_add_string(evidence, "signature_status", "verified");
+    otad_json_add_string(evidence, "target_status", "compatible");
+    rc = 0;
+out:
+    if (rc != 0) {
+        const char *reason = error && error[0] ? error : "release_trust_verification_failed";
+        if (error && error_len && !error[0])
+            snprintf(error, error_len, "%s", reason);
+        otad_json_add_string(evidence, "signature_status", reason);
+        otad_json_add_string(evidence, "target_status", reason);
+    }
+    free(signed_payload);
+    free(signature);
+    if (signed_json)
+        json_object_put(signed_json);
+    if (outer_statement)
+        json_object_put(outer_statement);
+    if (policy)
+        json_object_put(policy);
+    if (evidence_out)
+        *evidence_out = evidence;
+    else
+        json_object_put(evidence);
+    return rc;
+}
+
+/*
+ * Epoch policy for a hot update. Deliberately narrower than
+ * trust_current_release_policy(): a hot package does not replace the slot and
+ * does not rewrite build_id, so the build_id downgrade and same-build checks
+ * do not apply and would reject every legitimate hot update (allow_same_build
+ * is false in the shipped policy). The security epoch floor still applies -
+ * that is what stops a signed but superseded package from walking the device
+ * back past a security fix.
+ */
+static int trust_hot_epoch_policy(struct json_object *policy, int candidate_epoch,
+                                  int *current_epoch_out,
+                                  char *error, size_t error_len)
+{
+    struct json_object *current = NULL;
+    const char *release_path = NULL;
+    char release_error[OTAD_MAX_TEXT] = "";
+    int minimum_epoch = otad_json_int(policy, "minimum_security_epoch", 1);
+    int current_epoch = 0;
+    int release_rc;
+
+    if (candidate_epoch < 1 || candidate_epoch < minimum_epoch) {
+        snprintf(error, error_len, "security_epoch_below_policy");
+        return -1;
+    }
+    release_rc = otad_release_metadata_read(&current, &release_path, release_error,
+                                           sizeof(release_error));
+    (void)release_path;
+    if (release_rc < 0) {
+        snprintf(error, error_len, "%s", release_error);
+        return -1;
+    }
+    if (current && json_object_is_type(current, json_type_object)) {
+        struct json_object *target = NULL;
+
+        if (json_object_object_get_ex(current, "target", &target))
+            current_epoch = otad_json_int(target, "security_epoch", 0);
+    }
+    if (current_epoch_out)
+        *current_epoch_out = current_epoch;
+    if (candidate_epoch < current_epoch &&
+        !otad_json_bool(policy, "allow_security_epoch_downgrade", 0)) {
+        snprintf(error, error_len, "security_epoch_downgrade_forbidden");
+        if (current)
+            json_object_put(current);
+        return -1;
+    }
+    if (current)
+        json_object_put(current);
+    return 0;
+}
+
+int otad_hot_release_trust_verify(struct json_object *manifest,
+                                 struct json_object **evidence_out,
+                                 char *error, size_t error_len)
+{
+    struct json_object *evidence = json_object_new_object();
+    struct json_object *signature_object = NULL;
+    struct json_object *signed_json = NULL;
+    struct json_object *outer_statement = NULL;
+    struct json_object *policy = NULL;
+    struct json_object *target = NULL;
+    struct otad_target_identity identity;
+    unsigned char *signed_payload = NULL;
+    unsigned char *signature = NULL;
+    size_t signed_payload_len = 0;
+    size_t signature_len = 0;
+    const char *key_id = "";
+    const char *manifest_arch;
+    char manifest_digest[65] = "";
+    char policy_digest[65] = "";
+    char identity_digest[65] = "";
+    char target_reason[96] = "";
+    int current_epoch = 0;
+    int candidate_epoch;
+    int rc = -1;
+
+    if (error && error_len)
+        error[0] = '\0';
+    json_object_object_add(evidence, "authenticity_verified", json_object_new_boolean(0));
+    json_object_object_add(evidence, "signature_required", json_object_new_boolean(1));
+    json_object_object_add(evidence, "signature_verified", json_object_new_boolean(0));
+    json_object_object_add(evidence, "target_compatible", json_object_new_boolean(0));
+    json_object_object_add(evidence, "policy_passed", json_object_new_boolean(0));
+    otad_json_add_string(evidence, "statement_type", OTAD_HOT_STATEMENT_TYPE);
+    /*
+     * There is no payload_region for a hot package. Authenticity of the bytes
+     * comes from the signed manifest carrying a sha256 (and md5) for every
+     * payload, which hot_payloads_verify() then checks against the file. Saying
+     * so in the evidence keeps the binding auditable rather than implied.
+     */
+    otad_json_add_string(evidence, "payload_binding", "manifest_payload_digests");
+    if (!manifest || !json_object_is_type(manifest, json_type_object) ||
+        strcmp(otad_json_str(manifest, "artifact_type", ""), "hot_update") ||
+        otad_json_int(manifest, "manifest_version", 0) != 1 ||
+        strcmp(otad_json_str(manifest, "release_state", ""), "signed") ||
+        !otad_json_bool(manifest, "publishable", 0)) {
+        snprintf(error, error_len, "signed_hot_update_schema_required");
+        goto out;
+    }
+    if (trust_load_policy(&policy, error, error_len) != 0)
+        goto out;
+    if (trust_sha256_file(OTAD_TRUST_POLICY_PATH, policy_digest) != 0) {
+        snprintf(error, error_len, "trust_policy_digest_failed");
+        goto out;
+    }
+    json_object_object_add(evidence, "trust_policy_version",
+                           json_object_new_int(otad_json_int(policy, "policy_version", 0)));
+    otad_json_add_string(evidence, "trust_policy_digest", policy_digest);
+    if (!json_object_object_get_ex(manifest, "release_signature", &signature_object) ||
+        !signature_object ||
+        strcmp(otad_json_str(signature_object, "algorithm", ""), "ed25519") ||
+        strcmp(otad_json_str(signature_object, "signed_payload_encoding", ""), "base64") ||
+        strcmp(otad_json_str(signature_object, "signature_encoding", ""), "base64")) {
+        snprintf(error, error_len, "release_signature_contract_invalid");
+        goto out;
+    }
+    key_id = otad_json_str(signature_object, "key_id", "");
+    otad_json_add_string(evidence, "key_id", key_id);
+    otad_json_add_string(evidence, "signing_key_id", key_id);
+    if (!trust_key_id_ok(key_id) ||
+        trust_key_allowed(policy, key_id, otad_now_s(), error, error_len) != 0 ||
+        trust_base64_decode(otad_json_str(signature_object, "signed_payload", ""),
+                            &signed_payload, &signed_payload_len,
+                            OTAD_MAX_JSON_BYTES) != 0 ||
+        trust_base64_decode(otad_json_str(signature_object, "signature", ""),
+                            &signature, &signature_len, 128) != 0)
+        goto out;
+    if (trust_sha256_bytes(signed_payload, signed_payload_len, manifest_digest) != 0) {
+        snprintf(error, error_len, "signed_manifest_digest_failed");
+        goto out;
+    }
+    otad_json_add_string(evidence, "manifest_digest", manifest_digest);
+    if (trust_verify_ed25519(key_id, signed_payload, signed_payload_len,
+                             signature, signature_len, error, error_len) != 0)
+        goto out;
+    signed_json = json_tokener_parse((const char *)signed_payload);
+    outer_statement = trust_hot_statement(manifest);
+    if (!signed_json || !outer_statement ||
+        !json_object_equal(signed_json, outer_statement) ||
+        strcmp(otad_json_str(signed_json, "statement_type", ""),
+               OTAD_HOT_STATEMENT_TYPE)) {
+        snprintf(error, error_len, "signed_statement_metadata_mismatch");
+        goto out;
+    }
+    json_object_object_del(evidence, "signature_verified");
+    json_object_object_add(evidence, "signature_verified", json_object_new_boolean(1));
+    if (trust_device_identity(&identity) != 0) {
+        snprintf(error, error_len, "device_target_identity_unavailable");
+        goto out;
+    }
+    if (trust_device_identity_digest(&identity, identity_digest) != 0) {
+        snprintf(error, error_len, "device_identity_digest_failed");
+        goto out;
+    }
+    otad_json_add_string(evidence, "device_identity_digest", identity_digest);
+    if (!json_object_object_get_ex(manifest, "target", &target) ||
+        trust_target_match(target, &identity, target_reason,
+                           sizeof(target_reason)) != 0) {
+        snprintf(error, error_len, "%s",
+                 target_reason[0] ? target_reason : "target_incompatible");
+        goto out;
+    }
+    /*
+     * The manifest's own arch/board fields predate the signed target block and
+     * are what the packaging tool prints. Rejecting a disagreement keeps the
+     * two from drifting into a package that claims one thing and is signed for
+     * another.
+     */
+    manifest_arch = otad_json_str(manifest, "arch", "");
+    if (manifest_arch[0] &&
+        strcmp(manifest_arch, otad_json_str(target, "architecture", ""))) {
+        snprintf(error, error_len, "target_architecture_mismatch");
+        goto out;
+    }
+    candidate_epoch = otad_json_int(target, "security_epoch", 0);
+    if (trust_hot_epoch_policy(policy, candidate_epoch, &current_epoch,
+                               error, error_len) != 0)
         goto out;
     json_object_object_add(evidence, "candidate_security_epoch",
                            json_object_new_int(candidate_epoch));

@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260805-drawer-standard-portal-02';
   const kind = /(?:^|[-_/])wan(?:$|[-_/])/.test(`${item.id || ''} ${item.func_name || ''} ${item.path || ''}`) ? 'wan' : 'lan';
   const isWan = kind === 'wan';
   const embedded = context.embedded === true;
@@ -34,8 +34,28 @@ export function mount(context = {}) {
     seq: 0,
     returnFocus: null,
     editorOpen: isWan ? 'identity' : 'identity',
+    tableStale: false,
+    /* 宿主（全局配置页）喂进来的真实 WAN 名单，供 IPv6 上游 WAN 下拉使用。 */
+    wanNames: asArray(context.wanNames),
     pollTimer: 0
   };
+
+  /* 区分同页并存的 LAN / WAN 实例，供 document 层事件归属判断与抽屉标记使用。 */
+  const instanceId = `${kind}-${Math.random().toString(36).slice(2, 8)}`;
+
+  /*
+   * 抽屉可能已经被 kit 搬进 body 下的 portal，所以查它不能只看 root。先在 root 内找
+   * （尚未 mountAll 的那一帧），再按 owner 标记去整个文档里找本实例的那一个。
+   */
+  function drawerNode() {
+    return root?.querySelector('.network-interface-drawer')
+      || document.querySelector(`.network-interface-drawer[data-interface-owner="${instanceId}"]`)
+      || null;
+  }
+
+  function drawerQuery(selector) {
+    return root?.querySelector(selector) || drawerNode()?.querySelector(selector) || null;
+  }
 
   /*
    * 手动刷新按钮按用户第 9 条删除。这里只在独立路由下自轮询：内嵌进全局配置时
@@ -372,7 +392,20 @@ export function mount(context = {}) {
     state.ports = normalizePorts(ports || {});
     state.loading = false;
     state.refreshing = false;
-    render();
+    /*
+     * 抽屉开着时不许重绘。render() 是 root.innerHTML 整页重建，会连抽屉一起
+     * 换掉：手风琴的展开态、正在输入的字段、焦点和光标全部丢失。内嵌进全局配置
+     * 时宿主每 20s 喂一次 setData()，宿主只检查自己的 state.drawer、看不到内嵌
+     * 实例的抽屉，于是用户点开编辑 LAN 停留超过 20s 就必然被打断一次 —— 这正是
+     * “点一下里面的东西整个抽屉重新加载”和周期性闪烁的来源。
+     * 抽屉打开期间只让新数据落进 state.rows / state.ports（端口选择器下一次
+     * patchDrawerContents() 会用到），底表留到抽屉关闭时再补。
+     */
+    if (state.drawer) {
+      state.tableStale = true;
+    } else {
+      render();
+    }
     if (typeof context.onDataChange === 'function') {
       context.onDataChange({ kind, rows: state.rows, ports: state.ports, capabilities: state.capabilities });
     }
@@ -528,7 +561,7 @@ export function mount(context = {}) {
       <td><span class="network-interface-name"><strong>${escapeHtml(row.name)}</strong>${identity ? `<small>${escapeHtml(identity)}</small>` : ''}</span></td>
       <td><code>${escapeHtml(row.device || row.ifname || '--')}</code></td>
       <td>${escapeHtml(modeLabel)}</td>
-      <td>${escapeHtml(row.vlan_id || '--')}</td>
+      <td>${escapeHtml(row.vlan_id || '默认')}</td>
       <td><code>${escapeHtml(subnet)}</code></td>
       <td>${row.dhcp.enabled ? '服务器' : '关闭'}</td>
       <td>${row.ipv6.enabled ? escapeHtml(row.ipv6.mode === 'static' ? firstText(row.ipv6.addr, '静态') : '自动') : '关闭'}</td>
@@ -590,8 +623,77 @@ export function mount(context = {}) {
     return `<select data-interface-field="${escapeHtml(field)}" ${attributes.disabled ? 'disabled' : ''}>${options.map(([key, label, disabled]) => `<option value="${escapeHtml(key)}" ${String(value) === String(key) ? 'selected' : ''} ${disabled ? 'disabled' : ''}>${escapeHtml(label)}</option>`).join('')}</select>`;
   }
 
+  /*
+   * 逻辑接口是 UCI 的 network 段名，取值范围由现有配置和物理口决定，让用户手打
+   * 只会打错（写成不存在的名字、和别的接口撞名、大小写空格出入）。后端
+   * `network/<kind>s/capabilities` 目前是空对象，没有下发候选集，所以候选从已知
+   * 事实拼：本接口当前值 + 自身 id（新建时后端就是拿 id 兜底的，见 lanPayload/
+   * wanPayload 的 `firstText(draft.ifname, draft.id)`）+ 同类接口已用的名字（标记
+   * 已占用，不可选）+ 物理口名。
+   */
+  function ifnameOptions(draft) {
+    const current = firstText(draft.ifname);
+    const selfId = firstText(draft.id);
+    const takenBy = new Map();
+    state.rows.forEach((row) => {
+      const name = firstText(row.ifname, row.id);
+      if (!name || row.id === selfId) return;
+      takenBy.set(name, firstText(row.name, row.id));
+    });
+    const seen = new Set();
+    const options = [];
+    const push = (value, label, disabled = false) => {
+      const key = firstText(value);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      options.push([key, label, disabled]);
+    };
+    if (current) push(current, `${current}（当前）`);
+    push(selfId, `${selfId}（跟随${isWan ? '线路' : '网络'} ID）`);
+    state.rows.forEach((row) => {
+      const name = firstText(row.ifname, row.id);
+      if (!name) return;
+      const owner = takenBy.get(name);
+      push(name, owner ? `${name}（已被 ${owner} 占用）` : name, Boolean(owner));
+    });
+    state.ports.forEach((port) => push(port.name, `${port.name}（物理口）`));
+    return options;
+  }
+
   function switchField(field, checked, title, detail = '') {
     return `<label class="network-interface-switch-row"><span><strong>${escapeHtml(title)}</strong>${detail ? `<small>${escapeHtml(detail)}</small>` : ''}</span><input type="checkbox" data-interface-field="${escapeHtml(field)}" ${checked ? 'checked' : ''}><i></i></label>`;
+  }
+
+  /*
+   * 上游 WAN 是「从现有 WAN 里挑」，不是自由文本：手打会写出不存在的接口名，
+   * 而且后端存的是 JSON 数组（parent_json），本来就有明确的取值集合。
+   * 用 <select multiple> 而不是单选，因为 IPv6 委派可以指向多条上游。
+   */
+  function multiSelectField(field, values, options, attributes = {}) {
+    const selected = new Set(asArray(values).map(String));
+    const size = Math.min(Math.max(options.length, 2), 5);
+    return `<select data-interface-field="${escapeHtml(field)}" data-interface-multi multiple size="${size}" ${attributes.disabled ? 'disabled' : ''}>${options.map(([key, label]) => `<option value="${escapeHtml(key)}" ${selected.has(String(key)) ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select>`;
+  }
+
+  /*
+   * WAN 候选优先用宿主喂进来的真实 WAN 列表（全局配置页同时持有两边数据）。
+   * 独立路由下没有宿主，退回从端口的 owner_id 推导 —— 只能发现绑了物理口的 WAN，
+   * 所以把当前已选值一并并入，避免已配置的上游因为没绑口而从列表里消失。
+   */
+  function upstreamWanOptions(selectedValues) {
+    const names = [];
+    const push = (value) => {
+      const name = firstText(value);
+      if (name && !names.includes(name)) names.push(name);
+    };
+    asArray(state.wanNames).forEach(push);
+    if (!names.length) {
+      state.ports.forEach((port) => {
+        if (firstText(port.ownerType).toLowerCase() === 'wan') push(port.ownerId);
+      });
+    }
+    asArray(selectedValues).forEach(push);
+    return names.map((name) => [name, name]);
   }
 
   function segmentedField(field, value, options, label) {
@@ -683,12 +785,12 @@ export function mount(context = {}) {
     const dhcp = draft.dhcp || {};
     const ipv6 = draft.ipv6 || {};
     const identity = `${switchField('enabled', draft.enabled, '启用网络', '停用后保留配置与地址分配')}
-      <div class="network-interface-form-grid">${formField('网络名称', inputField('name', draft.name, { placeholder: '例如 IoT' }))}${formField('网络 ID', inputField('id', draft.id, { disabled: state.drawer === 'edit' }), '保存后的稳定标识')}${formField('备注', inputField('note', draft.note, { placeholder: '可选' }))}${formField('设备 / 网桥', inputField('device', draft.device, { placeholder: 'br-lan' }))}${formField('逻辑接口', inputField('ifname', draft.ifname, { placeholder: draft.id }))}</div>
+      <div class="network-interface-form-grid">${formField('网络名称', inputField('name', draft.name, { placeholder: '例如 IoT' }))}${formField('网络 ID', inputField('id', draft.id, { disabled: state.drawer === 'edit' }), '保存后的稳定标识')}${formField('备注', inputField('note', draft.note, { placeholder: '可选' }))}${formField('设备 / 网桥', inputField('device', draft.device, { placeholder: 'br-lan' }))}${formField('逻辑接口', selectField('ifname', firstText(draft.ifname, draft.id), ifnameOptions(draft)), 'UCI network 段名')}</div>
       ${segmentedField('mode', draft.mode, [['bridge', '桥接', '普通本地网络'], ['access', 'VLAN 接入', '单个 VLAN'], ['trunk', 'VLAN Trunk', '承载多个 VLAN']], '网络模式')}
       ${draft.mode !== 'bridge' ? dependentMarkup(formField('VLAN ID', inputField('vlan_id', draft.vlan_id, { type: 'number', min: 1, max: 4094 }), '1-4094')) : ''}${inlinePortPicker(draft)}`;
     const addressing = `<div class="network-interface-form-grid">${formField('网关地址', inputField('ipaddr', draft.ipaddr, { placeholder: '192.168.30.1' }))}${formField('子网前缀', inputField('cidr', draft.cidr, { type: 'number', min: 1, max: 30 }), 'CIDR 前缀')}${formField('扩展 IP', inputField('extra_ips_text', asArray(draft.extra_ips).join(', '), { placeholder: '192.168.50.1/24, 192.168.60.1/24' }), '多个地址使用逗号分隔')}</div>`;
     const dhcpBody = `${switchField('dhcp.enabled', dhcp.enabled, 'DHCP 服务器', '向该网络内终端自动分配地址')}${dhcp.enabled ? dependentMarkup(`${formField('地址池起始', inputField('dhcp.pool_start', dhcp.pool_start))}${formField('地址池结束', inputField('dhcp.pool_end', dhcp.pool_end))}${formField('租期（分钟）', inputField('dhcp.lease', dhcp.lease, { type: 'number', min: 1 }))}${formField('DHCP 网关', inputField('dhcp.gateway', dhcp.gateway))}${formField('DNS 服务器', inputField('dhcp.dns_text', dhcp.dns.join(', ')), '多个地址使用逗号分隔')}`) : ''}`;
-    const ipv6Body = `${switchField('ipv6.enabled', ipv6.enabled, '启用 IPv6', '配置地址委派、RA 与 DHCPv6')}${ipv6.enabled ? dependentMarkup(`${formField('地址模式', selectField('ipv6.mode', ipv6.mode, [['dhcp', '自动 / 委派'], ['static', '静态']]))}${formField('上游 WAN', inputField('ipv6.parent_text', ipv6.parent_wans.join(', '), { placeholder: 'wan, wan2' }), '多个接口使用逗号分隔')}${formField('静态地址', inputField('ipv6.addr', ipv6.addr, { placeholder: '2001:db8::1/64' }))}${formField('前缀长度', inputField('ipv6.prefix_len', ipv6.prefix_len, { placeholder: 'auto' }))}${formField('IPv6 租期（分钟）', inputField('ipv6.leasetime', ipv6.leasetime, { type: 'number', min: 1 }))}${formField('RA 标志', selectField('ipv6.ra_flags', ipv6.ra_flags, [['1', 'Managed + Other'], ['2', 'Managed'], ['3', 'Other'], ['0', '无状态']]))}${switchField('ipv6.dhcpv6', ipv6.dhcpv6, 'DHCPv6 服务')}${switchField('ipv6.ra_static', ipv6.ra_static, '静态 RA', '使用固定前缀通告')}${switchField('ipv6.use_dns6', ipv6.use_dns6, '下发 IPv6 DNS')}${ipv6.use_dns6 ? formField('IPv6 DNS', inputField('ipv6.dns_text', ipv6.dns6.join(', ')), '多个地址使用逗号分隔') : ''}${switchField('ipv6.ra_mtu_set', ipv6.ra_mtu_set, '自定义 RA MTU')}${ipv6.ra_mtu_set ? formField('RA MTU', inputField('ipv6.ra_mtu', ipv6.ra_mtu, { type: 'number', min: 1280, max: 9000 })) : ''}`) : ''}`;
+    const ipv6Body = `${switchField('ipv6.enabled', ipv6.enabled, '启用 IPv6', '配置地址委派、RA 与 DHCPv6')}${ipv6.enabled ? dependentMarkup(`${formField('地址模式', selectField('ipv6.mode', ipv6.mode, [['dhcp', '自动 / 委派'], ['static', '静态']]))}${formField('上游 WAN', multiSelectField('ipv6.parent_wans', ipv6.parent_wans, upstreamWanOptions(ipv6.parent_wans)), '按住 Cmd / Ctrl 可多选')}${formField('静态地址', inputField('ipv6.addr', ipv6.addr, { placeholder: '2001:db8::1/64' }))}${formField('前缀长度', inputField('ipv6.prefix_len', ipv6.prefix_len, { placeholder: 'auto' }))}${formField('IPv6 租期（分钟）', inputField('ipv6.leasetime', ipv6.leasetime, { type: 'number', min: 1 }))}${formField('RA 标志', selectField('ipv6.ra_flags', ipv6.ra_flags, [['1', 'Managed + Other'], ['2', 'Managed'], ['3', 'Other'], ['0', '无状态']]))}${switchField('ipv6.dhcpv6', ipv6.dhcpv6, 'DHCPv6 服务')}${switchField('ipv6.ra_static', ipv6.ra_static, '静态 RA', '使用固定前缀通告')}${switchField('ipv6.use_dns6', ipv6.use_dns6, '下发 IPv6 DNS')}${ipv6.use_dns6 ? formField('IPv6 DNS', inputField('ipv6.dns_text', ipv6.dns6.join(', ')), '多个地址使用逗号分隔') : ''}${switchField('ipv6.ra_mtu_set', ipv6.ra_mtu_set, '自定义 RA MTU')}${ipv6.ra_mtu_set ? formField('RA MTU', inputField('ipv6.ra_mtu', ipv6.ra_mtu, { type: 'number', min: 1280, max: 9000 })) : ''}`) : ''}`;
     const link = `<div class="network-interface-form-grid">${switchField('lan_visit', draft.lan_visit, '允许 LAN 互访', '关闭后阻止其他本地网络主动访问此网络')}${formField('MAC 克隆', inputField('mac_clone', draft.mac_clone, { placeholder: '留空使用设备地址' }))}${formField('端口速率', selectField('speed', draft.speed, [['0', '自动协商'], ['100', '100 Mbps'], ['1000', '1 Gbps'], ['2500', '2.5 Gbps'], ['10000', '10 Gbps']]))}${formField('双工模式', selectField('duplex', draft.duplex, [['0', '自动'], ['full', '全双工'], ['half', '半双工']]))}</div>`;
     return `<div class="network-interface-editor-panel">${editorGroup('identity', '身份与端口', '名称、网络模式和成员端口', 'network', identity)}${editorGroup('addressing', 'IPv4 地址', '网关、子网与扩展地址', 'globe', addressing)}${editorGroup('dhcp', 'DHCP', dhcp.enabled ? '已启用地址分配' : '当前关闭', 'dhcp', dhcpBody)}${editorGroup('ipv6', 'IPv6', ipv6.enabled ? 'RA 与 DHCPv6 已启用' : '当前关闭', 'internet', ipv6Body)}${editorGroup('link', '访问与链路', '互访策略、MAC 与物理参数', 'shield', link)}</div>`;
   }
@@ -703,7 +805,7 @@ export function mount(context = {}) {
     const multiWrite = state.capabilities.pppoe_multi_write === true;
     const bondWrite = state.capabilities.wan_bonding_write === true;
     const identity = `${switchField('enabled', draft.enabled, '启用线路', '停用后保留线路配置')}
-      <div class="network-interface-form-grid">${formField('线路名称', inputField('name', draft.name, { placeholder: '例如 中国联通' }))}${formField('WAN ID', inputField('id', draft.id, { disabled: state.drawer === 'edit' }), '保存后的稳定标识')}${formField('备注', inputField('note', draft.note, { placeholder: '可选' }))}${formField('运营商标识', inputField('carrier', draft.carrier, { placeholder: 'unicom / mobile / telecom' }))}${formField('逻辑接口', inputField('ifname', draft.ifname, { placeholder: draft.id }))}</div>${inlinePortPicker(draft)}`;
+      <div class="network-interface-form-grid">${formField('线路名称', inputField('name', draft.name, { placeholder: '例如 中国联通' }))}${formField('WAN ID', inputField('id', draft.id, { disabled: state.drawer === 'edit' }), '保存后的稳定标识')}${formField('备注', inputField('note', draft.note, { placeholder: '可选' }))}${formField('运营商标识', inputField('carrier', draft.carrier, { placeholder: 'unicom / mobile / telecom' }))}${formField('逻辑接口', selectField('ifname', firstText(draft.ifname, draft.id), ifnameOptions(draft)), 'UCI network 段名')}</div>${inlinePortPicker(draft)}`;
     const accessOptions = [['dhcp', 'DHCP', '自动获取地址'], ['static', '静态 IP', '固定地址与网关'], ['pppoe', 'PPPoE', '宽带账号拨号'], ['bridge', 'Bridge', '仅桥接上游'], ['hybrid_macvlan', '物理混合', '虚拟 MAC 子线路', !hybridWrite], ['hybrid_vlan', 'VLAN 混合', 'VLAN 子线路', !hybridWrite]];
     let accessFields = '';
     if (mode === 'static') accessFields = `<div class="network-interface-span-full">${wanAddressFields(draft)}</div>${formField('网关', inputField('gateway', draft.gateway, { placeholder: '203.0.113.1' }))}${formField('DNS 服务器', inputField('dns_text', draft.dns.join(', ')), '多个地址使用逗号分隔')}`;
@@ -762,8 +864,8 @@ export function mount(context = {}) {
     const editing = ['edit', 'create'].includes(state.drawer);
     const title = state.drawer === 'create' ? `新建 ${kind.toUpperCase()}` : state.drawer === 'ports' ? '物理接口' : `编辑 ${row.name || kind.toUpperCase()}`;
     const body = editing ? (isWan ? wanEditorMarkup(state.draft) : lanEditorMarkup(state.draft)) : portsDrawerMarkup(row);
-    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-interface-close aria-label="关闭配置面板"></button>
-      <aside class="network-interface-drawer dwrt-kit-sheet is-open" aria-label="${escapeHtml(title)}">
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-interface-close data-interface-owner="${escapeHtml(instanceId)}" aria-label="关闭配置面板"></button>
+      <aside class="network-interface-drawer dwrt-kit-sheet is-open" data-interface-owner="${escapeHtml(instanceId)}" aria-label="${escapeHtml(title)}">
         <header class="dwrt-kit-sheet-header"><div><span>${isWan ? '外网线路配置' : '本地网络配置'}</span><strong>${escapeHtml(title)}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-interface-close aria-label="关闭">${icon('close')}</button></header>
         <div class="dwrt-kit-sheet-body network-interface-drawer-body" data-interface-drawer-scroll>${body}${state.notice ? `<div class="network-interface-notice is-${escapeHtml(state.noticeTone || 'info')}">${escapeHtml(state.notice)}</div>` : ''}</div>
         <footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-interface-close>取消</button>
@@ -778,7 +880,7 @@ export function mount(context = {}) {
     const tableScroll = root.querySelector('[data-interface-scroll]');
     const tableTop = tableScroll?.scrollTop || 0;
     const tableLeft = tableScroll?.scrollLeft || 0;
-    const drawerScroll = root.querySelector('[data-interface-drawer-scroll]')?.scrollTop || 0;
+    const drawerScroll = drawerQuery('[data-interface-drawer-scroll]')?.scrollTop || 0;
     root.hidden = false;
     root.className = root.className.split(/\s+/).filter((name) => name && !['policy-table-route-host', 'routing-table-route-host', 'global-config-route-host', 'network-interface-route-host', 'is-lan', 'is-wan'].includes(name)).join(' ');
     root.classList.add('route-workspace', 'network-interface-route-host', `is-${kind}`);
@@ -789,7 +891,7 @@ export function mount(context = {}) {
     root.innerHTML = `<section class="network-interface-shell ${embedded ? 'is-embedded' : ''} ${showOverview && !showTable ? 'is-overview-only' : ''} ${showTable && !showOverview ? 'is-table-only' : ''}">${toolbarMarkup()}${pageNotice}${showOverview ? overviewMarkup() : ''}${showTable ? tableMarkup() : ''}${drawerMarkup()}</section>`;
     const nextTable = root.querySelector('[data-interface-scroll]');
     if (nextTable) { nextTable.scrollTop = tableTop; nextTable.scrollLeft = tableLeft; }
-    const nextDrawer = root.querySelector('[data-interface-drawer-scroll]');
+    const nextDrawer = drawerQuery('[data-interface-drawer-scroll]');
     if (nextDrawer) nextDrawer.scrollTop = drawerScroll;
     ui.mountAll?.(root);
     ui.scheduleGlassCardsRender?.(180);
@@ -812,7 +914,7 @@ export function mount(context = {}) {
   }
 
   function patchDrawerContents(returnField = '') {
-    const drawer = root?.querySelector('.network-interface-drawer');
+    const drawer = drawerNode();
     if (!drawer) { render(); return; }
     const scrollTop = drawer.querySelector('[data-interface-drawer-scroll]')?.scrollTop || 0;
     const template = document.createElement('template');
@@ -860,6 +962,8 @@ export function mount(context = {}) {
     state.noticeTone = '';
     state.saving = false;
     state.returnFocus = null;
+    /* 抽屉期间被推迟的后台数据已经落在 state 里，这次整页重绘一并补上。 */
+    state.tableStale = false;
     render();
     requestAnimationFrame(() => {
       if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
@@ -879,6 +983,14 @@ export function mount(context = {}) {
 
   function patchDraft(field, input) {
     let value = input.type === 'checkbox' ? input.checked : input.type === 'number' ? (input.value === '' ? '' : Number(input.value)) : input.value;
+    /*
+     * 多选 select 的 `.value` 只给出第一个选中项，会把多上游静默截断成一个。
+     * 这里改读 selectedOptions，并直接落进数组字段。
+     */
+    if (input.multiple || input.hasAttribute?.('data-interface-multi')) {
+      setDeep(state.draft, field, [...input.selectedOptions].map((option) => option.value).filter(Boolean));
+      return;
+    }
     if (field === 'extra_ips_text') {
       state.draft.extra_ips = String(value).split(',').map((entry) => entry.trim()).filter(Boolean);
       return;
@@ -1117,11 +1229,12 @@ export function mount(context = {}) {
     if (editorToggle) {
       const next = editorToggle.dataset.interfaceEditorToggle;
       state.editorOpen = state.editorOpen === next ? '' : next;
-      root.querySelectorAll('[data-interface-editor-group]').forEach((group) => {
+      /* 手风琴住在抽屉里，抽屉可能已被搬进 portal，所以从抽屉节点往下找而不是从 root。 */
+      const scope = editorToggle.closest('.network-interface-drawer') || drawerNode() || root;
+      scope.querySelectorAll('[data-interface-editor-group]').forEach((group) => {
         const trigger = group.querySelector('[data-interface-editor-toggle]');
         const groupId = trigger?.dataset.interfaceEditorToggle || '';
-        const panelId = trigger?.getAttribute('aria-controls') || '';
-        const panel = panelId ? root.querySelector(`#${CSS.escape(panelId)}`) : null;
+        const panel = group.querySelector('.network-interface-editor-group-body');
         const open = state.editorOpen === groupId;
         trigger?.setAttribute('aria-expanded', String(open));
         group.classList.toggle('is-open', open);
@@ -1194,9 +1307,37 @@ export function mount(context = {}) {
     if (conditional) patchDrawerContents(field.dataset.interfaceField);
   }
 
-  root.addEventListener('click', onClick);
-  root.addEventListener('input', onInput);
-  root.addEventListener('change', onChange);
+  /*
+   * 监听必须挂在 document 上，不能挂 root。
+   *
+   * kit 的 mountAll() 会把 `.dwrt-kit-sheet` 连同遮罩搬到 body 直属的
+   * #dwrtKitSheetPortal（见 dwrt-ui-kit.js 的“抽屉传送门”注释：祖先链上的
+   * transform/filter/contain 会让 position:fixed 重新锚定，所以抽屉必须离开路由宿主）。
+   * 抽屉一旦搬走就不再是 root 的后代，绑在 root 上的委派监听收不到抽屉里的任何事件 ——
+   * 手风琴点了没反应、字段改了不生效都是这一个原因。aegisx 之类的页面没犯这病，
+   * 是因为它们逐元素直绑而不是委派。
+   *
+   * 全局配置页同时挂 LAN 与 WAN 两个实例，所以在 document 层要按归属过滤：
+   * 事件目标要么在本实例的 root 里，要么在本实例打了 data-interface-owner 的抽屉里。
+   * 删除确认由 kit 渲染、拿不到 owner 标记，用 state.drawer 兜住 —— 同一时刻只有
+   * 打开了删除确认的那个实例会认领它。
+   */
+  function ownsEvent(event) {
+    const target = event.target;
+    if (!(target instanceof Element)) return false;
+    if (root.contains(target)) return true;
+    const owner = target.closest('[data-interface-owner]');
+    if (owner) return owner.dataset.interfaceOwner === instanceId;
+    if (target.closest('[data-dwrt-confirmation]')) return state.drawer === 'delete';
+    return false;
+  }
+
+  const onDocumentClick = (event) => { if (ownsEvent(event)) onClick(event); };
+  const onDocumentInput = (event) => { if (ownsEvent(event)) onInput(event); };
+  const onDocumentChange = (event) => { if (ownsEvent(event)) onChange(event); };
+  document.addEventListener('click', onDocumentClick);
+  document.addEventListener('input', onDocumentInput);
+  document.addEventListener('change', onDocumentChange);
   render();
   if (context.initialDataReady && context.initialData) applyData(context.initialData.config, context.initialData.ports);
   else if (context.deferLoad === true) render();
@@ -1216,16 +1357,19 @@ export function mount(context = {}) {
     openCreate() {
       openDrawer('create');
     },
-    setData(config, ports) {
+    setData(config, ports, wanNames) {
+      /* WAN 名单随每次喂数据更新：挂载那一刻宿主可能还没读到 WAN，
+         只在 mount 时取一次会让 IPv6 上游下拉长期为空。 */
+      if (Array.isArray(wanNames)) state.wanNames = wanNames.filter(Boolean);
       applyData(config, ports);
     },
     unmount() {
       state.mounted = false;
       state.seq += 1;
       stopPolling();
-      root.removeEventListener('click', onClick);
-      root.removeEventListener('input', onInput);
-      root.removeEventListener('change', onChange);
+      document.removeEventListener('click', onDocumentClick);
+      document.removeEventListener('input', onDocumentInput);
+      document.removeEventListener('change', onDocumentChange);
       root.replaceChildren();
       root.classList.remove('network-interface-route-host', 'is-lan', 'is-wan', 'route-workspace', 'is-embedded');
     }

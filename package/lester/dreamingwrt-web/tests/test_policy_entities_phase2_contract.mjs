@@ -81,15 +81,24 @@ for (const key of ['policy.objects']) assert.match(objectsSource, new RegExp(`re
 for (const endpoint of ['/api/v1/routing/objects', '/api/v1/flowd/objects', '/api/v1/flowd/custom-protocols']) {
   assert.ok(objectsSource.includes(endpoint), endpoint);
 }
-for (const forbidden of ['clients.inventory', 'network.lans', 'network.wans', '/api/v1/clients', '/catalog']) {
+for (const forbidden of ['clients.inventory', 'network.lans', 'network.wans', '/api/v1/clients']) {
   assert.doesNotMatch(objectsSource, new RegExp(forbidden.replaceAll('.', '\\.')));
 }
+/* catalog 这条原先禁的是整个 substring，于是连「文案里提一句 catalog 在哪」都不允许。
+   真实意图是本页不得从 catalog 取数（它只读 policy.objects + flowd/routed 三个来源），
+   所以改成禁「把 catalog 当数据源」，而不是禁提这个词。
+   动机：旧文案「不包含系统 catalog」与实测不符 —— catalog 有 12 类数据、
+   applications 有 100 条，只有 objects 为空，照旧说法会让用户以为整个目录都没有。 */
+assert.doesNotMatch(objectsSource, /(?:fetch|request)\(\s*['"`][^'"`]*catalog/);
+assert.doesNotMatch(objectsSource, /ENDPOINTS?[^\n]*catalog/);
 assert.match(objectsSource, /objects_atomic_apply/);
 assert.match(objectsSource, /页面不会展示无法提交的名称、成员或模块开关/);
 assert.doesNotMatch(objectsSource, /data-object-create|data-object-save|disabled[^\n]*添加对象/);
 assert.doesNotMatch(objectsSource, /method:\s*['"](?:POST|PUT|PATCH|DELETE)['"]/);
 assert.match(objectsSource, /data-object-tab="\$\{id\}"/);
-assert.match(objectsSource, /不包含系统 catalog、内置应用签名或协议目录/);
+assert.match(objectsSource, /不含系统内置应用签名与协议目录/);
+// 不许再回到「不包含系统 catalog」那种否认整个目录存在的说法。
+assert.doesNotMatch(objectsSource, /不包含系统 catalog/);
 assert.match(objectsSource, /引用关系仅覆盖 flowd 内部规则/);
 assert.match(objectsSource, /runtime_kind 表示计划产物类型，不代表已经应用到数据面/);
 assert.match(objectsSource, /referenced_by/);
@@ -116,13 +125,16 @@ assert.doesNotMatch(objectsSource + regionsSource, /\.innerHTML\s*=/);
 const policy = menu.items.find((item) => item.id === 'policy-engine');
 const objectMenu = policy.children.find((item) => item.id === 'policy-object');
 const regionMenu = policy.children.find((item) => item.id === 'policy-region');
-const SHARED_STYLE_VERSION = '20260802-ui-batch-01';
+/* 共享样式表改了就要一起抬版本号，否则区域页会继续吃缓存里的旧 CSS。
+   本次动的是 .policy-entity-alert 里的 code / 链接两条规则。 */
+const SHARED_STYLE_VERSION = '20260805-readonly-copy-accuracy-01';
 for (const item of [objectMenu, regionMenu]) {
   assert.equal(item.style, '/static/css/policy-entities.css');
   // the two pages share one stylesheet, so the style version must stay in lockstep
   assert.equal(item.style_version, SHARED_STYLE_VERSION);
 }
-assert.equal(objectMenu.module_version, '20260802-ui-batch-01');
+// 只有对象页的 JS 变了，区域页模块未动，module_version 各自独立。
+assert.equal(objectMenu.module_version, '20260805-readonly-copy-accuracy-01');
 assert.equal(regionMenu.module_version, '20260802-ui-batch-01');
 assert.equal(objectMenu.module, 'native/policy-objects.js');
 assert.equal(regionMenu.module, 'native/policy-regions.js');

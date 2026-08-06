@@ -38,7 +38,14 @@
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: 48px minmax(0, 1fr);
+  /*
+   * 单行。模块模板里 shell 只有一个子节点（`.storage-overview-scroll`），
+   * 早先那 48px 是留给页内表头的，表头移除后行定义没跟着改，于是唯一的内容区
+   * 落进 48px 那一行、又配合 `overflow: hidden`，卡片主体被整块裁掉 ——
+   * 页面看起来「只剩框架」。实测 scrollHeight 403 / clientHeight 48。
+   * 行数必须与模板的子节点数一致，多留一行就会吃掉内容高度。
+   */
+  grid-template-rows: minmax(0, 1fr);
   gap: var(--app-page-gap, 14px);
   overflow: hidden;
   color: var(--app-text);
@@ -85,7 +92,8 @@
 
 @media (max-width: 760px) {
   .console-stage.is-storage-overview { height: 100%; padding: 10px; }
-  .storage-overview-shell { grid-template-rows: 44px minmax(0, 1fr); gap: 9px; }
+  /* 与桌面态同因：shell 只有一个子节点，留表头行会把内容区压成 44px 再被裁掉。 */
+  .storage-overview-shell { grid-template-rows: minmax(0, 1fr); gap: 9px; }
   .storage-overview-summary { grid-template-columns: 1fr; }
   .storage-overview-summary .dwrt-kit-overview-card { min-height: 104px; }
 }

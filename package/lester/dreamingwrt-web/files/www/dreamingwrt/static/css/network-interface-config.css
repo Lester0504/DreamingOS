@@ -314,7 +314,12 @@
 .network-interface-notice.is-bad { color: #ff8d99; background: rgba(222,61,78,0.10); box-shadow: inset 0 0 0 1px rgba(246,91,108,0.18); }
 
 .network-interface-drawer {
-  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-wide);
+  /*
+   * 编辑 LAN / WAN 原先用 -wide（820px），但内容是单列手风琴表单，不是宽表：
+   * 820px 下每个字段行都拉得很长，读起来费劲。收敛到标准档，与 AI 抽屉的 460px
+   * 对齐（kit 注释里也以 AI 抽屉为标准档基准）。
+   */
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   --dwrt-kit-sheet-z: 72;
 }
 
@@ -371,7 +376,8 @@ body:has(.network-interface-drawer.is-open) .ai-orb-restore {
 .network-interface-editor-group > h3 i { width: 24px; height: 24px; display: grid; place-items: center; color: var(--app-text-muted); transition: transform 180ms ease; }
 .network-interface-editor-group > h3 i svg { width: 16px; height: 16px; }
 .network-interface-editor-group.is-open > h3 i { transform: rotate(180deg); }
-.network-interface-editor-group-body { min-width: 0; padding: 0 18px 20px 64px; }
+/* 64px 的左缩进是给 820px 宽抽屉留的图标对齐位；标准档下会吃掉七分之一可用宽度。 */
+.network-interface-editor-group-body { min-width: 0; padding: 0 16px 20px 16px; }
 .network-interface-editor-group-body[hidden] { display: none; }
 .network-interface-editor-group-body > .network-interface-form-grid + *,
 .network-interface-editor-group-body > .network-interface-switch-row + *,
@@ -428,7 +434,12 @@ body:has(.network-interface-drawer.is-open) .ai-orb-restore {
 .network-interface-form-grid {
   min-width: 0;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /*
+   * 标准档抽屉（460px）减去左右内边距后可用宽约 400px，两列会让每列只剩 190px 上下，
+   * IP、MAC、DNS 这类字段放不下。这里按可用宽度自适应而不是按视口断点：媒体查询量的
+   * 是视口，抽屉却是固定 460px，桌面端永远不会命中 620px 那条规则，两列就一直挤着。
+   */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
   gap: 13px 14px;
 }
 
@@ -460,6 +471,21 @@ body:has(.network-interface-drawer.is-open) .ai-orb-restore {
 }
 .network-interface-field input:disabled,
 .network-interface-field select:disabled { opacity: 0.58; cursor: not-allowed; }
+
+/* 多选 select（IPv6 上游 WAN）要露出多行选项，固定 38px 会把它压成单行、
+   看不出这是可多选的列表。行高按选项数自适应，超出后自己滚。 */
+.network-interface-field select[multiple] {
+  height: auto;
+  max-height: 116px;
+  overflow-y: auto;
+  padding: 5px;
+}
+
+.network-interface-field select[multiple] option {
+  border-radius: var(--app-radius-compact, 8px);
+  padding: 5px 7px;
+}
+
 .network-interface-field input::placeholder { color: var(--app-text-muted); }
 
 .network-interface-switch-row {

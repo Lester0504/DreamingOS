@@ -1,4 +1,4 @@
-const VERSION = '20260804-wifi-telemetry-reason-01';
+const VERSION = '20260805-wifi-ap-management-tab-01';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -48,6 +48,20 @@ export function mount(context = {}) {
     apSheetAp: '',
     apSheetTab: 'overview',
     statusView: 'radios',
+    /*
+     * AP 管理 Tab 的数据独立于 wifi/config：它走 /api/v1/ac/*（AC 控制面），
+     * 与本页原有的 /api/v1/wifi/config 不是同一份契约，所以单独存一份状态，
+     * 也单独走一次加载，避免切 Tab 时把 config 的 loading 语义搅在一起。
+     */
+    ac: {
+      loading: false, loaded: false, error: '',
+      aps: [], tokens: [], capabilities: {}, reasons: {}, observedAt: 0, seq: 0
+    },
+    apEditor: null,
+    tokenDraft: null,
+    tokenSecret: null,
+    confirmToken: null,
+    acBusy: false,
     filters: {
       ai: false, broadcast: 'all', aps: new Set(), bands: new Set(), mimo: new Set(), types: new Set(), status: new Set(),
       connectivityRange: 48, environmentAp: 'all', environmentBand: '', environmentRange: '1d', environmentWidths: new Set(), signalMin: -90, signalMax: -30
@@ -280,6 +294,108 @@ export function mount(context = {}) {
       ap_group: firstText(ap.ap_group, ap.group, ap.site_name, runtime.ap_group),
       ip_mode: firstText(ap.ip_mode, ap.addressing_mode, ap.network?.mode, runtime.ip_mode),
       led_enabled: ap.led_enabled ?? ap.led?.enabled ?? runtime.led_enabled
+    };
+  }
+
+  /*
+   * ── AP 管理（AC 控制面）──
+   *
+   * 与上面的 normalizeAp 分开：那个服务于 /api/v1/wifi/status 的射频视图，
+   * 这里的字段来自 /api/v1/ac/aps，两份契约的键名与语义都不同。
+   */
+
+  function nowSeconds() { return Math.floor(Date.now() / 1000); }
+
+  function relativeSeconds(value) {
+    const stamp = Number(value);
+    if (!Number.isFinite(stamp) || stamp <= 0) return '';
+    const delta = nowSeconds() - stamp;
+    if (delta < 0) return '刚刚';
+    if (delta < 60) return `${delta} 秒前`;
+    if (delta < 3600) return `${Math.floor(delta / 60)} 分钟前`;
+    if (delta < 86400) return `${Math.floor(delta / 3600)} 小时前`;
+    return `${Math.floor(delta / 86400)} 天前`;
+  }
+
+  function countdownSeconds(value) {
+    const stamp = Number(value);
+    if (!Number.isFinite(stamp) || stamp <= 0) return '';
+    const delta = stamp - nowSeconds();
+    if (delta <= 0) return '已过期';
+    if (delta < 60) return `剩 ${delta} 秒`;
+    if (delta < 3600) return `剩 ${Math.floor(delta / 60)} 分钟`;
+    if (delta < 86400) return `剩 ${Math.floor(delta / 3600)} 小时`;
+    return `剩 ${Math.floor(delta / 86400)} 天`;
+  }
+
+  function absoluteTime(value) {
+    const stamp = Number(value);
+    if (!Number.isFinite(stamp) || stamp <= 0) return '';
+    return new Date(stamp * 1000).toLocaleString();
+  }
+
+  /*
+   * 显示名兜底链由后端定稿（Handoff Acceptance-to-Backend-ap-management-tab-rest-layer-missing）：
+   * name -> model -> board_name -> ap_id 前 8 位。
+   * 不能只回退到 model：AC 侧的 model 本身是 model_override || reported_model，
+   * 两者都空时 model 也是空串（model_available=false 的 AP 即如此），
+   * 所以 board_name 必须留在链上，再兜一层 ap_id 防全空。
+   */
+  function acApLabel(ap = {}) {
+    const named = firstText(ap.name, ap.model, ap.board_name);
+    if (named) return named;
+    const id = String(ap.ap_id || '');
+    return id ? `AP ${id.slice(0, 8)}` : 'AP';
+  }
+
+  function normalizeAcAp(ap = {}, index = 0) {
+    const runtime = ap.runtime && typeof ap.runtime === 'object' ? ap.runtime : {};
+    return {
+      ap_id: firstText(ap.ap_id, `ac-ap-${index}`),
+      site_id: firstText(ap.site_id),
+      name: typeof ap.name === 'string' ? ap.name : '',
+      label: acApLabel(ap),
+      named: Boolean(firstText(ap.name)),
+      adoption_state: firstText(ap.adoption_state, 'unknown'),
+      online: bool(ap.online, false),
+      stale: bool(ap.stale, false),
+      session_connected: bool(ap.session_connected, false),
+      last_seen_at: firstNumber(ap.last_seen_at) || 0,
+      model: firstText(ap.model),
+      reported_model: firstText(ap.reported_model),
+      model_override: typeof ap.model_override === 'string' ? ap.model_override : '',
+      override_supported: bool(ap.override_supported, false),
+      model_available: bool(ap.model_available, false),
+      model_reason: firstText(ap.model_reason),
+      model_source: firstText(ap.model_source),
+      board_name: firstText(ap.board_name),
+      control_protocol: firstText(ap.control_protocol),
+      control_protocol_version: firstNumber(ap.control_protocol_version) || 0,
+      scan_execution: bool(ap.scan_execution, false),
+      capabilities: ap.capabilities && typeof ap.capabilities === 'object' ? ap.capabilities : {},
+      runtime_available: bool(runtime.available, false),
+      runtime_complete: bool(runtime.complete, false),
+      runtime_stale: bool(runtime.stale, false),
+      runtime_reason: firstText(runtime.reason)
+    };
+  }
+
+  function normalizeAcToken(token = {}, index = 0) {
+    const expires = firstNumber(token.expires_at) || 0;
+    const state = firstText(token.state, 'unknown');
+    return {
+      token_id: firstText(token.token_id, `token-${index}`),
+      state,
+      // 后端只记 expires_at，不把过期单独写进 state，所以过期判定放在前端。
+      expired: state === 'active' && expires > 0 && expires <= nowSeconds(),
+      site_id: firstText(token.site_id),
+      hardware_bound: bool(token.hardware_bound, false),
+      attempts: firstNumber(token.attempts) || 0,
+      max_attempts: firstNumber(token.max_attempts) || 0,
+      created_at: firstNumber(token.created_at) || 0,
+      expires_at: expires,
+      consumed_at: firstNumber(token.consumed_at) || 0,
+      revoked_at: firstNumber(token.revoked_at) || 0
     };
   }
 
@@ -551,6 +667,87 @@ export function mount(context = {}) {
     }
   }
 
+  /*
+   * AP 管理 Tab 的数据加载。三个只读端点并发取：
+   *   GET /api/v1/ac/aps            清单
+   *   GET /api/v1/ac/capabilities   能力位（含 reasons）
+   *   GET /api/v1/ac/pairing-tokens 配对令牌
+   * 路径前缀由后端定稿为 /api/v1/ac/（不是 /api/v1/wifi/），不新增别名。
+   *
+   * 能力位只在运行时读，不缓存成常量：写死过一次探测结果就会在后端放开
+   * 事务层之后继续显示"不可用"，这类漂移今天已经出现过四笔。
+   */
+  async function loadAc(background = false) {
+    const seq = ++state.ac.seq;
+    state.ac.loading = !background || !state.ac.loaded;
+    if (!background) state.ac.error = '';
+    if (!background) render();
+    try {
+      const [aps, caps, tokens] = await Promise.all([
+        requestJson('/api/v1/ac/aps'),
+        requestJson('/api/v1/ac/capabilities'),
+        requestJson('/api/v1/ac/pairing-tokens')
+      ]);
+      if (!state.mounted || seq !== state.ac.seq) return;
+      const capabilities = caps.capabilities && typeof caps.capabilities === 'object' ? caps.capabilities : {};
+      state.ac.aps = asArray(aps.items || aps.aps).map(normalizeAcAp);
+      state.ac.tokens = asArray(tokens.items || tokens.tokens).map(normalizeAcToken);
+      state.ac.capabilities = capabilities;
+      state.ac.reasons = capabilities.reasons && typeof capabilities.reasons === 'object' ? capabilities.reasons : {};
+      state.ac.observedAt = firstNumber(aps.observed_at) || 0;
+      state.ac.loaded = true;
+      state.ac.error = '';
+    } catch (error) {
+      if (!state.mounted || seq !== state.ac.seq) return;
+      state.ac.error = `读取 AP 管理数据失败：${firstText(error.message, '未知错误')}`;
+    } finally {
+      if (!state.mounted || seq !== state.ac.seq) return;
+      state.ac.loading = false;
+      if (background && state.configView === 'aps' && !state.sheet) patchAcSections(); else render();
+    }
+  }
+
+  function acCap(name) { return bool(state.ac.capabilities[name], false); }
+
+  /*
+   * Kit 会把带 data-dwrt-component="sheet" 的抽屉搬到 document.body 下的传送门里
+   * （dwrt-ui-kit.js:258 sheetPortal），所以抽屉内的节点用 root.querySelector 找不到。
+   * Kit 只把事件回放到路由根，DOM 位置并不跟着回来，因此凡是要在抽屉里就地改按钮
+   * 状态的地方都必须从 document 查。
+   */
+  function sheetQuery(selector) {
+    return root?.querySelector(selector) || document.querySelector(`.dwrt-kit-sheet-portal ${selector}`) || document.querySelector(selector);
+  }
+
+  /*
+   * 后台刷新只换清单与配对码两块，不整页重建：整页 innerHTML 重写会把用户
+   * 正在输入的搜索词连同焦点与光标位置一起抹掉（每 20 秒一次）。
+   */
+  function patchAcSections() {
+    if (!root || !state.mounted) return;
+    const active = document.activeElement;
+    const searchFocused = Boolean(active && active.matches?.('[data-wifi-search]'));
+    const caret = searchFocused ? active.selectionStart : null;
+    const inventory = root.querySelector('.wifi-ap-inventory');
+    const pairing = root.querySelector('.wifi-pairing-card');
+    if (!inventory || !pairing) { render(); return; }
+    inventory.outerHTML = apInventoryTable();
+    pairing.outerHTML = pairingTokenCard();
+    if (typeof ui.mountAll === 'function') ui.mountAll(root); else window.DWRT_UI_KIT?.mountAll?.(root);
+    if (!searchFocused) return;
+    const field = root.querySelector('[data-wifi-search]');
+    if (!field) return;
+    field.focus({ preventScroll: true });
+    const end = caret === null ? field.value.length : caret;
+    try { field.setSelectionRange(end, end); } catch (_) {}
+  }
+
+  function acReason(name) { return firstText(state.ac.reasons[name]); }
+
+  function canEditAcAp() { return acCap('ap_inventory_edit'); }
+
+  function canManageTokens() { return acCap('pairing_token_ipc') || acCap('pairing_token_security_base'); }
+
   function icon(name) {
     const icons = {
       plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
@@ -616,14 +813,23 @@ export function mount(context = {}) {
     return `<div class="wifi-page-toolbar"><button class="policy-create-button" type="button" data-wifi-create>${icon('plus')}<span>新建 Wi-Fi</span></button></div>`;
   }
 
+  function apToolbar() {
+    const allowed = canManageTokens();
+    const reason = allowed ? '' : firstText(acReason('pairing_token_ipc'), '后端未开放配对令牌能力');
+    return `<div class="wifi-page-toolbar"><button class="policy-create-button" type="button" data-wifi-token-create ${allowed && !state.acBusy ? '' : 'disabled'} ${reason ? `title="${escapeHtml(reason)}"` : ''}>${icon('plus')}<span>生成配对码</span></button></div>`;
+  }
+
   function configNavigation() {
     const tabs = [
       ['broadcasts', 'Wi-Fi 广播'],
       ['radios', 'Radio 与信道'],
-      ['extensions', '扩展能力']
+      ['extensions', '扩展能力'],
+      ['aps', 'AP 管理']
     ];
     const hasConfigurableWifi = state.loaded && (state.config.capabilities.wifi || state.config.radios.length || state.config.ssids.length);
-    const action = state.configView === 'broadcasts' && hasConfigurableWifi ? configToolbar() : '';
+    const action = state.configView === 'aps'
+      ? apToolbar()
+      : state.configView === 'broadcasts' && hasConfigurableWifi ? configToolbar() : '';
     return `<header class="wifi-config-navigation"><nav class="dwrt-kit-tabs dwrt-kit-page-tabs wifi-config-tabs" role="tablist" aria-label="Wi-Fi 配置视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${tabs.map(([id, label]) => `<button class="dwrt-kit-tab ${state.configView === id ? 'is-active' : ''}" type="button" role="tab" data-wifi-config-tab="${id}" aria-selected="${state.configView === id ? 'true' : 'false'}">${label}</button>`).join('')}</nav>${action}</header>`;
   }
 
@@ -697,13 +903,94 @@ export function mount(context = {}) {
     return `<section class="wifi-panel-section"><header class="wifi-section-head"><div><strong>Dreaming OS 扩展设置</strong><small>OpenWrt、hostapd 与 QCA 驱动提供的附加配置维度。</small></div></header><div class="wifi-extension-grid"><label class="wifi-field"><span>地区码</span><select data-wifi-setting="global.country" ${disabled ? 'disabled' : ''}>${regions.map((region) => `<option value="${escapeHtml(region.code)}" ${String(region.code) === String(global.country) ? 'selected' : ''}>${escapeHtml(`${region.code} · ${region.name || region.code}`)}</option>`).join('')}</select><small>最终合法信道以后端 regdb 与驱动裁剪结果为准。</small></label><label class="wifi-field"><span>5 GHz 漫游阈值</span><div class="wifi-field-unit"><input type="number" min="-95" max="-45" data-wifi-setting="global.roam_threshold" value="${firstNumber(global.roam_threshold, -75)}" ${disabled ? 'disabled' : ''}><b>dBm</b></div></label></div><div class="wifi-settings-list two-columns">${switchRow('global.band_steering', '频段引导', '引导兼容终端优先使用高频段。', global.band_steering, disabled)}${switchRow('global.fast_roaming', '快速漫游', '启用 802.11k/v 的全局默认值。', global.fast_roaming, disabled)}${switchRow('global.mlo', 'MLO', 'Wi-Fi 7 多链路操作，需至少两个 Radio。', global.mlo, disabled)}${switchRow('global.airtime_fairness', 'Airtime Fairness', '避免低速终端长期占用空口。', global.airtime_fairness, disabled)}${switchRow('global.multicast_enhance', '组播增强', '将部分无线组播转换为单播，降低空口占用。', global.multicast_enhance, disabled)}${switchRow('global.qca_rrm', 'RRM', '启用 QCA/OpenWrt 无线资源测量。', global.qca_rrm, disabled)}${switchRow('global.qca_qbssload', 'QBSS Load', '广播 BSS 负载辅助终端选择 AP。', global.qca_qbssload, disabled)}${switchRow('global.mu_beamformer', 'MU Beamformer', '启用支持硬件的多用户波束成形。', global.mu_beamformer, disabled)}${switchRow('global.doth', '802.11h / DFS', '启用频谱管理与雷达检测相关能力。', global.doth, disabled)}${switchRow('global.sae_pwe', 'SAE PWE', '使用 WPA3 SAE H2E/兼容模式。', global.sae_pwe, disabled)}${switchRow('global.roam_assist', '漫游辅助', '根据阈值辅助低信号终端重新关联。', global.roam_assist, disabled)}</div></section>`;
   }
 
+  /*
+   * ── AP 管理视图 ──
+   *
+   * 第一版只做后端已开放的能力：清单只读 + 显示名/型号覆盖编辑（ap_inventory_edit）
+   * + 配对令牌生成与吊销。SSID 编辑、信道调整、AP 重启/定位依赖尚未落地的
+   * validate/apply/readback/rollback 事务层，按 DESIGN 规则以禁用态呈现并写明原因，
+   * 不做成"点了不生效"的控件。
+   */
+  function acStatusBadge(ap) {
+    const [tone, label] = !ap.online
+      ? ['error', '离线']
+      : ap.stale
+        ? ['warning', '心跳陈旧']
+        : !ap.session_connected ? ['warning', '隧道未连接'] : ['success', '在线'];
+    return `<span class="dwrt-kit-status-badge is-${tone}" data-dwrt-status="${tone}"><i class="dwrt-kit-status-badge-dot" aria-hidden="true"></i><span>${label}</span></span>`;
+  }
+
+  function tokenStateBadge(token) {
+    const [tone, label] = token.revoked_at
+      ? ['muted', '已吊销']
+      : token.state === 'consumed'
+        ? ['success', '已使用']
+        : token.expired || token.state === 'expired'
+          ? ['muted', '已过期']
+          : token.state === 'active' ? ['info', '等待配对'] : ['muted', token.state];
+    return `<span class="dwrt-kit-status-badge is-${tone}" data-dwrt-status="${tone}"><i class="dwrt-kit-status-badge-dot" aria-hidden="true"></i><span>${escapeHtml(label)}</span></span>`;
+  }
+
+  function apInventoryTable() {
+    const query = state.query.trim().toLowerCase();
+    const rows = state.ac.aps.filter((ap) => !query ||
+      [ap.label, ap.name, ap.model, ap.board_name, ap.ap_id, ap.site_id].join(' ').toLowerCase().includes(query));
+    const editable = canEditAcAp();
+    const editReason = editable ? '' : firstText(acReason('ap_inventory_edit'), '后端未开放清单编辑能力');
+    return `<section class="wifi-panel-section wifi-ap-inventory"><header class="wifi-panel-heading"><div><strong>受管 AP</strong><small>${rows.length} 台已绑定${state.ac.observedAt ? ` · 数据于 ${escapeHtml(relativeSeconds(state.ac.observedAt))}采集` : ''}</small></div><label class="wifi-ap-search"><span class="sr-only">搜索 AP</span><input type="search" data-wifi-search placeholder="搜索名称、型号或 AP ID" value="${escapeHtml(state.query)}"></label></header><div class="dwrt-kit-table-scroll wifi-table-scroll"><table class="dwrt-kit-table"><thead><tr><th>名称</th><th>型号</th><th>状态</th><th>最后心跳</th><th>控制协议</th><th>运行数据</th><th><span class="sr-only">操作</span></th></tr></thead><tbody>${rows.map((ap) => `<tr><td><span class="wifi-ap-name-cell"><strong>${escapeHtml(ap.label)}</strong>${ap.named ? '' : '<small>未设置显示名</small>'}</span></td><td><span class="wifi-ap-model-cell">${escapeHtml(ap.model || ap.board_name || '--')}${ap.model_override ? '<small>型号已覆盖</small>' : ap.model_available ? '' : `<small>${escapeHtml(firstText(ap.model_reason, '型号未上报'))}</small>`}</span></td><td>${acStatusBadge(ap)}</td><td><span class="wifi-ap-seen" title="${escapeHtml(absoluteTime(ap.last_seen_at))}">${escapeHtml(relativeSeconds(ap.last_seen_at) || '--')}</span></td><td>${escapeHtml(ap.control_protocol || '--')}</td><td><span class="wifi-ap-runtime">${ap.runtime_available ? (ap.runtime_complete ? '完整' : '部分') : '无'}${ap.runtime_reason && !ap.runtime_complete ? `<small>${escapeHtml(ap.runtime_reason)}</small>` : ''}</span></td><td><button class="wifi-row-button" type="button" data-wifi-ap-edit="${escapeHtml(ap.ap_id)}" ${editable ? '' : 'disabled'} ${editReason ? `title="${escapeHtml(editReason)}"` : ''} aria-label="编辑 ${escapeHtml(ap.label)}">${icon('chevron')}</button></td></tr>`).join('')}</tbody></table></div>${rows.length ? '' : `<div class="wifi-table-empty" data-dwrt-component="state-panel" data-dwrt-state="empty"><span>${icon('radio')}</span><strong>${query ? '没有匹配的 AP' : '尚未绑定 AP'}</strong><small>${query ? '调整搜索条件后重试。' : '使用“生成配对码”创建配对令牌，再在 AP 上完成配对。'}</small></div>`}</section>`;
+  }
+
+  function pairingTokenCard() {
+    const allowed = canManageTokens();
+    const reason = allowed ? '' : firstText(acReason('pairing_token_ipc'), '后端未开放配对令牌能力');
+    const tokens = state.ac.tokens.slice().sort((left, right) => (right.created_at || 0) - (left.created_at || 0));
+    const active = tokens.filter((token) => token.state === 'active' && !token.expired && !token.revoked_at);
+    return `<section class="wifi-panel-section wifi-pairing-card"><header class="wifi-panel-heading"><div><strong>配对码</strong><small>${active.length} 个等待配对 · 共 ${tokens.length} 条记录</small></div></header><div class="wifi-notice is-warn">${icon('info')}<span>生成配对码等于允许新设备接入本网络。请只把它交给你正在配对的那台 AP，用完或作废时及时吊销。</span></div>${state.tokenSecret ? `<div class="wifi-pairing-secret" role="status"><div><span>配对码（仅显示一次）</span><code>${escapeHtml(state.tokenSecret.token)}</code></div><div class="wifi-pairing-secret-meta"><span>有效期至 ${escapeHtml(absoluteTime(state.tokenSecret.expires_at) || '--')}</span><span>最多尝试 ${state.tokenSecret.max_attempts || '--'} 次</span></div><div class="wifi-pairing-secret-actions"><button class="policy-secondary" type="button" data-wifi-token-copy="${escapeHtml(state.tokenSecret.token)}">复制配对码</button><button class="policy-secondary" type="button" data-wifi-token-secret-dismiss>我已保存</button></div></div>` : ''}<div class="dwrt-kit-table-scroll wifi-table-scroll"><table class="dwrt-kit-table"><thead><tr><th>令牌</th><th>状态</th><th>有效期</th><th>尝试次数</th><th>站点</th><th>创建时间</th><th><span class="sr-only">操作</span></th></tr></thead><tbody>${tokens.map((token) => {
+      const revocable = allowed && token.state === 'active' && !token.expired && !token.revoked_at;
+      return `<tr><td><code class="wifi-token-id">${escapeHtml(token.token_id.slice(0, 8))}</code>${token.hardware_bound ? '<small>已绑定硬件</small>' : ''}</td><td>${tokenStateBadge(token)}</td><td><span title="${escapeHtml(absoluteTime(token.expires_at))}">${escapeHtml(token.state === 'active' && !token.revoked_at ? (countdownSeconds(token.expires_at) || '--') : (absoluteTime(token.expires_at) || '--'))}</span></td><td>${token.attempts} / ${token.max_attempts || '--'}</td><td>${escapeHtml(token.site_id || 'default')}</td><td><span title="${escapeHtml(absoluteTime(token.created_at))}">${escapeHtml(relativeSeconds(token.created_at) || '--')}</span></td><td><button class="policy-secondary wifi-token-revoke" type="button" data-wifi-token-revoke="${escapeHtml(token.token_id)}" ${revocable && !state.acBusy ? '' : 'disabled'} ${!allowed && reason ? `title="${escapeHtml(reason)}"` : ''}>吊销</button></td></tr>`;
+    }).join('')}</tbody></table></div>${tokens.length ? '' : `<div class="wifi-table-empty" data-dwrt-component="state-panel" data-dwrt-state="empty"><span>${icon('info')}</span><strong>还没有配对码</strong><small>${allowed ? '点击右上角“生成配对码”创建一个，再到 AP 上使用它完成配对。' : escapeHtml(reason)}</small></div>`}</section>`;
+  }
+
+  /*
+   * 未开放能力如实呈现：读运行时 capabilities.reasons，不写死清单。
+   * 后端放开某一项后这里会自然少一行，不需要改代码。
+   */
+  function apCapabilityNotice() {
+    const gated = [
+      ['ssid_create', '新建 SSID'], ['ssid_update', '修改 SSID'], ['ssid_delete', '删除 SSID'],
+      ['radio_update', '调整信道与功率'], ['ap_actions', 'AP 重启 / 定位闪灯'],
+      ['password_rotation', '轮换 Wi-Fi 密码'], ['certificate_rotation', '轮换证书'],
+      ['transactional_apply', '事务化下发'], ['automatic_rollback', '自动回滚']
+    ].filter(([cap]) => cap in state.ac.capabilities && !acCap(cap));
+    if (!gated.length) return '';
+    return `<section class="wifi-panel-section wifi-ap-gated"><header class="wifi-section-head"><div><strong>后端尚未开放的操作</strong><small>以下能力当前不可用，因此本页不提供对应控件；后端放开后此列表会自动缩短。</small></div></header><ul class="wifi-ap-gated-list">${gated.map(([cap, label]) => `<li><span>${escapeHtml(label)}</span><code>${escapeHtml(firstText(acReason(cap), '后端未说明原因'))}</code></li>`).join('')}</ul></section>`;
+  }
+
+  function apManagementContent() {
+    if (state.ac.loading && !state.ac.loaded) {
+      return `<div data-dwrt-component="state-panel" data-dwrt-state="loading"><strong>正在读取 AP 管理数据</strong><p>清单、能力位与配对码并发拉取，返回后原位更新。</p></div>`;
+    }
+    if (!state.ac.loaded && state.ac.error) {
+      return `<div data-dwrt-component="state-panel" data-dwrt-state="error"><strong>AP 管理暂不可用</strong><p>${escapeHtml(state.ac.error)}</p></div>`;
+    }
+    const banner = state.ac.error ? `<div class="wifi-notice is-error">${icon('info')}<span>${escapeHtml(state.ac.error)}</span></div>` : '';
+    return `${banner}${apInventoryTable()}${pairingTokenCard()}${apCapabilityNotice()}`;
+  }
+
   function configViewContent() {
+    if (state.configView === 'aps') return apManagementContent();
     if (state.configView === 'radios') return state.config.radios.length ? `${radioSummary()}${defaultSpeed()}${channelPlan()}` : radioSummary();
     if (state.configView === 'extensions') return `${globalSettings()}${extendedSettings()}`;
     return `${configTable()}<div class="wifi-notice is-info">${icon('info')}<span>为了实现最佳的物联网互操作性，建议为 2.4 GHz 物联网设备创建专用网络。</span></div>${speedLimits()}`;
   }
 
   function configStatePanel() {
+    /*
+     * AP 管理 Tab 的数据源与 wifi/config 无关，所以不能被 config 的
+     * loading / error / 无无线硬件 三种闸门挡住 —— 控制器就算本机没有 PHY
+     * 也仍然可以管理远端 AP（capabilities.local_wifi_required=false）。
+     */
+    if (state.configView === 'aps') return `<section class="wifi-config-surface dwrt-kit-table-wrap dwrt-kit-glass-surface" role="tabpanel" aria-label="AP 管理">${configViewContent()}</section>`;
     if (state.loading && !state.loaded) return `<section class="wifi-config-surface dwrt-kit-table-wrap dwrt-kit-glass-surface"><div data-dwrt-component="state-panel" data-dwrt-state="loading"><strong>正在读取 Wi-Fi 配置</strong><p>页面结构已就绪，配置返回后会原位更新。</p></div></section>`;
     if (!state.loaded && state.error) return `<section class="wifi-config-surface dwrt-kit-table-wrap dwrt-kit-glass-surface"><div data-dwrt-component="state-panel" data-dwrt-state="error"><strong>Wi-Fi 配置暂不可用</strong><p>读取失败不会回退到示例数据或本地配置；后端恢复后重新进入页面即可更新。</p></div></section>`;
     if (state.loaded && !state.config.capabilities.wifi && !state.config.radios.length && !state.config.ssids.length) return `<section class="wifi-config-surface dwrt-kit-table-wrap dwrt-kit-glass-surface"><div data-dwrt-component="state-panel" data-dwrt-state="unavailable"><strong>未检测到无线硬件</strong><p>当前设备没有可用 PHY 或受管 AP，因此不构造信道矩阵；接入无线设备后此页会显示完整设置。</p></div></section>`;
@@ -712,7 +999,8 @@ export function mount(context = {}) {
 
   function configPage() {
     const savebar = ui.floatingSavebarMarkup?.({ visible: state.dirty, omitWhenHidden: true, busy: state.saving, disabled: !canConfigWrite(), message: '有未应用的 Wi-Fi 更改', discardLabel: '放弃', busyLabel: '正在应用' }) || '';
-    return `<div class="wifi-management-shell wifi-config-shell">${configNavigation()}${state.error ? `<div class="wifi-notice is-error">${icon('info')}<span>${escapeHtml(state.error)}</span></div>` : ''}${state.notice ? `<div class="wifi-notice ${state.noticeTone ? `is-${state.noticeTone}` : ''}">${icon('info')}<span>${escapeHtml(state.notice)}</span></div>` : ''}${configStatePanel()}${savebar}${sheetMarkup()}</div>`;
+    const pageError = state.configView === 'aps' ? '' : state.error;
+    return `<div class="wifi-management-shell wifi-config-shell">${configNavigation()}${pageError ? `<div class="wifi-notice is-error">${icon('info')}<span>${escapeHtml(pageError)}</span></div>` : ''}${state.notice ? `<div class="wifi-notice ${state.noticeTone ? `is-${state.noticeTone}` : ''}">${icon('info')}<span>${escapeHtml(state.notice)}</span></div>` : ''}${configStatePanel()}${savebar}${sheetMarkup()}${apConfirmationMarkup()}</div>`;
   }
 
   function defaultDraft() {
@@ -750,9 +1038,56 @@ export function mount(context = {}) {
     return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-wifi-sheet-close aria-label="关闭速度限制编辑"></button><aside class="dwrt-kit-sheet wifi-sheet compact policy-stable-glass is-open" aria-label="编辑速度限制"><header class="dwrt-kit-sheet-header"><div><strong>Wi-Fi 速度限制</strong><small>${escapeHtml(draft.name || '新建档案')}</small></div><button class="dwrt-kit-sheet-close wifi-icon-button" type="button" data-wifi-sheet-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-sheet-body wifi-sheet-body"><section><div class="wifi-sheet-fields">${sheetField('名称', 'name', draft.name, { wide: true })}${sheetField('下载限制', 'download_mbps', draft.download_mbps, { type: 'number', min: 0, max: 100000, help: '0 表示无限制，单位 Mbps。' })}${sheetField('上传限制', 'upload_mbps', draft.upload_mbps, { type: 'number', min: 0, max: 100000, help: '0 表示无限制，单位 Mbps。' })}</div></section></div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-wifi-sheet-close>取消</button><button class="policy-primary" type="button" data-wifi-draft-save ${canConfigWrite() && draft.name.trim() ? '' : 'disabled'}>保存档案</button></footer></aside>`;
   }
 
+  /*
+   * AP 编辑抽屉。ap_update 的参数签名实测只有 ap_id / name / model_override，
+   * 且 webd 会拒掉任何多余键（不是静默忽略），所以抽屉里也只放这两个字段。
+   * 根节点写 dwrt-kit-sheet + 页面类并带 data-dwrt-component="sheet"，
+   * 几何交给 Kit，不自建骨架（DESIGN 规则 19、21）。
+   */
+  function apSheet() {
+    const editor = state.apEditor;
+    if (!editor) return '';
+    const overrideDisabled = !editor.override_supported;
+    const dirty = editor.name !== editor.original_name || editor.model_override !== editor.original_model_override;
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-wifi-sheet-close aria-label="关闭 AP 编辑"></button><aside class="dwrt-kit-sheet wifi-sheet wifi-ap-sheet policy-stable-glass is-open" data-dwrt-component="sheet" aria-label="编辑 AP"><header class="dwrt-kit-sheet-header"><div><strong>编辑 AP</strong><small>${escapeHtml(editor.label)}</small></div><button class="dwrt-kit-sheet-close wifi-icon-button" type="button" data-wifi-sheet-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-sheet-body wifi-sheet-body"><section><div class="wifi-sheet-fields">${sheetField('显示名', 'name', editor.name, { wide: true, help: '留空时列表按 型号 → 主板名 → AP ID 顺序回退显示。' })}${sheetField('型号覆盖', 'model_override', editor.model_override, { wide: true, disabled: overrideDisabled, help: overrideDisabled ? '该 AP 不支持型号覆盖。' : `留空则使用上报型号${editor.reported_model ? `（${editor.reported_model}）` : ''}。` })}</div></section><section class="wifi-ap-sheet-facts"><strong>只读信息</strong><dl><div><dt>AP ID</dt><dd><code>${escapeHtml(editor.ap_id)}</code></dd></div><div><dt>采纳状态</dt><dd>${escapeHtml(editor.adoption_state)}</dd></div><div><dt>主板名</dt><dd>${escapeHtml(editor.board_name || '--')}</dd></div><div><dt>型号来源</dt><dd>${escapeHtml(editor.model_source || '--')}</dd></div><div><dt>站点</dt><dd>${escapeHtml(editor.site_id || 'default')}</dd></div><div><dt>最后心跳</dt><dd>${escapeHtml(absoluteTime(editor.last_seen_at) || '--')}</dd></div></dl></section><div class="wifi-ap-sheet-note">仅显示名与型号覆盖可改，这两项只存在控制器清单里，不会下发到 AP。SSID、信道与重启类操作依赖尚未落地的事务层，因此不在此处提供。</div></div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-wifi-sheet-close>取消</button><button class="policy-primary" type="button" data-wifi-ap-save ${canEditAcAp() && dirty && !state.acBusy ? '' : 'disabled'}>${state.acBusy ? '正在保存' : '保存'}</button></footer></aside>`;
+  }
+
+  /*
+   * 生成配对码抽屉。webd 侧校验 ttl_seconds 60~86400、max_attempts 1~10，
+   * 前端同步用同一区间约束输入，避免拿一个模糊的 400 回来。
+   */
+  function tokenSheet() {
+    const draft = state.tokenDraft;
+    if (!draft) return '';
+    const ttlValid = draft.ttl_seconds >= 60 && draft.ttl_seconds <= 86400;
+    const attemptsValid = draft.max_attempts >= 1 && draft.max_attempts <= 10;
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-wifi-sheet-close aria-label="关闭配对码生成"></button><aside class="dwrt-kit-sheet wifi-sheet wifi-token-sheet policy-stable-glass is-open" data-dwrt-component="sheet" aria-label="生成配对码"><header class="dwrt-kit-sheet-header"><div><strong>生成配对码</strong><small>用于让一台新 AP 加入本控制器</small></div><button class="dwrt-kit-sheet-close wifi-icon-button" type="button" data-wifi-sheet-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-sheet-body wifi-sheet-body"><section><div class="wifi-sheet-fields">${sheetField('有效期', 'ttl_seconds', draft.ttl_seconds, { type: 'number', min: 60, max: 86400, help: '单位秒，允许 60 ~ 86400（1 分钟 ~ 1 天）。' })}${sheetField('最大尝试次数', 'max_attempts', draft.max_attempts, { type: 'number', min: 1, max: 10, help: '允许 1 ~ 10 次。超过次数后该配对码失效。' })}${sheetField('站点', 'site_id', draft.site_id, { wide: true, help: '留空即 default 站点。' })}</div></section><div class="wifi-notice is-warn">${icon('info')}<span>配对码是一次性凭据：生成后只显示一次，且持有它的设备可以接入本网络。请勿转发或截图外发。</span></div></div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-wifi-sheet-close>取消</button><button class="policy-primary" type="button" data-wifi-token-save ${canManageTokens() && ttlValid && attemptsValid && !state.acBusy ? '' : 'disabled'}>${state.acBusy ? '正在生成' : '生成配对码'}</button></footer></aside>`;
+  }
+
+  /*
+   * 吊销走 Kit 的统一确认弹窗（DESIGN 规则 17），不用原生 confirm。
+   */
+  function apConfirmationMarkup() {
+    if (!state.confirmToken) return '';
+    const renderer = ui.confirmationMarkup || window.DWRT_UI_KIT?.confirmationMarkup;
+    if (typeof renderer !== 'function') return '';
+    return renderer({
+      id: 'wifi-pairing-token-revoke',
+      action: 'revoke-pairing-token',
+      tone: 'danger',
+      title: '吊销配对码',
+      description: `配对码 ${state.confirmToken.slice(0, 8)} 将立即失效，尚未完成配对的 AP 需要用新配对码重新配对。已完成配对的 AP 不受影响。`,
+      cancelLabel: '取消',
+      confirmLabel: state.acBusy ? '正在吊销' : '确认吊销',
+      disabled: state.acBusy
+    });
+  }
+
   function sheetMarkup() {
     if (state.sheet === 'ssid') return ssidSheet();
     if (state.sheet === 'speed') return speedSheet();
+    if (state.sheet === 'ap') return apSheet();
+    if (state.sheet === 'token') return tokenSheet();
     return '';
   }
 
@@ -1375,6 +1710,23 @@ export function mount(context = {}) {
     root.innerHTML = isStatus ? statusPage() : configPage();
     if (typeof ui.mountAll === 'function') ui.mountAll(root);
     else window.DWRT_UI_KIT?.mountAll?.(root);
+    keepActiveTabVisible();
+  }
+
+  /*
+   * Tab 条在窄屏是横向滚动容器（390px 下 scrollWidth 460 > clientWidth 366），
+   * 而 render() 用 innerHTML 重建整条 nav，scrollLeft 会归零。于是用户滚过去点中
+   * 最后一个 Tab，重绘后那个 Tab 又被推出可视区，看起来像点了个不存在的东西。
+   * 只横向移动 nav 自己的 scrollLeft，不用 scrollIntoView（那会连带滚动祖先与页面）。
+   */
+  function keepActiveTabVisible() {
+    const nav = root?.querySelector('.wifi-config-tabs');
+    const active = nav?.querySelector('.dwrt-kit-tab.is-active');
+    if (!nav || !active || nav.scrollWidth <= nav.clientWidth) return;
+    const navBox = nav.getBoundingClientRect();
+    const box = active.getBoundingClientRect();
+    if (box.right > navBox.right) nav.scrollLeft += box.right - navBox.right;
+    else if (box.left < navBox.left) nav.scrollLeft -= navBox.left - box.left;
   }
 
   // Scroll containers are keyed by their DOM path inside the results region so
@@ -1470,7 +1822,116 @@ export function mount(context = {}) {
     render();
   }
 
-  function closeSheet() { state.sheet = ''; state.draft = null; render(); }
+  function closeSheet() { state.sheet = ''; state.draft = null; state.apEditor = null; state.tokenDraft = null; render(); }
+
+  function openApEditor(apId) {
+    const ap = state.ac.aps.find((item) => item.ap_id === apId);
+    if (!ap || !canEditAcAp()) return;
+    state.sheet = 'ap';
+    state.draft = null;
+    state.apEditor = {
+      ap_id: ap.ap_id, label: ap.label, name: ap.name, model_override: ap.model_override,
+      original_name: ap.name, original_model_override: ap.model_override,
+      override_supported: ap.override_supported, reported_model: ap.reported_model,
+      adoption_state: ap.adoption_state, board_name: ap.board_name,
+      model_source: ap.model_source, site_id: ap.site_id, last_seen_at: ap.last_seen_at
+    };
+    render();
+  }
+
+  function openTokenSheet() {
+    if (!canManageTokens()) return;
+    state.sheet = 'token';
+    state.draft = null;
+    state.tokenDraft = { ttl_seconds: 600, max_attempts: 5, site_id: '' };
+    render();
+  }
+
+  async function saveApEditor() {
+    const editor = state.apEditor;
+    if (!editor || !canEditAcAp() || state.acBusy) return;
+    const body = {};
+    if (editor.name !== editor.original_name) body.name = editor.name;
+    if (editor.override_supported && editor.model_override !== editor.original_model_override) {
+      body.model_override = editor.model_override;
+    }
+    // webd 要求 name / model_override 至少给一个，且拒绝任何多余键。
+    if (!Object.keys(body).length) return;
+    state.acBusy = true;
+    render();
+    try {
+      await requestJson(`/api/v1/ac/aps/${encodeURIComponent(editor.ap_id)}`, {
+        cacheVersion: false, method: 'PATCH', body: JSON.stringify(body)
+      });
+      state.notice = `AP“${firstText(body.name, editor.label)}”的清单信息已更新。`;
+      state.noticeTone = 'ok';
+      state.sheet = '';
+      state.apEditor = null;
+      state.acBusy = false;
+      await loadAc(true);
+    } catch (error) {
+      state.ac.error = `保存 AP 清单信息失败：${firstText(error.message, '未知错误')}`;
+    } finally {
+      state.acBusy = false;
+      if (state.mounted) render();
+    }
+  }
+
+  async function createPairingToken() {
+    const draft = state.tokenDraft;
+    if (!draft || !canManageTokens() || state.acBusy) return;
+    state.acBusy = true;
+    render();
+    try {
+      const body = { ttl_seconds: Number(draft.ttl_seconds), max_attempts: Number(draft.max_attempts) };
+      if (String(draft.site_id || '').trim()) body.site_id = String(draft.site_id).trim();
+      const payload = await requestJson('/api/v1/ac/pairing-tokens', {
+        cacheVersion: false, method: 'POST', body: JSON.stringify(body)
+      });
+      // display_once：码值只在这一次响应里出现，之后 list 只返回 token_id。
+      state.tokenSecret = {
+        token: firstText(payload.token),
+        token_id: firstText(payload.token_id),
+        expires_at: firstNumber(payload.expires_at) || 0,
+        max_attempts: firstNumber(payload.max_attempts) || Number(draft.max_attempts)
+      };
+      state.notice = '配对码已生成，请在下方卡片中复制保存，它只显示一次。';
+      state.noticeTone = 'warn';
+      state.sheet = '';
+      state.tokenDraft = null;
+      state.acBusy = false;
+      await loadAc(true);
+    } catch (error) {
+      state.ac.error = `生成配对码失败：${firstText(error.message, '未知错误')}`;
+    } finally {
+      state.acBusy = false;
+      if (state.mounted) render();
+    }
+  }
+
+  async function revokePairingToken() {
+    const tokenId = state.confirmToken;
+    if (!tokenId || !canManageTokens() || state.acBusy) return;
+    state.acBusy = true;
+    render();
+    try {
+      await requestJson(`/api/v1/ac/pairing-tokens/${encodeURIComponent(tokenId)}`, {
+        cacheVersion: false, method: 'DELETE'
+      });
+      state.notice = `配对码 ${tokenId.slice(0, 8)} 已吊销。`;
+      state.noticeTone = 'ok';
+      state.confirmToken = null;
+      if (state.tokenSecret && state.tokenSecret.token_id === tokenId) state.tokenSecret = null;
+      state.acBusy = false;
+      await loadAc(true);
+    } catch (error) {
+      state.ac.error = `吊销配对码失败：${firstText(error.message, '未知错误')}`;
+      state.confirmToken = null;
+    } finally {
+      state.acBusy = false;
+      if (state.mounted) render();
+    }
+  }
 
   function saveDraft() {
     if (!state.draft || !canConfigWrite()) return;
@@ -1617,16 +2078,42 @@ export function mount(context = {}) {
 
   function onClick(event) {
     const origin = event.target;
+    /*
+     * Kit 确认弹窗的取消/确认按钮先接住：它的取消键同时带 data-dwrt-modal-close，
+     * 遮罩也是 button，若落到后面的通用分支会被当成普通按钮忽略掉。
+     */
+    if (state.confirmToken) {
+      if (origin.closest('[data-dwrt-confirm-accept]')) { revokePairingToken(); return; }
+      if (origin.closest('[data-dwrt-confirm-cancel], [data-dwrt-modal-close]')) { state.confirmToken = null; render(); return; }
+    }
     const target = origin.closest('button, tr[data-wifi-edit], tr[data-wifi-speed-edit], tr[data-airview-radio-row]');
     if (!target) return;
     if (target.matches('[data-wifi-config-tab]')) {
       const view = target.dataset.wifiConfigTab;
-      if (!['broadcasts', 'radios', 'extensions'].includes(view) || state.configView === view) return;
+      if (!['broadcasts', 'radios', 'extensions', 'aps'].includes(view) || state.configView === view) return;
       state.configView = view;
+      // 切到 AP 管理时按需拉一次 AC 数据；离开时清掉只对该 Tab 有意义的搜索词。
+      state.query = '';
       render();
+      if (view === 'aps' && !state.ac.loaded && !state.ac.loading) loadAc();
       return;
     }
     if (target.matches('[data-wifi-create]')) { openSsid(); return; }
+    if (target.matches('[data-wifi-ap-edit]')) { openApEditor(target.dataset.wifiApEdit); return; }
+    if (target.matches('[data-wifi-ap-save]')) { saveApEditor(); return; }
+    if (target.matches('[data-wifi-token-create]')) { openTokenSheet(); return; }
+    if (target.matches('[data-wifi-token-save]')) { createPairingToken(); return; }
+    if (target.matches('[data-wifi-token-revoke]')) {
+      if (!canManageTokens()) return;
+      state.confirmToken = target.dataset.wifiTokenRevoke || null;
+      render();
+      return;
+    }
+    if (target.matches('[data-wifi-token-copy]')) {
+      navigator.clipboard?.writeText(target.dataset.wifiTokenCopy || '').catch(() => {});
+      return;
+    }
+    if (target.matches('[data-wifi-token-secret-dismiss]')) { state.tokenSecret = null; render(); return; }
     if (target.matches('[data-wifi-edit]')) { openSsid(target.dataset.wifiEdit); return; }
     if (target.matches('[data-wifi-speed-create]')) { openSpeed(); return; }
     if (target.matches('[data-wifi-speed-edit]')) { openSpeed(target.dataset.wifiSpeedEdit); return; }
@@ -1749,16 +2236,57 @@ export function mount(context = {}) {
     const target = event.target;
     if (target.matches('[data-wifi-search]')) {
       state.query = target.value || '';
+      if (state.configView === 'aps') {
+        const inventory = root.querySelector('.wifi-ap-inventory');
+        if (inventory) inventory.outerHTML = apInventoryTable();
+        requestAnimationFrame(() => {
+          const field = root.querySelector('[data-wifi-search]');
+          if (!field) return;
+          field.focus({ preventScroll: true });
+          const end = field.value.length;
+          try { field.setSelectionRange(end, end); } catch (_) {}
+        });
+        return;
+      }
       const table = root.querySelector('.wifi-config-table');
       if (table) table.outerHTML = configTable();
       requestAnimationFrame(() => root.querySelector('[data-wifi-search]')?.focus({ preventScroll: true }));
+      return;
+    }
+    if (target.matches('[data-wifi-draft]') && state.sheet === 'ap' && state.apEditor) {
+      const path = target.dataset.wifiDraft;
+      if (path === 'name' || path === 'model_override') state.apEditor[path] = target.value;
+      const save = sheetQuery('[data-wifi-ap-save]');
+      if (save) {
+        const editor = state.apEditor;
+        const dirty = editor.name !== editor.original_name || editor.model_override !== editor.original_model_override;
+        save.disabled = !canEditAcAp() || !dirty || state.acBusy;
+      }
+      return;
+    }
+    if (target.matches('[data-wifi-draft]') && state.sheet === 'token' && state.tokenDraft) {
+      const path = target.dataset.wifiDraft;
+      if (path === 'site_id') state.tokenDraft.site_id = target.value;
+      else if (path === 'ttl_seconds' || path === 'max_attempts') state.tokenDraft[path] = Number(target.value || 0);
+      const save = sheetQuery('[data-wifi-token-save]');
+      if (save) {
+        const draft = state.tokenDraft;
+        const valid = draft.ttl_seconds >= 60 && draft.ttl_seconds <= 86400 &&
+          draft.max_attempts >= 1 && draft.max_attempts <= 10;
+        save.disabled = !canManageTokens() || !valid || state.acBusy;
+      }
       return;
     }
     if (target.matches('[data-wifi-draft]')) {
       const path = target.dataset.wifiDraft;
       const value = target.type === 'number' ? Number(target.value || 0) : target.value;
       setPath(state.draft, path, value);
-      const save = root.querySelector('[data-wifi-draft-save]');
+      /*
+       * data-wifi-draft-save 渲染在 .dwrt-kit-sheet 里（wifiSheetMarkup / speedSheetMarkup），
+       * mountAll 会把抽屉搬进传送门，root 就查不到它了。相邻的 ap/token 两个分支已经用
+       * sheetQuery，这一支漏了：表现是在 Wi-Fi 或速度限制抽屉里输入名称后保存按钮不解禁。
+       */
+      const save = sheetQuery('[data-wifi-draft-save]');
       if (save) save.disabled = !canConfigWrite() || !String(state.draft.name || '').trim() || (state.sheet === 'ssid' && !state.draft.bands.length);
       return;
     }
@@ -1888,6 +2416,15 @@ export function mount(context = {}) {
   state.refreshTimer = window.setInterval(() => {
     if (!state.mounted || document.hidden || state.refreshing || state.scanning) return;
     if (state.dirty || state.radioDirty || state.saving || state.sheet) return;
+    /*
+     * AP 管理 Tab 走自己的端点，所以后台刷新也走 loadAc。
+     * 确认弹窗打开或写请求在飞时不刷，避免把用户正在看的确认对话重建掉。
+     */
+    if (!isStatus && state.configView === 'aps') {
+      if (state.acBusy || state.confirmToken || state.ac.loading) return;
+      loadAc(true);
+      return;
+    }
     load(true);
   }, isStatus ? 5000 : 20000);
 
@@ -1896,6 +2433,9 @@ export function mount(context = {}) {
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      state.ac.seq += 1;
+      state.tokenSecret = null;
+      state.confirmToken = null;
       state.environmentHistorySeq += 1;
       state.scanEpoch += 1;
       if (state.refreshTimer) clearInterval(state.refreshTimer);

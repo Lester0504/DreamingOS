@@ -38,7 +38,14 @@ if "data-interface-ports=" in INTERFACE_JS:
     raise AssertionError("the separate change-port table action must be removed")
 require(INTERFACE_JS, "data-interface-editor-toggle=", "editor groups need disclosure controls")
 require(INTERFACE_JS, "state.editorOpen = state.editorOpen === next ? '' : next", "editor disclosures must be single-open")
-require(INTERFACE_JS, "root.querySelectorAll('[data-interface-editor-group]').forEach", "opening one editor group must close every other group in place")
+# 2026-08-05: 原断言写死了 `root.querySelectorAll(...)`，而那正是手风琴点不动的成因 ——
+# kit 的 mountAll() 会把 .dwrt-kit-sheet 搬进 body 下的 portal，抽屉不再是 root 的后代，
+# 从 root 查询分组永远查不到。这里改为断言原本的意图（就地互斥展开、不整页重绘），
+# 并要求作用域是 portal 感知的，不再锁定具体写法。
+require(INTERFACE_JS, "scope.querySelectorAll('[data-interface-editor-group]').forEach", "opening one editor group must close every other group in place")
+require(INTERFACE_JS, "function drawerNode(", "editor group lookups must survive the kit sheet portal")
+if "root.querySelectorAll('[data-interface-editor-group]')" in INTERFACE_JS:
+    raise AssertionError("editor groups must not be queried from root: the sheet is portalled to body")
 require(INTERFACE_JS, "aria-expanded=", "editor disclosure state must be announced")
 require(INTERFACE_JS, "role=\"region\"", "editor groups need semantic regions")
 require(INTERFACE_JS, "function dependentMarkup", "dependent controls must remain visibly associated")

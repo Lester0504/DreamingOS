@@ -72,6 +72,40 @@ static int apd_handle_pairing_status(struct ubus_context *ctx,
     return UBUS_STATUS_OK;
 }
 
+enum {
+    APD_UNPAIR_CONFIRM,
+    __APD_UNPAIR_MAX
+};
+
+static const struct blobmsg_policy apd_unpair_policy[__APD_UNPAIR_MAX] = {
+    [APD_UNPAIR_CONFIRM] = { .name = "confirm", .type = BLOBMSG_TYPE_BOOL },
+};
+
+/*
+ * Destructive: drops the certificate and adoption state, after which the
+ * controller can no longer manage this AP. The explicit confirm flag exists so
+ * a mistyped or replayed call cannot unadopt a live AP; a missing flag is
+ * refused by apd_unpair_json() rather than treated as consent.
+ */
+static int apd_handle_unpair(struct ubus_context *ctx, struct ubus_object *obj,
+                             struct ubus_request_data *req, const char *method,
+                             struct blob_attr *msg)
+{
+    struct blob_attr *tb[__APD_UNPAIR_MAX];
+    struct json_object *response;
+    int confirmed = 0;
+
+    (void)obj; (void)method;
+    blobmsg_parse(apd_unpair_policy, __APD_UNPAIR_MAX, tb, blob_data(msg),
+                  blob_len(msg));
+    if (tb[APD_UNPAIR_CONFIRM])
+        confirmed = blobmsg_get_bool(tb[APD_UNPAIR_CONFIRM]);
+    response = apd_unpair_json(confirmed);
+    apd_send_json(ctx, req, response);
+    json_object_put(response);
+    return UBUS_STATUS_OK;
+}
+
 static const struct ubus_method apd_methods[] = {
     UBUS_METHOD_NOARG("status", apd_handle_status),
     UBUS_METHOD_NOARG("capabilities", apd_handle_capabilities),
@@ -81,6 +115,7 @@ static const struct ubus_method apd_methods[] = {
         .name = "snapshot",
         .handler = apd_handle_snapshot,
     },
+    UBUS_METHOD("unpair", apd_handle_unpair, apd_unpair_policy),
 };
 
 static struct ubus_object_type apd_object_type =

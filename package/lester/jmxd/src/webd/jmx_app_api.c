@@ -1483,14 +1483,61 @@ static void app_ai_provider_id_copy(const char *tail, const char *suffix,
     out[id_len] = '\0';
 }
 
-static struct json_object *ai_envelope(struct json_object *resp, int default_code)
+/*
+ * Failure envelope for the AI routes.
+ *
+ * `default_code` is the code to use when the upstream reply carries none, and
+ * every caller passes 200 because that is the success code. On the NULL path
+ * that made the failure report `ok:false` alongside `code:200`, which is not
+ * merely untidy: a client that decides success from `code` reads the failure as
+ * a success carrying no `data`, i.e. "the backend has no providers" rather than
+ * "the call never landed". So the NULL branch sets its own code and never
+ * borrows the success one.
+ *
+ * `diag` is optional. When the caller used the diag-aware invoke it tells
+ * connect / lookup / invoke apart, which is the difference between "core is not
+ * running", "core is up but the method is not registered", and "the call timed
+ * out". Collapsing those into one `internal_error` is what made this
+ * undiagnosable from the outside.
+ */
+static struct json_object *ai_envelope_diag(struct json_object *resp, int default_code,
+                                            const struct app_ubus_call_diag *diag)
 {
     if (!resp) {
         struct json_object *e = json_object_new_object();
+        const char *stage = (diag && diag->stage) ? diag->stage : "";
+        /*
+         * 504 only for a call that reached the object and then failed to
+         * complete; connect/lookup mean the dependency is not there to talk to,
+         * which is 502. app_routed_http_status() picks `http_status` up ahead of
+         * everything else, so the HTTP status and the body agree.
+         */
+        int http_status = !strcmp(stage, "invoke") ? 504 : 502;
+        const char *message = "core_unavailable";
+
+        if (!strcmp(stage, "invoke"))
+            message = "core_call_timeout";
+        else if (!strcmp(stage, "lookup"))
+            message = "core_method_unavailable";
+        else if (!strcmp(stage, "connect"))
+            message = "core_not_reachable";
+
         json_object_object_add(e, "ok", json_object_new_boolean(0));
-        json_object_object_add(e, "code", json_object_new_int(default_code));
-        json_object_object_add(e, "message", json_object_new_string("internal_error"));
+        json_object_object_add(e, "code", json_object_new_int(http_status));
+        json_object_object_add(e, "http_status", json_object_new_int(http_status));
+        json_object_object_add(e, "message", json_object_new_string(message));
+        if (stage[0])
+            json_object_object_add(e, "stage", json_object_new_string(stage));
+        if (diag && diag->rc >= 0)
+            json_object_object_add(e, "ubus_rc", json_object_new_int(diag->rc));
+        /*
+         * Keep the old name reachable so a client that matched on
+         * "internal_error" still sees it, while the specific reason is in
+         * `message`.
+         */
+        json_object_object_add(e, "reason", json_object_new_string("internal_error"));
         json_object_object_add(e, "ts", json_object_new_int64(time(NULL)));
+        (void)default_code;
         return e;
     }
     struct json_object *code_obj = NULL;
@@ -1524,6 +1571,16 @@ static struct json_object *ai_envelope(struct json_object *resp, int default_cod
     json_object_object_add(env, "ts", json_object_new_int64(time(NULL)));
     json_object_put(resp);
     return env;
+}
+
+/*
+ * Envelope without call diagnostics, for callers whose upstream object is not
+ * reached through the diag-aware invoke. The NULL branch still reports 502
+ * rather than the success code.
+ */
+static struct json_object *ai_envelope(struct json_object *resp, int default_code)
+{
+    return ai_envelope_diag(resp, default_code, NULL);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -18102,6 +18159,38 @@ static void webd_insights_risk_unknown(struct webd_insights_risk_annotation *ann
              (ctx && ctx->error[0] ? ctx->error : "no_reputation_match"));
 }
 
+/*
+ * True when the host is a literal address rather than a domain name.
+ *
+ * Used to suppress parent-label walking: label stripping is meaningful for
+ * a.b.example.com but produces nonsense for an IP, and the reputation feeds
+ * contain numeric values that such nonsense could accidentally equal.
+ *
+ * Deliberately loose. Anything containing ':' is treated as IPv6, and an
+ * all-digits-and-dots string is treated as IPv4 without validating octet
+ * ranges, because the goal is "do not walk labels on this", not strict parsing.
+ */
+static int webd_insights_host_is_address(const char *host)
+{
+    const char *p;
+    int digits = 0;
+
+    if (!host || !host[0])
+        return 0;
+    if (strchr(host, ':'))
+        return 1;
+    for (p = host; *p; p++) {
+        if (*p >= '0' && *p <= '9') {
+            digits++;
+            continue;
+        }
+        if (*p == '.')
+            continue;
+        return 0;
+    }
+    return digits > 0;
+}
+
 static int webd_insights_risk_query_one(struct webd_insights_risk_ctx *ctx,
                                         const char *domain,
                                         struct webd_insights_risk_annotation *ann)
@@ -18115,13 +18204,32 @@ static int webd_insights_risk_query_one(struct webd_insights_risk_ctx *ctx,
         "SELECT category,0,confidence,source_feed,domain "
         "FROM aegis_domain_categories "
         "WHERE domain=? ORDER BY confidence DESC LIMIT 1";
+    /*
+     * Bare-IP destinations were never looked up at all.
+     *
+     * aegis_reputation_items holds two kinds: 'domain' (365 rows on 30.1) and
+     * 'ipv4' (8637 rows). Only the domain kind was queried, while 49% of the
+     * flows in a 24h window on 30.1 have a bare IP as their destination host
+     * (4868 of 7588 distinct destinations). Those flows could not match
+     * anything no matter what the feeds contained, and landed in "unknown".
+     *
+     * Safe to try for every candidate: a hostname simply will not equal an
+     * ipv4 value, so the extra statement costs one indexed miss
+     * (idx_aegis_reputation_kind_value covers kind,value) and never
+     * misattributes a domain.
+     */
+    static const char *rep_ip_sql =
+        "SELECT category,severity,confidence,source_feed,value "
+        "FROM aegis_reputation_items "
+        "WHERE kind='ipv4' AND value=? "
+        "ORDER BY severity DESC, confidence DESC LIMIT 1";
     sqlite3_stmt *st = NULL;
-    const char *sqls[2] = {rep_sql, cat_sql};
+    const char *sqls[3] = {rep_sql, rep_ip_sql, cat_sql};
     int pass;
 
     if (!ctx || !ctx->db || !domain || !domain[0] || !ann)
         return 0;
-    for (pass = 0; pass < 2; pass++) {
+    for (pass = 0; pass < 3; pass++) {
         if (sqlite3_prepare_v2(ctx->db, sqls[pass], -1, &st, NULL) != SQLITE_OK) {
             if (!ctx->error[0])
                 snprintf(ctx->error, sizeof(ctx->error), "aegis_query_failed:%s",
@@ -18145,13 +18253,14 @@ static int webd_insights_risk_query_one(struct webd_insights_risk_ctx *ctx,
             snprintf(ann->risk, sizeof(ann->risk), "%s", risk);
             snprintf(ann->level, sizeof(ann->level), "%s", level);
             snprintf(ann->source, sizeof(ann->source), "%s",
-                     pass == 0 ? "aegis_reputation_items" : "aegis_domain_categories");
+                     pass == 2 ? "aegis_domain_categories" : "aegis_reputation_items");
             snprintf(ann->category, sizeof(ann->category), "%s", category ? category : "");
             snprintf(ann->feed, sizeof(ann->feed), "%s", feed ? feed : "");
             snprintf(ann->matched_domain, sizeof(ann->matched_domain), "%s",
                      matched && matched[0] ? matched : domain);
             snprintf(ann->reason, sizeof(ann->reason), "matched:%s",
-                     pass == 0 ? "reputation_item" : "domain_category");
+                     pass == 0 ? "reputation_item" :
+                     (pass == 1 ? "reputation_item_ipv4" : "domain_category"));
             ann->severity = severity;
             ann->confidence = confidence;
             sqlite3_finalize(st);
@@ -18197,12 +18306,29 @@ static void webd_insights_risk_lookup(struct webd_insights_risk_ctx *ctx,
     }
     snprintf(candidate, sizeof(candidate), "%s", domain);
     p = candidate;
-    while (p && *p) {
-        if (webd_insights_risk_query_one(ctx, p, ann))
-            break;
-        p = strchr(p, '.');
-        if (p)
-            p++;
+    /*
+     * Walk parent labels so a subdomain inherits a feed entry on its parent
+     * domain, but never do that for a literal address.
+     *
+     * Stripping labels off 116.113.75.103 asks the feeds about "113.75.103",
+     * "75.103" and "103", which are not parents of anything. The feeds hold
+     * 8715 numeric-valued entries (the ipv4 reputation kind), so a truncated
+     * octet string can in principle equal a real entry and stamp an unrelated
+     * verdict onto innocent traffic. No such collision exists in the current
+     * data (checked for five common resolver and CDN addresses), which is
+     * exactly why this would surface later as an unreproducible mislabel rather
+     * than an obvious bug. An address is matched whole or not at all.
+     */
+    if (webd_insights_host_is_address(candidate)) {
+        (void)webd_insights_risk_query_one(ctx, candidate, ann);
+    } else {
+        while (p && *p) {
+            if (webd_insights_risk_query_one(ctx, p, ann))
+                break;
+            p = strchr(p, '.');
+            if (p)
+                p++;
+        }
     }
     {
         struct webd_insights_risk_cache_entry *e =
@@ -20282,7 +20408,7 @@ static struct json_object *webd_insights_fetch_history_flows_limit(const struct 
 /* Same split, same reason, as the top-summary params: the batch and the serial
  * path must ask the identical question. */
 static struct json_object *webd_insights_flow_host_rollup_params(
-        const struct webd_insights_query *q, int host_limit)
+        const struct webd_insights_query *q, int host_limit, int offset)
 {
     struct json_object *params = json_object_new_object();
 
@@ -20293,6 +20419,8 @@ static struct json_object *webd_insights_flow_host_rollup_params(
     if (q && q->mode[0])
         json_object_object_add(params, "mode", json_object_new_string(q->mode));
     json_object_object_add(params, "top", json_object_new_int(host_limit));
+    if (offset > 0)
+        json_object_object_add(params, "offset", json_object_new_int(offset));
     return params;
 }
 
@@ -20302,10 +20430,366 @@ static struct json_object *webd_insights_fetch_flow_host_rollup(const struct web
     struct json_object *params;
     struct json_object *data;
 
-    params = webd_insights_flow_host_rollup_params(q, host_limit);
+    params = webd_insights_flow_host_rollup_params(q, host_limit, 0);
     data = webd_insights_ubus_data_timeout("audit_flow_host_rollup", params, 3500);
     json_object_put(params);
     return data;
+}
+
+/*
+ * Host rollup with a self-adjusting limit.
+ *
+ * A fixed limit cannot work here: the reply size grows with the number of
+ * distinct hosts in the window, so any hard-coded number is only correct until
+ * the network gets busier. 20000 was such a number, and once the window held
+ * more than ~16000 hosts the reply crossed the ubus ceiling
+ * (1104288 > 1015808 bytes). The caller only checked for "ok", so a real
+ * failure became indistinguishable from an empty result and the whole
+ * risk-annotation path silently fell back to a one-row probe - a 0.88 coverage
+ * ratio collapsed to 3.3e-06 with nothing in the response saying why.
+ *
+ * The server already reports both response_bytes and response_limit_bytes, so
+ * the correct next limit is computable rather than guessable: scale the limit
+ * by the ratio the reply overshot, keep 15% of headroom because per-host cost
+ * varies with hostname length, and retry. out_reason/out_attempts tell the
+ * caller what happened so a degraded answer can say so out loud.
+ */
+#define WEBD_INSIGHTS_ROLLUP_HOST_LIMIT_MAX   20000
+#define WEBD_INSIGHTS_ROLLUP_HOST_LIMIT_MIN     500
+#define WEBD_INSIGHTS_ROLLUP_MAX_ATTEMPTS         4
+
+/*
+ * Remember the limit that actually fit, so the ceiling is learned once instead
+ * of re-discovered on every request.
+ *
+ * The retry loop above is correct but it always started at _MAX, and on a busy
+ * window that first attempt is not merely unlucky - it is guaranteed to fail:
+ * measured on 30.1, top=20000 returns response_too_large (1085552 >
+ * 1015808 bytes) after 430-640ms, every single time, and only then does the
+ * reply that fits get fetched. Every flows/summary paid that twice-called
+ * round trip, which showed up as audit_flow_host_rollup "calls": 2 in
+ * diagnostics.timing and hid ~0.5s of pure waste inside what looked like one
+ * slow query.
+ *
+ * Caching only the starting point keeps the correctness story unchanged: if the
+ * remembered limit is now too large the same loop shrinks it again, and if the
+ * window got quieter the periodic re-probe below lets the limit climb back
+ * rather than pinning coverage low forever.
+ */
+#define WEBD_INSIGHTS_ROLLUP_LIMIT_REPROBE_S    300
+
+static int g_webd_insights_rollup_limit_hint = 0;
+static time_t g_webd_insights_rollup_limit_hint_ts = 0;
+
+static int webd_insights_rollup_start_limit(void)
+{
+    time_t now = time(NULL);
+
+    if (g_webd_insights_rollup_limit_hint <= 0)
+        return WEBD_INSIGHTS_ROLLUP_HOST_LIMIT_MAX;
+    /*
+     * Re-probe upward every few minutes. Without this a single busy spike
+     * would cap every later request, and risk_count_host_limit_capped would
+     * stay true long after the window could be covered completely again.
+     */
+    if (g_webd_insights_rollup_limit_hint_ts == 0 ||
+        now - g_webd_insights_rollup_limit_hint_ts > WEBD_INSIGHTS_ROLLUP_LIMIT_REPROBE_S)
+        return WEBD_INSIGHTS_ROLLUP_HOST_LIMIT_MAX;
+    return g_webd_insights_rollup_limit_hint;
+}
+
+static void webd_insights_rollup_remember_limit(int limit)
+{
+    if (limit < WEBD_INSIGHTS_ROLLUP_HOST_LIMIT_MIN ||
+        limit > WEBD_INSIGHTS_ROLLUP_HOST_LIMIT_MAX)
+        return;
+    g_webd_insights_rollup_limit_hint = limit;
+    g_webd_insights_rollup_limit_hint_ts = time(NULL);
+}
+
+static struct json_object *webd_insights_fetch_flow_host_rollup_page(
+        const struct webd_insights_query *q,
+        int offset,
+        int *out_limit_used, int *out_attempts,
+        char *out_reason, size_t reason_len,
+        int *out_limit_reduced)
+{
+    int limit = webd_insights_rollup_start_limit();
+    int attempt;
+    /*
+     * "Reduced" must keep meaning "the window tail was not counted", because
+     * risk_count_host_limit_capped is derived from it. Starting below _MAX on a
+     * remembered limit is already a capped answer, so it counts as reduced even
+     * when this particular request never had to shrink anything.
+     *
+     * With paging in place a smaller limit no longer implies a shorter answer -
+     * it only means more pages - so the caller now derives "capped" from
+     * whether the walk actually finished, not from this flag.
+     */
+    int started_below_max = limit < WEBD_INSIGHTS_ROLLUP_HOST_LIMIT_MAX;
+
+    if (out_reason && reason_len)
+        out_reason[0] = '\0';
+    if (out_limit_used)
+        *out_limit_used = limit;
+    if (out_attempts)
+        *out_attempts = 0;
+    if (out_limit_reduced)
+        *out_limit_reduced = started_below_max;
+
+    for (attempt = 1; attempt <= WEBD_INSIGHTS_ROLLUP_MAX_ATTEMPTS; attempt++) {
+        struct json_object *params = webd_insights_flow_host_rollup_params(q, limit, offset);
+        int64_t started = webd_insights_monotonic_ms();
+        /*
+         * Take the raw envelope, not webd_insights_ubus_data_timeout(). That
+         * helper routes through webd_data_or_self_from_jmx_response(), which
+         * returns NULL for any code other than success - so the very fields
+         * needed to size the retry (response_bytes / response_limit_bytes) were
+         * discarded before this function could read them, and every oversized
+         * reply arrived here indistinguishable from a dead call.
+         */
+        struct json_object *upstream = app_ubus_invoke_timeout("audit_flow_host_rollup",
+                                                              params, 3500);
+        struct json_object *data = webd_data_or_self_from_jmx_response(upstream);
+        struct json_object *hosts;
+        const char *err;
+        int64_t got_bytes;
+        int64_t max_bytes;
+        int next;
+
+        webd_insights_timing_record("audit_flow_host_rollup",
+                                    webd_insights_monotonic_ms() - started);
+        json_object_put(params);
+        hosts = webd_obj_child_array(data, "hosts");
+        if (out_limit_used)
+            *out_limit_used = limit;
+        if (out_attempts)
+            *out_attempts = attempt;
+        /* Keep the success test as strict as the caller's original one: the
+         * payload carries its own ok flag alongside hosts/returned/truncated. */
+        if (data && app_nc_json_bool(data, "ok", 0) && hosts) {
+            webd_insights_rollup_remember_limit(limit);
+            if (upstream)
+                json_object_put(upstream);
+            return data;
+        }
+        if (data)
+            json_object_put(data);
+
+        if (!upstream) {
+            if (out_reason && reason_len)
+                snprintf(out_reason, reason_len, "rollup_call_failed_no_response");
+            return NULL;
+        }
+
+        err = app_nc_json_str(upstream, "error", app_nc_json_str(upstream, "message", ""));
+        got_bytes = app_nc_json_int64(upstream, "response_bytes", 0);
+        max_bytes = app_nc_json_int64(upstream, "response_limit_bytes", 0);
+
+        /* Anything other than an oversized reply is not fixable by shrinking. */
+        if (strcmp(err, "response_too_large") || got_bytes <= 0 || max_bytes <= 0) {
+            if (out_reason && reason_len)
+                snprintf(out_reason, reason_len, "rollup_failed_%s",
+                         err[0] ? err : "unknown_error");
+            json_object_put(upstream);
+            return NULL;
+        }
+
+        /* Scale by how far the reply overshot, then keep 15% headroom. */
+        next = (int)(((double)limit * (double)max_bytes / (double)got_bytes) * 0.85);
+        json_object_put(upstream);
+        if (next >= limit)
+            next = limit / 2;
+        if (next < WEBD_INSIGHTS_ROLLUP_HOST_LIMIT_MIN)
+            next = WEBD_INSIGHTS_ROLLUP_HOST_LIMIT_MIN;
+        if (next >= limit) {
+            if (out_reason && reason_len)
+                snprintf(out_reason, reason_len,
+                         "rollup_response_too_large_at_minimum_limit");
+            return NULL;
+        }
+        limit = next;
+        if (out_limit_reduced)
+            *out_limit_reduced = 1;
+    }
+
+    if (out_reason && reason_len)
+        snprintf(out_reason, reason_len,
+                 "rollup_response_too_large_after_%d_attempts",
+                 WEBD_INSIGHTS_ROLLUP_MAX_ATTEMPTS);
+    return NULL;
+}
+
+/*
+ * Walk every page of the host rollup, not just the first one that fits.
+ *
+ * Shrinking the limit keeps the reply under the ubus ceiling but throws away
+ * the tail of the window: on 30.1 the adaptive read converged to ~16180 of
+ * 16000+ hosts and reported truncated=true on every request, pinning coverage
+ * at 0.825 with no limit choice able to do better. The server now accepts an
+ * offset, so the fix is to keep asking rather than to ask for less.
+ *
+ * Pages are merged into one hosts[] array so the annotation loop downstream is
+ * unchanged. The per-page counters (counted_flows) are summed; window_rows is
+ * taken from the last page because every page measures the same window with the
+ * same WHERE clause.
+ *
+ * WEBD_INSIGHTS_ROLLUP_MAX_PAGES bounds the total work: at the limits that
+ * currently fit this covers ~96000 hosts, well past the observed 16000, and a
+ * window somehow larger than that yields an honestly incomplete answer with
+ * pages_exhausted set rather than an unbounded stall on a live request.
+ */
+#define WEBD_INSIGHTS_ROLLUP_MAX_PAGES 6
+
+static struct json_object *webd_insights_fetch_flow_host_rollup_adaptive(
+        const struct webd_insights_query *q,
+        int *out_limit_used, int *out_attempts,
+        char *out_reason, size_t reason_len,
+        int *out_limit_reduced, int *out_pages, int *out_complete)
+{
+    struct json_object *merged = NULL;
+    struct json_object *merged_hosts = NULL;
+    int64_t counted_flows = 0;
+    int64_t window_rows = 0;
+    int64_t excluded_empty_flows = 0;
+    int offset = 0;
+    int total_attempts = 0;
+    int page;
+    int complete = 0;
+    /*
+     * Guard against a server that does not implement offset.
+     *
+     * An older jmxd silently ignores the parameter - verified on 30.1, where
+     * top=500&offset=100 returns the same 500 rows as offset=0 - so a paging
+     * caller would walk the same page repeatedly and double-count every host
+     * into the risk totals. That is worse than the truncation being fixed:
+     * truncation undercounts visibly, this would overcount silently. If the
+     * first page does not report the field, the walk stops after one page and
+     * the answer is the same single page the old code produced.
+     */
+    int server_pages = 0;
+
+    if (out_pages)
+        *out_pages = 0;
+    if (out_complete)
+        *out_complete = 0;
+
+    for (page = 1; page <= WEBD_INSIGHTS_ROLLUP_MAX_PAGES; page++) {
+        int page_limit = 0;
+        int page_attempts = 0;
+        int page_reduced = 0;
+        struct json_object *data = webd_insights_fetch_flow_host_rollup_page(
+            q, offset, &page_limit, &page_attempts,
+            out_reason, reason_len, &page_reduced);
+        struct json_object *hosts;
+        int rows_seen;
+        int has_more;
+        int server_next_offset;
+
+        total_attempts += page_attempts;
+        if (out_limit_used)
+            *out_limit_used = page_limit;
+        if (out_attempts)
+            *out_attempts = total_attempts;
+        if (out_limit_reduced && page_reduced)
+            *out_limit_reduced = 1;
+        if (out_pages)
+            *out_pages = page;
+
+        if (!data) {
+            /*
+             * A failed first page means no answer at all; out_reason already
+             * says why. A failure part-way through leaves the pages already
+             * collected, which is a genuinely partial result - keep it and let
+             * the caller mark it incomplete rather than discarding good data.
+             */
+            if (!merged)
+                return NULL;
+            break;
+        }
+
+        hosts = webd_obj_child_array(data, "hosts");
+        rows_seen = app_nc_json_int(data, "returned", 0) +
+                    app_nc_json_int(data, "hosts_excluded_empty", 0);
+        has_more = app_nc_json_bool(data, "has_more",
+                                    app_nc_json_bool(data, "truncated", 0));
+        server_next_offset = app_nc_json_int(data, "next_offset", 0);
+        if (page == 1)
+            server_pages = json_object_object_get(data, "next_offset") != NULL;
+        counted_flows += app_nc_json_int64(data, "counted_flows", 0);
+        excluded_empty_flows += app_nc_json_int64(data, "flows_excluded_empty_host", 0);
+        window_rows = app_nc_json_int64(data, "window_rows", window_rows);
+
+        if (!merged) {
+            /* Adopt the first page wholesale, then extend its hosts[] in
+             * place, so every scalar field the caller may read survives. */
+            merged = json_object_get(data);
+            merged_hosts = hosts;
+        } else if (hosts && merged_hosts) {
+            int i, n = (int)json_object_array_length(hosts);
+
+            for (i = 0; i < n; i++)
+                json_object_array_add(merged_hosts,
+                    json_object_get(json_object_array_get_idx(hosts, i)));
+        }
+        json_object_put(data);
+
+        if (!has_more || rows_seen <= 0) {
+            complete = 1;
+            break;
+        }
+        if (!server_pages) {
+            /* No offset support upstream: keep the first page, say it is
+             * partial, and do not risk duplicating it. */
+            if (out_reason && reason_len && !out_reason[0])
+                snprintf(out_reason, reason_len,
+                         "rollup_paging_unsupported_by_jmxd");
+            break;
+        }
+        /*
+         * Advance by the server's own next_offset so the walk stays aligned
+         * with the grouped rows it actually produced, including the empty-host
+         * bucket that is counted but never serialized. Falling back to a local
+         * sum keeps this working against a server that predates the field -
+         * though such a server also ignores offset entirely, which the caller
+         * detects as a non-advancing walk below.
+         */
+        if (server_next_offset > offset)
+            offset = server_next_offset;
+        else
+            offset += rows_seen;
+    }
+
+    if (!merged)
+        return NULL;
+
+    /* Republish the aggregate figures so they describe the whole walk rather
+     * than whichever page happened to be first. */
+    json_object_object_del(merged, "returned");
+    json_object_object_add(merged, "returned",
+        json_object_new_int(merged_hosts ?
+            (int)json_object_array_length(merged_hosts) : 0));
+    json_object_object_del(merged, "counted_flows");
+    json_object_object_add(merged, "counted_flows",
+                           json_object_new_int64(counted_flows));
+    json_object_object_del(merged, "flows_excluded_empty_host");
+    json_object_object_add(merged, "flows_excluded_empty_host",
+                           json_object_new_int64(excluded_empty_flows));
+    json_object_object_del(merged, "window_rows");
+    json_object_object_add(merged, "window_rows",
+                           json_object_new_int64(window_rows));
+    /* truncated now means "the walk did not reach the end", which is the
+     * question the caller actually needs answered. */
+    json_object_object_del(merged, "truncated");
+    json_object_object_add(merged, "truncated",
+                           json_object_new_boolean(!complete));
+    if (!complete && out_reason && reason_len && !out_reason[0])
+        snprintf(out_reason, reason_len,
+                 "rollup_pages_exhausted_after_%d_pages",
+                 WEBD_INSIGHTS_ROLLUP_MAX_PAGES);
+    if (out_complete)
+        *out_complete = complete;
+    return merged;
 }
 
 
@@ -21903,6 +22387,15 @@ static struct json_object *webd_insights_build_dataset(const struct webd_insight
         json_object_is_type(history_primary_items, json_type_array) &&
         json_object_array_length(history_primary_items) > 0;
     int risk_unknown = 0, risk_low = 0, risk_suspicious = 0, risk_concerning = 0, risk_high = 0;
+    /*
+     * Window-scoped risk totals, filled by the host-rollup annotation pass
+     * below. Declared out here because risk_matched_count is emitted after that
+     * block closes, and it must report the window population rather than the
+     * one-row sample.
+     */
+    int64_t risk_window_graded = 0;
+    int risk_window_hosts_graded = 0;
+    int risk_window_scope_valid = 0;
     int policy_item_matched_count = 0;
     int aegis_event_items_returned = 0;
     int aegis_event_items_total = 0;
@@ -22316,14 +22809,35 @@ static struct json_object *webd_insights_build_dataset(const struct webd_insight
     }
     if (!top_named_destinations)
         top_named_destinations = json_object_new_array();
-    json_object_object_add(data, "top_destinations", json_object_get(top_destinations));
-    json_object_object_add(data, "top_named_destinations", json_object_get(top_named_destinations));
-    json_object_object_add(data, "top_clients", json_object_get(top_clients));
     json_object_object_add(data, "top_apps", json_object_get(top_apps));
+    /*
+     * One key per list, not three.
+     *
+     * These lists used to be published under two or three names each, which
+     * json-c happily does because the aliases share one object: the cost is not
+     * memory, it is that every alias is serialised again on every request.
+     * Measured on 30.1, 147540 of 346022 body bytes (42.6%) were the same three
+     * lists repeated, and the router pays to encode them each time.
+     *
+     * Which name survives is dictated by the web client, not by preference:
+     * insights-flows.js topList() returns the FIRST candidate key that holds an
+     * array (insights-flows.js:294), and its candidate order puts
+     * top_all_count_by_destination / top_all_named_count_by_destination /
+     * top_all_count_by_client ahead of the shorter names, so those three are the
+     * ones that must stay. Dropping them and keeping top_destinations would
+     * still "work" only by falling through, which is a needless dependency on
+     * candidate ordering.
+     *
+     * The dropped names had no reader: within this endpoint nothing else
+     * consumes them, and dashboard.js's top_clients belongs to
+     * /api/v1/dashboard/snapshot, a different payload. Announced under
+     * capabilities.deprecated_response_keys so a client pinned to an old name
+     * gets a machine-readable signal instead of a silently missing field.
+     */
     json_object_object_add(data, "top_all_count_by_destination", top_destinations);
     json_object_object_add(data, "top_all_named_count_by_destination", json_object_get(top_named_destinations));
-    json_object_object_add(data, "top_all_count_by_named_destination", top_named_destinations);
     json_object_object_add(data, "top_all_count_by_client", top_clients);
+    json_object_put(top_named_destinations);
     if (flow_app_summary) {
         struct json_object *summary_apps = webd_obj_child_array(flow_app_summary, "items");
 
@@ -22433,11 +22947,21 @@ static struct json_object *webd_insights_build_dataset(const struct webd_insight
         json_object_object_add(all_by_risk, "concerning", json_object_new_int(risk_concerning));
         json_object_object_add(all_by_risk, "concern", json_object_new_int(risk_concerning));
         json_object_object_add(all_by_risk, "high", json_object_new_int(risk_high));
+        /* Same combined bucket as the window path; see the note there. */
+        json_object_object_add(all_by_risk, "concerning_or_high",
+            json_object_new_int(risk_concerning + risk_high));
         json_object_object_add(data, "all_count_by_risk", all_by_risk);
-        /* Explicit nulls, not zeros: a zero here is indistinguishable from a
-         * real count of zero and is exactly the confusion being fixed. */
-        json_object_object_add(data, "allowed_count_by_risk", NULL);
-        json_object_object_add(data, "blocked_count_by_risk", NULL);
+        /*
+         * These two keys are deliberately absent rather than null.
+         *
+         * They previously shipped as explicit JSON null to distinguish "no data"
+         * from a real count of zero. Acceptance asked for the null to go: a
+         * consumer reading data.allowed_count_by_risk.low throws on null but is
+         * fine with undefined, and the page's own reader (insights-flows.js:277)
+         * already falls back with `|| {}`. The unsupported state is still stated
+         * explicitly, just through action_split_supported / _reason below rather
+         * than through a null-valued key.
+         */
         json_object_object_add(data, "action_split_supported", json_object_new_boolean(0));
         json_object_object_add(data, "action_split_reason",
             json_object_new_string("risk_annotation_is_reputation_only_and_carries_no_policy_action"));
@@ -22462,7 +22986,16 @@ static struct json_object *webd_insights_build_dataset(const struct webd_insight
              * the sampled counters above remain the answer, and the scope field
              * says which one the caller got.
              */
-            struct json_object *rollup = webd_insights_fetch_flow_host_rollup(q, 20000);
+            int rollup_limit_used = 0;
+            int rollup_attempts = 0;
+            int rollup_limit_reduced = 0;
+            int rollup_pages = 0;
+            int rollup_complete = 0;
+            char rollup_fail_reason[96] = "";
+            struct json_object *rollup = webd_insights_fetch_flow_host_rollup_adaptive(
+                q, &rollup_limit_used, &rollup_attempts,
+                rollup_fail_reason, sizeof(rollup_fail_reason),
+                &rollup_limit_reduced, &rollup_pages, &rollup_complete);
             struct json_object *rollup_hosts = webd_obj_child_array(rollup, "hosts");
             int rollup_ok = rollup && app_nc_json_bool(rollup, "ok", 0) && rollup_hosts;
 
@@ -22471,6 +23004,7 @@ static struct json_object *webd_insights_build_dataset(const struct webd_insight
                 int64_t w_concerning = 0, w_high = 0;
                 int hn = (int)json_object_array_length(rollup_hosts);
                 int hi;
+                int graded_hosts = 0;
 
                 for (hi = 0; hi < hn; hi++) {
                     struct json_object *h = json_object_array_get_idx(rollup_hosts, hi);
@@ -22494,6 +23028,8 @@ static struct json_object *webd_insights_build_dataset(const struct webd_insight
                         w_high += flows;
                     else
                         w_unknown += flows;
+                    if (strcasecmp(ann.risk, "unknown"))
+                        graded_hosts++;
                 }
                 counted = (int)(w_unknown + w_low + w_suspicious +
                                 w_concerning + w_high);
@@ -22507,6 +23043,21 @@ static struct json_object *webd_insights_build_dataset(const struct webd_insight
                     json_object_object_add(by_risk, "concerning", json_object_new_int64(w_concerning));
                     json_object_object_add(by_risk, "concern", json_object_new_int64(w_concerning));
                     json_object_object_add(by_risk, "high", json_object_new_int64(w_high));
+                    /*
+                     * Also expose the severe total as one number.
+                     *
+                     * The page derives its third card with
+                     * firstNumber(all.concern, all.concerning, ..., all.high),
+                     * and firstNumber() returns the first *finite* value
+                     * (insights-flows.js:116). concerning=0 is finite, so it
+                     * wins and high is never consulted: a genuine high count is
+                     * shadowed by a zero rather than being unmapped. Publishing
+                     * the combined figure lets the card show severe traffic
+                     * without the frontend having to add a fourth bucket, and
+                     * without changing the meaning of the existing keys.
+                     */
+                    json_object_object_add(by_risk, "concerning_or_high",
+                        json_object_new_int64(w_concerning + w_high));
                     json_object_object_add(data, "all_count_by_risk", by_risk);
                 }
                 json_object_object_del(data, "risk_count_total");
@@ -22516,18 +23067,154 @@ static struct json_object *webd_insights_build_dataset(const struct webd_insight
                     json_object_new_int(app_nc_json_int(rollup, "returned", 0)));
                 json_object_object_add(data, "risk_count_hosts_truncated",
                     json_object_new_boolean(app_nc_json_bool(rollup, "truncated", 0)));
+                /*
+                 * Publish the window-scoped graded totals here.
+                 *
+                 * risk_matched_count used to be computed further down from the
+                 * sampled risk_* counters, which walk history_primary_items.
+                 * On the summary path that array is a single probe row
+                 * (WEBD_INSIGHTS_AGGREGATE_ROW_PROBE), so the field reported 0
+                 * while all_count_by_risk showed real graded flows from this
+                 * very loop. A caller then saw risk_overlay_applied=true next
+                 * to risk_matched_count=0 and reasonably concluded the overlay
+                 * had matched nothing.
+                 */
+                risk_window_graded = w_low + w_suspicious + w_concerning + w_high;
+                risk_window_hosts_graded = graded_hosts;
+                risk_window_scope_valid = 1;
             }
 
             json_object_object_add(data, "risk_count_scope",
                 json_object_new_string(rollup_ok ? "window_rows_by_host" : "sampled_rows"));
             json_object_object_add(data, "risk_count_is_window_total",
                 json_object_new_boolean(rollup_ok ? 1 : 0));
+            /*
+             * Say out loud how the preferred path went. Without these, a
+             * degraded answer looked exactly like a healthy one that happened
+             * to find nothing: risk_count_scope=sampled_rows was the only
+             * signal, and it cannot distinguish "rollup unavailable" from
+             * "rollup reply too large" from "rollup not implemented".
+             * diagnostics.timing even showed the call succeeding, which sent
+             * the first investigation down the wrong path entirely.
+             */
+            json_object_object_add(data, "risk_count_host_limit_used",
+                json_object_new_int(rollup_limit_used));
+            json_object_object_add(data, "risk_count_rollup_attempts",
+                json_object_new_int(rollup_attempts));
+            json_object_object_add(data, "risk_count_host_limit_reduced",
+                json_object_new_boolean(rollup_limit_reduced));
+            json_object_object_add(data, "risk_count_rollup_pages",
+                json_object_new_int(rollup_pages));
+            json_object_object_add(data, "risk_count_fallback_reason",
+                json_object_new_string(rollup_ok ? "" :
+                    (rollup_fail_reason[0] ? rollup_fail_reason :
+                     "rollup_unavailable_reason_unreported")));
+            /*
+             * Completeness is now decided by whether the paged walk reached the
+             * end, not by whether the limit shrank.
+             *
+             * Those were the same question only while a single request had to
+             * cover the window: a smaller limit then meant a shorter answer. Now
+             * a smaller limit just means more pages, and deriving "capped" from
+             * it would report every busy window as incomplete even after the
+             * walk counted every host - understating coverage instead of
+             * overstating it, but still wrong.
+             */
+            json_object_object_add(data, "risk_count_host_limit_capped",
+                json_object_new_boolean(rollup_ok && !rollup_complete));
             json_object_object_add(data, "risk_count_sampled_rows",
                 json_object_new_int(counted));
             json_object_object_add(data, "risk_count_window_rows",
                 json_object_new_int64(total));
             json_object_object_add(data, "risk_count_coverage_ratio",
                 json_object_new_double(total > 0 ? (double)counted / (double)total : 0.0));
+            /*
+             * Two different coverage questions, answered separately because
+             * conflating them is what made this look like a backend outage:
+             *
+             *   risk_count_coverage_ratio   how many window rows were examined
+             *                               (a resolvable destination existed)
+             *   risk_graded_coverage_ratio  how many of those got a real verdict
+             *
+             * On 30.1 the first is ~0.88 while the second is ~0.00007: nearly
+             * every row is examined and almost none is rated, because the
+             * reputation feeds simply do not contain this traffic's
+             * destinations. Publishing only the first invited the reading that
+             * 88% of traffic had been assessed and found safe.
+             */
+            if (risk_window_scope_valid) {
+                json_object_object_add(data, "risk_graded_flows",
+                    json_object_new_int64(risk_window_graded));
+                json_object_object_add(data, "risk_ungraded_flows",
+                    json_object_new_int64(counted > risk_window_graded ?
+                                          counted - risk_window_graded : 0));
+                json_object_object_add(data, "risk_graded_coverage_ratio",
+                    json_object_new_double(counted > 0 ?
+                        (double)risk_window_graded / (double)counted : 0.0));
+                json_object_object_add(data, "risk_graded_hosts",
+                    json_object_new_int(risk_window_hosts_graded));
+                /*
+                 * "unknown" means not present in any loaded feed, which is not
+                 * a safety judgement. Named explicitly so a UI cannot render it
+                 * as a clean bill of health.
+                 */
+                webd_obj_add_str(data, "risk_unknown_meaning",
+                    "destination_absent_from_loaded_reputation_feeds_not_assessed_safe");
+                webd_obj_add_str(data, "risk_unknown_reason",
+                    risk_window_hosts_graded > 0 ?
+                        "feeds_loaded_and_matching_but_cover_few_of_this_windows_destinations" :
+                        "no_destination_in_this_window_appears_in_any_loaded_feed");
+            }
+            else {
+                /*
+                 * The degraded path must publish this group too.
+                 *
+                 * These fields exist to stop a reader treating "unknown" as a
+                 * clean bill of health, and they used to be emitted only when
+                 * the rollup succeeded. That meant a rollup failure removed
+                 * precisely the fields that explain how little was examined,
+                 * leaving risk_count_coverage_ratio=3.3e-06 as the only hint -
+                 * a number a UI that does not special-case it renders as "no
+                 * risks found". Failure is stated with a scope label and a
+                 * reason, never by making fields disappear.
+                 *
+                 * The figures below are measured over the sampled rows only,
+                 * which risk_graded_scope says explicitly. They are not
+                 * window totals and must not be read as such.
+                 */
+                int64_t sampled_graded = (int64_t)(risk_low + risk_suspicious +
+                                                   risk_concerning + risk_high);
+
+                json_object_object_add(data, "risk_graded_flows",
+                    json_object_new_int64(sampled_graded));
+                json_object_object_add(data, "risk_ungraded_flows",
+                    json_object_new_int64(counted > sampled_graded ?
+                                          counted - sampled_graded : 0));
+                json_object_object_add(data, "risk_graded_coverage_ratio",
+                    json_object_new_double(counted > 0 ?
+                        (double)sampled_graded / (double)counted : 0.0));
+                /*
+                 * Distinct graded hosts are only countable on the rollup path.
+                 * Emitted as null with an explicit flag rather than 0, because
+                 * a zero here is indistinguishable from "nothing was rated".
+                 */
+                json_object_object_add(data, "risk_graded_hosts", NULL);
+                json_object_object_add(data, "risk_graded_hosts_measured",
+                    json_object_new_boolean(0));
+                webd_obj_add_str(data, "risk_unknown_meaning",
+                    "destination_absent_from_loaded_reputation_feeds_not_assessed_safe");
+                webd_obj_add_str(data, "risk_unknown_reason",
+                    "window_grading_unavailable_figures_cover_sampled_rows_only");
+            }
+            /*
+             * Which population the risk_graded_* group describes, on both
+             * paths, so it can never be mistaken for the window total.
+             */
+            webd_obj_add_str(data, "risk_graded_scope",
+                risk_window_scope_valid ? "window_rows_by_host" : "sampled_rows");
+            json_object_object_add(data, "risk_graded_window_complete",
+                json_object_new_boolean(risk_window_scope_valid &&
+                                        rollup_complete));
             json_object_object_add(data, "risk_count_uncounted_rows",
                 json_object_new_int64(total > counted ? total - counted : 0));
             json_object_object_add(data, "risk_count_reason",
@@ -22547,7 +23234,21 @@ static struct json_object *webd_insights_build_dataset(const struct webd_insight
          flow_top_destination_count > 0 ||
          flow_top_named_destination_count > 0)));
     json_object_object_add(data, "risk_matched_count",
-                           json_object_new_int(risk_low + risk_suspicious + risk_concerning + risk_high));
+        json_object_new_int64(risk_window_scope_valid ?
+                              risk_window_graded :
+                              (int64_t)(risk_low + risk_suspicious +
+                                        risk_concerning + risk_high)));
+    /*
+     * Say which population risk_matched_count describes, and how many distinct
+     * destinations actually carried a verdict. Without the host figure a reader
+     * cannot tell "the feeds know almost nothing about this traffic" from "the
+     * lookup is broken", which is exactly the ambiguity that produced this
+     * defect report.
+     */
+    webd_obj_add_str(data, "risk_matched_scope",
+                     risk_window_scope_valid ? "window_rows_by_host" : "sampled_rows");
+    json_object_object_add(data, "risk_matched_hosts",
+        json_object_new_int(risk_window_scope_valid ? risk_window_hosts_graded : 0));
     json_object_object_add(data, "risk_annotation_source", json_object_new_string(
         webd_insights_risk_available(&risk_ctx) ? "webd.aegis_reputation_overlay" : "unavailable"));
     json_object_object_add(data, "aegis_events", webd_insights_aegis_stats_json(&aegis_stats, q ? q->top : 30));
@@ -22656,6 +23357,25 @@ static struct json_object *webd_insights_build_dataset(const struct webd_insight
                                json_object_new_boolean(event_lifecycle_active));
         json_object_object_add(cap, "dnat_local_termination_supported",
                                json_object_new_boolean(event_lifecycle_active));
+        /*
+         * Names this endpoint used to publish as aliases of the lists above.
+         * Stated explicitly so a client that still reads one of them can tell a
+         * removed key from an empty result, which is otherwise the same "no
+         * array here" from the client's point of view.
+         */
+        {
+            struct json_object *gone = json_object_new_array();
+
+            json_object_array_add(gone, json_object_new_string("top_destinations"));
+            json_object_array_add(gone, json_object_new_string("top_named_destinations"));
+            json_object_array_add(gone, json_object_new_string("top_clients"));
+            json_object_array_add(gone,
+                json_object_new_string("top_all_count_by_named_destination"));
+            json_object_object_add(cap, "deprecated_response_keys", gone);
+            webd_obj_add_str(cap, "deprecated_response_keys_replacement",
+                "top_all_count_by_destination,top_all_named_count_by_destination,"
+                "top_all_count_by_client");
+        }
         json_object_object_add(data, "capabilities", cap);
     }
     {
@@ -24065,6 +24785,19 @@ static int webd_insights_geo_apply_exact_region_bytes(struct json_object *region
             webd_obj_add_str(region, "byte_source", "audit_flow_geo_summary_window_exact");
             json_object_object_add(region, "bytes_are_sample_only", json_object_new_boolean(0));
             json_object_object_add(region, "bytes_window_scoped", json_object_new_boolean(1));
+            /*
+             * Two different measurements, not two precisions of one.
+             *
+             * `bytes` is the SQL aggregate over the whole window. `*_sampled`
+             * is what the bounded row sample happened to observe, kept only so
+             * the sample size stays inspectable -- it can be thousands of times
+             * smaller and is never the figure to display. They were previously
+             * distinguishable only by name, which is how a few hundred bytes
+             * could be rendered where tens of megabytes were meant.
+             */
+            webd_obj_add_str(region, "bytes_field_to_display", "bytes");
+            webd_obj_add_str(region, "bytes_sampled_meaning",
+                "bytes observed in the bounded coordinate row sample; diagnostic only, not a window total");
             applied++;
             break;
         }
@@ -26050,6 +26783,21 @@ static struct json_object *webd_insights_geo_from_flows(const struct webd_insigh
      * coordinates still come from a bounded row sample.  The generic
      * byte_accounting_* capability describes per-row counter exactness and is
      * deliberately left alone; these two describe the map's own aggregation. */
+    /* Read the per-row counter verdict before the block below re-points the
+     * generic names at this response's aggregate figures. */
+    int row_byte_counters_exact = app_nc_json_bool(cap, "byte_accounting_exact", 0);
+    /*
+     * Copied rather than aliased: app_nc_json_str() hands back a pointer into
+     * the json string it found, and the block below replaces that very key, so
+     * holding the pointer would read freed memory and report the new aggregate
+     * source as if it were the per-row one.
+     */
+    char row_byte_counter_source[96];
+
+    snprintf(row_byte_counter_source, sizeof(row_byte_counter_source), "%s",
+             app_nc_json_str(cap, "byte_accounting_source",
+                             "sampled_conntrack_counters"));
+
     json_object_object_add(cap, "region_bytes_window_aggregated",
                            json_object_new_boolean(exact_region_bytes_applied > 0));
     json_object_object_add(cap, "region_bytes_sample_only",
@@ -26058,6 +26806,80 @@ static struct json_object *webd_insights_geo_from_flows(const struct webd_insigh
                            json_object_new_string(exact_region_bytes_applied > 0 ?
                                "audit_flow_geo_summary_group_by_destination_country" :
                                "sampled_flow_rows"));
+    /*
+     * Say what this response's region bytes actually are, in `capabilities`,
+     * under a name that cannot be confused with the per-row counter flags.
+     *
+     * `byte_accounting_exact` / `exact_window_bytes` describe whether an
+     * individual conntrack row's counters are exact, and both are false while
+     * ctnetlink destroy events are unavailable. That is true and stays true.
+     * But a caller looking for "are the map's byte totals a sample?" found only
+     * those two, read false, and labelled a window-exact 50 MB aggregate as
+     * sample-only -- the opposite of what the top-level
+     * `bytes_are_sample_only` said in the same payload. Both fields were
+     * individually honest and together they contradicted each other.
+     *
+     * These mirror the top-level verdict so `capabilities` and the top level
+     * can no longer disagree, and they name their scope so neither can be
+     * mistaken for the other's question.
+     */
+    json_object_object_add(cap, "geo_region_bytes_are_sample_only",
+                           json_object_new_boolean(exact_region_bytes_applied <= 0));
+    json_object_object_add(cap, "geo_region_bytes_window_exact",
+                           json_object_new_boolean(exact_region_bytes_applied > 0));
+    json_object_object_add(cap, "geo_region_byte_source",
+                           json_object_new_string(exact_region_bytes_applied > 0 ?
+                               "audit_flow_geo_summary_window_exact" :
+                               "sampled_flow_rows"));
+    /* Scope note for the two generic flags above, so a reader does not have to
+     * infer which question they answer. */
+    json_object_object_add(cap, "byte_accounting_exact_scope",
+                           json_object_new_string("per_conntrack_row_counters"));
+    json_object_object_add(cap, "exact_window_bytes_scope",
+                           json_object_new_string("per_conntrack_row_counters"));
+    /*
+     * The frontend's sampled check looks for `bytes_are_sample_only` inside
+     * `capabilities` and only ever found it at the top level, so that first
+     * (and correct) test never fired and it fell through to the per-row flags.
+     * Publishing it in both places, from the same value, removes the need to
+     * change the client to fix the verdict.
+     */
+    json_object_object_add(cap, "bytes_are_sample_only",
+                           json_object_new_boolean(exact_region_bytes_applied <= 0));
+    /*
+     * Within this endpoint the reported byte figures *are* the region
+     * aggregates, so these two now describe those figures rather than the
+     * conntrack rows underneath them. Leaving them describing per-row counters
+     * is what made a window-exact aggregate report itself as sample-only, and
+     * a client cannot be expected to know that two identically-named exactness
+     * flags answer different questions.
+     *
+     * The per-row truth is not lost: it moves to the explicitly named fields
+     * below, which keep reporting the conntrack counter state verbatim.
+     */
+    if (exact_region_bytes_applied > 0) {
+        json_object_object_del(cap, "byte_accounting_exact");
+        json_object_object_add(cap, "byte_accounting_exact",
+                               json_object_new_boolean(1));
+        json_object_object_del(cap, "exact_window_bytes");
+        json_object_object_add(cap, "exact_window_bytes",
+                               json_object_new_boolean(1));
+        json_object_object_del(cap, "byte_accounting_source");
+        json_object_object_add(cap, "byte_accounting_source",
+            json_object_new_string("audit_flow_geo_summary_window_exact"));
+        json_object_object_del(cap, "byte_accounting_exact_scope");
+        json_object_object_add(cap, "byte_accounting_exact_scope",
+            json_object_new_string("geo_region_window_aggregate"));
+        json_object_object_del(cap, "exact_window_bytes_scope");
+        json_object_object_add(cap, "exact_window_bytes_scope",
+            json_object_new_string("geo_region_window_aggregate"));
+    }
+    /* Per-conntrack-row counter state, reported unconditionally and under a
+     * name that says exactly what it covers. */
+    json_object_object_add(cap, "per_row_byte_counters_exact",
+                           json_object_new_boolean(row_byte_counters_exact));
+    json_object_object_add(cap, "per_row_byte_counter_source",
+                           json_object_new_string(row_byte_counter_source));
     json_object_object_add(cap, "route_aggregation_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "route_aggregation_key",
         json_object_new_string("direction|local_wan_id|client_ip|remote_ip|protocol|service|destination_port"));
@@ -31185,6 +32007,32 @@ static struct json_object *app_ubus_invoke(const char *method, struct json_objec
     return app_ubus_invoke_object("dreamingwrt", method, params);
 }
 
+/*
+ * Core call for the AI read routes.
+ *
+ * These read tables that are usually untouched, so the first request after a
+ * restart pays the cold cost of opening them: ai_providers_list measured 406ms
+ * on the first call and 2ms afterwards on 30.1. The default 2000ms is normally
+ * plenty, but webd forks per request, and a cold window plus concurrent first
+ * fetches can exhaust it. The result was a timeout surfacing as a 400 whose body
+ * said code:200 -- the bug this pairs with.
+ *
+ * 6000ms applies only to these reads rather than raising the global default,
+ * because a slow answer here delays one panel while a globally longer timeout
+ * would let every stuck call hold a worker three times as long.
+ *
+ * Fills `diag` so the envelope can name the failing stage.
+ */
+#define WEBD_AI_READ_UBUS_TIMEOUT_MS 6000
+
+static struct json_object *webd_ai_read_invoke(const char *method,
+                                               struct json_object *params,
+                                               struct app_ubus_call_diag *diag)
+{
+    return app_ubus_invoke_object_diag("dreamingwrt", method, params,
+                                       WEBD_AI_READ_UBUS_TIMEOUT_MS, diag);
+}
+
 struct json_object *jmx_app_core_invoke(const char *method,
                                         struct json_object *params,
                                         int timeout_ms)
@@ -32209,13 +33057,96 @@ static int app_setup_is_initialized(void)
     return initialized;
 }
 
+/*
+ * Decide whether the unauthenticated first-run write channel may stay open.
+ *
+ * setup_state.initialized alone is not trustworthy. On 30.1 it was still 0
+ * after months of production use because setup_finish had never run on that
+ * install path, which left every /api/setup/* write reachable with no
+ * credentials at all. One upstream field being wrong must not disable the
+ * whole gate, so the gate now needs several independent signals to agree.
+ *
+ * The admin account is created *before* the wizard runs (login page ->
+ * /api/v1/session/init -> wizard), so "a web user exists" cannot by itself
+ * mean "initialized" -- treating it that way would lock a genuinely new
+ * device out of the wizard it has not run yet. What it does mean is that
+ * somebody can log in, and therefore the unauthenticated channel is no longer
+ * the only way in: from that point on, setup writes must be authenticated or
+ * carry the setup session issued to the client that just created the account.
+ *
+ * Returns 1 when the public channel must be closed. Fails closed: any query
+ * error, missing field, or unreadable state counts as "closed".
+ */
+static int app_setup_public_channel_closed(int authenticated)
+{
+    struct json_object *resp = app_ubus_or_error("setup_status", NULL);
+    struct json_object *code_obj = NULL;
+    struct json_object *data = NULL;
+    struct json_object *obj = NULL;
+    int closed = 1;
+
+    if (!resp)
+        return 1;
+    if (!(json_object_object_get_ex(resp, "code", &code_obj) && code_obj &&
+          json_object_get_int(code_obj) == APP_API_CODE_SUCCESS &&
+          json_object_object_get_ex(resp, "data", &data) && data))
+        goto out;
+
+    /* An explicit initialized=true closes the channel outright. */
+    if (json_object_object_get_ex(data, "initialized", &obj) && obj &&
+        json_object_get_boolean(obj))
+        goto out;
+
+    /* A recorded completion closes it too, even if the flag column lags. */
+    if (json_object_object_get_ex(data, "setup_finished_at", &obj) && obj &&
+        json_object_get_int64(obj) > 0)
+        goto out;
+    if (json_object_object_get_ex(data, "initialized_at", &obj) && obj &&
+        json_object_get_int64(obj) > 0)
+        goto out;
+    if (json_object_object_get_ex(data, "initialized_version", &obj) && obj &&
+        json_object_get_string(obj) && json_object_get_string(obj)[0])
+        goto out;
+    if (json_object_object_get_ex(data, "completed_by", &obj) && obj &&
+        json_object_get_string(obj) && json_object_get_string(obj)[0])
+        goto out;
+
+    /*
+     * web_users state must be readable before the channel may be opened; an
+     * unreadable count is exactly the case that must not fall open.
+     */
+    if (!(json_object_object_get_ex(data, "web_users_known", &obj) && obj &&
+          json_object_get_boolean(obj)))
+        goto out;
+
+    if (json_object_object_get_ex(data, "web_user_count", &obj) && obj &&
+        json_object_get_int(obj) > 0) {
+        /*
+         * A login exists. The wizard may legitimately still be unfinished, so
+         * the route stays reachable, but only for a caller that proved who it
+         * is -- an authenticated session, or the setup session handed to the
+         * client that created the account. The caller checks the setup session
+         * itself; here we only refuse the fully anonymous case.
+         */
+        closed = !authenticated;
+        goto out;
+    }
+
+    /* No users, no completion record: a genuinely uninitialized device. */
+    closed = 0;
+
+out:
+    json_object_put(resp);
+    return closed;
+}
+
 static struct json_object *app_setup_first_run_required_response(void)
 {
     struct json_object *data = json_object_new_object();
 
     json_object_object_add(data, "ok", json_object_new_boolean(0));
     json_object_object_add(data, "error", json_object_new_string("wizard_already_initialized"));
-    json_object_object_add(data, "message", json_object_new_string("setup writes require first_run=true or authenticated reset_wizard"));
+    json_object_object_add(data, "message", json_object_new_string("setup writes require an uninitialized router with no web login, or an authenticated session / reset_wizard"));
     json_object_object_add(data, "ts", json_object_new_int64(now_s()));
     return app_jmx_response_data(APP_API_CODE_ERROR, data);
 }
@@ -32260,6 +33191,38 @@ static struct json_object *webd_init_status_data(void)
     json_object_object_add(data, "user_count", json_object_new_int(available ? users : 0));
     json_object_object_add(data, "user_count_known", json_object_new_boolean(available));
     json_object_object_add(data, "requires_initial_setup", json_object_new_boolean(available && users == 0));
+    /*
+     * This endpoint and /api/v1/setup/status both publish a boolean called
+     * "initialized", and they mean different things:
+     *
+     *   here                 an account exists, so the device can be logged into
+     *   setup/status         the setup wizard ran to completion
+     *
+     * Neither is wrong, but the shared name made them look like a
+     * contradiction. A device provisioned by jmctl or a direct database write
+     * gets a user without ever touching setup_state, so this endpoint says true
+     * while setup/status says false - which is exactly what 30.1 reports.
+     *
+     * Naming the scope, and stating which question decides whether to gate the
+     * UI, is the point: a consumer should not have to compare two endpoints to
+     * work out whether to show a wizard.
+     */
+    webd_obj_add_str(data, "initialized_scope", "login_capability_account_exists");
+    webd_obj_add_str(data, "initialized_meaning",
+                     "an_account_exists_so_the_device_can_be_logged_into");
+    webd_obj_add_str(data, "initialized_source", "config.db:web_users_count");
+    /*
+     * The gate answer. Login capability is what decides whether a first-run
+     * wizard must be forced: a device with an account is usable, whether or not
+     * the wizard was ever completed. An incomplete wizard is a thing to offer,
+     * not a reason to block the console.
+     */
+    json_object_object_add(data, "login_gate_required",
+                           json_object_new_boolean(available && users == 0));
+    webd_obj_add_str(data, "login_gate_authority", "session_init_user_count");
+    webd_obj_add_str(data, "wizard_completion_source", "/api/v1/setup/status");
+    webd_obj_add_str(data, "wizard_completion_note",
+                     "setup_status_initialized_reports_wizard_completion_not_login_capability");
     json_object_object_add(data, "default_username", json_object_new_string("root"));
     json_object_object_add(data, "password_algorithm", json_object_new_string("pbkdf2-sha256"));
     json_object_object_add(data, "password_iterations", json_object_new_int(WEBD_PBKDF2_ITER));
@@ -33226,7 +34189,8 @@ static void webd_policy_collect_pbr_config_db(struct json_object *rows, int *row
 
     if (sqlite3_prepare_v2(db,
         "SELECT id,enabled,priority,name,source_object,dest_object,proto,ports,action,"
-        "target,route_table,schedule,sticky,comment,hit_count,last_hit,updated_at "
+        "target,route_table,schedule,sticky,comment,hit_count,last_hit,updated_at,"
+        "source_kind,source_ref,pin_wan "
         "FROM policy_route_rule ORDER BY priority,id",
         -1, &st, NULL) == SQLITE_OK) {
         while (sqlite3_step(st) == SQLITE_ROW) {
@@ -33234,8 +34198,10 @@ static void webd_policy_collect_pbr_config_db(struct json_object *rows, int *row
             char name[256];
             char proto_label[128];
             char target[256];
+            const char *source_label;
             struct json_object *raw = json_object_new_object();
 
+            source_label = (const char *)sqlite3_column_text(st, 4);
             snprintf(id, sizeof(id), "policy_route_rule.%s",
                      (const char *)sqlite3_column_text(st, 0) ? (const char *)sqlite3_column_text(st, 0) : "");
             snprintf(name, sizeof(name), "%s",
@@ -33254,9 +34220,28 @@ static void webd_policy_collect_pbr_config_db(struct json_object *rows, int *row
             webd_obj_add_str(raw, "schedule", (const char *)sqlite3_column_text(st, 11));
             json_object_object_add(raw, "sticky", json_object_new_boolean(sqlite3_column_int(st, 12)));
             webd_obj_add_str(raw, "comment", (const char *)sqlite3_column_text(st, 13));
+            {
+                const char *sk = (const char *)sqlite3_column_text(st, 17);
+                const char *sr = (const char *)sqlite3_column_text(st, 18);
+
+                webd_obj_add_str(raw, "source_kind", (sk && sk[0]) ? sk : "object");
+                webd_obj_add_str(raw, "source_ref", sr ? sr : "");
+                json_object_object_add(raw, "pin_wan",
+                                      json_object_new_boolean(sqlite3_column_int(st, 19)));
+                /* source_display is what the source column should show: an
+                 * interface/zone rule has no source_object to render, and
+                 * showing the empty object reference reads as "any". */
+                if (sk && sk[0] && strcmp(sk, "object") && sr && sr[0]) {
+                    char disp[192];
+
+                    snprintf(disp, sizeof(disp), "%s:%s", sk, sr);
+                    webd_obj_add_str(raw, "source_display", disp);
+                    source_label = sr;
+                }
+            }
             webd_policy_row_add(rows, row_index, 1, id, name, "pbr", "convert",
                                 proto_label,
-                                "任何", (const char *)sqlite3_column_text(st, 4),
+                                "任何", source_label,
                                 "任何", (const char *)sqlite3_column_text(st, 5),
                                 ((const char *)sqlite3_column_text(st, 7) && ((const char *)sqlite3_column_text(st, 7))[0]) ?
                                 (const char *)sqlite3_column_text(st, 7) : "任何",
@@ -33671,11 +34656,51 @@ static struct json_object *webd_policy_capabilities(void)
     json_object_object_add(cap, "zones_crud", json_object_new_boolean(1));
     json_object_object_add(cap, "zone_member_uniqueness", json_object_new_boolean(1));
     json_object_object_add(cap, "zone_matrix", json_object_new_boolean(1));
+    /*
+     * PBR source dimension. These are deliberately separate from objects_crud:
+     * an interface/zone source needs no entry in the object catalogue, so it is
+     * available while objects_crud is still blocked.
+     */
+    json_object_object_add(cap, "pbr_source_kinds_supported", json_object_new_boolean(1));
+    {
+        struct json_object *kinds = json_object_new_array();
+
+        json_object_array_add(kinds, json_object_new_string("object"));
+        json_object_array_add(kinds, json_object_new_string("interface"));
+        json_object_array_add(kinds, json_object_new_string("zone"));
+        json_object_array_add(kinds, json_object_new_string("network"));
+        json_object_object_add(cap, "pbr_source_kinds", kinds);
+    }
+    json_object_object_add(cap, "pbr_source_interface", json_object_new_boolean(1));
+    json_object_object_add(cap, "pbr_source_zone", json_object_new_boolean(1));
+    json_object_object_add(cap, "pbr_pin_wan", json_object_new_boolean(1));
+    json_object_object_add(cap, "pbr_pin_wan_scope",
+                           json_object_new_string("interface_zone_network_sources_only"));
+    json_object_object_add(cap, "pbr_pin_wan_enforcement",
+                           json_object_new_string("ip_rule_iif_above_fwmark_rules"));
+    json_object_object_add(cap, "pbr_pin_wan_on_target_wan_down",
+                           json_object_new_string("stays_pinned_traffic_blackholes_until_wan_returns"));
     json_object_object_add(cap, "objects_list", json_object_new_boolean(1));
     json_object_object_add(cap, "objects_crud", json_object_new_boolean(0));
     json_object_object_add(cap, "objects_atomic_apply", json_object_new_boolean(0));
     json_object_object_add(cap, "objects_write_blocked_reason",
                            json_object_new_string("cross_component_firewall_pbr_sqm_flowd_transaction_pending"));
+    /*
+     * objects_crud here is the COMPOSITE object catalog spanning firewall, PBR, SQM
+     * and flowd, which cannot be written until those four share one rollback
+     * transaction. routed reports object_crud=1 for a different resource: its own
+     * route_object table, which really is writable. Both readings were correct and
+     * the interface gave no way to tell them apart, so the scope is now explicit
+     * and each side points at the other's write endpoint.
+     */
+    json_object_object_add(cap, "objects_crud_scope",
+                           json_object_new_string("policy_engine:composite_object"));
+    json_object_object_add(cap, "route_object_crud", json_object_new_boolean(1));
+    json_object_object_add(cap, "route_object_crud_scope",
+                           json_object_new_string("routed:route_object"));
+    json_object_object_add(cap, "route_object_crud_owner", json_object_new_string("routed"));
+    json_object_object_add(cap, "route_object_write_endpoint",
+                           json_object_new_string("/api/v1/routing/objects"));
     return cap;
 }
 
@@ -34817,6 +35842,9 @@ static int webd_policy_pbr_db_init(sqlite3 *db, char *err, size_t err_len)
         "enabled INTEGER NOT NULL DEFAULT 1,"
         "priority INTEGER NOT NULL,"
         "name TEXT NOT NULL,"
+        "source_kind TEXT NOT NULL DEFAULT 'object',"
+        "source_ref TEXT NOT NULL DEFAULT '',"
+        "pin_wan INTEGER NOT NULL DEFAULT 0,"
         "source_object TEXT NOT NULL DEFAULT '',"
         "dest_object TEXT NOT NULL DEFAULT '',"
         "proto TEXT NOT NULL DEFAULT 'all',"
@@ -34845,8 +35873,27 @@ static int webd_policy_pbr_db_init(sqlite3 *db, char *err, size_t err_len)
         "bytes INTEGER NOT NULL DEFAULT 0"
         ");"
         "INSERT OR IGNORE INTO advanced_routing_global(id) VALUES(1);";
+    /*
+     * The CREATE above only shapes a fresh database. Deployed routers already
+     * have policy_route_rule without these columns, so migrate explicitly --
+     * otherwise every insert naming source_kind fails with "no such column"
+     * on exactly the devices that matter.
+     */
+    static const char *const migrations[] = {
+        "ALTER TABLE policy_route_rule ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'object'",
+        "ALTER TABLE policy_route_rule ADD COLUMN source_ref TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE policy_route_rule ADD COLUMN pin_wan INTEGER NOT NULL DEFAULT 0",
+        NULL
+    };
+    int i;
 
-    return webd_policy_db_exec(db, schema, err, err_len);
+    if (webd_policy_db_exec(db, schema, err, err_len) != 0)
+        return -1;
+    /* A duplicate-column error means the migration already ran; ignore it and
+     * let a real failure surface on first use instead of refusing to start. */
+    for (i = 0; migrations[i]; i++)
+        (void)sqlite3_exec(db, migrations[i], NULL, NULL, NULL);
+    return 0;
 }
 
 static int webd_policy_pbr_id_ok(const char *s);
@@ -35519,6 +36566,15 @@ static struct json_object *webd_policy_objects_response(int *http_status)
     json_object_object_add(data, "total", json_object_new_int(0));
     json_object_object_add(data, "read_only", json_object_new_boolean(1));
     json_object_object_add(data, "blocked_by", blocked);
+    /*
+     * read_only above covers composite objects only. legacy_route_objects are
+     * routed's own objects and ARE writable through routed; say so here so the page
+     * can offer a jump instead of a dead read-only notice.
+     */
+    webd_obj_add_str(data, "read_only_scope", "policy_engine:composite_object");
+    json_object_object_add(data, "legacy_route_objects_read_only", json_object_new_boolean(0));
+    webd_obj_add_str(data, "legacy_route_objects_write_endpoint", "/api/v1/routing/objects");
+    webd_obj_add_str(data, "legacy_route_objects_owner", "routed");
     json_object_object_add(data, "capabilities", webd_policy_capabilities());
     webd_obj_add_str(data, "source", "config.db:route_object+policy_engine_contract");
     return webd_envelope(data, "webd.policy_engine.objects");
@@ -37813,6 +38869,12 @@ static int webd_policy_pbr_apply_fields(sqlite3 *db,
     static const char *name_keys[] = { "name", "label", "description", "rule_name", NULL };
     static const char *priority_keys[] = { "priority", "prio", "index", NULL };
     static const char *src_keys[] = { "source_object", "src", "src_ip", "source", "source_ip", "source_address", "src_addr", NULL };
+    static const char *src_kind_keys[] = { "source_kind", "src_kind", NULL };
+    static const char *src_ref_keys[] = {
+        "source_ref", "src_ref", "in_interface", "source_interface",
+        "source_zone", "source_network", "in_network", NULL
+    };
+    static const char *pin_keys[] = { "pin_wan", "pin", "exclude_from_balance", NULL };
     static const char *dst_keys[] = { "dest_object", "dst", "destination", "destination_ip", "dest_ip", "destination_address", "dest_addr", NULL };
     static const char *proto_keys[] = { "proto", "protocol", "ip_protocol", NULL };
     static const char *ports_keys[] = { "ports", "dest_port", "destination_port", "dst_port", "port", NULL };
@@ -37834,6 +38896,10 @@ static int webd_policy_pbr_apply_fields(sqlite3 *db,
     char route_table[128] = "";
     char schedule[128] = "always";
     char comment[512] = "";
+    char src_kind[32] = "";
+    char src_ref[128] = "";
+    int pin_wan = 0;
+    int pin_present = 0;
     int priority;
     int enabled = 1;
     int present = 0;
@@ -37873,6 +38939,9 @@ static int webd_policy_pbr_apply_fields(sqlite3 *db,
     webd_policy_body_string_any(body, action_keys, action_raw, sizeof(action_raw));
     webd_policy_body_string_any(body, schedule_keys, schedule, sizeof(schedule));
     webd_policy_body_string_any(body, comment_keys, comment, sizeof(comment));
+    webd_policy_body_string_any(body, src_kind_keys, src_kind, sizeof(src_kind));
+    webd_policy_body_string_any(body, src_ref_keys, src_ref, sizeof(src_ref));
+    pin_wan = webd_policy_body_bool_any(body, pin_keys, 0, &pin_present);
     webd_policy_pbr_target_from_body(body, target, sizeof(target), route_table, sizeof(route_table));
     enabled = webd_policy_body_bool_any(body, enabled_keys, 1, &present);
     if (!strcmp(operation, "disable"))
@@ -37885,6 +38954,57 @@ static int webd_policy_pbr_apply_fields(sqlite3 *db,
     if (priority <= 0 || priority > 65535) {
         if (err && err_len)
             snprintf(err, err_len, "priority must be 1..65535");
+        return -1;
+    }
+    /*
+     * Source dimension. Default stays "object" so existing callers that only
+     * send source_object behave exactly as before. An interface/zone/network
+     * source needs a ref, and must not be silently accepted without one --
+     * a kind with no ref would match every inbound interface.
+     */
+    if (!src_kind[0]) {
+        snprintf(src_kind, sizeof(src_kind), "%s", src_ref[0] ? "interface" : "object");
+    } else {
+        for (char *p = src_kind; *p; p++)
+            *p = (char)tolower((unsigned char)*p);
+        if (!strcmp(src_kind, "iface") || !strcmp(src_kind, "in_interface"))
+            snprintf(src_kind, sizeof(src_kind), "interface");
+    }
+    if (strcmp(src_kind, "object") && strcmp(src_kind, "interface") &&
+        strcmp(src_kind, "zone") && strcmp(src_kind, "network")) {
+        if (err && err_len)
+            snprintf(err, err_len,
+                     "source_kind must be object, interface, zone or network");
+        return -1;
+    }
+    if (strcmp(src_kind, "object")) {
+        if (!src_ref[0]) {
+            if (err && err_len)
+                snprintf(err, err_len,
+                         "source_ref is required when source_kind is %s", src_kind);
+            return -1;
+        }
+        if (!webd_policy_pbr_id_ok(src_ref)) {
+            if (err && err_len)
+                snprintf(err, err_len, "source_ref contains unsupported characters");
+            return -1;
+        }
+    } else if (src_ref[0]) {
+        if (err && err_len)
+            snprintf(err, err_len,
+                     "source_ref requires source_kind interface, zone or network");
+        return -1;
+    }
+    /*
+     * pin_wan is only meaningful for a whole-interface source: it is enforced by
+     * an `ip rule iif` entry, and an IP-group rule has no inbound device to key
+     * on. Refusing it here is better than accepting a flag that silently does
+     * nothing at runtime.
+     */
+    if (pin_wan && !strcmp(src_kind, "object")) {
+        if (err && err_len)
+            snprintf(err, err_len,
+                     "pin_wan requires source_kind interface, zone or network");
         return -1;
     }
     if (!src[0] || webd_policy_value_is_any(src))
@@ -37916,8 +39036,8 @@ static int webd_policy_pbr_apply_fields(sqlite3 *db,
     if (sqlite3_prepare_v2(db,
         "INSERT INTO policy_route_rule("
         "id,enabled,priority,name,source_object,dest_object,proto,ports,action,target,"
-        "route_table,schedule,sticky,comment,updated_at"
-        ") VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) "
+        "route_table,schedule,sticky,comment,updated_at,source_kind,source_ref,pin_wan"
+        ") VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) "
         "ON CONFLICT(id) DO UPDATE SET "
         "enabled=excluded.enabled,"
         "priority=excluded.priority,"
@@ -37932,7 +39052,10 @@ static int webd_policy_pbr_apply_fields(sqlite3 *db,
         "schedule=excluded.schedule,"
         "sticky=excluded.sticky,"
         "comment=excluded.comment,"
-        "updated_at=excluded.updated_at",
+        "updated_at=excluded.updated_at,"
+        "source_kind=excluded.source_kind,"
+        "source_ref=excluded.source_ref,"
+        "pin_wan=excluded.pin_wan",
         -1, &st, NULL) != SQLITE_OK) {
         if (err && err_len)
             snprintf(err, err_len, "prepare policy_route_rule upsert failed: %s", sqlite3_errmsg(db));
@@ -37953,6 +39076,9 @@ static int webd_policy_pbr_apply_fields(sqlite3 *db,
     sqlite3_bind_int(st, 13, app_nc_json_bool(body, "sticky", 1));
     sqlite3_bind_text(st, 14, comment, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 15, now_s());
+    sqlite3_bind_text(st, 16, src_kind, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 17, src_ref, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 18, pin_wan ? 1 : 0);
     if (sqlite3_step(st) != SQLITE_DONE) {
         if (err && err_len)
             snprintf(err, err_len, "write policy_route_rule failed: %s", sqlite3_errmsg(db));
@@ -49475,23 +50601,121 @@ static int webd_local_utc_offset_minutes(void)
     return (int)((mktime(&lt) - mktime(&gt)) / 60);
 }
 
+/*
+ * The accepted activity ranges, in one place.
+ *
+ * Validation, the rejection message and the advertised catalogue all read this
+ * table, so adding a range is a single edit and the three cannot disagree.
+ * label_key is a stable identifier for the frontend's own string table; the
+ * backend does not ship display text.
+ */
+struct webd_activity_range {
+    const char *id;
+    const char *label_key;
+    long window_s;
+    long bucket_s;
+};
+
+static const struct webd_activity_range g_webd_activity_ranges[] = {
+    { "1d", "range_1d", 24L * 3600,      3600L },
+    { "1w", "range_1w", 7L * 24 * 3600,  24L * 3600 },
+    { "1m", "range_1m", 30L * 24 * 3600, 24L * 3600 },
+    { "3m", "range_3m", 90L * 24 * 3600, 7L * 24 * 3600 },
+};
+
+#define WEBD_ACTIVITY_RANGE_COUNT \
+    (sizeof(g_webd_activity_ranges) / sizeof(g_webd_activity_ranges[0]))
+#define WEBD_ACTIVITY_RANGE_DEFAULT "1d"
+
 static int webd_activity_range_spec(const char *range, long *window_s,
                                     long *bucket_s, const char **canonical)
 {
+    size_t i;
+
     if (!window_s || !bucket_s || !canonical)
         return -1;
-    if (!range || !range[0] || !strcmp(range, "1d")) {
-        *window_s = 24L * 3600;      *bucket_s = 3600L;         *canonical = "1d";
-    } else if (!strcmp(range, "1w")) {
-        *window_s = 7L * 24 * 3600;  *bucket_s = 24L * 3600;    *canonical = "1w";
-    } else if (!strcmp(range, "1m")) {
-        *window_s = 30L * 24 * 3600; *bucket_s = 24L * 3600;    *canonical = "1m";
-    } else if (!strcmp(range, "3m")) {
-        *window_s = 90L * 24 * 3600; *bucket_s = 7L * 24 * 3600; *canonical = "3m";
-    } else {
-        return -1;
+    if (!range || !range[0])
+        range = WEBD_ACTIVITY_RANGE_DEFAULT;
+    for (i = 0; i < WEBD_ACTIVITY_RANGE_COUNT; i++) {
+        if (strcmp(range, g_webd_activity_ranges[i].id))
+            continue;
+        *window_s = g_webd_activity_ranges[i].window_s;
+        *bucket_s = g_webd_activity_ranges[i].bucket_s;
+        *canonical = g_webd_activity_ranges[i].id;
+        return 0;
     }
-    return 0;
+    return -1;
+}
+
+/*
+ * Builds the human-readable list used in the invalid_range message from the
+ * same table, so the message cannot drift from what is actually accepted.
+ */
+static const char *webd_activity_range_list(char *out, size_t out_len)
+{
+    size_t i, used = 0;
+
+    if (!out || !out_len)
+        return "";
+    out[0] = '\0';
+    for (i = 0; i < WEBD_ACTIVITY_RANGE_COUNT && used < out_len; i++) {
+        int n = snprintf(out + used, out_len - used, "%s%s",
+                         used ? ", " : "", g_webd_activity_ranges[i].id);
+
+        if (n < 0 || (size_t)n >= out_len - used)
+            break;
+        used += (size_t)n;
+    }
+    return out;
+}
+
+/*
+ * Publishes the accepted range set so a client does not have to probe for it.
+ *
+ * The frontend was keeping its own candidate list and submitting each entry to
+ * see which ones came back 400, because the legal set existed only inside the
+ * invalid_range message text. Parsing that message is fragile - rewording it
+ * silently breaks the switcher - and a probe list is still a frontend literal,
+ * so a range added here stayed invisible until the frontend was edited too.
+ */
+static void webd_activity_add_range_catalog(struct json_object *cap,
+                                            const char *active_range)
+{
+    struct json_object *arr;
+    struct json_object *ids;
+    size_t i;
+
+    if (!cap)
+        return;
+    arr = json_object_new_array();
+    ids = json_object_new_array();
+    for (i = 0; i < WEBD_ACTIVITY_RANGE_COUNT; i++) {
+        struct json_object *r = json_object_new_object();
+
+        webd_obj_add_str(r, "id", g_webd_activity_ranges[i].id);
+        webd_obj_add_str(r, "label_key", g_webd_activity_ranges[i].label_key);
+        json_object_object_add(r, "window_seconds",
+                               json_object_new_int64(g_webd_activity_ranges[i].window_s));
+        json_object_object_add(r, "bucket_seconds",
+                               json_object_new_int64(g_webd_activity_ranges[i].bucket_s));
+        json_object_object_add(r, "buckets",
+                               json_object_new_int((int)(g_webd_activity_ranges[i].window_s /
+                                                        g_webd_activity_ranges[i].bucket_s)));
+        json_object_object_add(r, "is_default",
+            json_object_new_boolean(!strcmp(g_webd_activity_ranges[i].id,
+                                            WEBD_ACTIVITY_RANGE_DEFAULT)));
+        json_object_object_add(r, "active",
+            json_object_new_boolean(active_range &&
+                                    !strcmp(g_webd_activity_ranges[i].id, active_range)));
+        json_object_array_add(arr, r);
+        json_object_array_add(ids, json_object_new_string(g_webd_activity_ranges[i].id));
+    }
+    json_object_object_add(cap, "ranges", arr);
+    /* Flat id list too: a switcher that only needs the ids should not have to
+     * walk the objects, and it keeps the older probe-based client working. */
+    json_object_object_add(cap, "range_ids", ids);
+    webd_obj_add_str(cap, "range_default", WEBD_ACTIVITY_RANGE_DEFAULT);
+    json_object_object_add(cap, "ranges_authoritative", json_object_new_boolean(1));
 }
 
 /*
@@ -49598,9 +50822,13 @@ static struct json_object *webd_directory_user_activity(const char *username,
     }
     if (req && webd_query_get(req->query, "range", range_s, sizeof(range_s)) &&
         webd_activity_range_spec(range_s, &window_s, &bucket_s, &range) != 0) {
+        char accepted[128];
+        char msg[192];
+
+        snprintf(msg, sizeof(msg), "range must be one of %s",
+                 webd_activity_range_list(accepted, sizeof(accepted)));
         if (http_status) *http_status = 400;
-        return webd_error("invalid_range", "range must be one of 1d, 1w, 1m, 3m",
-                          "range", "webd.user_activity");
+        return webd_error("invalid_range", msg, "range", "webd.user_activity");
     }
     if (!range_s[0])
         webd_activity_range_spec(NULL, &window_s, &bucket_s, &range);
@@ -49795,6 +51023,7 @@ static struct json_object *webd_directory_user_activity(const char *username,
      * rather than let the client infer a logout stream that does not exist. */
     json_object_object_add(cap, "logout_events", json_object_new_boolean(0));
     json_object_object_add(cap, "buckets_server_side", json_object_new_boolean(1));
+    webd_activity_add_range_catalog(cap, range);
     json_object_object_add(data, "capabilities", cap);
     if (http_status) *http_status = 200;
     return webd_envelope(data, "webd.user_activity");
@@ -51170,6 +52399,71 @@ static void webd_system_basic_attach_interrupt_runtime(struct json_object *data)
                      "proc_stat+sysfs_cpu+proc_interrupts+proc_irq_affinity");
 }
 
+/*
+ * Fill system/basic's flash backup fields from the real backup store.
+ *
+ * core publishes these as null because it cannot answer them: the backup store
+ * lives here in webd (webd_backup_store.c, rooted at
+ * /data/persist/var/lib/dreamingwrt/backups), and core has no view of it. They
+ * used to be hardcoded in core as "" / 0 / true, and auto_backup:true was the
+ * dangerous one -- the page reported scheduled backups were on while the store
+ * held nothing, so a user would believe backups existed when none did.
+ *
+ * Anything genuinely unknown stays null rather than becoming a plausible zero.
+ * `last_backup_at: null` means "never backed up"; `0` would read as an epoch
+ * timestamp.
+ */
+static void webd_system_basic_attach_backup_state(struct json_object *data)
+{
+    struct json_object *flash = NULL;
+    struct webd_backup_schedule sched;
+    struct webd_backup_list list;
+    char err[128] = "";
+
+    if (!data || !json_object_object_get_ex(data, "flash", &flash) || !flash ||
+        !json_object_is_type(flash, json_type_object))
+        return;
+
+    webd_backup_schedule_get(&sched);
+    json_object_object_add(flash, "auto_backup",
+                           json_object_new_boolean(sched.enabled ? 1 : 0));
+    if (sched.enabled) {
+        json_object_object_add(flash, "auto_backup_frequency",
+                               json_object_new_string(sched.frequency));
+        json_object_object_add(flash, "auto_backup_hour",
+                               json_object_new_int(sched.hour));
+        json_object_object_add(flash, "auto_backup_minute",
+                               json_object_new_int(sched.minute));
+    }
+
+    memset(&list, 0, sizeof(list));
+    if (webd_backup_list(&list, err, sizeof(err)) == 0) {
+        /* Newest first, so item 0 is the most recent backup. */
+        json_object_object_add(flash, "backup_count",
+                               json_object_new_int((int)list.count));
+        if (list.count > 0 && list.items) {
+            json_object_object_add(flash, "last_backup_at",
+                json_object_new_int64((int64_t)list.items[0].created_at));
+            json_object_object_add(flash, "backup_size",
+                json_object_new_int64((int64_t)list.items[0].size_bytes));
+        } else {
+            /* No backups: null, not 0. */
+            json_object_object_add(flash, "last_backup_at", NULL);
+            json_object_object_add(flash, "backup_size", NULL);
+        }
+        json_object_object_add(flash, "backup_state_error", NULL);
+        webd_backup_list_free(&list);
+    } else {
+        json_object_object_add(flash, "backup_count", NULL);
+        json_object_object_add(flash, "last_backup_at", NULL);
+        json_object_object_add(flash, "backup_size", NULL);
+        json_object_object_add(flash, "backup_state_error",
+            json_object_new_string(err[0] ? err : "backup_list_failed"));
+    }
+    json_object_object_add(flash, "backup_store_root",
+                           json_object_new_string(webd_backup_store_root()));
+}
+
 static struct json_object *webd_system_basic_response(int *status)
 {
     int cache_age_ms = 0;
@@ -51193,6 +52487,7 @@ static struct json_object *webd_system_basic_response(int *status)
     }
     if (data) {
         webd_system_basic_attach_interrupt_runtime(data);
+        webd_system_basic_attach_backup_state(data);
         resp = webd_envelope(data, "jmxd.dreamingwrt_system_settings_get");
         if (resp)
             jmx_cache_put_with_stale("system_basic", resp, 5, 30);
@@ -51760,23 +53055,36 @@ static struct json_object *webd_clients_finish(struct json_object *resp, int wit
     return own;
 }
 
-static struct json_object *webd_clients_response(int *http_status, int with_apps)
+static struct json_object *webd_clients_response(int *http_status, int with_apps,
+                                                 int include_stale)
 {
     int cache_age_ms = 0;
     int cache_stale = 0;
+    /* Two separate cache entries: the filtered inventory and the full history
+     * are different answers, so they must not overwrite each other. */
+    const char *cache_key = include_stale ? "clients_inventory_all"
+                                          : "clients_inventory";
     struct json_object *cached = jmx_cache_get_allow_stale(
-        "clients_inventory", 30, &cache_age_ms, &cache_stale);
+        cache_key, 30, &cache_age_ms, &cache_stale);
+    struct json_object *params = NULL;
     struct json_object *upstream;
     struct json_object *data = NULL;
     struct json_object *clients = NULL;
 
     if (cached && !cache_stale)
         return webd_clients_finish(cached, with_apps);
-    upstream = app_ubus_invoke_timeout("clients", NULL, 2500);
+    if (include_stale) {
+        params = json_object_new_object();
+        if (params)
+            json_object_object_add(params, "include_stale", json_object_new_int(1));
+    }
+    upstream = app_ubus_invoke_timeout("clients", params, 2500);
+    if (params)
+        json_object_put(params);
     data = webd_data_from_jmx_response(upstream);
     if (data && json_object_object_get_ex(data, "clients", &clients) && clients &&
         json_object_is_type(clients, json_type_array)) {
-        jmx_cache_put_with_stale("clients_inventory", upstream, 2, 30);
+        jmx_cache_put_with_stale(cache_key, upstream, 2, 30);
         json_object_put(data);
         if (cached)
             json_object_put(cached);
@@ -51800,6 +53108,134 @@ static struct json_object *webd_clients_response(int *http_status, int with_apps
     return webd_error("source_unavailable",
                       "client inventory source is not available",
                       "dreamingwrt.clients", "webd.clients");
+}
+
+/*
+ * Resolves the MAC behind an IP using the client inventory, which is the same
+ * evidence /api/v1/clients publishes. Doing the lookup here rather than in the
+ * page keeps one answer for a question with several awkward cases: randomized
+ * MACs, IPv6-only clients with no IPv4 lease, and hosts with no DHCP record.
+ *
+ * Returns 1 when a MAC was found. out_reason always receives a short code so
+ * the caller can say why the lookup failed instead of showing an empty field.
+ */
+static int webd_mac_for_ip(const char *ip, char *out_mac, size_t mac_len,
+                           char *out_reason, size_t reason_len)
+{
+    struct json_object *resp;
+    struct json_object *data;
+    struct json_object *clients = NULL;
+    int status = 200;
+    int found = 0;
+    int i, n;
+
+    if (out_mac && mac_len)
+        out_mac[0] = '\0';
+    if (out_reason && reason_len)
+        snprintf(out_reason, reason_len, "not_attempted");
+    if (!ip || !ip[0]) {
+        if (out_reason && reason_len)
+            snprintf(out_reason, reason_len, "no_source_ip");
+        return 0;
+    }
+
+    resp = webd_clients_response(&status, 0, 0);
+    data = webd_obj_child_obj(resp, "data");
+    if (data)
+        clients = webd_obj_child_array(data, "clients");
+    if (!clients) {
+        if (out_reason && reason_len)
+            snprintf(out_reason, reason_len, "client_inventory_unavailable");
+        if (resp)
+            json_object_put(resp);
+        return 0;
+    }
+
+    n = (int)json_object_array_length(clients);
+    for (i = 0; i < n && !found; i++) {
+        struct json_object *c = json_object_array_get_idx(clients, i);
+        const char *mac = app_nc_json_str(c, "mac", "");
+        struct json_object *v6 = NULL;
+
+        if (!mac[0])
+            continue;
+        if (!strcmp(app_nc_json_str(c, "ip", ""), ip))
+            found = 1;
+        /* Match IPv6 too: an IPv6-only client has no ip field to compare, and
+         * a browser reaching the router over IPv6 is the exact case where the
+         * self-lockout warning matters most. */
+        if (!found && (v6 = webd_obj_child_array(c, "ipv6_addrs")) != NULL) {
+            int j, m = (int)json_object_array_length(v6);
+
+            for (j = 0; j < m && !found; j++) {
+                const char *a = json_object_get_string(json_object_array_get_idx(v6, j));
+
+                if (a && !strcasecmp(a, ip))
+                    found = 1;
+            }
+        }
+        if (found && out_mac && mac_len)
+            snprintf(out_mac, mac_len, "%s", mac);
+    }
+    if (out_reason && reason_len)
+        snprintf(out_reason, reason_len, found ? "" : "ip_not_in_client_inventory");
+    if (resp)
+        json_object_put(resp);
+    return found;
+}
+
+/*
+ * Publishes where this request came from, for the self-lockout guard.
+ *
+ * A page that can cut a device off the network needs to warn when the target is
+ * the device the operator is using; without this the page could only name the
+ * target and hope the user recognised it. The values were already inside
+ * struct http_req and used for auditing, so nothing new is collected here.
+ *
+ * self_lockout_match_field names peer_ip deliberately. client_ip may hold a
+ * trusted X-Forwarded-For value whenever the TCP peer is loopback, so a guard
+ * keyed on it could be steered by a forged header - the protection would become
+ * the bypass. peer_ip is the TCP peer and no header can replace it.
+ */
+static void webd_session_add_request_origin(struct json_object *data,
+                                            const struct http_req *req)
+{
+    struct json_object *origin;
+    char mac[64] = "";
+    char mac_reason[64] = "";
+    int have_mac;
+
+    if (!data || !req)
+        return;
+    origin = json_object_new_object();
+    webd_obj_add_str(origin, "peer_ip", req->peer_ip);
+    webd_obj_add_str(origin, "client_ip", req->client_ip);
+    webd_obj_add_str(origin, "ip_source", req->ip_source);
+    /* Say which value a guard must key on, and why, rather than leaving the
+     * consumer to pick between two similar-looking fields. */
+    webd_obj_add_str(origin, "self_lockout_match_field", "peer_ip");
+    webd_obj_add_str(origin, "self_lockout_match_reason",
+                     "peer_ip_is_the_tcp_peer_and_cannot_be_replaced_by_x_forwarded_for");
+    json_object_object_add(origin, "client_ip_spoofable",
+                           json_object_new_boolean(1));
+
+    have_mac = webd_mac_for_ip(req->peer_ip, mac, sizeof(mac),
+                               mac_reason, sizeof(mac_reason));
+    webd_obj_add_str(origin, "client_mac", have_mac ? mac : "");
+    json_object_object_add(origin, "client_mac_resolved",
+                           json_object_new_boolean(have_mac));
+    webd_obj_add_str(origin, "client_mac_reason", have_mac ? "" : mac_reason);
+    webd_obj_add_str(origin, "client_mac_source",
+                     have_mac ? "client_inventory_by_ip" : "");
+    /* MAC rules match on MAC, so a page cannot complete the self check without
+     * one. State that plainly instead of letting an empty string read as
+     * "this is not your device". */
+    json_object_object_add(origin, "self_lockout_check_supported",
+                           json_object_new_boolean(have_mac));
+    if (!have_mac)
+        webd_obj_add_str(origin, "self_lockout_check_degraded_advice",
+                         "warn_on_ip_match_only_and_name_the_target_device");
+    json_object_object_add(data, "request_origin", origin);
 }
 
 static void webd_system_settings_scrub_sensitive(struct json_object *o)
@@ -56505,7 +57941,7 @@ static struct json_object *webd_firmware_apply_response(const char *owner_id,
     params = json_object_new_object();
     json_object_object_add(params, "operation_id", json_object_new_string(operation_id));
     response = app_ubus_invoke_object_timeout(
-        "dreamingwrt.otad", "apply", params, 10000);
+        "dreamingwrt.otad", "apply", params, 120000);
     json_object_put(params);
     if (!response)
         return webd_firmware_operation_error(
@@ -57421,11 +58857,43 @@ static void handle_client(int fd)
         int setup_verify = setup_active >= 0 ? webd_setup_session_verify(
             req.setup_session, req.client_ip, 1) : -1;
 
-        if (app_setup_is_initialized()) {
+        /*
+         * "Authenticated" for gate purposes means the caller proved an
+         * identity: a bearer/cookie session, or the setup session already
+         * issued to this client IP. Anonymous callers get no public write
+         * channel once a login exists on the device.
+         */
+        int setup_identified = req.auth_token[0] || setup_verify == 1;
+
+        /*
+         * The core refuses setup writes on an already-initialized router unless
+         * the caller states that intent, which is what keeps a bare
+         * `ubus call dreamingwrt setup_apply` from reconfiguring a device in
+         * service. Every write dispatched below this point has cleared the gate
+         * that follows -- verified setup session, and a proven identity once a
+         * login exists -- so the vouch is recorded here, in one place, instead
+         * of at each of the dozen dispatch sites. A direct ubus caller never
+         * passes through here and so never gets it.
+         *
+         * The key is deleted before it is set, so a request body cannot supply
+         * its own vouch. Without that, an anonymous caller on the public
+         * channel -- where the flag is deliberately not added -- would keep
+         * whatever value it sent.
+         */
+        if (!body_json)
+            body_json = json_object_new_object();
+        if (body_json && json_object_is_type(body_json, json_type_object)) {
+            json_object_object_del(body_json, "caller_authorized_initialized_write");
+            if (setup_identified)
+                json_object_object_add(body_json,
+                    "caller_authorized_initialized_write",
+                    json_object_new_boolean(1));
+        }
+
+        if (app_setup_public_channel_closed(setup_identified)) {
             resp = app_setup_first_run_required_response();
             response_status = 409;
-        } else if (req.sec_fetch_site[0] &&
-                   !strcmp(req.sec_fetch_site, "cross-site")) {
+        } else if (!strcmp(req.sec_fetch_site, "cross-site")) {
             resp = app_setup_session_error_response(
                 "cross_site_setup_write_rejected",
                 "cross-site setup writes are not allowed");
@@ -57505,6 +58973,12 @@ static void handle_client(int fd)
             }
         } else if (!strcmp(req.path, "/api/setup/reset") || !strcmp(req.path, "/api/setup/reset_wizard")) {
             setup_session_ok = 1;
+            /* The initialized-write vouch is set once above, before the gate.
+             * reset_wizard additionally needs its own explicit intent flag,
+             * because refusing outright would defeat the method's purpose. */
+            if (body_json && json_object_is_type(body_json, json_type_object))
+                json_object_object_add(body_json, "confirm_reset_initialized",
+                                       json_object_new_boolean(1));
             resp = app_ubus_or_error("setup_reset_wizard", body_json);
         } else if (!strcmp(req.path, "/api/setup/support-bundle")) {
             setup_session_ok = 1;
@@ -57704,6 +59178,8 @@ static void handle_client(int fd)
                 snprintf(action, sizeof(action), "api_key.%s.%s",
                          key_identity.tier == WEBD_API_KEY_TIER_CONTROL ?
                          "control" : "read",
+                         /* LOW is the only readable level; LOW_WRITE and above
+                          * are writes and must classify as such. */
                          jmx_perm_route_risk(req.method, req.path) == JMX_RISK_LOW ?
                          "read" : "write");
                 jmx_app_audit_log_ex("api_key", "", action,
@@ -57889,6 +59365,13 @@ static void handle_client(int fd)
          (!strncmp(req.path, "/api/v1/ac/pairing-tokens", 25) &&
           strcmp(req.method, "GET") && strcmp(req.method, "HEAD")) ||
          (!strncmp(req.path, "/api/v1/ac/aps", 14) &&
+          strcmp(req.method, "GET") && strcmp(req.method, "HEAD")) ||
+         /* AP-local writes (unpair) revoke an adoption, so they carry the same
+          * same-origin requirement as the controller-side AP writes above.
+          * Listed before the routes exist for the same reason the risk table
+          * is: a write that appears later is guarded on arrival rather than
+          * depending on whoever adds it remembering to come back here. */
+         (!strncmp(req.path, "/api/v1/apd/", 12) &&
           strcmp(req.method, "GET") && strcmp(req.method, "HEAD")) ||
          /* Relay settings and enrollment change how the router is reachable from
           * outside, so they get the same same-origin requirement as other
@@ -58137,6 +59620,28 @@ static void handle_client(int fd)
     }
 
     /* ── Authenticated first-run/setup management ── */
+    /*
+     * These routes are reached only after authentication and the per-route
+     * permission check (setup/apply is JMX_RISK_HIGH). The core refuses setup
+     * writes on an already-initialized router unless the caller states that
+     * intent, so record it here for the whole authenticated block rather than
+     * at each dispatch site. A direct ubus caller bypasses this file entirely
+     * and therefore never carries the vouch.
+     *
+     * Deleted before being set so the value cannot come from the request body.
+     */
+    if (!resp && strcmp(req.method, "GET") &&
+        (!strncmp(req.path, "/api/v1/setup/", 14) ||
+         !strcmp(req.path, "/api/v1/device/config/lan"))) {
+        if (!body_json)
+            body_json = json_object_new_object();
+        if (body_json && json_object_is_type(body_json, json_type_object)) {
+            json_object_object_del(body_json, "caller_authorized_initialized_write");
+            json_object_object_add(body_json,
+                "caller_authorized_initialized_write",
+                json_object_new_boolean(1));
+        }
+    }
     if (resp) {
         /* handled above */
     }
@@ -58187,6 +59692,18 @@ static void handle_client(int fd)
         resp = app_setup_finish_response(body_json, finish_actor, &status);
     }
     else if (!strcmp(req.path, "/api/v1/setup/reset-wizard") && !strcmp(req.method, "POST")) {
+        /*
+         * reset_wizard is the one setup write that must still work on an
+         * initialized router -- that is its purpose -- so the core asks for a
+         * dedicated intent flag instead of refusing. This route already required
+         * an authenticated session and a JMX_RISK_HIGH check, so the intent is
+         * established and asserted here rather than pushed onto the API.
+         */
+        if (!body_json)
+            body_json = json_object_new_object();
+        if (body_json && json_object_is_type(body_json, json_type_object))
+            json_object_object_add(body_json, "confirm_reset_initialized",
+                                   json_object_new_boolean(1));
         resp = app_ubus_or_error("setup_reset_wizard", body_json);
         status = app_jmx_response_http_status(resp, status);
     }
@@ -58266,6 +59783,10 @@ static void handle_client(int fd)
         int session_state = WEBD_AUTH_DB_INVALID;
         struct json_object *data = jmx_app_session_ex(req.auth_token, &session_state);
 
+        /* Tell the caller where this request came from, so a page about to cut
+         * network access can warn that the target is the caller's own device. */
+        if (data)
+            webd_session_add_request_origin(data, &req);
         resp = data ? webd_envelope(data, "webd.session") :
                       (session_state == WEBD_AUTH_DB_IDLE_TIMEOUT ?
                        webd_error(WEBD_SESSION_IDLE_ERROR,
@@ -60522,12 +62043,47 @@ static void handle_client(int fd)
         resp = app_ubus_invoke("network_global_get", NULL);
     }
     else if (!strcmp(req.path, "/api/v1/network/global") && (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
-        status = 409;
-        resp = webd_error("capability_disabled",
-                          "global network settings are read-only until each field has transactional apply, readback, and rollback",
-                          "network_global_apply", "network.capabilities");
-        json_object_object_add(resp, "persisted", json_object_new_boolean(0));
-        json_object_object_add(resp, "applied", json_object_new_boolean(0));
+        /*
+         * wan_mode is the one writable field; everything else in this object
+         * still has no transactional apply/readback/rollback and keeps the
+         * original 409. The check is "wan_mode present and it is the only key"
+         * rather than "wan_mode present", so a payload that smuggles other
+         * fields alongside it is refused instead of being silently half-applied.
+         */
+        struct json_object *wan_mode_v = NULL;
+        int only_wan_mode = body_json &&
+            json_object_is_type(body_json, json_type_object) &&
+            json_object_object_get_ex(body_json, "wan_mode", &wan_mode_v) &&
+            json_object_object_length(body_json) == 1;
+
+        if (only_wan_mode) {
+            resp = app_ubus_invoke("network_global_set", body_json);
+            if (!resp) {
+                status = 502;
+                resp = webd_error("upstream_unavailable",
+                                  "network_global_set did not respond",
+                                  "network_global_set", "network.capabilities");
+            } else {
+                /* core answers with the {code,data:{...}} envelope, so ok/error
+                 * live under data rather than at the top level. */
+                struct json_object *d = webd_obj_child_obj(resp, "data");
+                int ok = 0;
+
+                if (!webd_json_bool_field(d ? d : resp, "ok", &ok) || !ok) {
+                    const char *err = app_nc_json_str(d ? d : resp, "error", "");
+
+                    /* Distinguish a bad value from the capability gate. */
+                    status = !strcmp(err, "invalid_argument") ? 400 : 409;
+                }
+            }
+        } else {
+            status = 409;
+            resp = webd_error("capability_disabled",
+                              "only wan_mode is writable; the remaining global network settings are read-only until each field has transactional apply, readback, and rollback",
+                              "network_global_apply", "network.capabilities");
+            json_object_object_add(resp, "persisted", json_object_new_boolean(0));
+            json_object_object_add(resp, "applied", json_object_new_boolean(0));
+        }
     }
     else if (!strcmp(req.path, "/api/v1/network/global/apply") && (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
         status = 409;
@@ -61073,7 +62629,12 @@ static void handle_client(int fd)
     }
     /* ── AI Config & Tools ── */
     else if (!strcmp(req.path, "/api/v1/ai/config") && !strcmp(req.method, "GET")) {
-        resp = ai_envelope(app_ubus_invoke("ai_config_get", NULL), 200);
+        {
+            struct app_ubus_call_diag diag;
+
+            resp = ai_envelope_diag(webd_ai_read_invoke("ai_config_get", NULL, &diag),
+                                    200, &diag);
+        }
         webd_ai_runtime_attach_capabilities(resp);
     }
     else if (!strcmp(req.path, "/api/v1/ai/config") && (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
@@ -61081,7 +62642,12 @@ static void handle_client(int fd)
     }
     /* ── AI multi-provider & dispatch policy ── */
     else if (!strcmp(req.path, "/api/v1/ai/providers") && !strcmp(req.method, "GET")) {
-        resp = ai_envelope(app_ubus_invoke("ai_providers_list", NULL), 200);
+        {
+            struct app_ubus_call_diag diag;
+
+            resp = ai_envelope_diag(webd_ai_read_invoke("ai_providers_list", NULL, &diag),
+                                    200, &diag);
+        }
         webd_ai_runtime_attach_capabilities(resp);
     }
     else if (!strcmp(req.path, "/api/v1/ai/providers") && !strcmp(req.method, "POST")) {
@@ -61096,7 +62662,12 @@ static void handle_client(int fd)
              !strchr(req.path + 21, '/') && !strcmp(req.method, "GET")) {
         struct json_object *params = json_object_new_object();
         json_object_object_add(params, "id", json_object_new_string(req.path + 21));
-        resp = ai_envelope(app_ubus_invoke("ai_provider_get", params), 200);
+        {
+            struct app_ubus_call_diag diag;
+
+            resp = ai_envelope_diag(webd_ai_read_invoke("ai_provider_get", params, &diag),
+                                    200, &diag);
+        }
         json_object_put(params);
         status = app_response_status(resp, status);
     }
@@ -61145,12 +62716,22 @@ static void handle_client(int fd)
         struct json_object *params = json_object_new_object();
         app_ai_provider_id_copy(req.path + 21, "/models", provider_id, sizeof(provider_id));
         json_object_object_add(params, "id", json_object_new_string(provider_id));
-        resp = ai_envelope(app_ubus_invoke("ai_provider_models_get", params), 200);
+        {
+            struct app_ubus_call_diag diag;
+
+            resp = ai_envelope_diag(webd_ai_read_invoke("ai_provider_models_get", params, &diag),
+                                    200, &diag);
+        }
         json_object_put(params);
         status = app_response_status(resp, status);
     }
     else if (!strcmp(req.path, "/api/v1/ai/dispatch-policy") && !strcmp(req.method, "GET")) {
-        resp = ai_envelope(app_ubus_invoke("ai_dispatch_policy_get", NULL), 200);
+        {
+            struct app_ubus_call_diag diag;
+
+            resp = ai_envelope_diag(webd_ai_read_invoke("ai_dispatch_policy_get", NULL, &diag),
+                                    200, &diag);
+        }
     }
     else if (!strcmp(req.path, "/api/v1/ai/dispatch-policy") &&
              (!strcmp(req.method, "PUT") || !strcmp(req.method, "POST"))) {
@@ -61162,13 +62743,23 @@ static void handle_client(int fd)
                              status >= 200 && status < 300 ? "" : "dispatch_policy_set_failed");
     }
     else if (!strcmp(req.path, "/api/v1/ai/models") && !strcmp(req.method, "GET")) {
-        resp = ai_envelope(app_ubus_invoke("ai_models_get", NULL), 200);
+        {
+            struct app_ubus_call_diag diag;
+
+            resp = ai_envelope_diag(webd_ai_read_invoke("ai_models_get", NULL, &diag),
+                                    200, &diag);
+        }
     }
     else if (!strcmp(req.path, "/api/v1/ai/models/sync") && !strcmp(req.method, "POST")) {
         resp = webd_ai_runtime_models(device_id, &status);
     }
     else if (!strcmp(req.path, "/api/v1/ai/tools") && !strcmp(req.method, "GET")) {
-        resp = ai_envelope(app_ubus_invoke("ai_tools_get", NULL), 200);
+        {
+            struct app_ubus_call_diag diag;
+
+            resp = ai_envelope_diag(webd_ai_read_invoke("ai_tools_get", NULL, &diag),
+                                    200, &diag);
+        }
     }
     else if (!strcmp(req.path, "/api/v1/ai/chat") && (!strcmp(req.method, "POST") || !strcmp(req.method, "PUT"))) {
         resp = webd_ai_runtime_chat(body_json, device_id, &status);
@@ -61266,7 +62857,12 @@ static void handle_client(int fd)
     }
     /* ── AI Tool Authorizations list ── */
     else if (!strcmp(req.path, "/api/v1/ai/tool-authorizations") && !strcmp(req.method, "GET")) {
-        resp = ai_envelope(app_ubus_invoke("ai_tool_authorizations_list", NULL), 200);
+        {
+            struct app_ubus_call_diag diag;
+
+            resp = ai_envelope_diag(webd_ai_read_invoke("ai_tool_authorizations_list", NULL, &diag),
+                                    200, &diag);
+        }
     }
     /* ── AI Tool Authorizations approve/deny ── */
     else if (!strncmp(req.path, "/api/v1/ai/tool-authorizations/", 31) && !strcmp(req.method, "POST")) {
@@ -61373,7 +62969,12 @@ static void handle_client(int fd)
             struct json_object *params = json_object_new_object();
             json_object_object_add(params, "limit", json_object_new_int(limit));
             json_object_object_add(params, "offset", json_object_new_int(off));
-            resp = ai_envelope(app_ubus_invoke("ai_history_list", params), 200);
+            {
+            struct app_ubus_call_diag diag;
+
+            resp = ai_envelope_diag(webd_ai_read_invoke("ai_history_list", params, &diag),
+                                    200, &diag);
+        }
             json_object_put(params);
             status = app_response_status(resp, status);
         }
@@ -61381,7 +62982,12 @@ static void handle_client(int fd)
     else if (!strncmp(req.path, "/api/v1/ai/history/", 19) && req.path[19] &&
              !strchr(req.path + 19, '/') && !strcmp(req.method, "GET")) {
         struct json_object *params = app_json_id_param(req.path + 19);
-        resp = ai_envelope(app_ubus_invoke("ai_history_get", params), 200);
+        {
+            struct app_ubus_call_diag diag;
+
+            resp = ai_envelope_diag(webd_ai_read_invoke("ai_history_get", params, &diag),
+                                    200, &diag);
+        }
         json_object_put(params);
         status = app_response_status(resp, status);
     }
@@ -62052,7 +63658,9 @@ static void handle_client(int fd)
     /* ── Clients ── */
     else if (!strcmp(req.path, "/api/v1/clients")) {
         char with_apps[8] = {0};
+        char include_stale[8] = {0};
         int merge_apps = 0;
+        int want_stale = 0;
 
         /* ?with_apps=1 folds each device's active applications into the same
          * response, so the App does not need a second dashboard/snapshot call
@@ -62061,7 +63669,16 @@ static void handle_client(int fd)
             with_apps[0])
             merge_apps = !strcmp(with_apps, "1") || !strcasecmp(with_apps, "true") ||
                          !strcasecmp(with_apps, "yes");
-        resp = webd_clients_response(&status, merge_apps);
+        /* ?include_stale=1 returns the aged-out offline rows too. The default
+         * list drops offline devices unseen for longer than the retention
+         * window, which is what keeps three weeks of one-time DHCP leases from
+         * burying the devices actually on the network. */
+        if (webd_query_get(req.query, "include_stale", include_stale,
+                           sizeof(include_stale)) && include_stale[0])
+            want_stale = !strcmp(include_stale, "1") ||
+                         !strcasecmp(include_stale, "true") ||
+                         !strcasecmp(include_stale, "yes");
+        resp = webd_clients_response(&status, merge_apps, want_stale);
     }
     else if (!strcmp(req.path, "/api/v1/client_profile") && !strcmp(req.method, "GET")) {
         resp = webd_client_profile_response(&req);
@@ -64086,8 +65703,18 @@ static void handle_client(int fd)
     }
 
     if (resp) {
-        if (status == 200)
-            status = app_response_status(resp, status);
+        if (status == 200) {
+            /*
+             * A handler that never set `status` can still declare the failure in
+             * the body. app_routed_http_status() honours an explicit
+             * `http_status` field first and otherwise falls through to
+             * app_response_status(), so this stays the previous behaviour for
+             * every body that does not carry one. Without this a 502 body would
+             * go out under HTTP 200, which is the shape that makes a client read
+             * a failed call as an empty result.
+             */
+            status = app_routed_http_status(resp, status);
+        }
         http_send_json(fd, status, resp);
         json_object_put(resp);
     } else {

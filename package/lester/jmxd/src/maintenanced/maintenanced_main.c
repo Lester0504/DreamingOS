@@ -43,6 +43,23 @@ static void maintenance_warn_throttled(const char *msg, int rc, int next_delay_m
 {
     time_t now = time(NULL);
 
+    /*
+     * A single timeout that the next tick recovers from is not an error.
+     *
+     * rc=7 is UBUS_STATUS_TIMEOUT, and the common cause is entirely benign:
+     * core was restarting, so its ubus object was briefly absent. Every
+     * occurrence observed on 30.1 landed within a minute of a core restart,
+     * always with failures=1, and never recurred while core stayed up. Everything
+     * these daemons print goes to stderr, which the supervisor files under
+     * daemon.err, so that self-healing blip was being reported at error severity
+     * and read as a recurring production fault.
+     *
+     * Staying quiet on the first failure keeps the transient out of the error
+     * log while preserving the signal that matters: a fault that does not
+     * recover still reports, because consecutive_failures keeps climbing.
+     */
+    if (maintenance_consecutive_failures <= 1)
+        return;
     if (now - maintenance_last_warn < 30)
         return;
     maintenance_last_warn = now;

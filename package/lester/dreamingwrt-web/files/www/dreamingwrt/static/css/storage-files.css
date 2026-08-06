@@ -58,7 +58,7 @@
 .storage-file-toolbar { min-width: 0; display: grid; gap: 8px; }
 .storage-file-toolbar-top { min-width: 0; display: flex; align-items: center; gap: 10px; }
 .storage-file-root-select {
-  width: min(220px, 26vw);
+  width: min(264px, 30vw);
   height: 38px;
   flex: 0 0 auto;
   border: 1px solid var(--dwrt-glass-edge, rgba(255,255,255,.13));
@@ -104,8 +104,71 @@
 .storage-file-breadcrumb svg { width: 15px; height: 15px; }
 
 .storage-file-actions { min-width: 0; min-height: 48px; }
+
+/*
+ * 搜索与动作按钮已从页面级 header 收进表格工具栏（design.md 规则 15）。
+ * kit 的 `.dwrt-kit-table-toolbar` 是 flex + space-between，所以这块靠
+ * `margin-left: auto` 贴右，并允许在窄屏换行而不是把工具栏顶宽。
+ */
+.storage-file-table-actions {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
+}
 .storage-file-search { flex: 0 1 min(390px, 31vw); width: min(390px, 31vw); min-width: 40px; }
 .storage-file-selection-actions { min-width: 0; display: flex; align-items: center; gap: 6px; }
+
+.storage-file-root-badge {
+  flex: 0 0 auto;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  border-radius: var(--app-radius-compact, 8px);
+  color: #f5c166;
+  background: rgba(245,166,35,.10);
+  box-shadow: inset 0 0 0 1px rgba(245,166,35,.17);
+  font-size: 10px;
+  font-weight: 690;
+  white-space: nowrap;
+}
+
+.storage-file-readonly-hint {
+  min-width: 0;
+  color: var(--app-text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.storage-file-readonly-hint .is-short { display: none; }
+
+.storage-file-row-locked {
+  width: 28px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  color: var(--app-text-muted);
+}
+
+.storage-file-content-blocked {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 13px;
+  border-radius: var(--app-radius-control, 10px);
+  color: #f5c166;
+  background: rgba(245,166,35,.09);
+  box-shadow: inset 0 0 0 1px rgba(245,166,35,.16);
+}
+
+.storage-file-content-blocked strong { display: block; color: var(--app-text); font-size: 12px; font-weight: 690; }
+.storage-file-content-blocked p { margin: 4px 0 0; font-size: 11px; line-height: 1.5; }
+.storage-file-content-blocked svg { flex: 0 0 auto; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 
 .storage-file-segmented {
   min-height: 40px;
@@ -467,6 +530,13 @@ html[data-theme-resolved="light"] .storage-file-editor textarea {
 @media (max-width: 1040px) {
   .storage-file-selection-actions button span { display: none; }
   .storage-file-selection-actions button { width: 40px; min-width: 40px; padding: 0; justify-content: center; }
+}
+
+@media (max-width: 560px) {
+  /* 窄屏放不下整句：隐掉长句、露出短句，两段都是真实文本，读屏能正常读到。 */
+  .storage-file-readonly-hint { font-size: 10px; }
+  .storage-file-readonly-hint .is-long { display: none; }
+  .storage-file-readonly-hint .is-short { display: inline; }
 }
 
 @media (max-width: 800px) {

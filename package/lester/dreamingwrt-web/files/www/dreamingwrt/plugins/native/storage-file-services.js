@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260805-storage-layout-toolbar-03';
   const MODULE_CLASS = 'storage-file-services-route-host';
   const stage = root?.closest('.console-stage');
   const TABS = [['nfs', 'NFS'], ['samba', 'Samba'], ['webdav', 'WebDAV'], ['ftp', 'FTP']];
@@ -344,12 +344,18 @@ export function mount(context = {}) {
     return '<span></span>';
   }
 
+  /* 视图切换（导出/挂载、共享/设置）属于导航，留在页面级；动作按钮进表格工具栏。 */
+  function viewSwitchMarkup() {
+    const seg = segmentedMarkup();
+    return seg ? `<header class="policy-toolbar file-service-toolbar"><div class="file-service-toolbar-leading">${seg}</div></header>` : '';
+  }
+
   function toolbarMarkup() {
     const searchable = state.tab === 'nfs' || (state.tab === 'samba' && state.sambaView === 'shares') || (state.tab === 'ftp' && state.ftpView === 'users');
     const createLabel = state.tab === 'nfs' ? (state.nfsView === 'exports' ? '添加共享' : '添加挂载') : state.tab === 'samba' && state.sambaView === 'shares' ? '添加共享' : state.tab === 'ftp' && state.ftpView === 'users' ? '新建用户' : '';
     const settingsLabel = state.tab === 'webdav' || (state.tab === 'samba' && state.sambaView === 'settings') || (state.tab === 'ftp' && state.ftpView === 'settings') ? '编辑设置' : '';
     const placeholder = state.tab === 'nfs' ? '搜索路径、客户端或选项' : state.tab === 'samba' ? '搜索共享名称、路径、用户或备注' : '搜索用户名或目录';
-    return `<header class="policy-toolbar file-service-toolbar"><div class="file-service-toolbar-leading">${segmentedMarkup()}${searchable ? `<label class="policy-search policy-search-main" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-file-search value="${escapeHtml(state.query)}" placeholder="${placeholder}"></label>` : ''}</div><div class="policy-toolbar-actions">${settingsLabel ? `<button class="policy-create-button" type="button" data-file-settings="${state.tab}">${icon('edit')}<span>${settingsLabel}</span></button>` : ''}${createLabel ? `<button class="policy-create-button" type="button" data-file-create>${icon('plus')}<span>${createLabel}</span></button>` : ''}</div></header>`;
+    return `<div class="file-service-table-actions">${searchable ? `<label class="policy-search policy-search-main" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-file-search value="${escapeHtml(state.query)}" placeholder="${placeholder}"></label>` : ''}<div class="policy-toolbar-actions">${settingsLabel ? `<button class="policy-create-button" type="button" data-file-settings="${state.tab}">${icon('edit')}<span>${settingsLabel}</span></button>` : ''}${createLabel ? `<button class="policy-create-button" type="button" data-file-create>${icon('plus')}<span>${createLabel}</span></button>` : ''}</div></div>`;
   }
 
   function noticeMarkup() {
@@ -373,7 +379,7 @@ export function mount(context = {}) {
   }
 
   function tableMarkup(title, subtitle, headings, rows, empty) {
-    return `<section class="file-service-main-surface file-service-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(subtitle)}</span></div><span class="dwrt-kit-table-count">${rows.length} 条</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table file-service-table"><thead><tr>${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody>${state.loading && !state.loaded ? `<tr><td colspan="${headings.length}" class="dwrt-kit-table-empty">正在读取文件服务配置</td></tr>` : rows.length ? rows.join('') : `<tr><td colspan="${headings.length}" class="dwrt-kit-table-empty">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
+    return `<section class="file-service-main-surface file-service-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong></div><span class="dwrt-kit-table-count">${rows.length} 条</span>${toolbarMarkup()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table file-service-table"><thead><tr>${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody>${state.loading && !state.loaded ? `<tr><td colspan="${headings.length}" class="dwrt-kit-table-empty">正在读取文件服务配置</td></tr>` : rows.length ? rows.join('') : `<tr><td colspan="${headings.length}" class="dwrt-kit-table-empty">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
   }
 
   function renderNfs() {
@@ -528,7 +534,7 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', MODULE_CLASS);
-    root.innerHTML = `<section class="file-service-shell">${tabsMarkup()}${noticeMarkup()}<main class="file-service-workbench">${toolbarMarkup()}${mainSurfaceMarkup()}</main>${drawerMarkup()}</section>`;
+    root.innerHTML = `<section class="file-service-shell">${tabsMarkup()}${noticeMarkup()}<main class="file-service-workbench">${viewSwitchMarkup()}${mainSurfaceMarkup()}</main>${drawerMarkup()}</section>`;
     ui.mountAll?.(root);
   }
 

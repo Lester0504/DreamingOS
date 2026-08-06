@@ -1,6 +1,28 @@
 .routing-table-route-host,
 .routing-table-route-host * { box-sizing: border-box; letter-spacing: 0; }
 
+/* The shell prints 策略引擎 / 路由表 in .stage-header, and this page used to print
+   "路由表 / 配置版本 19" again right below it -- the page named itself twice and the
+   tabs were pushed to y=175 (measured on 30.1). The page-level heading is gone now,
+   so the shell header is the single title and the tabs come straight after it.
+
+   Why this is declared here: the stage rules for this route live in policy-table.css
+   under .console-stage.is-policy-table, which the shell does set for this route --
+   but routing-table.css never imported that file (terminal-groups.css does), so none
+   of it applied and the header stayed. Rather than import an unrelated page's
+   stylesheet, the two rules this route actually needs are scoped to its own host. */
+.console-stage.is-policy-table:has(> .routing-table-route-host) {
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
+  height: var(--app-stage-height);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.console-stage.is-policy-table:has(> .routing-table-route-host) .stage-header {
+  display: none;
+}
+
 .routing-table-route-host {
   width: 100%;
   max-width: 100%;
@@ -17,37 +39,38 @@
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   gap: var(--app-page-gap, 14px);
-  padding: var(--app-page-gutter-block) var(--app-page-gutter-inline);
+  /* 不要在这里写 --app-page-gutter-*：那层内边距归 .console-stage（见
+     menu-shell.css 的 .console-stage 规则），页面 shell 再写一遍就是双重 gutter。
+     上一版正是因此把 tab 推到 top=36/left=314，而其它所有页面都在 18/296 ——
+     这就是被打回的「位置不对」。几何一律交给 stage 与 kit。 */
   overflow: hidden;
 }
 
 .routing-page-toolbar {
   min-width: 0;
-  min-height: 52px;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  /* 只剩 tabs（重复标题与搜索/新建组已移走），单列即可让它贴左，
+     不再用三列栅格把 tab 居中。高度由 kit 的页面档 tab 决定，
+     这里不写 min-height —— 上一版同时写了 52px 和 0 两条，后者覆盖前者，
+     等于既没生效也没表达意图。 */
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
   gap: 16px;
 }
 
-.routing-page-heading { min-width: 0; display: grid; gap: 2px; }
-.routing-page-heading strong { color: var(--app-text); font-size: 18px; font-weight: 780; }
-.routing-page-heading span { color: var(--app-text-muted); font-size: 11px; }
+/*
+ * 几何全部交给 kit 的 `dwrt-kit-page-tabs`（高度、tab 最小宽度、内边距、
+ * 横滚与滚动条隐藏它都管了）。这里原先自己写 width/overflow/min-width，
+ * 把 tab 压成了比其它页面小一号的样子，是被打回的直接原因。
+ * 页面只保留「靠左」这一条位置意图。
+ */
+.routing-page-tabs.dwrt-kit-tabs { justify-self: start; }
 
-.routing-page-tabs.dwrt-kit-tabs {
-  width: max-content;
-  max-width: 100%;
-  min-width: 0;
-  justify-self: center;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-.routing-page-tabs.dwrt-kit-tabs::-webkit-scrollbar { display: none; }
-.routing-page-tabs .dwrt-kit-tab { min-width: max-content; white-space: nowrap; }
-
-.routing-page-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
-.routing-page-actions svg,
 .routing-row-action svg { width: 17px; height: 17px; display: block; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+/* Search + create, now living in the table card's toolbar rather than a page header. */
+.routing-table-controls { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.routing-table-controls svg { width: 17px; height: 17px; display: block; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 
 .routing-search {
   width: 38px;
@@ -266,16 +289,13 @@
 .routing-runtime-empty { min-height: 104px; display: grid; place-items: center; border-radius: var(--app-radius-card); color: var(--app-text-muted); background: var(--color-surface-control, rgba(255,255,255,.035)); font-size: 12px; }
 
 @media (max-width: 1180px) {
-  .routing-page-toolbar { grid-template-columns: auto minmax(0, 1fr); }
-  .routing-page-tabs { grid-column: 1 / -1; grid-row: 2; justify-self: start; }
-  .routing-page-actions { grid-column: 2; grid-row: 1; }
+  /* Single column at every width now; the tabs scroll horizontally on their own. */
+  .routing-page-tabs { justify-self: start; }
 }
 
 @media (max-width: 720px) {
-  .routing-table-shell { padding: max(10px, var(--app-page-gutter-block)) max(10px, var(--app-page-gutter-inline)); }
-  .routing-page-toolbar { grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
-  .routing-page-heading span { display: none; }
-  .routing-page-actions { gap: 6px; }
+  .routing-page-toolbar { gap: 10px; }
+  .routing-table-controls { gap: 6px; }
   .routing-create-button span { display: none; }
   .routing-search:focus-within { width: min(190px, 46vw); }
   .routing-capability-banner { grid-template-columns: 1fr; gap: 4px; }

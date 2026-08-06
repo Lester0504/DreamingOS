@@ -263,20 +263,55 @@ int storage_files_write_denied(const char *abs_path, const char **reason)
     return 0;
 }
 
+/* Mount points that must never become a browsable root.  These are excluded by
+ * path, not by device: the system disk itself stays browsable on purpose, so
+ * excluding a whole device would take the entire filesystem with it.  What is
+ * withheld here is the credential and live-state material that has no business
+ * being served as a document, plus kernel/runtime surfaces that are not files
+ * in any useful sense. */
+static int storage_files_root_excluded(const char *path)
+{
+    static const char *const excluded[] = {
+        "/etc/shadow", "/etc/dropbear", "/etc/ssh", "/etc/ssl/private",
+        "/etc/dreamingwrt", "/data/dreamingwrt",
+        "/proc", "/sys", "/dev", "/run", NULL
+    };
+    int i;
+
+    if (!path || !path[0])
+        return 0;
+    for (i = 0; excluded[i]; i++)
+        if (storage_files_path_prefix(path, excluded[i]))
+            return 1;
+    return 0;
+}
+
+/* Root admission.  The product decision is that operators may browse the real
+ * filesystem instead of being shown an empty page, so admission is decided per
+ * path and per filesystem type rather than by excluding the system disk
+ * wholesale.  The blanket "/mnt + /media only" rule combined with a
+ * same-device exclusion left zero roots on any router whose data lives on the
+ * system disk, which is every current unit.  Path-traversal defence is
+ * unchanged and orthogonal: it lives in the openat2 walk below. */
 static int storage_files_root_allowed(const char *path, const char *fstype)
 {
     static const char *const denied_fs[] = {
         "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "overlay",
         "squashfs", "debugfs", "tracefs", "securityfs", "cgroup",
-        "cgroup2", "pstore", "efivarfs", "fusectl", "configfs", NULL
+        "cgroup2", "pstore", "efivarfs", "fusectl", "configfs",
+        "bpf", "nfsd", "mqueue", "hugetlbfs", "binfmt_misc",
+        "autofs", "rpc_pipefs", "selinuxfs", NULL
     };
     int i;
 
     if (!path || !fstype || !path[0] || !fstype[0])
         return 0;
-#ifndef STORAGE_FILES_TEST_ALLOW_ANY_MOUNT_ROOT
-    if (!(storage_files_path_prefix(path, "/mnt") ||
-          storage_files_path_prefix(path, "/media")))
+    if (path[0] != '/')
+        return 0;
+#ifdef STORAGE_FILES_TEST_ALLOW_ANY_MOUNT_ROOT
+    (void)storage_files_root_excluded;
+#else
+    if (storage_files_root_excluded(path))
         return 0;
 #endif
     for (i = 0; denied_fs[i]; i++)
@@ -285,23 +320,24 @@ static int storage_files_root_allowed(const char *path, const char *fstype)
     return 1;
 }
 
-static int storage_files_protected_device(dev_t dev)
+/* Roots that are browsable but must not be written through this interface.
+ * Individual paths are still filtered by storage_files_write_denied(); this is
+ * the coarser statement that a root holding the running system is presented
+ * read-only, so the UI does not offer edit affordances it will then refuse. */
+static int storage_files_root_write_protected(const char *path)
 {
-#ifdef STORAGE_FILES_TEST_ALLOW_PROTECTED_DEVICE
-    (void)dev;
-    return 0;
-#else
-    static const char *const paths[] = {
-        "/", "/data", "/etc/dreamingwrt", "/boot", NULL
+    static const char *const protected_roots[] = {
+        "/", "/boot", "/etc", "/etc/config", "/etc/crontabs",
+        "/etc/nginx", "/etc/samba", "/etc/rc.local", NULL
     };
-    struct stat st;
     int i;
 
-    for (i = 0; paths[i]; i++)
-        if (stat(paths[i], &st) == 0 && st.st_dev == dev)
+    if (!path || !path[0])
+        return 0;
+    for (i = 0; protected_roots[i]; i++)
+        if (!strcmp(path, protected_roots[i]))
             return 1;
     return 0;
-#endif
 }
 
 static int storage_files_root_cmp(const void *a, const void *b)
@@ -363,12 +399,12 @@ static int storage_files_discover_roots(struct storage_file_root *roots,
             continue;
         }
         close(fd);
-        if (storage_files_protected_device(st.st_dev))
-            continue;
         root.major_id = maj;
         root.minor_id = min;
         root.dev = st.st_dev;
         root.read_only = storage_files_option_present(fields[5], "ro");
+        if (storage_files_root_write_protected(root.path))
+            root.read_only = 1;
         snprintf(root.id, sizeof(root.id), "mount-%u-%u-%08x", maj, min,
                  storage_files_hash(root.path,
                                     storage_files_hash(root.source, 0)));

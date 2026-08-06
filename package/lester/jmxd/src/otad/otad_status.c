@@ -275,9 +275,13 @@ struct json_object *otad_status_json(void)
                                json_object_new_boolean(slot_write_ready));
         json_object_object_add(resp, "full_firmware_apply_enabled",
                                json_object_new_boolean(slot_write_ready));
-        /* Stays closed: the hot update writer is compiled out, see below. */
+        /*
+         * Hot update needs less than a slot write: no A/B layout, no bootloader
+         * steering, because it replaces files in place and does not reboot. What
+         * it does need is the same signing trust, so it tracks trust_ready only.
+         */
         json_object_object_add(resp, "hot_update_apply_enabled",
-                               json_object_new_boolean(0));
+                               json_object_new_boolean(trust_ready));
         json_object_object_add(resp, "slot_write_enabled",
                                json_object_new_boolean(slot_write_ready));
         json_object_object_add(resp, "firmware_authenticity_verifier_ready",
@@ -291,17 +295,21 @@ struct json_object *otad_status_json(void)
          * and automatic fallback all exist in otad_firmware.c. What used to be
          * missing was permission to reach it, not the code.
          *
-         * Hot update is a different story and must not be reported as the same:
-         * its writer is still compiled out, so it stays unavailable no matter
-         * how the trust policy is configured.
+         * Hot update is now implemented too: its writer stages, replaces
+         * atomically, verifies the written file and rolls back on failure, and
+         * apply verifies a signed hot-update statement first. It differs from
+         * the full path in what it requires, not in whether it exists - no slot
+         * and no reboot, so trust alone decides whether it is reachable.
          */
         json_object_object_add(resp, "full_firmware_apply_implemented",
                                json_object_new_boolean(1));
         json_object_object_add(resp, "hot_update_apply_implemented",
-                               json_object_new_boolean(0));
+                               json_object_new_boolean(1));
         otad_json_add_string(resp, "full_firmware_apply_reason", gate_reason);
         otad_json_add_string(resp, "hot_update_apply_reason",
-                             "hot_update_writer_disabled_in_build");
+                             trust_ready ? "" :
+                             otad_json_str(trust, "reason",
+                                           "release_trust_unavailable"));
         if (!trust_ready)
             otad_json_add_string(resp, "release_trust_setup_reason",
                                  otad_json_str(trust, "reason",

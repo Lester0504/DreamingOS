@@ -2011,6 +2011,60 @@ static int jmx_mount_runtime_read(const char *path,
     return JMX_SYSTEM_MOUNT_OK;
 }
 
+/*
+ * `root` 是否为 `path` 的路径前缀（按 `/` 分界，不做裸字符串比较，
+ * 否则 `/persist/etc` 会错配 `/persist/etcetera`）。`/` 是任何绝对路径的前缀。
+ */
+static int jmx_mount_root_is_prefix(const char *root, const char *path)
+{
+    size_t root_len;
+
+    if (!root || !path || root[0] != '/' || path[0] != '/')
+        return 0;
+    if (!strcmp(root, "/"))
+        return 1;
+    root_len = strlen(root);
+    if (strncmp(root, path, root_len) != 0)
+        return 0;
+    return path[root_len] == '/' || path[root_len] == '\0';
+}
+
+/*
+ * 为绑定挂载补上宿主挂载点。判据是同一 major:minor（同一个文件系统）上 root 为本条
+ * root 路径前缀、且 root 最长的那条 —— 最长前缀才是真正的宿主，因为宿主自己也可能
+ * 是一层绑定挂载。宿主挂载通常 root 为 `/`（如 `/data`），但不假定它一定存在：
+ * 只挂了绑定挂载而整卷未挂载时留空，前端按"无宿主"处理而不是显示一个不存在的路径。
+ */
+static void jmx_mount_resolve_bind_hosts(struct jmx_system_mount_runtime_entry *entries,
+                                         size_t count)
+{
+    size_t i, j;
+
+    if (!entries)
+        return;
+    for (i = 0; i < count; i++) {
+        const struct jmx_system_mount_runtime_entry *best = NULL;
+
+        entries[i].bind_host_target[0] = '\0';
+        if (!entries[i].bind_mount)
+            continue;
+        for (j = 0; j < count; j++) {
+            if (j == i ||
+                entries[j].major_num != entries[i].major_num ||
+                entries[j].minor_num != entries[i].minor_num ||
+                strlen(entries[j].root) >= strlen(entries[i].root) ||
+                !jmx_mount_root_is_prefix(entries[j].root, entries[i].root))
+                continue;
+            if (!best || strlen(entries[j].root) > strlen(best->root))
+                best = &entries[j];
+        }
+        if (best)
+            (void)jmx_mount_copy_checked(entries[i].bind_host_target,
+                                         sizeof(entries[i].bind_host_target),
+                                         best->target);
+    }
+}
+
 static int jmx_mount_uci_next_arg(const char **cursor, char *out, size_t out_len)
 {
     const char *p;
@@ -2228,6 +2282,7 @@ int jmx_system_mount_read(const struct jmx_system_mount_read_opts *opts,
     rc = jmx_mount_runtime_read(mountinfo, runtime, runtime_max, &runtime_n, err, err_len);
     if (rc != 0)
         return rc;
+    jmx_mount_resolve_bind_hosts(runtime, runtime_n);
     rc = jmx_mount_config_read(fstab, configured, configured_max, &configured_n,
                                err, err_len);
     if (rc != 0)
@@ -2632,6 +2687,18 @@ struct json_object *jmx_system_mounts_read_json(void)
                                    json_object_new_string(runtime[i].bind_mount ? "bind" : "runtime"));
             json_object_object_add(o, "bind_mount",
                                    json_object_new_boolean(runtime[i].bind_mount));
+            /*
+             * 绑定挂载的自述位。`bind_host_target` 指向宿主挂载点，
+             * `capacity_is_host_filesystem` 说明容量三件套来自宿主文件系统而不是一个
+             * 独立卷 —— 15 条 persist 绑定挂载与 `/data` 共享同一份容量数字，
+             * 前端据此折叠展示，不要让它们各自看起来像独立的 19.5 GB 卷。
+             */
+            json_object_object_add(o, "bind_host_target",
+                                   json_object_new_string(runtime[i].bind_host_target));
+            json_object_object_add(o, "bind_host_mount",
+                                   json_object_new_string(runtime[i].bind_host_target));
+            json_object_object_add(o, "capacity_is_host_filesystem",
+                                   json_object_new_boolean(runtime[i].bind_mount));
             json_object_object_add(o, "configured",
                                    json_object_new_boolean(runtime[i].configured));
             json_object_object_add(o, "editable", json_object_new_boolean(0));
@@ -2671,7 +2738,11 @@ struct json_object *jmx_system_mounts_read_json(void)
     json_object_object_add(data, "points", json_object_get(mounted));
     json_object_object_add(data, "runtime_count", json_object_new_int64((int64_t)runtime_count));
     json_object_object_add(data, "configured_count", json_object_new_int64((int64_t)configured_count));
-    json_object_object_add(data, "contract_version", json_object_new_string("system-mounts.v2"));
+    /*
+     * v3 相对 v2 只是新增字段（`bind_host_target` / `bind_host_mount` /
+     * `capacity_is_host_filesystem`），未删改任何既有字段，老前端读 v3 仍然正常。
+     */
+    json_object_object_add(data, "contract_version", json_object_new_string("system-mounts.v3"));
     if (err[0])
         json_object_object_add(data, "read_error", json_object_new_string(err));
     free(runtime);

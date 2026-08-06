@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "ac_internal.h"
+#include "ac_discovery.h"
 
 static int ac_reply_json(struct ubus_context *ctx,
                          struct ubus_request_data *req,
@@ -529,6 +530,20 @@ static int ac_handle_aps_list(struct ubus_context *ctx, struct ubus_object *obj,
     return ac_reply_json(ctx, req, response);
 }
 
+/* Discovered-but-not-adopted candidates. Read-only: listing a candidate
+ * never adopts it. */
+static int ac_handle_discovery_list(struct ubus_context *ctx,
+                                    struct ubus_object *obj,
+                                    struct ubus_request_data *req,
+                                    const char *method, struct blob_attr *msg)
+{
+    (void)obj;
+    (void)method;
+    if (msg && blob_len(msg) != 0)
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    return ac_reply_json(ctx, req, ac_discovery_list_json());
+}
+
 static int ac_handle_pairing_token_create(
     struct ubus_context *ctx, struct ubus_object *obj,
     struct ubus_request_data *req, const char *method, struct blob_attr *msg)
@@ -801,6 +816,7 @@ static const struct ubus_method ac_methods[] = {
     UBUS_METHOD_NOARG("status", ac_handle_status),
     UBUS_METHOD_NOARG("capabilities", ac_handle_capabilities),
     UBUS_METHOD_NOARG("aps_list", ac_handle_aps_list),
+    UBUS_METHOD_NOARG("discovery_list", ac_handle_discovery_list),
     UBUS_METHOD("ap_update", ac_handle_ap_update, ac_ap_update_policy),
     UBUS_METHOD("pairing_token_create", ac_handle_pairing_token_create,
                 ac_create_policy),

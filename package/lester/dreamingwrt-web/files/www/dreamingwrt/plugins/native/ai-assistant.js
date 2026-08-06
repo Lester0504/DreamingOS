@@ -16,7 +16,7 @@ export function mount(context = {}) {
     return { name, ok, data: json?.data ?? json, raw: json, error: ok ? null : new Error(apiErrorText(json, response.statusText)) };
   });
 
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260804-llm-tabs-demo-02';
   const INSTANCE_ID = `ai-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
   const MODULE_CLASS = 'ai-assistant-route-host';
   const ACTIVE_CONVERSATION_KEY = 'dreamingwrt.ai.activeConversation';
@@ -27,6 +27,8 @@ export function mount(context = {}) {
     models: '/api/v1/ai/models',
     modelsSync: '/api/v1/ai/models/sync',
     providerTest: '/api/v1/ai/provider/test',
+    providers: '/api/v1/ai/providers',
+    dispatchPolicy: '/api/v1/ai/dispatch-policy',
     history: '/api/v1/ai/history',
     chat: '/api/v1/ai/chat',
     chatStream: '/api/v1/ai/chat/stream',
@@ -44,13 +46,18 @@ export function mount(context = {}) {
     oauthDisconnect: '/api/v1/ai/oauth/disconnect'
   };
   const PROVIDERS = [
-    { id: 'openai', label: 'OpenAI', mark: 'OpenAI', base: 'https://api.openai.com/v1' },
-    { id: 'anthropic', label: 'Anthropic', mark: 'Claude', base: 'https://api.anthropic.com' },
-    { id: 'gemini', label: 'Google Gemini', mark: 'Gemini', base: 'https://generativelanguage.googleapis.com/v1beta' },
-    { id: 'kimi', label: 'Kimi Code', mark: 'Moonshot', base: 'https://api.kimi.com/coding/v1' },
-    { id: 'deepseek', label: 'DeepSeek', mark: 'DeepSeek', base: 'https://api.deepseek.com' },
-    { id: 'qwen', label: '通义千问', mark: 'Qwen', base: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
-    { id: 'openai_compatible', label: 'OpenAI 兼容', mark: 'API', base: '' }
+    /*
+     * `hint` 是品牌下的代表模型，只用于给磁贴一行副标题（demo 1 的 `.sub`）。
+     * 它是**静态说明文本**，不是能力声明：真正可选的模型来自
+     * `/api/v1/ai/models` 同步结果，别把这里的字样当成后端已支持的模型清单。
+     */
+    { id: 'openai', label: 'OpenAI', mark: 'OpenAI', hint: 'GPT 系列', base: 'https://api.openai.com/v1' },
+    { id: 'anthropic', label: 'Anthropic', mark: 'Claude', hint: 'Claude 系列', base: 'https://api.anthropic.com' },
+    { id: 'gemini', label: 'Google Gemini', mark: 'Gemini', hint: 'Gemini 系列', base: 'https://generativelanguage.googleapis.com/v1beta' },
+    { id: 'kimi', label: 'Kimi Code', mark: 'Moonshot', hint: 'Kimi 系列', base: 'https://api.kimi.com/coding/v1' },
+    { id: 'deepseek', label: 'DeepSeek', mark: 'DeepSeek', hint: 'DeepSeek 系列', base: 'https://api.deepseek.com' },
+    { id: 'qwen', label: '通义千问', mark: 'Qwen', hint: 'Qwen 系列', base: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+    { id: 'openai_compatible', label: 'OpenAI 兼容', mark: 'API', hint: '自建或反代端点', base: '' }
   ];
   const OAUTH_REASON_LABELS = {
     requires_preconfigured_anthropic_workload_identity_federation: '需要预先配置 Anthropic Workload Identity Federation。',
@@ -147,6 +154,22 @@ export function mount(context = {}) {
     sending: false,
     syncingModels: false,
     testingProvider: false,
+    /*
+     * 最近一次「测试连接」的结果，供供应商页的状态卡展示联通与延迟。
+     * 后端没有 last_check_* 持久列（那是多供应商契约里的设计，尚未实现），
+     * 所以这是本次会话内的观测值，刷新页面即清空 —— 文案必须如实说明这一点，
+     * 不能让它看起来像后端记录的历史状态。
+     */
+    providerCheck: { state: 'unknown', latency: 0, model: '', error: '', at: 0 },
+    /*
+     * 多供应商与调度策略。列表与策略都来自后端，前端不留兜底数据：
+     * `loaded` 为 false 时页面说「未确认」，不说「没有」；
+     * `error` 已按状态码分类（见 classifyApiFailure），不混用一句通用失败文案。
+     */
+    providers: { items: [], count: 0, loaded: false, loading: false, error: '', errorKind: '' },
+    dispatch: { policy: null, loaded: false, loading: false, error: '', errorKind: '', saving: '' },
+    providerBusy: { id: '', action: '' },
+    providerRemoveId: '',
     tools: [],
     toolsError: '',
     stream: {
@@ -412,7 +435,22 @@ export function mount(context = {}) {
         tool_result_feedback: caps.tool_result_feedback === true,
         max_tool_rounds: Math.max(0, Math.round(firstNumber(caps.max_tool_rounds, 0))),
         provider_models_sync: caps.provider_models_sync === true,
-        provider_test: caps.provider_test === true
+        provider_test: caps.provider_test === true,
+        /*
+         * 多供应商能力位。2026-08-04 后端已交付并在 30.1 实测为 true：
+         *   GET /api/v1/ai/providers        200，capabilities.multi_provider = true
+         *   GET /api/v1/ai/dispatch-policy  200，available_strategies 三档
+         * 这里只读能力位、不硬编码结论；能力位为假时隐藏多供应商 UI（契约第六节）。
+         * 调度策略枚举一律取后端给的 dispatch_strategies，前端不自备清单。
+         */
+        multi_provider: caps.multi_provider === true || caps.ai_multi_provider === true,
+        multi_provider_reason: firstText(caps.ai_multi_provider_reason, caps.multi_provider_reason),
+        dispatch_strategies: asArray(caps.dispatch_strategies).length
+          ? asArray(caps.dispatch_strategies).map(String)
+          : asArray(caps.ai_dispatch_strategies).map(String),
+        providers_endpoint: firstText(caps.providers_endpoint, ENDPOINTS.providers),
+        dispatch_policy_endpoint: firstText(caps.dispatch_policy_endpoint, ENDPOINTS.dispatchPolicy),
+        provider_last_check_persisted: caps.provider_last_check_persisted === true
       },
       oauth: {
         available: oauth.available === true,
@@ -424,6 +462,79 @@ export function mount(context = {}) {
         disconnect_endpoint: firstText(oauth.disconnect_endpoint, ENDPOINTS.oauthDisconnect)
       }
     };
+  }
+
+  /*
+   * 供应商列表项。字段形状见 `Backend-to-Front-llm-multi-provider-contract.md` 第三节。
+   * 两条要点：
+   *  - 密钥永不回显，只有 `api_key_set` 与 `api_key_hint`（前 3 后 4）。
+   *  - `model_count` 为 0 且没有同步时间戳时是「未同步」，不是「0 个可用」。
+   */
+  function normalizeProvider(value = {}) {
+    const data = value && typeof value === 'object' ? value : {};
+    const check = data.last_check && typeof data.last_check === 'object' ? data.last_check : {};
+    const latencyRaw = check.latency_ms ?? check.latency;
+    const syncedAt = Math.round(firstNumber(data.models_synced_at, 0));
+    return {
+      id: firstText(data.id),
+      provider: firstText(data.provider, 'openai'),
+      display_name: firstText(data.display_name),
+      api_base: firstText(data.api_base),
+      api_key_set: Boolean(data.api_key_set),
+      api_key_hint: firstText(data.api_key_hint),
+      auth_mode: firstText(data.auth_mode, 'api_key') === 'oauth' ? 'oauth' : 'api_key',
+      default_model: firstText(data.default_model),
+      role: firstText(data.role, 'standby') === 'primary' ? 'primary' : 'standby',
+      priority: Math.round(firstNumber(data.priority, 100)),
+      weight: Math.max(1, Math.round(firstNumber(data.weight, 1))),
+      enabled: Boolean(data.enabled),
+      model_count: Math.max(0, Math.round(firstNumber(data.model_count, 0))),
+      models_synced_at: syncedAt,
+      last_check: {
+        // -1 / null 都表示「从未测过」，与「测过且失败」必须区分。
+        state: check.ok === true ? 'ok' : check.ok === false ? 'fail' : 'unknown',
+        latency_ms: latencyRaw === null || latencyRaw === undefined ? null : Math.round(firstNumber(latencyRaw, 0)),
+        checked_at: Math.round(firstNumber(check.checked_at, 0)),
+        error: firstText(check.error),
+        error_kind: firstText(check.error_kind)
+      }
+    };
+  }
+
+  function normalizeDispatchPolicy(value = {}) {
+    const data = unwrap(value);
+    const strategies = asArray(data.available_strategies).map(String).filter(Boolean);
+    return {
+      strategy: firstText(data.strategy, 'single'),
+      // 枚举只认后端。空数组保持为空，让 UI 走「策略枚举未确认」而不是自造三档。
+      available_strategies: strategies,
+      failover_timeout_ms: Math.max(0, Math.round(firstNumber(data.failover_timeout_ms, 0))),
+      failover_max_attempts: Math.max(0, Math.round(firstNumber(data.failover_max_attempts, 0))),
+      provider_count: Math.max(0, Math.round(firstNumber(data.provider_count, 0))),
+      enabled_provider_count: Math.max(0, Math.round(firstNumber(data.enabled_provider_count, 0))),
+      primary_ready: data.primary_ready === true,
+      updated_at: Math.round(firstNumber(data.updated_at, 0))
+    };
+  }
+
+  /*
+   * 失败分类。design.md「Capability truth and failure classification」第 3 条：
+   * 404/405/501 是接口未实现，401 会话失效，403 权限不足，5xx 后端错误，无状态码是网络不可用。
+   * `error.code` 优先于状态码，因为同一后端在不同构建下会用不同状态码表达同一件事。
+   */
+  function classifyApiFailure(error, subject = '数据', mode = 'read') {
+    const code = firstText(error?.payload?.error?.code, error?.payload?.code);
+    if (code === 'method_not_registered') return { kind: 'unimplemented', message: `${subject}对应的能力尚未接入当前固件` };
+    if (code === 'source_unavailable') return { kind: 'unavailable', message: `${subject}服务暂时不可用，请稍后重试` };
+    const status = Math.round(firstNumber(error?.status, 0));
+    const verb = mode === 'write' ? '写入' : '读取';
+    if (!status) return { kind: 'network', message: `无法连接路由器，${subject}${verb}失败` };
+    if (status === 401) return { kind: 'unauthorized', message: '登录状态已失效，请重新登录' };
+    // 403 必须区分读写：把写权限不足说成「无权读取」会让人以为整页都打不开。
+    if (status === 403) return { kind: 'forbidden', message: mode === 'write' ? `当前账号无权修改${subject}` : `当前账号无权读取${subject}` };
+    if (status === 404 || status === 405 || status === 501) return { kind: 'unimplemented', message: `${subject}接口未在当前固件实现` };
+    if (status >= 500) return { kind: 'server', message: `${subject}${verb}时后端返回 ${status}` };
+    return { kind: 'error', message: firstText(error?.message, `${subject}${verb}失败`) };
   }
 
   function configComparable(config = state.config) {
@@ -1043,6 +1154,61 @@ export function mount(context = {}) {
     touchActiveConversation();
   }
 
+  /*
+   * 供应商列表与调度策略。**先请求端点，再依据响应决定渲染**（design.md 第 2 条）：
+   * 不拿 `/api/v1/ai/config` 的能力位当前置门，资源端点自己才是它可用性的权威。
+   * 因此这两个请求无条件发出，即便 config 那边没声明 multi_provider。
+   */
+  async function loadProviders(options = {}) {
+    if (isGlobal) return null;
+    state.providers.loading = true;
+    if (options.render !== false) render();
+    try {
+      const data = unwrap(await requestJson(ENDPOINTS.providers));
+      if (!state.mounted) return null;
+      const items = asArray(data.providers).map(normalizeProvider).filter((item) => item.id);
+      state.providers = {
+        items,
+        // 条数以后端 count 为准；缺字段时才退回数组长度。
+        count: Math.max(0, Math.round(firstNumber(data.count, items.length))),
+        loaded: true,
+        loading: false,
+        error: '',
+        errorKind: ''
+      };
+      if (data.capabilities && typeof data.capabilities === 'object') {
+        const caps = data.capabilities;
+        state.config.capabilities.multi_provider = caps.multi_provider === true || caps.ai_multi_provider === true;
+        const strategies = asArray(caps.dispatch_strategies).length ? asArray(caps.dispatch_strategies) : asArray(caps.ai_dispatch_strategies);
+        if (strategies.length) state.config.capabilities.dispatch_strategies = strategies.map(String);
+        state.config.capabilities.provider_last_check_persisted = caps.provider_last_check_persisted === true;
+      }
+    } catch (error) {
+      if (!state.mounted) return null;
+      const classified = classifyApiFailure(error, '供应商列表');
+      state.providers = { items: [], count: 0, loaded: false, loading: false, error: classified.message, errorKind: classified.kind };
+    }
+    if (options.render !== false) render();
+    return state.providers;
+  }
+
+  async function loadDispatchPolicy(options = {}) {
+    if (isGlobal) return null;
+    state.dispatch.loading = true;
+    if (options.render !== false) render();
+    try {
+      const policy = normalizeDispatchPolicy(await requestJson(ENDPOINTS.dispatchPolicy));
+      if (!state.mounted) return null;
+      state.dispatch = { policy, loaded: true, loading: false, error: '', errorKind: '', saving: '' };
+    } catch (error) {
+      if (!state.mounted) return null;
+      const classified = classifyApiFailure(error, '调度策略');
+      state.dispatch = { policy: null, loaded: false, loading: false, error: classified.message, errorKind: classified.kind, saving: '' };
+    }
+    if (options.render !== false) render();
+    return state.dispatch;
+  }
+
   async function loadInitial() {
     const seq = ++state.seq;
     state.loading = true;
@@ -1071,6 +1237,13 @@ export function mount(context = {}) {
       state.modelsListed = state.models.length > 0;
     }
     if (!state.models.length) state.models = uniqueModels([state.config.model]);
+    /*
+     * 必须排在 `state.config = normalizeConfig(...)` 之后：`loadProviders` 会用
+     * `/ai/providers` 自带的 capabilities 覆盖能力位，先跑会被这里的赋值冲掉。
+     * 设置路由才需要，全局对话抽屉不拉。
+     */
+    if (!isGlobal) await Promise.all([loadProviders({ render: false }), loadDispatchPolicy({ render: false })]);
+    if (!state.mounted || seq !== state.seq) return;
     if (historyResult?.ok) {
       state.history = normalizeHistory(historyResult.data);
       state.historyError = '';
@@ -1717,6 +1890,23 @@ export function mount(context = {}) {
     return markup || `<div class="ai-oauth-confirm"><button type="button" data-ai-oauth-disconnect-cancel>取消</button><button type="button" data-ai-oauth-disconnect-confirm>断开连接</button></div>`;
   }
 
+  /*
+   * 移除供应商是不可逆写操作，走和 OAuth 断开一致的二次确认
+   * （design.md Capability truth 第 7 条：不得削弱写保护）。
+   */
+  function providerRemoveConfirmation() {
+    if (!state.providerRemoveId) return '';
+    const item = providerById(state.providerRemoveId);
+    if (!item) return '';
+    const label = firstText(item.display_name, oauthProviderLabel(item.provider));
+    const markup = window.DWRT_UI_KIT?.confirmationMarkup?.({
+      id: 'ai-provider-remove', action: 'ai-provider-remove', tone: 'danger',
+      title: `移除 ${label}`, description: '路由器将删除该供应商的凭据与已缓存模型列表。全局默认参数与其他供应商不受影响。',
+      cancelLabel: '取消', confirmLabel: '移除供应商'
+    });
+    return markup || `<div class="ai-oauth-confirm"><button type="button" data-ai-provider-remove-cancel>取消</button><button type="button" data-ai-provider-remove-confirm>移除供应商</button></div>`;
+  }
+
   function settingsView() {
     const provider = providerDefinition();
     const apiBaseHelp = state.config.auth_mode === 'oauth'
@@ -1725,15 +1915,22 @@ export function mount(context = {}) {
         ? 'OpenAI 兼容服务需要填写完整 API Base URL'
         : '留空时后端使用该提供商的默认 API 地址';
     const tab = settingsTab();
+    /*
+     * 「启用 LLM 服务」总开关只放在高级设置页。
+     *
+     * 用户 2026-08-04：「启用 llm 服务不用在每一页都显示，在高级设置页面显示就够了」。
+     * 它是个全局开关，跟着每个 Tab 复现一遍只是重复占位 —— 概览页已经用「接入状态」
+     * 那张卡说明了同一件事，供应商页关心的是选哪家和填凭据，都不需要再放一次开关。
+     */
     // 概览的四张卡提到主卡片外面，和其他页面一致；主卡片顶部不再复述 Tab 名。
     return `
       ${tab === 'overview' ? settingsOverviewCards() : ''}
-      ${settingsMasterCard()}
+      ${tab === 'advanced' ? settingsMasterCard() : ''}
       <form class="ai-settings-card ai-page-card dwrt-kit-page-surface dwrt-kit-glass-surface" data-ai-scroll="settings">
         ${state.settingsError ? `<div class="ai-inline-message error">${icon('alert')}<span>${escapeHtml(state.settingsError)}</span></div>` : ''}
         ${settingsTabContent(provider, apiBaseHelp)}
         ${settingsFooter()}
-      </form>${oauthDisconnectConfirmation()}
+      </form>${oauthDisconnectConfirmation()}${providerRemoveConfirmation()}
     `;
   }
 
@@ -1744,7 +1941,7 @@ export function mount(context = {}) {
     const ready = credentialReady();
     const badge = state.loading ? '读取中' : on ? (ready ? '运行中' : '缺少凭据') : '未启用';
     const badgeTone = state.loading ? 'neutral' : on ? (ready ? 'ok' : 'warn') : 'neutral';
-    return `<section class="ai-master-card ${on ? 'is-active' : ''} dwrt-kit-page-surface dwrt-kit-glass-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass">
+    return `<section class="ai-master-card ${on ? 'is-active' : ''} dwrt-kit-glass-surface" data-dwrt-component="surface" data-dwrt-surface="stable-glass">
       <div class="ai-master-copy">
         <strong>启用 LLM 服务<span class="ai-master-badge is-${badgeTone}">${escapeHtml(badge)}</span></strong>
         <small>路由器统一管理模型接入凭据，供本机诊断、日志解读与自然语言操作使用。</small>
@@ -1823,14 +2020,30 @@ export function mount(context = {}) {
     return state.config.auth_mode === 'oauth' ? 'OAuth 未连接' : '缺少 API Key';
   }
 
+  /*
+   * 供应商设置。排版参照 demo 1 的两个「舱位」：上面选品牌 + 填凭据，下面是当前生效的
+   * 供应商卡（联通状态 / 预载模型 / 针对该供应商的动作）。
+   *
+   * 2026-08-04 起后端已交付多供应商，30.1 用只读凭据实测：
+   *   GET /api/v1/ai/providers        -> 200，capabilities.multi_provider = true
+   *   GET /api/v1/ai/dispatch-policy  -> 200，available_strategies 三档
+   * 因此 demo 1 的两段结构补齐：顶部全局调度策略条 + 底部「已配置的供应商」列表。
+   * 早先这里写的「接口尚未开放」是后端交付之后没同步的过期文案，已删除 ——
+   * 页面不得在能力位为真时告诉用户功能不存在（design.md Capability truth 第 6 条）。
+   *
+   * 能力位为假或端点读取失败时，走的是「未确认 / 未实现」的分类文案，
+   * 而不是把列表画成空的假控件。
+   */
   function settingsProviderSection() {
     // 「模型提供商 / MODEL PROVIDER」这类小标题复述了 Tab 名与控件语义，按用户要求删除。
-    return `<div class="ai-settings-section">
+    return `${dispatchStrategySection()}
+        <div class="ai-settings-section">
           <div class="ai-provider-grid" role="radiogroup" aria-label="模型提供商">
             ${PROVIDERS.map((item) => `
               <button class="ai-provider-button ${state.config.provider === item.id ? 'is-active' : ''}" type="button" role="radio" aria-checked="${state.config.provider === item.id ? 'true' : 'false'}" data-ai-provider="${item.id}">
                 <span class="ai-provider-mark">${escapeHtml(item.mark)}</span>
                 <strong>${escapeHtml(item.label)}</strong>
+                <small class="ai-provider-hint">${escapeHtml(item.hint || '')}</small>
                 ${state.config.provider === item.id ? icon('check') : ''}
               </button>
             `).join('')}
@@ -1843,12 +2056,257 @@ export function mount(context = {}) {
           </div>
           ${state.oauth.available && oauthProvider() && oauthProvider()?.supported !== true ? `<div class="ai-auth-mode-hint">${icon('key')}<span>${escapeHtml(oauthReason(oauthProvider()?.reason, '当前提供商仅支持 API Key 接入。'))}</span></div>` : ''}
           ${state.config.auth_mode === 'oauth' ? oauthPanel() : `<div class="ai-settings-grid"><label class="ai-field ai-field-wide"><span>API Key</span><input type="password" autocomplete="new-password" value="${escapeHtml(state.config.api_key_input)}" placeholder="${state.config.api_key_set ? `已保存 ${state.config.api_key_hint || ''}，留空不修改` : '输入 API Key'}" data-ai-config="api_key_input"><small>${state.config.clear_api_key ? '保存后将清除已保存密钥' : state.config.api_key_set ? '密钥已保存，页面不会回显完整内容' : '密钥仅提交到路由器配置接口'}</small></label>${state.config.api_key_set ? `<button class="ai-secondary-button ai-clear-key-button" type="button" data-ai-clear-key>${state.config.clear_api_key ? '撤销清除密钥' : '清除已保存密钥'}</button>` : ''}</div>`}
+          ${multiProviderUsable() ? `<div class="ai-provider-draft-actions">
+            <button class="ai-secondary-button" type="button" data-ai-provider-add ${state.providerBusy.action === 'add' ? 'disabled' : ''}>${state.providerBusy.action === 'add' ? icon('loader') : icon('check')}添加到已配置列表</button>
+          </div>` : ''}
+        </div>
+        ${settingsProviderList()}`;
+  }
+
+  const STRATEGY_LABELS = {
+    single: ['单供应商', '只用主通道，不自动切换'],
+    failover: ['故障切换', '主通道失败时按优先级顺延'],
+    load_balance: ['负载均衡', '按权重把请求分散到多个通道']
+  };
+
+  function strategyLabel(id) {
+    return STRATEGY_LABELS[id]?.[0] || String(id || '--');
+  }
+
+  function dispatchStrategies() {
+    /*
+     * 三档一律来自后端：优先用 `/ai/dispatch-policy` 的 `available_strategies`，
+     * 其次用 `/ai/providers` 能力位里的 `dispatch_strategies`。
+     * **前端不硬编码 ['single','failover','load_balance']** —— 枚举归后端，
+     * 否则后端加减一档时页面会摆出一个点了没用的选项。
+     */
+    const fromPolicy = state.dispatch.policy?.available_strategies || [];
+    if (fromPolicy.length) return fromPolicy;
+    return state.config.capabilities.dispatch_strategies || [];
+  }
+
+  /*
+   * 「能力位为真」与「列表端点真的能用」是两件事：能力位来自 `/ai/config`，
+   * 而 `/ai/providers` 可能 404 / 500。此时不能摆出「添加到已配置列表」——
+   * 点了必然失败，属于假控件。判据是列表端点自己读成功了（design.md 第 1 条：
+   * 资源端点自己才是它可用性的权威）。
+   */
+  function multiProviderUsable() {
+    return state.config.capabilities.multi_provider && state.providers.loaded && !state.providers.error;
+  }
+
+  /* demo 1 顶部的全局调度策略条：左侧说明，右侧药丸式切换器。 */
+  function dispatchStrategySection() {
+    if (!state.config.capabilities.multi_provider) return multiProviderUnavailableNote();
+    const policy = state.dispatch.policy;
+    const strategies = dispatchStrategies();
+    let body = '';
+    if (state.dispatch.error) {
+      body = `<p class="ai-configured-error">${icon('alert')}<span>${escapeHtml(state.dispatch.error)}</span></p>`;
+    } else if (!state.dispatch.loaded || !policy) {
+      body = `<p class="ai-configured-note">${escapeHtml(state.dispatch.loading ? '读取调度策略…' : '调度策略尚未确认')}</p>`;
+    } else if (!strategies.length) {
+      // 枚举拿不到时不自造选项，如实说明。
+      body = `<p class="ai-configured-note">当前策略 ${escapeHtml(strategyLabel(policy.strategy))}。后端未返回可选策略集合，暂不提供切换。</p>`;
+    } else {
+      const active = policy.strategy;
+      const busy = Boolean(state.dispatch.saving);
+      body = `<div class="ai-strategy-switcher" role="radiogroup" aria-label="全局调度策略">
+            ${strategies.map((id) => `
+              <button class="ai-strategy-pill ${active === id ? 'is-active' : ''}" type="button" role="radio" aria-checked="${active === id ? 'true' : 'false'}" data-ai-strategy="${escapeHtml(id)}" ${busy ? 'disabled' : ''}>
+                ${state.dispatch.saving === id ? icon('loader') : ''}<span>${escapeHtml(strategyLabel(id))}</span>
+              </button>
+            `).join('')}
+          </div>`;
+    }
+    const detail = policy
+      ? `${policy.enabled_provider_count} / ${policy.provider_count} 个供应商已启用${policy.strategy === 'failover' ? ` · 最多尝试 ${policy.failover_max_attempts} 次 · 单次 ${Math.round(policy.failover_timeout_ms / 1000)}s 超时` : ''}`
+      : '';
+    const hint = strategyHint(policy);
+    return `<div class="ai-settings-section ai-strategy-section">
+          <div class="ai-strategy-bar">
+            <div class="ai-strategy-copy">
+              <strong>全局调度策略</strong>
+              <small>${escapeHtml(detail || '配置多个供应商时，决定请求如何分发')}</small>
+            </div>
+            ${body}
+          </div>
+          ${hint ? `<p class="ai-configured-note ai-strategy-hint">${icon('alert')}<span>${escapeHtml(hint)}</span></p>` : ''}
+        </div>`;
+  }
+
+  /*
+   * `single` 缺主供应商时后端返 422 `primary_required`，那是契约不是错误，
+   * 页面要把它说成「请先指定主供应商」而不是弹一个失败框。这里提前把同样的
+   * 状态渲染成提示，避免用户点了才知道。
+   */
+  function strategyHint(policy) {
+    if (!policy) return '';
+    if (!policy.provider_count) return '尚未配置任何供应商，策略保存后不会生效。';
+    if (policy.strategy === 'single' && !policy.primary_ready) return '当前为单供应商策略，但没有可用的主供应商，请先把一个供应商设为主通道。';
+    if (policy.strategy !== 'single' && policy.enabled_provider_count < 2) return `${strategyLabel(policy.strategy)} 需要至少两个已启用的供应商，当前只有 ${policy.enabled_provider_count} 个。`;
+    return '';
+  }
+
+  /*
+   * 能力位为假、或供应商端点读不到时的说明。**指名道姓写缺哪一个**，
+   * 不用一句笼统的「接口尚未开放」覆盖一整批已就绪的能力（design.md 第 3、4 条：
+   * 「能力为 false」与「能力未确认」是两种状态，文案必须区分）。
+   */
+  function multiProviderUnavailableNote() {
+    const reason = firstText(state.config.capabilities.multi_provider_reason);
+    const detail = state.providers.error
+      ? state.providers.error
+      : reason === 'not_implemented'
+        ? `当前固件未实现多供应商调度（${ENDPOINTS.providers}）。单供应商配置仍然可用。`
+        : `后端未声明多供应商能力（capabilities.multi_provider）${reason ? `：${reason}` : ''}。单供应商配置仍然可用。`;
+    return `<div class="ai-settings-section"><p class="ai-configured-capability">${icon('key')}<span>${escapeHtml(detail)}</span></p></div>`;
+  }
+
+  function providerLastCheckBadge(item) {
+    if (!item.enabled) return { tone: 'neutral', text: '未启用' };
+    if (!item.api_key_set && item.auth_mode !== 'oauth') return { tone: 'warn', text: '缺少 API Key' };
+    const check = item.last_check;
+    if (check.state === 'ok') return { tone: 'ok', text: check.latency_ms === null ? '已联通' : `已联通 · ${check.latency_ms} ms` };
+    if (check.state === 'fail') return { tone: 'error', text: check.error_kind ? `测试失败 · ${check.error_kind}` : '测试失败' };
+    return { tone: 'info', text: item.role === 'primary' ? '主通道 · 未测试' : '备用中 · 未测试' };
+  }
+
+  /*
+   * demo 1 下半部分的「已配置的供应商」。列表与条数来自 `GET /ai/providers`，
+   * 空列表渲染真实空态（design.md 第 5 条：`[]` 是正常业务状态，不是缺接口），
+   * **不回退成「只有一个供应商」的旧叙事**。
+   */
+  function settingsProviderList() {
+    if (!state.config.capabilities.multi_provider) return settingsConfiguredProvider();
+    if (state.providers.error) {
+      return `<div class="ai-settings-section ai-configured-section">
+          <h3 class="ai-configured-heading">已配置的供应商</h3>
+          <p class="ai-configured-error">${icon('alert')}<span>${escapeHtml(state.providers.error)}</span></p>
+        </div>`;
+    }
+    if (!state.providers.loaded) {
+      return `<div class="ai-settings-section ai-configured-section">
+          <h3 class="ai-configured-heading">已配置的供应商</h3>
+          <p class="ai-configured-note">${escapeHtml(state.providers.loading ? '读取供应商列表…' : '供应商列表尚未确认')}</p>
+        </div>`;
+    }
+    const count = state.providers.count;
+    const items = state.providers.items;
+    const head = `<h3 class="ai-configured-heading">已配置的供应商<em class="ai-configured-count">${count ? `当前共 ${count} 个` : '暂无'}</em></h3>`;
+    if (!items.length) {
+      return `<div class="ai-settings-section ai-configured-section">
+          ${head}
+          <div class="ai-provider-empty">
+            ${icon('key')}
+            <strong>还没有配置任何供应商</strong>
+            <small>在上方选择品牌并填入凭据后，点「添加到已配置列表」即可加入调度。</small>
+          </div>
+        </div>`;
+    }
+    return `<div class="ai-settings-section ai-configured-section">
+          ${head}
+          <div class="ai-provider-list">${items.map(providerRowMarkup).join('')}</div>
+        </div>`;
+  }
+
+  function providerRowMarkup(item) {
+    const definition = providerDefinition(item.provider);
+    const badge = providerLastCheckBadge(item);
+    const label = firstText(item.display_name, oauthProviderLabel(item.provider));
+    const authText = item.auth_mode === 'oauth' ? 'OAuth 授权' : 'API Key 模式';
+    const roleText = item.role === 'primary' ? '主通道' : '故障热备';
+    const endpoint = firstText(item.api_base, definition.base, '提供商默认端点');
+    // model_count 为 0 且没同步过是「未同步」，不是「0 个可用」（契约第三节）。
+    const modelText = item.models_synced_at || item.model_count
+      ? `${item.model_count} 个可用`
+      : '未同步';
+    const busy = state.providerBusy.id === item.id ? state.providerBusy.action : '';
+    const keyText = item.auth_mode === 'oauth' ? 'OAuth 凭据' : item.api_key_set ? `密钥 ${item.api_key_hint || '已保存'}` : '未保存密钥';
+    return `<article class="ai-provider-row" data-ai-provider-id="${escapeHtml(item.id)}">
+          <div class="ai-configured-head">
+            <span class="ai-configured-mark" aria-hidden="true">${escapeHtml(definition.mark || 'API')}</span>
+            <div class="ai-configured-title">
+              <strong>${escapeHtml(label)}</strong>
+              <small>${escapeHtml(`${authText} · ${roleText} · ${endpoint}`)}</small>
+            </div>
+            <span class="ai-configured-badge is-${badge.tone}">${escapeHtml(badge.text)}</span>
+          </div>
+          <div class="ai-configured-models">
+            <span>${escapeHtml(`${keyText}${item.default_model ? ` · 默认模型 ${item.default_model}` : ''}`)}</span>
+            <b>${escapeHtml(modelText)}</b>
+          </div>
+          ${item.last_check.state === 'fail' && item.last_check.error ? `<p class="ai-configured-error">${icon('alert')}<span>${escapeHtml(item.last_check.error)}</span></p>` : ''}
+          <div class="ai-provider-row-actions">
+            <button class="ai-secondary-button" type="button" data-ai-provider-test="${escapeHtml(item.id)}" ${busy ? 'disabled' : ''}>${busy === 'test' ? icon('loader') : icon('link')}测试</button>
+            <button class="ai-secondary-button" type="button" data-ai-provider-sync="${escapeHtml(item.id)}" ${busy ? 'disabled' : ''}>${busy === 'sync' ? icon('loader') : icon('refresh')}拉模型</button>
+            <button class="ai-secondary-button" type="button" data-ai-provider-primary="${escapeHtml(item.id)}" ${busy || item.role === 'primary' ? 'disabled' : ''}>${busy === 'primary' ? icon('loader') : icon('check')}设为主通道</button>
+            <button class="ai-secondary-button ai-danger-button" type="button" data-ai-provider-remove="${escapeHtml(item.id)}" ${busy ? 'disabled' : ''}>${busy === 'remove' ? icon('loader') : icon('alert')}移除</button>
+          </div>
+        </article>`;
+  }
+
+  /* 单供应商回退视图。仅在后端未声明 multi_provider 时使用。 */
+  function settingsConfiguredProvider() {
+    const provider = providerDefinition();
+    const label = oauthProviderLabel(state.config.provider);
+    const authText = state.config.auth_mode === 'oauth' ? 'OAuth 授权' : 'API Key 模式';
+    const ready = credentialReady();
+    const check = state.providerCheck || { state: 'unknown' };
+    let badgeTone = 'neutral';
+    let badgeText = '未配置凭据';
+    if (state.loading) { badgeTone = 'neutral'; badgeText = '读取中'; }
+    else if (!ready) { badgeTone = 'warn'; badgeText = state.config.auth_mode === 'oauth' ? 'OAuth 未连接' : '缺少 API Key'; }
+    else if (check.state === 'ok') { badgeTone = 'ok'; badgeText = check.latency ? `已联通 · ${check.latency} ms` : '已联通'; }
+    else if (check.state === 'fail') { badgeTone = 'error'; badgeText = '测试失败'; }
+    else { badgeTone = 'info'; badgeText = '凭据已就绪 · 未测试'; }
+    const models = state.modelsListed ? state.models.length : 0;
+    // 预载模型只列前三个，避免同步回一长串把卡片撑开。
+    const preview = models ? state.models.slice(0, 3).join('、') : '';
+    const endpoint = firstText(state.config.api_base, provider.base, '使用提供商默认端点');
+    return `<div class="ai-settings-section ai-configured-section">
+          <h3 class="ai-configured-heading">当前生效的供应商</h3>
+          <article class="ai-configured-card">
+            <div class="ai-configured-head">
+              <span class="ai-configured-mark" aria-hidden="true">${escapeHtml(provider.mark || 'API')}</span>
+              <div class="ai-configured-title">
+                <strong>${escapeHtml(label)}</strong>
+                <small>${escapeHtml(authText)} · ${escapeHtml(endpoint)}</small>
+              </div>
+              <span class="ai-configured-badge is-${badgeTone}">${escapeHtml(badgeText)}</span>
+            </div>
+            <div class="ai-configured-models">
+              <span>${models ? `预载模型：${escapeHtml(preview)}${models > 3 ? ` 等 ${models} 个` : ''}` : '尚未同步模型列表'}</span>
+              <b>${models ? `${models} 个可用` : '--'}</b>
+            </div>
+            ${check.state === 'fail' && check.error ? `<p class="ai-configured-error">${icon('alert')}<span>${escapeHtml(check.error)}</span></p>` : ''}
+            <p class="ai-configured-note">${escapeHtml(check.state === 'unknown'
+              ? '联通状态需点击下方「测试连接」实测；后端不持久化历史检测结果，刷新页面后需重新测试。'
+              : '联通状态与延迟来自本次会话内最近一次测试连接，非后端持久记录。')}</p>
+          </article>
         </div>`;
   }
 
   /* 高级设置。排版按 demo 的三个「舱位」：运行时与接口 / 生成参数与工具授权 /
      系统提示词。控件与材质仍是我们自己的 Kit，没有照搬 demo 的 rgba 玻璃与 emoji。 */
   function settingsAdvancedSection(provider, apiBaseHelp) {
+    /*
+     * demo 2 的停用态：总开关关闭时把配置主体收起，换一条占位说明。
+     * 早先这里的注释写了「关闭时折叠」，但代码从没实现 —— 字段照样全渲染。
+     * 之所以要收起：LLM 关闭时这些参数保存了也不生效，摆满一屏可编辑字段
+     * 会让人以为改了就有用。
+     *
+     * 注意仍然渲染总开关本身（在 settingsView 里），否则关掉之后就没有入口再打开。
+     */
+    if (!state.config.enabled) {
+      return `<section class="ai-settings-chamber ai-dormant-chamber" data-ai-chamber="dormant">
+          <div class="ai-dormant-body">
+            ${icon('shield')}
+            <strong>LLM 服务当前处于停用状态</strong>
+            <small>打开上方开关后即可配置运行时端点、生成参数与系统提示词。停用时这些参数不会生效。</small>
+          </div>
+        </section>`;
+    }
     const chambers = [
       {
         key: 'runtime', title: '运行时与接口',
@@ -2048,11 +2506,24 @@ export function mount(context = {}) {
       }
       render();
     });
-    root.querySelectorAll('[data-dwrt-confirm-cancel], [data-ai-oauth-disconnect-cancel], .dwrt-kit-modal-backdrop').forEach((button) => button.addEventListener('click', () => {
+    /*
+     * 两个确认框（断开 OAuth / 移除供应商）共用 kit 的通用 accept/cancel 钩子，
+     * 所以这里按当前打开的是哪一个来分发。同一时刻只会有一个为真。
+     */
+    root.querySelectorAll('[data-dwrt-confirm-cancel], [data-ai-oauth-disconnect-cancel], [data-ai-provider-remove-cancel], .dwrt-kit-modal-backdrop').forEach((button) => button.addEventListener('click', () => {
       state.oauth.confirmDisconnect = false;
+      state.providerRemoveId = '';
       render();
     }));
-    root.querySelectorAll('[data-dwrt-confirm-accept], [data-ai-oauth-disconnect-confirm]').forEach((button) => button.addEventListener('click', disconnectOAuth));
+    root.querySelectorAll('[data-dwrt-confirm-accept], [data-ai-oauth-disconnect-confirm], [data-ai-provider-remove-confirm]').forEach((button) => button.addEventListener('click', () => {
+      if (state.providerRemoveId) {
+        const id = state.providerRemoveId;
+        state.providerRemoveId = '';
+        runProviderAction(id, 'remove');
+        return;
+      }
+      if (state.oauth.confirmDisconnect) disconnectOAuth();
+    }));
     const fileInput = root.querySelector('[data-ai-file]');
     root.querySelector('[data-ai-add-file]')?.addEventListener('click', (event) => {
       state.addMenuOpen = false;
@@ -2086,6 +2557,16 @@ export function mount(context = {}) {
     root.querySelector('[data-ai-sync-models]')?.addEventListener('click', syncModels);
     root.querySelector('[data-ai-test-provider]')?.addEventListener('click', testProvider);
     root.querySelector('[data-ai-save]')?.addEventListener('click', saveConfig);
+    root.querySelectorAll('[data-ai-strategy]').forEach((button) => button.addEventListener('click', () => setDispatchStrategy(button.dataset.aiStrategy)));
+    root.querySelector('[data-ai-provider-add]')?.addEventListener('click', addProvider);
+    root.querySelectorAll('[data-ai-provider-test]').forEach((button) => button.addEventListener('click', () => runProviderAction(button.dataset.aiProviderTest, 'test')));
+    root.querySelectorAll('[data-ai-provider-sync]').forEach((button) => button.addEventListener('click', () => runProviderAction(button.dataset.aiProviderSync, 'sync')));
+    root.querySelectorAll('[data-ai-provider-primary]').forEach((button) => button.addEventListener('click', () => runProviderAction(button.dataset.aiProviderPrimary, 'primary')));
+    root.querySelectorAll('[data-ai-provider-remove]').forEach((button) => button.addEventListener('click', () => {
+      // 先开确认框，真正的 DELETE 在 confirm 分发里执行。
+      state.providerRemoveId = firstText(button.dataset.aiProviderRemove);
+      render();
+    }));
   }
 
   function bindHistoryItemEvents(scope) {
@@ -2602,15 +3083,166 @@ export function mount(context = {}) {
       if (!state.mounted) return;
       const latency = firstNumber(data.latency_ms, data.latency, 0);
       const model = firstText(data.model, currentModel());
+      state.providerCheck = {
+        state: data.ok === false ? 'fail' : 'ok',
+        latency: Math.round(latency) || 0,
+        model,
+        error: data.ok === false ? apiErrorText(data, '提供商未返回成功状态') : '',
+        at: Date.now()
+      };
       state.notice = data.ok === false
         ? `连接测试失败：${apiErrorText(data, '提供商未返回成功状态')}`
         : `连接正常${model ? `（${model}）` : ''}${latency ? ` · ${Math.round(latency)} ms` : ''}`;
     } catch (error) {
       if (!state.mounted) return;
+      state.providerCheck = { state: 'fail', latency: 0, model: '', error: error?.message || '连接测试失败', at: Date.now() };
       state.settingsError = error?.message || '连接测试失败';
     }
     if (!state.mounted) return;
     state.testingProvider = false;
+    render();
+  }
+
+  /*
+   * 调度策略写入。`PUT /api/v1/ai/dispatch-policy`。
+   * 422 `primary_required` 是契约里的正常分支（single 缺主供应商），
+   * 渲染成「请先指定主供应商」的引导文案，不当成失败弹窗。
+   */
+  async function setDispatchStrategy(strategy) {
+    const id = firstText(strategy);
+    if (!id || state.dispatch.saving) return;
+    if (state.dispatch.policy?.strategy === id) return;
+    if (!dispatchStrategies().includes(id)) return;
+    state.dispatch.saving = id;
+    state.settingsError = '';
+    state.notice = '';
+    render();
+    try {
+      await requestJson(ENDPOINTS.dispatchPolicy, { method: 'PUT', body: JSON.stringify({ strategy: id }) });
+      if (!state.mounted) return;
+      state.dispatch.saving = '';
+      await loadDispatchPolicy({ render: false });
+      if (!state.mounted) return;
+      state.notice = `调度策略已切换为${strategyLabel(id)}`;
+    } catch (error) {
+      if (!state.mounted) return;
+      state.dispatch.saving = '';
+      const code = firstText(error?.payload?.error?.code, error?.payload?.code);
+      const status = Math.round(firstNumber(error?.status, 0));
+      if (status === 422 || code === 'primary_required') {
+        state.settingsError = '';
+        state.notice = '请先把一个供应商设为主通道，再切换到单供应商策略。';
+      } else {
+        state.settingsError = classifyApiFailure(error, '调度策略', 'write').message;
+      }
+    }
+    if (!state.mounted) return;
+    render();
+  }
+
+  function providerById(id) {
+    return state.providers.items.find((item) => item.id === id) || null;
+  }
+
+  /* 列表内单条供应商的动作：测试 / 拉模型 / 设为主通道 / 移除。 */
+  async function runProviderAction(id, action) {
+    const providerId = firstText(id);
+    const item = providerById(providerId);
+    if (!providerId || !item || state.providerBusy.id) return;
+    state.providerBusy = { id: providerId, action };
+    state.settingsError = '';
+    state.notice = '';
+    render();
+    const label = firstText(item.display_name, oauthProviderLabel(item.provider));
+    const base = `${ENDPOINTS.providers}/${encodeURIComponent(providerId)}`;
+    try {
+      if (action === 'test') {
+        const data = unwrap(await requestJson(`${base}/test`, { method: 'POST' }));
+        if (!state.mounted) return;
+        const latency = data.latency_ms === null || data.latency_ms === undefined ? null : Math.round(firstNumber(data.latency_ms, 0));
+        state.notice = data.ok === false
+          ? `${label} 连接失败：${firstText(data.error_kind, apiErrorText(data, '未返回成功状态'))}`
+          : `${label} 连接正常${latency === null ? '' : ` · ${latency} ms`}`;
+      } else if (action === 'sync') {
+        const data = unwrap(await requestJson(`${base}/models/sync`, { method: 'POST' }));
+        if (!state.mounted) return;
+        const models = asArray(data.models || data);
+        // 很多 OpenAI 兼容反代不实现 /v1/models，此时后端给 invalid_response。
+        state.notice = models.length
+          ? `${label} 已同步 ${models.length} 个模型`
+          : `${label} 未返回模型列表，可在高级设置手工填写模型名`;
+      } else if (action === 'primary') {
+        // PATCH 不带的字段保持原值（契约第五、七节），所以只提交 role。
+        await requestJson(base, { method: 'PATCH', body: JSON.stringify({ role: 'primary' }) });
+        if (!state.mounted) return;
+        state.notice = `${label} 已设为主通道`;
+      } else if (action === 'remove') {
+        await requestJson(base, { method: 'DELETE' });
+        if (!state.mounted) return;
+        state.notice = `${label} 已移除`;
+      }
+      state.providerBusy = { id: '', action: '' };
+      await Promise.all([loadProviders({ render: false }), loadDispatchPolicy({ render: false })]);
+    } catch (error) {
+      if (!state.mounted) return;
+      state.providerBusy = { id: '', action: '' };
+      const code = firstText(error?.payload?.error?.code, error?.payload?.code);
+      if (code === 'provider_in_use') state.settingsError = `${label} 正被进行中的会话占用，请稍后再移除。`;
+      else if (code === 'provider_not_found') {
+        state.settingsError = `${label} 已不存在，列表已刷新。`;
+        await loadProviders({ render: false });
+      } else state.settingsError = classifyApiFailure(error, `${label} 操作`, 'write').message;
+    }
+    if (!state.mounted) return;
+    render();
+  }
+
+  /*
+   * 「添加到已配置列表」：把上方选中的品牌与凭据提交为一条新供应商。
+   * 列表为空时第一条自动设为主通道，否则默认备用（契约允许唯一主）。
+   */
+  async function addProvider() {
+    if (state.providerBusy.id || state.providerBusy.action) return;
+    const apiKey = state.config.api_key_input.trim();
+    if (state.config.auth_mode !== 'oauth' && !apiKey) {
+      state.settingsError = '请先填写该供应商的 API Key，再添加到列表。';
+      render();
+      return;
+    }
+    state.providerBusy = { id: '', action: 'add' };
+    state.settingsError = '';
+    state.notice = '';
+    render();
+    const definition = providerDefinition();
+    const label = oauthProviderLabel(state.config.provider);
+    try {
+      await requestJson(ENDPOINTS.providers, {
+        method: 'POST',
+        body: JSON.stringify({
+          provider: state.config.provider,
+          display_name: label,
+          api_base: firstText(state.config.api_base, definition.base),
+          auth_mode: state.config.auth_mode,
+          ...(state.config.auth_mode === 'oauth' ? {} : { api_key: apiKey }),
+          default_model: state.config.model,
+          role: state.providers.items.length ? 'standby' : 'primary',
+          enabled: true
+        })
+      });
+      if (!state.mounted) return;
+      state.providerBusy = { id: '', action: '' };
+      state.config.api_key_input = '';
+      state.notice = `${label} 已加入已配置列表`;
+      await Promise.all([loadProviders({ render: false }), loadDispatchPolicy({ render: false })]);
+    } catch (error) {
+      if (!state.mounted) return;
+      state.providerBusy = { id: '', action: '' };
+      const code = firstText(error?.payload?.error?.code, error?.payload?.code);
+      if (code === 'invalid_provider_kind') state.settingsError = '后端不接受该供应商类型，请换一个品牌或使用 OpenAI 兼容。';
+      else if (code === 'capability_disabled') state.settingsError = '后端当前关闭了 AI 写入能力，无法新增供应商。';
+      else state.settingsError = classifyApiFailure(error, '新增供应商', 'write').message;
+    }
+    if (!state.mounted) return;
     render();
   }
 

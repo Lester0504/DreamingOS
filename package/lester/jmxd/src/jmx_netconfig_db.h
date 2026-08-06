@@ -121,6 +121,14 @@ struct json_object *jmx_netconfig_lan_validate(struct json_object *lan_json);
 
 /* Global config */
 struct json_object *jmx_netconfig_global_get(void);
+/*
+ * Global WAN mode, "failover" or "load_balance". Copies into `out` and returns 0
+ * on success. On any failure (db missing, column absent, unknown value) it
+ * writes "failover" and still returns 0, so callers cannot accidentally act on
+ * an empty string. routed uses this to pick the default rule's selection
+ * algorithm, so a wrong answer here silently changes forwarding.
+ */
+int  jmx_netconfig_wan_mode_get(char *out, size_t out_len);
 
 /* Network overview — combines global + WAN summary + LAN summary */
 struct json_object *jmx_netconfig_network_overview(void);

@@ -68,8 +68,9 @@ NOTIFYD_OBJS := notifyd/notifyd_main.o notifyd/notifyd_common.o notifyd/notifyd_
 FLOWD_OBJS := flowd/flowd_main.o flowd/flowd_common.o flowd/flowd_db.o flowd/wan_sla_tx.o flowd/flowd_ubus.o jmx_path_provider.o jmx_system_data_path.o
 AUTHD_OBJS := authd/authd_main.o authd/authd_common.o authd/authd_db.o authd/authd_write.o authd/authd_html.o authd/authd_ubus.o
 OTAD_OBJS := otad/otad_main.o otad/otad_common.o otad/otad_db.o otad/otad_inventory.o otad/otad_inventory_transaction.o otad/otad_persist_source.o otad/otad_manifest.o otad/otad_trust.o otad/otad_topology.o otad/otad_firmware.o otad/otad_hot.o otad/otad_status.o otad/otad_ubus.o jmx_path_provider.o
-AC_OBJS := ac/ac_main.o ac/ac_db.o ac/ac_enrollment.o ac/ac_pki.o ac/ac_secrets.o ac/ac_protocol.o ac/ac_transport.o ac/ac_ubus.o ap_control_wire.o
-APD_OBJS := apd/apd_main.o apd/apd_db.o apd/apd_enrollment.o apd/apd_credentials.o apd/apd_protocol.o apd/apd_transport.o apd/apd_backend.o apd/apd_backend_openwrt.o apd/apd_vendor_chanlist.o apd/apd_readonly_command.o apd/apd_radio_job_journal.o apd/apd_config_job_journal.o apd/apd_config_executor.o apd/apd_config_recovery.o apd/apd_ubus.o ap_control_wire.o
+AC_OBJS := ac/ac_main.o ac/ac_db.o ac/ac_enrollment.o ac/ac_pki.o ac/ac_secrets.o ac/ac_protocol.o ac/ac_transport.o ac/ac_discovery.o ac/ac_ubus.o ap_control_wire.o
+APD_OBJS := apd/apd_main.o apd/apd_db.o apd/apd_enrollment.o apd/apd_credentials.o apd/apd_protocol.o apd/apd_transport.o apd/apd_backend.o apd/apd_backend_openwrt.o apd/apd_vendor_chanlist.o apd/apd_readonly_command.o apd/apd_radio_job_journal.o apd/apd_config_job_journal.o apd/apd_config_executor.o apd/apd_config_recovery.o apd/apd_beacon.o apd/apd_ubus.o ap_control_wire.o
+APDCTL_OBJS := apd/apdctl_main.o apd/apd_paircode.o apd/apd_qr.o
 AEGISXD_OBJS := aegisxd/aegisxd_main.o aegisxd/aegisxd_common.o aegisxd/aegisxd_db.o aegisxd/aegisxd_status.o aegisxd/aegisxd_feeds.o aegisxd/aegisxd_import.o aegisxd/aegisxd_dataplane.o aegisxd/aegisxd_hits.o aegisxd/aegisxd_honeypot.o aegisxd/aegisxd_content.o aegisxd/aegisxd_certificate.o aegisxd/aegisxd_pcdn.o aegisxd/aegisxd_pcdn_parser.o aegisxd/aegisxd_geo.o aegisxd/aegisxd_signature_policy.o geoip/mmdb_country_prefix.o aegisxd/aegisxd_ubus.o jmx_identification_runtime.o jmx_exec.o
 HONEYPOTD_OBJS := honeypotd/main.o honeypotd/runtime.o honeypotd/protocols.o honeypotd/events.o honeypotd/sha256.o
 TOOLKIT_OBJS := toolkit/toolkit_main.o toolkit/toolkit_common.o toolkit/toolkit_db.o toolkit/toolkit_ops.o
@@ -91,6 +92,7 @@ AUTHD_EXEC := dreamingwrt-authd
 OTAD_EXEC := dreamingwrt-otad
 AC_EXEC := dreamingwrt-ac
 APD_EXEC := dreamingwrt-apd
+APDCTL_EXEC := apdctl
 AEGISXD_EXEC := dreamingwrt-aegisxd
 HONEYPOTD_EXEC := dreamingwrt-honeypotd
 TOOLKIT_EXEC := dreamingwrt-toolkit
@@ -114,6 +116,7 @@ AUTHD_CFLAGS ?=
 OTAD_LIBS ?= -lubus -lubox -lblobmsg_json -ljson-c -lsqlite3 -lblkid -lssl -lcrypto -lz -lm
 AC_LIBS ?= -lubus -lubox -lblobmsg_json -ljson-c -lsqlite3 -lssl -lcrypto -lpthread
 APD_LIBS ?= -lubus -lubox -lblobmsg_json -ljson-c -lsqlite3 -luci -lssl -lcrypto -lm -lpthread
+APDCTL_LIBS ?= -lubus -lubox -lblobmsg_json -ljson-c -lcrypto
 AEGISXD_LIBS ?= -lssl -lcrypto -lmaxminddb
 HONEYPOTD_LIBS ?= -lubus -lubox -lblobmsg_json -ljson-c
 TOOLKIT_LIBS ?= -ljson-c -lsqlite3 -lcurl -lssl -lcrypto
@@ -121,7 +124,7 @@ CLOUD_LIBS ?= -lubus -lubox -lblobmsg_json -ljson-c -lsqlite3 -luci -lssl -lcryp
 JMCTL_LIBS ?= -lubus -lubox -lblobmsg_json -ljson-c
 INIT_LIBS ?= -lsqlite3 -lcrypto
 
-all: $(EXEC) $(WEBD_EXEC) $(HEALTHD_EXEC) $(IDENTITYD_EXEC) $(METRICSD_EXEC) $(MAINTENANCED_EXEC) $(ROUTED_EXEC) $(LOGD_EXEC) $(NOTIFYD_EXEC) $(FLOWD_EXEC) $(AUTHD_EXEC) $(OTAD_EXEC) $(AC_EXEC) $(APD_EXEC) $(AEGISXD_EXEC) $(HONEYPOTD_EXEC) $(TOOLKIT_EXEC) $(CLOUD_EXEC) $(JMCTL_EXEC) $(INIT_EXEC)
+all: $(EXEC) $(WEBD_EXEC) $(HEALTHD_EXEC) $(IDENTITYD_EXEC) $(METRICSD_EXEC) $(MAINTENANCED_EXEC) $(ROUTED_EXEC) $(LOGD_EXEC) $(NOTIFYD_EXEC) $(FLOWD_EXEC) $(AUTHD_EXEC) $(OTAD_EXEC) $(AC_EXEC) $(APD_EXEC) $(APDCTL_EXEC) $(AEGISXD_EXEC) $(HONEYPOTD_EXEC) $(TOOLKIT_EXEC) $(CLOUD_EXEC) $(JMCTL_EXEC) $(INIT_EXEC)
 
 $(EXEC): $(OBJS)
 	$(CC) -o $@ $(OBJS) $(LIBS)
@@ -168,6 +171,9 @@ $(AC_EXEC): $(AC_OBJS)
 $(APD_EXEC): $(APD_OBJS)
 	$(CC) -o $@ $(APD_OBJS) $(APD_LIBS)
 
+$(APDCTL_EXEC): $(APDCTL_OBJS)
+	$(CC) -o $@ $(APDCTL_OBJS) $(APDCTL_LIBS)
+
 $(AEGISXD_EXEC): $(AEGISXD_OBJS)
 	$(CC) -o $@ $(AEGISXD_OBJS) $(AEGISXD_LIBS)
 
@@ -187,4 +193,4 @@ $(INIT_EXEC): $(INIT_OBJS)
 	$(CC) -o $@ $(INIT_OBJS) $(INIT_LIBS)
 
 clean:
-	-rm -f $(EXEC) $(WEBD_EXEC) $(HEALTHD_EXEC) $(IDENTITYD_EXEC) $(METRICSD_EXEC) $(MAINTENANCED_EXEC) $(ROUTED_EXEC) $(LOGD_EXEC) $(NOTIFYD_EXEC) $(FLOWD_EXEC) $(AUTHD_EXEC) $(OTAD_EXEC) $(AC_EXEC) $(APD_EXEC) $(AEGISXD_EXEC) $(HONEYPOTD_EXEC) $(TOOLKIT_EXEC) $(CLOUD_EXEC) $(JMCTL_EXEC) $(INIT_EXEC) jmxd webd/dreamingwrt-webd *.o webd/*.o healthd/*.o identityd/*.o metricsd/*.o maintenanced/*.o routed/*.o logd/*.o notifyd/*.o flowd/*.o authd/*.o otad/*.o ac/*.o apd/*.o aegisxd/*.o geoip/*.o honeypotd/*.o toolkit/*.o cloud/*.o ctl/*.o init/*.o dreamingwrt-*.bak-* webd/dreamingwrt-*.bak-*
+	-rm -f $(EXEC) $(WEBD_EXEC) $(HEALTHD_EXEC) $(IDENTITYD_EXEC) $(METRICSD_EXEC) $(MAINTENANCED_EXEC) $(ROUTED_EXEC) $(LOGD_EXEC) $(NOTIFYD_EXEC) $(FLOWD_EXEC) $(AUTHD_EXEC) $(OTAD_EXEC) $(AC_EXEC) $(APD_EXEC) $(APDCTL_EXEC) $(AEGISXD_EXEC) $(HONEYPOTD_EXEC) $(TOOLKIT_EXEC) $(CLOUD_EXEC) $(JMCTL_EXEC) $(INIT_EXEC) jmxd webd/dreamingwrt-webd *.o webd/*.o healthd/*.o identityd/*.o metricsd/*.o maintenanced/*.o routed/*.o logd/*.o notifyd/*.o flowd/*.o authd/*.o otad/*.o ac/*.o apd/*.o aegisxd/*.o geoip/*.o honeypotd/*.o toolkit/*.o cloud/*.o ctl/*.o init/*.o dreamingwrt-*.bak-* webd/dreamingwrt-*.bak-*

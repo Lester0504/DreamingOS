@@ -194,6 +194,7 @@ int apd_db_pairing_verify_challenge(const char *request_id,
                                     const unsigned char *challenge,
                                     size_t challenge_len);
 int apd_db_pairing_reset(const char *request_id);
+int apd_db_pairing_clear(void);
 
 int apd_enrollment_csr_create(unsigned char *csr_der, size_t csr_der_size,
                               size_t *csr_der_len,
@@ -227,6 +228,23 @@ int apd_credentials_activate(
     const char *certificate_id,
     const unsigned char certificate_fingerprint[SHA256_DIGEST_LENGTH],
     struct apd_enrollment_metadata *out);
+
+/* Which files an unpair actually destroyed, so callers can report the truth
+ * rather than assuming a full teardown happened. */
+struct apd_credentials_unpair_report {
+    int certificate_removed;
+    int enrollment_removed;
+    int bootstrap_removed;
+};
+
+enum apd_credentials_unpair_result {
+    APD_CREDENTIALS_UNPAIR_OK = 0,
+    APD_CREDENTIALS_UNPAIR_LOCK_FAILED = -1,
+    APD_CREDENTIALS_UNPAIR_CERTIFICATE_FAILED = -2,
+    APD_CREDENTIALS_UNPAIR_METADATA_FAILED = -3,
+    APD_CREDENTIALS_UNPAIR_BOOTSTRAP_FAILED = -4,
+};
+int apd_credentials_unpair(struct apd_credentials_unpair_report *out);
 void apd_credentials_bootstrap_cleanse(struct apd_bootstrap_config *config);
 void apd_credentials_metadata_cleanse(struct apd_enrollment_metadata *metadata);
 
@@ -245,6 +263,7 @@ struct json_object *apd_identity_json(void);
 struct json_object *apd_pairing_status_json(void);
 struct json_object *apd_write_disabled_json(const char *operation,
                                             const char *reason);
+struct json_object *apd_unpair_json(int confirmed);
 int apd_protocol_init(void);
 void apd_protocol_close(void);
 

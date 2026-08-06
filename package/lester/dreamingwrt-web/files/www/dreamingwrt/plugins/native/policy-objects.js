@@ -1,4 +1,5 @@
 const SOURCE_TABS = [
+  ['overview', '概览'],
   ['composite', '复合策略对象'],
   ['routing', '路由对象'],
   ['flowObjects', '流量对象'],
@@ -126,7 +127,8 @@ export function mount(context = {}) {
   const escapeHtml = context.utils?.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
   const state = {
     mounted: true,
-    tab: 'composite',
+    /* 概览是第一页，进页面先看汇总，再按来源分页细看。 */
+    tab: 'overview',
     snapshot: null,
     composite: null,
     refreshing: false,
@@ -230,7 +232,7 @@ export function mount(context = {}) {
     if (terminal) return statePanel(terminal.name, terminal.title, terminal.detail);
     const data = state.source.routing.data;
     const stale = state.source.routing.status === 'ready' ? '' : `<div class="policy-entity-alert is-warning" role="status"><strong>正在显示上次可用快照</strong><span>${escapeHtml(state.source.routing.error || '路由对象刷新失败。')}</span></div>`;
-    return `${stale}<div class="policy-entity-alert" role="status"><strong>独立路由资源</strong><span>此处仅查看 routed 返回的路由对象；新增、编辑与删除归“策略引擎 → 路由表”所有，本页不会复制写入口。</span></div>${tableMarkup({ title: '路由对象', description: `权威来源：/api/v1/routing/objects · ${data.source}`, rows: data.items, columns: ['名称', '类型', '地址族', '归属', '状态'], empty: '路由表尚未配置路由对象', kind: 'routing' })}`;
+    return `${stale}<div class="policy-entity-alert" role="status"><strong>独立路由资源</strong><span>此处仅查看 routed 返回的路由对象；新增、编辑与删除归“策略引擎 → 路由表”所有，本页不会复制写入口。<a class="policy-entity-alert-link" href="#/policy-engine/routes">前往路由表管理路由对象</a></span></div>${tableMarkup({ title: '路由对象', description: `权威来源：/api/v1/routing/objects · ${data.source}`, rows: data.items, columns: ['名称', '类型', '地址族', '归属', '状态'], empty: '路由表尚未配置路由对象', kind: 'routing' })}`;
   }
 
   function flowdMarkup() {
@@ -238,7 +240,7 @@ export function mount(context = {}) {
     if (terminal) return statePanel(terminal.name, terminal.title, terminal.detail);
     const data = state.source.flowd.data;
     const stale = state.source.flowd.status === 'ready' ? '' : `<div class="policy-entity-alert is-warning" role="status"><strong>正在显示上次可用快照</strong><span>${escapeHtml(state.source.flowd.error || '自定义协议刷新失败。')}</span></div>`;
-    return `${stale}<div class="policy-entity-alert" role="status"><strong>独立协议资源</strong><span>仅展示 flowd 用户自定义协议，不包含系统 catalog、内置应用签名或协议目录；本页保持只读。</span></div>${tableMarkup({ title: 'flowd 自定义协议', description: `权威来源：/api/v1/flowd/custom-protocols · ${data.source}`, rows: data.items, columns: ['名称', '层级', '协议', '端口', '状态'], empty: 'flowd 尚未配置自定义协议', kind: 'flowd' })}`;
+    return `${stale}<div class="policy-entity-alert" role="status"><strong>独立协议资源</strong><span>本表只列 flowd 用户自定义协议，不含系统内置应用签名与协议目录；那两类属于 <code>/api/v1/policy-engine/catalog</code>，由策略表的匹配条件直接引用。本页保持只读。</span></div>${tableMarkup({ title: 'flowd 自定义协议', description: `权威来源：/api/v1/flowd/custom-protocols · ${data.source}`, rows: data.items, columns: ['名称', '层级', '协议', '端口', '状态'], empty: 'flowd 尚未配置自定义协议', kind: 'flowd' })}`;
   }
 
   function flowObjectsMarkup() {
@@ -250,14 +252,45 @@ export function mount(context = {}) {
   }
 
   function activeSourceMarkup() {
+    if (state.tab === 'overview') return overviewSourcesMarkup();
     if (state.tab === 'routing') return routingMarkup();
     if (state.tab === 'flowObjects') return flowObjectsMarkup();
     if (state.tab === 'flowd') return flowdMarkup();
     return compositeMarkup();
   }
 
+  /*
+   * 概览页除了四张卡片，还列出每个来源的读取状态。只放卡片会让这一页除了
+   * 四个数字之外没有信息量；而「某个来源为什么显示 --」恰好是看概览时最想
+   * 知道的事，它原先只在切到对应 tab 之后才看得到。
+   */
+  function overviewSourcesMarkup() {
+    const rows = [
+      ['composite', '复合策略对象', '/api/v1/policy-engine/objects'],
+      ['routing', '路由对象', '/api/v1/routing/objects'],
+      ['flowObjects', '流量对象', '/api/v1/flowd/objects'],
+      ['flowd', '自定义协议', '/api/v1/flowd/protocols']
+    ].map(([key, label, endpoint]) => {
+      const problem = key === 'composite' ? null : sourceTerminal(key);
+      const count = key === 'composite'
+        ? (state.composite?.items.length ?? 0)
+        : (state.source[key]?.data?.items.length ?? null);
+      const tone = problem ? (problem.name === 'loading' ? 'muted' : 'warning') : 'success';
+      const stateText = problem ? problem.title : '已读取';
+      return `<tr><td><strong>${escapeHtml(label)}</strong><small>${escapeHtml(endpoint)}</small></td><td>${escapeHtml(count === null ? '--' : String(count))}</td><td>${statusBadge(stateText, tone)}</td><td>${escapeHtml(problem?.detail || '只读快照')}</td></tr>`;
+    }).join('');
+    return `<section class="policy-entity-table policy-object-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>来源读取状态</strong><span>四类对象各自的权威接口与当前可读性</span></div><span class="dwrt-kit-table-count">4 个来源</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr><th>来源</th><th>数量</th><th>状态</th><th>说明</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+  }
+
   function workbenchMarkup() {
-    return `<section class="policy-entity-page policy-objects-page"><header class="policy-object-toolbar" data-adaptive-sample>${tabsMarkup()}<div class="policy-entity-header-actions"><span class="policy-object-readonly-status">${statusBadge('只读分类', 'warning')}</span></div></header><main class="policy-object-workbench">${overviewMarkup()}<section class="policy-object-source-view" data-object-source-view="${state.tab}">${activeSourceMarkup()}</section></main></section>`;
+    /*
+     * 四张状态卡片只属于「概览」这一页。原先它们在每个 tab 上都重复出现，
+     * 于是看「路由对象」时还要先跳过一排跟当前视图无关的汇总数字，
+     * 而那排数字里正好有一张就是当前 tab 自己的条数。
+     */
+    const overview = state.tab === 'overview' ? overviewMarkup() : '';
+    const sourceView = `<section class="policy-object-source-view" data-object-source-view="${state.tab}">${activeSourceMarkup()}</section>`;
+    return `<section class="policy-entity-page policy-objects-page"><header class="policy-object-toolbar" data-adaptive-sample>${tabsMarkup()}<div class="policy-entity-header-actions"><span class="policy-object-readonly-status">${statusBadge('只读分类', 'warning')}</span></div></header><main class="policy-object-workbench">${overview}${sourceView}</main></section>`;
   }
 
   function detailData() {
@@ -296,9 +329,32 @@ export function mount(context = {}) {
   }
 
   function replaceMarkup(host, markup) {
+    /*
+     * 先把已被搬进传送门的抽屉收回来，再交给 kit 卸载。
+     *
+     * kit 的 mountAll() 会把 `.dwrt-kit-sheet` 连同遮罩搬到 body 直属的
+     * #dwrtKitSheetPortal，而 kit 的 unmount(host) 只在 host 子树内查找抽屉。
+     * 抽屉搬走后 host 里空无一物，unmountSheet() 不会执行，抽屉和那层 `is-open`
+     * 遮罩就永久留在传送门里：关闭后遮罩仍盖住页面吞掉所有点击，必须刷新才能继续。
+     * 实测每开关一轮传送门多出 2 个节点，第二轮起抽屉的 left 还会错位到视口之外。
+     */
+    reclaimPortaledSheets(host);
     window.DWRT_UI_KIT?.unmount?.(host);
     host.replaceChildren(document.createRange().createContextualFragment(markup));
+    /* 打归属标记：抽屉一旦被搬进传送门，只能靠这个标记认回自己的节点。 */
+    host.querySelectorAll('.dwrt-kit-sheet, .dwrt-kit-sheet-overlay')
+      .forEach((node) => { node.dataset.objectOverlayOwned = ''; });
     ui.mountAll?.(host);
+  }
+
+  /* 把本宿主搬出去的抽屉与遮罩接回来，让 kit 的 unmount 能够看到它们。 */
+  function reclaimPortaledSheets(host) {
+    const portal = document.getElementById('dwrtKitSheetPortal');
+    if (!portal) return;
+    portal.querySelectorAll('.dwrt-kit-sheet, .dwrt-kit-sheet-overlay').forEach((node) => {
+      if (node.dataset.objectOverlayOwned === undefined) return;
+      host.append(node);
+    });
   }
 
   function renderPage() {
@@ -402,7 +458,7 @@ export function mount(context = {}) {
   function onClick(event) {
     const tab = event.target.closest('[data-object-tab]');
     if (tab) {
-      state.tab = SOURCE_TABS.some(([id]) => id === tab.dataset.objectTab) ? tab.dataset.objectTab : 'composite';
+      state.tab = SOURCE_TABS.some(([id]) => id === tab.dataset.objectTab) ? tab.dataset.objectTab : 'overview';
       state.detail = null;
       renderPage();
       renderOverlay();

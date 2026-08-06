@@ -31,10 +31,28 @@
   height: 100%;
   min-width: 0;
   min-height: 0;
+  /*
+   * 保持 grid，但行定义不能按位置写死。原先是
+   * `grid-template-rows: auto minmax(0, 1fr)`：`noticeMarkup()` 没有告警时返回空串，
+   * workbench 落到第一行的 `auto` 上、第二行塌成 0px；`auto` 由内容撑开，
+   * workbench 拿不到受限高度，内部的 `.storage-partitions-scroll` 便永远滚不动
+   * （实测 shellRows "757.656px 0px"，分区表一路撑到页面底部、卡片下沿被裁掉，
+   * 用户报的「这个卡片不能滚动」就是它）。
+   *
+   * 这里**不能改成 flex 列**：宿主 `.route-workspace` 是 `display: grid` 且带
+   * `align-content: start`，隐式行按内容高度收缩。shell 一旦变成 flex，它的内容
+   * 高度会算成 0，那一行随之为 0px，整页塌掉（实测 shellH 0 / rows "0px"）。
+   * 所以按「告警自适应、内容占满」显式指名，与子节点数量无关。
+   */
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   gap: 12px;
   overflow: hidden;
+}
+
+/* 告警在场时补一行给它，内容行仍然吃掉剩余高度。 */
+.storage-partitions-shell:has(> .storage-partitions-notice) {
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .storage-partitions-disk-tabs {
@@ -124,7 +142,9 @@
   min-width: 0;
   display: grid;
   gap: 0;
-  border-radius: 8px;
+  /* 卡片圆角归 token，不写死。硬写 8px 会明显小于同侧页面（概览、RAID 都用
+     var(--app-radius-card)，实测 24px），观感上接近直角，就是「圆角逃逸」。 */
+  border-radius: var(--app-radius-card, var(--dwrt-kit-radius));
   overflow: hidden;
 }
 
@@ -295,7 +315,28 @@
 }
 
 .storage-partitions-table {
-  border-radius: 8px;
+  /* 同上：表格卡也走 token，与概览的 .storage-smart-card 保持一致。 */
+  border-radius: var(--app-radius-card, var(--dwrt-kit-radius));
+  /*
+   * 卡片要「工具栏 + 可滚动表体」两行，否则表体无限长高。
+   * 原先卡片没有行定义、内层 `.dwrt-kit-table-scroll` 也没有 `min-height: 0`，
+   * 于是 kit 的 `overflow: auto` 形同虚设：grid 子项的 min-height 默认是 auto、
+   * 不肯收缩，滚动层被内容顶到和内容一样高（实测灌到 45 行时
+   * scrollHeight === clientHeight === 2063，而卡片本身只有 398px），
+   * 表体因此溢出卡片被 `overflow: hidden` 裁掉，哪一层都滚不动 ——
+   * 用户报的「这个卡片不能滚动」就是它。范本是概览页的 `.storage-smart-card`。
+   */
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.storage-partitions-table .dwrt-kit-table-scroll {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
 }
 
 /* 条带行：名称 | 用量条+挂载点 | 卷标 | 扇区 | 状态 | 操作（验收单第 2 条）。 */

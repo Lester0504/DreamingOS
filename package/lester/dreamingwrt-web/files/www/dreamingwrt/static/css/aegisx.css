@@ -41,6 +41,19 @@
 .aegisx-region-country-action small { color: var(--app-text-muted); font-size: var(--dwrt-type-meta, 12px); }
 .aegisx-honeypot-row { min-width: 0; width: 100%; display: flex; align-items: center; justify-content: flex-start; gap: 10px 14px; }
 .aegisx-certificate { color: var(--app-accent, #4a9dff); font-size: var(--dwrt-type-label, 13px); font-weight: 650; }
+.aegisx-certificate-row { min-width: 0; width: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; }
+.aegisx-certificate-actions { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+.aegisx-certificate-actions .aegisx-link-button { min-height: 36px; padding: 0 12px; }
+.aegisx-next-action { color: var(--app-text-secondary); }
+.aegisx-log-levels { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; }
+.aegisx-log-level { min-width: 0; display: inline-flex; align-items: center; gap: 8px; }
+.aegisx-log-level > span { color: var(--app-text-secondary); font-size: var(--dwrt-type-label, 13px); white-space: nowrap; }
+/* kit 用 :where() 给字段控件描边，特异性为 0，所以这里必须自己写全边框与底色，
+ * 否则下拉在页面上看起来只是一段纯文本，用户不知道那是可点的控件。 */
+/* WebKit 上 select 不重置 -webkit-appearance 时，border 与 background-color 会被
+ * 原生控件外观吃掉（只有 background-image 生效），实测就是一段没有边框的纯文本。 */
+.aegisx-log-level select { -webkit-appearance: none; appearance: none; min-width: 104px; min-height: 36px; height: 36px; border: 1px solid color-mix(in srgb, var(--app-text-muted) 34%, transparent); border-radius: var(--app-radius-compact, 6px); padding: 0 30px 0 10px; color: var(--app-text); background-color: color-mix(in srgb, var(--app-text) 7%, transparent); background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%); background-position: calc(100% - 16px) calc(50% - 2px), calc(100% - 11px) calc(50% - 2px); background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; font: inherit; font-size: var(--dwrt-type-label, 13px); outline: 0; }
+.aegisx-log-level select:disabled { opacity: .6; cursor: not-allowed; }
 .aegisx-route-host .aegisx-explanation { flex: 1 1 100%; margin: 0; color: var(--app-text-muted); font-size: var(--dwrt-type-meta, 12px); font-weight: 450; line-height: var(--dwrt-leading-body, 1.55); }
 
 .aegisx-switch { min-height: 44px; flex: 0 0 auto; }
@@ -158,6 +171,23 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-honeypot-modal-body input,
 .aegisx-honeypot-modal-body select { height: 48px; font-size: var(--dwrt-type-body, 14px); }
 .aegisx-honeypot-manager { --dwrt-kit-modal-width: 720px; }
+.aegisx-certificate-modal-layer { --dwrt-kit-modal-z: 74; }
+.aegisx-certificate-modal { --dwrt-kit-modal-width: 680px; }
+.aegisx-certificate-modal .dwrt-kit-modal-header { min-height: 76px; padding-inline: 28px; }
+.aegisx-certificate-modal .dwrt-kit-modal-header h2 { font-size: 18px; }
+.aegisx-certificate-modal .dwrt-kit-modal-footer { padding: 18px 28px 24px; }
+.aegisx-certificate-modal .dwrt-kit-modal-footer button { min-width: 88px; min-height: 40px; }
+.aegisx-certificate-modal .aegisx-drawer-body { gap: 18px; padding: 22px 28px 26px; }
+.aegisx-certificate-modal .aegisx-explanation { margin: 0; color: var(--app-text-muted); font-size: var(--dwrt-type-meta, 12px); line-height: var(--dwrt-leading-body, 1.55); }
+.aegisx-certificate-target { display: grid; gap: 8px; }
+.aegisx-certificate-target > span { color: var(--app-text-secondary); font-size: 12px; font-weight: 700; }
+.aegisx-certificate-target select { -webkit-appearance: none; appearance: none; height: 44px; border: 1px solid color-mix(in srgb, var(--app-text-muted) 30%, transparent); border-radius: var(--app-radius-compact, 6px); padding: 0 12px; color: var(--app-text); background-color: color-mix(in srgb, var(--app-text) 6%, transparent); font: inherit; font-size: var(--dwrt-type-body, 14px); outline: 0; }
+.aegisx-certificate-list { min-width: 0; display: grid; gap: 8px; max-height: 260px; overflow: auto; }
+.aegisx-certificate-list article { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px 12px; padding: 10px 12px; border-radius: var(--app-radius-control); background: color-mix(in srgb, var(--app-text) 4%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-text-muted) 12%, transparent); }
+.aegisx-certificate-list article > div { min-width: 0; display: grid; gap: 2px; }
+.aegisx-certificate-list strong { min-width: 0; color: var(--app-text); font-size: var(--dwrt-type-label, 13px); overflow-wrap: anywhere; }
+.aegisx-certificate-list span { color: var(--app-text-muted); font-size: var(--dwrt-type-meta, 12px); overflow-wrap: anywhere; }
+.aegisx-certificate-list small { color: var(--app-text-muted); font-size: var(--dwrt-type-meta, 12px); white-space: nowrap; }
 .aegisx-drawer .dwrt-kit-sheet-header span { display: block; color: var(--app-text-muted); font-size: 10px; font-weight: 760; }
 .aegisx-drawer .dwrt-kit-sheet-header strong { display: block; margin-top: 2px; color: var(--app-text); font-size: 17px; }
 .aegisx-drawer-body { display: grid; align-content: start; gap: 16px; padding: 18px var(--dwrt-kit-sheet-padding-x); color: var(--app-text-secondary); }
@@ -183,7 +213,10 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-content-form-row small { display: block; margin-top: 6px; color: var(--app-text-muted); font-size: 11px; line-height: 1.4; }
 .aegisx-content-form-row .aegisx-choice-row,
 .aegisx-content-form-row .aegisx-check-row { gap: 8px 16px; }
-.aegisx-intrusion-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-wide); }
+/* 收到 620px 的 -form 档：正文是规则源 / 分类 / 签名三段纵向内容，签名列表用的是
+   卡片式 <article> 而不是宽表，820px 的 -wide 没有内容依据（design.md 规则 24：
+   -wide 留给真正的宽表）。签名编辑器那两列改为按容器宽度自适应。 */
+.aegisx-intrusion-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form); }
 .aegisx-intrusion-section { min-width: 0; display: grid; gap: 10px; padding: 14px; border-radius: var(--app-radius-control); background: color-mix(in srgb, var(--app-text) 4%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-text-muted) 12%, transparent); }
 .aegisx-intrusion-section > header { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .aegisx-intrusion-section > header > div:first-child { min-width: 0; display: grid; gap: 2px; }
@@ -227,7 +260,8 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-signature-list article > div:last-child { display: flex; align-items: center; justify-content: flex-end; gap: 3px; }
 .aegisx-signature-editor > label { display: grid; gap: 6px; }
 .aegisx-signature-editor label > span { color: var(--app-text-secondary); font-size: 10px; font-weight: 700; }
-.aegisx-signature-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+/* 按可用宽度收敛，而不是写死两列：抽屉是固定宽度，视口媒体查询管不到它。 */
+.aegisx-signature-editor-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 8px; }
 .aegisx-signature-editor-grid > label { display: grid; gap: 6px; }
 .aegisx-signature-editor-actions { display: flex; justify-content: flex-end; }
 .aegisx-signature-editor-actions button { min-height: 36px; padding-inline: 13px; }

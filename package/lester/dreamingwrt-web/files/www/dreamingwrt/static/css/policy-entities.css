@@ -454,6 +454,41 @@
   line-height: 1.5;
 }
 
+/* 只读提示里的写入口跳转。用户看到「本页不会复制写入口」却不知道该去哪写，
+   所以提示必须自带链接。inline 而非独立按钮：它属于句子的一部分，
+   而 .policy-entity-alert 是 auto + 1fr 两列网格，塞第三个子元素会挤掉正文。 */
+.policy-entity-alert span > .policy-entity-alert-link {
+  margin-inline-start: 6px;
+  /* 不用 --color-info：实测那个青色在本页玻璃面板上只有 2.22:1，
+     12px 正文需要 4.5:1。跟随正文色实测 4.41:1，
+     可及性靠下划线与字重承载，不靠色相。 */
+  color: var(--app-text, var(--dwrt-kit-text, currentColor));
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.policy-entity-alert span > .policy-entity-alert-link:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.policy-entity-alert span > code {
+  /* 全局重置把 code 设成了 block，不写这一条时这个 28 字的路径会独占整行
+     （实测宽 857px），把一句话撑成三行。 */
+  display: inline;
+  padding: 1px 4px;
+  border-radius: 3px;
+  /* --color-surface-control 是主题里真实定义的那一个（dwrt-theme.css:45，
+     随 light/dark 自动换）。同文件上方那些 --color-surface-subtle 其实没有定义，
+     所以那里的底色一直是透明的。 */
+  background: var(--color-surface-control);
+  font-family: var(--app-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+}
+
 .policy-entity-section {
   min-width: 0;
   display: grid;
@@ -519,6 +554,13 @@
   display: grid;
   align-content: start;
   gap: 16px;
+  /*
+   * 正文内边距：kit 的 `.dwrt-kit-sheet-body` 只管滚动，不给 padding，页面必须
+   * 自己补（vpn-config 的 .vpn-sheet-body 是同样的写法）。这里原先什么都没写，
+   * 于是字段、下拉、说明文字全部贴着抽屉左右边缘，顶部也紧挨页头。
+   * 横向沿用 kit 的 --dwrt-kit-sheet-padding-x，跟页头页脚对齐成一条竖线。
+   */
+  padding: 16px var(--dwrt-kit-sheet-padding-x, 20px) 28px;
 }
 
 .policy-object-reference-list {
@@ -841,7 +883,14 @@
 }
 
 .policy-region-action-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /*
+   * 按可用宽度收敛，不写死三列。抽屉是固定 460px，视口媒体查询量不到它，
+   * 所以桌面端永远命中不到下面那条收单栏的规则，三列在 460px 里每列只剩
+   * 130px 上下 ——「进入路由器」「路由器发出」「区域转发」这些标签放不下，
+   * 直接横向溢出到抽屉外面（用户截图里「区域转发」已经跑出右边界）。
+   * 150px 是一列放得下四字标签 + 下拉箭头的实测下限。
+   */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr));
 }
 
 .policy-region-members-field .dwrt-kit-combobox-popover {

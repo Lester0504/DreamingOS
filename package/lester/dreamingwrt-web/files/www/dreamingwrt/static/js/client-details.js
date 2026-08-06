@@ -1504,7 +1504,7 @@
 
     function listPanel(title, list, empty) {
       const rows = rawList(list);
-      return `<section class="client-detail-card">
+      return `<section class="client-detail-card dwrt-kit-glass-surface">
         <div class="client-detail-card-head"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(rows.length ? `${rows.length} 项` : empty)}</span></div>
         ${rows.length ? `<div class="client-detail-list">${rows.slice(0, 40).map((item) => {
           if (typeof item !== 'object') return `<div><strong>${escapeHtml(detailValue(item))}</strong></div>`;
@@ -1804,7 +1804,7 @@
     function overviewLineChart({ title, samples, series, mode }) {
       const payload = overviewChartPayload({ title, samples, series, mode });
       const hasData = payload.samples.some((point) => payload.series.some((item) => Number(point[item.key]) > 0));
-      return `<section class="client-overview-chart-card client-detail-card" data-client-overview-card="${escapeHtml(mode)}">
+      return `<section class="client-overview-chart-card client-detail-card dwrt-kit-glass-surface" data-client-overview-card="${escapeHtml(mode)}">
         <div class="client-overview-chart-title">${escapeHtml(title)}</div>
         <div class="client-overview-chart" data-client-overview-chart="${escapeHtml(mode)}" data-chart-payload="${escapeHtml(JSON.stringify(payload))}">
           <div class="client-overview-echart" aria-label="${escapeHtml(title)}"></div>
@@ -2645,7 +2645,7 @@
     function protocolDonutCard(title, centerLabel, buckets, metric) {
       const total = buckets.reduce((sum, bucket) => sum + (Number(bucket.value) || 0), 0);
       const centerValue = metric === 'connections' ? formatInteger(total) : formatBytes(total);
-      return `<section class="client-protocol-donut-card client-detail-card">
+      return `<section class="client-protocol-donut-card client-detail-card dwrt-kit-glass-surface">
         <div class="client-protocol-card-title">${escapeHtml(title)}</div>
         <div class="client-protocol-donut-layout">
           <div class="client-protocol-donut" role="img" aria-label="${escapeHtml(title)}">
@@ -2898,7 +2898,7 @@
 
     function protocolRateSection(samples, mode) {
       const legend = page && page.protocolLegend ? page.protocolLegend : parseProtocolLegend();
-      return `<section class="client-protocol-rate-card client-detail-card">
+      return `<section class="client-protocol-rate-card client-detail-card dwrt-kit-glass-surface">
         <div class="client-protocol-line-wrap">
           ${protocolRateChart('上行速率', samples, 'up', mode)}
           ${protocolRateChart('下行速率', samples, 'down', mode)}
@@ -3317,8 +3317,8 @@
               <button class="${tab === 'columns' ? 'is-active' : ''}" type="button" data-client-connection-options-tab="columns">列</button>
             </nav>
             <section class="client-connection-options-section ${tab === 'filter' ? 'is-active' : ''}">
-              <div class="client-connection-filter-card"><header><strong>协议</strong><span>⌄</span></header>${options.protocols.map(([value, label, count]) => filterButton('proto', value, label, count)).join('')}</div>
-              <div class="client-connection-filter-card"><header><strong>线路</strong><span>⌄</span></header>${options.lines.map(([value, label, count]) => filterButton('line', value, label, count)).join('')}</div>
+              <div class="client-connection-filter-card dwrt-kit-glass-surface"><header><strong>协议</strong><span>⌄</span></header>${options.protocols.map(([value, label, count]) => filterButton('proto', value, label, count)).join('')}</div>
+              <div class="client-connection-filter-card dwrt-kit-glass-surface"><header><strong>线路</strong><span>⌄</span></header>${options.lines.map(([value, label, count]) => filterButton('line', value, label, count)).join('')}</div>
             </section>
             <section class="client-connection-options-section ${tab === 'columns' ? 'is-active' : ''}">
               <label class="client-connection-column-row is-all ${allChecked ? 'is-active' : ''}">
@@ -3532,7 +3532,7 @@
     function controlPanel(client, profile, merged) {
       const rows = controlRules(profile, merged || client);
       const notice = firstText(page.controlNotice);
-      return `<section class="client-control-panel client-detail-card ${page.controlEditorOpen ? 'is-editor-open' : ''}">
+      return `<section class="client-control-panel client-detail-card ${page.controlEditorOpen ? 'is-editor-open' : ''} dwrt-kit-glass-surface">
         <div class="client-control-toolbar">
           <div>${rows.length ? `<strong>共 ${escapeHtml(formatInteger(rows.length))} 条</strong>` : '<strong>管控规则</strong>'}${notice && !page.controlEditorOpen ? `<span>${escapeHtml(notice)}</span>` : ''}</div>
           <div><button class="client-control-add-button" type="button" data-client-control-add>新增</button></div>
@@ -3546,7 +3546,7 @@
       const state = connectionPanelState(client, profile, merged);
       const { rows, filtered, columns, notice } = state;
       const auto = page.connectionAutoRefresh !== false;
-      return `<section class="client-connection-panel client-detail-card">
+      return `<section class="client-connection-panel client-detail-card dwrt-kit-glass-surface">
         <div class="client-connection-toolbar">
           <div class="client-connection-count"><strong>共 ${escapeHtml(formatInteger(filtered.length))} 条</strong>${rows.length !== filtered.length ? `<span>已从 ${escapeHtml(formatInteger(rows.length))} 条筛选</span>` : ''}${notice ? `<em>${escapeHtml(notice)}</em>` : ''}</div>
           <div class="client-connection-actions">
@@ -3585,7 +3585,7 @@
           ['接入方式', usefulInfoText(merged.link_type, merged.interface, merged.network, merged.ssid) || '--'],
           ['识别置信度', usefulInfoText(merged.fingerprint_confidence, profile.confidence) || '--']
         ];
-        return `<section class="client-detail-card">
+        return `<section class="client-detail-card dwrt-kit-glass-surface">
           <div class="client-detail-card-head"><strong>信息详情</strong><span>DHCP、邻居表、指纹和用户覆盖信息</span></div>
           <div class="client-detail-list client-detail-list-grid">
             ${infoRows.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')}
@@ -3599,7 +3599,7 @@
         return connectionPanel(client, profile, merged);
       }
       if (tab === 'custom') {
-        return `<section class="client-detail-card">
+        return `<section class="client-detail-card dwrt-kit-glass-surface">
           <div class="client-detail-card-head"><strong>自定义识别</strong><span>保存后固定使用用户指定信息，优先级高于自动识别</span></div>
           <form class="client-custom-form" data-client-custom-form>
             <input type="hidden" name="mac" value="${escapeHtml(merged.mac || '')}">

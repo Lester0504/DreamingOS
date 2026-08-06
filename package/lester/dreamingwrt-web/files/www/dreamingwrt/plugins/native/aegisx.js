@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const api = context.api || {};
   const utils = context.utils || {};
   const ui = context.ui || {};
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260805-aegisx-capability-truth-01';
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
   const ENDPOINTS = {
     status: '/api/v1/aegis/status',
@@ -38,6 +38,12 @@ export function mount(context = {}) {
     signatureSuppress: '/api/v1/aegis/signatures/suppress',
     signatureUnsuppress: '/api/v1/aegis/signatures/unsuppress',
     logSettings: '/api/v1/logs/settings',
+    inspectionCa: '/api/v1/aegis/certificates/inspection-ca',
+    inspectionCaGenerate: '/api/v1/aegis/certificates/inspection-ca/generate',
+    inspectionCaRotate: '/api/v1/aegis/certificates/inspection-ca/rotate',
+    inspectionCaRevoke: '/api/v1/aegis/certificates/inspection-ca/revoke',
+    inspectionCaDownload: '/api/v1/aegis/certificates/inspection-ca/download',
+    inspectionCaDistributions: '/api/v1/aegis/certificates/inspection-ca/distributions',
     lans: '/api/v1/network/lans',
     clients: '/api/v1/clients'
   };
@@ -66,7 +72,23 @@ export function mount(context = {}) {
     job_already_running: '已有 Aegisx 后台任务正在运行', aegis_job_running: '已有 Aegisx 后台任务正在运行',
     pcdn_revision_conflict: 'PCDN 配置已被其他会话修改', pcdn_rules_not_ready: '请先同步 PCDN 规则',
     pcdn_apply_failed: 'PCDN 应用失败，旧配置已保留', signature_revision_mismatch: '签名规则已更新，请重新核对',
-    revision_conflict: '配置已被其他会话修改', revision_required: '缺少配置修订号', signature_not_found: '找不到该签名规则'
+    revision_conflict: '配置已被其他会话修改', revision_required: '缺少配置修订号', signature_not_found: '找不到该签名规则',
+    invalid_log_level: '日志级别取值无效', invalid_log_levels: '日志级别参数格式无效',
+    unknown_log_level_group: '日志分组无效', invalid_logd_settings: '日志设置参数无效',
+    settings_missing: '设备上没有日志设置记录', settings_query_failed: '日志设置读取失败',
+    confirmation_required: '该操作需要确认', invalid_common_name: '证书主题名称无效',
+    invalid_validity_days: '证书有效期必须在 365 到 7300 天之间',
+    inspection_ca_not_active: '需要先生成可用的检查根证书',
+    inspection_ca_material_invalid: '证书材料校验失败，请重新生成',
+    inspection_ca_encode_failed: '证书编码失败',
+    invalid_certificate_format: '证书格式必须是 pem 或 der',
+    certificate_state_unavailable: '证书状态不可读',
+    automatic_distribution_unavailable: '自动分发不可用，请使用手工分发',
+    invalid_distribution_target_type: '仅支持向已知终端分发',
+    invalid_distribution_target: '目标必须是终端 MAC 地址',
+    certificate_distribution_target_not_found: '设备库里找不到该终端',
+    certificate_distribution_create_failed: '分发记录写入失败',
+    certificate_distribution_state_unavailable: '分发记录不可读'
   };
   function initialTab() {
     try {
@@ -84,12 +106,16 @@ export function mount(context = {}) {
     status: {}, runtime: {}, stats: {}, health: {}, events: [], geo: { countries: [], rules: [], feeds: [], events: [] },
     honeypot: { items: [], runtime: {}, capabilities: {} }, honeypotEvents: [], content: { items: [], runtime: {}, capabilities: {} },
     overrides: [], identification: {}, appBlocks: { items: [], capabilities: {} }, appCatalog: [], pcdn: {}, logSettings: {}, lans: [], clients: [],
+    inspectionCa: {}, inspectionCaDistributions: { items: [], total: 0 }, logLevelDraft: {},
+    certificateTarget: '',
     feeds: {}, feedStatus: {}, feedImportStatus: {}, signatureCategories: {}, signaturePolicies: { items: [], counts: {}, total: 0, limit: 50, offset: 0 },
     contentDraft: null, appBlockDraft: null, honeypotDraft: null, signatureDraft: null, pcdnSyncPreview: null, pcdnPendingIntent: null, pcdnJobId: '', feedPreview: null,
     geoQuery: '', geoDraftEnabled: null, appQuery: '', eventQuery: '', signatureQuery: '', signaturePage: 0, jobPollAttempts: 0, mounted: true, seq: 0
   };
   let portal = null;
   let jobPollTimer = 0;
+  /* 被选区/输入推迟的主体重绘（见 shouldDeferRender / deferRender）。 */
+  let deferredRenderTimer = 0;
 
   /*
    * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
@@ -190,6 +216,16 @@ export function mount(context = {}) {
   function stateBadge(label, tone = 'neutral') {
     return ui.statusBadgeMarkup?.(label, tone) || `<span>${escapeHtml(label)}</span>`;
   }
+  /*
+   * "后端未开放" 只允许从这里产出。
+   *
+   * 之前每一行都自己写死这句字面量，结果后端做完了、前端还在报未开放（日志级别、
+   * 拦截页面都是这么错的）。现在文案由能力位推导：能力位缺失或为假才显示未开放，
+   * 后端哪天真的接上了，这一行会自己翻过来，不需要有人记得回来改文案。
+   */
+  function capabilityBadge(supported, readyLabel, readyTone = 'ok') {
+    return supported ? stateBadge(readyLabel, readyTone) : stateBadge('后端未开放', 'neutral');
+  }
   function switchControl(name, checked, enabled = false, label = '') {
     return `<label class="dwrt-kit-switch aegisx-switch ${enabled ? '' : 'is-disabled'}" data-dwrt-component="switch" ${enabled ? '' : `data-dwrt-tooltip="${escapeHtml(label || '后端未开放写入')}"`}><input type="checkbox" data-aegis-toggle="${name}" ${checked ? 'checked' : ''} ${enabled ? '' : 'disabled'} aria-label="${escapeHtml(label || name)}"></label>`;
   }
@@ -213,6 +249,7 @@ export function mount(context = {}) {
       ['content', ENDPOINTS.content], ['overrides', ENDPOINTS.overrides], ['identification', ENDPOINTS.identification],
       ['appBlocks', ENDPOINTS.appBlocks], ['appCatalog', ENDPOINTS.appCatalog], ['pcdn', ENDPOINTS.pcdn],
       ['logSettings', ENDPOINTS.logSettings], ['lans', ENDPOINTS.lans], ['clients', ENDPOINTS.clients]
+      , ['inspectionCa', ENDPOINTS.inspectionCa], ['inspectionCaDistributions', ENDPOINTS.inspectionCaDistributions]
     ];
     const results = await Promise.allSettled(requests.map(([, url]) => requestJson(url)));
     if (!state.mounted || seq !== state.seq) return;
@@ -229,11 +266,13 @@ export function mount(context = {}) {
       else if (key === 'appCatalog') state.appCatalog = asArray(value?.data || value, ['applications', 'items']);
       else if (key === 'pcdn') state.pcdn = value?.data || value || {};
       else if (key === 'logSettings') state.logSettings = value?.data || value || {};
+      else if (key === 'inspectionCa') state.inspectionCa = value?.data || value || {};
+      else if (key === 'inspectionCaDistributions') state.inspectionCaDistributions = value?.data || value || state.inspectionCaDistributions;
       else if (key === 'lans') state.lans = asArray(value?.data || value, ['lans', 'items']);
       else if (key === 'clients') state.clients = asArray(value?.data || value, ['clients', 'items']);
       else state[key] = value;
     });
-    const optionalKeys = new Set(['appBlocks', 'appCatalog', 'pcdn', 'logSettings', 'clients']);
+    const optionalKeys = new Set(['appBlocks', 'appCatalog', 'pcdn', 'logSettings', 'clients', 'inspectionCa', 'inspectionCaDistributions']);
     const failures = results.map((item, index) => ({ item, key: requests[index][0] }))
       .filter(({ item, key }) => item.status === 'rejected' && !optionalKeys.has(key))
       .map(({ item }) => message(item.reason)).filter(Boolean);
@@ -318,6 +357,45 @@ export function mount(context = {}) {
     return { label: '尚未同步', tone: 'neutral' };
   }
   function identification() { return state.identification || {}; }
+  /*
+   * 拦截页面 / 检查根证书。
+   *
+   * 证书这一层后端是齐的（generate / rotate / revoke / download / 手工分发），
+   * 但 SSL 检查的数据面确实没实现，后端用 ssl_inspection_reason 明说。所以这里
+   * 把已就绪的证书能力接出来，同时如实呈现"拦截页面本身还不能生效"，不做
+   * 能点但不生效的假开关。
+   */
+  function inspectionCa() { return state.inspectionCa || {}; }
+  function inspectionCaLoaded() { return Object.keys(inspectionCa()).length > 0; }
+  function inspectionCaPresent() { return bool(inspectionCa().present); }
+  function inspectionCaActive() { return bool(inspectionCa().active); }
+  function inspectionCaDownloadable() { return bool(inspectionCa().download_supported); }
+  function inspectionCaManualDistribution() { return bool(inspectionCa().manual_distribution_supported); }
+  function sslInspectionActive() { return bool(inspectionCa().ssl_inspection_active); }
+  function inspectionCaDistributionItems() { return asArray(state.inspectionCaDistributions, ['items']); }
+  function inspectionCaState() {
+    if (!inspectionCaLoaded()) return { label: '状态不可用', tone: 'warn' };
+    if (inspectionCaActive()) return { label: `证书已就绪 · 第 ${Number(inspectionCa().generation) || 1} 代`, tone: 'ok' };
+    if (inspectionCaPresent()) return { label: '证书不可用', tone: 'warn' };
+    return { label: '尚未生成证书', tone: 'neutral' };
+  }
+  function inspectionCaReason() {
+    const reasons = {
+      inspection_dataplane_not_implemented: '拦截页面尚不能生效：SSL 检查数据面未实现。',
+      trusted_terminal_certificate_agent_missing: '暂不支持自动分发：终端证书代理未实现，请手工分发。',
+      signed_against_future_clock: '证书签发时间早于系统时钟，请校正时间后重新生成。',
+      certificate_unusable: '证书材料不可用，请重新生成。',
+      inspection_ca_material_invalid: '证书材料校验失败，请重新生成。',
+      absent: ''
+    };
+    const parts = [
+      reasons[firstText(inspectionCa().ssl_inspection_reason)],
+      reasons[firstText(inspectionCa().inactive_reason)],
+      reasons[firstText(inspectionCa().automatic_distribution_reason)],
+      reasons[firstText(inspectionCa().runtime_error)]
+    ].filter(Boolean);
+    return [...new Set(parts)].join(' ');
+  }
   function identificationCaps() { return identification().capabilities || {}; }
   function identificationSupported() {
     return bool(identificationCaps().identification_mode ?? identificationCaps().identification_mode_supported ?? capabilities().identification_mode_supported);
@@ -333,7 +411,7 @@ export function mount(context = {}) {
     return 'disabled';
   }
   function identificationBadge() {
-    if (!identificationSupported()) return stateBadge('后端未开放', 'neutral');
+    if (!identificationSupported()) return capabilityBadge(false, '');
     const mode = identificationMode();
     if (mode === 'disabled') return stateBadge('已禁用', 'neutral');
     if (bool(identification().applied) || identification().apply_state === 'active') return stateBadge('运行中', 'ok');
@@ -382,11 +460,58 @@ export function mount(context = {}) {
   function idsManagementAvailable() {
     return feedItems().length > 0 || bool(state.signatureCategories?.available) || Number(state.signaturePolicies?.total) > 0;
   }
+  /*
+   * 入侵防御的"下一步该做什么"。
+   *
+   * 后端已经用 ids_ips_next_action 明确给出了推进动作，之前前端只显示"运行组件未就绪"，
+   * 用户看得到状态却看不到出路。这里把动作翻译成人话；apply/restart 都要用户确认，
+   * 因为那一步等于真的开始拦包，所以只提示、不代替用户按下。
+   */
+  const IDS_NEXT_ACTIONS = {
+    import_suricata_rules: '下一步：导入 Suricata 规则（规则管理 → 重新导入）。',
+    install_suricata_runtime: '下一步：安装 Suricata 运行组件。',
+    configure_suricata_capture: '下一步：配置抓包来源（接口或 NFQUEUE）。',
+    apply_suricata_with_confirm: '下一步：生成 Suricata 配置并启用生产防护，该操作会真正开始拦包，需要你确认。',
+    restart_suricata_with_confirm: '下一步：重启 Suricata 进程，需要你确认。',
+    wait_for_or_check_eve_log: '下一步：等待或检查 eve 日志输出。'
+  };
+  function idsNextAction() {
+    const rt = runtime();
+    return firstText(rt.ids_ips_next_action, state.status?.ids_ips_next_action, capabilities().ids_ips_next_action);
+  }
+  function idsNextActionText() {
+    return IDS_NEXT_ACTIONS[idsNextAction()] || '';
+  }
+  /*
+   * 运行原因。后端给的是 ids_ips_runtime_reason（如 suricata_config_missing），
+   * 之前这一行读的是 suricata_reason —— 实机没有这个键，于是回落到字面量
+   * "运行组件未就绪"，和右边的 badge 一模一样，等于把同一句话说了两遍。
+   * 现在优先翻译后端真实原因；翻不出来才留空，让 badge 单独说话。
+   */
+  const IDS_REASONS = {
+    suricata_runtime_missing: 'Suricata 运行组件未安装。',
+    suricata_settings_unavailable: '读取 Suricata 设置失败。',
+    suricata_capture_mode_not_configured: '尚未配置抓包模式。',
+    suricata_capture_interface_missing: '尚未指定抓包接口。',
+    suricata_capture_interface_unavailable: '指定的抓包接口当前不可用。',
+    suricata_config_missing: '规则与二进制已就绪，但 Suricata 配置尚未生成。',
+    suricata_ready_not_active: '配置已就绪，但尚未启用。',
+    suricata_process_not_running: '已启用，但 Suricata 进程未在运行。',
+    suricata_process_capture_mismatch: 'Suricata 进程的抓包参数与配置不一致。',
+    suricata_nfqueue_not_active: 'NFQUEUE 尚未生效。',
+    suricata_eve_missing: '缺少 eve 事件日志输出。'
+  };
+  function idsReasonText() {
+    const rt = runtime();
+    const code = firstText(rt.ids_ips_runtime_reason, state.status?.ids_ips_runtime_reason,
+      capabilities().ids_ips_runtime_reason, rt.suricata_reason, capabilities().suricata_apply_reason);
+    return IDS_REASONS[code] || '';
+  }
   function renderProtect() {
     const rt = runtime();
     const idsSupported = bool(capabilities().ids_ips_supported);
     const idsActive = bool(rt.ids_ips_production_active) || bool(state.status.ids_ips_production_active);
-    const idsReason = firstText(rt.suricata_reason, capabilities().suricata_apply_reason, idsActive ? '' : '运行组件未就绪');
+    const idsReason = idsReasonText();
     const geoSelected = selectedCountries();
     const regionRule = geoRule();
     const regionEnabled = geoControlEnabled();
@@ -410,8 +535,19 @@ export function mount(context = {}) {
       </div>`)}
       ${row('蜜罐', '检测并记录对指定 IPv4 地址的请求，以发现网络中的异常客户端。', `<div class="aegisx-honeypot-row">${hpItems.length ? `<div class="aegisx-inline-summary"><strong>${hpItems.length} 个蜜罐</strong><small>${bool(hpRuntime.active) ? `运行中 · ${formatNumber(hpRuntime.hits)} 次命中` : '当前未运行'}</small></div>${actionButton('管理', 'honeypot', hpSupported)}` : ''}${actionButton('新建', 'honeypot-new', hpSupported)}</div>`)}
       ${row('识别', '识别设备类型和网关流量。', `<div class="aegisx-choice-row">${radio('identification', 'disabled', identificationMode() === 'disabled', '已禁用', identificationSupported() && !state.saving)}${radio('identification', 'device_traffic', identificationMode() === 'device_and_traffic', '设备和流量', identificationSupported() && !state.saving)}${radio('identification', 'traffic', identificationMode() === 'traffic_only', '仅流量', identificationSupported() && !state.saving)}</div>${identificationBadge()}`)}
-      ${row('拦截页面', '为内容过滤命中的网站显示解释页面。', `${switchControl('block-page', false, false, 'SSL 检查与证书接口尚未实现')}<span class="aegisx-certificate">Aegisx SSL Certificate</span>${stateBadge('后端未开放', 'neutral')}`, { detail: '<p class="aegisx-explanation">证书生成、下载和终端分发接口尚未实现，因此不会伪造可用开关。</p>' })}
-      ${row('入侵防御', '通过特征更新和深度数据包检测来检测和阻止威胁。', `<div class="aegisx-segment" aria-label="入侵防御"><button type="button" class="${idsActive ? '' : 'is-active'}" disabled>关</button><button type="button" class="${idsActive ? 'is-active' : ''}" disabled>开</button></div>${stateBadge(idsActive ? '生产防护已启用' : idsSupported ? '运行组件未就绪' : '后端未开放', idsActive ? 'ok' : 'warn')}<small class="aegisx-reason">${escapeHtml(idsReason)}</small>${actionButton('规则管理', 'intrusion', true)}`)}
+      ${row('拦截页面', '为内容过滤命中的网站显示解释页面，需要先在终端安装并信任检查根证书。', `<div class="aegisx-certificate-row">
+        <span class="aegisx-certificate">Aegisx SSL Certificate</span>
+        ${stateBadge(inspectionCaState().label, inspectionCaState().tone)}
+        ${stateBadge(sslInspectionActive() ? '检查数据面已生效' : '检查数据面未实现', sslInspectionActive() ? 'ok' : 'neutral')}
+        <div class="aegisx-certificate-actions">
+          ${inspectionCaPresent()
+            ? `${actionButton('轮换', 'certificate-rotate', inspectionCaLoaded())}${actionButton('吊销', 'certificate-revoke', inspectionCaLoaded())}`
+            : actionButton('生成证书', 'certificate-generate', inspectionCaLoaded(), { primary: true })}
+          ${actionButton('下载 PEM', 'certificate-download', inspectionCaDownloadable())}
+          ${actionButton('手工分发', 'certificate-distribute', inspectionCaManualDistribution() && inspectionCaActive())}
+        </div>
+      </div>`, { detail: `<p class="aegisx-explanation">${escapeHtml(inspectionCaReason() || '证书可生成、轮换、吊销、下载并手工分发。')}${inspectionCaDistributionItems().length ? ` 已记录 ${inspectionCaDistributionItems().length} 条分发。` : ''}</p>` })}
+      ${row('入侵防御', '通过特征更新和深度数据包检测来检测和阻止威胁。', `<div class="aegisx-segment" aria-label="入侵防御"><button type="button" class="${idsActive ? '' : 'is-active'}" disabled>关</button><button type="button" class="${idsActive ? 'is-active' : ''}" disabled>开</button></div>${stateBadge(idsActive ? '生产防护已启用' : idsSupported ? '运行组件未就绪' : '后端未开放', idsActive ? 'ok' : 'warn')}<small class="aegisx-reason">${escapeHtml(idsReason)}</small>${actionButton('规则管理', 'intrusion', true)}`, idsNextActionText() ? { detail: `<p class="aegisx-explanation aegisx-next-action">${escapeHtml(idsNextActionText())}</p>` } : {})}
     </section>`;
   }
 
@@ -468,8 +604,65 @@ export function mount(context = {}) {
     const settings = state.logSettings?.settings || state.logSettings || {};
     return settings.syslog && typeof settings.syslog === 'object' ? settings.syslog : {};
   }
+  /*
+   * 日志级别：能力由 /api/v1/logs/settings 的实际载荷推导，不写死"后端未开放"。
+   *
+   * 注意 30.1 在跑的 webd 尚未回 capabilities.log_levels 这一位（源码里有，
+   * 部署的二进制里没有），所以判据是「log_levels 对象里确实带回了这四组」而不是
+   * 单看能力位；否则一个能力位缺失就会把已经可用的功能重新标成未开放。
+   */
+  const LOG_LEVEL_GROUPS = [
+    ['device', '设备'], ['management', '管理'], ['remote_access', '远程访问'], ['system', '系统']
+  ];
+  const LOG_LEVEL_VALUES = [
+    ['auto', '自动'], ['normal', '精简'], ['verbose', '详细'], ['debug', '调试']
+  ];
+  function logSettingsBody() { return state.logSettings?.settings || state.logSettings || {}; }
+  function logLevels() {
+    const levels = logSettingsBody().log_levels;
+    return levels && typeof levels === 'object' ? levels : {};
+  }
+  function logLevelCaps() {
+    const caps = logSettingsBody().capabilities;
+    return caps && typeof caps === 'object' ? caps : {};
+  }
+  function logLevelsSupported() {
+    const levels = logLevels();
+    return LOG_LEVEL_GROUPS.some(([group]) => levels[group] !== undefined && levels[group] !== null);
+  }
+  function logLevelWritable() {
+    /* settings_write 缺位时不阻断：级别读回存在即认为可写，写失败由后端报错回传。 */
+    return logLevelsSupported() && logLevelCaps().settings_write !== false;
+  }
+  function logLevelValue(group) {
+    const entry = logLevels()[group];
+    const current = typeof entry === 'string' ? entry : firstText(entry?.level);
+    return firstText(state.logLevelDraft[group], current, 'auto');
+  }
+  function logLevelLabel(value) {
+    return (LOG_LEVEL_VALUES.find(([key]) => key === value) || [])[1] || value;
+  }
+  function logLevelSummary() {
+    if (!logLevelsSupported()) return { label: '状态不可用', tone: 'warn' };
+    const values = LOG_LEVEL_GROUPS.map(([group]) => logLevelValue(group));
+    const debug = values.filter((value) => value === 'debug').length;
+    if (debug) return { label: `${debug} 组调试级`, tone: 'warn' };
+    if (values.every((value) => value === 'auto')) return { label: '全部自动', tone: 'info' };
+    return { label: '已自定义', tone: 'ok' };
+  }
   function logRetentionDays() {
     return Number(state.logSettings?.retention_days ?? state.logSettings?.settings?.retention_days) || 0;
+  }
+  /*
+   * NetFlow / IPFIX 与流量日志采集范围：后端目前确实没有实现（全树 netflow / ipfix
+   * 零命中；aegis/status 也没有采集范围维度的字段）。这里仍然走能力位而不是写死，
+   * 后端补上对应能力位后这两行会自己变成可配置。
+   */
+  function netflowSupported() {
+    return bool(capabilities().netflow_export_supported ?? capabilities().ipfix_export_supported);
+  }
+  function trafficLogScopeSupported() {
+    return bool(capabilities().traffic_log_scope_supported ?? capabilities().traffic_logging_scope_supported);
   }
   function renderLogging() {
     const events = filteredEvents();
@@ -485,12 +678,14 @@ export function mount(context = {}) {
         { key: 'honeypot', label: '蜜罐命中', value: formatNumber(stats.honeypot_hits), detail: '诱捕服务事件', tone: 'warn', icon: icon('trap') }
       ], 'Aegisx 流量日志概览')}
       <section class="aegisx-panel aegisx-unsupported-panel dwrt-kit-glass-surface">
-        ${row('NetFlow (IPFIX)', '捕获流量信息并导出到收集器。', `${switchControl('netflow', false)}${stateBadge('后端未开放', 'neutral')}`)}
-        ${row('流量日志', '选择记录所有安全流量或仅记录被阻止流量，并可附加 DNS、服务和设备管理事件。', `${radio('traffic-logging', 'all', true, '所有流量', false, '后端缺少独立采集范围合同')}${radio('traffic-logging', 'blocked', false, '仅阻止的流量', false, '后端缺少独立采集范围合同')}${stateBadge('后端未开放', 'neutral')}`, { detail: '<p class="aegisx-explanation">Gateway DNS、Aegisx 服务和设备管理三类额外流量仍缺独立设置与回读。</p>' })}
+        ${row('NetFlow (IPFIX)', '捕获流量信息并导出到收集器。', `${switchControl('netflow', false, netflowSupported())}${capabilityBadge(netflowSupported(), '可配置')}`)}
+        ${row('流量日志', '选择记录所有安全流量或仅记录被阻止流量，并可附加 DNS、服务和设备管理事件。', `${radio('traffic-logging', 'all', true, '所有流量', trafficLogScopeSupported(), '后端缺少独立采集范围合同')}${radio('traffic-logging', 'blocked', false, '仅阻止的流量', trafficLogScopeSupported(), '后端缺少独立采集范围合同')}${capabilityBadge(trafficLogScopeSupported(), '可配置')}`, { detail: '<p class="aegisx-explanation">Gateway DNS、Aegisx 服务和设备管理三类额外流量仍缺独立设置与回读。</p>' })}
         ${row('活动日志 (Syslog)', '将活动日志保存在本机，或使用日志中心转发到 SIEM / Syslog 服务器。', `${radio('syslog', 'off', false, '关', false)}${radio('syslog', 'internal', syslogLoaded && !bool(syslog.enabled), '内部存储', false)}${radio('syslog', 'siem', bool(syslog.enabled), 'SIEM 服务器', false)}${stateBadge(syslogLoaded ? bool(syslog.enabled) ? '转发已启用' : '内部存储' : '状态不可用', syslogLoaded ? bool(syslog.enabled) ? 'ok' : 'info' : 'warn')}${actionButton('管理', 'log-center', syslogLoaded)}`, { detail: `<p class="aegisx-explanation">${bool(syslog.enabled) ? `${escapeHtml(firstText(syslog.server, '--'))}:${escapeHtml(firstText(syslog.port, 514))} · ${escapeHtml(firstText(syslog.protocol, 'udp').toUpperCase())}` : '日志保留、转发协议、TLS/mTLS、队列和测试统一由日志中心管理。'}</p>` })}
         ${row('数据保留', '控制本机日志保留，并清除设备与流量识别产生的历史数据。', `${stateBadge(logRetentionDays() ? `保留 ${logRetentionDays()} 天` : '自动', 'info')}${actionButton('保留设置', 'log-center', syslogLoaded)}${actionButton('清除流量历史', 'traffic-clear', clearSupported, { icon: 'trash' })}`)}
-        ${row('SNMP 监控', '允许监控工具使用 SNMP 收集网络信息。', `${stateBadge('后端未开放', 'neutral')}`)}
-        ${row('日志级别', '按设备、管理、远程访问和系统分别控制日志详细程度。', `${stateBadge('后端未开放', 'neutral')}`)}
+        ${row('SNMP 监控', '允许监控工具使用 SNMP 收集网络信息。', `${stateBadge('可保存，运行消费者未实现', 'neutral')}${actionButton('跨三层服务', 'cross-l3-service', true)}`, { detail: '<p class="aegisx-explanation">SNMP 的监听端口与版本可在“策略引擎 → 跨三层服务”中保存并回读，但设备上没有 SNMP 运行消费者，保存后不会真的开始应答。</p>' })}
+        ${row('日志级别', '按设备、管理、远程访问和系统分别控制日志详细程度。', `<div class="aegisx-log-levels">
+          ${LOG_LEVEL_GROUPS.map(([group, label]) => `<label class="aegisx-log-level dwrt-kit-field" data-dwrt-component="field"><span>${escapeHtml(label)}</span><select class="dwrt-kit-select" data-dwrt-component="select" data-aegis-log-level="${group}" ${logLevelWritable() && !state.saving ? '' : 'disabled'} aria-label="${escapeHtml(`${label}日志级别`)}">${LOG_LEVEL_VALUES.map(([value, text]) => `<option value="${value}" ${logLevelValue(group) === value ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></label>`).join('')}
+        </div>${stateBadge(logLevelSummary().label, logLevelSummary().tone)}`, { detail: `<p class="aegisx-explanation">${logLevelsSupported() ? '级别在采集入口生效，error 与 critical 永不被抑制。调试级会显著增加日志量。' : '日志设置读取失败，级别暂不可用。'}</p>` })}
       </section>
       <section class="aegisx-events-card dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar aegisx-events-toolbar" data-dwrt-component="toolbar"><div class="dwrt-kit-table-title"><strong>近期活动</strong><span>来自 Aegisx 真实事件接口，最多显示最近 100 条。</span></div><label class="dwrt-kit-expand-search aegisx-event-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-event-search value="${escapeHtml(state.eventQuery)}" placeholder="搜索事件" aria-label="搜索安全事件"></label></div>
         <div class="dwrt-kit-table-wrap"><table class="dwrt-kit-table aegisx-events-table"><thead><tr><th>时间</th><th>事件</th><th>动作</th><th>策略 / 来源</th><th>终端 / 目标</th><th>状态</th></tr></thead><tbody>${events.length ? events.map((event) => `<tr><td>${escapeHtml(formatTime(event.ts))}</td><td><strong>${escapeHtml(eventLabel(event.event_type))}</strong><small>${escapeHtml(event.risk || event.level || '')}</small></td><td>${escapeHtml(event.action || '--')}</td><td><strong>${escapeHtml(event.policy_name || event.rule_name || '--')}</strong><small>${escapeHtml(event.source || '')}</small></td><td><strong>${escapeHtml(event.source_ip || event.source_mac || '--')}</strong><small>${escapeHtml(event.destination_host || event.destination_ip || '')}</small></td><td>${stateBadge(event.production_event === false ? '测试事件' : '生产事件', event.production_event === false ? 'warn' : 'ok')}</td></tr>`).join('') : '<tr><td colspan="6" class="aegisx-table-empty">没有匹配的安全事件</td></tr>'}</tbody></table></div>
@@ -527,6 +722,23 @@ export function mount(context = {}) {
       </div><footer class="dwrt-kit-modal-footer"><button class="policy-secondary" type="button" data-aegis-close>取消</button><button class="policy-primary" type="button" data-honeypot-save ${state.saving || !draft.network_id || !draft.address.trim() ? 'disabled' : ''}>${state.saving ? '正在创建' : editing ? '保存' : '创建'}</button></footer></section></div>`;
     }
     return `<div class="dwrt-kit-modal-layer aegisx-honeypot-modal-layer is-open" data-dwrt-component="modal"><button class="dwrt-kit-modal-backdrop" type="button" data-aegis-close aria-label="关闭蜜罐管理"></button><section class="dwrt-kit-modal aegisx-honeypot-modal aegisx-honeypot-manager dwrt-kit-glass-surface" data-dwrt-modal-variant="copilot" data-adaptive-sample role="dialog" aria-modal="true" aria-labelledby="aegisx-honeypot-manager-title"><header class="dwrt-kit-modal-header"><div><h2 id="aegisx-honeypot-manager-title">蜜罐</h2></div><button class="dwrt-kit-modal-close" type="button" data-aegis-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-modal-body aegisx-drawer-body"><div class="aegisx-honeypot-list">${items.map((item) => `<article><div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.address)} · ${escapeHtml(item.network_id)}</span></div>${stateBadge(item.apply_state === 'active' ? '运行中' : item.enabled === false ? '已停用' : '未运行', item.apply_state === 'active' ? 'ok' : 'warn')}<div><button type="button" data-honeypot-edit="${escapeHtml(item.id)}">编辑</button><button type="button" data-honeypot-delete="${escapeHtml(item.id)}">删除</button></div></article>`).join('')}</div>${state.honeypotEvents.length ? `<section class="aegisx-honeypot-events"><strong>近期命中</strong>${state.honeypotEvents.slice(0, 8).map((event) => `<span><b>${escapeHtml(firstText(event.source_ip, event.source_mac, '未知终端'))}</b><small>${escapeHtml(formatTime(event.ts || event.last_seen))}</small></span>`).join('')}</section>` : ''}</div><footer class="dwrt-kit-modal-footer"><button class="policy-secondary" type="button" data-aegis-close>关闭</button><button class="policy-primary" type="button" data-honeypot-new>新建</button></footer></section></div>`;
+  }
+  /*
+   * 手工分发根证书。
+   *
+   * 后端只接受 target_type=client + target_id=已知终端 MAC，且 method 必须是 manual
+   * （自动分发确实没实现）。所以这里从已加载的终端列表里选，而不是让用户手敲 MAC，
+   * 也不跳转到别的页面假装完成。
+   */
+  function renderCertificateDistributeModal() {
+    const items = inspectionCaDistributionItems();
+    const candidates = state.clients.filter((client) => clientMac(client));
+    const target = firstText(state.certificateTarget);
+    return `<div class="dwrt-kit-modal-layer aegisx-certificate-modal-layer is-open" data-dwrt-component="modal"><button class="dwrt-kit-modal-backdrop" type="button" data-aegis-close aria-label="关闭证书分发"></button><section class="dwrt-kit-modal aegisx-certificate-modal dwrt-kit-glass-surface" data-dwrt-modal-variant="copilot" data-adaptive-sample role="dialog" aria-modal="true" aria-labelledby="aegisx-certificate-title"><header class="dwrt-kit-modal-header"><div><h2 id="aegisx-certificate-title">手工分发检查根证书</h2></div><button class="dwrt-kit-modal-close" type="button" data-aegis-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-modal-body aegisx-drawer-body">
+      <p class="aegisx-explanation">为所选终端登记一条分发记录，随后由你把证书安装到该终端并信任。后端不支持自动推送，也无法回读终端是否已安装。</p>
+      <label class="aegisx-certificate-target dwrt-kit-field" data-dwrt-component="field"><span>目标终端</span><select class="dwrt-kit-select" data-dwrt-component="select" data-certificate-target ${candidates.length ? '' : 'disabled'}><option value="">${candidates.length ? '请选择终端' : '没有可选终端'}</option>${candidates.map((client) => `<option value="${escapeHtml(clientMac(client))}" ${clientMac(client) === target ? 'selected' : ''}>${escapeHtml(clientLabel(client))} · ${escapeHtml(clientMac(client))}</option>`).join('')}</select></label>
+      ${items.length ? `<div class="aegisx-certificate-list">${items.slice(0, 20).map((item) => `<article><div><strong>${escapeHtml(firstText(clientLabel(clientByMac(item.target_id)), item.target_id))}</strong><span>${escapeHtml(item.target_id)} · 第 ${Number(item.ca_generation) || 0} 代</span></div>${stateBadge(item.state === 'ready_for_download' ? '待安装' : firstText(item.state, '未知'), item.state === 'ready_for_download' ? 'warn' : 'info')}<small>${escapeHtml(formatTime(item.created_at))}</small></article>`).join('')}</div>` : '<p class="aegisx-explanation">尚无分发记录。</p>'}
+    </div><footer class="dwrt-kit-modal-footer"><button class="policy-secondary" type="button" data-aegis-close>关闭</button><button class="policy-primary" type="button" data-certificate-distribute-save ${state.saving || !target ? 'disabled' : ''}>${state.saving ? '正在登记' : '登记分发'}</button></footer></section></div>`;
   }
   function defaultAppBlockDraft(item = null) {
     const schedule = asArray(item?.schedule).map((range) => ({
@@ -634,6 +846,7 @@ export function mount(context = {}) {
     if (state.drawer === 'app-block') return renderAppBlockDrawer();
     if (state.drawer === 'intrusion') return renderIntrusionDrawer();
     if (state.drawer === 'content') return renderContentDrawer();
+    if (state.drawer === 'certificate-distribute') return renderCertificateDistributeModal();
     return '';
   }
   function renderConfirmation() {
@@ -657,9 +870,77 @@ export function mount(context = {}) {
       portal.dataset.aegisxPortal = VERSION;
       document.body.append(portal);
     }
+    /*
+     * 抽屉已经开着时只换正文与页脚，不动外壳。
+     *
+     * 这里原先无条件 `portal.innerHTML = markup`，而本模块有 70 多处 render()：
+     * 抽屉里任何一次交互，甚至只是后台刷新，都会把整个抽屉 DOM 换掉。换掉的瞬间
+     * 浏览器里正在进行的文本选择被清空、焦点回到 body，所以「复制一串内容都不行，
+     * 老自己跳」—— 选中的那个节点在复制之前就已经不存在了。
+     *
+     * 外壳（页头 / 关闭按钮 / 玻璃层）保持原节点，选区和滚动位置才能活下来。
+     */
+    const liveSheet = portal.querySelector('.dwrt-kit-sheet');
+    if (liveSheet) {
+      const template = document.createElement('div');
+      template.innerHTML = markup;
+      const nextSheet = template.querySelector('.dwrt-kit-sheet');
+      const sameSheet = nextSheet && nextSheet.className === liveSheet.className;
+      const body = liveSheet.querySelector('.dwrt-kit-sheet-body');
+      const nextBody = nextSheet?.querySelector('.dwrt-kit-sheet-body');
+      if (sameSheet && body && nextBody) {
+        const scrollTop = body.scrollTop;
+        if (body.innerHTML !== nextBody.innerHTML) body.innerHTML = nextBody.innerHTML;
+        body.scrollTop = scrollTop;
+        const foot = liveSheet.querySelector('.dwrt-kit-sheet-footer');
+        const nextFoot = nextSheet.querySelector('.dwrt-kit-sheet-footer');
+        if (foot && nextFoot && foot.innerHTML !== nextFoot.innerHTML) foot.innerHTML = nextFoot.innerHTML;
+        /* 确认框是独立节点，跟抽屉一起活在 portal 里，单独同步。 */
+        syncConfirmation(template);
+        return;
+      }
+    }
     portal.innerHTML = markup;
   }
+
+  /* 确认框的增删不影响抽屉外壳，所以单独处理而不是整块重写 portal。 */
+  function syncConfirmation(template) {
+    const current = portal.querySelector('[data-dwrt-confirm]') || portal.querySelector('.dwrt-kit-confirm');
+    const next = template.querySelector('[data-dwrt-confirm]') || template.querySelector('.dwrt-kit-confirm');
+    if (!current && next) portal.append(next);
+    else if (current && !next) current.remove();
+    else if (current && next && current.innerHTML !== next.innerHTML) current.replaceWith(next);
+  }
   function query(selector) { return root.querySelector(selector) || portal?.querySelector(selector) || null; }
+
+  /*
+   * 判断此刻重绘主体会不会破坏用户正在做的事：
+   *  - 页面里存在跨节点的非空选区（正在划词准备复制）；
+   *  - 焦点在输入控件里（正在填表）。
+   * 两种情况都只推迟主体重绘，抽屉与 portal 仍按各自的增量路径更新。
+   */
+  function shouldDeferRender() {
+    if (!root) return false;
+    const active = document.activeElement;
+    if (active && root.contains(active) && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)) return true;
+    const selection = window.getSelection?.();
+    if (!selection || selection.isCollapsed || !selection.rangeCount) return false;
+    if (!String(selection).trim()) return false;
+    const node = selection.anchorNode;
+    return Boolean(node && root.contains(node.nodeType === 1 ? node : node.parentNode));
+  }
+
+  /* 交互结束后补一次重绘：状态只是延后呈现，不会丢。 */
+  function deferRender() {
+    if (deferredRenderTimer) return;
+    deferredRenderTimer = window.setInterval(() => {
+      if (!state.mounted) { window.clearInterval(deferredRenderTimer); deferredRenderTimer = 0; return; }
+      if (shouldDeferRender()) return;
+      window.clearInterval(deferredRenderTimer);
+      deferredRenderTimer = 0;
+      render();
+    }, 400);
+  }
   function queryAll(selector) { return [...root.querySelectorAll(selector), ...(portal ? portal.querySelectorAll(selector) : [])]; }
   function rerenderWithFocus(selector, value) {
     render();
@@ -670,6 +951,18 @@ export function mount(context = {}) {
   }
   function render() {
     if (!root) return;
+    /*
+     * 用户正在选文字或正在输入时不要重绘主体。
+     *
+     * 本模块有 70 多处 render()，主体走的是 `root.innerHTML = ...`：重绘会把
+     * 承载选区的那些节点整个换掉，浏览器的 selection 随之清空，焦点回到 body。
+     * 用户的体验就是「复制一串内容都不行，老自己跳」—— 想复制的东西在按下
+     * 复制键之前就已经被替换掉了。后台任务轮询（scheduleJobPoll，2.2s 一次）
+     * 会让这件事反复发生。
+     *
+     * 这里把这类重绘推迟到交互结束：延后而不是丢弃，状态最终仍会呈现。
+     */
+    if (shouldDeferRender()) { deferRender(); return; }
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', 'aegisx-route-host');
@@ -682,7 +975,7 @@ export function mount(context = {}) {
     if (portal) ui.scheduleAdaptiveForegroundSample?.(40, portal);
   }
 
-  function closeDrawer() { state.drawer = ''; state.contentDraft = null; state.appBlockDraft = null; state.honeypotDraft = null; render(); }
+  function closeDrawer() { state.drawer = ''; state.contentDraft = null; state.appBlockDraft = null; state.honeypotDraft = null; state.certificateTarget = ''; render(); }
   async function saveGeo(options = {}) {
     state.saving = true; state.error = ''; render();
     try {
@@ -714,6 +1007,96 @@ export function mount(context = {}) {
       state.saving = false;
       await load({ silent: true });
     } catch (error) { state.error = message(error, '识别模式切换失败'); state.saving = false; await load({ silent: true }); }
+  }
+  /*
+   * 日志级别写入。
+   *
+   * 只提交 log_levels 一个键：后端 logd_settings_set 会先把 retention/max_* 从库里读出来
+   * 作为缺省，未提交的字段保持原值，所以这是安全的局部写，不会顺手把保留策略改掉。
+   * 写入格式与读回不同 —— 读回是 {level, min_severity_rank, keeps_debug} 对象，
+   * 写入必须是纯字符串，否则后端回 invalid_log_level。
+   */
+  async function saveLogLevel(group, value) {
+    if (!LOG_LEVEL_GROUPS.some(([key]) => key === group)) return;
+    if (!LOG_LEVEL_VALUES.some(([key]) => key === value)) return;
+    const previous = logLevelValue(group);
+    if (previous === value) return;
+    state.logLevelDraft = { ...state.logLevelDraft, [group]: value };
+    state.saving = true; state.error = ''; render();
+    try {
+      await requestJson(ENDPOINTS.logSettings, { method: 'POST', body: JSON.stringify({ log_levels: { [group]: value } }) });
+      state.notice = `${logLevelLabel(value)}：${(LOG_LEVEL_GROUPS.find(([key]) => key === group) || [])[1]}日志级别已保存。`;
+      state.saving = false;
+      state.logLevelDraft = {};
+      await load({ silent: true });
+    } catch (error) {
+      /* 写失败时回退草稿，否则选择器会停在一个后端并未接受的值上。 */
+      state.logLevelDraft = {};
+      state.error = message(error, '日志级别保存失败');
+      state.saving = false;
+      await load({ silent: true });
+    }
+  }
+  /*
+   * 检查根证书的写操作。generate / rotate / revoke 后端都要求 confirm=true，
+   * 且都是 high 风险并写审计日志，所以每一步都先弹确认框再提交。
+   */
+  async function commitCertificate(action) {
+    const endpoints = {
+      generate: ENDPOINTS.inspectionCaGenerate, rotate: ENDPOINTS.inspectionCaRotate, revoke: ENDPOINTS.inspectionCaRevoke
+    };
+    const notices = {
+      generate: '检查根证书已生成，请下载并在终端安装信任后再使用。',
+      rotate: '检查根证书已轮换，此前分发的证书需要重新安装。',
+      revoke: '检查根证书已吊销。'
+    };
+    if (!endpoints[action]) return;
+    state.confirm = null;
+    state.saving = true; state.error = ''; render();
+    try {
+      await requestJson(endpoints[action], { method: 'POST', body: JSON.stringify({ confirm: true }) });
+      state.notice = notices[action];
+      state.saving = false;
+      await load({ silent: true });
+    } catch (error) { state.error = message(error, '证书操作失败'); state.saving = false; await load({ silent: true }); }
+  }
+  function downloadCertificate() {
+    /* 下载走浏览器导航：后端返回 base64 载荷的 JSON，这里交给会话闸门拿带鉴权的响应。 */
+    (async () => {
+      state.saving = true; state.error = ''; render();
+      try {
+        const result = await requestJson(`${ENDPOINTS.inspectionCaDownload}?format=pem`);
+        const content = firstText(result?.content_base64);
+        if (!content) throw new Error('证书内容为空');
+        const blob = new Blob([Uint8Array.from(atob(content), (ch) => ch.charCodeAt(0))], { type: firstText(result?.content_type, 'application/x-pem-file') });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = firstText(result?.filename, 'dreamingos-aegisx-inspection-ca.pem');
+        document.body.append(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        state.notice = '证书已下载，请在终端安装并信任后使用。';
+        state.saving = false;
+        render();
+      } catch (error) { state.error = message(error, '证书下载失败'); state.saving = false; render(); }
+    })();
+  }
+  async function commitCertificateDistribution() {
+    const target = firstText(state.certificateTarget);
+    if (!target) return;
+    state.saving = true; state.error = ''; render();
+    try {
+      await requestJson(ENDPOINTS.inspectionCaDistributions, {
+        method: 'POST',
+        body: JSON.stringify({ target_type: 'client', target_id: target, method: 'manual' })
+      });
+      state.notice = '已登记分发记录，请下载证书并在该终端安装信任。';
+      state.certificateTarget = '';
+      state.saving = false;
+      await load({ silent: true });
+    } catch (error) { state.error = message(error, '分发登记失败'); state.saving = false; await load({ silent: true }); }
   }
   function contentPayload() {
     const draft = state.contentDraft || defaultContentDraft();
@@ -972,7 +1355,7 @@ export function mount(context = {}) {
   }
   function bindEvents() {
     queryAll('[data-aegis-tab]').forEach((button) => button.addEventListener('click', () => { state.tab = button.dataset.aegisTab; rememberTab(state.tab); state.drawer = ''; state.notice = ''; render(); }));
-    queryAll('[data-aegis-close], [data-dwrt-confirm-cancel]').forEach((button) => button.addEventListener('click', () => { if (button.closest('[data-dwrt-confirmation]')) state.confirm = null; else { state.drawer = ''; state.contentDraft = null; state.appBlockDraft = null; state.honeypotDraft = null; state.signatureDraft = null; state.feedPreview = null; window.clearTimeout(jobPollTimer); } render(); }));
+    queryAll('[data-aegis-close], [data-dwrt-confirm-cancel]').forEach((button) => button.addEventListener('click', () => { if (button.closest('[data-dwrt-confirmation]')) state.confirm = null; else { state.drawer = ''; state.contentDraft = null; state.appBlockDraft = null; state.honeypotDraft = null; state.signatureDraft = null; state.feedPreview = null; state.certificateTarget = ''; window.clearTimeout(jobPollTimer); } render(); }));
     queryAll('[data-aegis-action]').forEach((button) => button.addEventListener('click', () => {
       if (button.disabled) return;
       const action = button.dataset.aegisAction;
@@ -988,6 +1371,12 @@ export function mount(context = {}) {
       else if (action === 'feed-update') { previewFeedUpdate(); return; }
       else if (action === 'feed-import') { state.confirm = { action: 'feed-import', tone: 'warning', title: '重新导入规则？', description: '将从已下载并校验的 artifact 后台重建签名、域名分类和信誉数据库；不会自动启用生产 IDS/IPS。', confirmLabel: '开始导入' }; render(); return; }
       else if (action === 'log-center') { window.location.hash = '#/logs'; return; }
+      else if (action === 'cross-l3-service') { window.location.hash = '#/policy-engine/routes'; return; }
+      else if (action === 'certificate-generate') { state.confirm = { action: 'certificate-generate', tone: 'warning', title: '生成检查根证书？', description: '将在网关生成 Aegisx 检查根证书（私钥不导出）。生成后需下载并在终端安装信任；SSL 检查数据面尚未实现，因此拦截页面仍不会生效。', confirmLabel: '生成证书' }; render(); return; }
+      else if (action === 'certificate-rotate') { state.confirm = { action: 'certificate-rotate', tone: 'warning', title: '轮换检查根证书？', description: '将签发新一代根证书，此前已分发到终端的证书会失效，需要重新下载并安装。', confirmLabel: '轮换证书' }; render(); return; }
+      else if (action === 'certificate-revoke') { state.confirm = { action: 'certificate-revoke', tone: 'danger', title: '吊销检查根证书？', description: '将吊销当前根证书并停止其分发。终端上已安装的证书需自行移除。', confirmLabel: '吊销证书' }; render(); return; }
+      else if (action === 'certificate-download') { downloadCertificate(); return; }
+      else if (action === 'certificate-distribute') { state.certificateTarget = ''; state.drawer = 'certificate-distribute'; render(); return; }
       else if (action === 'traffic-clear') { state.confirm = { action: 'traffic-clear', tone: 'danger', title: '清除流量历史？', description: '将永久清除设备与流量识别产生的日汇总、明细和客户端快照。安全事件日志不受影响。', confirmLabel: '清除历史' }; render(); return; }
       else state.drawer = action;
       render();
@@ -1002,6 +1391,9 @@ export function mount(context = {}) {
     queryAll('[data-geo-action]').forEach((button) => button.addEventListener('click', () => { updateGeoRule({ action: button.dataset.geoAction }); if (selectedCountries().length) saveGeo({ closeDrawer: false }); else render(); }));
     queryAll('input[name="geo-direction"]').forEach((input) => input.addEventListener('change', () => { updateGeoRule({ direction: input.value }); if (selectedCountries().length) saveGeo({ closeDrawer: false }); else render(); }));
     queryAll('input[name="identification"]').forEach((input) => input.addEventListener('change', () => { if (input.checked) saveIdentification(input.value); }));
+    queryAll('[data-aegis-log-level]').forEach((select) => select.addEventListener('change', () => saveLogLevel(select.dataset.aegisLogLevel, select.value)));
+    query('[data-certificate-target]')?.addEventListener('change', (event) => { state.certificateTarget = event.target.value; render(); });
+    query('[data-certificate-distribute-save]')?.addEventListener('click', commitCertificateDistribution);
     query('[data-geo-search]')?.addEventListener('input', (event) => { state.geoQuery = event.target.value; rerenderWithFocus('[data-geo-search]', state.geoQuery); });
     queryAll('[data-geo-country]').forEach((input) => input.addEventListener('change', () => {
       const item = geoCountries().find((country) => firstText(country.id, country.code) === input.dataset.geoCountry);
@@ -1055,11 +1447,11 @@ export function mount(context = {}) {
     queryAll('[data-honeypot-field]').forEach((input) => input.addEventListener('input', () => { state.honeypotDraft[input.dataset.honeypotField] = input.value; }));
     queryAll('[data-honeypot-service]').forEach((input) => input.addEventListener('change', () => { const service = input.dataset.honeypotService; state.honeypotDraft.services = input.checked ? [...new Set([...state.honeypotDraft.services, service])] : state.honeypotDraft.services.filter((item) => item !== service); }));
     query('[data-honeypot-save]')?.addEventListener('click', validateHoneypot);
-    query('[data-dwrt-confirm-accept]')?.addEventListener('click', () => { const confirm = state.confirm; if (!confirm) return; if (confirm.action === 'content-save') commitContent(confirm.payload); else if (confirm.action === 'app-block-save') commitAppBlock(confirm.payload, confirm.revision); else if (confirm.action === 'pcdn-save') commitPcdn(confirm.enabled); else if (confirm.action === 'pcdn-sync') commitPcdnSync(); else if (confirm.action === 'feed-import') startFeedImport(); else if (confirm.action === 'signature-suppress') setSignatureSuppressed(confirm.signature); else if (confirm.action === 'traffic-clear') clearTrafficHistory(); else if (confirm.action === 'honeypot-save') commitHoneypot(confirm.payload); else deleteResource(confirm.resourceKind, confirm.resourceId); });
+    query('[data-dwrt-confirm-accept]')?.addEventListener('click', () => { const confirm = state.confirm; if (!confirm) return; if (confirm.action === 'content-save') commitContent(confirm.payload); else if (confirm.action === 'app-block-save') commitAppBlock(confirm.payload, confirm.revision); else if (confirm.action === 'pcdn-save') commitPcdn(confirm.enabled); else if (confirm.action === 'pcdn-sync') commitPcdnSync(); else if (confirm.action === 'feed-import') startFeedImport(); else if (confirm.action === 'signature-suppress') setSignatureSuppressed(confirm.signature); else if (confirm.action === 'traffic-clear') clearTrafficHistory(); else if (confirm.action === 'honeypot-save') commitHoneypot(confirm.payload); else if (confirm.action === 'certificate-generate') commitCertificate('generate'); else if (confirm.action === 'certificate-rotate') commitCertificate('rotate'); else if (confirm.action === 'certificate-revoke') commitCertificate('revoke'); else deleteResource(confirm.resourceKind, confirm.resourceId); });
   }
 
   stage?.classList.add('is-aegisx');
   render();
   load();
-  return { unmount() { state.mounted = false; state.seq += 1; window.clearTimeout(jobPollTimer); portal?.remove(); portal = null; stage?.classList.remove('is-aegisx'); root?.replaceChildren(); root?.classList.remove('aegisx-route-host', 'policy-table-route-host', 'route-workspace'); } };
+  return { unmount() { state.mounted = false; state.seq += 1; window.clearTimeout(jobPollTimer); window.clearInterval(deferredRenderTimer); deferredRenderTimer = 0; portal?.remove(); portal = null; stage?.classList.remove('is-aegisx'); root?.replaceChildren(); root?.classList.remove('aegisx-route-host', 'policy-table-route-host', 'route-workspace'); } };
 }

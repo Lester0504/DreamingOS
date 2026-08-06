@@ -1,4 +1,4 @@
-import { mount as mountNetworkInterfaceConfig } from './network-interface-config.js?v=20260802-ui-batch-01';
+import { mount as mountNetworkInterfaceConfig } from './network-interface-config.js?v=20260805-drawer-standard-portal-01';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -6,7 +6,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260805-drawer-standard-portal-02';
   const MODULE_CLASS = 'global-config-route-host';
   const ENDPOINTS = {
     overview: '/api/v1/network/overview',
@@ -546,7 +546,8 @@ export function mount(context = {}) {
     interfacePayloads = { lan: lansData || {}, wan: wansData || {}, ports: portsData || {} };
     interfaceInstances.forEach((instance, key) => {
       const kind = key.startsWith('lan') ? 'lan' : 'wan';
-      instance?.setData?.(interfacePayloads[kind], interfacePayloads.ports);
+      instance?.setData?.(interfacePayloads[kind], interfacePayloads.ports,
+        state.wans.map((wan) => firstText(wan.id, wan.name)).filter(Boolean));
     });
     if (!gatewayDirty()) {
       const assignments = Object.fromEntries(ports.filter((port) => port.kind === 'wan' && gatewayOwnerId(port)).map((port) => [gatewayOwnerId(port), port.id]));
@@ -1124,6 +1125,9 @@ export function mount(context = {}) {
         deferLoad: true,
         initialDataReady: !state.loading,
         initialData: { config: interfacePayloads[kind], ports: interfacePayloads.ports },
+        /* LAN 实例只加载 LAN 数据，拿不到 WAN 名单；宿主同时持有两边，喂给它做
+           IPv6 上游 WAN 下拉的候选。 */
+        wanNames: state.wans.map((wan) => firstText(wan.id, wan.name)).filter(Boolean),
         onDataChange(payload) {
           if (payload.kind === 'lan') state.lans = payload.rows.map(normalizeLan);
           if (payload.kind === 'wan') state.wans = normalizeWans(payload.rows);

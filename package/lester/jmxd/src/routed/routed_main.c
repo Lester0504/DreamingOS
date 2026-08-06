@@ -20,6 +20,13 @@ static struct ubus_context *route_ubus;
 static struct blob_buf route_blob;
 static struct uloop_timeout route_timer;
 static time_t route_last_warn;
+/*
+ * Consecutive _route_tick failures. Only used to keep the first transient quiet:
+ * rc=7 is UBUS_STATUS_TIMEOUT, and its usual cause is core restarting, which the
+ * next tick recovers from. stderr here is filed under daemon.err, so a
+ * self-healing blip was being reported at error severity.
+ */
+static unsigned int route_tick_failures;
 static int route_runtime_loaded;
 
 struct route_invoke_result {
@@ -100,9 +107,13 @@ static int route_invoke_tick(void)
     ubus_free(tick_ubus);
 
     if (rc != UBUS_STATUS_OK) {
-        route_warn_throttled("_route_tick invoke failed", rc);
+        /* First failure stays quiet; it is nearly always core restarting and the
+         * next tick recovers. A persistent fault still reports. */
+        if (++route_tick_failures > 1)
+            route_warn_throttled("_route_tick invoke failed", rc);
         return -1;
     }
+    route_tick_failures = 0;
     return 0;
 }
 

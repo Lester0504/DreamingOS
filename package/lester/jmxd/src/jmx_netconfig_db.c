@@ -547,6 +547,14 @@ static int nc_schema(void)
         " ddns INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1,"
         " username TEXT DEFAULT '', password_ref TEXT DEFAULT '',"
         " pppoe_multi_json TEXT DEFAULT '{}',"
+        /* Multi-WAN scheduling inputs, one per line.
+         * weight: relative share under network_global.wan_mode='load_balance'.
+         *   100 is the neutral default, matching flow_group_members.weight so
+         *   the two models read on the same scale.
+         * priority: order under wan_mode='failover'. 0 means "not set
+         *   explicitly", and the projection then reports metric, which is what
+         *   actually drives route selection today. */
+        " weight INTEGER DEFAULT 100, priority INTEGER DEFAULT 0,"
         " created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);"
 
         "CREATE TABLE IF NOT EXISTS wan_dns_policy ("
@@ -636,6 +644,7 @@ static int nc_schema(void)
         " jumbo_frames INTEGER DEFAULT 0,"
         " flow_control INTEGER DEFAULT 0,"
         " dot1x INTEGER DEFAULT 0,"
+        " wan_mode TEXT DEFAULT 'failover',"
         " bridge_stp INTEGER DEFAULT 1, bridge_forward_delay INTEGER DEFAULT 2);"
 
         "CREATE TABLE IF NOT EXISTS radius_server ("
@@ -859,6 +868,11 @@ static int nc_schema(void)
     nc_add_column_if_missing("wan_advanced", "pppoe_ac", "TEXT DEFAULT ''");
     nc_add_column_if_missing("wan_advanced", "pppoe_ac_mac", "TEXT DEFAULT ''");
     nc_add_column_if_missing("wan_advanced", "pppoe_service", "TEXT DEFAULT ''");
+    /* network_global.wan_mode: added after the table shipped, so existing
+     * network.db files need it backfilled. 'failover' matches the column
+     * default and the frontend's historical fallback, so a device upgrading
+     * in place keeps its current observable behaviour. */
+    nc_add_column_if_missing("network_global", "wan_mode", "TEXT DEFAULT 'failover'");
     /* UPnP: add stun_port and pcp columns if missing */
     nc_add_column_if_missing("upnp_service", "stun_port", "INTEGER DEFAULT 3478");
     nc_add_column_if_missing("upnp_service", "pcp", "INTEGER DEFAULT 1");
@@ -1005,6 +1019,13 @@ static int nc_schema(void)
     nc_add_column_if_missing("wan", "username", "TEXT DEFAULT ''");
     nc_add_column_if_missing("wan", "password_ref", "TEXT DEFAULT ''");
     nc_add_column_if_missing("wan", "pppoe_multi_json", "TEXT DEFAULT '{}'");
+    /* wan.weight / wan.priority: added after the table shipped, so an existing
+     * network.db needs them backfilled. The defaults keep a device upgrading in
+     * place on its current observable behaviour: weight 100 is an equal share,
+     * and priority 0 means "unset", which makes the projection fall back to
+     * metric - the value that already decides route order. */
+    nc_add_column_if_missing("wan", "weight", "INTEGER DEFAULT 100");
+    nc_add_column_if_missing("wan", "priority", "INTEGER DEFAULT 0");
 
     /* ensure dns service row exists */
     if (nc_prepare(&st,
@@ -3038,6 +3059,34 @@ static struct json_object *nc_wan_row_to_json(sqlite3_stmt *st)
         if (json_object_object_get_ex(o, "pppoe_multi", &multi) && multi)
             nc_redact_secret_fields(multi);
     }
+    /* Multi-WAN scheduling projection. Both fields used to be absent entirely,
+     * so the UI showed "--" for weight and silently fell back to metric for
+     * priority - which happened to be right, but only by coincidence.
+     *
+     * priority is reported as an explicit number rather than left to the
+     * consumer's fallback: when the stored value is 0 (unset) the effective
+     * priority *is* metric, because metric is what the route table actually
+     * orders on. priority_source says which of the two produced the number, so
+     * the UI does not have to guess whether the user set it or inherited it.
+     * The aliases mirror the names the shipped Web module already reads. */
+    {
+        int weight = col_count > 27 ? sqlite3_column_int(st, 27) : 100;
+        int stored_priority = col_count > 28 ? sqlite3_column_int(st, 28) : 0;
+        int metric = sqlite3_column_int(st, 16);
+        int effective_priority = stored_priority > 0 ? stored_priority : metric;
+
+        if (weight <= 0)
+            weight = 100;
+        json_object_object_add(o, "weight", json_object_new_int(weight));
+        json_object_object_add(o, "load_balance_weight", json_object_new_int(weight));
+        json_object_object_add(o, "priority", json_object_new_int(effective_priority));
+        json_object_object_add(o, "failover_priority", json_object_new_int(effective_priority));
+        json_object_object_add(o, "priority_source",
+                               json_object_new_string(stored_priority > 0 ?
+                                                      "wan_priority" : "wan_metric"));
+        json_object_object_add(o, "weight_scale",
+                               json_object_new_string("relative_share_default_100"));
+    }
     return o;
 }
 
@@ -3155,7 +3204,7 @@ struct json_object *jmx_netconfig_wan_list(void)
         "gateway,dns_json,ipv6_mode,ipv6_addr,delegated_prefix,"
         "vlan_enabled,vlan_id,mtu,metric,role,"
         "expected_down_mbps,expected_up_mbps,smart_queue,upnp,ddns,enabled,"
-        "username,password_ref,pppoe_multi_json "
+        "username,password_ref,pppoe_multi_json,weight,priority "
         "FROM wan ORDER BY id") == 0) {
         while (sqlite3_step(st) == SQLITE_ROW) {
             const char *wid = (const char *)sqlite3_column_text(st, 0);
@@ -3219,7 +3268,7 @@ struct json_object *jmx_netconfig_wan_get(const char *id)
         "gateway,dns_json,ipv6_mode,ipv6_addr,delegated_prefix,"
         "vlan_enabled,vlan_id,mtu,metric,role,"
         "expected_down_mbps,expected_up_mbps,smart_queue,upnp,ddns,enabled,"
-        "username,password_ref,pppoe_multi_json "
+        "username,password_ref,pppoe_multi_json,weight,priority "
         "FROM wan WHERE id=?1") == 0) {
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(st) == SQLITE_ROW) {
@@ -3658,6 +3707,8 @@ int jmx_netconfig_wan_set(struct json_object *wan_json)
     char *pppoe_multi_json = NULL;
     char *stored_password = NULL;
     char *stored_pppoe_multi_json = NULL;
+    int stored_weight = 100;
+    int stored_priority = 0;
     const char *requested_password = NULL;
     int clear_password = 0;
     int64_t ts = nc_now_s();
@@ -3673,13 +3724,19 @@ int jmx_netconfig_wan_set(struct json_object *wan_json)
     if (jmx_netconfig_db_init() != 0) return -1;
 
     if (nc_prepare(&st,
-        "SELECT password_ref,pppoe_multi_json FROM wan WHERE id=?1") == 0) {
+        "SELECT password_ref,pppoe_multi_json,weight,priority FROM wan WHERE id=?1") == 0) {
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(st) == SQLITE_ROW) {
             const char *old_password = (const char *)sqlite3_column_text(st, 0);
             const char *old_multi = (const char *)sqlite3_column_text(st, 1);
             stored_password = strdup(old_password ? old_password : "");
             stored_pppoe_multi_json = strdup(old_multi ? old_multi : "{}");
+            if (sqlite3_column_type(st, 2) != SQLITE_NULL)
+                stored_weight = sqlite3_column_int(st, 2);
+            if (sqlite3_column_type(st, 3) != SQLITE_NULL)
+                stored_priority = sqlite3_column_int(st, 3);
+            if (stored_weight <= 0)
+                stored_weight = 100;
         }
         sqlite3_finalize(st);
         st = NULL;
@@ -3704,9 +3761,9 @@ int jmx_netconfig_wan_set(struct json_object *wan_json)
         "gateway,dns_json,ipv6_mode,ipv6_addr,delegated_prefix,"
         "vlan_enabled,vlan_id,mtu,metric,role,"
         "expected_down_mbps,expected_up_mbps,smart_queue,upnp,ddns,enabled,"
-        "username,password_ref,pppoe_multi_json,"
+        "username,password_ref,pppoe_multi_json,weight,priority,"
         "created_at,updated_at) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?28) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?29,?30,?28,?28) "
         "ON CONFLICT(id) DO UPDATE SET "
         "name=excluded.name,note=excluded.note,carrier=excluded.carrier,"
         "ifname=excluded.ifname,device=excluded.device,port_label=excluded.port_label,"
@@ -3721,6 +3778,7 @@ int jmx_netconfig_wan_set(struct json_object *wan_json)
         "ddns=excluded.ddns,enabled=excluded.enabled,"
         "username=excluded.username,password_ref=excluded.password_ref,"
         "pppoe_multi_json=excluded.pppoe_multi_json,"
+        "weight=excluded.weight,priority=excluded.priority,"
         "updated_at=excluded.updated_at") == 0) {
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, nc_json_str(wan_json, "name", id), -1, SQLITE_TRANSIENT);
@@ -3751,6 +3809,13 @@ int jmx_netconfig_wan_set(struct json_object *wan_json)
                           -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 27, pppoe_multi_json ? pppoe_multi_json : "{}", -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 28, ts);
+        /* Keep the stored value when the caller does not mention the field, so
+         * a partial WAN write from a page with no weight/priority control does
+         * not silently reset the schedule. */
+        sqlite3_bind_int(st, 29, nc_json_int(wan_json, "weight",
+                                             nc_json_int(wan_json, "load_balance_weight",
+                                                         stored_weight)));
+        sqlite3_bind_int(st, 30, nc_json_int(wan_json, "priority", stored_priority));
         if (nc_step_done(st) == 0) rc = 0;
         sqlite3_finalize(st);
     }
@@ -4840,7 +4905,8 @@ struct json_object *jmx_netconfig_global_get(void)
     if (jmx_netconfig_db_init() != 0) goto done;
     if (nc_prepare(&st,
         "SELECT default_posture,mdns_proxy,igmp_snooping,stp_mode,"
-        "rogue_dhcp_detection,jumbo_frames,flow_control,dot1x,bridge_stp,bridge_forward_delay "
+        "rogue_dhcp_detection,jumbo_frames,flow_control,dot1x,bridge_stp,bridge_forward_delay,"
+        "wan_mode "
         "FROM network_global WHERE id=1") == 0) {
         if (sqlite3_step(st) == SQLITE_ROW) {
             nc_add_text(global, "default_posture", st, 0);
@@ -4853,6 +4919,19 @@ struct json_object *jmx_netconfig_global_get(void)
             json_object_object_add(global, "dot1x", json_object_new_boolean(sqlite3_column_int(st, 7)));
             json_object_object_add(global, "bridge_stp", json_object_new_boolean(sqlite3_column_int(st, 8)));
             json_object_object_add(global, "bridge_forward_delay", json_object_new_int(sqlite3_column_int(st, 9)));
+            /*
+             * wan_mode is "failover" | "load_balance". A row written before this
+             * column existed reads as NULL/empty, which must not surface as ""
+             * -- the frontend treats an empty string as a real value and would
+             * select neither radio. Normalise to the documented default instead.
+             */
+            {
+                const char *mode = (const char *)sqlite3_column_text(st, 10);
+
+                if (!mode || !mode[0] || (strcmp(mode, "failover") && strcmp(mode, "load_balance")))
+                    mode = "failover";
+                json_object_object_add(global, "wan_mode", json_object_new_string(mode));
+            }
         }
         sqlite3_finalize(st);
     }
@@ -4915,10 +4994,74 @@ static int nc_lan_requires_global(const char *mode)
     return (mode && (!strcmp(mode, "gateway") || !strcmp(mode, "bypass_router")));
 }
 
+/* Only these values are accepted anywhere wan_mode is read or written. */
+static int nc_wan_mode_valid(const char *mode)
+{
+    return mode && (!strcmp(mode, "failover") || !strcmp(mode, "load_balance"));
+}
+
+int jmx_netconfig_wan_mode_get(char *out, size_t out_len)
+{
+    sqlite3_stmt *st = NULL;
+
+    if (!out || out_len == 0)
+        return -1;
+    /* Default first, so every early return below is already safe. */
+    snprintf(out, out_len, "failover");
+    if (jmx_netconfig_db_init() != 0)
+        return 0;
+    if (nc_prepare(&st, "SELECT wan_mode FROM network_global WHERE id=1") == 0) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *mode = (const char *)sqlite3_column_text(st, 0);
+
+            if (nc_wan_mode_valid(mode))
+                snprintf(out, out_len, "%s", mode);
+        }
+        sqlite3_finalize(st);
+    }
+    return 0;
+}
+
+/*
+ * Global network write path.
+ *
+ * This deliberately implements a *whitelist of one*: wan_mode. Every other
+ * column in network_global still has no transactional apply/readback/rollback
+ * story, which is why POST/PUT /api/v1/network/global rejects them at the webd
+ * layer. Widening this function is not a matter of adding binds here -- each
+ * field needs a runtime executor first, or the UI gets a control that saves and
+ * does nothing.
+ *
+ * Returns 0 on success, -2 when the payload carries no writable field (caller
+ * maps that to the existing capability_disabled response), -1 on db failure.
+ */
 int jmx_netconfig_global_set(struct json_object *global_json)
 {
-    (void)global_json;
-    return -2;
+    struct json_object *v = NULL;
+    const char *mode;
+    sqlite3_stmt *st = NULL;
+    int rc;
+
+    if (!global_json || !json_object_is_type(global_json, json_type_object))
+        return -2;
+    if (!json_object_object_get_ex(global_json, "wan_mode", &v) || !v ||
+        !json_object_is_type(v, json_type_string))
+        return -2;
+    mode = json_object_get_string(v);
+    if (!nc_wan_mode_valid(mode))
+        return -1;
+    if (jmx_netconfig_db_init() != 0)
+        return -1;
+    /* id=1 is created by the schema, but INSERT..ON CONFLICT keeps this correct
+     * on a database whose singleton row was never materialised. */
+    if (nc_prepare(&st,
+            "INSERT INTO network_global(id,wan_mode) VALUES(1,?1) "
+            "ON CONFLICT(id) DO UPDATE SET wan_mode=excluded.wan_mode") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, mode, -1, SQLITE_TRANSIENT);
+    rc = nc_step_done(st);
+    sqlite3_finalize(st);
+    return rc == 0 ? 0 : -1;
 }
 
 int jmx_netconfig_global_apply(void)
@@ -8485,6 +8628,41 @@ struct json_object *jmx_netconfig_capabilities(void)
     json_object_object_add(data, "wan_bonding_write", json_object_new_boolean(0));
     json_object_object_add(data, "wan_bonding_write_reason",
                            json_object_new_string("bond runtime apply/readback is not transactionally closed"));
+    /*
+     * WAN mode (failover | load_balance) is now stored and read back in
+     * network_global.wan_mode, and it is writable.
+     *
+     * The write is a whitelist of one: PUT /api/v1/network/global accepts a body
+     * containing wan_mode and nothing else. Every other global field still has
+     * no transactional apply/readback/rollback and keeps its 409, so this key
+     * must not be read as "global network settings are writable".
+     *
+     * The mode has a real runtime consumer: route_rule_from_json() maps
+     * "failover" onto the kernel's PRIMARY_BACKUP selector for the default
+     * multi-WAN rule, and "load_balance" leaves the weighted selector in place.
+     * It takes effect on routed's next config sync, which is why the write
+     * response reports apply_state "pending_route_sync" rather than applied.
+     *
+     * wan_mode_write is the canonical key. The two names the frontend probes
+      * today (wan_policy_write / wan_load_balance_write) are published as
+      * aliases so the contract is discoverable from either side, and all three
+     * report the same value.
+     */
+    json_object_object_add(data, "wan_mode_read", json_object_new_boolean(1));
+    json_object_object_add(data, "wan_mode_write", json_object_new_boolean(1));
+    json_object_object_add(data, "wan_policy_write", json_object_new_boolean(1));
+    json_object_object_add(data, "wan_load_balance_write", json_object_new_boolean(1));
+    json_object_object_add(data, "wan_mode_apply", json_object_new_string("pending_route_sync"));
+    /* Other global fields are still refused; say so next to the writable one. */
+    json_object_object_add(data, "global_network_write_scope",
+                           json_object_new_string("wan_mode_only"));
+    {
+        struct json_object *modes = json_object_new_array();
+
+        json_object_array_add(modes, json_object_new_string("failover"));
+        json_object_array_add(modes, json_object_new_string("load_balance"));
+        json_object_object_add(data, "wan_mode_values", modes);
+    }
     json_object_object_add(data, "pppoe_secret_write_only", json_object_new_boolean(1));
     json_object_object_add(data, "pppoe_keep_password", json_object_new_boolean(1));
 
@@ -19458,6 +19636,28 @@ static void nc_adv_route_db_init(void)
     nc_exec("CREATE TABLE IF NOT EXISTS policy_route_hit_sample (id INTEGER PRIMARY KEY AUTOINCREMENT,ts INTEGER NOT NULL,rule_id TEXT NOT NULL,client TEXT NOT NULL DEFAULT '',source TEXT NOT NULL DEFAULT '',destination TEXT NOT NULL DEFAULT '',app TEXT NOT NULL DEFAULT '',route_table TEXT NOT NULL DEFAULT '',action TEXT NOT NULL DEFAULT '',reason TEXT NOT NULL DEFAULT '',bytes INTEGER NOT NULL DEFAULT 0)");
     nc_exec("CREATE VIEW IF NOT EXISTS policy_table_index AS SELECT id, enabled, 'static' AS policy_type, '静态路由' AS type_label, name, destination || ' · ' || interface AS scope, gateway || ' · ' || route_table AS target, '高级路由' AS owner, comment, updated_at FROM static_route UNION ALL SELECT id, enabled, 'pbr' AS policy_type, '策略路由' AS type_label, name, source_object || ' -> ' || dest_object AS scope, action || ' · ' || target AS target, '高级路由' AS owner, comment, updated_at FROM policy_route_rule UNION ALL SELECT id, enabled, 'cross' AS policy_type, '跨三层服务' AS type_label, name, server_ip || ' · ' || scope AS scope, service_type || ' · ' || listen_port AS target, '高级路由' AS owner, remark AS comment, updated_at FROM cross_l3_service");
     nc_exec("INSERT OR IGNORE INTO advanced_routing_global(id) VALUES(1)");
+    /*
+     * PBR source dimension beyond "a group of IPs".
+     *
+     * The table shipped with source_object only, which is a route_object
+     * reference, so the source side could never say "everything arriving on
+     * lan2". These three columns add that without touching source_object, so
+     * existing rows keep their meaning and keep being read by the old path:
+     *
+     *   source_kind  object (default, = legacy source_object) | interface |
+     *                zone | network
+     *   source_ref   the interface name, zone name or network name that
+     *                source_kind selects. Ignored when source_kind=object.
+     *   pin_wan      1 = this rule pins its flows to its own target and must
+     *                not be re-spread by multi-WAN load balancing. See
+     *                nc_adv_generate_runtime() for how that is enforced.
+     */
+    nc_add_column_if_missing("policy_route_rule", "source_kind",
+                             "TEXT NOT NULL DEFAULT 'object'");
+    nc_add_column_if_missing("policy_route_rule", "source_ref",
+                             "TEXT NOT NULL DEFAULT ''");
+    nc_add_column_if_missing("policy_route_rule", "pin_wan",
+                             "INTEGER NOT NULL DEFAULT 0");
 }
 
 static int nc_adv_id_ok(const char *s){return nc_valid_name(s);}
@@ -19539,6 +19739,134 @@ static int nc_adv_table_ref_ok(const char *table)
 static int nc_adv_object_value_ok(const char *value)
 {
     return nc_adv_ip_cidr_ok(value, AF_INET, 0);
+}
+
+static int nc_adv_source_kind_ok(const char *kind)
+{
+    return kind && (!strcmp(kind, "object") || !strcmp(kind, "interface") ||
+                    !strcmp(kind, "zone") || !strcmp(kind, "network"));
+}
+
+/*
+ * Resolve a PBR source into the list of inbound devices it matches.
+ *
+ * interface: taken as a device name directly (br-lan2), or as a network name
+ *            whose device is looked up, because the UI shows users network
+ *            names while nft needs the device.
+ * network:   network name -> lan.device.
+ * zone:      firewall_zone.networks is a CSV of network names; each is resolved
+ *            to its device. One zone can therefore yield several devices.
+ *
+ * Returns the number of devices written, or -1 on error. A return of 0 means
+ * the source named nothing that exists, which callers must treat as a failure
+ * rather than as "matches everything" -- an unresolved source that silently
+ * became a match-all rule would route traffic the operator never asked for.
+ */
+static int nc_adv_network_device(const char *network, char *out, size_t out_len)
+{
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+
+    if (!network || !network[0] || !out || !out_len)
+        return -1;
+    out[0] = '\0';
+    if (nc_prepare(&st,
+        "SELECT device FROM lan WHERE (id=?1 OR name=?1) AND enabled=1") != 0)
+        return -1;
+    if (sqlite3_bind_text(st, 1, network, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *dev = (const char *)sqlite3_column_text(st, 0);
+        if (dev && dev[0]) {
+            snprintf(out, out_len, "%s", dev);
+            found = 1;
+        }
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+#define NC_ADV_MAX_SRC_DEVS 8
+
+static int nc_adv_resolve_source_devices(const char *kind, const char *ref,
+                                         char devs[][32], int max_devs)
+{
+    int count = 0;
+
+    if (!kind || !ref || !ref[0] || !devs || max_devs <= 0)
+        return -1;
+
+    if (!strcmp(kind, "interface")) {
+        char dev[32] = "";
+
+        /* A device name is accepted as-is; otherwise treat it as a network. */
+        if (nc_physical_port_ifname_strict_ok(ref) &&
+            if_nametoindex(ref) > 0) {
+            snprintf(devs[count++], 32, "%s", ref);
+            return count;
+        }
+        if (nc_adv_network_device(ref, dev, sizeof(dev)) == 1 &&
+            nc_physical_port_ifname_strict_ok(dev)) {
+            snprintf(devs[count++], 32, "%s", dev);
+            return count;
+        }
+        return 0;
+    }
+
+    if (!strcmp(kind, "network")) {
+        char dev[32] = "";
+
+        if (nc_adv_network_device(ref, dev, sizeof(dev)) == 1 &&
+            nc_physical_port_ifname_strict_ok(dev)) {
+            snprintf(devs[count++], 32, "%s", dev);
+            return count;
+        }
+        return 0;
+    }
+
+    if (!strcmp(kind, "zone")) {
+        sqlite3_stmt *st = NULL;
+        char networks[512] = "";
+        char *save = NULL;
+        char *tok;
+
+        if (nc_prepare(&st,
+            "SELECT networks FROM firewall_zone WHERE (id=?1 OR name=?1) "
+            "AND enabled=1") != 0)
+            return -1;
+        if (sqlite3_bind_text(st, 1, ref, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *csv = (const char *)sqlite3_column_text(st, 0);
+            if (csv)
+                snprintf(networks, sizeof(networks), "%s", csv);
+        }
+        sqlite3_finalize(st);
+        if (!networks[0])
+            return 0;
+        for (tok = strtok_r(networks, ", \t", &save); tok && count < max_devs;
+             tok = strtok_r(NULL, ", \t", &save)) {
+            char dev[32] = "";
+            int i;
+            int dup = 0;
+
+            if (nc_adv_network_device(tok, dev, sizeof(dev)) != 1 ||
+                !nc_physical_port_ifname_strict_ok(dev))
+                continue;
+            for (i = 0; i < count; i++)
+                if (!strcmp(devs[i], dev))
+                    dup = 1;
+            if (!dup)
+                snprintf(devs[count++], 32, "%s", dev);
+        }
+        return count;
+    }
+
+    return -1;
 }
 
 static int nc_adv_validate_array(struct json_object *arr)
@@ -19660,12 +19988,17 @@ static int nc_adv_validate_config(struct json_object *cfg, int require_runtime_i
             const char *action = nc_json_str_def(o, "action", "route_table");
             const char *source = nc_json_str_def(o, "source_object", "");
             const char *destination = nc_json_str_def(o, "dest_object", "");
+            const char *source_kind = nc_json_str_def(o, "source_kind", "object");
+            const char *source_ref = nc_json_str_def(o, "source_ref", "");
             const char *table = nc_json_str_def(o, "table",
                 nc_json_str_def(o, "route_table", nc_json_str_def(o, "target", "")));
             int priority = nc_json_int_def(o, "priority", 1000 + i);
 
             if (!nc_adv_id_ok(id) || (source[0] && !nc_adv_id_ok(source)) ||
                 (destination[0] && !nc_adv_id_ok(destination)) ||
+                !nc_adv_source_kind_ok(source_kind) ||
+                (strcmp(source_kind, "object") &&
+                 (!source_ref[0] || !nc_adv_id_ok(source_ref))) ||
                 !nc_adv_proto_ok(proto) ||
                 !nc_fw_port_expr_ok(ports) || strcmp(action, "route_table") ||
                 !nc_adv_table_ref_ok(table) || !strcmp(table, "local") ||
@@ -19694,7 +20027,7 @@ static void nc_adv_add_objects_json(struct json_object *arr)
 static void nc_adv_add_cross_json(struct json_object *arr)
 {sqlite3_stmt*st=NULL;if(nc_prepare(&st,"SELECT id,enabled,name,service_type,server_ip,scope,listen_port,version,access_rate,remark,updated_at FROM cross_l3_service ORDER BY name")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();nc_add_text(o,"id",st,0);json_object_object_add(o,"enabled",json_object_new_boolean(sqlite3_column_int(st,1)));nc_add_text(o,"name",st,2);nc_add_text(o,"service_type",st,3);nc_add_text(o,"server_ip",st,4);nc_add_text(o,"scope",st,5);nc_add_text(o,"listen_port",st,6);nc_add_text(o,"version",st,7);nc_add_text(o,"access_rate",st,8);nc_add_text(o,"remark",st,9);json_object_object_add(o,"updated_at",json_object_new_int64(sqlite3_column_int64(st,10)));json_object_array_add(arr,o);}sqlite3_finalize(st);}}
 static void nc_adv_add_rules_json(struct json_object *arr)
-{sqlite3_stmt*st=NULL;if(nc_prepare(&st,"SELECT id,enabled,priority,name,source_object,dest_object,proto,ports,action,target,route_table,schedule,sticky,comment,hit_count,last_hit,updated_at FROM policy_route_rule ORDER BY priority,id")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();nc_add_text(o,"id",st,0);json_object_object_add(o,"enabled",json_object_new_boolean(sqlite3_column_int(st,1)));json_object_object_add(o,"priority",json_object_new_int(sqlite3_column_int(st,2)));nc_add_text(o,"name",st,3);nc_add_text(o,"source_object",st,4);nc_add_text(o,"dest_object",st,5);nc_add_text(o,"proto",st,6);nc_add_text(o,"ports",st,7);nc_add_text(o,"action",st,8);nc_add_text(o,"target",st,9);nc_add_text(o,"table",st,10);nc_add_text(o,"schedule",st,11);json_object_object_add(o,"sticky",json_object_new_boolean(sqlite3_column_int(st,12)));nc_add_text(o,"comment",st,13);json_object_object_add(o,"hit_count",json_object_new_int64(sqlite3_column_int64(st,14)));json_object_object_add(o,"last_hit",json_object_new_int64(sqlite3_column_int64(st,15)));json_object_object_add(o,"updated_at",json_object_new_int64(sqlite3_column_int64(st,16)));json_object_array_add(arr,o);}sqlite3_finalize(st);}}
+{sqlite3_stmt*st=NULL;if(nc_prepare(&st,"SELECT id,enabled,priority,name,source_object,dest_object,proto,ports,action,target,route_table,schedule,sticky,comment,hit_count,last_hit,updated_at,source_kind,source_ref,pin_wan FROM policy_route_rule ORDER BY priority,id")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();nc_add_text(o,"id",st,0);json_object_object_add(o,"enabled",json_object_new_boolean(sqlite3_column_int(st,1)));json_object_object_add(o,"priority",json_object_new_int(sqlite3_column_int(st,2)));nc_add_text(o,"name",st,3);nc_add_text(o,"source_object",st,4);nc_add_text(o,"dest_object",st,5);nc_add_text(o,"proto",st,6);nc_add_text(o,"ports",st,7);nc_add_text(o,"action",st,8);nc_add_text(o,"target",st,9);nc_add_text(o,"table",st,10);nc_add_text(o,"schedule",st,11);json_object_object_add(o,"sticky",json_object_new_boolean(sqlite3_column_int(st,12)));nc_add_text(o,"comment",st,13);json_object_object_add(o,"hit_count",json_object_new_int64(sqlite3_column_int64(st,14)));json_object_object_add(o,"last_hit",json_object_new_int64(sqlite3_column_int64(st,15)));json_object_object_add(o,"updated_at",json_object_new_int64(sqlite3_column_int64(st,16)));nc_add_text(o,"source_kind",st,17);nc_add_text(o,"source_ref",st,18);json_object_object_add(o,"pin_wan",json_object_new_boolean(sqlite3_column_int(st,19)));json_object_array_add(arr,o);}sqlite3_finalize(st);}}
 static void nc_adv_add_hits_json(struct json_object *arr)
 {sqlite3_stmt*st=NULL;if(nc_prepare(&st,"SELECT h.id,h.ts,COALESCE(r.name,h.rule_id),h.client,h.source,h.destination,h.app,h.route_table,h.action,h.reason,h.bytes FROM policy_route_hit_sample h LEFT JOIN policy_route_rule r ON r.id=h.rule_id ORDER BY h.ts DESC LIMIT 200")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();char id[64];snprintf(id,sizeof(id),"hit-%d",sqlite3_column_int(st,0));json_object_object_add(o,"id",json_object_new_string(id));json_object_object_add(o,"ts",json_object_new_int64(sqlite3_column_int64(st,1)));nc_add_text(o,"rule",st,2);nc_add_text(o,"client",st,3);nc_add_text(o,"source",st,4);nc_add_text(o,"destination",st,5);nc_add_text(o,"app",st,6);nc_add_text(o,"table",st,7);nc_add_text(o,"action",st,8);nc_add_text(o,"reason",st,9);json_object_object_add(o,"bytes",json_object_new_int64(sqlite3_column_int64(st,10)));json_object_array_add(arr,o);}sqlite3_finalize(st);}}
 
@@ -19823,14 +20156,17 @@ static int nc_adv_set_rules(struct json_object *arr)
         sqlite3_stmt *st = NULL;
         const char *id = nc_json_str_def(o,"id","");
         int rc;
-        if (nc_prepare(&st,"INSERT OR REPLACE INTO policy_route_rule(id,enabled,priority,name,source_object,dest_object,proto,ports,action,target,route_table,schedule,sticky,comment,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)") != 0) return -1;
+        if (nc_prepare(&st,"INSERT OR REPLACE INTO policy_route_rule(id,enabled,priority,name,source_object,dest_object,proto,ports,action,target,route_table,schedule,sticky,comment,updated_at,source_kind,source_ref,pin_wan) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)") != 0) return -1;
         rc = nc_fw_bind_text(st,1,id) || nc_fw_bind_int(st,2,nc_json_bool_def(o,"enabled",1)) || nc_fw_bind_int(st,3,nc_json_int_def(o,"priority",1000+i)) ||
              nc_fw_bind_text(st,4,nc_json_str_def(o,"name",id)) || nc_fw_bind_text(st,5,nc_json_str_def(o,"source_object","")) ||
              nc_fw_bind_text(st,6,nc_json_str_def(o,"dest_object","")) || nc_fw_bind_text(st,7,nc_json_str_def(o,"proto","all")) ||
              nc_fw_bind_text(st,8,nc_json_str_def(o,"ports","any")) || nc_fw_bind_text(st,9,nc_json_str_def(o,"action","route_table")) ||
              nc_fw_bind_text(st,10,nc_json_str_def(o,"target","")) || nc_fw_bind_text(st,11,nc_json_str_def(o,"table",nc_json_str_def(o,"route_table",""))) ||
              nc_fw_bind_text(st,12,nc_json_str_def(o,"schedule","always")) || nc_fw_bind_int(st,13,nc_json_bool_def(o,"sticky",1)) ||
-             nc_fw_bind_text(st,14,nc_json_str_def(o,"comment","")) || nc_fw_bind_int64(st,15,nc_now_s());
+             nc_fw_bind_text(st,14,nc_json_str_def(o,"comment","")) || nc_fw_bind_int64(st,15,nc_now_s()) ||
+             nc_fw_bind_text(st,16,nc_json_str_def(o,"source_kind","object")) ||
+             nc_fw_bind_text(st,17,nc_json_str_def(o,"source_ref","")) ||
+             nc_fw_bind_int(st,18,nc_json_bool_def(o,"pin_wan",0));
         if (nc_adv_statement_done(st, rc ? -1 : 0) != 0) return -1;
     }
     return 0;
@@ -20068,7 +20404,10 @@ static int nc_adv_generate_runtime(FILE *script_path, FILE *nft_fp)
     if (step_rc != SQLITE_DONE || sqlite3_finalize(st) != SQLITE_OK)
         return -1;
     st = NULL;
-    fprintf(script_path, "for p in $(seq 10000 19999); do ip rule del pref $p 2>/dev/null || true; ip -6 rule del pref $p 2>/dev/null || true; done\n");
+    /* Clear both bands this generator owns: 9000-9899 holds the pinned
+     * iif rules, 10000-19999 the fwmark rules. Missing the pin band would
+     * leave a stale pin behind on every re-apply. */
+    fprintf(script_path, "for p in $(seq 9000 9899) $(seq 10000 19999); do ip rule del pref $p 2>/dev/null || true; ip -6 rule del pref $p 2>/dev/null || true; done\n");
 
     if(nc_prepare(&st,"SELECT family,destination,gateway,interface,route_table,metric,mtu,route_type FROM static_route WHERE enabled=1 ORDER BY metric,id")!=0)
         return -1;
@@ -20105,13 +20444,38 @@ static int nc_adv_generate_runtime(FILE *script_path, FILE *nft_fp)
         return -1;
     st = NULL;
 
-    if(nc_prepare(&st,"SELECT id,priority,source_object,dest_object,proto,ports,action,target,route_table FROM policy_route_rule WHERE enabled=1 ORDER BY priority,id")!=0)
+    if(nc_prepare(&st,"SELECT id,priority,source_object,dest_object,proto,ports,action,target,route_table,source_kind,source_ref,pin_wan FROM policy_route_rule WHERE enabled=1 ORDER BY priority,id")!=0)
         return -1;
     while((step_rc=sqlite3_step(st))==SQLITE_ROW){
             const char *id=(const char*)sqlite3_column_text(st,0), *src=(const char*)sqlite3_column_text(st,2), *dst=(const char*)sqlite3_column_text(st,3), *proto=(const char*)sqlite3_column_text(st,4), *ports=(const char*)sqlite3_column_text(st,5), *action=(const char*)sqlite3_column_text(st,6), *target=(const char*)sqlite3_column_text(st,7), *rt=(const char*)sqlite3_column_text(st,8);
+            const char *src_kind=(const char*)sqlite3_column_text(st,9);
+            const char *src_ref=(const char*)sqlite3_column_text(st,10);
+            int pin_wan=sqlite3_column_int(st,11);
+            char src_devs[NC_ADV_MAX_SRC_DEVS][32];
+            int src_dev_count = 0;
             int tid = 0;
             int src_count, dst_count;
             int prio=sqlite3_column_int(st,1); const char *table=(rt&&rt[0])?rt:target; unsigned mark=nc_adv_rule_mark(id,prio);
+
+            if (!src_kind || !src_kind[0])
+                src_kind = "object";
+            if (!nc_adv_source_kind_ok(src_kind)) {
+                sqlite3_finalize(st);
+                return -1;
+            }
+            if (strcmp(src_kind, "object")) {
+                /* An interface/zone/network source must resolve to at least one
+                 * real device. Emitting a rule with no iifname would match every
+                 * inbound interface, which is the opposite of what the operator
+                 * asked for, so an unresolved source fails the whole publish. */
+                src_dev_count = nc_adv_resolve_source_devices(
+                    src_kind, src_ref ? src_ref : "", src_devs,
+                    NC_ADV_MAX_SRC_DEVS);
+                if (src_dev_count <= 0) {
+                    sqlite3_finalize(st);
+                    return -1;
+                }
+            }
             if (!nc_adv_id_ok(id) || prio < 0 || prio > 1000000 ||
                 !nc_adv_proto_ok(proto) || !nc_fw_port_expr_ok(ports) ||
                 !action || strcmp(action, "route_table") ||
@@ -20120,10 +20484,21 @@ static int nc_adv_generate_runtime(FILE *script_path, FILE *nft_fp)
                 return -1;
             }
             int has=0; fprintf(nft_fp,"\t\t");
-            src_count = nc_adv_emit_obj_nft(nft_fp,src,"saddr",&has);
+            if (src_dev_count > 0) {
+                /* iifname carries the source dimension for interface/zone rules;
+                 * source_object is not consulted for those. */
+                fprintf(nft_fp," iifname { ");
+                for (int d = 0; d < src_dev_count; d++)
+                    fprintf(nft_fp, "%s\"%s\"", d ? ", " : "", src_devs[d]);
+                fprintf(nft_fp," }");
+                has = 1;
+                src_count = src_dev_count;
+            } else {
+                src_count = nc_adv_emit_obj_nft(nft_fp,src,"saddr",&has);
+            }
             dst_count = nc_adv_emit_obj_nft(nft_fp,dst,"daddr",&has);
             if (src_count < 0 || dst_count < 0 ||
-                (src && src[0] && src_count == 0) ||
+                (src_dev_count == 0 && src && src[0] && src_count == 0) ||
                 (dst && dst[0] && dst_count == 0)) {
                 sqlite3_finalize(st);
                 return -1;
@@ -20133,6 +20508,34 @@ static int nc_adv_generate_runtime(FILE *script_path, FILE *nft_fp)
             fprintf(nft_fp," meta mark set 0x%04x ct mark set 0x%04x comment \"dwrt-pbr:%s\"\n",mark,mark,id?id:"rule");
             fprintf(script_path,"ip rule add pref %d fwmark 0x%04x/0xffff table %d\n",10000+(prio%9000),mark,tid);
             fprintf(script_path,"ip -6 rule add pref %d fwmark 0x%04x/0xffff table %d\n",10000+(prio%9000),mark,tid);
+            /*
+             * "Pin this interface to this WAN, keep it out of load balancing."
+             *
+             * A fwmark rule alone cannot express that. The jmx kernel hook runs
+             * at NF_IP_PRI_MANGLE+1, i.e. after this nft chain at mangle
+             * priority, and jmx_route_maybe_bind() overwrites skb->mark with the
+             * WAN its own selector picked. A mark set here is therefore not
+             * guaranteed to survive to the route lookup.
+             *
+             * An `ip rule iif <dev>` entry does survive: it is evaluated on the
+             * device the packet arrived on, which no mark rewrite can change. It
+             * is installed at a lower pref than the fwmark rules above so it wins
+             * for this interface, which is exactly the "does not participate"
+             * semantic. Only whole-interface sources can be pinned this way --
+             * an IP-group rule has no inbound device to key on.
+             */
+            if (pin_wan && src_dev_count > 0) {
+                for (int d = 0; d < src_dev_count; d++) {
+                    fprintf(script_path,"ip rule add pref %d iif ",
+                            9000+(prio%900));
+                    nc_shquote(script_path, src_devs[d]);
+                    fprintf(script_path," table %d\n",tid);
+                    fprintf(script_path,"ip -6 rule add pref %d iif ",
+                            9000+(prio%900));
+                    nc_shquote(script_path, src_devs[d]);
+                    fprintf(script_path," table %d\n",tid);
+                }
+            }
     }
     if (step_rc != SQLITE_DONE || sqlite3_finalize(st) != SQLITE_OK)
         return -1;
@@ -21651,6 +22054,28 @@ struct json_object *jmx_custom_config_status(void)
 #define NC_AEGIS_APPFILTER_MAX_RULES 64
 #define NC_AEGIS_APPFILTER_MAX_APP_IDS 1024
 
+/*
+ * Number of MAC values that already have more than one ACL rule.
+ *
+ * Used to decide whether the uniqueness index can be created. Returns a
+ * negative value when the question cannot be answered, which is treated as
+ * "assume duplicates" so the migration never fails hard.
+ */
+static int nc_netctl_mac_duplicate_groups(void)
+{
+    sqlite3_stmt *st = NULL;
+    int groups = -1;
+
+    if (nc_prepare(&st,
+            "SELECT COUNT(*) FROM (SELECT mac FROM network_control_mac_rule "
+            "GROUP BY mac HAVING COUNT(*) > 1)") != 0)
+        return -1;
+    if (sqlite3_step(st) == SQLITE_ROW)
+        groups = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return groups;
+}
+
 static void nc_netctl_db_init(void)
 {
     nc_exec("CREATE TABLE IF NOT EXISTS network_control_global (id INTEGER PRIMARY KEY CHECK (id = 1),enabled INTEGER NOT NULL DEFAULT 1,mode TEXT NOT NULL DEFAULT 'balanced',default_action TEXT NOT NULL DEFAULT 'allow',schedule_default TEXT NOT NULL DEFAULT 'always',apply_state TEXT NOT NULL DEFAULT 'draft',last_apply_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0,appfilter_enabled INTEGER NOT NULL DEFAULT 1,macfilter_enabled INTEGER NOT NULL DEFAULT 1,record_enabled INTEGER NOT NULL DEFAULT 1,revision INTEGER NOT NULL DEFAULT 1)");
@@ -21674,8 +22099,33 @@ static void nc_netctl_db_init(void)
     nc_add_column_if_missing("network_control_global", "record_enabled", "INTEGER NOT NULL DEFAULT 1");
     nc_add_column_if_missing("network_control_global", "revision", "INTEGER NOT NULL DEFAULT 1");
     nc_add_column_if_missing("network_control_rule", "runtime_rule_id", "INTEGER NOT NULL DEFAULT 0");
+    /*
+     * expires: absolute unix time after which the rule stops taking effect.
+     * 0 means "never expires", which keeps every pre-existing row behaving
+     * exactly as before this column existed.
+     */
+    nc_add_column_if_missing("network_control_rule", "expires", "INTEGER NOT NULL DEFAULT 0");
     nc_add_column_if_missing("network_control_app_rule", "filter_quic", "INTEGER NOT NULL DEFAULT 0");
     nc_add_column_if_missing("network_control_tc_state", "clsact_owned", "INTEGER NOT NULL DEFAULT 0");
+    /*
+     * One rule per MAC, matching the upstream acl_mac_black.mac UNIQUE
+     * constraint. Until now duplicates were only prevented by the frontend, so
+     * an API client could create several rules for one MAC and all of them
+     * would render into nftables.
+     *
+     * Duplicates are checked first rather than letting CREATE UNIQUE INDEX
+     * fail: on a table that already holds duplicates the statement errors, and
+     * nc_exec() would log that as a migration failure on every startup even
+     * though nothing is wrong with the schema. A device in that state gets a
+     * plain index instead; the write path refuses new duplicates either way
+     * via nc_netctl_mac_conflict().
+     */
+    if (nc_netctl_mac_duplicate_groups() == 0)
+        nc_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_network_control_mac_rule_mac "
+                "ON network_control_mac_rule(mac)");
+    else
+        nc_exec("CREATE INDEX IF NOT EXISTS idx_network_control_mac_rule_mac_dup "
+                "ON network_control_mac_rule(mac)");
     nc_exec("INSERT OR IGNORE INTO network_control_global(id) VALUES(1)");
     nc_exec("INSERT OR IGNORE INTO network_control_other(id) VALUES(1)");
     nc_exec("INSERT OR IGNORE INTO network_control_status(id,warnings) VALUES(1,'phase1 persistence only; nft/tc/url runtime pending')");
@@ -26338,6 +26788,114 @@ static int nc_sys_safe_token(const char*s){if(!s||!*s)return 0;for(const char*p=
 static int nc_sys_hostname_ok(const char*s){if(!s||!*s||strlen(s)>63)return 0;for(const char*p=s;*p;p++)if(!(isalnum((unsigned char)*p)||*p=='-'))return 0;return 1;}
 static int nc_sys_disabled_code_ok(const char*s){if(!s||!*s||strlen(s)>64)return 0;for(const char*p=s;*p;p++)if(!(isupper((unsigned char)*p)||isdigit((unsigned char)*p)||*p=='_'))return 0;return 1;}
 static char *nc_sys_read_first_line(const char*path,char*out,size_t n){FILE*fp=fopen(path,"r");if(!fp){if(n)out[0]=0;return out;}if(!fgets(out,n,fp))out[0]=0;fclose(fp);out[strcspn(out,"\r\n")]=0;return out;}
+
+/*
+ * Firmware version for system/basic.
+ *
+ * This used to be nc_sys_read_first_line("/etc/openwrt_release"), which returns
+ * the file's first line. That line is `DISTRIB_ID='DreamingWrt'`, so the version
+ * shown on the settings page was a key=value pair rather than a version, and the
+ * same string fed flash.current_firmware.
+ *
+ * Preferred source is /etc/dreamingwrt-release.json, the same file
+ * jmx_system_add_release_contract() reads for system/status, so the two
+ * endpoints cannot disagree. /etc/openwrt_release is the fallback, and there we
+ * look the key up and strip the quotes instead of trusting line order.
+ *
+ * Returns 1 when a version was found, 0 when not. On 0 the caller must publish
+ * null rather than inventing a plausible-looking string: "DreamingWrt" reads as
+ * a real answer and hides the failure.
+ */
+/*
+ * Build timestamp from the release file, 0 when absent. `generated_at` is when
+ * the release was produced, which is what flash.build_time is asking for.
+ */
+static int64_t nc_sys_release_build_time(void)
+{
+    struct json_object *release = json_object_from_file("/etc/dreamingwrt-release.json");
+    struct json_object *v = NULL;
+    int64_t out = 0;
+
+    if (release && json_object_is_type(release, json_type_object) &&
+        json_object_object_get_ex(release, "generated_at", &v) && v &&
+        json_object_is_type(v, json_type_int))
+        out = json_object_get_int64(v);
+    if (release)
+        json_object_put(release);
+    return out > 0 ? out : 0;
+}
+
+static int nc_sys_release_version(char *out, size_t n, const char **source)
+{
+    struct json_object *release;
+    const char *keys[] = { "dreamingwrt_version", "linux_version" };
+    size_t i;
+
+    if (!out || n == 0)
+        return 0;
+    out[0] = 0;
+    if (source)
+        *source = "";
+
+    release = json_object_from_file("/etc/dreamingwrt-release.json");
+    if (release && json_object_is_type(release, json_type_object)) {
+        for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+            struct json_object *v = NULL;
+
+            if (json_object_object_get_ex(release, keys[i], &v) && v &&
+                json_object_is_type(v, json_type_string)) {
+                const char *s = json_object_get_string(v);
+
+                if (s && s[0]) {
+                    snprintf(out, n, "%s", s);
+                    if (source)
+                        *source = "/etc/dreamingwrt-release.json";
+                    break;
+                }
+            }
+        }
+    }
+    if (release)
+        json_object_put(release);
+    if (out[0])
+        return 1;
+
+    /* Fallback: DISTRIB_RELEASE='Linux7.2' -> Linux7.2 */
+    {
+        FILE *fp = fopen("/etc/openwrt_release", "r");
+        char line[256];
+
+        if (!fp)
+            return 0;
+        while (fgets(line, sizeof(line), fp)) {
+            char *eq;
+            char *val;
+            size_t len;
+
+            line[strcspn(line, "\r\n")] = 0;
+            if (strncmp(line, "DISTRIB_RELEASE", 15))
+                continue;
+            eq = strchr(line, '=');
+            if (!eq)
+                continue;
+            val = eq + 1;
+            len = strlen(val);
+            if (len >= 2 && (val[0] == '\'' || val[0] == '"') &&
+                val[len - 1] == val[0]) {
+                val[len - 1] = 0;
+                val++;
+            }
+            if (val[0]) {
+                snprintf(out, n, "%s", val);
+                if (source)
+                    *source = "/etc/openwrt_release";
+            }
+            break;
+        }
+        fclose(fp);
+    }
+    return out[0] ? 1 : 0;
+}
 static void nc_sys_cmd_first(const char*cmd,char*out,size_t n){FILE*fp=popen(cmd,"r");if(!fp){out[0]=0;return;}if(!fgets(out,n,fp))out[0]=0;pclose(fp);out[strcspn(out,"\r\n")]=0;}
 static void nc_sys_write_disabled_file(void);
 static void nc_sys_hwprobe_disabled(void)
@@ -28652,8 +29210,8 @@ int jmx_admin_password_set(struct json_object *req, struct json_object *out)
 
 struct json_object *jmx_system_settings_get(void)
 {
-    if(jmx_netconfig_db_init()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);nc_sys_settings_db_init();nc_sys_sync_disabled_from_file();char hostname[128]="",model[256]="",ver[256]="";nc_sys_read_first_line("/proc/sys/kernel/hostname",hostname,sizeof(hostname));nc_sys_read_first_line("/tmp/sysinfo/model",model,sizeof(model));nc_sys_read_first_line("/etc/openwrt_release",ver,sizeof(ver));struct json_object*d=json_object_new_object();json_object_object_add(d,"ts",json_object_new_int64(nc_now_s()));
-    sqlite3_stmt*st=NULL;struct json_object*g=json_object_new_object();if(nc_prepare(&st,"SELECT hostname,timezone,language,led_policy,update_channel,description,note,time_format,show_timezone_name,ntp_mode,ntp_interval,ntp_server_enabled,ntp_use_dhcp,log_level,kernel_log_level,log_buffer_kb,cron_log_level,remote_log_enabled,remote_log_host,remote_log_port,remote_log_protocol,log_file_path,table_filter,interface_density,number_format,last_time_sync_at FROM system_settings WHERE id=1")==0&&sqlite3_step(st)==SQLITE_ROW){const char*dbhost=(const char*)sqlite3_column_text(st,0);json_object_object_add(g,"hostname",json_object_new_string(dbhost&&dbhost[0]?dbhost:hostname));json_object_object_add(g,"model",json_object_new_string(model[0]?model:"DreamingWrt Router"));json_object_object_add(g,"version",json_object_new_string(ver[0]?ver:"DreamingWrt"));nc_add_text(g,"timezone",st,1);nc_add_text(g,"language",st,2);nc_add_text(g,"led_policy",st,3);json_object_object_add(g,"time_sync",json_object_new_boolean(1));struct json_object*ntp=json_object_new_array();sqlite3_stmt*ns=NULL;if(nc_prepare(&ns,"SELECT server FROM system_ntp_server WHERE enabled=1 ORDER BY priority,id")==0){while(sqlite3_step(ns)==SQLITE_ROW)json_object_array_add(ntp,json_object_new_string((const char*)sqlite3_column_text(ns,0)));sqlite3_finalize(ns);}if(json_object_array_length(ntp)==0){json_object_array_add(ntp,json_object_new_string("ntp.aliyun.com"));json_object_array_add(ntp,json_object_new_string("time.cloudflare.com"));}json_object_object_add(g,"ntp_servers",ntp);nc_add_text(g,"update_channel",st,4);nc_add_text(g,"description",st,5);nc_add_text(g,"note",st,6);nc_add_text(g,"time_format",st,7);json_object_object_add(g,"show_timezone_name",json_object_new_boolean(sqlite3_column_int(st,8)));nc_add_text(g,"ntp_mode",st,9);nc_add_text(g,"ntp_interval",st,10);json_object_object_add(g,"ntp_server_enabled",json_object_new_boolean(sqlite3_column_int(st,11)));json_object_object_add(g,"ntp_use_dhcp",json_object_new_boolean(sqlite3_column_int(st,12)));nc_add_text(g,"log_level",st,13);nc_add_text(g,"kernel_log_level",st,14);json_object_object_add(g,"log_buffer_kb",json_object_new_int(sqlite3_column_int(st,15)));nc_add_text(g,"cron_log_level",st,16);json_object_object_add(g,"remote_log_enabled",json_object_new_boolean(sqlite3_column_int(st,17)));nc_add_text(g,"remote_log_host",st,18);json_object_object_add(g,"remote_log_port",json_object_new_int(sqlite3_column_int(st,19)));nc_add_text(g,"remote_log_protocol",st,20);nc_add_text(g,"log_file_path",st,21);json_object_object_add(g,"table_filter",json_object_new_boolean(sqlite3_column_int(st,22)));nc_add_text(g,"interface_density",st,23);nc_add_text(g,"number_format",st,24);json_object_object_add(g,"last_time_sync_at",json_object_new_int64(sqlite3_column_int64(st,25)));sqlite3_finalize(st);}
+    if(jmx_netconfig_db_init()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL);nc_sys_settings_db_init();nc_sys_sync_disabled_from_file();char hostname[128]="",model[256]="",ver[256]="";const char*ver_source="";nc_sys_read_first_line("/proc/sys/kernel/hostname",hostname,sizeof(hostname));nc_sys_read_first_line("/tmp/sysinfo/model",model,sizeof(model));nc_sys_release_version(ver,sizeof(ver),&ver_source);struct json_object*d=json_object_new_object();json_object_object_add(d,"ts",json_object_new_int64(nc_now_s()));
+    sqlite3_stmt*st=NULL;struct json_object*g=json_object_new_object();if(nc_prepare(&st,"SELECT hostname,timezone,language,led_policy,update_channel,description,note,time_format,show_timezone_name,ntp_mode,ntp_interval,ntp_server_enabled,ntp_use_dhcp,log_level,kernel_log_level,log_buffer_kb,cron_log_level,remote_log_enabled,remote_log_host,remote_log_port,remote_log_protocol,log_file_path,table_filter,interface_density,number_format,last_time_sync_at FROM system_settings WHERE id=1")==0&&sqlite3_step(st)==SQLITE_ROW){const char*dbhost=(const char*)sqlite3_column_text(st,0);json_object_object_add(g,"hostname",json_object_new_string(dbhost&&dbhost[0]?dbhost:hostname));json_object_object_add(g,"model",json_object_new_string(model[0]?model:"DreamingWrt Router"));json_object_object_add(g,"version",ver[0]?json_object_new_string(ver):NULL);json_object_object_add(g,"version_source",ver_source[0]?json_object_new_string(ver_source):NULL);json_object_object_add(g,"version_error",ver[0]?NULL:json_object_new_string("release_version_unavailable"));nc_add_text(g,"timezone",st,1);nc_add_text(g,"language",st,2);nc_add_text(g,"led_policy",st,3);json_object_object_add(g,"time_sync",json_object_new_boolean(1));struct json_object*ntp=json_object_new_array();sqlite3_stmt*ns=NULL;if(nc_prepare(&ns,"SELECT server FROM system_ntp_server WHERE enabled=1 ORDER BY priority,id")==0){while(sqlite3_step(ns)==SQLITE_ROW)json_object_array_add(ntp,json_object_new_string((const char*)sqlite3_column_text(ns,0)));sqlite3_finalize(ns);}if(json_object_array_length(ntp)==0){json_object_array_add(ntp,json_object_new_string("ntp.aliyun.com"));json_object_array_add(ntp,json_object_new_string("time.cloudflare.com"));}json_object_object_add(g,"ntp_servers",ntp);nc_add_text(g,"update_channel",st,4);nc_add_text(g,"description",st,5);nc_add_text(g,"note",st,6);nc_add_text(g,"time_format",st,7);json_object_object_add(g,"show_timezone_name",json_object_new_boolean(sqlite3_column_int(st,8)));nc_add_text(g,"ntp_mode",st,9);nc_add_text(g,"ntp_interval",st,10);json_object_object_add(g,"ntp_server_enabled",json_object_new_boolean(sqlite3_column_int(st,11)));json_object_object_add(g,"ntp_use_dhcp",json_object_new_boolean(sqlite3_column_int(st,12)));nc_add_text(g,"log_level",st,13);nc_add_text(g,"kernel_log_level",st,14);json_object_object_add(g,"log_buffer_kb",json_object_new_int(sqlite3_column_int(st,15)));nc_add_text(g,"cron_log_level",st,16);json_object_object_add(g,"remote_log_enabled",json_object_new_boolean(sqlite3_column_int(st,17)));nc_add_text(g,"remote_log_host",st,18);json_object_object_add(g,"remote_log_port",json_object_new_int(sqlite3_column_int(st,19)));nc_add_text(g,"remote_log_protocol",st,20);nc_add_text(g,"log_file_path",st,21);json_object_object_add(g,"table_filter",json_object_new_boolean(sqlite3_column_int(st,22)));nc_add_text(g,"interface_density",st,23);nc_add_text(g,"number_format",st,24);json_object_object_add(g,"last_time_sync_at",json_object_new_int64(sqlite3_column_int64(st,25)));sqlite3_finalize(st);}
     nc_json_add_string_default(g,"hostname",hostname[0]?hostname:"DreamingWrt");
     {
         sqlite3_stmt *apply_st = NULL;
@@ -28943,7 +29501,7 @@ struct json_object *jmx_system_settings_get(void)
     json_object_object_add(cap,"mounts_generate_config",json_object_new_boolean(mounts_gen));
     json_object_object_add(cap,"flash_read",json_object_new_boolean(1));
     json_object_object_add(cap,"flash_factory_reset",json_object_new_boolean(0));
-    struct json_object*flash=json_object_new_object();json_object_object_add(flash,"current_firmware",json_object_new_string(ver[0]?ver:"DreamingWrt"));json_object_object_add(flash,"build_time",json_object_new_string(""));json_object_object_add(flash,"backup_size",json_object_new_string(""));json_object_object_add(flash,"keep_settings",json_object_new_boolean(1));json_object_object_add(flash,"last_backup_at",json_object_new_int64(0));json_object_object_add(flash,"auto_backup",json_object_new_boolean(1));json_object_object_add(d,"flash",flash);
+    struct json_object*flash=json_object_new_object();json_object_object_add(flash,"current_firmware",ver[0]?json_object_new_string(ver):NULL);{int64_t bt=nc_sys_release_build_time();json_object_object_add(flash,"build_time",bt?json_object_new_int64(bt):NULL);}json_object_object_add(flash,"backup_size",NULL);json_object_object_add(flash,"keep_settings",json_object_new_boolean(1));json_object_object_add(flash,"last_backup_at",NULL);json_object_object_add(flash,"auto_backup",NULL);json_object_object_add(flash,"backup_state_source",json_object_new_string("webd_backup_store"));json_object_object_add(d,"flash",flash);
     {
         char kern[256]="";
         nc_sys_read_first_line("/proc/version",kern,sizeof(kern));

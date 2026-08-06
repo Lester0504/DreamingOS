@@ -4310,6 +4310,30 @@ static void route_rule_from_json(struct json_object *rule,
                 out->wan_count < JMX_ROUTE_MAX_WAN_IFACES; i++)
         out->wan_ids[out->wan_count++] = (uint8_t)json_object_get_int(
             json_object_array_get_idx(wan_ids, i));
+
+    /*
+     * Global WAN mode override for the default multi-WAN rule.
+     *
+     * The kernel already implements both semantics per rule: PRIMARY_BACKUP
+     * always takes the first healthy WAN (failover), while the weighted
+     * selectors spread new flows across every healthy WAN (load balance). What
+     * was missing was anything driving that choice from user configuration --
+     * network_global.wan_mode now does.
+     *
+     * Scope is deliberately narrow: only the default rule, meaning carrier_id 0
+     * (no operator steering) spanning more than one WAN, and only when the rule
+     * did not state an algorithm of its own. An explicit policy rule carries a
+     * deliberate algorithm, and a global toggle must not silently rewrite the
+     * operator's per-rule steering.
+     */
+    if (out->carrier_id == 0 && out->wan_count > 1 &&
+        !json_has_key(rule, "algorithm") && !json_has_key(rule, "sticky_mode")) {
+        char wan_mode[32];
+
+        if (jmx_netconfig_wan_mode_get(wan_mode, sizeof(wan_mode)) == 0 &&
+            !strcmp(wan_mode, "failover"))
+            out->sticky_mode = JMX_STICKY_PRIMARY_BACKUP;
+    }
 }
 
 static int jmx_route_sync_json(struct json_object *config)

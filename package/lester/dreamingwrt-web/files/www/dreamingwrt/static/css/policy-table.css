@@ -106,6 +106,21 @@
   min-width: 0;
 }
 
+/*
+ * 搜索 / 筛选 / 创建已从页面级 `<header>` 收进表格工具栏（design.md 规则 15）。
+ * kit 的 `.dwrt-kit-table-toolbar` 是 flex + space-between，计数徽标在左，
+ * 这块靠 `margin-left: auto` 贴右，窄屏允许换行而不是把工具栏顶宽。
+ */
+.policy-table-actions {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
+}
+
 .policy-toolbar-actions {
   display: flex;
   align-items: center;
@@ -302,7 +317,14 @@
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  /*
+   * 三行：工具栏 / 滚动区 / 页脚。
+   * 行定义必须与子元素个数一致。工具栏收进卡片后卡片有了三个子节点，而这里还写着
+   * 两行，于是工具栏和滚动区一起被塞进第一行：实测两者都从 y=18 起、表头「目标域」
+   * 「目标」透在「筛选」「创建新策略」背后。与 F-75 存储概览「卡片内容没了只剩框架」
+   * 是同一类缺陷 —— grid 行数与模板子节点数脱节。
+   */
+  grid-template-rows: auto minmax(0, 1fr) auto;
   border-radius: var(--app-radius-card);
   align-self: stretch;
 }
@@ -352,9 +374,30 @@
 }
 
 .policy-table-card .dwrt-kit-table {
-  width: max(100%, 1240px);
-  min-width: 1240px;
+  /*
+   * 表宽必须等于列宽总和，否则 fixed 布局会忽略各列声明、改成平分（那正是名称列
+   * 曾被推离左缘约 300px 的原因）。这个总和**不能写死**：展开列只在存在可展开行时
+   * 才渲染，列集合是动态的，写死 1406px 在展开列缺席时就又出现「表宽 ≠ 列宽和」
+   * 的矛盾。改由模块在渲染 colgroup 时算出真实总和，写进 --policy-table-min-width。
+   * 兜底 1360px = 1406 - 46（即不含展开列的总和）。
+   */
+  width: max(100%, var(--policy-table-min-width, 1360px));
+  min-width: var(--policy-table-min-width, 1360px);
   table-layout: fixed;
+}
+
+/*
+ * 工具栏必须自己建立层叠上下文并压过粘性表头。
+ * 表头是 `position: sticky; z-index: 2`，而工具栏原先是 `position: static` ——
+ * 没有 z-index 参与排序，于是表头绘制在它之上。工具栏还在页面级 <header> 里时两者
+ * 不相干，收进卡片后就重叠了：实测「创建新策略」按钮在 (1338,42)，
+ * elementFromPoint 命中的却是 <th 目标>，Playwright 报
+ * "<th data-adaptive-region="dark">目标</th> ... intercepts pointer events"，
+ * 按钮完全点不动。表格横向滚动时表头会滑到工具栏下方，所以这不只是初始态的问题。
+ */
+.policy-table-card .dwrt-kit-table-toolbar {
+  position: relative;
+  z-index: 3;
 }
 
 .policy-table-card .dwrt-kit-ikuai-table thead th {
@@ -390,9 +433,13 @@
 }
 
 .policy-col-expand {
-  width: 46px;
   text-align: center;
 }
+
+/* The expand cell only ever holds a 24px button, so it is centred and never given a
+   width here: the <colgroup> owns column widths now. A `width` on the td was the old
+   attempt and it could not work, because table-layout: fixed reads the first row
+   only. */
 
 .policy-expand {
   width: 24px;
@@ -683,11 +730,13 @@
 
 .policy-side-panel {
   --dwrt-kit-sheet-z: 70;
-  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form);
+  /* 与 AI 抽屉一致的标准档（460px）。用户 2026-08-05 明确要求策略引擎抽屉
+     宽度对齐 AI 抽屉，这条覆盖「按内容形态选档」的默认判断。 */
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
 }
 
 .policy-create-panel {
-  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form);
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   grid-template-rows: auto minmax(0, 1fr) auto;
 }
 
@@ -728,12 +777,13 @@
   top: 0;
   z-index: 3;
   display: flex;
-  flex: 0 0 66px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
   min-height: 66px;
   align-items: center;
-  gap: 0;
-  overflow-x: auto;
-  padding: 0 0 11px;
+  column-gap: 0;
+  row-gap: 10px;
+  padding: 4px 0 11px;
   background: color-mix(in srgb, var(--dwrt-glass-tint, transparent) 34%, transparent);
   border-bottom: 1px solid color-mix(in srgb, var(--app-text) 10%, transparent);
   scrollbar-width: none;
@@ -744,11 +794,11 @@
 .policy-type-picker label {
   position: relative;
   flex: 0 0 auto;
-  min-width: 72px;
+  min-width: 58px;
   min-height: 42px;
   display: grid;
   place-items: center;
-  padding: 0 13px;
+  padding: 0 11px;
   color: var(--app-text-secondary, var(--app-text));
   font-size: 13px;
   font-weight: 680;
@@ -764,9 +814,9 @@
 .policy-type-picker label::after {
   content: "";
   position: absolute;
-  left: 13px;
-  right: 13px;
-  bottom: -7px;
+  left: 11px;
+  right: 11px;
+  bottom: -4px;
   height: 2px;
   border-radius: 2px;
   background: transparent;

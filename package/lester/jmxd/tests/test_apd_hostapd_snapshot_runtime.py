@@ -48,6 +48,8 @@ def main() -> None:
             "missing-dir",
             "untrusted-dir",
             "untrusted-local-dir",
+            "vendor-dir",
+            "stale-global",
         ):
             subprocess.run([str(binary), scenario], check=True, timeout=10)
     print(

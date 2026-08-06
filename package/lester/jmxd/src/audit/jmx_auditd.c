@@ -252,6 +252,45 @@ static time_t g_last_url_sample_at;
 static int g_last_agg_ok;
 static int g_last_url_sample_rows;
 
+/*
+ * Aggregation counters are routine statistics, not errors. procd folds a
+ * service's stderr into syslog at err level, so printing them every
+ * AGG_INTERVAL made daemon.err the most common level in logread and buried
+ * real faults. Keep the numbers available for field diagnosis, but off by
+ * default and rate limited when enabled.
+ */
+#define AGG_DEBUG_MIN_INTERVAL  300     /* seconds between agg debug lines */
+
+static int agg_debug_enabled(void)
+{
+    static int cached = -1;
+    const char *env;
+
+    if (cached >= 0)
+        return cached;
+
+    env = getenv("JMX_AUDITD_DEBUG");
+    cached = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
+    return cached;
+}
+
+static void agg_debug_stats(int nconns, int nct, int ct_with_bytes)
+{
+    static time_t last_emit;
+    time_t now;
+
+    if (!agg_debug_enabled())
+        return;
+
+    now = time(NULL);
+    if (last_emit && now - last_emit < AGG_DEBUG_MIN_INTERVAL)
+        return;
+    last_emit = now;
+
+    fprintf(stderr, "jmx_auditd: debug agg conns=%d ct=%d ct_with_bytes=%d\n",
+            nconns, nct, ct_with_bytes);
+}
+
 static int audit_bulk_writes_allowed(time_t now, int count_suppressed)
 {
     int allowed = jmx_storage_guard_allow(DW_AUDIT_STATE_DIR,
@@ -770,13 +809,12 @@ static int aggregate_and_store(int period)
     nf_ct_entry_t ct_entries[4096];
     int nct = parse_nf_conntrack(ct_entries, 4096);
 
-    /* Count how many ct entries have non-zero bytes for debugging */
     int ct_with_bytes = 0;
     for (int i = 0; i < nct; i++) {
         if (ct_entries[i].orig_bytes > 0 || ct_entries[i].reply_bytes > 0)
             ct_with_bytes++;
     }
-    fprintf(stderr, "jmx_auditd: agg conns=%d ct=%d ct_with_bytes=%d\n", nconns, nct, ct_with_bytes);
+    agg_debug_stats(nconns, nct, ct_with_bytes);
 
     const char *table = (period == HOUR_SECONDS) ?
         "terminal_3proto_load_hour" : "terminal_3proto_load_day";

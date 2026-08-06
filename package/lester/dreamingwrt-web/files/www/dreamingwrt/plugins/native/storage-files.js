@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260805-storage-layout-toolbar-03';
   const ENDPOINT = '/api/v1/storage/files';
   const MODULE_CLASS = 'storage-files-route-host';
   const stage = root?.closest('.console-stage');
@@ -26,6 +26,8 @@ export function mount(context = {}) {
     notice: '',
     noticeTone: '',
     path: '/',
+    rootId: '',
+    rootPath: '',
     query: '',
     entries: [],
     roots: [],
@@ -184,15 +186,57 @@ export function mount(context = {}) {
   }
 
   function normalizeRoot(item, index = 0) {
-    if (typeof item === 'string') return { id: item, label: item === '/' ? '根目录' : item, path: normalizePath(item) };
+    if (typeof item === 'string') {
+      const only = normalizePath(item);
+      return { id: item, label: only === '/' ? '根文件系统' : only, path: only, read_only: false, total_bytes: 0, available_bytes: 0 };
+    }
     const path = normalizePath(firstText(item.path, item.mount_point, item.root, '/'));
-    return { ...item, id: firstText(item.id, item.uuid, path, `root-${index + 1}`), label: firstText(item.label, item.name, path === '/' ? '根目录' : path), path };
+    return {
+      ...item,
+      id: firstText(item.id, item.uuid, path, `root-${index + 1}`),
+      /* 后端 label 就是挂载路径，`/` 直接显示成 "/" 用户读不出含义，只对它换成中文名。 */
+      label: path === '/' ? '根文件系统' : firstText(item.label, item.name, path),
+      path,
+      read_only: bool(item.read_only, false),
+      total_bytes: firstNumber(item.total_bytes, item.total, item.size_bytes),
+      available_bytes: firstNumber(item.available_bytes, item.available, item.free_bytes)
+    };
+  }
+
+  function rootById(id) {
+    return state.roots.find((item) => item.id === id) || null;
+  }
+
+  function currentRoot() {
+    return rootById(state.rootId);
+  }
+
+  function isReadOnlyRoot() {
+    /* 只读判定只认接口下发的 read_only。不要在前端维护路径清单：分级由后端
+     * storage_files_root_write_protected() 决定，硬编码必然与后端漂移。 */
+    return currentRoot()?.read_only === true;
+  }
+
+  /* 后端把「根内相对路径」拼在 root.path 后面，根为 `/` 时结果是 `//etc` 这种双斜杠形式，
+   * 而且它只接受这一形式：请求 `/etc` 会被判成 invalid_relative_path。所以对外发出的
+   * path 必须按当前根重新拼装，不能用 normalizePath 把 `//` 压成 `/`。 */
+  function apiPath(path, root = currentRoot()) {
+    const target = firstText(path, '/');
+    if (!root || root.path !== '/') return normalizePath(target);
+    const relative = target.replace(/^\/+/, '');
+    return relative ? `//${relative}` : '/';
+  }
+
+  /* 面包屑与标题用的可读路径：把后端的 `//etc` 显示成 `/etc`。 */
+  function displayPath(path) {
+    return normalizePath(path);
   }
 
   function normalizePayload(payload = {}) {
     const source = payload.files && typeof payload.files === 'object' ? payload.files : payload;
     return {
       path: normalizePath(firstText(source.path, source.cwd, source.directory, state.path)),
+      rootId: firstText(source.root_id, source.rootId),
       entries: asArray(source.entries, ['files', 'items']).map(normalizeEntry),
       roots: asArray(source.roots, ['volumes', 'mounts']).map(normalizeRoot),
       capabilities: source.capabilities && typeof source.capabilities === 'object' ? source.capabilities : {},
@@ -200,18 +244,26 @@ export function mount(context = {}) {
     };
   }
 
-  async function load(path = state.path, background = false) {
+  /* 每个根都是独立的 root_id，且路径遍历带 RESOLVE_NO_XDEV：从 `/` 进不去 `/data`，
+   * 必须用 /data 自己的 root_id 进入。所以任何一次列目录都要带上 root_id，
+   * 只传 path 会让用户卡在默认根里。 */
+  async function load(path = state.path, background = false, rootId = state.rootId) {
     const seq = ++state.seq;
+    const targetRoot = rootById(rootId);
     const nextPath = normalizePath(path);
+    const query = [`path=${encodeURIComponent(apiPath(nextPath, targetRoot))}`];
+    if (rootId) query.push(`root_id=${encodeURIComponent(rootId)}`);
     if (background) state.refreshing = true; else state.loading = true;
     state.error = '';
     render();
     try {
-      const payload = normalizePayload(await requestJson(`${ENDPOINT}?path=${encodeURIComponent(nextPath)}`));
+      const payload = normalizePayload(await requestJson(`${ENDPOINT}?${query.join('&')}`));
       if (!state.mounted || seq !== state.seq) return;
       state.path = payload.path;
       state.entries = payload.entries;
       state.roots = payload.roots;
+      state.rootId = payload.rootId || rootId;
+      state.rootPath = rootById(state.rootId)?.path || '';
       state.capabilities = payload.capabilities;
       state.limits = payload.limits;
       state.selected.clear();
@@ -220,13 +272,26 @@ export function mount(context = {}) {
       if (!state.mounted || seq !== state.seq) return;
       state.path = nextPath;
       state.entries = [];
-      state.error = '文件管理后端接口尚未开放。页面保留完整操作结构，但不会读取或伪造设备文件。';
+      state.error = loadErrorText(error);
     } finally {
       if (!state.mounted || seq !== state.seq) return;
       state.loading = false;
       state.refreshing = false;
       render();
     }
+  }
+
+  /* 后端的失败原因是有意义的语义，不要一律说成「接口尚未开放」——那会把越界防护
+   * 和真正的后端缺失混成一句话，用户无从判断。 */
+  function loadErrorText(error) {
+    const message = firstText(error?.message);
+    if (/storage_root_not_found/.test(message)) return '该路径不属于任何可访问的存储根。请从上方存储位置里选择一个根。';
+    if (/mount_boundary_rejected/.test(message)) return '该目录是另一个挂载点，出于越界防护不能从当前存储根进入。请在上方存储位置里直接选择它。';
+    if (/invalid_relative_path/.test(message)) return '该路径不在当前存储根范围内。请切换到对应的存储位置。';
+    if (/directory_unavailable/.test(message)) return '目录无法打开，可能已被删除或没有读取权限。';
+    if (/mount_inventory_unavailable/.test(message)) return '无法读取挂载表，暂时列不出存储根。';
+    if (error?.status === 401) return '会话已过期，请重新登录后再查看。';
+    return message ? `读取目录失败：${message}` : '读取目录失败。';
   }
 
   function hasCapability(action, entry = null) {
@@ -281,26 +346,69 @@ export function mount(context = {}) {
     return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(date);
   }
 
+  /* 面包屑必须以当前根为起点，不能从 `/` 逐级拆。跨根的中间层级（例如 /etc/config 根
+   * 的 /etc）并不属于本根，点进去只会拿到 invalid_relative_path。 */
   function breadcrumbMarkup() {
-    const parts = state.path.split('/').filter(Boolean);
-    let current = '';
-    const crumbs = [`<button type="button" data-file-path="/" aria-label="根目录">${icon('home')}<span>根目录</span></button>`];
-    parts.forEach((part) => {
+    const root = currentRoot();
+    const rootPath = root?.path || '/';
+    const here = displayPath(state.path);
+    const rootLabel = root ? root.label : '根目录';
+    const crumbs = [`<button type="button" data-file-path="${escapeHtml(rootPath)}" aria-label="${escapeHtml(rootLabel)}">${icon('home')}<span>${escapeHtml(rootLabel)}</span></button>`];
+    const tail = rootPath === '/' ? here : here.slice(rootPath.length);
+    let current = rootPath === '/' ? '' : rootPath;
+    tail.split('/').filter(Boolean).forEach((part) => {
       current = `${current}/${part}`;
       crumbs.push(`<span>${icon('chevron')}</span><button type="button" data-file-path="${escapeHtml(current)}">${escapeHtml(part)}</button>`);
     });
     return `<nav class="storage-file-breadcrumb" aria-label="文件路径">${crumbs.join('')}</nav>`;
   }
 
+  /* 窄屏下选择器只有 102px，容量后缀会把根名挤成「根文件系统 ·」这种截断，
+   * 根名反而看不全。窄屏只保留根名与只读标记。 */
+  function rootOptionLabel(item) {
+    /* 窄屏下选择器只有 102px：容量和只读后缀会把根名截断成「根文件系统 ·」，
+     * 根名反而看不全。窄屏只留根名，只读状态由旁边的徽标承担。 */
+    const compact = typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 800px)').matches;
+    if (compact) return item.label;
+    const capacity = item.total_bytes ? `${formatBytes(item.available_bytes)} 可用 / ${formatBytes(item.total_bytes)}` : '';
+    return [item.label, item.read_only ? '只读' : '', capacity].filter(Boolean).join(' · ');
+  }
+
   function rootsMarkup() {
     if (!state.roots.length) return '';
-    return `<select class="storage-file-root-select" data-file-root aria-label="存储位置">${state.roots.map((item) => `<option value="${escapeHtml(item.path)}" ${state.path === item.path || state.path.startsWith(`${item.path}/`) ? 'selected' : ''}>${escapeHtml(item.label)}</option>`).join('')}</select>`;
+    const options = state.roots.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === state.rootId ? 'selected' : ''}>${escapeHtml(rootOptionLabel(item))}</option>`).join('');
+    return `<select class="storage-file-root-select" data-file-root aria-label="存储位置">${options}</select>${isReadOnlyRoot() ? '<span class="storage-file-root-badge" data-dwrt-tooltip="该存储根只读，写入类操作已隐藏">只读</span>' : ''}`;
   }
 
   function toolbarMarkup() {
     const count = state.selected.size;
     const canPaste = Boolean(state.clipboard?.paths?.length) && hasCapability(state.clipboard.action === 'cut' ? 'move' : 'copy');
-    return `<header class="storage-file-toolbar"><div class="storage-file-toolbar-top">${rootsMarkup()}${breadcrumbMarkup()}</div><div class="policy-toolbar storage-file-actions"><label class="policy-search policy-search-main storage-file-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-file-search value="${escapeHtml(state.query)}" placeholder="搜索文件或文件夹"></label><div class="storage-file-selection-actions"><button class="policy-filter-button" type="button" data-file-copy ${count ? '' : 'disabled'}>${icon('copy')}<span>复制</span></button><button class="policy-filter-button" type="button" data-file-cut ${count ? '' : 'disabled'}>${icon('cut')}<span>剪切</span></button><button class="policy-filter-button" type="button" data-file-paste ${canPaste ? '' : 'disabled'}>${icon('paste')}<span>粘贴</span></button><button class="policy-filter-button" type="button" data-file-compress ${count ? '' : 'disabled'}>${icon('compress')}<span>压缩</span></button><button class="policy-filter-button danger" type="button" data-file-delete-selected ${count ? '' : 'disabled'}>${icon('trash')}<span>删除</span></button></div><div class="policy-toolbar-actions"><button class="policy-filter-button" type="button" data-file-upload>${icon('upload')}<span>上传</span></button><button class="policy-create-button" type="button" data-file-new>${icon('plus')}<span>新建</span></button></div></div></header>`;
+    /* 只读根上不给写入入口：后端会拒，但让用户点了才被拒是差的体验。 */
+    const readOnly = isReadOnlyRoot();
+    const writeActions = readOnly ? '' : `<button class="policy-filter-button" type="button" data-file-cut ${count ? '' : 'disabled'}>${icon('cut')}<span>剪切</span></button><button class="policy-filter-button" type="button" data-file-paste ${canPaste ? '' : 'disabled'}>${icon('paste')}<span>粘贴</span></button>`;
+    /* 压缩会在当前目录写出归档文件，所以它跟删除一样属于写入类，只读根上一并隐藏。 */
+    const destructiveActions = readOnly ? '' : `<button class="policy-filter-button" type="button" data-file-compress ${count ? '' : 'disabled'}>${icon('compress')}<span>压缩</span></button><button class="policy-filter-button danger" type="button" data-file-delete-selected ${count ? '' : 'disabled'}>${icon('trash')}<span>删除</span></button>`;
+    const createActions = readOnly
+      ? '<span class="storage-file-readonly-hint"><span class="is-long">此存储根只读，仅可浏览与查看</span><span class="is-short">只读，仅可浏览</span></span>'
+      : `<button class="policy-filter-button" type="button" data-file-upload>${icon('upload')}<span>上传</span></button><button class="policy-create-button" type="button" data-file-new>${icon('plus')}<span>新建</span></button>`;
+    /*
+     * 页面级 header 只留导航（存储根 + 面包屑）。搜索与动作按钮属于表格工具栏，
+     * 由 `tableActionsMarkup()` 渲染进 `.dwrt-kit-table-toolbar`（design.md 规则 15）。
+     */
+    return `<header class="storage-file-toolbar"><div class="storage-file-toolbar-top">${rootsMarkup()}${breadcrumbMarkup()}</div></header>`;
+  }
+
+  /* 表格工具栏里的搜索与动作。与 toolbarMarkup() 共用同一批 data-* 钩子。 */
+  function tableActionsMarkup() {
+    const count = state.selected.size;
+    const canPaste = Boolean(state.clipboard?.paths?.length) && hasCapability(state.clipboard.action === 'cut' ? 'move' : 'copy');
+    const readOnly = isReadOnlyRoot();
+    const writeActions = readOnly ? '' : `<button class="policy-filter-button" type="button" data-file-cut ${count ? '' : 'disabled'}>${icon('cut')}<span>剪切</span></button><button class="policy-filter-button" type="button" data-file-paste ${canPaste ? '' : 'disabled'}>${icon('paste')}<span>粘贴</span></button>`;
+    const destructiveActions = readOnly ? '' : `<button class="policy-filter-button" type="button" data-file-compress ${count ? '' : 'disabled'}>${icon('compress')}<span>压缩</span></button><button class="policy-filter-button danger" type="button" data-file-delete-selected ${count ? '' : 'disabled'}>${icon('trash')}<span>删除</span></button>`;
+    const createActions = readOnly
+      ? '<span class="storage-file-readonly-hint"><span class="is-long">此存储根只读，仅可浏览与查看</span><span class="is-short">只读，仅可浏览</span></span>'
+      : `<button class="policy-filter-button" type="button" data-file-upload>${icon('upload')}<span>上传</span></button><button class="policy-create-button" type="button" data-file-new>${icon('plus')}<span>新建</span></button>`;
+    return `<div class="storage-file-table-actions"><label class="policy-search policy-search-main storage-file-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-file-search value="${escapeHtml(state.query)}" placeholder="搜索文件或文件夹"></label><div class="storage-file-selection-actions"><button class="policy-filter-button" type="button" data-file-copy ${count ? '' : 'disabled'}>${icon('copy')}<span>复制</span></button>${writeActions}${destructiveActions}</div><div class="policy-toolbar-actions">${createActions}</div></div>`;
   }
 
   function kindIcon(kind) {
@@ -320,7 +428,16 @@ export function mount(context = {}) {
   }
 
   function rowActionMarkup(entry) {
-    return `<div class="storage-file-row-actions">${entry.kind === 'archive' ? `<button type="button" data-file-extract="${escapeHtml(entry.id)}" aria-label="解压" data-dwrt-tooltip="解压">${icon('archive')}</button>` : !entry.is_dir ? `<button type="button" data-file-download="${escapeHtml(entry.id)}" aria-label="下载" data-dwrt-tooltip="下载">${icon('download')}</button>` : ''}<button type="button" data-file-rename="${escapeHtml(entry.id)}" aria-label="重命名" data-dwrt-tooltip="重命名">${icon('edit')}</button><button type="button" data-file-permissions="${escapeHtml(entry.id)}" aria-label="权限与属主" data-dwrt-tooltip="权限与属主">${icon('lock')}</button><button class="danger" type="button" data-file-delete="${escapeHtml(entry.id)}" aria-label="删除" data-dwrt-tooltip="删除">${icon('trash')}</button></div>`;
+    const readOnly = isReadOnlyRoot();
+    const head = entry.kind === 'archive' && !readOnly
+      ? `<button type="button" data-file-extract="${escapeHtml(entry.id)}" aria-label="解压" data-dwrt-tooltip="解压">${icon('archive')}</button>`
+      : !entry.is_dir
+        ? `<button type="button" data-file-download="${escapeHtml(entry.id)}" aria-label="下载" data-dwrt-tooltip="下载">${icon('download')}</button>`
+        : '';
+    /* 只读根上重命名/改权限/删除全部隐藏；解压同理，它写入目标目录。 */
+    const mutating = readOnly ? '' : `<button type="button" data-file-rename="${escapeHtml(entry.id)}" aria-label="重命名" data-dwrt-tooltip="重命名">${icon('edit')}</button><button type="button" data-file-permissions="${escapeHtml(entry.id)}" aria-label="权限与属主" data-dwrt-tooltip="权限与属主">${icon('lock')}</button><button class="danger" type="button" data-file-delete="${escapeHtml(entry.id)}" aria-label="删除" data-dwrt-tooltip="删除">${icon('trash')}</button>`;
+    const locked = readOnly && !head && !mutating ? `<span class="storage-file-row-locked" data-dwrt-tooltip="只读存储根">${icon('lock')}</span>` : '';
+    return `<div class="storage-file-row-actions">${head}${mutating}${locked}</div>`;
   }
 
   function tableMarkup() {
@@ -330,9 +447,9 @@ export function mount(context = {}) {
       const target = entry.is_dir ? 'directory' : ['text', 'image', 'video', 'audio', 'package'].includes(entry.kind) ? entry.kind : 'download';
       return `<tr class="${selected ? 'is-selected' : ''}" data-file-row="${escapeHtml(entry.id)}"><td><input type="checkbox" data-file-select="${escapeHtml(entry.id)}" ${selected ? 'checked' : ''} aria-label="选择 ${escapeHtml(entry.name)}"></td><td><button class="storage-file-name" type="button" data-file-open="${escapeHtml(entry.id)}" data-file-target="${target}"><span class="is-${escapeHtml(entry.kind)}">${icon(kindIcon(entry.kind))}</span><span><strong>${escapeHtml(entry.name)}</strong>${entry.link_target ? `<small>→ ${escapeHtml(entry.link_target)}</small>` : ''}</span></button></td><td>${entry.is_dir ? '--' : formatBytes(entry.size_bytes)}</td><td>${escapeHtml(formatTime(entry))}</td><td><code>${escapeHtml(entry.mode || '--')}</code></td><td>${escapeHtml([entry.owner, entry.group].filter(Boolean).join('/') || '--')}</td><td>${rowActionMarkup(entry)}</td></tr>`;
     });
-    const empty = state.loading && !state.loaded ? '正在读取目录' : state.error ? '后端文件管理能力尚未接入' : state.query ? '没有符合搜索条件的文件' : '此目录为空';
+    const empty = state.loading && !state.loaded ? '正在读取目录' : state.error ? state.error : state.query ? '没有符合搜索条件的文件' : '此目录为空';
     const allSelected = entries.length > 0 && entries.every((entry) => state.selected.has(entry.id));
-    return `<section class="storage-file-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(state.path)}</strong><span>${state.selected.size ? `已选择 ${state.selected.size} 项` : '名称、大小、修改时间、权限与属主'}</span></div><span class="dwrt-kit-table-count">${entries.length} 项</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table storage-file-table"><thead><tr><th><input type="checkbox" data-file-select-all ${allSelected ? 'checked' : ''} ${entries.length ? '' : 'disabled'} aria-label="全选"></th><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th>属主</th><th>操作</th></tr></thead><tbody>${rows.length ? rows.join('') : `<tr><td colspan="7" class="dwrt-kit-table-empty">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
+    return `<section class="storage-file-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(displayPath(state.path))}</strong>${state.selected.size ? `<span>已选择 ${state.selected.size} 项</span>` : ''}</div><span class="dwrt-kit-table-count">${entries.length} 项</span>${tableActionsMarkup()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table storage-file-table"><thead><tr><th><input type="checkbox" data-file-select-all ${allSelected ? 'checked' : ''} ${entries.length ? '' : 'disabled'} aria-label="全选"></th><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th>属主</th><th>操作</th></tr></thead><tbody>${rows.length ? rows.join('') : `<tr><td colspan="7" class="dwrt-kit-table-empty">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
   }
 
   function noticeMarkup() {
@@ -395,12 +512,15 @@ export function mount(context = {}) {
 
   function editorDrawerBody() {
     const entry = state.editor.entry;
-    return `<div class="storage-file-editor-meta"><code>${escapeHtml(entry?.path || '')}</code><span>${formatBytes(entry?.size_bytes)}</span></div><label class="storage-file-editor"><textarea data-file-draft="content" spellcheck="false" ${state.editor.loadingContent ? 'disabled' : ''}>${escapeHtml(state.editor.content || '')}</textarea></label>${!hasCapability('write', entry) ? '<div class="storage-file-capability">后端文本写入能力尚未开放。可以查看内容，但保存按钮保持禁用。</div>' : ''}${state.notice ? noticeMarkup() : ''}`;
+    const meta = `<div class="storage-file-editor-meta"><code>${escapeHtml(displayPath(entry?.path || ''))}</code><span>${formatBytes(entry?.size_bytes)}</span></div>`;
+    /* 内容被安全策略拒绝时不要摆一个空编辑器：那会被读成「文件是空的」。 */
+    if (state.editor.contentError) return `${meta}<div class="storage-file-content-blocked">${icon('lock')}<div><strong>内容不可显示</strong><p>${escapeHtml(state.editor.contentError)}</p></div></div>`;
+    return `${meta}<label class="storage-file-editor"><textarea data-file-draft="content" spellcheck="false" ${state.editor.loadingContent ? 'disabled' : ''}>${escapeHtml(state.editor.content || '')}</textarea></label>${!hasCapability('write', entry) ? '<div class="storage-file-capability">后端文本写入能力尚未开放。可以查看内容，但保存按钮保持禁用。</div>' : ''}${state.notice ? noticeMarkup() : ''}`;
   }
 
   function previewDrawerBody() {
     const entry = state.editor.entry;
-    const src = `${ENDPOINT}/content?path=${encodeURIComponent(entry?.path || '')}&v=${VERSION}`;
+    const src = `${ENDPOINT}/content?path=${encodeURIComponent(apiPath(entry?.path || ''))}${state.rootId ? `&root_id=${encodeURIComponent(state.rootId)}` : ''}&v=${VERSION}`;
     if (entry?.kind === 'image') return `<div class="storage-file-media"><img src="${escapeHtml(src)}" alt="${escapeHtml(entry.name)}"></div>`;
     if (entry?.kind === 'video') return `<div class="storage-file-media"><video src="${escapeHtml(src)}" controls></video></div>`;
     if (entry?.kind === 'audio') return `<div class="storage-file-media is-audio"><span>${icon('audio')}</span><strong>${escapeHtml(entry.name)}</strong><audio src="${escapeHtml(src)}" controls></audio></div>`;
@@ -447,7 +567,9 @@ export function mount(context = {}) {
 
   function drawerMarkup() {
     if (!state.drawer) return '';
-    const readonly = state.drawer === 'preview';
+    /* 内容被安全策略拒绝时没有可保存的东西，按预览处理，footer 只留「关闭」，
+     * 否则会显示成「等待后端能力」——那是错的归因，后端能力在，是策略拒绝。 */
+    const readonly = state.drawer === 'preview' || (state.drawer === 'editor' && Boolean(state.editor.contentError));
     return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-file-close aria-label="关闭文件管理面板"></button><aside class="storage-file-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" aria-label="${escapeHtml(drawerTitle())}"><header class="dwrt-kit-sheet-header"><div><span>FILE MANAGER</span><strong>${escapeHtml(drawerTitle())}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-file-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body storage-file-drawer-body">${drawerBody()}</div><footer class="dwrt-kit-sheet-footer storage-file-drawer-footer"><span></span><div><button class="policy-secondary" type="button" data-file-close>${readonly ? '关闭' : '取消'}</button>${readonly ? '' : `<button class="policy-primary ${state.drawer === 'delete' ? 'danger' : ''}" type="button" data-file-save ${drawerCanSave() && !state.saving ? '' : 'disabled'}>${drawerSaveLabel()}</button>`}</div></footer></aside>`;
   }
 
@@ -520,10 +642,10 @@ export function mount(context = {}) {
   function openDelete(entries) { if (entries.length) openDrawer('delete', { entries }); }
 
   async function openTextEditor(entry) {
-    openDrawer('editor', { entry, name: entry.name, content: '', loadingContent: true });
+    openDrawer('editor', { entry, name: entry.name, content: '', loadingContent: true, contentError: '' });
     if (!hasCapability('read', entry) && !hasCapability('preview', entry)) return;
     try {
-      const payload = await requestJson(`${ENDPOINT}/content?path=${encodeURIComponent(entry.path)}`);
+      const payload = await requestJson(`${ENDPOINT}/content?path=${encodeURIComponent(apiPath(entry.path))}${state.rootId ? `&root_id=${encodeURIComponent(state.rootId)}` : ''}`);
       if (!state.mounted || state.drawer !== 'editor' || state.editor.entry?.id !== entry.id) return;
       state.editor.content = firstText(payload.content, payload.text);
       state.editor.loadingContent = false;
@@ -531,18 +653,46 @@ export function mount(context = {}) {
     } catch (error) {
       if (!state.mounted) return;
       state.editor.loadingContent = false;
-      state.notice = `读取失败：${firstText(error.message, '后端未返回内容')}`;
-      state.noticeTone = 'error';
+      /* 「目录能进、文件打不开」是后端有意的保护语义（列目录保留可导航性，只拒绝读字节）。
+       * 把 reason 如实呈现，不要显示成加载失败或空文件。 */
+      /* 原因只在抽屉里说一次；再往页面顶部推一条同文案的通知是重复噪音。 */
+      state.editor.contentError = contentErrorText(error);
       render();
     }
   }
 
+  function contentErrorText(error) {
+    const message = firstText(error?.message);
+    if (/protected_system_path|protected_executable_or_boot_path|protected_system_account_or_boot_file/.test(message)) {
+      return '系统受保护路径，内容不予显示。该目录可以浏览，但文件内容按安全策略不下发。';
+    }
+    if (/protected_credential_or_database_file/.test(message)) {
+      return '凭据或数据库文件，内容不予显示。密钥、证书与数据库文件按安全策略不下发。';
+    }
+    if (/content_protected/.test(message)) return '该文件受安全策略保护，内容不予显示。';
+    if (/text_too_large/.test(message)) return '文件超出可在线查看的大小上限，请下载后查看。';
+    if (/not_utf8_text/.test(message)) return '该文件不是 UTF-8 文本，无法在编辑器中显示。';
+    if (/mount_boundary_rejected/.test(message)) return '该文件属于另一个挂载点，需要从它自己的存储根打开。';
+    if (/file_read_failed|directory_unavailable/.test(message)) return '文件读取失败，可能已被删除或没有读取权限。';
+    if (error?.status === 401) return '会话已过期，请重新登录后再查看。';
+    return message ? `读取失败：${message}` : '读取失败。';
+  }
+
   function openEntry(entry) {
-    if (entry.is_dir) { load(entry.path); return; }
+    if (entry.is_dir) { openDirectory(entry.path); return; }
     if (entry.kind === 'text') { openTextEditor(entry); return; }
     if (['image', 'video', 'audio'].includes(entry.kind)) { openDrawer('preview', { entry, name: entry.name }); return; }
     if (entry.kind === 'package') { openDrawer('package', { entry, name: entry.name }); return; }
     downloadEntry(entry);
+  }
+
+  /* 子挂载点在当前根里列得出来，但进不去（RESOLVE_NO_XDEV）。它们各自是独立的根，
+   * 所以点进这类目录时直接切到它自己的 root_id，而不是让后端回 mount_boundary_rejected。 */
+  function openDirectory(path) {
+    const target = displayPath(path);
+    const owner = state.roots.find((item) => item.path === target);
+    if (owner && owner.id !== state.rootId) { load(owner.path, false, owner.id); return; }
+    load(target);
   }
 
   async function submitDrawer() {
@@ -553,30 +703,31 @@ export function mount(context = {}) {
     render();
     try {
       if (state.drawer === 'new') {
-        await requestJson(`${ENDPOINT}/${state.editor.kind === 'directory' ? 'directories' : 'entries'}`, { method: 'POST', body: JSON.stringify({ parent: state.path, name: state.editor.name }) });
+        await requestJson(`${ENDPOINT}/${state.editor.kind === 'directory' ? 'directories' : 'entries'}`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, parent: apiPath(state.path), name: state.editor.name }) });
       } else if (state.drawer === 'upload') {
         if (state.editor.mode === 'url') {
-          await requestJson(`${ENDPOINT}/download-url`, { method: 'POST', body: JSON.stringify({ url: state.editor.url, destination: joinPath(state.path, state.editor.name) }) });
+          await requestJson(`${ENDPOINT}/download-url`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, url: state.editor.url, destination: apiPath(joinPath(state.path, state.editor.name)) }) });
         } else {
           const data = new FormData();
-          data.append('path', state.path);
+          data.append('path', apiPath(state.path));
+          if (state.rootId) data.append('root_id', state.rootId);
           state.uploadFiles.forEach((file) => data.append('files', file, file.name));
           await requestJson(`${ENDPOINT}/upload`, { method: 'POST', body: data });
         }
       } else if (state.drawer === 'rename') {
-        await requestJson(`${ENDPOINT}/rename`, { method: 'POST', body: JSON.stringify({ path: state.editor.entry.path, name: state.editor.name }) });
+        await requestJson(`${ENDPOINT}/rename`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, path: apiPath(state.editor.entry.path), name: state.editor.name }) });
       } else if (state.drawer === 'permissions') {
-        await requestJson(`${ENDPOINT}/permissions`, { method: 'PUT', body: JSON.stringify({ path: state.editor.entry.path, mode: state.editor.mode, owner: state.editor.owner, group: state.editor.group }) });
+        await requestJson(`${ENDPOINT}/permissions`, { method: 'PUT', body: JSON.stringify({ root_id: state.rootId, path: apiPath(state.editor.entry.path), mode: state.editor.mode, owner: state.editor.owner, group: state.editor.group }) });
       } else if (state.drawer === 'compress') {
-        await requestJson(`${ENDPOINT}/compress`, { method: 'POST', body: JSON.stringify({ paths: selectedEntries().map((entry) => entry.path), format: state.editor.format, target: joinPath(state.path, state.editor.name) }) });
+        await requestJson(`${ENDPOINT}/compress`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, paths: selectedEntries().map((entry) => apiPath(entry.path)), format: state.editor.format, target: apiPath(joinPath(state.path, state.editor.name)) }) });
       } else if (state.drawer === 'extract') {
-        await requestJson(`${ENDPOINT}/extract`, { method: 'POST', body: JSON.stringify({ path: state.editor.entry.path, destination: normalizePath(state.editor.destination) }) });
+        await requestJson(`${ENDPOINT}/extract`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, path: apiPath(state.editor.entry.path), destination: apiPath(state.editor.destination) }) });
       } else if (state.drawer === 'delete') {
-        await requestJson(`${ENDPOINT}/entries`, { method: 'DELETE', body: JSON.stringify({ paths: state.editor.entries.map((entry) => entry.path), confirm: true }) });
+        await requestJson(`${ENDPOINT}/entries`, { method: 'DELETE', body: JSON.stringify({ root_id: state.rootId, paths: state.editor.entries.map((entry) => apiPath(entry.path)), confirm: true }) });
       } else if (state.drawer === 'editor') {
-        await requestJson(`${ENDPOINT}/content`, { method: 'PUT', body: JSON.stringify({ path: state.editor.entry.path, content: state.editor.content, expected_mtime: state.editor.entry.modified_unix || state.editor.entry.modified_at }) });
+        await requestJson(`${ENDPOINT}/content`, { method: 'PUT', body: JSON.stringify({ root_id: state.rootId, path: apiPath(state.editor.entry.path), content: state.editor.content, expected_mtime: state.editor.entry.modified_unix || state.editor.entry.modified_at }) });
       } else if (state.drawer === 'package') {
-        await requestJson(`${ENDPOINT}/install-package`, { method: 'POST', body: JSON.stringify({ path: state.editor.entry.path, confirm: true }) });
+        await requestJson(`${ENDPOINT}/install-package`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, path: apiPath(state.editor.entry.path), confirm: true }) });
       }
       if (!state.mounted) return;
       state.saving = false;
@@ -601,7 +752,7 @@ export function mount(context = {}) {
     const action = clipboard.action === 'cut' ? 'move' : 'copy';
     if (!hasCapability(action)) return;
     try {
-      await requestJson(`${ENDPOINT}/${action}`, { method: 'POST', body: JSON.stringify({ paths: clipboard.paths, destination: state.path }) });
+      await requestJson(`${ENDPOINT}/${action}`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, source_root_id: clipboard.sourceRootId || state.rootId, paths: clipboard.paths, destination: apiPath(state.path) }) });
       if (clipboard.action === 'cut') state.clipboard = null;
       state.notice = '粘贴操作已完成';
       state.noticeTone = 'ok';
@@ -614,9 +765,11 @@ export function mount(context = {}) {
   }
 
   function rememberSelection(action) {
-    const paths = selectedEntries().map((entry) => entry.path);
+    /* 复制/剪切时就把路径转成当前根的接口形式：粘贴时当前根可能已经换了，
+     * 那时再按新根拼装会指到错误的位置。 */
+    const paths = selectedEntries().map((entry) => apiPath(entry.path));
     if (!paths.length) return;
-    state.clipboard = { action, paths, source: state.path };
+    state.clipboard = { action, paths, source: state.path, sourceRootId: state.rootId };
     state.notice = action === 'cut' ? `已准备移动 ${paths.length} 个项目` : `已准备复制 ${paths.length} 个项目`;
     state.noticeTone = 'info';
     render();
@@ -630,7 +783,7 @@ export function mount(context = {}) {
       return;
     }
     const link = document.createElement('a');
-    link.href = `${ENDPOINT}/download?path=${encodeURIComponent(entry.path)}&v=${VERSION}`;
+    link.href = `${ENDPOINT}/download?path=${encodeURIComponent(apiPath(entry.path))}${state.rootId ? `&root_id=${encodeURIComponent(state.rootId)}` : ''}&v=${VERSION}`;
     link.download = entry.name;
     link.click();
   }
@@ -646,7 +799,7 @@ export function mount(context = {}) {
     if (event.target.closest('[data-file-delete-selected]')) { openDelete(selectedEntries()); return; }
     if (event.target.closest('[data-file-save]')) { submitDrawer(); return; }
     const path = event.target.closest('[data-file-path]');
-    if (path) { load(path.dataset.filePath); return; }
+    if (path) { openDirectory(path.dataset.filePath); return; }
     const kind = event.target.closest('[data-file-new-kind]');
     if (kind) { state.editor.kind = kind.dataset.fileNewKind; state.editor.name = ''; render(); return; }
     const open = event.target.closest('[data-file-open]');
@@ -691,7 +844,8 @@ export function mount(context = {}) {
 
   function onChange(event) {
     const rootSelect = event.target.closest('[data-file-root]');
-    if (rootSelect) { load(rootSelect.value); return; }
+    /* 切根要按 root_id 走，并回到该根的根目录；沿用旧 path 会落到别的根里。 */
+    if (rootSelect) { const next = rootById(rootSelect.value); load(next?.path || '/', false, rootSelect.value); return; }
     const all = event.target.closest('[data-file-select-all]');
     if (all) {
       filteredEntries().forEach((entry) => all.checked ? state.selected.add(entry.id) : state.selected.delete(entry.id));
@@ -714,13 +868,38 @@ export function mount(context = {}) {
     if (event.key === 'Escape' && state.drawer) closeDrawer();
   }
 
+  /* 落点选择：后端 roots[] 按路径字典序排，`/` 恒排第一且是只读根。用户打开文件管理
+   * 第一眼落在一个不能写的根上，会以为整个文件管理都是只读的。所以首屏先按默认根拿
+   * roots 清单，再挑一个可写根落下去；`/data` 优先（用户数据所在），其次任意可写根，
+   * 全只读时才留在默认根。偏好路径只用于排序，不硬编码根是否存在。 */
+  const PREFERRED_ROOTS = ['/data', '/root', '/opt/dreamingwrt'];
+
+  function preferredRoot() {
+    const writable = state.roots.filter((item) => !item.read_only);
+    if (!writable.length) return null;
+    for (const path of PREFERRED_ROOTS) {
+      const match = writable.find((item) => item.path === path);
+      if (match) return match;
+    }
+    return writable[0];
+  }
+
+  async function bootstrap() {
+    await load('/');
+    if (!state.mounted || !state.loaded) return;
+    if (!isReadOnlyRoot()) return;
+    const target = preferredRoot();
+    if (!target || target.id === state.rootId) return;
+    await load(target.path, false, target.id);
+  }
+
   root?.addEventListener('click', onClick);
   root?.addEventListener('input', onInput);
   root?.addEventListener('change', onChange);
   document.addEventListener('keydown', onKeyDown);
   stage?.classList.add('is-storage-files');
   render();
-  load('/');
+  bootstrap();
 
   /*
    * 手动刷新按钮按用户第 9 条删除，补一条可见性受控的轮询代替；

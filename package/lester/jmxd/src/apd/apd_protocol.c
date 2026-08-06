@@ -69,6 +69,10 @@ struct json_object *apd_capabilities_json(void)
     apd_capability(cap, reasons, "pairing_state_machine", 1, NULL);
     apd_capability(cap, reasons, "pairing", APD_NODE_TRANSPORT_ENABLED,
                    apd_transport_reason());
+    /* Advertised unconditionally so a client can tell "not supported by this
+     * build" from "the call failed". Unpair is local teardown and stays
+     * available even when the controller session is down. */
+    apd_capability(cap, reasons, "unpair", 1, NULL);
     apd_capability(cap, reasons, "controller_transport", apd_transport_connected(),
                    apd_transport_reason());
     apd_capability(cap, reasons, "heartbeat", apd_transport_connected(),
@@ -155,6 +159,29 @@ struct json_object *apd_pairing_status_json(void)
                            json_object_new_string(adopted ? "adopted" : status.state));
     json_object_object_add(root, "enrollment_state",
                            json_object_new_string(status.state));
+    /*
+     * enrollment_state is the raw one-shot-token state machine, and after a
+     * successful adoption it legitimately reads "expired": the token aged
+     * out, the adoption did not. Reporting only that value invites a UI to
+     * show a healthy AP as unpaired, so the disambiguation is published
+     * explicitly instead of left to each consumer to infer.
+     *
+     * The raw field keeps its meaning for existing consumers; new UI should
+     * read enrollment_phase, which is terminal once adopted.
+     */
+    json_object_object_add(root, "enrollment_phase",
+                           json_object_new_string(
+                               adopted ? "completed" : status.state));
+    json_object_object_add(root, "enrollment_complete",
+                           json_object_new_boolean(adopted));
+    /* True only when the token expiry actually matters, i.e. the AP is not
+     * adopted and would need a fresh pairing code. */
+    json_object_object_add(root, "pairing_token_expired",
+                           json_object_new_boolean(
+                               !adopted &&
+                               strcmp(status.state, "expired") == 0));
+    json_object_object_add(root, "requires_pairing",
+                           json_object_new_boolean(!adopted));
     json_object_object_add(root, "controller_id",
                            json_object_new_string(status.controller_id));
     json_object_object_add(root, "request_id",
@@ -207,6 +234,13 @@ struct json_object *apd_status_json(void)
                                                               pairing.state));
         json_object_object_add(root, "enrollment_state",
                                json_object_new_string(pairing.state));
+        /* See apd_pairing_status_json(): "expired" here refers to the
+         * one-shot token, not the adoption relationship. */
+        json_object_object_add(root, "enrollment_phase",
+                               json_object_new_string(
+                                   adopted ? "completed" : pairing.state));
+        json_object_object_add(root, "enrollment_complete",
+                               json_object_new_boolean(adopted));
     }
     json_object_object_add(root, "adoption_state",
                            json_object_new_string(adopted ?
@@ -232,6 +266,110 @@ struct json_object *apd_write_disabled_json(const char *operation,
     json_object_object_add(root, "accepted", json_object_new_boolean(0));
     json_object_object_add(root, "persisted", json_object_new_boolean(0));
     json_object_object_add(root, "applied", json_object_new_boolean(0));
+    return root;
+}
+
+static const char *apd_unpair_error(int rc)
+{
+    switch (rc) {
+    case APD_CREDENTIALS_UNPAIR_LOCK_FAILED:
+        return "credentials_lock_failed";
+    case APD_CREDENTIALS_UNPAIR_CERTIFICATE_FAILED:
+        return "certificate_remove_failed";
+    case APD_CREDENTIALS_UNPAIR_METADATA_FAILED:
+        return "enrollment_remove_failed";
+    case APD_CREDENTIALS_UNPAIR_BOOTSTRAP_FAILED:
+        return "bootstrap_remove_failed";
+    default:
+        return "unpair_failed";
+    }
+}
+
+/*
+ * Local teardown of the adoption relationship.
+ *
+ * The transport is stopped first. The session thread reads credentials on
+ * every cycle, so tearing files out from under a live session would let it
+ * observe a half-removed state; stopping it makes the removal quiescent. It
+ * is restarted afterwards because an unadopted apd still needs the worker
+ * running to enroll again later.
+ *
+ * The discovery beacon needs no action here: it re-checks adoption on each
+ * 30s tick and resumes announcing on its own once the credentials are gone.
+ */
+struct json_object *apd_unpair_json(int confirmed)
+{
+    struct json_object *root = json_object_new_object();
+    struct json_object *removed;
+    struct apd_credentials_unpair_report report;
+    int was_adopted;
+    int transport_restarted = 0;
+    int pairing_cleared;
+    int rc;
+
+    memset(&report, 0, sizeof(report));
+
+    if (!confirmed) {
+        json_object_object_add(root, "ok", json_object_new_boolean(0));
+        json_object_object_add(root, "error",
+                               json_object_new_string("confirmation_required"));
+        json_object_object_add(root, "operation",
+                               json_object_new_string("unpair"));
+        json_object_object_add(root, "reason", json_object_new_string(
+            "unpair is destructive; call with {\"confirm\": true}"));
+        json_object_object_add(root, "unpaired", json_object_new_boolean(0));
+        return root;
+    }
+
+    was_adopted = apd_transport_adopted();
+
+    apd_transport_stop();
+    rc = apd_credentials_unpair(&report);
+    pairing_cleared = apd_db_pairing_clear() == 0;
+    if (apd_transport_start() == 0)
+        transport_restarted = 1;
+
+    json_object_object_add(root, "contract_version",
+                           json_object_new_string(APD_CONTRACT_VERSION));
+    json_object_object_add(root, "operation", json_object_new_string("unpair"));
+    json_object_object_add(root, "was_adopted",
+                           json_object_new_boolean(was_adopted));
+
+    removed = json_object_new_object();
+    json_object_object_add(removed, "certificate",
+                           json_object_new_boolean(report.certificate_removed));
+    json_object_object_add(removed, "enrollment",
+                           json_object_new_boolean(report.enrollment_removed));
+    json_object_object_add(removed, "bootstrap",
+                           json_object_new_boolean(report.bootstrap_removed));
+    json_object_object_add(removed, "pairing_state",
+                           json_object_new_boolean(pairing_cleared));
+    json_object_object_add(root, "removed", removed);
+
+    json_object_object_add(root, "transport_restarted",
+                           json_object_new_boolean(transport_restarted));
+
+    if (rc != APD_CREDENTIALS_UNPAIR_OK) {
+        json_object_object_add(root, "ok", json_object_new_boolean(0));
+        json_object_object_add(root, "error",
+                               json_object_new_string(apd_unpair_error(rc)));
+        json_object_object_add(root, "unpaired", json_object_new_boolean(0));
+        return root;
+    }
+
+    /* Report the observed end state rather than assuming the writes worked. */
+    json_object_object_add(root, "adopted",
+                           json_object_new_boolean(apd_transport_adopted()));
+    json_object_object_add(root, "unpaired",
+                           json_object_new_boolean(!apd_transport_adopted()));
+    json_object_object_add(root, "pairing_state_cleared",
+                           json_object_new_boolean(pairing_cleared));
+    json_object_object_add(root, "ok",
+                           json_object_new_boolean(!apd_transport_adopted()));
+    if (apd_transport_adopted()) {
+        json_object_object_add(root, "error",
+                               json_object_new_string("still_adopted_after_unpair"));
+    }
     return root;
 }
 

@@ -1,4 +1,4 @@
-const VERSION = '20260802-ui-batch-01';
+const VERSION = '20260805-kit-material-radius-01';
 const ENDPOINT = '/api/v1/container_service';
 const REFRESH_MS = 5000;
 
@@ -184,8 +184,21 @@ export function mount(context = {}) {
     return icons[name] || icons.box;
   }
 
-  function overviewCard(label, value, detail, glyph, tone = 'info') {
-    return `<article class="dwrt-kit-overview-card is-${tone}"><div class="dwrt-kit-overview-content"><span class="dwrt-kit-overview-label">${escapeHtml(label)}</span><strong>${escapeHtml(value || '--')}</strong><small>${escapeHtml(detail || '--')}</small></div><span class="dwrt-kit-overview-icon">${icon(glyph)}</span></article>`;
+  /*
+   * 概览卡交给 kit 渲染（DESIGN.md 规则 13：页面只提供数据、语义色和 SVG，不得复制
+   * 卡片 DOM）。原先这里手写了 article/div/span 整套内部结构 —— 类名是 kit 的，DOM 是
+   * 自己的，kit 改结构时这里不会跟着变。改为拼数据交给 overviewCardsMarkup()，顺带
+   * 拿到两样手写版没有的东西：局部 patch 用的 data-dwrt-overview-* 钩子，以及
+   * normalizeOverviewIcon() 对 SVG 尺寸/viewBox 的统一。
+   */
+  function overviewMetric(label, value, detail, glyph, tone = 'info') {
+    return { key: glyph, label, value: value || '--', detail: detail || '--', icon: icon(glyph), tone };
+  }
+
+  function overviewGrid(items, label) {
+    const render = ui.overviewCardsMarkup || window.DWRT_UI_KIT?.overviewCardsMarkup;
+    if (typeof render !== 'function') return '';
+    return render(items, { className: 'container-service-overview', label });
   }
 
   function overview() {
@@ -193,20 +206,20 @@ export function mount(context = {}) {
       const lxc = state.data.lxc;
       const availableCommands = Object.values(lxc.commands).filter((value) => bool(value)).length;
       const path = firstText(lxc.config.lxcpath, lxc.config.path, lxc.config.root);
-      return `<section class="dwrt-kit-overview-grid container-service-overview" aria-label="LXC 概览">
-        ${overviewCard('LXC', lxc.available ? '可用' : '未检测到', serviceState(lxc.service), 'lxc', lxc.available ? 'ok' : 'warn')}
-        ${overviewCard('容器', String(lxc.containers.length), `${lxc.containers.filter((row) => /running/i.test(firstText(row.state, row.State))).length} 个运行中`, 'box')}
-        ${overviewCard('命令', `${availableCommands} / ${Object.keys(lxc.commands).length}`, lxc.missing.length ? `缺少 ${lxc.missing.length} 个命令` : '命令完整', 'terminal', lxc.missing.length ? 'warn' : 'ok')}
-        ${overviewCard('配置路径', path || '--', Object.keys(lxc.config).length ? '配置已读取' : '后端未返回路径', 'disk', path ? 'info' : 'warn')}
-      </section>`;
+      return overviewGrid([
+        overviewMetric('LXC', lxc.available ? '可用' : '未检测到', serviceState(lxc.service), 'lxc', lxc.available ? 'ok' : 'warn'),
+        overviewMetric('容器', String(lxc.containers.length), `${lxc.containers.filter((row) => /running/i.test(firstText(row.state, row.State))).length} 个运行中`, 'box'),
+        overviewMetric('命令', `${availableCommands} / ${Object.keys(lxc.commands).length}`, lxc.missing.length ? `缺少 ${lxc.missing.length} 个命令` : '命令完整', 'terminal', lxc.missing.length ? 'warn' : 'ok'),
+        overviewMetric('配置路径', path || '--', Object.keys(lxc.config).length ? '配置已读取' : '后端未返回路径', 'disk', path ? 'info' : 'warn')
+      ], 'LXC 概览');
     }
     const docker = state.data.docker;
-    return `<section class="dwrt-kit-overview-grid container-service-overview" aria-label="Docker 概览">
-      ${overviewCard('Docker', docker.available ? '可用' : '未检测到', [docker.version, serviceState(docker.service)].filter(Boolean).join(' · '), 'docker', docker.available ? 'ok' : 'warn')}
-      ${overviewCard('运行容器', `${docker.counts.running} / ${docker.counts.containers}`, '运行中 / 总数', 'box')}
-      ${overviewCard('镜像', String(docker.counts.images), '本地镜像', 'image')}
-      ${overviewCard('存储驱动', docker.driver || '--', docker.dataRoot || '后端未返回数据目录', 'disk', docker.driver ? 'info' : 'warn')}
-    </section>`;
+    return overviewGrid([
+      overviewMetric('Docker', docker.available ? '可用' : '未检测到', [docker.version, serviceState(docker.service)].filter(Boolean).join(' · '), 'docker', docker.available ? 'ok' : 'warn'),
+      overviewMetric('运行容器', `${docker.counts.running} / ${docker.counts.containers}`, '运行中 / 总数', 'box'),
+      overviewMetric('镜像', String(docker.counts.images), '本地镜像', 'image'),
+      overviewMetric('存储驱动', docker.driver || '--', docker.dataRoot || '后端未返回数据目录', 'disk', docker.driver ? 'info' : 'warn')
+    ], 'Docker 概览');
   }
 
   function tabs() {

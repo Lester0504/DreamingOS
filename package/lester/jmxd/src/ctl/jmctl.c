@@ -35,6 +35,13 @@
 #define JMCTL_COMPLETION_MAX 64
 #define JMCTL_COMPLETION_WORD_MAX 64
 
+/*
+ * The AP controller registers both "dreamingwrt.ac" and the legacy alias
+ * "dreamingos.ac" over one shared method table. jmctl always talks to the
+ * canonical name.
+ */
+#define JMCTL_AC_OBJECT "dreamingwrt.ac"
+
 struct jmctl_opts {
     int json;
     int dry_run;
@@ -57,6 +64,9 @@ struct jmctl_completion_cache {
     int wan_count;
     char lans[JMCTL_COMPLETION_MAX][JMCTL_COMPLETION_WORD_MAX];
     int lan_count;
+    /* AP ids are 36-char UUIDs, which fit JMCTL_COMPLETION_WORD_MAX. */
+    char aps[JMCTL_COMPLETION_MAX][JMCTL_COMPLETION_WORD_MAX];
+    int ap_count;
 };
 
 static struct jmctl_completion_cache g_completion_cache;
@@ -102,6 +112,22 @@ static void usage(FILE *out)
         "Users:\n"
         "  jmctl user password set <username> <new-password> [--sync-system]\n"
         "  jmctl user password reset <username> <new-password> [--sync-system]\n"
+        "\n"
+        "AP control:\n"
+        "  jmctl ac status                      Controller/local-wifi/managed-AP/PKI state\n"
+        "  jmctl ac caps                        Capability flags with reasons for disabled ones\n"
+        "  jmctl ac aps                         List managed APs\n"
+        "  jmctl ac ap set <ap_id> name <name>\n"
+        "  jmctl ac ap set <ap_id> model <model-override>\n"
+        "  jmctl ac token list\n"
+        "  jmctl ac token status <token_id>\n"
+        "  jmctl ac token create [--ttl <sec>] [--max-attempts <n>] [--site <id>]\n"
+        "                        [--hardware-digest <sha256>] [--yes]\n"
+        "  jmctl ac token revoke <token_id> [--yes]\n"
+        "  jmctl ac job list [<ap_id>]          Without ap_id, walks every managed AP\n"
+        "  jmctl ac job status <job_id>\n"
+        "  jmctl ac job result <job_id>\n"
+        "  jmctl ac job latest                  Latest scan results across APs\n"
         "\n"
         "Raw ubus:\n"
         "  jmctl ubus <object> <method> [json]\n"
@@ -397,6 +423,18 @@ static void completion_load(struct jmctl_opts *opts)
                              g_completion_cache.lans, &g_completion_cache.lan_count);
     completion_extract_array(data, "lans", "ifname",
                              g_completion_cache.lans, &g_completion_cache.lan_count);
+    if (resp)
+        json_object_put(resp);
+
+    /*
+     * ap_ids are UUIDs and cannot realistically be typed by hand, so they are
+     * cached for tab completion. A controller without the ac object simply
+     * yields an empty list.
+     */
+    resp = ubus_invoke_json(opts, JMCTL_AC_OBJECT, "aps_list", NULL, NULL);
+    data = jmx_get_data_object(resp);
+    completion_extract_array(data, "items", "ap_id",
+                             g_completion_cache.aps, &g_completion_cache.ap_count);
     if (resp)
         json_object_put(resp);
 
@@ -954,6 +992,621 @@ static int cmd_user(struct jmctl_opts *opts, int argc, char **argv)
     return invoke_or_dry_run(opts, "user password", "system_admin_password_set", req);
 }
 
+/* ---------------------------------------------------------------------------
+ * AP control (dreamingwrt.ac)
+ * -------------------------------------------------------------------------*/
+
+/*
+ * ac_site_id_valid() in the backend also accepts ':', which is_name_safe()
+ * rejects. Validating with a stricter local rule would refuse site ids the
+ * controller considers legal.
+ */
+static int ac_site_id_safe(const char *s)
+{
+    const unsigned char *p = (const unsigned char *)s;
+
+    if (!s)
+        return 0;
+    for (; *p; p++) {
+        if (isalnum(*p) || *p == '_' || *p == '-' || *p == '.' || *p == ':')
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int ac_confirm(struct jmctl_opts *opts, const char *prompt)
+{
+    char line[64];
+
+    if (opts && opts->json) {
+        print_error(opts, "confirmation_required",
+                    "refusing an interactive prompt in --json mode; pass --yes");
+        return 0;
+    }
+    printf("%s [y/N] ", prompt);
+    fflush(stdout);
+    if (!fgets(line, sizeof(line), stdin)) {
+        printf("\naborted\n");
+        return 0;
+    }
+    if (line[0] == 'y' || line[0] == 'Y')
+        return 1;
+    printf("aborted\n");
+    return 0;
+}
+
+/*
+ * Read-only ac call. Mirrors cmd_list()/cmd_status(): raw JSON by default,
+ * wrapped envelope under --json.
+ */
+static int ac_read_call(struct jmctl_opts *opts, const char *cmd,
+                        const char *method, struct json_object *req)
+{
+    struct json_object *resp;
+    int rc;
+
+    resp = ubus_invoke_json(opts, JMCTL_AC_OBJECT, method, req, NULL);
+    if (opts->json)
+        rc = emit_result(opts, cmd, method, req, resp);
+    else {
+        print_json_obj(resp);
+        rc = response_success(resp) ? 0 : 1;
+    }
+    if (resp)
+        json_object_put(resp);
+    if (req)
+        json_object_put(req);
+    return rc;
+}
+
+/* Write path against ac, honouring --dry-run the same way invoke_or_dry_run does. */
+static int ac_write_call(struct jmctl_opts *opts, const char *cmd,
+                         const char *method, struct json_object *req)
+{
+    struct json_object *resp;
+    int rc;
+
+    if (opts->dry_run) {
+        resp = json_object_new_object();
+        json_object_object_add(resp, "ok", json_object_new_boolean(1));
+        json_object_object_add(resp, "dry_run", json_object_new_boolean(1));
+        json_add_string(resp, "would_call", method);
+        json_add_string(resp, "object", JMCTL_AC_OBJECT);
+        rc = emit_result(opts, cmd, method, req, resp);
+        json_object_put(resp);
+        if (req)
+            json_object_put(req);
+        return rc;
+    }
+    resp = ubus_invoke_json(opts, JMCTL_AC_OBJECT, method, req, NULL);
+    rc = emit_result(opts, cmd, method, req, resp);
+    if (resp)
+        json_object_put(resp);
+    if (req)
+        json_object_put(req);
+    return rc;
+}
+
+/*
+ * capabilities returns {capabilities:{...,reasons:{...}}}. Printing the raw
+ * blob makes the operator diff two dozen booleans by eye, so split it into
+ * available/unavailable and attach the reason string the backend already ships.
+ */
+static int ac_print_caps(struct jmctl_opts *opts)
+{
+    struct json_object *resp;
+    struct json_object *caps = NULL;
+    struct json_object *reasons = NULL;
+    int ok;
+
+    resp = ubus_invoke_json(opts, JMCTL_AC_OBJECT, "capabilities", NULL, NULL);
+    ok = response_success(resp);
+    if (opts->json) {
+        int rc = emit_result(opts, "ac caps", "capabilities", NULL, resp);
+        if (resp)
+            json_object_put(resp);
+        return rc;
+    }
+    if (!ok) {
+        print_json_obj(resp);
+        if (resp)
+            json_object_put(resp);
+        return 1;
+    }
+    if (!json_object_object_get_ex(resp, "capabilities", &caps) || !caps) {
+        print_json_obj(resp);
+        json_object_put(resp);
+        return 1;
+    }
+    json_object_object_get_ex(caps, "reasons", &reasons);
+
+    printf("AP control capabilities (%s)\n",
+           json_get_string_def(resp, "contract_version", "?"));
+    printf("\navailable:\n");
+    {
+        struct json_object_iterator it = json_object_iter_begin(caps);
+        struct json_object_iterator end = json_object_iter_end(caps);
+        for (; !json_object_iter_equal(&it, &end); json_object_iter_next(&it)) {
+            const char *key = json_object_iter_peek_name(&it);
+            struct json_object *val = json_object_iter_peek_value(&it);
+            if (!strcmp(key, "reasons"))
+                continue;
+            if (!json_object_is_type(val, json_type_boolean))
+                continue;
+            if (json_object_get_boolean(val))
+                printf("  %s\n", key);
+        }
+    }
+    printf("\nunavailable:\n");
+    {
+        struct json_object_iterator it = json_object_iter_begin(caps);
+        struct json_object_iterator end = json_object_iter_end(caps);
+        for (; !json_object_iter_equal(&it, &end); json_object_iter_next(&it)) {
+            const char *key = json_object_iter_peek_name(&it);
+            struct json_object *val = json_object_iter_peek_value(&it);
+            if (!strcmp(key, "reasons"))
+                continue;
+            if (!json_object_is_type(val, json_type_boolean))
+                continue;
+            if (json_object_get_boolean(val))
+                continue;
+            printf("  %-24s %s\n", key,
+                   json_get_string_def(reasons, key, "no reason reported"));
+        }
+    }
+    json_object_put(resp);
+    return 0;
+}
+
+/*
+ * aps_list carries a full runtime snapshot per AP. The table keeps the
+ * inventory fields an operator needs to pick an ap_id; --json still returns
+ * everything.
+ */
+static int ac_print_aps(struct jmctl_opts *opts)
+{
+    struct json_object *resp;
+    struct json_object *items = NULL;
+    size_t i, n;
+
+    resp = ubus_invoke_json(opts, JMCTL_AC_OBJECT, "aps_list", NULL, NULL);
+    if (opts->json) {
+        int rc = emit_result(opts, "ac aps", "aps_list", NULL, resp);
+        if (resp)
+            json_object_put(resp);
+        return rc;
+    }
+    if (!response_success(resp)) {
+        print_json_obj(resp);
+        if (resp)
+            json_object_put(resp);
+        return 1;
+    }
+    if (!json_object_object_get_ex(resp, "items", &items) ||
+        !items || !json_object_is_type(items, json_type_array)) {
+        print_json_obj(resp);
+        json_object_put(resp);
+        return 1;
+    }
+    n = json_object_array_length(items);
+    if (n == 0) {
+        printf("no managed APs\n");
+        json_object_put(resp);
+        return 0;
+    }
+    /*
+     * Precision on every padded column: a long AP name would otherwise push
+     * the remaining columns out of alignment.
+     */
+    printf("%-36.36s  %-16.16s  %-6.6s  %-9.9s  %s\n",
+           "AP_ID", "NAME", "ONLINE", "STATE", "MODEL");
+    for (i = 0; i < n; i++) {
+        struct json_object *ap = json_object_array_get_idx(items, i);
+        const char *name = json_get_string_def(ap, "name", "");
+        const char *model = json_get_string_def(ap, "model", "");
+        printf("%-36.36s  %-16.16s  %-6.6s  %-9.9s  %s\n",
+               json_get_string_def(ap, "ap_id", "?"),
+               name && name[0] ? name : "-",
+               json_get_bool_def(ap, "online", 0) ? "yes" : "no",
+               json_get_string_def(ap, "adoption_state", "?"),
+               model && model[0] ? model : "-");
+    }
+    printf("\n%zu AP(s)\n", n);
+    json_object_put(resp);
+    return 0;
+}
+
+/* Collect ap_ids from aps_list. Returns the count written into out. */
+static int ac_collect_ap_ids(struct jmctl_opts *opts,
+                             char out[][JMCTL_COMPLETION_WORD_MAX], int max)
+{
+    struct json_object *resp;
+    struct json_object *items = NULL;
+    int count = 0;
+    size_t i, n;
+
+    resp = ubus_invoke_json(opts, JMCTL_AC_OBJECT, "aps_list", NULL, NULL);
+    if (!response_success(resp)) {
+        if (resp)
+            json_object_put(resp);
+        return 0;
+    }
+    if (!json_object_object_get_ex(resp, "items", &items) ||
+        !items || !json_object_is_type(items, json_type_array)) {
+        json_object_put(resp);
+        return 0;
+    }
+    n = json_object_array_length(items);
+    for (i = 0; i < n && count < max; i++) {
+        struct json_object *ap = json_object_array_get_idx(items, i);
+        const char *id = json_get_string_def(ap, "ap_id", "");
+        if (!id || !id[0])
+            continue;
+        snprintf(out[count], JMCTL_COMPLETION_WORD_MAX, "%s", id);
+        count++;
+    }
+    json_object_put(resp);
+    return count;
+}
+
+/*
+ * radio_job_list requires ap_id. Bare "job list" walks aps_list so the common
+ * case does not hand the operator an Invalid argument.
+ */
+static int ac_job_list(struct jmctl_opts *opts, const char *ap_id)
+{
+    char ids[JMCTL_COMPLETION_MAX][JMCTL_COMPLETION_WORD_MAX];
+    int count, i;
+    int failed = 0;
+
+    if (ap_id) {
+        struct json_object *req = json_object_new_object();
+        json_add_string(req, "ap_id", ap_id);
+        return ac_read_call(opts, "ac job list", "radio_job_list", req);
+    }
+
+    count = ac_collect_ap_ids(opts, ids, JMCTL_COMPLETION_MAX);
+    if (count == 0)
+        return print_error(opts, "no_managed_aps",
+                           "aps_list returned no AP; pass an explicit <ap_id>");
+
+    if (opts->json) {
+        struct json_object *root = json_object_new_object();
+        struct json_object *arr = json_object_new_array();
+        for (i = 0; i < count; i++) {
+            struct json_object *req = json_object_new_object();
+            struct json_object *resp;
+            struct json_object *entry = json_object_new_object();
+            json_add_string(req, "ap_id", ids[i]);
+            resp = ubus_invoke_json(opts, JMCTL_AC_OBJECT, "radio_job_list",
+                                    req, NULL);
+            json_add_string(entry, "ap_id", ids[i]);
+            json_object_object_add(entry, "response",
+                                   resp ? json_object_get(resp) : NULL);
+            json_object_array_add(arr, entry);
+            if (!response_success(resp))
+                failed = 1;
+            if (resp)
+                json_object_put(resp);
+            json_object_put(req);
+        }
+        json_object_object_add(root, "ok", json_object_new_boolean(!failed));
+        json_add_string(root, "command", "ac job list");
+        json_add_string(root, "method", "radio_job_list");
+        json_object_object_add(root, "aps", arr);
+        print_json_obj(root);
+        json_object_put(root);
+        return failed ? 1 : 0;
+    }
+
+    for (i = 0; i < count; i++) {
+        struct json_object *req = json_object_new_object();
+        struct json_object *resp;
+        struct json_object *jobs = NULL;
+        json_add_string(req, "ap_id", ids[i]);
+        resp = ubus_invoke_json(opts, JMCTL_AC_OBJECT, "radio_job_list", req, NULL);
+        printf("== ap %s\n", ids[i]);
+        if (!response_success(resp)) {
+            printf("   query failed\n");
+            print_json_obj(resp);
+            failed = 1;
+        } else if (json_object_object_get_ex(resp, "items", &jobs) && jobs &&
+                   json_object_is_type(jobs, json_type_array)) {
+            size_t j, m = json_object_array_length(jobs);
+            if (m == 0) {
+                printf("   no radio jobs\n");
+            } else {
+                printf("   %-36.36s  %-6.6s  %-9.9s  %-10.10s  %s\n",
+                       "JOB_ID", "RADIO", "MODE", "STATE", "UPDATED_AT");
+                for (j = 0; j < m; j++) {
+                    struct json_object *job = json_object_array_get_idx(jobs, j);
+                    struct json_object *upd = NULL;
+                    json_object_object_get_ex(job, "updated_at", &upd);
+                    printf("   %-36.36s  %-6.6s  %-9.9s  %-10.10s  %lld\n",
+                           json_get_string_def(job, "job_id", "?"),
+                           json_get_string_def(job, "radio_id", "-"),
+                           json_get_string_def(job, "mode", "-"),
+                           json_get_string_def(job, "state", "-"),
+                           upd ? (long long)json_object_get_int64(upd) : 0LL);
+                }
+            }
+        } else {
+            print_json_obj(resp);
+        }
+        if (resp)
+            json_object_put(resp);
+        json_object_put(req);
+    }
+    return failed ? 1 : 0;
+}
+
+static int ac_cmd_ap(struct jmctl_opts *opts, int argc, char **argv)
+{
+    struct json_object *req;
+    const char *ap_id;
+    const char *field;
+
+    /* Only "ap set <ap_id> name|model <value>" exists; ap_update takes nothing else. */
+    if (argc < 4 || strcmp(argv[0], "set"))
+        return print_error(opts, "usage",
+                           "jmctl ac ap set <ap_id> name|model <value>");
+    ap_id = argv[1];
+    field = argv[2];
+    if (!is_name_safe(ap_id))
+        return print_error(opts, "invalid_ap_id",
+                           "ap_id contains unsupported characters");
+
+    req = json_object_new_object();
+    json_add_string(req, "ap_id", ap_id);
+    if (!strcmp(field, "name")) {
+        json_add_string(req, "name", argv[3]);
+    } else if (!strcmp(field, "model") || !strcmp(field, "model_override")) {
+        json_add_string(req, "model_override", argv[3]);
+    } else {
+        json_object_put(req);
+        return print_error(opts, "usage",
+                           "only name and model are editable: jmctl ac ap set <ap_id> name|model <value>");
+    }
+    /* Inventory-only edit, no network effect, so no confirmation. */
+    return ac_write_call(opts, "ac ap set", "ap_update", req);
+}
+
+static int ac_print_tokens(struct jmctl_opts *opts)
+{
+    struct json_object *resp;
+    struct json_object *items = NULL;
+    size_t i, n;
+
+    resp = ubus_invoke_json(opts, JMCTL_AC_OBJECT, "pairing_token_list", NULL, NULL);
+    if (opts->json) {
+        int rc = emit_result(opts, "ac token list", "pairing_token_list", NULL, resp);
+        if (resp)
+            json_object_put(resp);
+        return rc;
+    }
+    if (!response_success(resp)) {
+        print_json_obj(resp);
+        if (resp)
+            json_object_put(resp);
+        return 1;
+    }
+    if (!json_object_object_get_ex(resp, "items", &items) ||
+        !items || !json_object_is_type(items, json_type_array)) {
+        print_json_obj(resp);
+        json_object_put(resp);
+        return 1;
+    }
+    n = json_object_array_length(items);
+    if (n == 0) {
+        printf("no pairing tokens\n");
+        json_object_put(resp);
+        return 0;
+    }
+    printf("%-36.36s  %-9.9s  %-10.10s  %-8.8s  %s\n",
+           "TOKEN_ID", "STATE", "SITE", "ATTEMPTS", "EXPIRES_AT");
+    for (i = 0; i < n; i++) {
+        struct json_object *tok = json_object_array_get_idx(items, i);
+        struct json_object *att = NULL, *maxatt = NULL, *exp = NULL;
+        char attempts[24];
+        json_object_object_get_ex(tok, "attempts", &att);
+        json_object_object_get_ex(tok, "max_attempts", &maxatt);
+        json_object_object_get_ex(tok, "expires_at", &exp);
+        snprintf(attempts, sizeof(attempts), "%d/%d",
+                 att ? json_object_get_int(att) : 0,
+                 maxatt ? json_object_get_int(maxatt) : 0);
+        printf("%-36.36s  %-9.9s  %-10.10s  %-8.8s  %lld\n",
+               json_get_string_def(tok, "token_id", "?"),
+               json_get_string_def(tok, "state", "?"),
+               json_get_string_def(tok, "site_id", "-"),
+               attempts,
+               exp ? (long long)json_object_get_int64(exp) : 0LL);
+    }
+    printf("\n%zu token(s)\n", n);
+    json_object_put(resp);
+    return 0;
+}
+
+static int ac_cmd_token(struct jmctl_opts *opts, int argc, char **argv)
+{
+    const char *action;
+
+    if (argc < 1)
+        return print_error(opts, "usage",
+                           "jmctl ac token list|status|create|revoke");
+    action = argv[0];
+
+    if (!strcmp(action, "list")) {
+        if (argc != 1)
+            return print_error(opts, "usage", "jmctl ac token list takes no argument");
+        return ac_print_tokens(opts);
+    }
+
+    if (!strcmp(action, "status")) {
+        struct json_object *req;
+        if (argc != 2)
+            return print_error(opts, "usage", "jmctl ac token status <token_id>");
+        if (!is_name_safe(argv[1]))
+            return print_error(opts, "invalid_token_id",
+                               "token_id contains unsupported characters");
+        req = json_object_new_object();
+        json_add_string(req, "token_id", argv[1]);
+        return ac_read_call(opts, "ac token status", "pairing_token_status", req);
+    }
+
+    if (!strcmp(action, "create")) {
+        /*
+         * pairing_token_create is strict-required on all four fields, so every
+         * one is always sent. Defaults match the backend's accepted range
+         * (ttl 60..86400, attempts 1..10).
+         */
+        int ttl = 3600;
+        int max_attempts = 5;
+        const char *site = "default";
+        const char *digest = "";
+        int assume_yes = 0;
+        struct json_object *req;
+        int i;
+
+        for (i = 1; i < argc; i++) {
+            if (!strcmp(argv[i], "--yes")) {
+                assume_yes = 1;
+            } else if (!strcmp(argv[i], "--ttl") && i + 1 < argc) {
+                ttl = atoi(argv[++i]);
+            } else if (!strcmp(argv[i], "--max-attempts") && i + 1 < argc) {
+                max_attempts = atoi(argv[++i]);
+            } else if (!strcmp(argv[i], "--site") && i + 1 < argc) {
+                site = argv[++i];
+            } else if (!strcmp(argv[i], "--hardware-digest") && i + 1 < argc) {
+                digest = argv[++i];
+            } else {
+                return print_error(opts, "usage",
+                                   "jmctl ac token create [--ttl <sec>] [--max-attempts <n>] [--site <id>] [--hardware-digest <sha256>] [--yes]");
+            }
+        }
+        if (ttl < 60 || ttl > 86400)
+            return print_error(opts, "invalid_ttl", "--ttl must be 60..86400 seconds");
+        if (max_attempts < 1 || max_attempts > 10)
+            return print_error(opts, "invalid_max_attempts", "--max-attempts must be 1..10");
+        if (!ac_site_id_safe(site))
+            return print_error(opts, "invalid_site", "--site contains unsupported characters");
+        if (!assume_yes && !opts->dry_run) {
+            char prompt[160];
+            snprintf(prompt, sizeof(prompt),
+                     "Creating a pairing token lets a new AP join site '%s' for %ds. Continue?",
+                     site, ttl);
+            if (!ac_confirm(opts, prompt))
+                return 1;
+        }
+        req = json_object_new_object();
+        json_object_object_add(req, "ttl_seconds", json_object_new_int(ttl));
+        json_object_object_add(req, "max_attempts", json_object_new_int(max_attempts));
+        json_add_string(req, "site_id", site);
+        json_add_string(req, "hardware_digest", digest);
+        return ac_write_call(opts, "ac token create", "pairing_token_create", req);
+    }
+
+    if (!strcmp(action, "revoke")) {
+        int assume_yes = 0;
+        const char *token_id = NULL;
+        struct json_object *req;
+        int i;
+
+        for (i = 1; i < argc; i++) {
+            if (!strcmp(argv[i], "--yes"))
+                assume_yes = 1;
+            else if (!token_id)
+                token_id = argv[i];
+            else
+                return print_error(opts, "usage", "jmctl ac token revoke <token_id> [--yes]");
+        }
+        if (!token_id)
+            return print_error(opts, "usage", "jmctl ac token revoke <token_id> [--yes]");
+        if (!is_name_safe(token_id))
+            return print_error(opts, "invalid_token_id",
+                               "token_id contains unsupported characters");
+        if (!assume_yes && !opts->dry_run) {
+            char prompt[160];
+            snprintf(prompt, sizeof(prompt),
+                     "Revoking token %s makes any AP currently pairing with it fail. Continue?",
+                     token_id);
+            if (!ac_confirm(opts, prompt))
+                return 1;
+        }
+        req = json_object_new_object();
+        json_add_string(req, "token_id", token_id);
+        return ac_write_call(opts, "ac token revoke", "pairing_token_revoke", req);
+    }
+
+    return print_error(opts, "usage", "jmctl ac token list|status|create|revoke");
+}
+
+static int ac_cmd_job(struct jmctl_opts *opts, int argc, char **argv)
+{
+    const char *action;
+    struct json_object *req;
+
+    if (argc < 1)
+        return print_error(opts, "usage", "jmctl ac job list|status|result|latest");
+    action = argv[0];
+
+    if (!strcmp(action, "list")) {
+        if (argc > 2)
+            return print_error(opts, "usage", "jmctl ac job list [<ap_id>]");
+        if (argc == 2 && !is_name_safe(argv[1]))
+            return print_error(opts, "invalid_ap_id",
+                               "ap_id contains unsupported characters");
+        return ac_job_list(opts, argc == 2 ? argv[1] : NULL);
+    }
+    if (!strcmp(action, "latest")) {
+        if (argc != 1)
+            return print_error(opts, "usage", "jmctl ac job latest takes no argument");
+        return ac_read_call(opts, "ac job latest", "radio_job_latest_results", NULL);
+    }
+    if (!strcmp(action, "status") || !strcmp(action, "result")) {
+        if (argc != 2)
+            return print_error(opts, "usage", "jmctl ac job status|result <job_id>");
+        if (!is_name_safe(argv[1]))
+            return print_error(opts, "invalid_job_id",
+                               "job_id contains unsupported characters");
+        req = json_object_new_object();
+        json_add_string(req, "job_id", argv[1]);
+        if (!strcmp(action, "status"))
+            return ac_read_call(opts, "ac job status", "radio_job_status", req);
+        return ac_read_call(opts, "ac job result", "radio_job_result", req);
+    }
+    return print_error(opts, "usage", "jmctl ac job list|status|result|latest");
+}
+
+static int cmd_ac(struct jmctl_opts *opts, int argc, char **argv)
+{
+    if (argc < 1)
+        return print_error(opts, "usage",
+                           "jmctl ac status|caps|aps|ap|token|job");
+    if (!strcmp(argv[0], "status")) {
+        if (argc != 1)
+            return print_error(opts, "usage", "jmctl ac status takes no argument");
+        return ac_read_call(opts, "ac status", "status", NULL);
+    }
+    if (!strcmp(argv[0], "caps") || !strcmp(argv[0], "capabilities")) {
+        if (argc != 1)
+            return print_error(opts, "usage", "jmctl ac caps takes no argument");
+        return ac_print_caps(opts);
+    }
+    if (!strcmp(argv[0], "aps")) {
+        if (argc != 1)
+            return print_error(opts, "usage", "jmctl ac aps takes no argument");
+        return ac_print_aps(opts);
+    }
+    if (!strcmp(argv[0], "ap"))
+        return ac_cmd_ap(opts, argc - 1, argv + 1);
+    if (!strcmp(argv[0], "token"))
+        return ac_cmd_token(opts, argc - 1, argv + 1);
+    if (!strcmp(argv[0], "job"))
+        return ac_cmd_job(opts, argc - 1, argv + 1);
+    return print_error(opts, "usage", "jmctl ac status|caps|aps|ap|token|job");
+}
+
 static int cmd_raw_ubus(struct jmctl_opts *opts, int argc, char **argv)
 {
     struct json_object *payload = NULL;
@@ -1300,6 +1953,8 @@ static int dispatch_argv(struct jmctl_opts *opts, int argc, char **argv)
         return cmd_set(opts, argc - 1, argv + 1);
     if (!strcmp(argv[0], "user"))
         return cmd_user(opts, argc - 1, argv + 1);
+    if (!strcmp(argv[0], "ac"))
+        return cmd_ac(opts, argc - 1, argv + 1);
     if (!strcmp(argv[0], "ubus"))
         return cmd_raw_ubus(opts, argc - 1, argv + 1);
     if (!strcmp(argv[0], "@llm"))
@@ -1347,7 +2002,11 @@ enum console_ctx_type {
     CTX_ADD_LAN,
     CTX_DEL,
     CTX_USER,
-    CTX_USER_PASSWORD
+    CTX_USER_PASSWORD,
+    CTX_AC,
+    CTX_AC_AP,
+    CTX_AC_TOKEN,
+    CTX_AC_JOB
 };
 
 struct console_ctx {
@@ -1376,6 +2035,10 @@ static const char *console_prompt(struct console_ctx *ctx)
     case CTX_DEL: return "jmctl del> ";
     case CTX_USER: return "jmctl user> ";
     case CTX_USER_PASSWORD: return "jmctl user password> ";
+    case CTX_AC: return "jmctl ac> ";
+    case CTX_AC_AP: return "jmctl ac ap> ";
+    case CTX_AC_TOKEN: return "jmctl ac token> ";
+    case CTX_AC_JOB: return "jmctl ac job> ";
     case CTX_NONE:
     default:
         return "jmctl> ";
@@ -1441,6 +2104,37 @@ static void console_help(struct console_ctx *ctx)
     case CTX_USER_PASSWORD:
         printf("user password usage: set|reset <username> <new-password> [--sync-system]\n");
         break;
+    case CTX_AC:
+        printf("ac usage:\n");
+        printf("  status              Controller/local-wifi/managed-AP/PKI state\n");
+        printf("  caps                Capability flags, with reasons for disabled ones\n");
+        printf("  aps                 List managed APs\n");
+        printf("  ap                  Enter AP inventory context\n");
+        printf("  token               Enter pairing token context\n");
+        printf("  job                 Enter radio scan job context\n");
+        break;
+    case CTX_AC_AP:
+        printf("ac ap usage:\n");
+        printf("  set <ap_id> name <name>    Rename an adopted AP\n");
+        printf("  set <ap_id> model <model>  Override the reported model\n");
+        printf("  Only name and model are editable; SSID/radio apply is not available yet.\n");
+        break;
+    case CTX_AC_TOKEN:
+        printf("ac token usage:\n");
+        printf("  list\n");
+        printf("  status <token_id>\n");
+        printf("  create [--ttl <sec>] [--max-attempts <n>] [--site <id>]\n");
+        printf("         [--hardware-digest <sha256>] [--yes]\n");
+        printf("  revoke <token_id> [--yes]\n");
+        printf("  create/revoke ask for confirmation unless --yes; --dry-run changes nothing.\n");
+        break;
+    case CTX_AC_JOB:
+        printf("ac job usage:\n");
+        printf("  list [<ap_id>]      Without ap_id, walks every managed AP\n");
+        printf("  status <job_id>\n");
+        printf("  result <job_id>\n");
+        printf("  latest              Latest scan results across APs\n");
+        break;
     case CTX_NONE:
     default:
         printf("DreamingWrt jmctl commands:\n");
@@ -1453,6 +2147,7 @@ static void console_help(struct console_ctx *ctx)
         printf("  del         delete WAN/LAN\n");
         printf("  set         update WAN/gateway settings\n");
         printf("  user        web admin password operations\n");
+        printf("  ac          AP controller: status/caps/aps/ap/token/job\n");
         printf("  ubus        raw ubus escape hatch\n");
         printf("  @llm        ask configured AI assistant\n");
         printf("  refresh     reload WAN/LAN/port completion candidates\n");
@@ -1504,10 +2199,11 @@ static int console_handle_line(struct jmctl_opts *opts, struct console_ctx *ctx,
     }
     if (line_is(p, "refresh") || line_is(p, "reload")) {
         completion_refresh(opts);
-        printf("Completion candidates refreshed: ports=%d wans=%d lans=%d\n",
+        printf("Completion candidates refreshed: ports=%d wans=%d lans=%d aps=%d\n",
                g_completion_cache.port_count,
                g_completion_cache.wan_count,
-               g_completion_cache.lan_count);
+               g_completion_cache.lan_count,
+               g_completion_cache.ap_count);
         return 0;
     }
     if (first_arg_is(p, "@llm")) {
@@ -1561,6 +2257,26 @@ static int console_handle_line(struct jmctl_opts *opts, struct console_ctx *ctx,
         }
         if (line_is(p, "user")) {
             ctx->type = CTX_USER;
+            console_help(ctx);
+            return 0;
+        }
+        if (line_is(p, "ac")) {
+            ctx->type = CTX_AC;
+            console_help(ctx);
+            return 0;
+        }
+        if (line_is(p, "ac ap")) {
+            ctx->type = CTX_AC_AP;
+            console_help(ctx);
+            return 0;
+        }
+        if (line_is(p, "ac token")) {
+            ctx->type = CTX_AC_TOKEN;
+            console_help(ctx);
+            return 0;
+        }
+        if (line_is(p, "ac job")) {
+            ctx->type = CTX_AC_JOB;
             console_help(ctx);
             return 0;
         }
@@ -1695,12 +2411,55 @@ static int console_handle_line(struct jmctl_opts *opts, struct console_ctx *ctx,
             console_reset(ctx);
             return rc;
         }
+
+    case CTX_AC:
+        if (line_is(p, "ap")) {
+            ctx->type = CTX_AC_AP;
+            console_help(ctx);
+            return 0;
+        }
+        if (line_is(p, "token")) {
+            ctx->type = CTX_AC_TOKEN;
+            console_help(ctx);
+            return 0;
+        }
+        if (line_is(p, "job")) {
+            ctx->type = CTX_AC_JOB;
+            console_help(ctx);
+            return 0;
+        }
+        {
+            int rc = console_exec_prefixed(opts, "ac", p);
+            console_reset(ctx);
+            return rc;
+        }
+
+    case CTX_AC_AP:
+        {
+            int rc = console_exec_prefixed(opts, "ac ap", p);
+            console_reset(ctx);
+            return rc;
+        }
+
+    case CTX_AC_TOKEN:
+        {
+            int rc = console_exec_prefixed(opts, "ac token", p);
+            console_reset(ctx);
+            return rc;
+        }
+
+    case CTX_AC_JOB:
+        {
+            int rc = console_exec_prefixed(opts, "ac job", p);
+            console_reset(ctx);
+            return rc;
+        }
     }
     return 0;
 }
 
 static const char *root_words[] = {
-    "@llm", "add", "audit", "back", "del", "delete", "doctor", "exit", "help",
+    "@llm", "ac", "add", "audit", "back", "del", "delete", "doctor", "exit", "help",
     "list", "refresh", "reload", "set", "status", "storage", "ubus", "user", NULL
 };
 static const char *audit_words[] = { "status", "prune", "compact", NULL };
@@ -1714,6 +2473,10 @@ static const char *add_lan_words[] = { "lan1", "lan2", NULL };
 static const char *del_words[] = { "wan1", "wan2", "lan1", "lan2", NULL };
 static const char *user_words[] = { "password", NULL };
 static const char *user_password_words[] = { "set", "reset", NULL };
+static const char *ac_words[] = { "status", "caps", "aps", "ap", "token", "job", NULL };
+static const char *ac_ap_words[] = { "set", NULL };
+static const char *ac_token_words[] = { "list", "status", "create", "revoke", NULL };
+static const char *ac_job_words[] = { "list", "status", "result", "latest", NULL };
 
 static const char **completion_words(struct console_ctx *ctx)
 {
@@ -1729,6 +2492,10 @@ static const char **completion_words(struct console_ctx *ctx)
     case CTX_DEL: return del_words;
     case CTX_USER: return user_words;
     case CTX_USER_PASSWORD: return user_password_words;
+    case CTX_AC: return ac_words;
+    case CTX_AC_AP: return ac_ap_words;
+    case CTX_AC_TOKEN: return ac_token_words;
+    case CTX_AC_JOB: return ac_job_words;
     case CTX_SET_GATEWAY:
     case CTX_NONE:
     default: return root_words;
@@ -1831,6 +2598,22 @@ static int completion_collect_matches(struct jmctl_opts *opts, struct console_ct
         completion_add_cache_matches(matches, &count, max_matches,
                                      g_completion_cache.lans, g_completion_cache.lan_count,
                                      prefix, prefix_len);
+        break;
+    case CTX_AC_AP:
+        /* "set <ap_id> name <value>": the ap_id is the second word. */
+        if (word_index == 1) {
+            completion_add_cache_matches(matches, &count, max_matches,
+                                         g_completion_cache.aps, g_completion_cache.ap_count,
+                                         prefix, prefix_len);
+        }
+        break;
+    case CTX_AC_JOB:
+        /* "list <ap_id>": the ap_id is the second word. */
+        if (word_index == 1) {
+            completion_add_cache_matches(matches, &count, max_matches,
+                                         g_completion_cache.aps, g_completion_cache.ap_count,
+                                         prefix, prefix_len);
+        }
         break;
     default:
         break;

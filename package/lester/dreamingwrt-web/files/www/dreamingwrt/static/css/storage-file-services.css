@@ -482,3 +482,17 @@ html[data-theme-resolved="light"] .file-service-field select {
 @media (prefers-reduced-motion: reduce) {
   .file-service-switch i::after { transition: none; }
 }
+
+/*
+ * 搜索与「编辑设置 / 添加共享」已从页面级 header 收进表格工具栏
+ * （design.md 规则 15）。视图切换的分段控件仍留在页面级，它是导航而非动作。
+ */
+.file-service-table-actions {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
+}

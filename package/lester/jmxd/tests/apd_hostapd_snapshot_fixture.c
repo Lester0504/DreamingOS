@@ -3,6 +3,9 @@
 #define APD_HOSTAPD_STANDALONE_TEST 1
 #define APD_HOSTAPD_RUN_DIR "/tmp/apd-hostapd-runtime-fixture-20260722/run"
 #define APD_HOSTAPD_LOCAL_DIR "/tmp/apd-hostapd-runtime-fixture-20260722/local"
+/* Pinned to the fixture tree so the vendor per-radio directory scan cannot
+ * reach the host's real /var/run while these scenarios execute. */
+#define APD_HOSTAPD_RUN_DIR_PARENT "/tmp/apd-hostapd-runtime-fixture-20260722"
 #define APD_HOSTAPD_EXPECTED_UID ((uid_t)getuid())
 #define APD_HOSTAPD_TIMEOUT_MS 100
 #define APD_HOSTAPD_COLLECTION_TIMEOUT_MS 500
@@ -18,6 +21,8 @@
 #include <sys/wait.h>
 
 #define FIXTURE_BASE "/tmp/apd-hostapd-runtime-fixture-20260722"
+/* QSDK-style per-radio control directory, a sibling of the run directory. */
+#define FIXTURE_VENDOR_DIR_PATH FIXTURE_BASE "/hostapd-wifi0"
 
 enum fixture_mode {
     FIXTURE_SUCCESS,
@@ -34,6 +39,11 @@ enum fixture_mode {
     FIXTURE_MISSING_DIR,
     FIXTURE_UNTRUSTED_DIR,
     FIXTURE_UNTRUSTED_LOCAL_DIR,
+    /* QSDK layout: `global` in the run directory, VAP sockets in per-radio
+     * sibling directories (`hostapd-wifiN`). */
+    FIXTURE_VENDOR_DIR,
+    /* Only a `global` socket, with nothing listening on it. */
+    FIXTURE_STALE_GLOBAL,
 };
 
 struct fixture_socket {
@@ -69,8 +79,17 @@ static void fixture_cleanup_paths(struct fixture_socket *sockets,
         if (sockets[i].path[0])
             unlink(sockets[i].path);
     }
+    /*
+     * The `global` socket is not part of the caller's socket_count (the vendor
+     * scenario parks it past the end, the stale one leaves only a path), so both
+     * layouts are removed by name. Leaving one behind would leak into the next
+     * scenario and make it read as a live control channel.
+     */
+    unlink(APD_HOSTAPD_RUN_DIR "/global");
+    unlink(FIXTURE_VENDOR_DIR_PATH "/wlan0");
     rmdir(APD_HOSTAPD_LOCAL_DIR);
     rmdir(APD_HOSTAPD_RUN_DIR);
+    rmdir(FIXTURE_VENDOR_DIR_PATH);
     rmdir(FIXTURE_BASE);
 }
 
@@ -87,7 +106,8 @@ static int fixture_prepare_dirs(void)
     return 0;
 }
 
-static int fixture_open_socket(struct fixture_socket *control, const char *name)
+static int fixture_open_socket_in(struct fixture_socket *control,
+                                  const char *directory, const char *name)
 {
     struct sockaddr_un address = { .sun_family = AF_UNIX };
 
@@ -95,7 +115,7 @@ static int fixture_open_socket(struct fixture_socket *control, const char *name)
     control->fd = -1;
     control->name = name;
     if (snprintf(control->path, sizeof(control->path), "%s/%s",
-                 APD_HOSTAPD_RUN_DIR, name) >= (int)sizeof(control->path))
+                 directory, name) >= (int)sizeof(control->path))
         return -1;
     memcpy(address.sun_path, control->path, strlen(control->path) + 1);
     control->fd = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -103,6 +123,11 @@ static int fixture_open_socket(struct fixture_socket *control, const char *name)
         bind(control->fd, (struct sockaddr *)&address, sizeof(address)) != 0)
         return -1;
     return 0;
+}
+
+static int fixture_open_socket(struct fixture_socket *control, const char *name)
+{
+    return fixture_open_socket_in(control, APD_HOSTAPD_RUN_DIR, name);
 }
 
 static int fixture_reply(int fd, const struct sockaddr_un *peer,
@@ -321,6 +346,27 @@ static int fixture_assert_result(enum fixture_mode mode,
             result->station_count != 0 ||
             strcmp(result->reason, "local_control_directory_untrusted"))
             return 35;
+    } else if (mode == FIXTURE_VENDOR_DIR) {
+        /*
+         * The QSDK case this was blind to. The VAP socket lives in
+         * `hostapd-wifi0`, not in the run directory, and the old collector saw
+         * only `global` there and reported per_interface_control_unavailable on
+         * a device where the socket existed and answered.
+         */
+        if (!result->available || !result->complete ||
+            result->interface_controls != 1 || result->bss_count != 1 ||
+            strcmp(result->bss[0].interface, "wlan0") ||
+            !result->global_control || result->reason[0])
+            return 36;
+    } else if (mode == FIXTURE_STALE_GLOBAL) {
+        /*
+         * A `global` socket nobody listens on must not be read as a live
+         * control channel. lstat proves the inode, not a listener.
+         */
+        if (result->available || result->complete || result->bss_count != 0 ||
+            !result->global_control ||
+            strcmp(result->reason, "hostapd_control_socket_stale"))
+            return 37;
     }
     return 0;
 }
@@ -369,6 +415,12 @@ static int fixture_parse_mode(const char *value, enum fixture_mode *mode,
     } else if (!strcmp(value, "untrusted-local-dir")) {
         *mode = FIXTURE_UNTRUSTED_LOCAL_DIR;
         *socket_count = 1;
+    } else if (!strcmp(value, "vendor-dir")) {
+        *mode = FIXTURE_VENDOR_DIR;
+        *socket_count = 1;
+    } else if (!strcmp(value, "stale-global")) {
+        *mode = FIXTURE_STALE_GLOBAL;
+        *socket_count = 0;
     } else {
         return -1;
     }
@@ -394,8 +446,36 @@ int main(int argc, char **argv)
     fixture_cleanup_paths(sockets, 0);
     if (fixture_prepare_dirs() != 0)
         return 65;
+    /*
+     * Both new scenarios need a `global` socket present. In the vendor case a
+     * live one, because the collector now probes it; in the stale case an inode
+     * with no listener, which is what hostapd leaves behind when it exits.
+     */
+    if (mode == FIXTURE_VENDOR_DIR || mode == FIXTURE_STALE_GLOBAL) {
+        struct fixture_socket global_socket;
+
+        if (fixture_open_socket(&global_socket, "global") != 0) {
+            fixture_cleanup_paths(sockets, socket_count);
+            return 66;
+        }
+        /*
+         * The fd is closed while the path stays: an inode with no listener.
+         * That is exactly the abandoned socket hostapd leaves behind. The
+         * vendor scenario never probes it (the probe only runs when no
+         * per-interface socket was found), so one layout serves both.
+         */
+        close(global_socket.fd);
+    }
+    if (mode == FIXTURE_VENDOR_DIR && mkdir(FIXTURE_VENDOR_DIR_PATH, 0700) != 0 &&
+        errno != EEXIST) {
+        fixture_cleanup_paths(sockets, socket_count);
+        return 65;
+    }
     for (i = 0; i < socket_count; i++) {
-        if (fixture_open_socket(&sockets[i], names[i]) != 0) {
+        if ((mode == FIXTURE_VENDOR_DIR ?
+                fixture_open_socket_in(&sockets[i], FIXTURE_VENDOR_DIR_PATH,
+                                       names[i]) :
+                fixture_open_socket(&sockets[i], names[i])) != 0) {
             fixture_cleanup_paths(sockets, socket_count);
             return 66;
         }

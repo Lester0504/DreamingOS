@@ -275,6 +275,20 @@ static const struct route_risk g_route_risks[] = {
     /* AC controller reads are observable; pairing-token lifecycle is admin-grade. */
     { "/api/v1/ac/status",         "GET,HEAD", JMX_RISK_LOW },
     { "/api/v1/ac/aps",            "GET,HEAD", JMX_RISK_LOW },
+    /*
+     * Unpair / forget-AP is owner-only, and is listed BEFORE the id-subtree
+     * PATCH row below because the table returns the first match: a bare
+     * "/api/v1/ac/aps/" prefix would otherwise answer for these paths too and
+     * hand them the MEDIUM risk meant for rename.
+     *
+     * Registered ahead of the REST route existing on purpose. Dropping unpair
+     * through to the unknown-write default would make it MEDIUM, which admits
+     * `admin`; losing controller management of an AP is as destructive as a
+     * factory reset, so it belongs with reboot at owner-only. The apd side
+     * additionally requires {"confirm": true} and answers
+     * `confirmation_required` without deleting anything when it is absent.
+     */
+    { "/api/v1/ac/aps/unpair",     "POST,PUT,DELETE", JMX_RISK_HIGH },
     /* AP inventory edits (rename / model override) are controller-side metadata
      * only, but they change what every operator sees, so they stay admin-grade.
      * The trailing '/' makes this an explicit id subtree. */
@@ -703,7 +717,29 @@ static const struct route_risk g_route_risks[] = {
     { "/api/v1/services/multicast",        "POST,PUT", JMX_RISK_MEDIUM },
     { "/api/v1/network/hybrid-lines",      "POST,PUT", JMX_RISK_MEDIUM },
     { "/api/v1/device/config/lan",         "POST,PUT", JMX_RISK_MEDIUM },
-    { "/api/v1/client_override",           "POST,PUT,PATCH", JMX_RISK_MEDIUM },
+    /*
+     * Client presentation-layer overrides: custom name, icon/image, pinned,
+     * hidden, note. These change how a device is displayed and nothing else —
+     * no reachability, no firewall rule, no traffic policy — and a mistake is
+     * corrected in place. LOW_WRITE so an operator-role App can edit them while
+     * viewer stays read-only.
+     *
+     * Both rows are required and must stay in agreement: /api/v1/clients/{mac}
+     * PATCH and /api/v1/client_override dispatch to the same ubus method
+     * (jmx_app_api.c) and write the same tables, so levelling only one of them
+     * would leave the other as a differently-gated path to the same write.
+     * Destructive client actions are not covered here: kick/block/limit go
+     * through /api/v1/clients/{mac}/actions and the client_control_* and
+     * client_connections rows, which keep their own stricter levels.
+     *
+     * The clients rows are written as exact paths, not as a "/api/v1/clients/"
+     * subtree, on purpose. A subtree prefix would also swallow
+     * /api/v1/clients/{mac}/wan-policy PATCH, which binds a client to a WAN and
+     * is traffic policy rather than presentation. That route currently answers
+     * 501 not_implemented, so a subtree rule would look harmless today and
+     * quietly ship an under-gated write the moment it is implemented.
+     */
+    { "/api/v1/client_override",           "POST,PUT,PATCH", JMX_RISK_LOW_WRITE },
     { "/api/v1/client_control_rules",      "POST", JMX_RISK_MEDIUM },
     { "/api/v1/logs/channels",             "POST,PUT", JMX_RISK_MEDIUM },
     { "/api/v1/logs/warning-rules",        "POST,PUT", JMX_RISK_MEDIUM },
@@ -784,17 +820,128 @@ static int route_prefix_matches(const char *path, const char *prefix)
     return path[len] == '\0' || path[len] == '/';
 }
 
+/*
+ * Client identity override: PATCH /api/v1/clients/{mac}
+ *                          PATCH /api/v1/clients/{mac}/identity
+ *
+ * The {mac} segment is variable, so this cannot be expressed as a static table
+ * prefix without also covering sibling subresources such as .../wan-policy.
+ * The shape tested here mirrors the dispatcher condition in jmx_app_api.c that
+ * routes these two paths to the client_override ubus method; keep the two in
+ * agreement, since a path that dispatches to client_override but is not
+ * recognised here would silently fall through to the default MEDIUM.
+ */
+static int route_is_client_identity_patch(const char *method, const char *path)
+{
+    static const char prefix[] = "/api/v1/clients/";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    const char *rest, *slash;
+
+    if (strcmp(method, "PATCH") != 0)
+        return 0;
+    if (strncmp(path, prefix, prefix_len) != 0)
+        return 0;
+
+    rest = path + prefix_len;
+    if (!rest[0])
+        return 0;               /* no mac segment */
+
+    slash = strchr(rest, '/');
+    if (!slash)
+        return 1;               /* /api/v1/clients/{mac} */
+    if (slash == rest)
+        return 0;               /* empty mac segment */
+    return strcmp(slash, "/identity") == 0;
+}
+
+/*
+ * Unpair / forget-AP: any write shape that revokes an adoption.
+ *
+ * The {ap_id} segment is variable, so the id-bearing shapes cannot be written
+ * as static table prefixes without also swallowing sibling subresources such
+ * as the rename PATCH. Recognised here instead:
+ *
+ *   POST|PUT|DELETE /api/v1/ac/aps/{ap_id}/unpair
+ *   DELETE          /api/v1/ac/aps/{ap_id}          (forget from inventory)
+ *   POST|PUT|DELETE /api/v1/apd/unpair              (AP-local, no id)
+ *
+ * This is deliberately written before any of these routes exist. The default
+ * for an unregistered write is MEDIUM, which admits `admin`; an unpair costs
+ * the controller its management of that AP, so it is owner-only like reboot.
+ * If a route lands with a shape not covered here it silently falls back to
+ * MEDIUM, so keep this in agreement with the dispatcher in jmx_app_api.c.
+ *
+ * Consulted ahead of the risk table, not after it, because the rename row
+ * "/api/v1/ac/aps/" would otherwise answer MEDIUM for a PATCH-shaped unpair
+ * under the same id subtree.
+ */
+static int route_is_ap_unpair(const char *method, const char *path)
+{
+    static const char aps[] = "/api/v1/ac/aps/";
+    const size_t aps_len = sizeof(aps) - 1;
+    const char *rest, *slash;
+
+    if (method_is_readonly(method))
+        return 0;
+
+    if (!strcmp(path, "/api/v1/apd/unpair"))
+        return 1;
+
+    if (strncmp(path, aps, aps_len) != 0)
+        return 0;
+
+    rest = path + aps_len;
+    if (!rest[0])
+        return 0;               /* no ap_id segment */
+
+    slash = strchr(rest, '/');
+    if (!slash) {
+        /*
+         * Final segment. Either the collection-level unpair route
+         * ("/api/v1/ac/aps/unpair", any write verb), or a bare id being
+         * deleted, which forgets the AP and is an unpair by another name.
+         *
+         * The literal check is not redundant with the table row for that path:
+         * the row lists POST,PUT,DELETE, so a PATCH would otherwise fall
+         * through to the rename id-subtree row and be answered MEDIUM.
+         */
+        if (!strcmp(rest, "unpair"))
+            return 1;
+        return !strcmp(method, "DELETE");    /* forget AP by id */
+    }
+    if (slash == rest)
+        return 0;               /* empty ap_id segment */
+    return strcmp(slash, "/unpair") == 0;
+}
+
 jmx_risk_t jmx_perm_route_risk(const char *method, const char *path)
 {
     const struct route_risk *r;
 
     if (!method || !path || !method[0] || !path[0]) return JMX_RISK_BLOCKED;
 
+    /*
+     * Deliberately ahead of the table. "/api/v1/ac/aps/" is registered as a
+     * PATCH id-subtree for rename, so a PATCH-shaped unpair under that subtree
+     * would match the rename row and be answered MEDIUM. An unpair must not be
+     * reachable by `admin` regardless of which verb it lands on.
+     */
+    if (route_is_ap_unpair(method, path))
+        return JMX_RISK_HIGH;
+
     for (r = g_route_risks; r->prefix; r++) {
         if (!route_prefix_matches(path, r->prefix)) continue;
         if (!method_matches(method, r->methods)) continue;
         return r->risk;
     }
+
+    /*
+     * Checked after the explicit table so a future table row for this subtree
+     * still wins, and before the default so the presentation-layer override
+     * does not fall through to MEDIUM.
+     */
+    if (route_is_client_identity_patch(method, path))
+        return JMX_RISK_LOW_WRITE;
 
     return method_is_readonly(method) ? JMX_RISK_LOW : JMX_RISK_MEDIUM;
 }
@@ -817,7 +964,11 @@ int jmx_perm_check(jmx_role_t role, jmx_risk_t risk)
     if (risk == JMX_RISK_MEDIUM)
         return (role == JMX_ROLE_ADMIN || role == JMX_ROLE_OWNER) ? 1 : 0;
 
-    /* low — everyone except viewer/ai-agent checked above */
+    /*
+     * low / low_write — operator, admin, owner. viewer and ai-agent were both
+     * answered above and never reach here, so low_write stays closed to the
+     * read-only audiences by construction rather than by an extra test.
+     */
     return 1;
 }
 
@@ -839,6 +990,7 @@ const char *jmx_perm_risk_str(jmx_risk_t r)
 {
     switch (r) {
     case JMX_RISK_LOW:     return "low";
+    case JMX_RISK_LOW_WRITE: return "low_write";
     case JMX_RISK_MEDIUM:  return "medium";
     case JMX_RISK_HIGH:    return "high";
     case JMX_RISK_BLOCKED: return "blocked";

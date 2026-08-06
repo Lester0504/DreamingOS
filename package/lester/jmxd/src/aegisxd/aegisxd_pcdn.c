@@ -12,6 +12,10 @@
 #define PCDN_MAX_BYTES (2U * 1024U * 1024U)
 #define PCDN_MAX_RULES 20000U
 #define PCDN_MAX_REJECTED 10000U
+/* Rejected-rule samples recorded so a source format change can be audited
+ * without re-downloading; the count alone cannot say what was dropped. */
+#define PCDN_REJECT_SAMPLES 8
+#define PCDN_REJECT_SAMPLE_BUFSZ 128
 
 struct pcdn_download {
     FILE *fp;
@@ -24,6 +28,9 @@ struct pcdn_rules {
     size_t count;
     size_t capacity;
     size_t rejected;
+    char samples[PCDN_REJECT_SAMPLES][PCDN_REJECT_SAMPLE_BUFSZ];
+    const char *sample_reasons[PCDN_REJECT_SAMPLES];
+    size_t sample_count;
 };
 
 struct pcdn_settings {
@@ -725,6 +732,38 @@ static int pcdn_rules_add(struct pcdn_rules *rules, const char *domain)
     return 0;
 }
 
+static void pcdn_reject_record(struct pcdn_rules *rules, const char *line,
+                               const char *reason)
+{
+    size_t i, o = 0;
+
+    if (rules->sample_count >= PCDN_REJECT_SAMPLES)
+        return;
+    i = rules->sample_count++;
+    /* Remote text is untrusted and lands in logs and JSON, so keep only
+     * printable ASCII and cap the length. */
+    for (const char *p = line ? line : ""; *p && o < PCDN_REJECT_SAMPLE_BUFSZ - 1; p++)
+        rules->samples[i][o++] = (*p >= 0x20 && *p < 0x7f) ? *p : '.';
+    rules->samples[i][o] = '\0';
+    rules->sample_reasons[i] = reason ? reason : "unspecified";
+}
+
+/* rejected_count alone cannot say whether the source changed format or the
+ * parser is too strict, so publish a bounded sample of what was dropped. */
+static struct json_object *pcdn_rejected_samples_json(const struct pcdn_rules *rules)
+{
+    struct json_object *arr = json_object_new_array();
+
+    for (size_t i = 0; i < rules->sample_count; i++) {
+        struct json_object *o = json_object_new_object();
+
+        aegisxd_json_add_string(o, "line", rules->samples[i]);
+        aegisxd_json_add_string(o, "reason", rules->sample_reasons[i]);
+        json_object_array_add(arr, o);
+    }
+    return arr;
+}
+
 static int pcdn_rules_load(const char *path, struct pcdn_rules *rules)
 {
     FILE *fp = fopen(path, "r");
@@ -734,18 +773,21 @@ static int pcdn_rules_load(const char *path, struct pcdn_rules *rules)
         return -1;
     while (fgets(line, sizeof(line), fp)) {
         int parsed;
+        const char *reason = "unspecified";
 
         if (!strchr(line, '\n') && !feof(fp)) {
             int c;
             while ((c = fgetc(fp)) != '\n' && c != EOF) {}
+            pcdn_reject_record(rules, line, "line_too_long");
             if (++rules->rejected > PCDN_MAX_REJECTED)
                 goto fail;
             continue;
         }
-        parsed = aegisxd_pcdn_parse_line(line, domain, sizeof(domain));
+        parsed = aegisxd_pcdn_parse_line_ex(line, domain, sizeof(domain), &reason);
         if (parsed == 0)
             continue;
         if (parsed < 0) {
+            pcdn_reject_record(rules, line, reason);
             if (++rules->rejected > PCDN_MAX_REJECTED)
                 goto fail;
             continue;
@@ -1037,6 +1079,26 @@ static void pcdn_sync_error(const char *error)
     sqlite3_finalize(st);
 }
 
+/* A bare "pcdn_download_failed" cannot distinguish a transient network blip
+ * from a source that is gone, and those need opposite responses.  Keep the
+ * stable prefix for existing consumers and append the libcurl symbol plus the
+ * HTTP status when one was received. */
+static void pcdn_download_error_detail(CURLcode cc, long http_status,
+                                      char *out, size_t out_len)
+{
+    const char *name = curl_easy_strerror(cc);
+    int n;
+
+    n = snprintf(out, out_len, "pcdn_download_failed:CURLE_%d", (int)cc);
+    if (n < 0 || (size_t)n >= out_len)
+        return;
+    if (http_status > 0)
+        n += snprintf(out + n, out_len - (size_t)n, ":http_%ld", http_status);
+    if (n < 0 || (size_t)n >= out_len || !name || !name[0])
+        return;
+    snprintf(out + n, out_len - (size_t)n, ":%s", name);
+}
+
 static struct json_object *pcdn_sync_run(void)
 {
     struct json_object *resp;
@@ -1047,6 +1109,8 @@ static struct json_object *pcdn_sync_run(void)
     CURLcode cc = CURLE_FAILED_INIT;
     char raw[AEGISXD_MAX_PATH] = "", canonical[AEGISXD_MAX_PATH] = "";
     char final[AEGISXD_MAX_PATH] = "", sha256[65] = "";
+    char download_error[192] = "";
+    long http_status = 0;
     sqlite3_stmt *st = NULL;
     const char *error = "pcdn_sync_failed";
     int installed = 0, repaired = 0;
@@ -1080,6 +1144,10 @@ static struct json_object *pcdn_sync_run(void)
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, pcdn_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &download);
     cc = curl_easy_perform(curl);
+    /* Read the status before the handle is released; on CURLE_HTTP_RETURNED_ERROR
+     * this is what separates 403/429 rate limiting from a 404 dead source. */
+    if (curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status) != CURLE_OK)
+        http_status = 0;
     if (fflush(download.fp) != 0 || fsync(fileno(download.fp)) != 0) {
         error = "pcdn_download_write_failed";
         goto fail;
@@ -1093,13 +1161,23 @@ static struct json_object *pcdn_sync_run(void)
     curl_easy_cleanup(curl);
     curl = NULL;
     if (cc != CURLE_OK) {
-        error = download.too_large ? "pcdn_source_too_large" : "pcdn_download_failed";
+        if (download.too_large) {
+            error = "pcdn_source_too_large";
+        } else {
+            pcdn_download_error_detail(cc, http_status, download_error,
+                                       sizeof(download_error));
+            error = download_error;
+        }
         goto fail;
     }
     if (pcdn_rules_load(raw, &rules) != 0) {
         error = "pcdn_rules_invalid_or_empty";
         goto fail;
     }
+    if (rules.rejected)
+        for (size_t i = 0; i < rules.sample_count; i++)
+            fprintf(stderr, "[dreamingwrt-aegisxd] pcdn rejected rule %zu/%zu reason=%s line=%s\n",
+                    i + 1, rules.rejected, rules.sample_reasons[i], rules.samples[i]);
     if (pcdn_rules_write(canonical, &rules) != 0 || pcdn_sha256_file(canonical, sha256) != 0) {
         error = "pcdn_artifact_validation_failed";
         goto fail;
@@ -1146,6 +1224,10 @@ static struct json_object *pcdn_sync_run(void)
     json_object_object_add(resp, "dataplane_changed", json_object_new_boolean(0));
     json_object_object_add(resp, "apply_required", json_object_new_boolean(previous.enabled));
     json_object_object_add(resp, "downloaded_bytes", json_object_new_int64((int64_t)download.written));
+    json_object_object_add(resp, "rejected_count", json_object_new_int((int)rules.rejected));
+    json_object_object_add(resp, "rejected_samples", pcdn_rejected_samples_json(&rules));
+    json_object_object_add(resp, "rejected_samples_truncated",
+                           json_object_new_boolean(rules.rejected > rules.sample_count));
     json_object_object_add(resp, "artifact_cleanup",
                            pcdn_cleanup_artifacts(final, previous.artifact_path));
     free(rules.items);

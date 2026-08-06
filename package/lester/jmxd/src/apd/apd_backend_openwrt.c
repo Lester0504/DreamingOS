@@ -48,6 +48,26 @@
 #ifndef APD_HOSTAPD_RUN_DIR
 #define APD_HOSTAPD_RUN_DIR "/var/run/hostapd"
 #endif
+/*
+ * QCA/QSDK builds (QWRT on the BE10000) do not put per-interface control
+ * sockets in APD_HOSTAPD_RUN_DIR. That directory holds only the `global`
+ * socket, and each radio gets its own `ctrl_interface=/var/run/hostapd-wifiN`
+ * directory holding the VAP sockets (ath0, ath01, ...). Scanning only the main
+ * directory therefore found a global socket and no per-interface ones, and
+ * concluded `per_interface_control_unavailable` on a device where every socket
+ * was present. The sibling directories are matched by this prefix under the
+ * same parent as the main run directory.
+ */
+#ifndef APD_HOSTAPD_RUN_DIR_PARENT
+#define APD_HOSTAPD_RUN_DIR_PARENT "/var/run"
+#endif
+#ifndef APD_HOSTAPD_VENDOR_DIR_PREFIX
+#define APD_HOSTAPD_VENDOR_DIR_PREFIX "hostapd-"
+#endif
+/* Bounds the sibling-directory scan; QSDK ships at most a handful of radios. */
+#ifndef APD_HOSTAPD_VENDOR_DIR_LIMIT
+#define APD_HOSTAPD_VENDOR_DIR_LIMIT 8
+#endif
 #ifndef APD_IW_PATH
 #define APD_IW_PATH ""
 #endif
@@ -75,6 +95,18 @@
 #ifndef APD_HOSTAPD_BSS_LIMIT
 #define APD_HOSTAPD_BSS_LIMIT 32U
 #endif
+/*
+ * Size of the control-directory paths held while scanning.
+ *
+ * These buffers only ever feed apd_hostapd_socket_path(), which writes
+ * "<dir>/<name>" into a sockaddr_un sun_path, so a directory longer than
+ * sun_path is unusable no matter how much room we reserve for it. PATH_MAX
+ * per entry is what overflowed the collector's stack: BSS_LIMIT plus the
+ * vendor directories came to roughly 166KB in a single frame, against the
+ * 128KB default thread stack musl gives the transport worker, so the
+ * function faulted in its prologue as soon as a radio was present.
+ */
+#define APD_HOSTAPD_DIR_LEN sizeof(((struct sockaddr_un *)0)->sun_path)
 #ifndef APD_HOSTAPD_STATION_LIMIT
 #define APD_HOSTAPD_STATION_LIMIT 256U
 #endif
@@ -3060,6 +3092,65 @@ static int apd_hostapd_control_dir_available(void)
            !(st.st_mode & (S_IWGRP | S_IWOTH));
 }
 
+/* A control directory is only trusted when root owns it and it is not
+ * group/world writable, matching the check already applied to the main run
+ * directory. Applied to vendor directories too so widening the search does not
+ * widen who may plant a socket we then talk to. */
+static int apd_hostapd_dir_trusted(const char *path)
+{
+    struct stat st;
+
+    return path && lstat(path, &st) == 0 && S_ISDIR(st.st_mode) &&
+           st.st_uid == APD_HOSTAPD_EXPECTED_UID &&
+           !(st.st_mode & (S_IWGRP | S_IWOTH));
+}
+
+/*
+ * Collects the QSDK per-radio control directories (`/var/run/hostapd-wifiN`).
+ * Only names starting with the vendor prefix and holding a trusted directory
+ * are accepted, and the count is bounded. Returns the number appended.
+ */
+static size_t apd_hostapd_vendor_dirs(char (*out)[APD_HOSTAPD_DIR_LEN],
+                                      size_t out_limit)
+{
+    DIR *parent = opendir(APD_HOSTAPD_RUN_DIR_PARENT);
+    struct dirent *entry;
+    size_t found = 0;
+    size_t prefix_len = strlen(APD_HOSTAPD_VENDOR_DIR_PREFIX);
+
+    if (!parent || !out || out_limit == 0) {
+        if (parent)
+            closedir(parent);
+        return 0;
+    }
+    while ((entry = readdir(parent)) != NULL && found < out_limit) {
+        char path[PATH_MAX];
+
+        if (entry->d_name[0] == '.')
+            continue;
+        if (strncmp(entry->d_name, APD_HOSTAPD_VENDOR_DIR_PREFIX, prefix_len))
+            continue;
+        /* The suffix must be a plain interface-ish token; this rejects
+         * `hostapd-global.pid` and similar non-directory siblings early. */
+        if (!entry->d_name[prefix_len] ||
+            !apd_hostapd_safe_name(entry->d_name + prefix_len))
+            continue;
+        if (snprintf(path, sizeof(path), "%s/%s", APD_HOSTAPD_RUN_DIR_PARENT,
+                     entry->d_name) >= (int)sizeof(path))
+            continue;
+        if (!apd_hostapd_dir_trusted(path))
+            continue;
+        /* Skip anything that cannot round-trip through sun_path rather than
+         * storing a truncated directory we would fail to dial later. */
+        if ((size_t)snprintf(out[found], APD_HOSTAPD_DIR_LEN, "%s", path) >=
+            APD_HOSTAPD_DIR_LEN)
+            continue;
+        found++;
+    }
+    closedir(parent);
+    return found;
+}
+
 static int apd_hostapd_local_dir_prepare(void)
 {
     struct stat st;
@@ -3188,6 +3279,26 @@ done:
         S_ISSOCK(cleanup_st.st_mode) && cleanup_st.st_uid == getuid())
         unlink(local.sun_path);
     return rc;
+}
+
+/*
+ * Liveness probe for a control socket. These are SOCK_DGRAM, so `connect()`
+ * succeeds against an abandoned inode and proves nothing; only a reply proves a
+ * listener. `PING` is hostapd's own no-op command, so this reads state without
+ * changing it. A timeout counts as dead: the socket exists but nothing answers.
+ */
+static int apd_hostapd_socket_alive(const char *directory, const char *name)
+{
+    char remote_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    char response[64];
+    size_t response_len = 0;
+
+    if (apd_hostapd_socket_path(directory, name, remote_path,
+                                sizeof(remote_path)) != 0)
+        return 0;
+    return apd_hostapd_request(remote_path, "PING", response, sizeof(response),
+                               &response_len, 0) == APD_HOSTAPD_REQUEST_OK &&
+           response_len > 0;
 }
 
 static char *apd_hostapd_next_line(char **cursor)
@@ -3478,11 +3589,6 @@ static int apd_hostapd_collect_bss(const char *remote_path,
     }
 }
 
-static int apd_hostapd_name_compare(const void *left, const void *right)
-{
-    return strcmp((const char *)left, (const char *)right);
-}
-
 static int apd_hostapd_collect_raw(int phy_count,
                                    struct apd_hostapd_observation *result)
 {
@@ -3490,6 +3596,11 @@ static int apd_hostapd_collect_raw(int phy_count,
     struct dirent *entry;
     struct stat dir_st;
     char names[APD_HOSTAPD_BSS_LIMIT][APD_HOSTAPD_IFACE_LEN + 1];
+    /* Directory each socket in `names` lives in, so a VAP found in a vendor
+     * per-radio directory is reconnected there rather than in the main one. */
+    char dirs[APD_HOSTAPD_BSS_LIMIT][APD_HOSTAPD_DIR_LEN];
+    char scan_dirs[APD_HOSTAPD_VENDOR_DIR_LIMIT + 1][APD_HOSTAPD_DIR_LEN];
+    size_t scan_dir_count = 0;
     char *response;
     size_t scanned = 0;
     size_t name_count = 0;
@@ -3523,47 +3634,82 @@ static int apd_hostapd_collect_raw(int phy_count,
                                "local_control_directory_untrusted");
         return -1;
     }
-    dir = opendir(APD_HOSTAPD_RUN_DIR);
-    if (!dir) {
-        apd_hostapd_set_reason(result->reason, sizeof(result->reason),
-                               "control_directory_unavailable");
-        return -1;
-    }
-    result->directory_available = 1;
-    while ((entry = readdir(dir)) != NULL) {
-        char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
-        struct stat st;
-        size_t name_len;
+    /* Main run directory first, then the vendor per-radio directories. On
+     * mainline OpenWrt the vendor scan finds nothing and behavior is unchanged;
+     * on QSDK it is where every per-interface socket actually lives. */
+    snprintf(scan_dirs[0], APD_HOSTAPD_DIR_LEN, "%s", APD_HOSTAPD_RUN_DIR);
+    scan_dir_count = 1;
+    scan_dir_count += apd_hostapd_vendor_dirs(&scan_dirs[1],
+                                              APD_HOSTAPD_VENDOR_DIR_LIMIT);
+    for (i = 0; i < scan_dir_count; i++) {
+        const char *scan_dir = scan_dirs[i];
 
-        if (entry->d_name[0] == '.')
+        dir = opendir(scan_dir);
+        if (!dir) {
+            /* The main directory failing is fatal; a vendor directory that
+             * vanished between listing and opening is not. */
+            if (i == 0) {
+                apd_hostapd_set_reason(result->reason, sizeof(result->reason),
+                                       "control_directory_unavailable");
+                return -1;
+            }
             continue;
-        if (++scanned > APD_HOSTAPD_SOCKET_SCAN_LIMIT) {
-            result->socket_scan_limited = 1;
+        }
+        if (i == 0)
+            result->directory_available = 1;
+        while ((entry = readdir(dir)) != NULL) {
+            char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+            struct stat st;
+            size_t name_len;
+
+            if (entry->d_name[0] == '.')
+                continue;
+            if (++scanned > APD_HOSTAPD_SOCKET_SCAN_LIMIT) {
+                result->socket_scan_limited = 1;
+                break;
+            }
+            if (apd_hostapd_socket_path(scan_dir, entry->d_name,
+                                        path, sizeof(path)) != 0 ||
+                lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode) ||
+                st.st_uid != APD_HOSTAPD_EXPECTED_UID)
+                continue;
+            if (!strcmp(entry->d_name, "global")) {
+                result->global_control = 1;
+                continue;
+            }
+            if (!apd_hostapd_safe_name(entry->d_name))
+                continue;
+            name_len = strlen(entry->d_name);
+            if (name_len >= sizeof(names[0]))
+                continue;
+            /* The same VAP name can appear in more than one directory; count
+             * and dial it once. */
+            {
+                size_t seen;
+                int duplicate = 0;
+
+                for (seen = 0; seen < name_count; seen++) {
+                    if (!strcmp(names[seen], entry->d_name)) {
+                        duplicate = 1;
+                        break;
+                    }
+                }
+                if (duplicate)
+                    continue;
+            }
+            result->interface_controls++;
+            if (name_count >= APD_HOSTAPD_BSS_LIMIT) {
+                result->bss_limited = 1;
+                continue;
+            }
+            memcpy(names[name_count], entry->d_name, name_len + 1);
+            snprintf(dirs[name_count], APD_HOSTAPD_DIR_LEN, "%s", scan_dir);
+            name_count++;
+        }
+        closedir(dir);
+        if (result->socket_scan_limited)
             break;
-        }
-        if (apd_hostapd_socket_path(APD_HOSTAPD_RUN_DIR, entry->d_name,
-                                    path, sizeof(path)) != 0 ||
-            lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode) ||
-            st.st_uid != APD_HOSTAPD_EXPECTED_UID)
-            continue;
-        if (!strcmp(entry->d_name, "global")) {
-            result->global_control = 1;
-            continue;
-        }
-        if (!apd_hostapd_safe_name(entry->d_name))
-            continue;
-        name_len = strlen(entry->d_name);
-        if (name_len >= sizeof(names[0]))
-            continue;
-        result->interface_controls++;
-        if (name_count >= APD_HOSTAPD_BSS_LIMIT) {
-            result->bss_limited = 1;
-            continue;
-        }
-        memcpy(names[name_count], entry->d_name, name_len + 1);
-        name_count++;
     }
-    closedir(dir);
     result->available = result->interface_controls > 0;
     if (!name_count) {
         if (phy_count == 0) {
@@ -3571,15 +3717,41 @@ static int apd_hostapd_collect_raw(int phy_count,
             apd_hostapd_set_reason(result->reason, sizeof(result->reason),
                                    "no_phy_detected");
         } else if (result->global_control) {
+            /*
+             * A `global` socket alone used to be read as "hostapd is running
+             * but exposes no per-interface control". That inference is wrong
+             * when hostapd has exited and left the socket behind: lstat only
+             * proves the inode exists, not that anything is listening. Connect
+             * to it, and if nothing accepts, report the stale socket for what
+             * it is instead of an unavailable control interface.
+             */
             apd_hostapd_set_reason(result->reason, sizeof(result->reason),
-                                   "per_interface_control_unavailable");
+                apd_hostapd_socket_alive(APD_HOSTAPD_RUN_DIR, "global") ?
+                    "per_interface_control_unavailable" :
+                    "hostapd_control_socket_stale");
         } else {
             apd_hostapd_set_reason(result->reason, sizeof(result->reason),
                                    "control_sockets_unavailable");
         }
         return result->complete ? 0 : -1;
     }
-    qsort(names, name_count, sizeof(names[0]), apd_hostapd_name_compare);
+    /* names[] and dirs[] are parallel, so they are ordered together. qsort on
+     * names alone would leave each socket pointing at another's directory. */
+    for (i = 1; i < name_count; i++) {
+        char name_key[APD_HOSTAPD_IFACE_LEN + 1];
+        char dir_key[APD_HOSTAPD_DIR_LEN];
+        size_t j = i;
+
+        memcpy(name_key, names[i], sizeof(name_key));
+        memcpy(dir_key, dirs[i], sizeof(dir_key));
+        while (j > 0 && strcmp(names[j - 1], name_key) > 0) {
+            memcpy(names[j], names[j - 1], sizeof(names[0]));
+            memcpy(dirs[j], dirs[j - 1], sizeof(dirs[0]));
+            j--;
+        }
+        memcpy(names[j], name_key, sizeof(name_key));
+        memcpy(dirs[j], dir_key, sizeof(dir_key));
+    }
     collection_deadline = apd_monotonic_ms() + APD_HOSTAPD_COLLECTION_TIMEOUT_MS;
     response = calloc(1, APD_HOSTAPD_RESPONSE_LIMIT + 2U);
     if (!response) {
@@ -3598,7 +3770,7 @@ static int apd_hostapd_collect_raw(int phy_count,
             continue;
         }
         result->bss_count++;
-        if (apd_hostapd_socket_path(APD_HOSTAPD_RUN_DIR, names[i], remote_path,
+        if (apd_hostapd_socket_path(dirs[i], names[i], remote_path,
                                     sizeof(remote_path)) != 0 ||
             apd_hostapd_collect_bss(remote_path, result, bss, response,
                                     APD_HOSTAPD_RESPONSE_LIMIT + 2U,
@@ -3630,6 +3802,112 @@ static void apd_hostapd_json_u64(struct json_object *obj, const char *name,
                                json_object_new_int64((int64_t)value));
 }
 
+/*
+ * Emits one `wlanconfig`-derived station using the same field names the
+ * hostapd path emits, so the aggregator and the wireless page do not need to
+ * know which collector produced the row. `source` still reports the truth.
+ *
+ * Signal is carried as `signal_dbm` because that is the key consumers read;
+ * wlanconfig's RSSI is already combined over chains in dBm (the tool says so
+ * in its own header), so no conversion is applied.
+ */
+static void apd_vendor_station_emit(struct json_object *stations,
+                                    const struct apd_vendor_station *st,
+                                    const char *interface,
+                                    int64_t observed_at)
+{
+    struct json_object *item;
+
+    if (!stations || !st)
+        return;
+    item = json_object_new_object();
+    if (!item)
+        return;
+    json_object_object_add(item, "mac", json_object_new_string(st->mac));
+    json_object_object_add(item, "interface",
+                           json_object_new_string(interface ? interface : ""));
+    if (st->has_rssi)
+        json_object_object_add(item, "signal_dbm",
+                               json_object_new_int(st->rssi));
+    if (st->has_min_rssi)
+        json_object_object_add(item, "min_signal_dbm",
+                               json_object_new_int(st->min_rssi));
+    if (st->has_max_rssi)
+        json_object_object_add(item, "max_signal_dbm",
+                               json_object_new_int(st->max_rssi));
+    if (st->has_tx_rate)
+        json_object_object_add(item, "tx_rate_kbps",
+                               json_object_new_int64((int64_t)st->tx_rate_kbps));
+    if (st->has_rx_rate)
+        json_object_object_add(item, "rx_rate_kbps",
+                               json_object_new_int64((int64_t)st->rx_rate_kbps));
+    if (st->has_tx_nss)
+        json_object_object_add(item, "tx_nss", json_object_new_int(st->tx_nss));
+    if (st->has_rx_nss)
+        json_object_object_add(item, "rx_nss", json_object_new_int(st->rx_nss));
+    if (st->has_idle)
+        json_object_object_add(item, "inactive_time_ms",
+                               json_object_new_int64((int64_t)st->idle_ms));
+    if (st->mode[0])
+        json_object_object_add(item, "wifi_standard",
+                               json_object_new_string(st->mode));
+    if (st->aid > 0)
+        json_object_object_add(item, "aid", json_object_new_int(st->aid));
+    /*
+     * wlanconfig lists only associated stations, so association is implied.
+     * Authorization is not reported by this tool and is left absent rather
+     * than guessed.
+     */
+    json_object_object_add(item, "associated", json_object_new_boolean(1));
+    json_object_object_add(item, "mlo_evidence", json_object_new_boolean(0));
+    json_object_object_add(item, "mlo_relation_complete",
+                           json_object_new_boolean(0));
+    json_object_object_add(item, "mlo_relation_state",
+                           json_object_new_string("unavailable"));
+    apd_json_nullable_string(item, "mlo_reason", "not_reported_by_wlanconfig");
+    json_object_object_add(item, "source",
+                           json_object_new_string("wlanconfig_list"));
+    json_object_object_add(item, "stale", json_object_new_boolean(0));
+    json_object_object_add(item, "observed_at",
+                           json_object_new_int64(observed_at));
+    json_object_array_add(stations, item);
+}
+
+/*
+ * Spatial-stream counts for one station, looked up by MAC in a vendor set.
+ *
+ * hostapd's station reply has no NSS columns, so a radio's MIMO width stayed
+ * unreportable on APs where hostapd otherwise works fine. `wlanconfig` has
+ * RXNSS/TXNSS and costs almost nothing to call, so the hostapd rows are
+ * enriched rather than replaced: hostapd stays the source of the traffic and
+ * MLO fields it alone reports, and this only adds what it never had.
+ */
+static void apd_vendor_station_attach_nss(struct json_object *item,
+                                          const struct apd_vendor_station_set *set,
+                                          const char *mac)
+{
+    size_t i;
+
+    if (!item || !set || !mac || !mac[0])
+        return;
+    for (i = 0; i < set->count; i++) {
+        const struct apd_vendor_station *st = &set->items[i];
+
+        if (strcasecmp(st->mac, mac))
+            continue;
+        if (st->has_rx_nss)
+            json_object_object_add(item, "rx_nss",
+                                   json_object_new_int(st->rx_nss));
+        if (st->has_tx_nss)
+            json_object_object_add(item, "tx_nss",
+                                   json_object_new_int(st->tx_nss));
+        if (st->has_rx_nss || st->has_tx_nss)
+            json_object_object_add(item, "spatial_stream_source",
+                                   json_object_new_string("wlanconfig_list"));
+        return;
+    }
+}
+
 static struct json_object *apd_collect_hostapd(int phy_count,
                                                struct json_object **stations_out,
                                                int64_t observed_at,
@@ -3640,6 +3918,17 @@ static struct json_object *apd_collect_hostapd(int phy_count,
     struct json_object *bss_array = json_object_new_array();
     struct json_object *state;
     size_t i;
+    size_t vendor_station_total = 0;
+    int vendor_truncated = 0;
+    /*
+     * One vendor query per VAP, reused across that VAP's stations. The
+     * hostapd station list is grouped by interface, so caching the last
+     * interface queried keeps this at one `wlanconfig` call per VAP.
+     */
+    struct apd_vendor_station_set *nss_set = NULL;
+    char nss_interface[IFNAMSIZ] = { 0 };
+    const char *nss_tool = NULL;
+    int nss_valid = 0;
 
     if (!observation || !stations || !bss_array) {
         free(observation);
@@ -3707,6 +3996,22 @@ static struct json_object *apd_collect_hostapd(int phy_count,
         json_object_object_add(item, "mac", json_object_new_string(raw->mac));
         json_object_object_add(item, "interface",
                                json_object_new_string(raw->interface));
+        /* Refresh the vendor set when the interface changes. */
+        if (raw->interface[0] && strcmp(nss_interface, raw->interface)) {
+            if (!nss_tool)
+                nss_tool = apd_find_wlanconfig();
+            if (nss_tool && !nss_set)
+                nss_set = calloc(1, sizeof(*nss_set));
+            snprintf(nss_interface, sizeof(nss_interface), "%s", raw->interface);
+            nss_valid = 0;
+            if (nss_tool && nss_set) {
+                memset(nss_set, 0, sizeof(*nss_set));
+                nss_valid = apd_vendor_station_collect(nss_tool, raw->interface,
+                                                       nss_set) == 0;
+            }
+        }
+        if (nss_valid)
+            apd_vendor_station_attach_nss(item, nss_set, raw->mac);
         if (raw->has_signal)
             json_object_object_add(item, "signal_dbm",
                                    json_object_new_int(raw->signal_dbm));
@@ -3752,6 +4057,46 @@ static struct json_object *apd_collect_hostapd(int phy_count,
                                json_object_new_int64(observed_at));
         json_object_array_add(stations, item);
     }
+    /*
+     * Vendor fallback for the station detail.
+     *
+     * On QCA/ath APs the per-VAP hostapd control sockets are absent (only
+     * `global` exists), so the STATUS query yields per-BSS counts while the
+     * station query fails; the snapshot then reported 30 associated clients
+     * with an empty station array, leaving signal and spatial streams null on
+     * a page that had the data available all along. `wlanconfig <vap> list`
+     * carries it, and was already used by the on-demand survey path only.
+     *
+     * Driven by "did hostapd produce rows for this BSS", never by "does the
+     * binary exist", so an AP where hostapd works keeps using hostapd and this
+     * costs one `wlanconfig` call per affected VAP.
+     */
+    if (observation->bss_count && !observation->station_count) {
+        const char *wlanconfig = apd_find_wlanconfig();
+        struct apd_vendor_station_set *vendor;
+
+
+        vendor = wlanconfig ? calloc(1, sizeof(*vendor)) : NULL;
+        for (i = 0; vendor && i < observation->bss_count; i++) {
+            const struct apd_hostapd_bss_observation *raw = &observation->bss[i];
+            size_t s;
+
+            if (!raw->interface[0])
+                continue;
+            memset(vendor, 0, sizeof(*vendor));
+            if (apd_vendor_station_collect(wlanconfig, raw->interface,
+                                           vendor) != 0)
+                continue;
+            for (s = 0; s < vendor->count; s++) {
+                apd_vendor_station_emit(stations, &vendor->items[s],
+                                        raw->interface, observed_at);
+                vendor_station_total++;
+            }
+            if (vendor->truncated)
+                vendor_truncated = 1;
+        }
+        free(vendor);
+    }
     state = apd_source_state("hostapd_control", "runtime",
                              observation->available,
                              observation->complete,
@@ -3765,6 +4110,21 @@ static struct json_object *apd_collect_hostapd(int phy_count,
                            json_object_new_int((int)observation->bss_count));
     json_object_object_add(state, "station_count",
                            json_object_new_int((int)observation->station_count));
+    /*
+     * Two separate facts, kept separate: how many rows the station array holds,
+     * and which collector produced them. `station_count` above stays hostapd's
+     * own tally so an existing reader sees no change in meaning.
+     */
+    json_object_object_add(state, "station_detail_count",
+        json_object_new_int((int)(observation->station_count +
+                                 vendor_station_total)));
+    json_object_object_add(state, "station_detail_source",
+        json_object_new_string(observation->station_count ? "hostapd_control" :
+                               vendor_station_total ? "wlanconfig_list" :
+                                                      "unavailable"));
+    if (vendor_truncated)
+        json_object_object_add(state, "station_detail_truncated",
+                               json_object_new_boolean(1));
     json_object_object_add(state, "bss", bss_array);
     json_object_object_add(state, "limits", json_object_new_object());
     {
@@ -3786,6 +4146,7 @@ static struct json_object *apd_collect_hostapd(int phy_count,
     *stations_out = stations;
     if (complete_out)
         *complete_out = observation->complete;
+    free(nss_set);
     free(observation);
     return state;
 }

@@ -6,7 +6,7 @@ export function mount(context = {}) {
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character])));
   const signal = context.signal;
   const stage = root?.closest('.console-stage');
-  const VERSION = '20260802-sheet-portal-scope-01';
+  const VERSION = '20260805-drawer-width-portal-02';
 
   const state = {
     mounted: true,
@@ -417,9 +417,27 @@ export function mount(context = {}) {
   }
 
   function replaceMarkup(host, markup) {
+    /*
+     * 先回收传送门里的抽屉，再交给 kit 卸载。kit 的 unmount(host) 只走 host 子树，
+     * 而 mountAll() 已经把 `.dwrt-kit-sheet` 与遮罩搬去 #dwrtKitSheetPortal，
+     * 于是卸载扫不到它们，关闭后遮罩留在页面上吞掉全部点击。详见 policy-objects.js。
+     */
+    reclaimPortaledSheets(host);
     window.DWRT_UI_KIT?.unmount?.(host);
     host.replaceChildren(document.createRange().createContextualFragment(markup));
+    host.querySelectorAll('.dwrt-kit-sheet, .dwrt-kit-sheet-overlay')
+      .forEach((node) => { node.dataset.ipamOverlayOwned = ''; });
     ui.mountAll?.(host);
+  }
+
+  /* 把本宿主搬出去的抽屉与遮罩接回来，让 kit 的 unmount 能够看到它们。 */
+  function reclaimPortaledSheets(host) {
+    const portal = document.getElementById('dwrtKitSheetPortal');
+    if (!portal) return;
+    portal.querySelectorAll('.dwrt-kit-sheet, .dwrt-kit-sheet-overlay').forEach((node) => {
+      if (node.dataset.ipamOverlayOwned === undefined) return;
+      host.append(node);
+    });
   }
 
   function renderPage() {

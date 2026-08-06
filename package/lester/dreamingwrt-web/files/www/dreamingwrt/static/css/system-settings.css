@@ -876,29 +876,77 @@
   line-height: 1.6;
 }
 
-.system-flash-schedule-facts {
+/*
+ * 定时备份控件。几何与布局在这里，材质仍由 .system-demo-panel / .system-glass-input
+ * 提供，不在页面私有 CSS 里重画卡片底色（design.md 第 14 条）。
+ */
+.system-flash-schedule-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.system-flash-schedule-row-copy {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 3px;
+  min-width: 0;
+}
+
+.system-flash-schedule-row-copy strong {
+  color: var(--app-text);
+  font-size: 14px;
+  font-weight: 780;
+}
+
+.system-flash-schedule-row-copy em {
+  color: var(--system-muted);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 650;
+  line-height: 1.5;
+}
+
+.system-flash-schedule-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
-  margin: 0;
+  align-items: end;
 }
 
-.system-flash-schedule-facts > div {
+/* 关闭时字段整体降低不透明度但仍可读（design.md 第 24 条），不禁用也不隐藏。 */
+.system-flash-schedule-fields.is-idle {
+  opacity: 0.62;
+}
+
+.system-flash-schedule-field {
   display: grid;
-  gap: 4px;
+  gap: 6px;
+  min-width: 0;
 }
 
-.system-flash-schedule-facts dt {
+.system-flash-schedule-field > span {
   color: var(--system-muted);
   font-size: 12px;
   font-weight: 700;
 }
 
-.system-flash-schedule-facts dd {
-  margin: 0;
-  color: var(--app-text);
-  font-size: 14px;
+.system-flash-schedule-time {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.system-flash-schedule-time b {
+  color: var(--system-muted);
   font-weight: 780;
+}
+
+.system-flash-schedule-footer {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .system-flash-config-header,
@@ -3333,6 +3381,11 @@ textarea.system-glass-input {
 .system-mount-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  /*
+   * 折叠摘要让宿主卡（/data 带 15 条绑定挂载）比同行其他卡高。默认 `stretch` 会把
+   * 同行的矮卡一起拉到同高，多出的空白读起来像内容没渲染完，所以按内容高度对齐。
+   */
+  align-items: start;
   gap: 14px;
   max-width: 100%;
   min-width: 0;
@@ -3427,6 +3480,45 @@ textarea.system-glass-input {
   grid-column: 1 / -1;
   display: flex;
   justify-content: flex-end;
+  white-space: nowrap;
+}
+
+/*
+ * 绑定挂载折叠摘要。它是宿主卡片的一段附属信息，不是第二张卡：沿用卡内发丝线分隔，
+ * 不引入独立圆角、背景或阴影（否则就成了卡中卡）。
+ */
+.system-mount-bind-list {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255,255,255,0.07);
+}
+
+.system-mount-bind-label {
+  color: var(--system-muted);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.system-mount-bind-paths {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.system-mount-bind-paths code {
+  max-width: 100%;
+  overflow: hidden;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(0,0,0,0.20);
+  color: var(--system-ink);
+  font-size: 11px;
+  font-weight: 700;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 

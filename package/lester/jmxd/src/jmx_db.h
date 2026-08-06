@@ -30,6 +30,16 @@ struct json_object *jmx_db_api_client_get(struct json_object *req);
 struct json_object *jmx_db_api_clients_list(struct json_object *req);
 struct json_object *jmx_db_api_client_identity(struct json_object *req);
 
+/* How long an offline client stays in the default inventory. Randomized MACs
+ * mean every DHCP lease can mint a new row, so without an age-out the list
+ * grows without bound and buries the handful of devices actually connected.
+ * Callers that need the unfiltered history pass include_stale=1. */
+#define JMX_DB_CLIENT_STALE_RETENTION_DAYS 7
+#define JMX_DB_CLIENT_STALE_RETENTION_SEC  (JMX_DB_CLIENT_STALE_RETENTION_DAYS * 86400)
+
+int jmx_db_client_row_stale(struct json_object *client, int64_t now,
+                            int64_t retention_sec);
+
 /* ── Schema v2: line_load / audit / traffic buckets ── */
 
 int jmx_db_upsert_interface(const char *name, const char *kind,

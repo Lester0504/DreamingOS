@@ -780,7 +780,14 @@ static int client_ipv6_is_loopback(const char *addr)
 
 static int client_ipv6_is_usable(const char *addr)
 {
-    return addr && addr[0] && strchr(addr, ':') && !client_ipv6_is_loopback(addr);
+    /* :: is the unspecified address the kernel client table reports when it has
+     * no IPv6 evidence for a MAC. Accepting it stored a one-element address
+     * list holding a non-address, which every consumer then read as "this
+     * client has IPv6". Screen it here, at the collector, so no downstream
+     * copy of the runtime node carries the sentinel. */
+    return addr && addr[0] && strchr(addr, ':') &&
+           !client_ipv6_is_loopback(addr) &&
+           strcmp(addr, "::") && strcmp(addr, "0:0:0:0:0:0:0:0");
 }
 
 static void client_append_ipv6_addr(client_node_t *node, const char *addr)
@@ -1166,7 +1173,11 @@ void update_client_hostname(void)
         if (!node)
         {
             node = add_client_node(mac_buf);
-            copy_string_truncated(node->ip, sizeof(node->ip), ip_buf);
+            if (!node)
+                continue;
+            /* Same screen as the kernel and neighbour paths: a lease file line
+             * with no address must not seed the node with a sentinel. */
+            client_set_ipv4_evidence(node, ip_buf, NULL);
             node->online = 0;
             node->offline_time = get_timestamp();
         }
@@ -1368,10 +1379,13 @@ void update_client_from_kernel(void)
             node = add_client_node(mac_buf);
             if (!node)
                 continue;
-            strncpy(node->ip, ip_buf, sizeof(node->ip));
         }
-
-        strncpy(node->ip, ip_buf, sizeof(node->ip));
+        /* Route the kernel's IPv4 field through the same screen the neighbour
+         * table path already uses. The raw copy accepted 0.0.0.0, which the
+         * module reports for an IPv6-only client, and that sentinel then
+         * travelled into client_network_state and out of /api/v1/clients as if
+         * it were an address the device held. */
+        client_set_ipv4_evidence(node, ip_buf, NULL);
 
         if (parsed >= 4 && strlen(ipv6_buf) > 0)
         {

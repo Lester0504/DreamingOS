@@ -67,6 +67,20 @@ def test_small_utf8_text_read_is_bounded_and_fail_closed() -> None:
         assert forbidden not in FILES
 
 
+def test_basic_write_handler_is_transactional_but_not_publicly_advertised() -> None:
+    require_all(HEADER, ("jmx_storage_files_mutate",), "write handler ABI")
+    require_all(FILES, (
+        "jmx_storage_files_mutate", '"confirmation_required"',
+        "storage_files_open_directory", "storage_files_safe_name",
+        "storage_files_join_path", "expected_etag_required",
+        '"revision_conflict"', "STORAGE_FILES_TRANSACTION_PREFIX",
+        "RENAME_NOREPLACE", "RENAME_EXCHANGE", "fsync(parent_fd)",
+        '"readback_verified"', '"rolled_back"',
+    ), "transactional basic writes")
+    assert "jmx_storage_files_mutate" not in UBUS
+    assert "storage_files_mutate" not in WEB
+
+
 def test_content_route_compiled_permission_boundary() -> None:
     compiler = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
     assert compiler, "a C compiler is required for the permission contract"
@@ -103,25 +117,46 @@ int main(void)
         subprocess.run([str(binary)], check=True)
 
 
-def test_roots_are_real_external_mounts_not_rootfs_or_pseudo_filesystems() -> None:
+def test_roots_admit_real_mounts_and_exclude_pseudo_filesystems() -> None:
+    """Root admission is per-path, not a whole-device exclusion.
+
+    The previous policy admitted only /mnt and /media and then dropped every
+    mount sharing a device with /, /data, /etc/dreamingwrt or /boot.  On a unit
+    whose data lives on the system disk those two rules intersect to the empty
+    set, so the file manager had no roots at all and every path returned
+    storage_root_not_found.  Browsing the real filesystem is the intended
+    product behaviour; writes are constrained by the deny-lists instead.
+    """
     require_all(FILES, (
         'STORAGE_FILES_MOUNTINFO "/proc/self/mountinfo"',
-        'storage_files_path_prefix(path, "/mnt")',
-        'storage_files_path_prefix(path, "/media")',
         '"proc", "sysfs", "devtmpfs"', '"tmpfs", "overlay"',
+        '"bpf", "nfsd", "mqueue"',
         "(unsigned int)major(st.st_dev) != maj",
         "(unsigned int)minor(st.st_dev) != min",
         'storage_files_option_present(fields[5], "ro")',
         'open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)',
         "SYS_openat2", "RESOLVE_BENEATH", "RESOLVE_NO_SYMLINKS",
         "RESOLVE_NO_XDEV",
-        '"/", "/data", "/etc/dreamingwrt", "/boot"',
-        "storage_files_protected_device(st.st_dev)",
+        "storage_files_root_excluded(path)",
+        "storage_files_root_write_protected(root.path)",
     ), "root discovery")
-    assert 'storage_files_path_prefix(path, "/")' not in FILES
+    # Credential and live-state mounts must not be offered as roots at all.
+    require_all(FILES, (
+        '"/etc/shadow", "/etc/dropbear", "/etc/ssh", "/etc/ssl/private"',
+        '"/etc/dreamingwrt", "/data/dreamingwrt"',
+    ), "root exclusion list")
+    # Roots carrying the running system or service configuration are presented
+    # read-only, so the UI does not offer edits the write guard will refuse.
+    require_all(FILES, (
+        '"/", "/boot", "/etc", "/etc/config", "/etc/crontabs"',
+        '"/etc/nginx", "/etc/samba", "/etc/rc.local"',
+    ), "read-only root list")
+    # The blanket policy must not come back: no /mnt+/media gate, and no
+    # device-wide exclusion that would take the whole filesystem with it.
+    assert 'storage_files_path_prefix(path, "/mnt") ||' not in FILES
+    assert "storage_files_protected_device" not in FILES
+    assert "st.st_dev == dev" not in FILES
     assert 'strstr(fields[5], "ro")' not in FILES
-    assert "#ifndef STORAGE_FILES_TEST_ALLOW_ANY_MOUNT_ROOT" in FILES
-
 
 def test_path_walk_never_follows_links_or_crosses_mounts() -> None:
     require_all(FILES, (

@@ -97,6 +97,13 @@ static int routed_text_ok(const char *s, size_t max_len)
     return 1;
 }
 
+/* Custom table numbers only: 253/254/255 are default/main/local. */
+static int routed_table_id_ok(int table_id)
+{
+    return table_id > 0 && table_id < 32768 &&
+           table_id != 253 && table_id != 254 && table_id != 255;
+}
+
 static struct json_object *routed_error(const char *code, const char *message,
                                         int http_status)
 {
@@ -138,10 +145,52 @@ static struct json_object *routed_capabilities(void)
     json_object_object_add(o, "legacy_adv_tables_write", json_object_new_boolean(0));
     json_object_object_add(o, "table_crud", json_object_new_boolean(1));
     json_object_object_add(o, "object_crud", json_object_new_boolean(1));
+    /*
+     * object_crud is routed's OWN object catalog (config.db:route_object), written
+     * through object_set/object_delete and reloaded via dreamingwrt.route_reload.
+     * It is NOT the policy-engine composite object catalog, which is a different
+     * resource in a different component and reports objects_crud=false. The two
+     * booleans were read as contradicting each other, so both sides now publish
+     * an explicit scope string.
+     */
+    json_object_object_add(o, "object_crud_scope", json_object_new_string("routed:route_object"));
+    json_object_object_add(o, "object_crud_write_endpoint", json_object_new_string("/api/v1/routing/objects"));
+    json_object_object_add(o, "composite_object_crud", json_object_new_boolean(0));
+    json_object_object_add(o, "composite_object_crud_owner", json_object_new_string("policy_engine"));
+    json_object_object_add(o, "composite_object_crud_scope",
+                           json_object_new_string("policy_engine:composite_object"));
     json_object_object_add(o, "cross_service_crud", json_object_new_boolean(1));
     json_object_object_add(o, "cross_service_config_crud", json_object_new_boolean(1));
     json_object_object_add(o, "cross_service_runtime", json_object_new_boolean(0));
     json_object_object_add(o, "cross_service_runtime_reason", json_object_new_string("runtime_consumer_not_implemented"));
+    /*
+     * The reason above applies to cross_services only. It was being rendered as a
+     * whole-page conclusion for the routing table, which made tables and route
+     * objects look unusable when they are not. resource_reasons carries one reason
+     * per resource; a resource absent from the map has no blocking reason at all.
+     */
+    json_object_object_add(o, "cross_service_runtime_reason_scope",
+                           json_object_new_string("cross_services"));
+    {
+        struct json_object *reasons = json_object_new_object();
+        struct json_object *writable = json_object_new_array();
+
+        json_object_object_add(reasons, "cross_services_runtime",
+                               json_object_new_string("runtime_consumer_not_implemented"));
+        json_object_object_add(reasons, "static_routes",
+                               json_object_new_string("uci_network_projection_read_only"));
+        json_object_object_add(reasons, "policy_rules",
+                               json_object_new_string("policy_table_owns_write_path"));
+        json_object_object_add(reasons, "external_policies",
+                               json_object_new_string("external_policy_files_read_only"));
+        json_object_object_add(o, "resource_reasons", reasons);
+
+        json_object_array_add(writable, json_object_new_string("tables"));
+        json_object_array_add(writable, json_object_new_string("objects"));
+        json_object_array_add(writable, json_object_new_string("cross_services_config"));
+        json_object_array_add(writable, json_object_new_string("policy_rules_order"));
+        json_object_object_add(o, "writable_resources", writable);
+    }
     json_object_object_add(o, "reference_conflict", json_object_new_boolean(1));
     json_object_object_add(o, "policy_reorder", json_object_new_boolean(1));
     json_object_object_add(o, "external_policies_read_only", json_object_new_boolean(1));
@@ -164,6 +213,8 @@ static int routed_exec(sqlite3 *db, const char *sql)
     }
     return 0;
 }
+
+static void routed_sync_wan_tables(sqlite3 *db);
 
 static int routed_db_open(sqlite3 **out)
 {
@@ -215,6 +266,7 @@ static int routed_db_open(sqlite3 **out)
         sqlite3_close(db);
         return -1;
     }
+    routed_sync_wan_tables(db);
     *out = db;
     return 0;
 }
@@ -883,6 +935,81 @@ static int routed_collision(sqlite3 *db, const char *sql, const char *a,
     found = sqlite3_step(st) == SQLITE_ROW;
     sqlite3_finalize(st);
     return found;
+}
+
+static int routed_table_present(sqlite3 *db, const char *name)
+{
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+
+    if (!db || !name ||
+        sqlite3_prepare_v2(db,
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    found = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return found;
+}
+
+/*
+ * Mirror the configured WANs into route_table.
+ *
+ * route_table was written by explicit CRUD only, so a second WAN never got a
+ * row: "send lan2 out wan2" had no legal `target` to name, even though the data
+ * plane was already carrying that table. The table number comes from
+ * route_wan.table_id, the same value jmx_route programs into the kernel
+ * (fwmark 0x10000+id -> table 100+id). Allocating a fresh number here would
+ * create an empty table that rules match and then find no route in, which looks
+ * like a successful config and behaves like a dead link.
+ *
+ * Runs on every routed_db_open() and fills in only what is missing, so adding
+ * wan3 later needs no migration. Operator-owned rows are preserved: the UPDATE
+ * branch is restricted to rows this function could have created (role='wan'),
+ * and a name or table number already claimed by another id is skipped rather
+ * than stolen.
+ */
+static void routed_sync_wan_tables(sqlite3 *db)
+{
+    sqlite3_stmt *st = NULL;
+    int changed = 0;
+
+    if (!db || !routed_table_present(db, "route_wan"))
+        return;
+    if (sqlite3_prepare_v2(db,
+            "SELECT name,table_id FROM route_wan ORDER BY position",
+            -1, &st, NULL) != SQLITE_OK)
+        return;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *name = routed_text(st, 0);
+        int table_id = sqlite3_column_int(st, 1);
+        sqlite3_stmt *ins = NULL;
+
+        if (!routed_id_ok(name) || !routed_table_id_ok(table_id))
+            continue;
+        if (routed_collision(db,
+                "SELECT 1 FROM route_table WHERE id<>? AND (name=? OR table_id=?3) LIMIT 1",
+                name, name, table_id) == 1)
+            continue;
+        if (sqlite3_prepare_v2(db,
+                "INSERT INTO route_table(id,name,table_id,role,gateway,metric,enabled,updated_at) "
+                "VALUES(?1,?1,?2,'wan','',0,1,?3) "
+                "ON CONFLICT(id) DO UPDATE SET table_id=excluded.table_id,"
+                "updated_at=excluded.updated_at "
+                "WHERE route_table.role='wan' AND route_table.table_id<>excluded.table_id",
+                -1, &ins, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(ins, 1, name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(ins, 2, table_id);
+            sqlite3_bind_int64(ins, 3, routed_now());
+            if (sqlite3_step(ins) == SQLITE_DONE && sqlite3_changes(db) > 0)
+                changed = 1;
+        }
+        sqlite3_finalize(ins);
+    }
+    sqlite3_finalize(st);
+    if (changed)
+        routed_touch_revision(db);
 }
 
 static struct json_object *routed_table_set(struct ubus_context *ctx,

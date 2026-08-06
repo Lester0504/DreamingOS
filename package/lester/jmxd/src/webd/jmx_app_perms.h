@@ -3,18 +3,33 @@
  * Copyright(c) 2026 Lester(CJM) <www.lesterwrt.com>
  *
  * Permission layer for Mobile App API.
- * Risk levels: low / medium / high / blocked
+ * Risk levels: low / low_write / medium / high / blocked
  * Roles: owner / admin / operator / viewer / ai-agent
  */
 #ifndef __JMX_APP_PERMS_H__
 #define __JMX_APP_PERMS_H__
 
-/* Risk levels — ordered by severity */
+/*
+ * Risk levels — ordered by severity.
+ *
+ * LOW_WRITE sits between LOW and MEDIUM: it is a write, so read-only audiences
+ * (viewer, ai-agent, read_only API keys) must not perform it, but its blast
+ * radius is confined to presentation-layer state that cannot affect
+ * reachability, firewalling, or traffic policy. It exists because LOW is
+ * readable by viewer and MEDIUM is admin-only, leaving no level that means
+ * "operator may write this".
+ *
+ * Numeric values are deliberately reassigned rather than appending LOW_WRITE at
+ * the end, so the enum stays ordered by severity. Nothing compares jmx_risk_t
+ * with < or >, but keeping the order true prevents a future ordered comparison
+ * from silently reading LOW_WRITE as the most dangerous level.
+ */
 typedef enum {
-    JMX_RISK_LOW     = 0,
-    JMX_RISK_MEDIUM  = 1,
-    JMX_RISK_HIGH    = 2,
-    JMX_RISK_BLOCKED = 3
+    JMX_RISK_LOW       = 0,
+    JMX_RISK_LOW_WRITE = 1,
+    JMX_RISK_MEDIUM    = 2,
+    JMX_RISK_HIGH      = 3,
+    JMX_RISK_BLOCKED   = 4
 } jmx_risk_t;
 
 /* Roles — ordered by privilege */
@@ -40,6 +55,7 @@ jmx_risk_t jmx_perm_route_risk(const char *method, const char *path);
  *   blocked   → nobody
  *   high      → owner only (+ local confirm)
  *   medium    → admin + owner
+ *   low_write → operator + admin + owner (viewer/ai-agent denied)
  *   low       → operator + admin + owner
  *   viewer    → read-only (GET on safe paths)
  *   ai-agent  → low only (medium+ blocked)

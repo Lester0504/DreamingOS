@@ -230,6 +230,9 @@ static void wifi_replace_null(struct json_object *obj, const char *key)
     json_object_object_add(obj, key, json_object_new_null());
 }
 
+/* 802.11be allows at most 16 spatial streams per direction. */
+#define WIFI_MAX_SPATIAL_STREAMS 16
+
 /*
  * Copies one air-stats counter from the collector's block onto the radio.
  *
@@ -697,6 +700,13 @@ static struct json_object *wifi_ap_summary(struct json_object *ap,
     return summary;
 }
 
+static int wifi_number_positive(struct json_object *obj, const char *key)
+{
+    double value;
+
+    return wifi_number(obj, key, &value) && value > 0.0;
+}
+
 static int wifi_station_source_state(struct json_object *snapshot,
                                      int *inventory, int *metrics,
                                      const char **inventory_reason,
@@ -720,6 +730,29 @@ static int wifi_station_source_state(struct json_object *snapshot,
         return 0;
     complete = wifi_bool(hostapd, "complete", 0);
     if (!complete) {
+        /*
+         * Partial is not the same as absent.
+         *
+         * On QCA APs only the `global` hostapd control socket exists, so the
+         * per-VAP station query fails on every BSS and `complete` is false
+         * even though STATUS still yielded a full station list. Treating that
+         * as "no data" discarded 30 rows that each carried a real signal
+         * reading, and the wireless page showed no clients and a null average
+         * signal for an AP with 30 associated stations.
+         *
+         * When rows are actually present we use them and keep the reason so
+         * the payload still says the source was partial. Nothing is fabricated:
+         * a missing row stays missing, it just no longer voids the rest.
+         */
+        if (wifi_number_positive(hostapd, "station_count")) {
+            if (inventory) *inventory = 1;
+            if (metrics) *metrics = 1;
+            if (!reason[0] || !strcmp(reason, "available"))
+                reason = "station_source_partial";
+            if (inventory_reason) *inventory_reason = reason;
+            if (metrics_reason) *metrics_reason = reason;
+            return 1;
+        }
         if (!reason[0] || !strcmp(reason, "available"))
             reason = "station_source_partial";
         if (inventory_reason) *inventory_reason = reason;
@@ -757,6 +790,98 @@ static int wifi_radio_tx_power(struct json_object *radio, double *out)
     return 0;
 }
 
+/*
+ * Does this station belong to this radio?
+ *
+ * `radio_id` is the direct answer when the collector supplies it. Managed-AP
+ * snapshots do not: their station rows carry the VAP name (`ath01`) because
+ * that is what hostapd and wlanconfig report, and the radio owns the
+ * interface list that resolves it. Matching on `radio_id` alone made every
+ * managed radio report 0 clients and a null average signal while 30 stations
+ * with real signal values sat in the same payload.
+ */
+static int wifi_station_on_radio(struct json_object *station,
+                                 struct json_object *radio,
+                                 const char *radio_id)
+{
+    struct json_object *interfaces;
+    const char *station_radio = wifi_string(station, "radio_id", "");
+    const char *station_interface;
+    size_t i;
+
+    if (station_radio[0])
+        return !strcmp(station_radio, radio_id);
+    station_interface = wifi_string(station, "interface", "");
+    if (!station_interface[0])
+        return 0;
+    interfaces = wifi_child_array(radio, "interfaces");
+    for (i = 0; interfaces && i < json_object_array_length(interfaces); i++) {
+        struct json_object *interface = json_object_array_get_idx(interfaces, i);
+
+        if (!strcmp(wifi_string(interface, "interface", ""), station_interface))
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Publishes the per-radio channel plan from the read-only `channel_catalog`.
+ *
+ * apd already builds that catalog from `iw phy` and the AC stores it as the
+ * evidence `ac_wifi_validate_radio_change()` checks a requested channel
+ * against, so the numbers below are the same ones a write is validated with.
+ * webd nonetheless hardcoded `supported_channels` to null while separately
+ * reading the catalog to raise `capabilities.channel_catalog`, so the payload
+ * simultaneously claimed the catalog was available and reported no channels.
+ *
+ * Only forwarding happens here. `dfs_channels` comes from each entry's
+ * `radar_detection` flag, and an empty result stays an empty array rather than
+ * a null: "the driver listed no DFS channels" is a fact, distinct from "nobody
+ * asked". `unavailable_channels`/`excluded_channels` remain null because the
+ * catalog carries no evidence for either.
+ */
+static int wifi_publish_channel_plan(struct json_object *radio)
+{
+    struct json_object *catalog = wifi_child_object(radio, "channel_catalog");
+    struct json_object *supported = catalog ?
+        wifi_child_array(catalog, "supported_channels") : NULL;
+    struct json_object *entries;
+    struct json_object *dfs;
+    struct json_object *copy;
+    size_t i;
+
+    if (!catalog || !supported || !wifi_bool(catalog, "complete", 0))
+        return 0;
+    copy = wifi_clone(supported);
+    if (!copy)
+        return 0;
+    json_object_object_del(radio, "supported_channels");
+    json_object_object_add(radio, "supported_channels", copy);
+
+    dfs = json_object_new_array();
+    entries = wifi_child_array(catalog, "channels");
+    for (i = 0; dfs && entries && i < json_object_array_length(entries); i++) {
+        struct json_object *entry = json_object_array_get_idx(entries, i);
+        struct json_object *channel;
+
+        if (!entry || !wifi_bool(entry, "radar_detection", 0))
+            continue;
+        channel = wifi_child(entry, "channel");
+        if (channel && json_object_is_type(channel, json_type_int))
+            json_object_array_add(dfs, json_object_get(channel));
+    }
+    if (dfs) {
+        json_object_object_del(radio, "dfs_channels");
+        json_object_object_add(radio, "dfs_channels", dfs);
+    }
+
+    wifi_replace_string(radio, "channel_plan_source",
+                        wifi_string(catalog, "source", "iw_phy"));
+    wifi_replace_string(radio, "channel_plan_regdomain",
+                        wifi_string(catalog, "regdomain", ""));
+    return 1;
+}
+
 static void wifi_decorate_radio_metrics(struct json_object *radios,
                                         size_t first_radio,
                                         struct json_object *stations,
@@ -773,6 +898,20 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
         int signals = 0;
         double signal_sum = 0.0;
         double tx_power = 0.0;
+        /*
+         * Taken from the station rows that actually matched this radio, so a
+         * managed AP that fell back to `wlanconfig` does not get reported as
+         * `hostapd_control`.
+         */
+        const char *matched_source = NULL;
+        /*
+         * Highest spatial-stream count seen among this radio's stations.
+         * `wlanconfig` reports RXNSS/TXNSS per station; a radio's usable MIMO
+         * width is the best a client actually negotiated, so the maximum is
+         * the honest summary rather than an average.
+         */
+        int max_rx_nss = 0;
+        int max_tx_nss = 0;
         size_t j;
 
         for (j = 0; station_inventory && stations &&
@@ -780,18 +919,46 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
             struct json_object *station = json_object_array_get_idx(stations, j);
             double signal;
 
-            if (strcmp(wifi_string(station, "radio_id", ""), radio_id))
+            if (!wifi_station_on_radio(station, radio, radio_id))
                 continue;
             clients++;
+            if (!matched_source) {
+                const char *row = wifi_string(station, "source", "");
+
+                if (row[0])
+                    matched_source = row;
+            }
             if (station_metrics && wifi_number(station, "signal_dbm", &signal)) {
                 signal_sum += signal;
                 signals++;
+            }
+            {
+                double nss;
+
+                /*
+                 * Spatial streams are bounded by the standard: 802.11be tops
+                 * out at 16 per direction. A vendor tool that prints anything
+                 * outside 1..16 is reporting garbage rather than a wider radio,
+                 * so it is discarded instead of widening the reported MIMO.
+                 * The bound also keeps the "RXxTX" formatting below provably
+                 * within its buffer.
+                 */
+                if (wifi_number(station, "rx_nss", &nss) &&
+                    nss >= 1.0 && nss <= WIFI_MAX_SPATIAL_STREAMS &&
+                    (int)nss > max_rx_nss)
+                    max_rx_nss = (int)nss;
+                if (wifi_number(station, "tx_nss", &nss) &&
+                    nss >= 1.0 && nss <= WIFI_MAX_SPATIAL_STREAMS &&
+                    (int)nss > max_tx_nss)
+                    max_tx_nss = (int)nss;
             }
         }
         if (station_inventory) {
             json_object_object_del(radio, "clients");
             json_object_object_add(radio, "clients", json_object_new_int(clients));
-            wifi_replace_string(radio, "clients_source", "hostapd_control");
+            wifi_replace_string(radio, "clients_source",
+                                matched_source ? matched_source :
+                                                 "hostapd_control");
         } else {
             wifi_replace_null(radio, "clients");
             wifi_replace_string(radio, "clients_reason", station_reason);
@@ -800,7 +967,9 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
             json_object_object_del(radio, "avg_signal_dbm");
             json_object_object_add(radio, "avg_signal_dbm",
                                    json_object_new_double(signal_sum / signals));
-            wifi_replace_string(radio, "avg_signal_source", "hostapd_control");
+            wifi_replace_string(radio, "avg_signal_source",
+                                matched_source ? matched_source :
+                                                 "hostapd_control");
         } else {
             wifi_replace_null(radio, "avg_signal_dbm");
             wifi_replace_string(radio, "avg_signal_reason",
@@ -840,7 +1009,19 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
              */
             const char *survey_source = wifi_string(survey, "source", "iw_survey");
 
-            if (utilization && json_object_is_type(utilization, json_type_double) &&
+            /*
+             * Accept int as well as double.
+             *
+             * apd emits this as a JSON double, but a whole-numbered percent
+             * survives the ubus/json round trip as an integer (`3`, not
+             * `3.0`), and a double-only check silently dropped it. That is why
+             * the wireless page showed `iw_survey_unavailable` while the AC
+             * payload already carried utilization 3 / 12 / 47 from
+             * `apstats_radio`. The noise branch below already accepted both.
+             */
+            if (utilization &&
+                (json_object_is_type(utilization, json_type_double) ||
+                 json_object_is_type(utilization, json_type_int)) &&
                 json_object_get_double(utilization) >= 0.0 &&
                 json_object_get_double(utilization) <= 100.0) {
                 double pct = json_object_get_double(utilization);
@@ -948,20 +1129,88 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
                                     survey ? "air_statistics_not_collected" :
                                              "channel_survey_not_reported");
             }
+            /*
+             * Interference is the airtime other networks occupy on this
+             * channel, which is exactly what `apstats` reports as OBSS
+             * utilization. It is taken from the same vendor counter block as
+             * `channel_utilization_pct` rather than derived from neighbor-scan
+             * RSSI: a count of audible BSSIDs says how many neighbours exist,
+             * not how much air they consume, and converting signal strength
+             * into a percentage would be a fabricated unit.
+             *
+             * Self-BSS airtime is deliberately excluded. Traffic this radio
+             * generates is load, not interference, and folding it in would make
+             * a busy AP with no neighbours look congested by other networks.
+             */
+            {
+                struct json_object *obss = wifi_child(air, "obss_util_pct");
+
+                if (obss && (json_object_is_type(obss, json_type_double) ||
+                             json_object_is_type(obss, json_type_int))) {
+                    json_object_object_del(radio, "avg_interference_pct");
+                    json_object_object_add(radio, "avg_interference_pct",
+                                           json_object_get(obss));
+                    wifi_replace_string(radio, "avg_interference_source",
+                                        survey_source);
+                    json_object_object_del(radio, "avg_interference_reason");
+                } else {
+                    wifi_replace_null(radio, "avg_interference_pct");
+                    wifi_replace_string(radio, "avg_interference_reason",
+                        air ? "obss_utilization_not_reported" :
+                              "interference_telemetry_not_collected");
+                }
+            }
         }
-        wifi_replace_null(radio, "avg_interference_pct");
-        wifi_replace_string(radio, "avg_interference_reason",
-                            "interference_telemetry_not_collected");
-        wifi_replace_null(radio, "mimo");
-        wifi_replace_string(radio, "mimo_reason", "spatial_streams_not_reported");
+        /*
+         * Reported as RXxTX (e.g. "2x2") when the station rows carry spatial
+         * stream counts. Only hostapd lacks them; the vendor `wlanconfig` path
+         * has RXNSS/TXNSS columns, so this stays null on a mac80211 AP and
+         * fills in on a QCA one instead of claiming "not reported" everywhere.
+         */
+        if (max_rx_nss > 0 && max_tx_nss > 0) {
+            char mimo[16];
+
+            /*
+             * Re-clamped at the point of use. The ingest filter above already
+             * rejects out-of-range streams, but restating the bound here keeps
+             * the format provably in-buffer without depending on the optimizer
+             * to track the range across the station loop.
+             */
+            int rx = max_rx_nss > WIFI_MAX_SPATIAL_STREAMS ?
+                     WIFI_MAX_SPATIAL_STREAMS : max_rx_nss;
+            int tx = max_tx_nss > WIFI_MAX_SPATIAL_STREAMS ?
+                     WIFI_MAX_SPATIAL_STREAMS : max_tx_nss;
+
+            snprintf(mimo, sizeof(mimo), "%dx%d", rx, tx);
+            wifi_replace_string(radio, "mimo", mimo);
+            wifi_replace_string(radio, "mimo_source",
+                                matched_source ? matched_source : "station_nss");
+            json_object_object_del(radio, "mimo_reason");
+        } else {
+            wifi_replace_null(radio, "mimo");
+            wifi_replace_string(radio, "mimo_reason",
+                clients > 0 ? "station_spatial_streams_not_reported" :
+                              "spatial_streams_not_reported");
+        }
         wifi_replace_null(radio, "uplink_type");
         wifi_replace_string(radio, "uplink_type_reason", "ap_uplink_not_reported");
-        wifi_replace_null(radio, "supported_channels");
-        wifi_replace_null(radio, "dfs_channels");
+        /*
+         * The catalog is authoritative for what the driver and regdomain
+         * permit; exclusions and plan transactions are a separate producer, so
+         * those two stay null with their own reason even when it is present.
+         */
+        if (wifi_publish_channel_plan(radio)) {
+            wifi_replace_string(radio, "channel_plan_reason", "available");
+        } else {
+            wifi_replace_null(radio, "supported_channels");
+            wifi_replace_null(radio, "dfs_channels");
+            wifi_replace_string(radio, "channel_plan_reason",
+                                "regdomain_driver_channel_catalog_pending");
+        }
         wifi_replace_null(radio, "unavailable_channels");
         wifi_replace_null(radio, "excluded_channels");
-        wifi_replace_string(radio, "channel_plan_reason",
-                            "regdomain_driver_channel_catalog_pending");
+        wifi_replace_string(radio, "channel_exclusion_reason",
+                            "channel_exclusion_producer_pending");
         wifi_replace_bool(radio, "metrics_complete", station_metrics && signals == clients);
     }
 }
@@ -1723,6 +1972,81 @@ void webd_wifi_merge_station_identity(struct json_object *data,
     }
 }
 
+/*
+ * Airtime aggregates rolled up from whatever radios actually reported, local or
+ * managed. The previous implementation derived these from the local survey
+ * alone, which is permanently null on an x86 router with no phy, while the
+ * managed AP's values sat unused in the same response. Radios carry
+ * `channel_utilization_pct` / `noise_dbm` / `retry_rate` already decorated by
+ * wifi_decorate_radio_metrics, so the roll-up reads those instead of
+ * re-deriving from survey internals.
+ *
+ * `sample_source` is set to the source that produced the samples so the caller
+ * can say where a number came from rather than asserting a tool that ran dry.
+ * Counts stay separate from values: zero samples yields null, never 0.
+ */
+struct wifi_airtime_rollup {
+    double utilization_sum;
+    int utilization_samples;
+    double retry_sum;
+    int retry_samples;
+    double worst_noise;
+    int noise_samples;
+    double signal_sum;
+    int signal_samples;
+    int local_samples;
+    int managed_samples;
+};
+
+static void wifi_airtime_rollup_radio(struct json_object *radio,
+                                      struct wifi_airtime_rollup *roll)
+{
+    double value;
+    int counted = 0;
+
+    if (!radio || !roll)
+        return;
+    if (wifi_number(radio, "channel_utilization_pct", &value) &&
+        value >= 0.0 && value <= 100.0) {
+        roll->utilization_sum += value;
+        roll->utilization_samples++;
+        counted = 1;
+    }
+    if (wifi_number(radio, "retry_rate", &value) &&
+        value >= 0.0 && value <= 100.0) {
+        roll->retry_sum += value;
+        roll->retry_samples++;
+        counted = 1;
+    }
+    /* Worst noise is the least negative floor, i.e. the noisiest radio. */
+    if (wifi_number(radio, "noise_dbm", &value) && value < 0.0) {
+        if (roll->noise_samples == 0 || value > roll->worst_noise)
+            roll->worst_noise = value;
+        roll->noise_samples++;
+        counted = 1;
+    }
+    if (wifi_number(radio, "avg_signal_dbm", &value) && value < 0.0) {
+        roll->signal_sum += value;
+        roll->signal_samples++;
+        counted = 1;
+    }
+    if (!counted)
+        return;
+    if (!strcmp(wifi_string(radio, "source", ""), "managed_ap"))
+        roll->managed_samples++;
+    else
+        roll->local_samples++;
+}
+
+static void wifi_summary_replace_double(struct json_object *summary,
+                                        const char *key, int have,
+                                        double value)
+{
+    json_object_object_del(summary, key);
+    json_object_object_add(summary, key, have ?
+        json_object_new_double(value) : json_object_new_null());
+}
+
 struct json_object *webd_wifi_aggregate_data_with_resolver(
     struct json_object *local_response, struct json_object *ac_response,
     int runtime_status, webd_wifi_model_image_resolver_fn image_resolver)
@@ -1758,6 +2082,15 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
     const char *station_metrics_reason = "station_source_not_reported";
     int remote_station_inventory_sources = 0;
     int remote_station_metric_sources = 0;
+    /*
+     * Which side produced the reason currently held in
+     * `station_inventory_reason`. Without this the summary published a string
+     * like `per_interface_control_unavailable` with no indication whether it
+     * described this router or the managed AP, and a reason about the local
+     * hostapd channel read as an explanation for an empty remote client list.
+     */
+    const char *station_inventory_reason_scope = "unknown";
+    const char *station_metrics_reason_scope = "unknown";
     int local_station_inventory;
     int local_station_metrics;
     int desired_available = 0;
@@ -1786,14 +2119,18 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
     {
         struct json_object *local_reasons = wifi_child_object(capabilities, "reasons");
 
-        if (!local_station_inventory)
+        if (!local_station_inventory) {
             station_inventory_reason = wifi_string(
                 local_reasons, "station_inventory",
                 "local_station_source_not_authoritative");
-        if (!local_station_metrics)
+            station_inventory_reason_scope = "local";
+        }
+        if (!local_station_metrics) {
             station_metrics_reason = wifi_string(
                 local_reasons, "station_metrics",
                 "local_station_metrics_not_authoritative");
+            station_metrics_reason_scope = "local";
+        }
     }
     if (runtime_status && local_radio_count > 0)
         wifi_decorate_radio_metrics(
@@ -1870,10 +2207,14 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
             remote_station_inventory_sources++;
         if (fresh && ap_station_metrics)
             remote_station_metric_sources++;
-        if (fresh && !ap_station_inventory)
+        if (fresh && !ap_station_inventory) {
             station_inventory_reason = ap_station_inventory_reason;
-        if (fresh && !ap_station_metrics)
+            station_inventory_reason_scope = "managed_ap";
+        }
+        if (fresh && !ap_station_metrics) {
             station_metrics_reason = ap_station_metrics_reason;
+            station_metrics_reason_scope = "managed_ap";
+        }
         if (snapshot && wifi_child_array(snapshot, "radios") &&
             json_object_array_length(wifi_child_array(snapshot, "radios")) > 0)
             ap_radio_mapping = 1;
@@ -1931,22 +2272,57 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
     station_metrics = station_inventory &&
         (!(local_radio_count || local_ssid_count) || local_station_metrics) &&
         (remote_fresh == 0 || remote_station_metric_sources == remote_fresh);
-    if (station_inventory)
+    if (station_inventory) {
         station_inventory_reason = "available";
-    else if ((local_radio_count || local_ssid_count) && !local_station_inventory)
+        station_inventory_reason_scope =
+            (local_radio_count || local_ssid_count) ?
+                (remote_fresh > 0 ? "local+managed_ap" : "local") :
+                (remote_fresh > 0 ? "managed_ap" : "none");
+    } else if ((local_radio_count || local_ssid_count) &&
+               !local_station_inventory) {
         station_inventory_reason = "local_station_source_not_authoritative";
-    else if (remote_fresh == 0 && remote_stale > 0)
+        station_inventory_reason_scope = "local";
+    } else if (remote_fresh == 0 && remote_stale > 0) {
         station_inventory_reason = "telemetry_stale";
-    else if (remote_fresh == 0 && remote_offline > 0)
+        station_inventory_reason_scope = "managed_ap";
+    } else if (remote_fresh == 0 && remote_offline > 0) {
         station_inventory_reason = "managed_ap_offline";
-    if (station_metrics)
+        station_inventory_reason_scope = "managed_ap";
+    }
+    if (station_metrics) {
         station_metrics_reason = "available";
-    else if ((local_radio_count || local_ssid_count) && !local_station_metrics)
+        station_metrics_reason_scope = station_inventory_reason_scope;
+    } else if ((local_radio_count || local_ssid_count) &&
+               !local_station_metrics) {
         station_metrics_reason = "local_station_metrics_not_authoritative";
-    else if (remote_fresh == 0 && remote_stale > 0)
+        station_metrics_reason_scope = "local";
+    } else if (remote_fresh == 0 && remote_stale > 0) {
         station_metrics_reason = "telemetry_stale";
-    else if (remote_fresh == 0 && remote_offline > 0)
+        station_metrics_reason_scope = "managed_ap";
+    } else if (remote_fresh == 0 && remote_offline > 0) {
         station_metrics_reason = "managed_ap_offline";
+        station_metrics_reason_scope = "managed_ap";
+    }
+    /*
+     * A local reason must not stand as the summary's explanation when the local
+     * side has no radio at all. On a router without a phy the stations can only
+     * come from a managed AP, so a string describing the local hostapd control
+     * channel is not an answer about the remote client list.
+     */
+    if (!station_inventory && !(local_radio_count || local_ssid_count) &&
+        !strcmp(station_inventory_reason_scope, "local")) {
+        station_inventory_reason = remote_fresh > 0 ?
+            "managed_ap_station_source_unavailable" :
+            "no_local_phy_and_no_managed_ap_runtime";
+        station_inventory_reason_scope = "managed_ap";
+    }
+    if (!station_metrics && !(local_radio_count || local_ssid_count) &&
+        !strcmp(station_metrics_reason_scope, "local")) {
+        station_metrics_reason = remote_fresh > 0 ?
+            "managed_ap_station_metrics_unavailable" :
+            "no_local_phy_and_no_managed_ap_runtime";
+        station_metrics_reason_scope = "managed_ap";
+    }
 
     if (runtime_status) {
         struct json_object *runtime_radios_copy = wifi_clone(runtime_radios);
@@ -2026,6 +2402,21 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
         station_inventory ? "available" : station_inventory_reason);
     wifi_capability_reason(capabilities, "station_metrics",
         station_metrics ? "available" : station_metrics_reason);
+    /*
+     * The scope says whose failure the reason describes. `station_inventory`
+     * false plus scope `managed_ap` is a remote collection gap; the same flag
+     * with scope `local` is this router's. The frontend hides station UI on the
+     * capability alone, so it needs to know which.
+     */
+    {
+        struct json_object *scopes = wifi_ensure_object(capabilities,
+                                                       "reason_scopes");
+
+        wifi_replace_string(scopes, "station_inventory",
+                            station_inventory_reason_scope);
+        wifi_replace_string(scopes, "station_metrics",
+                            station_metrics_reason_scope);
+    }
     wifi_capability_reason(capabilities, "ap_radio_mapping",
         ap_radio_mapping ? "snapshot_resource_identity" :
                            "managed_ap_radio_snapshot_unavailable");
@@ -2125,6 +2516,31 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
     json_object_object_del(summary, "ssid_count");
     json_object_object_add(summary, "ssid_count", json_object_new_int(
         (int)json_object_array_length(ssids)));
+    /*
+     * `interface_count` / `phy_count` are produced by the local chain and count
+     * local phys only. Left under those names they contradict `radio_count`,
+     * which includes managed AP radios: a reader sees 3 radios on 0 phys. They
+     * are republished with explicit `local_` names, and the bare names are kept
+     * as aliases so existing frontend readers keep working, with a reason field
+     * saying what they count.
+     */
+    {
+        struct json_object *local_interfaces = wifi_child(summary,
+                                                          "interface_count");
+        struct json_object *local_phys = wifi_child(summary, "phy_count");
+        int interface_count = local_interfaces ?
+            json_object_get_int(local_interfaces) : 0;
+        int phy_count = local_phys ? json_object_get_int(local_phys) : 0;
+
+        json_object_object_del(summary, "local_interface_count");
+        json_object_object_add(summary, "local_interface_count",
+                               json_object_new_int(interface_count));
+        json_object_object_del(summary, "local_phy_count");
+        json_object_object_add(summary, "local_phy_count",
+                               json_object_new_int(phy_count));
+        wifi_replace_string(summary, "interface_count_scope", "local_only");
+        wifi_replace_string(summary, "phy_count_scope", "local_only");
+    }
     json_object_object_del(summary, "station_count");
     json_object_object_del(summary, "clients");
     if (station_inventory) {
@@ -2140,12 +2556,83 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
         wifi_replace_string(summary, "clients_reason",
                             station_inventory_reason);
     }
+    /* Same distinction as the capability scope: whose gap this reason is. */
+    wifi_replace_string(summary, "station_count_reason_scope",
+                        station_inventory ? "available" :
+                                            station_inventory_reason_scope);
     json_object_object_del(summary, "managed_ap_count");
     json_object_object_add(summary, "managed_ap_count", json_object_new_int(
         ac_items ? (int)json_object_array_length(ac_items) : 0));
     json_object_object_del(summary, "managed_ap_online");
     json_object_object_add(summary, "managed_ap_online",
                            json_object_new_int(managed_online));
+    /*
+     * Airtime aggregates. The local chain writes these as null with
+     * `local_survey_source_unavailable` because a router without a phy can
+     * never sample a channel. That reason is correct about the local source and
+     * wrong as the summary's answer: the managed AP's radios are in this same
+     * response. Roll the published radios up instead, and name the source that
+     * supplied them.
+     */
+    {
+        struct wifi_airtime_rollup roll;
+        size_t radio_index;
+        const char *airtime_source;
+        const char *airtime_reason;
+
+        memset(&roll, 0, sizeof(roll));
+        for (radio_index = 0; radios &&
+             radio_index < json_object_array_length(radios); radio_index++)
+            wifi_airtime_rollup_radio(
+                json_object_array_get_idx(radios, radio_index), &roll);
+
+        wifi_summary_replace_double(summary, "avg_utilization",
+            roll.utilization_samples > 0,
+            roll.utilization_samples > 0 ?
+                roll.utilization_sum / roll.utilization_samples : 0.0);
+        wifi_summary_replace_double(summary, "avg_retry_rate",
+            roll.retry_samples > 0,
+            roll.retry_samples > 0 ? roll.retry_sum / roll.retry_samples : 0.0);
+        wifi_summary_replace_double(summary, "worst_noise",
+            roll.noise_samples > 0, roll.worst_noise);
+        /*
+         * avg_signal comes from per-radio station signal averages. It stays
+         * null when no station reported one; with no associated client there is
+         * no signal to average, and 0 dBm would be a fabricated reading.
+         */
+        if (roll.signal_samples > 0)
+            wifi_summary_replace_double(summary, "avg_signal", 1,
+                roll.signal_sum / roll.signal_samples);
+
+        if (roll.managed_samples > 0 && roll.local_samples > 0)
+            airtime_source = "local+managed_ap_radios";
+        else if (roll.managed_samples > 0)
+            airtime_source = "managed_ap_radios";
+        else if (roll.local_samples > 0)
+            airtime_source = "local_radios";
+        else
+            airtime_source = NULL;
+
+        /*
+         * When nothing reported, say which sources were tried rather than
+         * blaming the local survey for a deployment that has no local radio.
+         */
+        if (airtime_source)
+            airtime_reason = "available";
+        else if (json_object_array_length(radios) > 0)
+            airtime_reason = "radio_airtime_not_sampled_by_local_survey_or_managed_ap";
+        else if (ac_items && json_object_array_length(ac_items) > 0)
+            airtime_reason = "no_radio_reported_by_local_phy_or_managed_ap";
+        else
+            airtime_reason = "no_local_phy_and_no_managed_ap";
+        wifi_replace_string(summary, "airtime_reason", airtime_reason);
+        json_object_object_del(summary, "airtime_source");
+        json_object_object_add(summary, "airtime_source", airtime_source ?
+            json_object_new_string(airtime_source) : json_object_new_null());
+        json_object_object_del(summary, "airtime_radio_samples");
+        json_object_object_add(summary, "airtime_radio_samples",
+            json_object_new_int(roll.local_samples + roll.managed_samples));
+    }
     wifi_replace_string(summary, "source", "local+dreamingwrt-ac");
     return data;
 }

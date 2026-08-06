@@ -5,8 +5,10 @@ export function mount(context = {}) {
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
   const formatInteger = utils.formatInteger || ((value) => new Intl.NumberFormat('zh-CN').format(Number(value) || 0));
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260805-drawer-detach-01';
   const MODULE_CLASS = 'terminal-groups-route-host';
+  /* 绑定去重：selector -> 已绑过的节点集合（见 scopedAll）。 */
+  const boundNodes = new Map();
   const ENDPOINT = '/api/v1/policy-engine/terminal-groups';
   const CLIENTS_ENDPOINT = '/api/v1/clients';
 
@@ -252,19 +254,29 @@ export function mount(context = {}) {
     return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(timestamp);
   }
 
-  function renderToolbar() {
+  /* Search, import/export and create used to sit in their own <header> above the
+     card, which cost a 58px band before the table even started. The kit's table
+     toolbar is already a space-between flex with a free right-hand slot, so the
+     controls live there instead and the page starts at the table. */
+  function renderTableControls() {
     const importDisabled = state.clientsLoading ? 'disabled' : '';
-    const exportDisabled = state.groups.length ? '' : 'disabled';
-    return `<header class="policy-toolbar terminal-group-toolbar">
-      <label class="policy-search policy-search-main" data-dwrt-component="expand-search">${icon('search')}<input type="search" data-terminal-group-search placeholder="搜索分组、终端、IP 或 MAC" value="${escapeHtml(state.query)}"></label>
-      <div class="policy-toolbar-actions terminal-group-toolbar-actions">
-        <button class="policy-filter-button" type="button" data-terminal-group-import ${importDisabled}>${icon('upload')}<span>导入</span></button>
-        <button class="policy-filter-button" type="button" data-terminal-group-export="json" ${exportDisabled}>${icon('download')}<span>导出 JSON</span></button>
-        <button class="policy-filter-button terminal-group-export-csv" type="button" data-terminal-group-export="csv" ${exportDisabled}>CSV</button>
-        <button class="policy-create-button" type="button" data-terminal-group-create>${icon('plus')}<span>创建分组</span></button>
-      </div>
+    /*
+     * 导出不再按「有没有分组」禁用。用户反馈导出按钮点不动，原因是这里用
+     * state.groups.length 当门槛，而当前后端返回 0 个分组（实测
+     * /api/v1/policy-engine/terminal-groups 的 groups 为空数组），按钮就永远是灰的。
+     * 导出的是「当前这张表」，空表导出一个空集合是有意义的结果 —— 用户拿到的
+     * 文件能证明这里确实没有数据，也能当作导入模板。只在数据还没读完时禁用，
+     * 避免导出一份半截的快照。
+     */
+    const exportDisabled = state.loading ? 'disabled' : '';
+    return `<div class="terminal-group-table-controls">
+      <label class="policy-search terminal-group-table-search" data-dwrt-component="expand-search">${icon('search')}<input type="search" data-terminal-group-search placeholder="搜索分组、终端、IP 或 MAC" value="${escapeHtml(state.query)}"></label>
+      <button class="policy-filter-button" type="button" data-terminal-group-import ${importDisabled}>${icon('upload')}<span>导入</span></button>
+      <button class="policy-filter-button" type="button" data-terminal-group-export="json" ${exportDisabled}>${icon('download')}<span>导出 JSON</span></button>
+      <button class="policy-filter-button terminal-group-export-csv" type="button" data-terminal-group-export="csv" ${exportDisabled}>CSV</button>
+      <button class="policy-create-button" type="button" data-terminal-group-create>${icon('plus')}<span>创建分组</span></button>
       <input type="file" data-terminal-group-import-file accept=".json,.csv,application/json,text/csv" hidden>
-    </header>`;
+    </div>`;
   }
 
   function groupRow(group) {
@@ -284,11 +296,17 @@ export function mount(context = {}) {
 
   function renderTable() {
     const groups = filteredGroups();
-    const subtitle = state.loading ? '正在读取 config.db 分组' : state.error || (state.source ? `数据源：${state.source}` : '按终端身份维护策略对象');
+    /*
+     * 工具栏左侧只放条数徽标。原先这里是「终端分组」标题 + 「数据源：
+     * config.db:terminal_group+terminal_group_member」副文本：标题重复了壳层
+     * 面包屑已经写过的页面名，副文本把内部表名暴露给用户，两者都不是使用页面
+     * 时需要的信息。错误信息仍要留一条可见通道，所以出错时徽标位置改为报错。
+     */
+    const countText = `${formatInteger(groups.length)} 个分组 · ${formatInteger(groups.reduce((sum, item) => sum + item.member_count, 0))} 个成员`;
     return `<section class="terminal-group-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface">
       <div class="dwrt-kit-table-toolbar terminal-group-table-toolbar">
-        <div class="dwrt-kit-table-title"><strong>终端分组</strong><span class="${state.error ? 'is-warning' : ''}">${escapeHtml(subtitle)}</span></div>
-        <div class="terminal-group-table-meta"><span class="dwrt-kit-table-count">${escapeHtml(formatInteger(groups.length))} 个分组 · ${escapeHtml(formatInteger(groups.reduce((sum, item) => sum + item.member_count, 0)))} 个成员</span></div>
+        <span class="dwrt-kit-table-count terminal-group-table-count${state.error ? ' is-warning' : ''}">${escapeHtml(state.loading ? '正在读取终端分组' : state.error || countText)}</span>
+        <div class="terminal-group-table-meta">${renderTableControls()}</div>
       </div>
       <div class="dwrt-kit-table-scroll terminal-group-table-scroll">
         <table class="dwrt-kit-table dwrt-kit-ikuai-table terminal-group-table">
@@ -305,6 +323,13 @@ export function mount(context = {}) {
     const scroll = card.querySelector('.terminal-group-table-scroll');
     const scrollTop = scroll?.scrollTop || 0;
     const scrollLeft = scroll?.scrollLeft || 0;
+    /* The search box now lives inside this card, so replacing the card wholesale
+       would blow away the element the user is typing in. Selection and focus are
+       carried across, and the controls are re-bound below -- bindTableActions()
+       alone only covers the row buttons. */
+    const search = card.querySelector('[data-terminal-group-search]');
+    const wasFocused = document.activeElement === search;
+    const caret = wasFocused ? [search.selectionStart, search.selectionEnd] : null;
     card.outerHTML = renderTable();
     const nextScroll = root.querySelector('.terminal-group-table-scroll');
     if (nextScroll) {
@@ -314,7 +339,15 @@ export function mount(context = {}) {
     const importButton = root.querySelector('[data-terminal-group-import]');
     if (importButton) importButton.disabled = state.clientsLoading;
     root.querySelectorAll('[data-terminal-group-export]').forEach((button) => { button.disabled = !state.groups.length; });
+    bindTableControls();
     bindTableActions();
+    if (wasFocused) {
+      const next = root.querySelector('[data-terminal-group-search]');
+      if (next) {
+        next.focus();
+        try { next.setSelectionRange(caret[0], caret[1]); } catch (_) {}
+      }
+    }
   }
 
   function currentDraftMembers() {
@@ -410,9 +443,55 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', MODULE_CLASS);
-    root.innerHTML = `<section class="policy-table-shell terminal-group-shell">${renderToolbar()}${renderTable()}${renderDrawer()}</section>`;
+    /*
+     * 抽屉单独渲染进 [data-terminal-group-overlay]，不再拼进整页模板。
+     * 原先它是这句 innerHTML 的一部分，于是抽屉里任何一次交互（换成员、
+     * 勾选、改导入模式）走到 render() 都会把正在使用的抽屉整块换掉 ——
+     * 表现为「弹出之后立马闪退」和输入被打断。
+     */
+    root.innerHTML = `<section class="policy-table-shell terminal-group-shell">${renderTable()}<div data-terminal-group-overlay></div></section>`;
+    renderOverlay();
     bindEvents();
     ui.mountAll?.(root);
+  }
+
+  /* 抽屉层：只有它自己变化时才重绘，主体不受影响。 */
+  function renderOverlay() {
+    const host = root?.querySelector('[data-terminal-group-overlay]');
+    if (!host) return;
+    document.querySelectorAll('#dwrtKitSheetPortal [data-terminal-group-owned]').forEach((node) => node.remove());
+    host.innerHTML = renderDrawer();
+    host.querySelectorAll('.dwrt-kit-sheet').forEach((node) => node.setAttribute('data-terminal-group-owned', ''));
+    ui.mountAll?.(host);
+  }
+
+  /*
+   * 抽屉已在场时只换正文与页脚，保留外壳：重建外壳会重播入场动画、
+   * 丢滚动位置与焦点，用户看到的就是「点一下整个抽屉重新加载」。
+   */
+  function patchDrawer() {
+    const sheet = liveDrawer();
+    if (!sheet) { renderOverlay(); bindEvents(); return; }
+    const template = document.createElement('div');
+    template.innerHTML = renderDrawer();
+    const next = template.querySelector('.dwrt-kit-sheet');
+    if (!next) { renderOverlay(); bindEvents(); return; }
+    const body = sheet.querySelector('.terminal-group-drawer-body');
+    const nextBody = next.querySelector('.terminal-group-drawer-body');
+    if (body && nextBody) {
+      const top = body.scrollTop;
+      body.innerHTML = nextBody.innerHTML;
+      body.scrollTop = top;
+    }
+    const foot = sheet.querySelector('.terminal-group-drawer-footer');
+    const nextFoot = next.querySelector('.terminal-group-drawer-footer');
+    if (foot && nextFoot) foot.innerHTML = nextFoot.innerHTML;
+    bindEvents();
+  }
+
+  function liveDrawer() {
+    return [...document.querySelectorAll('[data-terminal-group-owned].dwrt-kit-sheet, [data-terminal-group-overlay] .dwrt-kit-sheet')]
+      .find((node) => node.getBoundingClientRect().width > 0) || null;
   }
 
   function draftFromGroup(group) {
@@ -430,7 +509,8 @@ export function mount(context = {}) {
     state.memberKind = 'all';
     state.importPreview = null;
     state.draft = group ? draftFromGroup(group) : emptyDraft();
-    render();
+    renderOverlay();
+    bindEvents();
   }
 
   function closeDrawer() {
@@ -438,12 +518,14 @@ export function mount(context = {}) {
     state.notice = '';
     state.confirmDelete = false;
     state.importPreview = null;
-    render();
+    renderOverlay();
+    bindEvents();
   }
 
   function patchMemberPicker() {
-    const host = root.querySelector('.terminal-group-member-picker');
-    if (!host) return render();
+    const host = root?.querySelector('.terminal-group-member-picker')
+      || document.querySelector('#dwrtKitSheetPortal [data-terminal-group-owned] .terminal-group-member-picker');
+    if (!host) return patchDrawer();
     const selected = currentDraftMembers();
     const clients = filteredClients();
     const available = host.querySelector('[data-terminal-group-available]');
@@ -480,7 +562,9 @@ export function mount(context = {}) {
   }
 
   function bindMemberEvents() {
-    const picker = root.querySelector('.terminal-group-member-picker');
+    /* 成员选择器住在抽屉里，抽屉可能已被搬到传送门，所以不能只从 root 找。 */
+    const picker = root?.querySelector('.terminal-group-member-picker')
+      || document.querySelector('#dwrtKitSheetPortal [data-terminal-group-owned] .terminal-group-member-picker');
     if (!picker) return;
     picker.querySelector('[data-terminal-group-member-search]')?.addEventListener('input', (event) => {
       state.memberQuery = event.target.value || '';
@@ -509,27 +593,56 @@ export function mount(context = {}) {
   }
 
   function bindEvents() {
+    bindTableControls();
+    bindTableActions();
+    /* 抽屉被 kit 搬进 #dwrtKitSheetPortal 后就不再是 root 的后代，
+       以 root 为根的查询一个都选不到，抽屉里的控件会全部失效。 */
+    scopedAll('[data-terminal-group-close]').forEach((button) => button.addEventListener('click', closeDrawer));
+    scopedAll('[data-terminal-group-name]').forEach((input) => input.addEventListener('input', (event) => { state.draft.name = event.target.value || ''; updateSaveButton(); }));
+    scopedAll('[data-terminal-group-description]').forEach((input) => input.addEventListener('input', (event) => { state.draft.description = event.target.value || ''; }));
+    scopedAll('[data-terminal-group-import-mode]').forEach((input) => input.addEventListener('change', (event) => { state.importMode = event.target.value === 'replace' ? 'replace' : 'merge'; }));
+    scopedAll('[data-terminal-group-save]').forEach((button) => button.addEventListener('click', saveCurrent));
+    scopedAll('[data-terminal-group-delete]').forEach((button) => button.addEventListener('click', deleteCurrent));
+    bindMemberEvents();
+  }
+
+  /* 查询范围 = 路由宿主 + 传送门里属于本页的抽屉；带去重，避免重复叠加监听。 */
+  function scopedAll(selector) {
+    const found = [];
+    if (root) found.push(...root.querySelectorAll(selector));
+    document.querySelectorAll('#dwrtKitSheetPortal [data-terminal-group-owned]').forEach((node) => {
+      if (node.matches?.(selector)) found.push(node);
+      found.push(...node.querySelectorAll(selector));
+    });
+    let seen = boundNodes.get(selector);
+    if (!seen) { seen = new WeakSet(); boundNodes.set(selector, seen); }
+    return found.filter((node) => {
+      if (seen.has(node)) return false;
+      seen.add(node);
+      return true;
+    });
+  }
+
+  /* These controls live inside the table card, so they are re-bound every time the
+     card is replaced. Keeping them out of bindEvents() is what makes
+     patchLoadedTable() safe: previously the create/import/export handlers were
+     attached once at full render and a card swap silently dropped them. */
+  function bindTableControls() {
     root.querySelector('[data-terminal-group-search]')?.addEventListener('input', (event) => {
       state.query = event.target.value || '';
       const tbody = root.querySelector('.terminal-group-table tbody');
-      const count = root.querySelector('.terminal-group-table-meta .dwrt-kit-table-count');
+      /* 徽标已从 .terminal-group-table-meta 里移到工具栏最左侧，选择器跟着改；
+         沿用旧路径会静默选不到，搜索时条数就不再更新。 */
+      const count = root.querySelector('.terminal-group-table-count');
       const groups = filteredGroups();
       if (tbody) tbody.innerHTML = groups.length ? groups.map(groupRow).join('') : `<tr><td colspan="6" class="dwrt-kit-table-empty">${escapeHtml(state.query ? '没有匹配的终端分组' : state.error || '暂无终端分组')}</td></tr>`;
       if (count) count.textContent = `${formatInteger(groups.length)} 个分组 · ${formatInteger(groups.reduce((sum, item) => sum + item.member_count, 0))} 个成员`;
       bindTableActions();
     });
-    bindTableActions();
     root.querySelector('[data-terminal-group-create]')?.addEventListener('click', () => openDrawer('create'));
-    root.querySelectorAll('[data-terminal-group-close]').forEach((button) => button.addEventListener('click', closeDrawer));
     root.querySelector('[data-terminal-group-import]')?.addEventListener('click', () => root.querySelector('[data-terminal-group-import-file]')?.click());
     root.querySelector('[data-terminal-group-import-file]')?.addEventListener('change', handleImportFile);
     root.querySelectorAll('[data-terminal-group-export]').forEach((button) => button.addEventListener('click', () => exportGroups(button.dataset.terminalGroupExport)));
-    root.querySelector('[data-terminal-group-name]')?.addEventListener('input', (event) => { state.draft.name = event.target.value || ''; updateSaveButton(); });
-    root.querySelector('[data-terminal-group-description]')?.addEventListener('input', (event) => { state.draft.description = event.target.value || ''; });
-    root.querySelector('[data-terminal-group-import-mode]')?.addEventListener('change', (event) => { state.importMode = event.target.value === 'replace' ? 'replace' : 'merge'; });
-    root.querySelector('[data-terminal-group-save]')?.addEventListener('click', saveCurrent);
-    root.querySelector('[data-terminal-group-delete]')?.addEventListener('click', deleteCurrent);
-    bindMemberEvents();
   }
 
   function bindTableActions() {
@@ -560,12 +673,12 @@ export function mount(context = {}) {
     const action = importing ? 'import' : state.drawerMode === 'edit' ? 'update' : 'create';
     if (!can(action)) {
       state.notice = '后端写入接口尚未接入，不能把分组伪存到浏览器。';
-      render();
+      patchDrawer();
       return;
     }
     state.saving = true;
     state.notice = '';
-    render();
+    patchDrawer();
     try {
       if (importing) {
         await requestJson(`${ENDPOINT}/import`, { method: 'POST', body: JSON.stringify({ mode: state.importMode, groups: state.importPreview.groups }) });
@@ -579,7 +692,7 @@ export function mount(context = {}) {
     } catch (error) {
       state.saving = false;
       state.notice = `保存失败：${firstText(error.message, 'unknown')}`;
-      render();
+      patchDrawer();
     }
   }
 
@@ -587,11 +700,11 @@ export function mount(context = {}) {
     if (!can('delete') || !state.draft.id || state.deleting) return;
     if (!state.confirmDelete) {
       state.confirmDelete = true;
-      render();
+      patchDrawer();
       return;
     }
     state.deleting = true;
-    render();
+    patchDrawer();
     try {
       await requestJson(`${ENDPOINT}/${encodeURIComponent(state.draft.id)}`, { method: 'DELETE' });
       state.drawerOpen = false;
@@ -600,7 +713,7 @@ export function mount(context = {}) {
       state.deleting = false;
       state.confirmDelete = false;
       state.notice = `删除失败：${firstText(error.message, 'unknown')}`;
-      render();
+      patchDrawer();
     }
   }
 

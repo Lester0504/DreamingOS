@@ -154,6 +154,7 @@ static int aegisxd_count_sql(const char *sql)
 static int aegisxd_status_contract_load(char *state, size_t state_len,
                                         char *last_error, size_t last_error_len,
                                         int *schema_version, int64_t *updated_at,
+                                        int64_t *last_error_at,
                                         struct json_object *datasets)
 {
     sqlite3_stmt *st;
@@ -189,21 +190,39 @@ static int aegisxd_status_contract_load(char *state, size_t state_len,
     } else {
         ok = 0;
     }
+    /* aegis_feeds and aegis_import_state are keyed per feed and cleared on
+     * success, so a non-empty last_error there is genuinely current.
+     * aegis_job_state is append-only history: every failed job keeps its error
+     * row forever, so the old query surfaced a long-dead failure even after a
+     * later sync of the same op succeeded.  Consider only the newest job per
+     * op, which lets a success supersede the failure it replaced.
+     * The GROUP BY uses SQLite's documented bare-column rule: with a single
+     * MAX() aggregate, the non-aggregated columns come from the matching row.
+     * That keeps this a single scan; aegis_job_state is never pruned, so a
+     * correlated per-row subquery here would degrade as history grows. */
     st = aegisxd_prepare(
-        "SELECT error,updated_at FROM ("
-        "SELECT last_error AS error,updated_at FROM aegis_feeds WHERE last_error<>'' "
+        "SELECT error,ts FROM ("
+        "SELECT last_error AS error,updated_at AS ts FROM aegis_feeds WHERE last_error<>'' "
         "UNION ALL SELECT last_error,last_finished_at FROM aegis_import_state WHERE last_error<>'' "
-        "UNION ALL SELECT last_error,MAX(started_at,finished_at) FROM aegis_job_state WHERE last_error<>'') "
-        "ORDER BY updated_at DESC LIMIT 1");
+        "UNION ALL SELECT error,ts FROM ("
+        "SELECT last_error AS error,MAX(MAX(started_at,finished_at)) AS ts "
+        "FROM aegis_job_state GROUP BY op) WHERE error<>'') "
+        "ORDER BY ts DESC");
     if (st) {
-        rc = sqlite3_step(st);
-        if (rc == SQLITE_ROW) {
-            snprintf(last_error, last_error_len, "%s", aegisxd_sqlite_text(st, 0, ""));
-            if (sqlite3_column_int64(st, 1) > *updated_at)
-                *updated_at = sqlite3_column_int64(st, 1);
-        } else if (rc != SQLITE_DONE) {
-            ok = 0;
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+            const char *err = aegisxd_sqlite_text(st, 0, "");
+            int64_t ts = sqlite3_column_int64(st, 1);
+
+            if (ts > *updated_at)
+                *updated_at = ts;
+            if (err[0] && !last_error[0]) {
+                snprintf(last_error, last_error_len, "%s", err);
+                if (last_error_at)
+                    *last_error_at = ts;
+            }
         }
+        if (rc != SQLITE_DONE)
+            ok = 0;
         sqlite3_finalize(st);
     } else {
         ok = 0;
@@ -900,6 +919,7 @@ struct json_object *aegisxd_status_json(void)
     char last_error[AEGISXD_MAX_TEXT] = "";
     int schema_version = 0;
     int64_t updated_at = 0;
+    int64_t last_error_at = 0;
     int settings_ok;
     int ok;
     int degraded;
@@ -910,7 +930,8 @@ struct json_object *aegisxd_status_json(void)
 
     settings_ok = aegisxd_settings_load(&settings) == 0;
     ok = aegisxd_status_contract_load(state, sizeof(state), last_error, sizeof(last_error),
-                                      &schema_version, &updated_at, datasets);
+                                      &schema_version, &updated_at, &last_error_at,
+                                      datasets);
     ok = ok && settings_ok;
     if (!ok && !last_error[0])
         snprintf(last_error, sizeof(last_error), "%s", "status_query_failed");
@@ -929,6 +950,9 @@ struct json_object *aegisxd_status_json(void)
     aegisxd_json_add_string(resp, "state", degraded ? "degraded" : state);
     json_object_object_add(resp, "degraded", json_object_new_boolean(degraded));
     aegisxd_json_add_string(resp, "last_error", last_error);
+    /* Without a timestamp a sticky error reads as a current fault.  Callers can
+     * now tell how old it is instead of guessing. */
+    json_object_object_add(resp, "last_error_at", json_object_new_int64(last_error_at));
     json_object_object_add(resp, "feed_health", feed_health);
     json_object_object_add(resp, "feeds_total", json_object_new_int(feeds_total));
     json_object_object_add(resp, "feeds_failing", json_object_new_int(feeds_failing));
