@@ -4845,6 +4845,7 @@ struct json_object *jmx_api_route_status(struct json_object *req_obj);
 struct json_object *jmx_api_route_reload(struct json_object *req_obj);
 struct json_object *jmx_api_route_config_get(struct json_object *req_obj);
 struct json_object *jmx_api_route_config_set(struct json_object *req_obj);
+struct json_object *jmx_api_route_policy_set(struct json_object *req_obj);
 
 
 
@@ -5523,6 +5524,7 @@ static jmx_api_node_t jmx_api_node_list[] = {
     {"route_reload", jmx_api_route_reload},
     {"route_config_get", jmx_api_route_config_get},
     {"route_config_set", jmx_api_route_config_set},
+    {"route_policy_set", jmx_api_route_policy_set},
     {"get_user_records", jmx_api_get_user_records},
     {"get_history_session", jmx_api_get_history_session},
     {"get_feature_info", jmx_api_get_feature_info},

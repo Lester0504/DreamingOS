@@ -766,6 +766,46 @@
 .global-advanced-panel .global-mode-options small { font-size: 9px; }
 .global-advanced-panel .global-wan-policy-list article { min-height: 48px; }
 .global-advanced-panel .global-inline-action { min-height: 32px; border-radius: 8px; }
+.global-wan-policy-editor { min-width: 0; display: grid; gap: 12px; }
+.global-wan-policy-modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.global-wan-policy-mode { position: relative; min-width: 0; cursor: pointer; }
+.global-wan-policy-mode input { position: absolute; opacity: 0; }
+.global-wan-policy-mode > span {
+  min-height: 54px;
+  display: grid;
+  align-content: center;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255,255,255,.027);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.08);
+}
+.global-wan-policy-mode input:checked + span { background: rgba(47,132,255,.11); box-shadow: inset 0 0 0 1px rgba(88,158,255,.30); }
+.global-wan-policy-mode input:focus-visible + span { outline: 2px solid #5c9fff; outline-offset: 2px; }
+.global-wan-policy-mode input:disabled + span { cursor: not-allowed; opacity: .55; }
+.global-wan-policy-mode strong { color: var(--app-text); font-size: 10px; }
+.global-wan-policy-mode small { color: var(--app-text-muted); font-size: 9px; line-height: 1.4; }
+.global-wan-policy-current {
+  display: grid;
+  gap: 3px;
+  border-left: 2px solid rgba(72,148,255,.72);
+  padding: 3px 0 3px 10px;
+}
+.global-wan-policy-current strong { color: var(--app-text); font-size: 12px; }
+.global-wan-policy-current small { color: var(--app-text-muted); font-size: 9px; line-height: 1.45; }
+.global-wan-policy-members { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.global-wan-policy-member { min-width: 0; display: flex; align-items: center; gap: 8px; min-height: 46px; padding: 7px 9px; border-radius: 8px; background: rgba(255,255,255,.026); box-shadow: inset 0 0 0 1px rgba(255,255,255,.07); cursor: pointer; }
+.global-wan-policy-member input { accent-color: #4c99ff; flex: 0 0 auto; }
+.global-wan-policy-member span { min-width: 0; display: grid; gap: 2px; }
+.global-wan-policy-member strong { color: var(--app-text); font-size: 10px; }
+.global-wan-policy-member small { overflow: hidden; color: var(--app-text-muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.global-wan-policy-presets { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.global-wan-policy-presets > span { color: var(--app-text-muted); font-size: 9px; margin-right: 2px; }
+.global-wan-policy-presets .global-inline-action { min-height: 28px; padding: 0 9px; font-size: 9px; }
+.global-wan-policy-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px solid rgba(255,255,255,.065); padding-top: 10px; }
+.global-wan-policy-actions small { color: var(--app-text-muted); font-size: 9px; line-height: 1.4; }
+.global-wan-policy-actions .policy-primary { min-height: 34px; border: 0; border-radius: 8px; padding: 0 12px; color: #fff; background: #2f84ff; font: inherit; font-size: 10px; font-weight: 760; cursor: pointer; white-space: nowrap; }
+.global-wan-policy-actions .policy-primary:disabled { cursor: default; opacity: .42; }
 
 @media (prefers-reduced-motion: reduce) {
   .global-advanced-module::before,
@@ -855,6 +895,10 @@
   .global-advanced-module-icon { width: 30px; height: 30px; }
   .global-advanced-module-body { padding: 0 12px 14px 51px; }
   .global-advanced-panel .global-mode-options { grid-template-columns: 1fr; }
+  .global-wan-policy-modes,
+  .global-wan-policy-members { grid-template-columns: 1fr; }
+  .global-wan-policy-actions { align-items: stretch; flex-direction: column; }
+  .global-wan-policy-actions .policy-primary { width: 100%; }
   .global-advanced-panel .global-setting-row { grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 12px; padding: 7px 0; }
   .global-advanced-panel .global-setting-row:has(select),
   .global-advanced-panel .global-setting-row:has(input[type=number]) { grid-template-columns: 1fr; align-items: start; }

@@ -5519,6 +5519,9 @@ int jmx_db_prune_audit(int64_t now_ts, int64_t max_age_sec)
 int jmx_db_prune_traffic_buckets(int64_t now_ts, int64_t max_age_sec) { return db_delete_before("DELETE FROM traffic_buckets WHERE bucket_ts<?1", (now_ts ? now_ts : now_s()) - (max_age_sec > 0 ? max_age_sec : 30 * 86400)); }
 int jmx_db_prune_interface_state(int64_t now_ts, int64_t max_age_sec) { return db_delete_before("DELETE FROM net_interface_state WHERE ts<?1", (now_ts ? now_ts : now_s()) - (max_age_sec > 0 ? max_age_sec : 7 * 86400)); }
 int jmx_db_prune_wan_health(int64_t now_ts, int64_t max_age_sec) { return db_delete_before("DELETE FROM wan_health_samples WHERE ts<?1", (now_ts ? now_ts : now_s()) - (max_age_sec > 0 ? max_age_sec : 30 * 86400)); }
+/* Closed sessions only: an open row (ended_at IS NULL) is live state and is
+ * never pruned regardless of age. Without this the table only ever grew. */
+int jmx_db_prune_wan_sessions(int64_t now_ts, int64_t max_age_sec) { return db_delete_before("DELETE FROM wan_session WHERE ended_at IS NOT NULL AND ended_at<?1", (now_ts ? now_ts : now_s()) - (max_age_sec > 0 ? max_age_sec : 30 * 86400)); }
 
 int jmx_db_prune_and_vacuum(void)
 {
@@ -5540,6 +5543,10 @@ int jmx_db_prune_and_vacuum(void)
     n = jmx_db_prune_wan_health(now, 6 * 3600);  /* keep only 6h of samples */
     if (n < 0) rc = -1;
     if (n > 0) LOG_INFO("prune wan_health_samples: deleted %d rows\n", n);
+
+    n = jmx_db_prune_wan_sessions(now, 30 * 86400);  /* keep 30d of ended sessions */
+    if (n < 0) rc = -1;
+    if (n > 0) LOG_INFO("prune wan_session: deleted %d rows\n", n);
 
     if (jmx_db_prune_activity_samples(31 * 86400) < 0)  /* keep 31 days of activity samples */
         rc = -1;
@@ -5734,6 +5741,10 @@ typedef struct {
     int64_t ended_at;
     char end_reason[64];
     int  active;
+    /* 1 when this session adopted an already-open DB row instead of starting
+     * its own; surfaced as connection_time_reason so a stale inherited timer
+     * is distinguishable from a genuine reset. */
+    int  inherited;
     int  dirty;
 } wan_session_state_t;
 
@@ -5910,6 +5921,96 @@ int jmx_db_upsert_wan_profile(const char *ifname, const char *display_name,
 
 /* ── session tracking ── */
 
+/* Close every open session row for one wan_id. Returns rows affected, or -1. */
+static int db_wan_session_close_open(const char *wan_id, int64_t ended_at,
+                                     const char *reason)
+{
+    sqlite3_stmt *st = NULL;
+    int changes = 0;
+
+    if (!wan_id || !wan_id[0])
+        return -1;
+    if (jmx_db_init() != 0)
+        return -1;
+    if (db_prepare(&st,
+        "UPDATE wan_session SET ended_at=?1,end_reason=?2 "
+        "WHERE wan_id=?3 AND ended_at IS NULL") != 0)
+        return -1;
+    sqlite3_bind_int64(st, 1, ended_at > 0 ? ended_at : now_s());
+    sqlite3_bind_text(st, 2, reason ? reason : "closed", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, wan_id, -1, SQLITE_TRANSIENT);
+    if (db_step_done(st) != 0) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    changes = sqlite3_changes(g_db);
+    sqlite3_finalize(st);
+    return changes;
+}
+
+/* Open a new session row and return its started_at, or 0 on failure. */
+static int64_t db_wan_session_open(const wan_session_state_t *s,
+                                   const char *ifname)
+{
+    sqlite3_stmt *st = NULL;
+
+    if (!s || jmx_db_init() != 0)
+        return 0;
+    if (db_prepare(&st,
+        "INSERT INTO wan_session(wan_id,ifname,ip,gateway,access_mode,started_at) "
+        "VALUES(?1,?2,?3,?4,?5,?6)") != 0)
+        return 0;
+    sqlite3_bind_text(st, 1, s->wan_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, ifname ? ifname : "", -1, SQLITE_TRANSIENT);
+    bind_text_or_null(st, 3, s->ip);
+    bind_text_or_null(st, 4, s->gateway);
+    bind_text_or_null(st, 5, s->access_mode);
+    sqlite3_bind_int64(st, 6, s->started_at);
+    if (db_step_done(st) != 0) {
+        sqlite3_finalize(st);
+        return 0;
+    }
+    sqlite3_finalize(st);
+    return s->started_at;
+}
+
+/* An address change means the carrier handed us a different session, so the
+ * old started_at must not carry over. Acquiring a first address (""->value)
+ * and losing one (value->"") are not rollovers: the former is the session
+ * coming up, the latter is a transient poll gap or teardown handled by the
+ * offline branch. DHCP renewals that keep the same address are unaffected. */
+static int wan_session_addr_rollover(const char *old_v, const char *new_v)
+{
+    if (!new_v || !new_v[0])
+        return 0;
+    if (!old_v || !old_v[0])
+        return 0;
+    return strcmp(old_v, new_v) != 0;
+}
+
+void jmx_db_close_wan_session(const char *wan_id, const char *reason)
+{
+    wan_session_state_t *s;
+
+    if (!wan_id || !wan_id[0])
+        return;
+    db_wan_session_close_open(wan_id, now_s(),
+                             reason && reason[0] ? reason : "wan_deleted");
+    s = find_session(wan_id);
+    if (s) {
+        /* Drop the in-memory session too: a same-named WAN recreated later
+         * must start from zero instead of resuming this state. */
+        s->active = 0;
+        s->started_at = 0;
+        s->ended_at = now_s();
+        s->ip[0] = '\0';
+        s->gateway[0] = '\0';
+        s->dirty = 0;
+        snprintf(s->end_reason, sizeof(s->end_reason), "%s",
+                 reason && reason[0] ? reason : "wan_deleted");
+    }
+}
+
 void jmx_db_update_wan_session(const char *wan_id, const char *ifname,
                                 const char *ip, const char *gateway,
                                 const char *access_mode, int online)
@@ -5917,6 +6018,8 @@ void jmx_db_update_wan_session(const char *wan_id, const char *ifname,
     wan_session_state_t *s;
     int changed = 0;
     int64_t existing_started_at = 0;
+    int have_open_row = 0;
+    int rollover = 0;
     int64_t current_ts;
     int64_t boot_uptime;
     int64_t boot_at = 0;
@@ -5926,37 +6029,44 @@ void jmx_db_update_wan_session(const char *wan_id, const char *ifname,
     if (!s) return;
 
     if (online) {
+        current_ts = now_s();
+        /* An address change is a session boundary even while the link stayed
+         * up: PPPoE redial gets a new IP and must not inherit the old timer. */
+        if (s->active &&
+            (wan_session_addr_rollover(s->ip, ip) ||
+             wan_session_addr_rollover(s->gateway, gateway))) {
+            rollover = 1;
+            db_wan_session_close_open(wan_id, current_ts, "address_changed");
+            s->active = 0;
+            s->started_at = 0;
+        }
         if (!s->active) {
             /* new session */
             s->active = 1;
-            current_ts = now_s();
             boot_uptime = db_read_system_uptime_sec();
             if (boot_uptime > 0 && boot_uptime <= current_ts)
                 boot_at = current_ts - boot_uptime;
-            existing_started_at = jmx_db_wan_session_started_at(wan_id);
+            existing_started_at = rollover ? 0
+                                           : jmx_db_wan_session_started_at(wan_id);
             if (existing_started_at > current_ts ||
                 (boot_at > 0 && existing_started_at > 0 && existing_started_at < boot_at)) {
-                if (jmx_db_init() == 0) {
-                    sqlite3_stmt *st = NULL;
-                    if (db_prepare(&st,
-                        "UPDATE wan_session SET ended_at=?1,end_reason=?2 "
-                        "WHERE wan_id=?3 AND ended_at IS NULL") == 0) {
-                        sqlite3_bind_int64(st, 1, current_ts);
-                        sqlite3_bind_text(st, 2,
-                            existing_started_at > current_ts ?
-                            "future_timestamp_pruned" : "previous_boot_pruned",
-                            -1, SQLITE_STATIC);
-                        sqlite3_bind_text(st, 3, wan_id, -1, SQLITE_TRANSIENT);
-                        db_step_done(st);
-                        sqlite3_finalize(st);
-                    }
-                }
+                db_wan_session_close_open(wan_id, current_ts,
+                    existing_started_at > current_ts ?
+                    "future_timestamp_pruned" : "previous_boot_pruned");
                 existing_started_at = 0;
             }
             s->started_at = existing_started_at > 0 ? existing_started_at : current_ts;
             s->ended_at = 0;
             s->end_reason[0] = '\0';
-            changed = existing_started_at <= 0;
+            have_open_row = existing_started_at > 0;
+            s->inherited = have_open_row;
+            changed = !have_open_row;
+        } else {
+            /* Already active in memory: an open row exists unless a previous
+             * write failed. Ask the DB instead of inferring it from a local
+             * that is only set on the transition tick; that inference made
+             * every later field update INSERT a duplicate row. */
+            have_open_row = jmx_db_wan_session_started_at(wan_id) > 0;
         }
         /* check ip/gateway change */
         if (ip && strcmp(s->ip, ip) != 0) {
@@ -5976,7 +6086,7 @@ void jmx_db_update_wan_session(const char *wan_id, const char *ifname,
             /* write to DB */
             if (jmx_db_init() == 0) {
                 sqlite3_stmt *st = NULL;
-                if (existing_started_at > 0) {
+                if (have_open_row) {
                     if (db_prepare(&st,
                         "UPDATE wan_session SET ifname=?1,ip=?2,gateway=?3,access_mode=?4 "
                         "WHERE wan_id=?5 AND ended_at IS NULL") == 0) {
@@ -5988,24 +6098,15 @@ void jmx_db_update_wan_session(const char *wan_id, const char *ifname,
                         db_step_done(st);
                         sqlite3_finalize(st);
                     }
-                } else if (db_prepare(&st,
-                    "INSERT INTO wan_session(wan_id,ifname,ip,gateway,access_mode,started_at) "
-                    "VALUES(?1,?2,?3,?4,?5,?6)") == 0) {
-                        sqlite3_bind_text(st, 1, wan_id, -1, SQLITE_TRANSIENT);
-                        sqlite3_bind_text(st, 2, ifname ? ifname : "", -1, SQLITE_TRANSIENT);
-                        bind_text_or_null(st, 3, s->ip);
-                        bind_text_or_null(st, 4, s->gateway);
-                        bind_text_or_null(st, 5, s->access_mode);
-                        sqlite3_bind_int64(st, 6, s->started_at);
-                        db_step_done(st);
-                        sqlite3_finalize(st);
+                } else if (db_wan_session_open(s, ifname) > 0) {
+                    have_open_row = 1;
                 }
                 st = NULL;
                 if (db_prepare(&st,
                     "UPDATE wan_session SET ended_at=?1,end_reason='duplicate_active_pruned' "
                     "WHERE wan_id=?2 AND ended_at IS NULL AND id NOT IN "
                     "(SELECT id FROM wan_session WHERE wan_id=?2 AND ended_at IS NULL "
-                    " ORDER BY started_at ASC, id ASC LIMIT 1)") == 0) {
+                    " ORDER BY started_at DESC, id DESC LIMIT 1)") == 0) {
                     sqlite3_bind_int64(st, 1, now_s());
                     sqlite3_bind_text(st, 2, wan_id, -1, SQLITE_TRANSIENT);
                     db_step_done(st);
@@ -6020,18 +6121,7 @@ void jmx_db_update_wan_session(const char *wan_id, const char *ifname,
             s->ended_at = now_s();
             snprintf(s->end_reason, sizeof(s->end_reason), "link_down");
             /* update DB end time */
-            if (jmx_db_init() == 0) {
-                sqlite3_stmt *st = NULL;
-                if (db_prepare(&st,
-                    "UPDATE wan_session SET ended_at=?1,end_reason=?2 "
-                    "WHERE wan_id=?3 AND ended_at IS NULL") == 0) {
-                    sqlite3_bind_int64(st, 1, s->ended_at);
-                    sqlite3_bind_text(st, 2, "link_down", -1, SQLITE_STATIC);
-                    sqlite3_bind_text(st, 3, wan_id, -1, SQLITE_TRANSIENT);
-                    db_step_done(st);
-                    sqlite3_finalize(st);
-                }
-            }
+            db_wan_session_close_open(wan_id, s->ended_at, "link_down");
         }
     }
 }
@@ -6098,12 +6188,14 @@ void jmx_db_add_wan_session_contract(struct json_object *obj,
     int valid = 0;
     const char *source = "wan_session_db";
     const char *reason = "no_active_session";
+    const wan_session_state_t *sess;
 
     if (!obj || !wan_id || !wan_id[0])
         return;
     if (now_ts <= 0)
         now_ts = now_s();
     started_at = jmx_db_wan_session_started_at(wan_id);
+    sess = find_session(wan_id);
     boot_uptime = db_read_system_uptime_sec();
     if (boot_uptime > 0 && boot_uptime <= now_ts)
         boot_at = now_ts - boot_uptime;
@@ -6117,7 +6209,11 @@ void jmx_db_add_wan_session_contract(struct json_object *obj,
     } else if (started_at > 0) {
         uptime = now_ts - started_at;
         valid = 1;
-        reason = "ok";
+        /* Distinguish a timer this session started from one it adopted from an
+         * already-open row, so a wrong-looking uptime can be attributed.
+         * "ok" is kept for the normal case: existing docs and clients read it. */
+        reason = (sess && sess->active && sess->inherited) ?
+                 "session_inherited" : "ok";
     }
     json_object_object_add(obj, "uptime", json_object_new_int64(uptime));
     json_object_object_add(obj, "online_seconds", json_object_new_int64(uptime));

@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
-  const VERSION = '20260805-drawer-standard-portal-02';
+  const VERSION = '20260806-lan-delete-gate-01';
   const kind = /(?:^|[-_/])wan(?:$|[-_/])/.test(`${item.id || ''} ${item.func_name || ''} ${item.path || ''}`) ? 'wan' : 'lan';
   const isWan = kind === 'wan';
   const embedded = context.embedded === true;
@@ -31,6 +31,8 @@ export function mount(context = {}) {
     notice: '',
     noticeTone: '',
     fieldErrors: {},
+    /* 正在重连的 WAN id，用于给该行一个进行态（拨号可能十几秒）。 */
+    reconnecting: '',
     seq: 0,
     returnFocus: null,
     editorOpen: isWan ? 'identity' : 'identity',
@@ -176,6 +178,9 @@ export function mount(context = {}) {
     if (!response.ok || json?.ok === false || payload?.ok === false) {
       const error = new Error(firstText(payload?.message, payload?.error, json?.message, json?.error, `HTTP ${response.status}`));
       error.details = payload?.errors || json?.errors || [];
+      /* 错误码单独留一份：删除被拒时要靠它翻成人话，只看 message 拿到的是原始字面量。 */
+      error.code = firstText(payload?.error, payload?.code, json?.error, json?.code);
+      error.status = response.status;
       throw error;
     }
     return payload || {};
@@ -411,13 +416,55 @@ export function mount(context = {}) {
     }
   }
 
-  function assignablePorts(ownerId = '') {
-    return state.ports.filter((port) => {
+  /*
+   * 物理口候选。这里原来把「已被别人占用」的口直接 filter 掉，结果新建 WAN 时四个口
+   * 全部归属已有 WAN，列表渲染成「后端未返回可用物理端口」—— 用户既选不到口，也看不出
+   * 为什么，最后提交一个 device 为空的 payload，被后端 wan.device=missing 拒掉，
+   * 表现就是用户报的那个不明所以的保存失败。
+   * 现在改为全部返回并带上归属信息：自己的口可选，别人的口保留在列表里但禁用并写清
+   * 占用者，让「为什么不能选」这件事显示在界面上而不是靠猜。
+   */
+  function annotatedPorts(ownerId = '') {
+    const self = firstText(ownerId);
+    return state.ports.map((port) => {
       const ownerType = firstText(port.ownerType).toLowerCase();
       const currentOwner = firstText(port.ownerId);
-      if (!ownerType || !currentOwner) return true;
-      return ownerType === kind && currentOwner === ownerId;
+      const free = !ownerType || !currentOwner;
+      const mine = ownerType === kind && currentOwner === self && Boolean(self);
+      return { ...port, free, mine, takenBy: free || mine ? '' : currentOwner, takenByType: free || mine ? '' : ownerType };
     });
+  }
+
+  function assignablePorts(ownerId = '') {
+    return annotatedPorts(ownerId).filter((port) => port.free || port.mine);
+  }
+
+  /*
+   * 同一块物理网卡被两个接口同时声明时，界面必须说出来。现实里已经出现过：uci 里
+   * 已无 lan2，但 network/lans 仍返回 lan2 占着 eth3，而 eth3 在 network/ports 与
+   * network/wans 里都归 wan3。静默二选一显示会让用户以为删掉的网络又回来了。
+   * 判据只用后端自己给的两份数据：ports 的 owner_type/owner_id 与本页 rows 的引用。
+   */
+  function portConflicts() {
+    const claims = new Map();
+    const claim = (portName, holder, holderType) => {
+      const name = firstText(portName);
+      if (!name) return;
+      if (!claims.has(name)) claims.set(name, []);
+      const list = claims.get(name);
+      const label = `${holderType}:${holder}`;
+      if (!list.includes(label)) list.push(label);
+    };
+    state.ports.forEach((port) => {
+      if (firstText(port.ownerId)) claim(port.name, firstText(port.ownerId), firstText(port.ownerType) || 'port');
+    });
+    state.rows.forEach((row) => {
+      if (isWan) claim(row.device, firstText(row.id), 'wan');
+      else asArray(row.ports).forEach((name) => claim(name, firstText(row.id), 'lan'));
+    });
+    return [...claims.entries()]
+      .filter(([, holders]) => holders.length > 1)
+      .map(([name, holders]) => ({ port: name, holders }));
   }
 
   function nextId() {
@@ -501,6 +548,15 @@ export function mount(context = {}) {
     const active = isWan ? row.enabled && row.online : row.enabled;
     const label = !row.enabled ? '已停用' : isWan ? (row.online ? '在线' : '离线') : '已启用';
     return ui.statusBadgeMarkup?.(label, active ? 'success' : row.enabled ? 'error' : 'muted') || `<span>${label}</span>`;
+  }
+
+  /*
+   * 重连能力开关。后端还没有这条路由，所以只认 capability，不做「先打过去试试」——
+   * 未注册的写路由会被权限层以 403 挡下（jmx_app_perms.c 的 fail-closed 默认），
+   * 那个 403 和「有路由但无权限」长得一模一样，用它判断能力会得出错误结论。
+   */
+  function reconnectEnabled() {
+    return state.capabilities.wan_reconnect === true;
   }
 
   function overviewMarkup() {
@@ -589,7 +645,19 @@ export function mount(context = {}) {
   }
 
   function rowActions(row) {
+    /*
+     * 重连入口。后端目前没有 POST /api/v1/network/wans/{id}/reconnect（源码里 WAN 的
+    /*
+     * 重连入口。后端目前没有 POST /api/v1/network/wans/{id}/reconnect（源码里 WAN 的
+     * 子路由只有 /dns-policy），所以按钮在 capability 出现之前保持禁用并说明原因 ——
+     * 放一个点了没反应、或者假装成功的按钮，比没有按钮更糟。
+     * 后端交付后只要 capabilities.wan_reconnect 为 true，这里自动变可用，无需再改。
+     */
+    const reconnect = isWan
+      ? `<button type="button" class="${state.reconnecting === row.id ? 'is-busy' : ''}" data-interface-reconnect="${escapeHtml(row.id)}" ${reconnectEnabled() && row.enabled && state.reconnecting !== row.id ? '' : 'disabled'} aria-label="重连 ${escapeHtml(row.name)}" data-dwrt-tooltip="${reconnectEnabled() ? (row.enabled ? '断线重连' : '线路已停用，无法重连') : '后端尚未提供 WAN 重连接口（capability wan_reconnect 未开启）'}">${icon(state.reconnecting === row.id ? 'activity' : 'refresh')}</button>`
+      : '';
     return `<span class="network-interface-row-actions">
+      ${reconnect}
       <button type="button" data-interface-edit="${escapeHtml(row.id)}" aria-label="编辑 ${escapeHtml(row.name)}" data-dwrt-tooltip="编辑">${icon('edit')}</button>
       <button type="button" class="is-danger" data-interface-delete="${escapeHtml(row.id)}" aria-label="删除 ${escapeHtml(row.name)}" data-dwrt-tooltip="删除">${icon('trash')}</button>
     </span>`;
@@ -610,8 +678,99 @@ export function mount(context = {}) {
     </section>`;
   }
 
+  /*
+   * 字段级错误。后端 wan_config_validate / lan_config_validate 早就返回
+   * errors[{field,reason,message}]（field 形如 "wan.device"、"lan.ipaddr"、
+   * "wan.dns[0]"），requestJson 也已经把它接进 error.details，但此前只被
+   * validationMessage 拼成一句话丢进抽屉底部的通知里 —— 用户看到的就是一句
+   * 不指明位置的失败。这里把 field 映射回表单控件的 data-interface-field 路径，
+   * 直接标在出错的那一项上。
+   */
+  const FIELD_ERROR_ALIASES = {
+    device: 'device',
+    ipaddr: 'ipaddr',
+    dns: 'dns_text',
+    'dhcp.dns': 'dhcp.dns_text',
+    'health_check.targets': 'advanced.health_check.targets_text'
+  };
+
+  /*
+   * 后端 reason 是稳定的机器码，message 是英文。页面其余部分是中文，直接把英文原文
+   * 贴到字段旁边会很突兀，所以按 reason 给中文说法，认不出的 reason 才退回后端原文
+   * （宁可显示英文，也不要吞掉一个我们没预料到的校验失败）。
+   */
+  const FIELD_ERROR_TEXT = {
+    missing: '此项为必填',
+    invalid: '取值不在允许范围内',
+    invalid_ip: '需要填写合法的 IPv4 地址',
+    invalid_uci_section: '只能使用字母、数字或下划线',
+    out_of_range: '数值超出允许范围',
+    invalid_range: '地址池范围不合法',
+    outside_subnet: '地址不在本网段内',
+    no_primary: '至少需要一个主地址',
+    multiple_primary: '只能有一个主地址',
+    unsupported_write: '后端当前不支持写入此项'
+  };
+
+  function fieldErrorText(entry) {
+    const reason = firstText(entry?.reason);
+    return firstText(FIELD_ERROR_TEXT[reason], entry?.message, entry?.error, '该项未被后端接受');
+  }
+
+  /*
+   * 把 error.details 摊成 { 表单字段路径: 中文说明 }。同一字段多条只留第一条 ——
+   * 字段旁边塞两行反而看不清该改什么。返回未能落到具体字段的条目，交给顶部通知兜住，
+   * 否则一条认不出 field 的错误会被完全丢掉。
+   */
+  function collectFieldErrors(details) {
+    const mapped = {};
+    const orphans = [];
+    asArray(details).forEach((entry) => {
+      const key = fieldErrorKey(entry?.field);
+      const text = fieldErrorText(entry);
+      if (!key) { orphans.push(text); return; }
+      if (!mapped[key]) mapped[key] = text;
+    });
+    return { mapped, orphans };
+  }
+
+  /* 出错的字段可能折在没展开的分组里，保存失败后要把第一处错误所在的分组打开。 */
+  const FIELD_GROUP_HINTS = isWan
+    ? [
+      [/^(id|name|note|carrier|carrier_custom|ifname|device)/, 'identity'],
+      [/^(access_mode|username|password_input|gateway|dns_text|addresses)/, 'access'],
+      [/^(ipv6)/, 'ipv6'],
+      [/^(mtu|metric|role|expected_|advanced\.link_time|advanced\.default_route|advanced\.failover|advanced\.health_check|smart_queue|upnp|ddns)/, 'routing'],
+      [/^(vlan_|advanced\.dhcp|advanced\.pppoe)/, 'protocol'],
+      [/^(hybrid_lines|pppoe_multi|bond)/, 'hybrid']
+    ]
+    : [
+      [/^(id|name|note|device|ifname|mode|vlan_|ports)/, 'identity'],
+      [/^(ipaddr|cidr|extra_ips|addresses)/, 'addressing'],
+      [/^(dhcp)/, 'dhcp'],
+      [/^(ipv6)/, 'ipv6'],
+      [/^(lan_visit|mac|mtu)/, 'link']
+    ];
+
+  function groupForField(field) {
+    const hit = FIELD_GROUP_HINTS.find(([pattern]) => pattern.test(field));
+    return hit ? hit[1] : '';
+  }
+
+  function fieldErrorKey(field) {
+    /* 去掉 "wan." / "lan." 前缀和数组下标，落到表单里真实存在的那个字段路径。 */
+    const raw = firstText(field).replace(/^(wan|lan)\./, '').replace(/\[\d+\]$/, '');
+    return FIELD_ERROR_ALIASES[raw] || raw;
+  }
+
+  function fieldError(field) {
+    return state.fieldErrors[field] || '';
+  }
+
   function formField(label, control, detail = '', modifier = '') {
-    return `<label class="network-interface-field ${modifier}"><span>${escapeHtml(label)}</span>${control}${detail ? `<small>${escapeHtml(detail)}</small>` : ''}</label>`;
+    const match = /data-interface-field="([^"]+)"/.exec(control);
+    const error = match ? fieldError(match[1]) : '';
+    return `<label class="network-interface-field ${modifier} ${error ? 'is-invalid' : ''}"><span>${escapeHtml(label)}</span>${control}${error ? `<em class="network-interface-field-error" role="alert">${escapeHtml(error)}</em>` : ''}${detail ? `<small>${escapeHtml(detail)}</small>` : ''}</label>`;
   }
 
   function inputField(field, value, options = {}) {
@@ -629,7 +788,11 @@ export function mount(context = {}) {
    * `network/<kind>s/capabilities` 目前是空对象，没有下发候选集，所以候选从已知
    * 事实拼：本接口当前值 + 自身 id（新建时后端就是拿 id 兜底的，见 lanPayload/
    * wanPayload 的 `firstText(draft.ifname, draft.id)`）+ 同类接口已用的名字（标记
-   * 已占用，不可选）+ 物理口名。
+   * 已占用，不可选）。
+   *
+   * 物理口名此前也被塞进这个下拉，于是 eth1/eth2 和 wan/wan2 混在一起，用户根本
+   * 分不清该选哪个 —— 那是交接单第一条点名的问题。物理口现在由上方独立的物理网卡
+   * 选择器负责，这里只留 UCI 段名。
    */
   function ifnameOptions(draft) {
     const current = firstText(draft.ifname);
@@ -656,12 +819,51 @@ export function mount(context = {}) {
       const owner = takenBy.get(name);
       push(name, owner ? `${name}（已被 ${owner} 占用）` : name, Boolean(owner));
     });
-    state.ports.forEach((port) => push(port.name, `${port.name}（物理口）`));
     return options;
   }
 
   function switchField(field, checked, title, detail = '') {
     return `<label class="network-interface-switch-row"><span><strong>${escapeHtml(title)}</strong>${detail ? `<small>${escapeHtml(detail)}</small>` : ''}</span><input type="checkbox" data-interface-field="${escapeHtml(field)}" ${checked ? 'checked' : ''}><i></i></label>`;
+  }
+
+  /*
+   * 运营商改成选择而不是填写。用户填错拼写只会在保存后换来一句看不懂的失败。
+   * 取值集合与本页 carrierLabel()/carrierLogo() 已经识别的那套 key 对齐（unicom /
+   * cmcc / ctcc / cernet），这样选完立刻能拿到正确的中文名与图标。
+   * 后端 wan.carrier 是自由 TEXT、无枚举约束（jmx_netconfig_db.c 建表处），所以
+   * 保留「其他」+ 自由输入，避免把用户真实存在的小运营商挡在外面 —— 交接单要求的
+   * 「未就绪前至少有客户端校验与合法值提示」在这里由固定选项本身完成。
+   */
+  const CARRIER_OPTIONS = [
+    ['', '未指定'],
+    ['unicom', '中国联通'],
+    ['cmcc', '中国移动'],
+    ['ctcc', '中国电信'],
+    ['cernet', '教育网'],
+    ['__custom__', '其他（手动填写）']
+  ];
+
+  /*
+   * 已保存的值可能是 mobile/telecom 这类别名，归一到下拉里真实存在的那个 option。
+   * `carrier_custom` 是纯界面状态：用户刚选「其他」时 carrier 还是空的，只看值会把
+   * 它读回「未指定」，自由输入框就永远出不来，所以选择意图要单独记一笔。
+   */
+  function carrierSelectValue(draft) {
+    const raw = firstText(draft.carrier);
+    if (draft.carrier_custom === true) return '__custom__';
+    if (!raw) return '';
+    const key = raw.toLowerCase().replace(/[\s_-]+/g, '');
+    if (['unicom', 'chinaunicom', 'cucc'].includes(key)) return 'unicom';
+    if (['mobile', 'chinamobile', 'cmcc'].includes(key)) return 'cmcc';
+    if (['telecom', 'chinatelecom', 'ctcc'].includes(key)) return 'ctcc';
+    if (['cernet', 'edu', 'education'].includes(key)) return 'cernet';
+    return '__custom__';
+  }
+
+  function carrierField(draft) {
+    const selected = carrierSelectValue(draft);
+    const custom = selected === '__custom__';
+    return `${formField('运营商', selectField('carrier_select', selected, CARRIER_OPTIONS), custom ? '' : '用于线路标识与运营商策略')}${custom ? formField('运营商名称', inputField('carrier', draft.carrier, { placeholder: '例如 广电 / 长城宽带' }), '自定义标识按原样保存') : ''}`;
   }
 
   /*
@@ -723,10 +925,77 @@ export function mount(context = {}) {
     return `<details class="network-interface-availability"><summary>可用性说明</summary><p>${escapeHtml(text)}</p></details>`;
   }
 
+  /*
+   * 归属冲突横幅。只在真的检测到一口多主时出现，并把双方都点出来，而不是替用户
+   * 挑一个显示。文案里不作根因判断（前端看不到 uci），只说明现象和处置方向。
+   */
+  function conflictMarkup() {
+    const conflicts = portConflicts();
+    if (!conflicts.length) return '';
+    const lines = conflicts.map((entry) => `${entry.port} → ${entry.holders.join(' / ')}`).join('；');
+    return `<div class="network-interface-notice is-warn network-interface-conflict" role="status">
+      <strong>物理口归属冲突</strong>
+      <span>${escapeHtml(lines)}</span>
+      <small>同一块网卡被多个接口声明，后端两份数据不一致。界面不替你二选一：请核对实际归属后再改，必要时让后端复核该接口是否已残留。</small>
+    </div>`;
+  }
+
+  /*
+   * 端口卡片的说明行按「速率 · 状态 · 归属」排，速率放最前是因为用户挑口时先看 2500M
+   * 还是千兆；归属只在被别人占用时才出现，避免每张卡片都重复自己的名字。
+   */
+  function portCardDetail(port) {
+    const parts = [port.speed, port.status].filter(Boolean);
+    if (port.takenBy) parts.push(`已被 ${port.takenBy} 占用`);
+    else if (port.mine) parts.push('当前占用');
+    return parts.join(' · ') || '未提供运行状态';
+  }
+
+  function portCardMarkup(port, selected) {
+    const disabled = Boolean(port.takenBy);
+    return `<label class="${selected ? 'is-selected' : ''} ${disabled ? 'is-taken' : ''}" ${disabled ? `data-dwrt-tooltip="该口已归 ${escapeHtml(port.takenBy)}，请先在对应接口上释放"` : ''}><input type="${isWan ? 'radio' : 'checkbox'}" name="network-interface-${kind}-port" value="${escapeHtml(port.name)}" ${selected ? 'checked' : ''} ${disabled ? 'disabled' : ''} data-interface-port><span>${icon('ports')}<strong>${escapeHtml(port.label)}</strong><small>${escapeHtml(portCardDetail(port))}</small></span></label>`;
+  }
+
   function inlinePortPicker(draft) {
-    const selected = new Set(isWan ? [draft.device].filter(Boolean) : draft.ports || []);
-    const available = assignablePorts(draft.id);
-    return `<div class="network-interface-port-picker is-inline"><p>${isWan ? '选择承载此线路的物理网卡。端口变更将随本次配置保存。' : '选择加入此本地网络的成员端口。'}</p><div>${available.length ? available.map((port) => `<label class="${selected.has(port.name) ? 'is-selected' : ''}"><input type="${isWan ? 'radio' : 'checkbox'}" name="network-interface-${kind}-port" value="${escapeHtml(port.name)}" ${selected.has(port.name) ? 'checked' : ''} data-interface-port><span>${icon('ports')}<strong>${escapeHtml(port.label)}</strong><small>${escapeHtml([port.status, port.speed, port.localMac].filter(Boolean).join(' · ') || '未提供运行状态')}</small></span></label>`).join('') : '<div class="dwrt-kit-table-empty">后端未返回可用物理端口</div>'}</div></div>`;
+    const selected = new Set(isWan ? [draft.device].filter(Boolean) : asArray(draft.ports));
+    const ports = annotatedPorts(draft.id);
+    const free = ports.filter((port) => port.free || port.mine);
+    const hint = isWan
+      ? '选择承载此线路的物理网卡（必填）。端口变更将随本次配置保存。'
+      : '选择加入此本地网络的成员端口。';
+    const exhausted = isWan && !free.length && ports.length
+      ? '<p class="network-interface-inline-note">所有物理口都已被现有线路占用。新建 WAN 需要一块空闲网卡：请先在占用它的线路上释放，或改用 VLAN 混合模式复用同一块口。</p>'
+      : '';
+    return `<div class="network-interface-port-picker is-inline"><p>${hint}</p>${exhausted}<div>${ports.length ? ports.map((port) => portCardMarkup(port, selected.has(port.name))).join('') : '<div class="dwrt-kit-table-empty">后端未返回可用物理端口</div>'}</div></div>`;
+  }
+
+  /*
+   * 交接单第一条：物理口和逻辑接口名此前挤在同一个「逻辑接口」下拉里，eth1/eth2 和
+   * wan/wan2 混着排，用户分不清该选哪个。它们是两层概念 —— device 是物理网卡，
+   * ifname 是 UCI 段名 —— 所以拆成两块带小标题的区域，各自说清自己是什么。
+   */
+  function subsectionMarkup(title, description, body) {
+    return `<section class="network-interface-subsection">
+      <header><strong>${escapeHtml(title)}</strong><small>${escapeHtml(description)}</small></header>
+      ${body}
+    </section>`;
+  }
+
+  function physicalPortSection(draft) {
+    const error = fieldError('device');
+    return subsectionMarkup(
+      isWan ? '物理网卡' : '成员端口',
+      isWan ? '这条线路的网线插在哪块口上' : '加入此网桥的物理口',
+      `${error ? `<div class="network-interface-field-error is-block" role="alert">${escapeHtml(error)}</div>` : ''}${inlinePortPicker(draft)}`
+    );
+  }
+
+  function logicalNameSection(draft) {
+    return subsectionMarkup(
+      '逻辑接口名',
+      'UCI network 段名，不是物理口；一般保持与 ID 一致即可',
+      `<div class="network-interface-form-grid">${formField('接口段名', selectField('ifname', firstText(draft.ifname, draft.id), ifnameOptions(draft)))}</div>`
+    );
   }
 
   function hybridCapabilityMarkup(lines, writeEnabled) {
@@ -785,9 +1054,12 @@ export function mount(context = {}) {
     const dhcp = draft.dhcp || {};
     const ipv6 = draft.ipv6 || {};
     const identity = `${switchField('enabled', draft.enabled, '启用网络', '停用后保留配置与地址分配')}
-      <div class="network-interface-form-grid">${formField('网络名称', inputField('name', draft.name, { placeholder: '例如 IoT' }))}${formField('网络 ID', inputField('id', draft.id, { disabled: state.drawer === 'edit' }), '保存后的稳定标识')}${formField('备注', inputField('note', draft.note, { placeholder: '可选' }))}${formField('设备 / 网桥', inputField('device', draft.device, { placeholder: 'br-lan' }))}${formField('逻辑接口', selectField('ifname', firstText(draft.ifname, draft.id), ifnameOptions(draft)), 'UCI network 段名')}</div>
+      <div class="network-interface-form-grid">${formField('网络名称', inputField('name', draft.name, { placeholder: '例如 IoT' }), '显示用名称，可随时修改')}${formField('网络 ID', inputField('id', draft.id, { disabled: state.drawer === 'edit' }), '保存后的稳定标识')}${formField('备注', inputField('note', draft.note, { placeholder: '可选' }))}${formField('网桥设备', inputField('device', draft.device, { placeholder: 'br-lan' }), '内核里的网桥名，通常为 br-<ID>')}</div>
+      ${conflictMarkup()}
       ${segmentedField('mode', draft.mode, [['bridge', '桥接', '普通本地网络'], ['access', 'VLAN 接入', '单个 VLAN'], ['trunk', 'VLAN Trunk', '承载多个 VLAN']], '网络模式')}
-      ${draft.mode !== 'bridge' ? dependentMarkup(formField('VLAN ID', inputField('vlan_id', draft.vlan_id, { type: 'number', min: 1, max: 4094 }), '1-4094')) : ''}${inlinePortPicker(draft)}`;
+      ${draft.mode !== 'bridge' ? dependentMarkup(formField('VLAN ID', inputField('vlan_id', draft.vlan_id, { type: 'number', min: 1, max: 4094 }), '1-4094')) : ''}
+      ${physicalPortSection(draft)}
+      ${logicalNameSection(draft)}`;
     const addressing = `<div class="network-interface-form-grid">${formField('网关地址', inputField('ipaddr', draft.ipaddr, { placeholder: '192.168.30.1' }))}${formField('子网前缀', inputField('cidr', draft.cidr, { type: 'number', min: 1, max: 30 }), 'CIDR 前缀')}${formField('扩展 IP', inputField('extra_ips_text', asArray(draft.extra_ips).join(', '), { placeholder: '192.168.50.1/24, 192.168.60.1/24' }), '多个地址使用逗号分隔')}</div>`;
     const dhcpBody = `${switchField('dhcp.enabled', dhcp.enabled, 'DHCP 服务器', '向该网络内终端自动分配地址')}${dhcp.enabled ? dependentMarkup(`${formField('地址池起始', inputField('dhcp.pool_start', dhcp.pool_start))}${formField('地址池结束', inputField('dhcp.pool_end', dhcp.pool_end))}${formField('租期（分钟）', inputField('dhcp.lease', dhcp.lease, { type: 'number', min: 1 }))}${formField('DHCP 网关', inputField('dhcp.gateway', dhcp.gateway))}${formField('DNS 服务器', inputField('dhcp.dns_text', dhcp.dns.join(', ')), '多个地址使用逗号分隔')}`) : ''}`;
     const ipv6Body = `${switchField('ipv6.enabled', ipv6.enabled, '启用 IPv6', '配置地址委派、RA 与 DHCPv6')}${ipv6.enabled ? dependentMarkup(`${formField('地址模式', selectField('ipv6.mode', ipv6.mode, [['dhcp', '自动 / 委派'], ['static', '静态']]))}${formField('上游 WAN', multiSelectField('ipv6.parent_wans', ipv6.parent_wans, upstreamWanOptions(ipv6.parent_wans)), '按住 Cmd / Ctrl 可多选')}${formField('静态地址', inputField('ipv6.addr', ipv6.addr, { placeholder: '2001:db8::1/64' }))}${formField('前缀长度', inputField('ipv6.prefix_len', ipv6.prefix_len, { placeholder: 'auto' }))}${formField('IPv6 租期（分钟）', inputField('ipv6.leasetime', ipv6.leasetime, { type: 'number', min: 1 }))}${formField('RA 标志', selectField('ipv6.ra_flags', ipv6.ra_flags, [['1', 'Managed + Other'], ['2', 'Managed'], ['3', 'Other'], ['0', '无状态']]))}${switchField('ipv6.dhcpv6', ipv6.dhcpv6, 'DHCPv6 服务')}${switchField('ipv6.ra_static', ipv6.ra_static, '静态 RA', '使用固定前缀通告')}${switchField('ipv6.use_dns6', ipv6.use_dns6, '下发 IPv6 DNS')}${ipv6.use_dns6 ? formField('IPv6 DNS', inputField('ipv6.dns_text', ipv6.dns6.join(', ')), '多个地址使用逗号分隔') : ''}${switchField('ipv6.ra_mtu_set', ipv6.ra_mtu_set, '自定义 RA MTU')}${ipv6.ra_mtu_set ? formField('RA MTU', inputField('ipv6.ra_mtu', ipv6.ra_mtu, { type: 'number', min: 1280, max: 9000 })) : ''}`) : ''}`;
@@ -805,7 +1077,10 @@ export function mount(context = {}) {
     const multiWrite = state.capabilities.pppoe_multi_write === true;
     const bondWrite = state.capabilities.wan_bonding_write === true;
     const identity = `${switchField('enabled', draft.enabled, '启用线路', '停用后保留线路配置')}
-      <div class="network-interface-form-grid">${formField('线路名称', inputField('name', draft.name, { placeholder: '例如 中国联通' }))}${formField('WAN ID', inputField('id', draft.id, { disabled: state.drawer === 'edit' }), '保存后的稳定标识')}${formField('备注', inputField('note', draft.note, { placeholder: '可选' }))}${formField('运营商标识', inputField('carrier', draft.carrier, { placeholder: 'unicom / mobile / telecom' }))}${formField('逻辑接口', selectField('ifname', firstText(draft.ifname, draft.id), ifnameOptions(draft)), 'UCI network 段名')}</div>${inlinePortPicker(draft)}`;
+      <div class="network-interface-form-grid">${formField('线路名称', inputField('name', draft.name, { placeholder: '例如 中国联通' }), '显示用名称，可随时修改')}${formField('WAN ID', inputField('id', draft.id, { disabled: state.drawer === 'edit' }), '保存后的稳定标识')}${formField('备注', inputField('note', draft.note, { placeholder: '可选' }))}${carrierField(draft)}</div>
+      ${conflictMarkup()}
+      ${physicalPortSection(draft)}
+      ${logicalNameSection(draft)}`;
     const accessOptions = [['dhcp', 'DHCP', '自动获取地址'], ['static', '静态 IP', '固定地址与网关'], ['pppoe', 'PPPoE', '宽带账号拨号'], ['bridge', 'Bridge', '仅桥接上游'], ['hybrid_macvlan', '物理混合', '虚拟 MAC 子线路', !hybridWrite], ['hybrid_vlan', 'VLAN 混合', 'VLAN 子线路', !hybridWrite]];
     let accessFields = '';
     if (mode === 'static') accessFields = `<div class="network-interface-span-full">${wanAddressFields(draft)}</div>${formField('网关', inputField('gateway', draft.gateway, { placeholder: '203.0.113.1' }))}${formField('DNS 服务器', inputField('dns_text', draft.dns.join(', ')), '多个地址使用逗号分隔')}`;
@@ -824,18 +1099,30 @@ export function mount(context = {}) {
   }
 
   function portsDrawerMarkup(row) {
-    const selected = new Set(isWan ? [state.draft.device].filter(Boolean) : state.draft.ports || []);
-    const available = assignablePorts(row.id);
+    const selected = new Set(isWan ? [state.draft.device].filter(Boolean) : asArray(state.draft.ports));
+    const ports = annotatedPorts(row.id);
     return `<section class="network-interface-port-picker">
       <p>${isWan ? '为该 WAN 选择一个物理接口。' : '选择加入该 LAN 网桥的物理端口。'}</p>
-      <div>${available.length ? available.map((port) => `<label class="${selected.has(port.name) ? 'is-selected' : ''}"><input type="${isWan ? 'radio' : 'checkbox'}" name="network-interface-port" value="${escapeHtml(port.name)}" ${selected.has(port.name) ? 'checked' : ''} data-interface-port><span>${icon('ports')}<strong>${escapeHtml(port.label)}</strong><small>${escapeHtml([port.ownerId, port.status, port.speed, port.localMac].filter(Boolean).join(' · ') || '未提供运行状态')}</small></span></label>`).join('') : '<div class="dwrt-kit-table-empty">后端未返回可用物理端口</div>'}</div>
+      ${conflictMarkup()}
+      <div>${ports.length ? ports.map((port) => portCardMarkup(port, selected.has(port.name))).join('') : '<div class="dwrt-kit-table-empty">后端未返回可用物理端口</div>'}</div>
     </section>`;
   }
 
   function deleteConfirmationMarkup(row) {
+    /*
+     * 默认 lan 是当前管理网络，从此页删掉会把自己关在门外，这一支的保护是对的。
+     * 但原先还有一句 `const unavailable = !isWan`，把「前端没接线」说成
+     * 「后端尚未提供 LAN 删除路由」—— 后端 DELETE /api/v1/network/lans/<id> 一直存在
+     * （webd 与 core 的 lan_delete 字面量都在，core 里还带 lan_ports_attached 这类
+     * 拒绝原因），于是任何非默认 LAN 的删除按钮都是灰的且配一句错误解释，
+     * 用户据此以为无解，只能手改 /etc/config/network。
+     *
+     * 现在只保留两条真实约束：默认 lan 受保护；WAN 至少留一条。
+     * LAN 能否真的删掉由后端裁定，被拒时如实转述它给的原因。
+     */
     const protectedLan = !isWan && row.id === 'lan';
-    const unavailable = !isWan;
-    const canDelete = isWan && row.id && state.rows.length > 1;
+    const lastWan = isWan && state.rows.length <= 1;
+    const canDelete = Boolean(row.id) && !protectedLan && !lastWan;
     const renderer = ui.confirmationMarkup || window.DWRT_UI_KIT?.confirmationMarkup;
     if (typeof renderer !== 'function') return '';
     return renderer({
@@ -845,11 +1132,11 @@ export function mount(context = {}) {
       title: `删除 ${row.name || kind.toUpperCase()}`,
       description: protectedLan
         ? '默认 LAN 是当前管理网络，不能从此页面删除。'
-        : unavailable
-          ? '当前 Web API 尚未提供 LAN 删除路由，此操作不会伪造成成功。'
-          : state.rows.length <= 1
-            ? '至少需要保留一条 WAN，当前线路不能删除。'
-            : '删除后会移除该线路及其关联配置，此操作不可撤销。',
+        : lastWan
+          ? '至少需要保留一条 WAN，当前线路不能删除。'
+          : isWan
+            ? '删除后会移除该线路及其关联配置，此操作不可撤销。'
+            : '删除后会移除该 LAN 及其网桥配置，此操作不可撤销。若仍有物理端口挂在它上面，后端会拒绝并说明原因。',
       cancelLabel: '取消',
       confirmLabel: state.saving ? '正在删除' : '确认删除',
       disabled: !canDelete || state.saving,
@@ -960,6 +1247,7 @@ export function mount(context = {}) {
     state.initial = {};
     state.notice = '';
     state.noticeTone = '';
+    state.fieldErrors = {};
     state.saving = false;
     state.returnFocus = null;
     /* 抽屉期间被推迟的后台数据已经落在 state 里，这次整页重绘一并补上。 */
@@ -983,12 +1271,35 @@ export function mount(context = {}) {
 
   function patchDraft(field, input) {
     let value = input.type === 'checkbox' ? input.checked : input.type === 'number' ? (input.value === '' ? '' : Number(input.value)) : input.value;
+    /* 用户开始改这一项，就撤掉它上一次的错误标注，别让红字留在已经改对的字段上。 */
+    if (state.fieldErrors[field]) {
+      const next = { ...state.fieldErrors };
+      delete next[field];
+      state.fieldErrors = next;
+    }
     /*
      * 多选 select 的 `.value` 只给出第一个选中项，会把多上游静默截断成一个。
      * 这里改读 selectedOptions，并直接落进数组字段。
      */
     if (input.multiple || input.hasAttribute?.('data-interface-multi')) {
       setDeep(state.draft, field, [...input.selectedOptions].map((option) => option.value).filter(Boolean));
+      return;
+    }
+    /*
+     * 运营商下拉是展示层的字段，真正保存的仍是 draft.carrier。选到固定运营商就直接
+     * 写入对应 key；选「其他」时不要清掉用户已有的值，只在它本来就是固定项时才清空，
+     * 否则编辑一条已有线路时切一下下拉就把原来的自定义名字弄丢了。
+     */
+    if (field === 'carrier_select') {
+      if (value === '__custom__') {
+        /* 原本是固定运营商才清空；本来就是自定义名字的要留着，别让切一下下拉就丢。 */
+        const wasCustom = carrierSelectValue(state.draft) === '__custom__';
+        state.draft.carrier_custom = true;
+        if (!wasCustom) state.draft.carrier = '';
+      } else {
+        state.draft.carrier_custom = false;
+        state.draft.carrier = value;
+      }
       return;
     }
     if (field === 'extra_ips_text') {
@@ -1119,10 +1430,83 @@ export function mount(context = {}) {
     };
   }
 
+  /*
+   * 删除被拒时后端回的是错误码。原样显示 lan_ports_attached 这种字面量等于没解释，
+   * 所以这里把已知的几个翻成人话；未知码仍如实透出原文，不猜、不吞。
+   * 取值来自 dreamingwrt-core 的字面量（lan_ports_attached / lan_delete_failed）。
+   */
+  const DELETE_ERROR_TEXT = {
+    lan_ports_attached: '该 LAN 仍有物理端口挂在它的网桥上，后端拒绝删除。请先在「物理接口」里把端口移出，再重试。',
+    lan_delete_failed: '后端执行删除失败，配置未改动。',
+    lan_not_found: '后端找不到这个 LAN，可能已被其他会话删除，刷新后再看。',
+    lan_is_default: '这是默认管理网络，后端不允许删除。'
+  };
+
+  function deleteErrorText(error) {
+    const code = firstText(error?.code, error?.payload?.error, error?.payload?.code);
+    if (DELETE_ERROR_TEXT[code]) return DELETE_ERROR_TEXT[code];
+    /* 有些路径把码直接塞进 message，这里再兜一层，免得用户看到裸字面量。 */
+    const message = firstText(error?.message);
+    const hit = Object.keys(DELETE_ERROR_TEXT).find((key) => message === key || message.includes(key));
+    return hit ? DELETE_ERROR_TEXT[hit] : '';
+  }
+
   function validationMessage(error) {
     const details = asArray(error?.details);
-    if (!details.length) return firstText(error?.message, '后端未接受配置');
+    if (!details.length) return firstText(deleteErrorText(error), error?.message, '后端未接受配置');
     return details.map((entry) => firstText(entry.message, entry.error, entry.field)).filter(Boolean).join('；');
+  }
+
+  /*
+   * 提交前的本地必填检查。后端会拒（wan.device=missing / wan.id=missing），但那要走一
+   * 个来回才告诉用户，而且此前只弹一句 invalid_request。能在本地判定的就地标注。
+   * 这里只做「后端明确会拒且判据在前端就成立」的项，不自己发明规则。
+   */
+  function localFieldErrors() {
+    const draft = state.draft || {};
+    const errors = {};
+    if (!firstText(draft.id)) errors.id = '此项为必填';
+    else if (!/^[A-Za-z0-9_]+$/.test(firstText(draft.id))) errors.id = '只能使用字母、数字或下划线';
+    if (isWan && !firstText(draft.device)) errors.device = '请选择承载此线路的物理网卡';
+    if (!isWan && !firstText(draft.device)) errors.device = '请填写网桥设备名';
+    return errors;
+  }
+
+  /* 出错项可能折在收起的分组里，展开第一处，否则标注在看不见的地方等于没标。 */
+  function focusFirstError() {
+    const keys = Object.keys(state.fieldErrors);
+    if (!keys.length) return;
+    const group = keys.map(groupForField).find(Boolean);
+    if (group) state.editorOpen = group;
+  }
+
+  /*
+   * 后端可能对当前界面上不存在的字段报错：比如 access_mode=dhcp 时报 wan.gateway ——
+   * 网关输入框只在静态模式下渲染，标注无处可去。这种条目必须写进顶部通知，
+   * 否则「3 项未通过」却只看到 2 处红字，用户会以为剩下那条自己消失了。
+   */
+  function applyValidationError(error, prefix) {
+    const { mapped, orphans } = collectFieldErrors(error?.details);
+    state.fieldErrors = mapped;
+    focusFirstError();
+    const shown = Object.keys(mapped).filter((key) => renderedFields().has(key));
+    const hidden = Object.keys(mapped)
+      .filter((key) => !renderedFields().has(key))
+      .map((key) => `${key}：${mapped[key]}`);
+    const extras = [...orphans, ...hidden];
+    if (!shown.length) {
+      state.notice = `${prefix}：${extras.length ? extras.join('；') : firstText(error?.message, '后端未接受配置')}`;
+    } else {
+      state.notice = `${prefix}：${shown.length} 项已在对应表单项标出${extras.length ? `；另有 ${extras.join('；')}` : ''}`;
+    }
+    state.noticeTone = 'bad';
+  }
+
+  /* 当前抽屉里实际渲染出来的字段集合，用于判断某条错误能否就地标注。 */
+  function renderedFields() {
+    const scope = drawerNode();
+    if (!scope) return new Set();
+    return new Set([...scope.querySelectorAll('[data-interface-field]')].map((el) => el.dataset.interfaceField));
   }
 
   function notifyCommitted() {
@@ -1131,14 +1515,25 @@ export function mount(context = {}) {
 
   async function saveDraft() {
     if (state.saving) return;
+    const local = localFieldErrors();
+    if (Object.keys(local).length) {
+      state.fieldErrors = local;
+      focusFirstError();
+      state.notice = `请先补全 ${Object.keys(local).length} 项必填内容，已在对应表单项标出`;
+      state.noticeTone = 'bad';
+      patchDrawerContents();
+      return;
+    }
     state.saving = true;
     state.notice = '';
+    state.fieldErrors = {};
     patchDrawerContents();
     try {
       const payload = isWan ? wanPayload() : lanPayload();
       const result = await requestJson(ENDPOINT, { method: state.drawer === 'create' ? 'POST' : 'PUT', body: JSON.stringify(payload) });
       state.saving = false;
       state.drawer = '';
+      state.fieldErrors = {};
       await load(true);
       state.notice = result.applied === true ? '配置已保存并应用' : '配置已保存；后端未返回运行态应用结果';
       state.noticeTone = result.applied === true ? 'ok' : 'warn';
@@ -1146,8 +1541,7 @@ export function mount(context = {}) {
       notifyCommitted();
     } catch (error) {
       state.saving = false;
-      state.notice = `保存失败：${validationMessage(error)}`;
-      state.noticeTone = 'bad';
+      applyValidationError(error, '保存失败');
       patchDrawerContents();
     }
   }
@@ -1156,6 +1550,7 @@ export function mount(context = {}) {
     if (state.saving) return;
     state.saving = true;
     state.notice = '';
+    state.fieldErrors = {};
     patchDrawerContents();
     try {
       const payload = isWan ? wanPayload() : lanPayload();
@@ -1169,14 +1564,23 @@ export function mount(context = {}) {
       notifyCommitted();
     } catch (error) {
       state.saving = false;
-      state.notice = `端口保存失败：${validationMessage(error)}`;
-      state.noticeTone = 'bad';
+      applyValidationError(error, '端口保存失败');
       patchDrawerContents();
     }
   }
 
-  async function deleteWan() {
-    if (!isWan || state.saving || state.rows.length <= 1 || !state.selectedId) return;
+  /*
+   * WAN 与 LAN 共用这条删除路径。原先第一行是 `if (!isWan || ...) return`，
+   * 所以 LAN 不只是按钮灰 —— 就算点到了也会在这里静默返回，前端根本没有 LAN 的
+   * 提交通路。ENDPOINT 本身早就按 kind 切到 /api/v1/network/lans 了。
+   *
+   * 两条不能删的情况分别拦：默认 lan 是管理网络，WAN 要至少留一条。
+   */
+  async function deleteRow() {
+    if (state.saving || !state.selectedId) return;
+    if (!isWan && state.selectedId === 'lan') return;
+    if (isWan && state.rows.length <= 1) return;
+    const label = isWan ? 'WAN' : 'LAN';
     state.saving = true;
     patchDrawerContents();
     try {
@@ -1184,7 +1588,7 @@ export function mount(context = {}) {
       state.saving = false;
       state.drawer = '';
       await load(true);
-      state.notice = 'WAN 已删除';
+      state.notice = `${label} 已删除`;
       state.noticeTone = 'ok';
       render();
       notifyCommitted();
@@ -1192,7 +1596,47 @@ export function mount(context = {}) {
       state.saving = false;
       state.notice = `删除失败：${validationMessage(error)}`;
       state.noticeTone = 'bad';
-      patchDrawerContents();
+      /*
+       * 失败时必须收掉确认卡再重绘。页面级提示的渲染条件是 `!state.drawer`，而删除确认
+       * 又不是 sheet —— patchDrawerContents() 找不到 .network-interface-drawer 会退回
+       * render()，于是提示两处都落不下来，用户看到的是「点了确认什么都没发生」。
+       */
+      state.drawer = '';
+      render();
+    }
+  }
+
+  /*
+   * WAN 断线重连。拨号可能十几秒，所以整个过程给该行一个进行态，结束后重新拉一次
+   * 数据再报结果 —— 不按超时猜成功。后端返回 ok 但没说明运行态时也如实说明，
+   * 不把「已下发」写成「已连上」。
+   */
+  async function reconnectWan(id) {
+    if (!isWan || !reconnectEnabled() || state.reconnecting || !id) return;
+    state.reconnecting = id;
+    state.notice = `正在重连 ${id}，拨号可能需要十几秒`;
+    state.noticeTone = 'info';
+    render();
+    try {
+      const result = await requestJson(`${ENDPOINT}/${encodeURIComponent(id)}/reconnect`, { method: 'POST' });
+      state.reconnecting = '';
+      await load(true);
+      const row = state.rows.find((entry) => entry.id === id);
+      if (row?.online) {
+        state.notice = `${id} 已重新连接`;
+        state.noticeTone = 'ok';
+      } else {
+        state.notice = result?.applied === true
+          ? `${id} 重连指令已执行，但线路当前仍未在线`
+          : `${id} 重连指令已下发；后端未返回运行态结果，请稍后查看线路状态`;
+        state.noticeTone = 'warn';
+      }
+      render();
+    } catch (error) {
+      state.reconnecting = '';
+      state.notice = `${id} 重连失败：${validationMessage(error)}`;
+      state.noticeTone = 'bad';
+      render();
     }
   }
 
@@ -1257,9 +1701,11 @@ export function mount(context = {}) {
     }
     const remove = event.target.closest('[data-interface-delete]');
     if (remove) { openDrawer('delete', remove.dataset.interfaceDelete); return; }
+    const reconnect = event.target.closest('[data-interface-reconnect]');
+    if (reconnect) { reconnectWan(reconnect.dataset.interfaceReconnect); return; }
     if (event.target.closest('[data-interface-save]')) { saveDraft(); return; }
     if (event.target.closest('[data-interface-save-ports]')) { savePorts(); return; }
-    if (event.target.closest('[data-dwrt-confirm-accept]')) { deleteWan(); }
+    if (event.target.closest('[data-dwrt-confirm-accept]')) { deleteRow(); }
   }
 
   function onInput(event) {
@@ -1294,16 +1740,29 @@ export function mount(context = {}) {
       }
       port.closest('label')?.classList.toggle('is-selected', port.checked);
       if (isWan) {
-        root.querySelectorAll('[data-interface-port]').forEach((entry) => {
+        /*
+         * 单选口切换要清掉上一个卡片的选中态。查询范围必须覆盖抽屉：抽屉被 kit 搬进
+         * body 下的 portal 后就不再是 root 的后代，只查 root 会一个也找不到，于是旧卡片
+         * 的高亮留在原处，看起来像同时选中了两块网卡。
+         */
+        (drawerNode() || root).querySelectorAll('[data-interface-port]').forEach((entry) => {
           entry.closest('label')?.classList.toggle('is-selected', entry.checked);
         });
+      }
+      /* 选了口就等于填上了 device，撤掉它的必填标注。 */
+      if (isWan && state.fieldErrors.device) {
+        const next = { ...state.fieldErrors };
+        delete next.device;
+        state.fieldErrors = next;
+        patchDrawerContents();
       }
       return;
     }
     const field = event.target.closest('[data-interface-field]');
     if (!field) return;
     patchDraft(field.dataset.interfaceField, field);
-    const conditional = ['access_mode', 'mode', 'dhcp.enabled', 'ipv6.enabled', 'ipv6.use_dns6', 'ipv6.ra_mtu_set', 'ipv6_mode', 'advanced.health_check.enabled', 'advanced.pppoe.timing_restart', 'advanced.pppoe.abnormal_ip_check', 'vlan_enabled'].includes(field.dataset.interfaceField);
+    /* carrier_select 会决定「运营商名称」自由输入框是否出现，所以也要重绘抽屉内容。 */
+    const conditional = ['access_mode', 'mode', 'dhcp.enabled', 'ipv6.enabled', 'ipv6.use_dns6', 'ipv6.ra_mtu_set', 'ipv6_mode', 'advanced.health_check.enabled', 'advanced.pppoe.timing_restart', 'advanced.pppoe.abnormal_ip_check', 'vlan_enabled', 'carrier_select'].includes(field.dataset.interfaceField);
     if (conditional) patchDrawerContents(field.dataset.interfaceField);
   }
 

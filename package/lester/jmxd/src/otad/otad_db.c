@@ -212,6 +212,18 @@ int otad_db_init(void)
         "ON ota_operations(kind) WHERE kind='firmware' AND action='apply' "
         "AND state IN ('writing','rebooting','reconnecting')") != 0)
         return otad_db_init_fail();
+    /*
+     * The same exclusion for hot updates. Two concurrent hot applies would race
+     * each other's atomic replacements over the same targets, so only one may be
+     * in 'writing' at a time. Keyed on kind, which the partial index makes a
+     * single-row constraint per kind rather than a global one - a hot apply and a
+     * firmware apply are still refused independently of each other.
+     */
+    if (otad_exec(g_otad_inventory_db,
+        "CREATE UNIQUE INDEX IF NOT EXISTS ota_operations_one_hot_apply "
+        "ON ota_operations(kind) WHERE kind='hot_update' AND action='apply' "
+        "AND state IN ('writing','rebooting','reconnecting')") != 0)
+        return otad_db_init_fail();
 
     if (otad_exec(g_otad_inventory_db,
         "CREATE TABLE IF NOT EXISTS inventory_files ("
@@ -774,6 +786,112 @@ int otad_operation_commit_preflight(const char *operation_id,
     sqlite3_bind_text(st, 16, operation_id, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(st);
     sqlite3_finalize(st);
+    return rc == SQLITE_DONE && sqlite3_changes(g_otad_inventory_db) == 1 ? 0 : -1;
+}
+
+/*
+ * The hot-update twin of otad_operation_commit_preflight(). A hot package needs
+ * no slot and no A/B topology, so those two columns stay empty and the checks
+ * that apply to them are dropped; every trust field is still required, because
+ * the apply claim below refuses to move without them.
+ */
+int otad_operation_commit_hot_preflight(const char *operation_id,
+                                        const char *from_version,
+                                        const char *to_version,
+                                        const char *package_id,
+                                        const struct otad_trust_binding *binding,
+                                        struct json_object *result)
+{
+    sqlite3_stmt *st;
+    const char *result_text;
+    int rc;
+
+    if (!otad_operation_id_ok(operation_id) || !binding ||
+        !otad_digest_hex_ok(binding->manifest_digest) ||
+        !otad_signing_key_id_ok(binding->signing_key_id) ||
+        binding->trust_policy_version < 1 ||
+        !otad_digest_hex_ok(binding->trust_policy_digest) ||
+        !otad_digest_hex_ok(binding->device_identity_digest) ||
+        !binding->authenticity_verified || !binding->target_compatible ||
+        !binding->policy_passed || !result ||
+        !json_object_is_type(result, json_type_object))
+        return -1;
+    result_text = json_object_to_json_string_ext(result, JSON_C_TO_STRING_PLAIN);
+    if (!result_text || strlen(result_text) > OTAD_MAX_JSON_BYTES)
+        return -1;
+    st = otad_operation_prepare(
+        "UPDATE ota_operations SET state='pending',progress=20,from_version=?1,to_version=?2,"
+        "build_id=?3,manifest_digest=?4,signing_key_id=?5,"
+        "trust_policy_version=?6,trust_policy_digest=?7,device_identity_digest=?8,"
+        "authenticity_verified=?9,target_compatible=?10,policy_passed=?11,"
+        "result_json=?12,error_code='',error_message='',updated_at=?13 "
+        "WHERE operation_id=?14 AND kind='hot_update' AND action='preflight' "
+        "AND state='validating' "
+        "AND source_size>=1048576 AND length(source_sha256)=64 "
+        "AND source_sha256 NOT GLOB '*[^0-9A-Fa-f]*' "
+        "AND manifest_digest='' AND signing_key_id='' AND trust_policy_version=0 "
+        "AND trust_policy_digest='' AND device_identity_digest='' "
+        "AND authenticity_verified=0 AND target_compatible=0 AND policy_passed=0");
+    if (!st)
+        return -1;
+    sqlite3_bind_text(st, 1, from_version ? from_version : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, to_version ? to_version : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, package_id ? package_id : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, binding->manifest_digest, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, binding->signing_key_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 6, binding->trust_policy_version);
+    sqlite3_bind_text(st, 7, binding->trust_policy_digest, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, binding->device_identity_digest, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 9, binding->authenticity_verified);
+    sqlite3_bind_int(st, 10, binding->target_compatible);
+    sqlite3_bind_int(st, 11, binding->policy_passed);
+    sqlite3_bind_text(st, 12, result_text, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 13, otad_now_s());
+    sqlite3_bind_text(st, 14, operation_id, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE && sqlite3_changes(g_otad_inventory_db) == 1 ? 0 : -1;
+}
+
+/*
+ * Claim a verified hot preflight for writing. Mirrors otad_operation_claim_apply()
+ * minus the slot and topology conditions, and like it this is the single point
+ * where a hot apply becomes exclusive: the partial unique index on kind means a
+ * second concurrent claim fails rather than racing the first one into the
+ * filesystem.
+ */
+int otad_operation_claim_hot_apply(const char *operation_id)
+{
+    sqlite3_stmt *st;
+    int rc;
+
+    if (!otad_operation_id_ok(operation_id))
+        return -1;
+    st = otad_operation_prepare(
+        "UPDATE ota_operations SET action='apply',state='writing',progress=25,"
+        "worker_pid=0,error_code='',error_message='',updated_at=?1 "
+        "WHERE operation_id=?2 AND kind='hot_update' AND action='preflight' "
+        "AND state='pending' AND authenticity_verified=1 "
+        "AND target_compatible=1 AND policy_passed=1 "
+        "AND manifest_digest<>'' AND signing_key_id<>'' "
+        "AND trust_policy_version>0 AND trust_policy_digest<>'' "
+        "AND device_identity_digest<>'' "
+        "AND source_size>=1048576 AND length(source_sha256)=64 "
+        "AND source_sha256 NOT GLOB '*[^0-9A-Fa-f]*' "
+        "AND length(manifest_digest)=64 AND manifest_digest NOT GLOB '*[^0-9A-Fa-f]*' "
+        "AND length(signing_key_id)<=128 AND signing_key_id NOT GLOB '*[^0-9A-Za-z._-]*' "
+        "AND length(trust_policy_digest)=64 "
+        "AND trust_policy_digest NOT GLOB '*[^0-9A-Fa-f]*' "
+        "AND length(device_identity_digest)=64 "
+        "AND device_identity_digest NOT GLOB '*[^0-9A-Fa-f]*'");
+    if (!st)
+        return -1;
+    sqlite3_bind_int64(st, 1, otad_now_s());
+    sqlite3_bind_text(st, 2, operation_id, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc == SQLITE_CONSTRAINT)
+        return -2;
     return rc == SQLITE_DONE && sqlite3_changes(g_otad_inventory_db) == 1 ? 0 : -1;
 }
 

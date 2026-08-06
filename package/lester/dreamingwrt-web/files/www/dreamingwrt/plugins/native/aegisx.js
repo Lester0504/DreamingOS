@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const api = context.api || {};
   const utils = context.utils || {};
   const ui = context.ui || {};
-  const VERSION = '20260805-aegisx-capability-truth-01';
+  const VERSION = '20260806-honeypot-form-confirm-gate-01';
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
   const ENDPOINTS = {
     status: '/api/v1/aegis/status',
@@ -708,10 +708,143 @@ export function mount(context = {}) {
     return {
       id: item?.id || slug('honeypot'), name: item?.name || '蜜罐', enabled: item?.enabled !== false,
       network_id: item?.network_id || firstText(state.lans[0]?.id, state.lans[0]?.name), address: item?.address || '', profile: item?.profile || 'linux_server',
-      services: services.length ? services : ['ssh', 'http', 'ftp', 'dns']
+      /*
+       * 默认服务集不再写死，只取**后端声明支持**的那些。
+       * 原先硬编码 ['ssh','http','ftp','dns']：telnet 后端支持却默认不启用，
+       * 而一旦后端把某项转为不支持，前端仍会照旧提交并被拒。
+       */
+      services: services.length ? services : defaultHoneypotServices()
     };
   }
+
+  /*
+   * 蜜罐可选服务。顺序固定以便界面稳定，是否可选由 honeypot_get 的 capabilities
+   * 逐项决定（30.1 实测 ssh/telnet/http/ftp/dns 为 true，smb/rdp/redis 为 false）。
+   */
+  const HONEYPOT_SERVICES = [
+    ['ssh', 'SSH', '22'],
+    ['telnet', 'Telnet', '23'],
+    ['http', 'HTTP', '80'],
+    ['ftp', 'FTP', '21'],
+    ['dns', 'DNS', '53'],
+    ['smb', 'SMB', '445'],
+    ['rdp', 'RDP', '3389'],
+    ['redis', 'Redis', '6379']
+  ];
+
+  /* 后端把这个服务标成可用了吗。没有明确 true 就当不可用，不猜。 */
+  function honeypotServiceSupported(key) {
+    return honeypotCaps()[key] === true;
+  }
+
+  function honeypotSupportedServices() {
+    return HONEYPOT_SERVICES.filter(([key]) => honeypotServiceSupported(key)).map(([key]) => key);
+  }
+
+  /* 新建时的默认勾选：支持列表里去掉 telnet。
+     telnet 是明文协议，后端支持但不该默认替用户打开一个明文监听。 */
+  function defaultHoneypotServices() {
+    const supported = honeypotSupportedServices().filter((key) => key !== 'telnet');
+    return supported.length ? supported : honeypotSupportedServices();
+  }
+
+  /*
+   * 蜜罐画像。后端 honeypot_get 目前没有回可选画像清单，
+   * 所以这里给出与 profile 字段取值对应的固定几项；一旦后端开始回
+   * `profiles` / `supported_profiles`，就以它为准。
+   */
+  const HONEYPOT_PROFILES = [
+    ['linux_server', 'Linux 服务器'],
+    ['windows_host', 'Windows 主机'],
+    ['iot_device', 'IoT 设备'],
+    ['nas', 'NAS 存储']
+  ];
+
+  function honeypotProfileOptions() {
+    const declared = asArray(honeypotCaps().profiles || honeypotCaps().supported_profiles)
+      .map((entry) => firstText(entry?.id, entry?.name, entry))
+      .filter(Boolean);
+    if (!declared.length) return HONEYPOT_PROFILES;
+    const labels = new Map(HONEYPOT_PROFILES);
+    return declared.map((key) => [key, labels.get(key) || key]);
+  }
+
+  /* 同一网络最多几个蜜罐地址，后端 capabilities 给（30.1 实测 4）。 */
+  function honeypotAddressLimit() {
+    const limit = Number(honeypotCaps().max_addresses_per_network);
+    return Number.isFinite(limit) && limit > 0 ? Math.round(limit) : 0;
+  }
+
+  /*
+   * 当前草稿所在网络已经用掉几个地址。编辑自己时不计入，
+   * 否则改一次地址就会被自己占的名额挡住。
+   */
+  function honeypotAddressUsage(draft) {
+    const network = firstText(draft?.network_id).toLowerCase();
+    return honeypots().filter((item) => firstText(item.network_id).toLowerCase() === network && item.id !== draft?.id).length;
+  }
+
+  /*
+   * 保存按钮为什么不能点。除了原有的「网络 / 地址必填」，还要挡住两种会被后端
+   * 直接拒掉的提交：一个服务都没选（蜜罐不监听任何端口，等于空配置），
+   * 以及该网络地址名额已满（后端回 honeypot_network_address_limit_reached）。
+   */
+  function honeypotSaveBlocked(draft) {
+    if (state.saving) return true;
+    if (!draft?.network_id || !firstText(draft.address).trim()) return true;
+    const chosen = asArray(draft.services).map((entry) => firstText(entry?.name, entry));
+    if (!chosen.some((key) => honeypotServiceSupported(key))) return true;
+    const limit = honeypotAddressLimit();
+    const editing = honeypots().some((item) => item.id === draft.id);
+    if (limit && !editing && honeypotAddressUsage(draft) >= limit) return true;
+    return false;
+  }
+
+  /*
+   * 只把保存按钮的可用性同步到 DOM，不重绘弹窗 —— 供文本输入路径调用。
+   * 判定仍然只有 honeypotSaveBlocked 一处，避免两套规则漂移。
+   */
+  function syncHoneypotSaveState() {
+    const button = query('[data-honeypot-save]');
+    if (!button) return;
+    button.disabled = honeypotSaveBlocked(state.honeypotDraft);
+  }
   function renderHoneypotModal() {
+    /*
+     * 服务多选。逐项由后端 capabilities 决定是否可选，不支持的置灰并说明原因 ——
+     * 原先这一项根本不在界面上，`services` 硬编码 ['ssh','http','ftp','dns'] 就直接
+     * 提交，用户看不到也改不了，却会真的按这套配置开监听端口。
+     */
+    function honeypotServicesField(draft) {
+      const chosen = asArray(draft.services).map((entry) => firstText(entry?.name, entry));
+      const rows = HONEYPOT_SERVICES.map(([key, label, port]) => {
+        const supported = honeypotServiceSupported(key);
+        const checked = supported && chosen.includes(key);
+        const hint = supported ? `端口 ${port}` : '当前固件未提供该服务';
+        return `<label class="aegisx-honeypot-service ${supported ? '' : 'is-unavailable'}">`
+          + `<input type="checkbox" data-honeypot-service="${escapeHtml(key)}" ${checked ? 'checked' : ''} ${supported ? '' : 'disabled'}>`
+          + `<span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(hint)}</small></span></label>`;
+      }).join('');
+      const none = chosen.filter((key) => honeypotServiceSupported(key)).length === 0;
+      return `<div class="aegisx-honeypot-services"><span>模拟服务</span><div class="aegisx-honeypot-service-grid">${rows}</div>`
+        + (none ? '<small class="aegisx-honeypot-warn">至少选择一个服务，否则蜜罐不会监听任何端口。</small>' : '')
+        + '</div>';
+    }
+
+    /* 同一网络的地址名额提示。超出时后端会回 honeypot_network_address_limit_reached，
+       与其等它拒绝，不如先告诉用户。 */
+    function honeypotAddressLimitHint(draft) {
+      const limit = honeypotAddressLimit();
+      if (!limit) return '';
+      const used = honeypotAddressUsage(draft);
+      const full = used >= limit;
+      return `<small class="aegisx-honeypot-limit ${full ? 'aegisx-honeypot-warn' : ''}">`
+        + escapeHtml(full
+          ? `该网络的蜜罐地址已用满（${used}/${limit}），请换一个网络或先删除已有蜜罐。`
+          : `该网络最多 ${limit} 个蜜罐地址，已用 ${used} 个。`)
+        + '</small>';
+    }
+
     const items = honeypots();
     const draft = state.honeypotDraft;
     if (draft) {
@@ -719,7 +852,10 @@ export function mount(context = {}) {
       return `<div class="dwrt-kit-modal-layer aegisx-honeypot-modal-layer is-open" data-dwrt-component="modal"><button class="dwrt-kit-modal-backdrop" type="button" data-aegis-close aria-label="关闭蜜罐配置"></button><section class="dwrt-kit-modal aegisx-honeypot-modal dwrt-kit-glass-surface" data-dwrt-modal-variant="copilot" data-adaptive-sample role="dialog" aria-modal="true" aria-labelledby="aegisx-honeypot-title"><header class="dwrt-kit-modal-header"><div><h2 id="aegisx-honeypot-title">${editing ? '编辑蜜罐' : '创建蜜罐'}</h2></div><button class="dwrt-kit-modal-close" type="button" data-aegis-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-modal-body aegisx-drawer-body aegisx-honeypot-modal-body">
         <label><span>网络</span><select data-honeypot-field="network_id">${state.lans.map((lan) => `<option value="${escapeHtml(firstText(lan.id, lan.name))}" ${firstText(lan.id, lan.name) === draft.network_id ? 'selected' : ''}>${escapeHtml(firstText(lan.name, lan.id))} · ${escapeHtml(lanSubnet(lan))}</option>`).join('')}</select></label>
         <label><span>蜜罐 IPv4 地址</span><input type="text" inputmode="decimal" data-honeypot-field="address" value="${escapeHtml(draft.address)}" placeholder="192.168.30.250"></label>
-      </div><footer class="dwrt-kit-modal-footer"><button class="policy-secondary" type="button" data-aegis-close>取消</button><button class="policy-primary" type="button" data-honeypot-save ${state.saving || !draft.network_id || !draft.address.trim() ? 'disabled' : ''}>${state.saving ? '正在创建' : editing ? '保存' : '创建'}</button></footer></section></div>`;
+        ${honeypotAddressLimitHint(draft)}
+        <label><span>画像</span><select data-honeypot-field="profile">${honeypotProfileOptions().map(([key, label]) => `<option value="${escapeHtml(key)}" ${key === draft.profile ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label>
+        ${honeypotServicesField(draft)}
+      </div><footer class="dwrt-kit-modal-footer"><button class="policy-secondary" type="button" data-aegis-close>取消</button><button class="policy-primary" type="button" data-honeypot-save ${honeypotSaveBlocked(draft) ? 'disabled' : ''}>${state.saving ? '正在创建' : editing ? '保存' : '创建'}</button></footer></section></div>`;
     }
     return `<div class="dwrt-kit-modal-layer aegisx-honeypot-modal-layer is-open" data-dwrt-component="modal"><button class="dwrt-kit-modal-backdrop" type="button" data-aegis-close aria-label="关闭蜜罐管理"></button><section class="dwrt-kit-modal aegisx-honeypot-modal aegisx-honeypot-manager dwrt-kit-glass-surface" data-dwrt-modal-variant="copilot" data-adaptive-sample role="dialog" aria-modal="true" aria-labelledby="aegisx-honeypot-manager-title"><header class="dwrt-kit-modal-header"><div><h2 id="aegisx-honeypot-manager-title">蜜罐</h2></div><button class="dwrt-kit-modal-close" type="button" data-aegis-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-modal-body aegisx-drawer-body"><div class="aegisx-honeypot-list">${items.map((item) => `<article><div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.address)} · ${escapeHtml(item.network_id)}</span></div>${stateBadge(item.apply_state === 'active' ? '运行中' : item.enabled === false ? '已停用' : '未运行', item.apply_state === 'active' ? 'ok' : 'warn')}<div><button type="button" data-honeypot-edit="${escapeHtml(item.id)}">编辑</button><button type="button" data-honeypot-delete="${escapeHtml(item.id)}">删除</button></div></article>`).join('')}</div>${state.honeypotEvents.length ? `<section class="aegisx-honeypot-events"><strong>近期命中</strong>${state.honeypotEvents.slice(0, 8).map((event) => `<span><b>${escapeHtml(firstText(event.source_ip, event.source_mac, '未知终端'))}</b><small>${escapeHtml(formatTime(event.ts || event.last_seen))}</small></span>`).join('')}</section>` : ''}</div><footer class="dwrt-kit-modal-footer"><button class="policy-secondary" type="button" data-aegis-close>关闭</button><button class="policy-primary" type="button" data-honeypot-new>新建</button></footer></section></div>`;
   }
@@ -1343,8 +1479,54 @@ export function mount(context = {}) {
       const validation = await requestJson(ENDPOINTS.honeypotValidate, { method: 'POST', body: JSON.stringify(payload) });
       if (!bool(validation.valid ?? validation.ok)) throw new Error(asArray(validation.blockers).map((item) => ERROR_TEXT[item] || item).join('、') || message(validation));
       state.saving = false;
-      await commitHoneypot(payload);
+      /*
+       * 后端 honeypot_validate 会回 `confirm_required`，为真时必须先让用户确认再提交。
+       * 原先这里校验通过就直接 commitHoneypot()，`confirm_required` 全文件命中 0 次——
+       * 而蜜罐创建会真实改动 nftables（dreamingwrt_honeypot 表）、拉起一个 dummy 网卡
+       * （dwrt-hpot0）并占用一个 LAN 地址，属于有数据面副作用的写操作。
+       * 同文件里删除蜜罐、内容过滤保存都有确认，创建没有，本身就说明是漏了。
+       *
+       * `management_port_conflict` 与 `wan_exposure` 是后端已经算好的风险位，
+       * 一并呈现：WAN 暴露与仅在 LAN 上开蜜罐是完全不同量级的风险。
+       */
+      if (!bool(validation.confirm_required)) {
+        await commitHoneypot(payload);
+        return;
+      }
+      state.confirm = honeypotConfirmation(payload, validation);
+      render();
     } catch (error) { state.error = message(error, '蜜罐校验失败'); state.saving = false; render(); }
+  }
+
+  /*
+   * 确认卡的内容一律以**后端回值**为准，拿不到才退回本地草稿：
+   * 用户要确认的是后端真正打算落下去的那份配置，而不是界面上的输入。
+   */
+  function honeypotConfirmation(payload, validation) {
+    const iface = firstText(validation.interface, validation.device);
+    const address = firstText(validation.address, payload.address);
+    const prefix = Number(validation.prefix);
+    const services = asArray(validation.services).length
+      ? asArray(validation.services).map((entry) => firstText(entry?.name, entry))
+      : asArray(payload.services).map((entry) => firstText(entry?.name, entry));
+    const profileKey = firstText(validation.profile, payload.profile);
+    const profileLabel = new Map(honeypotProfileOptions()).get(profileKey) || profileKey;
+    const parts = [];
+    parts.push(`将在 ${iface || firstText(validation.network_id, payload.network_id)} 上占用地址 ${address}${Number.isFinite(prefix) && prefix > 0 ? `/${prefix}` : ''}`);
+    parts.push(`以「${profileLabel}」画像监听 ${services.length ? services.map((key) => key.toUpperCase()).join('、') : '（未选择服务）'}`);
+    parts.push('创建后会写入 nftables 表 dreamingwrt_honeypot 并拉起 dummy 网卡 dwrt-hpot0；失败时后端回滚。');
+    /* 两个风险位：后端算好的，为真才说，不为真不提，免得平白制造焦虑。 */
+    const risks = [];
+    if (bool(validation.wan_exposure)) risks.push('该配置会把蜜罐暴露到 WAN，互联网可直接访问这些端口');
+    if (bool(validation.management_port_conflict)) risks.push('所选端口与路由器管理端口冲突，可能影响管理访问');
+    return {
+      action: 'honeypot-save',
+      tone: risks.length ? 'danger' : 'warning',
+      title: risks.length ? '这个蜜罐配置有风险，确认创建？' : '创建蜜罐？',
+      description: `${parts.join('；')}${risks.length ? `\n风险：${risks.join('；')}` : ''}`,
+      confirmLabel: '创建并应用',
+      payload
+    };
   }
   async function commitHoneypot(payload) {
     state.confirm = null; state.saving = true; render();
@@ -1444,8 +1626,37 @@ export function mount(context = {}) {
     query('[data-honeypot-new]')?.addEventListener('click', () => { state.honeypotDraft = defaultHoneypotDraft(); render(); });
     queryAll('[data-honeypot-edit]').forEach((button) => button.addEventListener('click', () => { state.honeypotDraft = defaultHoneypotDraft(honeypots().find((item) => item.id === button.dataset.honeypotEdit)); render(); }));
     queryAll('[data-honeypot-delete]').forEach((button) => button.addEventListener('click', () => { const item = honeypots().find((entry) => entry.id === button.dataset.honeypotDelete); state.confirm = { action: 'honeypot-delete', tone: 'danger', title: '删除蜜罐？', description: `将删除“${item?.name || button.dataset.honeypotDelete}”并撤销对应运行态规则。`, confirmLabel: '删除蜜罐', resourceId: button.dataset.honeypotDelete, resourceKind: 'honeypot' }; render(); }));
-    queryAll('[data-honeypot-field]').forEach((input) => input.addEventListener('input', () => { state.honeypotDraft[input.dataset.honeypotField] = input.value; }));
-    queryAll('[data-honeypot-service]').forEach((input) => input.addEventListener('change', () => { const service = input.dataset.honeypotService; state.honeypotDraft.services = input.checked ? [...new Set([...state.honeypotDraft.services, service])] : state.honeypotDraft.services.filter((item) => item !== service); }));
+    /*
+     * 文本框用 input，下拉用 change（select 的 input 事件并非各处都可靠）。
+     * 换网络会改变「地址名额」提示和保存按钮的可用性，所以下拉要重绘；
+     * 文本框不重绘，否则每敲一个字都丢焦点。
+     */
+    queryAll('[data-honeypot-field]').forEach((input) => {
+      const isSelect = input.tagName === 'SELECT';
+      input.addEventListener(isSelect ? 'change' : 'input', () => {
+        if (!state.honeypotDraft) return;
+        state.honeypotDraft[input.dataset.honeypotField] = input.value;
+        if (isSelect) { render(); return; }
+        /*
+         * 文本框不重绘（否则每敲一个字丢焦点），但保存按钮的 disabled 只在渲染时算过一次，
+         * 于是「填好地址」这条唯一的正常路径反而点不动：地址是必填项，填完按钮仍禁用，
+         * 用户只有顺手动一下服务勾选触发重绘才能提交。这里只同步这一个属性。
+         */
+        syncHoneypotSaveState();
+      });
+    });
+    /* 服务勾选：立即回写并重绘，保存按钮与「至少选一个」的提示都跟着它变。 */
+    queryAll('[data-honeypot-service]').forEach((box) => box.addEventListener('change', () => {
+      if (!state.honeypotDraft) return;
+      const key = box.dataset.honeypotService;
+      const chosen = new Set(asArray(state.honeypotDraft.services).map((entry) => firstText(entry?.name, entry)));
+      if (box.checked) chosen.add(key); else chosen.delete(key);
+      /* 只保留后端仍然支持的项，顺序按 HONEYPOT_SERVICES 固定，避免提交顺序漂移。 */
+      state.honeypotDraft.services = HONEYPOT_SERVICES
+        .map(([entry]) => entry)
+        .filter((entry) => chosen.has(entry) && honeypotServiceSupported(entry));
+      render();
+    }));
     query('[data-honeypot-save]')?.addEventListener('click', validateHoneypot);
     query('[data-dwrt-confirm-accept]')?.addEventListener('click', () => { const confirm = state.confirm; if (!confirm) return; if (confirm.action === 'content-save') commitContent(confirm.payload); else if (confirm.action === 'app-block-save') commitAppBlock(confirm.payload, confirm.revision); else if (confirm.action === 'pcdn-save') commitPcdn(confirm.enabled); else if (confirm.action === 'pcdn-sync') commitPcdnSync(); else if (confirm.action === 'feed-import') startFeedImport(); else if (confirm.action === 'signature-suppress') setSignatureSuppressed(confirm.signature); else if (confirm.action === 'traffic-clear') clearTrafficHistory(); else if (confirm.action === 'honeypot-save') commitHoneypot(confirm.payload); else if (confirm.action === 'certificate-generate') commitCertificate('generate'); else if (confirm.action === 'certificate-rotate') commitCertificate('rotate'); else if (confirm.action === 'certificate-revoke') commitCertificate('revoke'); else deleteResource(confirm.resourceKind, confirm.resourceId); });
   }

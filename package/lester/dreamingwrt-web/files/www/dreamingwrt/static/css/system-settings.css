@@ -162,7 +162,7 @@
   align-content: center;
   gap: 8px;
   padding: 22px 70px 22px 22px;
-  border-radius: 18px;
+  border-radius: var(--app-radius-card);
   background: rgba(6, 12, 23, 0.11);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.09);
   cursor: pointer;
@@ -207,7 +207,7 @@
   width: 38px;
   height: 38px;
   place-items: center;
-  border-radius: 12px;
+  border-radius: var(--app-radius-control);
   background: rgba(255,255,255,0.08);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.10);
   color: var(--system-text);
@@ -231,7 +231,7 @@
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 20px;
   padding: 22px;
-  border-radius: 18px;
+  border-radius: var(--app-radius-panel);
   background: rgba(5, 11, 21, 0.12);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.075);
 }
@@ -260,7 +260,7 @@
   height: 44px;
   padding: 0 13px;
   border: 0;
-  border-radius: 13px;
+  border-radius: var(--app-radius-control);
   outline: 0;
   background: var(--system-field-bg);
   box-shadow: inset 0 0 0 1px var(--system-border);
@@ -289,7 +289,7 @@
   justify-content: space-between;
   gap: 16px;
   padding: 15px 18px;
-  border-radius: 16px;
+  border-radius: var(--app-radius-panel);
   background: rgba(6,12,23,0.10);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.075);
 }
@@ -339,7 +339,7 @@
   min-height: 30px;
   padding: 0 10px;
   border: 0;
-  border-radius: 9px;
+  border-radius: var(--app-radius-compact);
   background: rgba(255,255,255,0.08);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.10);
   color: var(--system-text);
@@ -407,7 +407,7 @@
   width: 48px;
   height: 48px;
   place-items: center;
-  border-radius: 15px;
+  border-radius: var(--app-radius-compact);
   background: rgba(111, 178, 255, 0.12);
   box-shadow: inset 0 0 0 1px rgba(139, 195, 255, 0.16);
   color: #8bc3ff;
@@ -482,7 +482,7 @@
   gap: 12px;
   padding: 10px 14px;
   overflow: hidden;
-  border-radius: 14px;
+  border-radius: var(--app-radius-control);
   background: var(--system-field-bg);
   box-shadow: inset 0 0 0 1px var(--system-border);
   color: var(--system-text);
@@ -632,7 +632,7 @@
 
 .system-flash-status {
   padding: 13px 16px;
-  border-radius: 14px;
+  border-radius: var(--app-radius-compact);
   background: rgba(52, 199, 89, 0.10);
   box-shadow: inset 0 0 0 1px rgba(52, 199, 89, 0.18);
   color: color-mix(in srgb, #75df91 82%, var(--system-ink));
@@ -695,7 +695,7 @@
   min-width: 0;
   gap: 6px;
   padding: 15px 16px;
-  border-radius: 16px;
+  border-radius: var(--app-radius-panel);
   background: rgba(7, 13, 24, 0.11);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.09);
 }
@@ -767,7 +767,7 @@
   gap: 12px;
   padding: 10px 14px;
   overflow: hidden;
-  border-radius: 14px;
+  border-radius: var(--app-radius-control);
   background: var(--system-field-bg);
   box-shadow: inset 0 0 0 1px var(--system-border);
   color: var(--system-text);
@@ -821,7 +821,7 @@
 .system-signature-note {
   margin: 0;
   padding: 11px 13px;
-  border-radius: 13px;
+  border-radius: var(--app-radius-compact);
   background: rgba(255, 149, 0, 0.09);
   box-shadow: inset 0 0 0 1px rgba(255, 159, 10, 0.17);
   color: #ffc36a;
@@ -1050,7 +1050,7 @@
   min-width: 0;
   box-sizing: border-box;
   border: 0;
-  border-radius: 30px;
+  border-radius: var(--app-radius-card);
   background: var(--dwrt-glass-surface);
   box-shadow:
     inset 0 0 0 1px var(--dwrt-glass-edge, rgba(255,255,255,0.12)),
@@ -1133,7 +1133,7 @@
   width: 100%;
   min-width: 0;
   border: 1px solid rgba(255,255,255,0.16);
-  border-radius: 12px;
+  border-radius: var(--app-radius-control);
   background: var(--system-field-bg);
   box-shadow:
     inset 0 0 0 1px rgba(255,255,255,0.035),
@@ -1206,7 +1206,7 @@ textarea.system-glass-input {
 .system-time-display {
   justify-self: start;
   border-left: 3px solid #0a84ff;
-  border-radius: 12px;
+  border-radius: var(--app-radius-control);
   background: rgba(8,14,26,0.13);
   color: var(--system-ink);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -1410,7 +1410,7 @@ textarea.system-glass-input {
 }
 
 .system-level-badge {
-  border-radius: 8px;
+  border-radius: var(--app-radius-compact);
   padding: 4px 12px;
   font-size: 12px;
   font-weight: 900;
@@ -1439,7 +1439,7 @@ textarea.system-glass-input {
 .system-segmented-control {
   display: flex;
   width: max-content;
-  border-radius: 10px;
+  border-radius: var(--app-radius-control);
   background: rgba(0, 0, 0, 0.18);
   padding: 3px;
 }
@@ -1447,7 +1447,7 @@ textarea.system-glass-input {
 .system-segment-btn {
   appearance: none;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--app-radius-compact);
   background: transparent;
   color: var(--system-faint);
   cursor: pointer;
@@ -1531,7 +1531,7 @@ textarea.system-glass-input {
   position: relative;
   width: 50px;
   height: 28px;
-  border-radius: 15px;
+  border-radius: 999px;
   background: rgba(0, 0, 0, 0.20);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12);
   transition: background 180ms ease;
@@ -1633,7 +1633,7 @@ textarea.system-glass-input {
   width: 36px;
   height: 36px;
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 10px;
+  border-radius: var(--app-radius-compact);
   background: rgba(255, 255, 255, 0.055);
 }
 
@@ -1674,7 +1674,7 @@ textarea.system-glass-input {
   height: 10px;
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.07);
-  border-radius: 6px;
+  border-radius: 999px;
   background: rgba(255, 255, 255, 0.055);
   margin-bottom: 0;
 }
@@ -1909,7 +1909,7 @@ textarea.system-glass-input {
   min-height: 36px;
   flex: 0 0 36px;
   border: 1px solid rgba(255,255,255,0.12);
-  border-radius: 12px;
+  border-radius: var(--app-radius-compact);
   background: rgba(255,255,255,0.06);
   color: var(--system-muted);
   line-height: 0;
@@ -1997,7 +1997,7 @@ textarea.system-glass-input {
   min-height: 72px;
   overflow: hidden;
   border: 1px solid rgba(255,255,255,0.16);
-  border-radius: 22px;
+  border-radius: var(--app-radius-card);
   background:
     radial-gradient(circle at 28% 22%, rgba(255,255,255,0.20), transparent 34%),
     rgba(255,255,255,0.08);
@@ -2140,7 +2140,7 @@ textarea.system-glass-input {
   min-width: 0;
   min-height: 50px;
   padding: 0 16px;
-  border-radius: 16px;
+  border-radius: var(--app-radius-panel);
   background: rgba(6, 12, 23, 0.14);
   box-shadow: inset 0 1px 3px rgba(0,0,0,0.16), inset 0 0 0 1px rgba(255,255,255,0.07);
 }
@@ -2184,7 +2184,7 @@ textarea.system-glass-input {
   gap: 16px;
   min-width: 0;
   padding: 20px;
-  border-radius: 20px;
+  border-radius: var(--app-radius-panel);
   background: rgba(6, 12, 23, 0.18);
   box-shadow: inset 0 2px 6px rgba(0,0,0,0.18), inset 0 0 0 1px rgba(255,255,255,0.06);
 }
@@ -2213,7 +2213,7 @@ textarea.system-glass-input {
   min-height: 54px;
   min-width: 0;
   border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 16px;
+  border-radius: var(--app-radius-panel);
   background: rgba(255,255,255,0.035);
   padding: 13px 15px;
   transition: background 180ms ease, border-color 180ms ease;
@@ -2387,7 +2387,7 @@ textarea.system-glass-input {
   min-width: 0;
   padding: 10px 12px;
   border: 1px solid var(--system-border);
-  border-radius: 8px;
+  border-radius: var(--app-radius-compact);
   background: rgba(255,255,255,0.04);
 }
 
@@ -2422,7 +2422,7 @@ textarea.system-glass-input {
   min-width: 0;
   padding: 11px 13px;
   border: 1px solid rgba(255,199,88,0.28);
-  border-radius: 8px;
+  border-radius: var(--app-radius-compact);
   background: rgba(255,199,88,0.1);
 }
 
@@ -2467,7 +2467,7 @@ textarea.system-glass-input {
   min-width: 0;
   padding: 11px 13px;
   border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 8px;
+  border-radius: var(--app-radius-compact);
   background: rgba(255, 255, 255, 0.04);
 }
 
@@ -2587,7 +2587,7 @@ textarea.system-glass-input {
   height: 220px;
   place-items: center;
   overflow: hidden;
-  border-radius: 16px;
+  border-radius: var(--app-radius-panel);
   background: #fff;
   box-shadow: inset 0 0 0 1px rgba(0,0,0,.08), 0 12px 28px rgba(0,0,0,.12);
   padding: 14px;
@@ -2622,7 +2622,7 @@ textarea.system-glass-input {
 .system-binding-loading {
   min-height: 210px;
   align-content: center;
-  border-radius: 16px;
+  border-radius: var(--app-radius-panel);
   color: var(--system-muted);
   background: rgba(255,255,255,.035);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,.08);
@@ -2653,7 +2653,7 @@ textarea.system-glass-input {
   display: grid;
   gap: 5px;
   padding: 12px 14px;
-  border-radius: 12px;
+  border-radius: var(--app-radius-control);
   background: rgba(255,255,255,.035);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,.08);
 }
@@ -2730,7 +2730,7 @@ textarea.system-glass-input {
 .system-binding-state,
 .system-binding-complete,
 .system-binding-warning {
-  border-radius: 14px;
+  border-radius: var(--app-radius-compact);
   padding: 15px 16px;
 }
 
@@ -2790,7 +2790,7 @@ textarea.system-glass-input {
 
 .system-otp-empty,
 .system-api-empty {
-  border-radius: 16px;
+  border-radius: var(--app-radius-panel);
   background: rgba(255,255,255,0.045);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.07);
   color: var(--system-muted);
@@ -2807,7 +2807,7 @@ textarea.system-glass-input {
   min-width: 0;
   overflow: hidden;
   border: 1px solid rgba(255,255,255,0.10);
-  border-radius: 18px;
+  border-radius: var(--app-radius-panel);
   background:
     radial-gradient(ellipse at 38% -18%, rgba(255,255,255,0.06), transparent 48%),
     rgba(255,255,255,0.045);
@@ -2883,7 +2883,7 @@ textarea.system-glass-input {
   align-items: center;
   gap: 10px;
   min-width: 0;
-  border-radius: 14px;
+  border-radius: var(--app-radius-compact);
   background: rgba(255,255,255,0.04);
   box-shadow: inset 0 0 0 1px rgba(255,255,255,0.07);
   padding: 10px;
@@ -2906,7 +2906,7 @@ textarea.system-glass-input {
   min-width: 36px;
   height: 36px;
   min-height: 36px;
-  border-radius: 10px;
+  border-radius: var(--app-radius-compact);
   background: rgba(94,199,255,0.10);
   color: #5ec7ff;
   line-height: 0;
@@ -3598,7 +3598,7 @@ textarea.system-glass-input {
   width: 30px;
   height: 30px;
   border: 1px solid rgba(255,255,255,0.10);
-  border-radius: 10px;
+  border-radius: var(--app-radius-compact);
   background: rgba(255,255,255,0.055);
   color: var(--system-ink);
   cursor: pointer;

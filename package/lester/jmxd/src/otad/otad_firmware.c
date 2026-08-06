@@ -30,16 +30,6 @@ struct otad_firmware_info {
     struct json_object *json;
 };
 
-struct otad_staged_upload {
-    int rootfd;
-    int dirfd;
-    int lockfd;
-    int fd;
-    uint64_t size;
-    time_t expires_at;
-    char sha256[65];
-};
-
 struct uloop_timeout g_otad_confirm_timer;
 
 static int otad_hex_ok(const char *s, size_t n)
@@ -713,7 +703,7 @@ invalid:
     return -1;
 }
 
-static void otad_staged_upload_close(struct otad_staged_upload *upload)
+void otad_staged_upload_close(struct otad_staged_upload *upload)
 {
     if (!upload)
         return;
@@ -728,9 +718,9 @@ static void otad_staged_upload_close(struct otad_staged_upload *upload)
     upload->rootfd = upload->dirfd = upload->lockfd = upload->fd = -1;
 }
 
-static int otad_staged_upload_open(const char *upload_id,
-                                   struct otad_staged_upload *upload,
-                                   char *error, size_t error_len)
+int otad_staged_upload_open(const char *upload_id,
+                            struct otad_staged_upload *upload,
+                            char *error, size_t error_len)
 {
     char md5[33] = "";
     char actual_sha[65] = "";
@@ -1051,7 +1041,7 @@ static int otad_firmware_validate_fd(int fd, uint64_t expected_size,
     return 0;
 }
 
-static struct json_object *otad_operation_status_by_id(const char *operation_id)
+struct json_object *otad_operation_status_by_id(const char *operation_id)
 {
     struct json_object *body = json_object_new_object();
     struct json_object *resp;

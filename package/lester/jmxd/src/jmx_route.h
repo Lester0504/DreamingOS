@@ -38,6 +38,8 @@ enum jmx_route_sticky_mode {
     JMX_STICKY_SIP_DIP_DPORT = 4,
     JMX_STICKY_5TUPLE = 5,
     JMX_STICKY_PRIMARY_BACKUP = 6,
+    JMX_STICKY_DOWNLOAD = 7,
+    JMX_STICKY_CONN_CNT = 8,
 };
 
 struct jmx_route_rule_wire {
@@ -86,6 +88,7 @@ struct json_object *jmx_api_route_status(struct json_object *req_obj);
 struct json_object *jmx_api_route_reload(struct json_object *req_obj);
 struct json_object *jmx_api_route_config_get(struct json_object *req_obj);
 struct json_object *jmx_api_route_config_set(struct json_object *req_obj);
+struct json_object *jmx_api_route_policy_set(struct json_object *req_obj);
 int jmx_route_sync_config(void);
 void jmx_route_health_tick(void);
 int jmx_route_counter_tick(void);

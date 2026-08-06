@@ -224,7 +224,7 @@
           "module": "native/user-authentication.js",
           "module_version": "20260804-speed-limit-two-tabs-02",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260804-speed-limit-two-tabs-02"
+          "style_version": "20260806-radius-token-converge-01"
         },
         {
           "label": "在线用户",
@@ -235,7 +235,7 @@
           "module": "native/user-authentication.js",
           "module_version": "20260804-speed-limit-two-tabs-02",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260804-speed-limit-two-tabs-02"
+          "style_version": "20260806-radius-token-converge-01"
         },
         {
           "label": "账号管理",
@@ -246,7 +246,7 @@
           "module": "native/user-authentication.js",
           "module_version": "20260804-speed-limit-two-tabs-02",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260804-speed-limit-two-tabs-02"
+          "style_version": "20260806-radius-token-converge-01"
         },
         {
           "label": "代拨服务",
@@ -257,7 +257,7 @@
           "module": "native/user-authentication.js",
           "module_version": "20260804-speed-limit-two-tabs-02",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260804-speed-limit-two-tabs-02"
+          "style_version": "20260806-radius-token-converge-01"
         },
         {
           "label": "终端限速",
@@ -271,7 +271,7 @@
           "module": "native/client-speed-limit.js",
           "module_version": "20260804-speed-limit-two-tabs-02",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260804-speed-limit-two-tabs-02"
+          "style_version": "20260806-radius-token-converge-01"
         },
         {
           "label": "网址浏览控制",
@@ -299,7 +299,7 @@
           "module": "native/app-filter.js",
           "module_version": "20260804-app-filter-01",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260804-app-filter-01"
+          "style_version": "20260806-radius-token-converge-01"
         },
         {
           "label": "终端联网控制",
@@ -313,7 +313,7 @@
           "module": "native/client-network-control.js",
           "module_version": "20260804-mac-network-control-01",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260804-mac-network-control-01"
+          "style_version": "20260806-radius-token-converge-01"
         },
         {
           "label": "认证通知",
@@ -324,7 +324,7 @@
           "module": "native/user-authentication.js",
           "module_version": "20260804-speed-limit-two-tabs-02",
           "style": "/static/css/user-authentication.css",
-          "style_version": "20260804-speed-limit-two-tabs-02"
+          "style_version": "20260806-radius-token-converge-01"
         }
       ]
     },
@@ -424,9 +424,9 @@
           "icon": "storage_mounts",
           "path": "/app/#/storage/mounts",
           "module": "native/system-settings.js",
-          "module_version": "20260805-mount-capacity-units-01",
+          "module_version": "20260806-front-batch10-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260805-mount-capacity-units-01"
+          "style_version": "20260806-radius-token-converge-01"
         },
         {
           "label": "文件管理",
@@ -535,9 +535,9 @@
           "icon": "policy_aegisx",
           "path": "/app/#/policy-engine/aegisx",
           "module": "native/aegisx.js",
-          "module_version": "20260805-aegisx-capability-truth-01",
+          "module_version": "20260806-honeypot-form-confirm-gate-01",
           "style": "/static/css/aegisx.css",
-          "style_version": "20260805-aegisx-capability-truth-01"
+          "style_version": "20260806-honeypot-form-confirm-gate-01"
         },
         {
           "label": "策略表",
@@ -601,9 +601,9 @@
           "icon": "flow",
           "path": "/app/#/policy-engine/flow-engine",
           "module": "native/flow-engine.js",
-          "module_version": "20260802-ui-batch-01",
+          "module_version": "20260806-flow-multiwan-balance-01",
           "style": "/static/css/flow-engine.css",
-          "style_version": "20260802-ui-batch-01"
+          "style_version": "20260806-flow-multiwan-balance-01"
         }
       ]
     },
@@ -636,9 +636,9 @@
           "icon": "general",
           "path": "/app/#/system/general",
           "module": "native/system-settings.js",
-          "module_version": "20260805-mount-capacity-units-01",
+          "module_version": "20260806-front-batch10-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260805-mount-capacity-units-01"
+          "style_version": "20260806-front-batch10-01"
         },
         {
           "label": "管理员",
@@ -647,9 +647,9 @@
           "icon": "system",
           "path": "/app/#/system/admin",
           "module": "native/system-settings.js",
-          "module_version": "20260805-mount-capacity-units-01",
+          "module_version": "20260806-front-batch10-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260805-mount-capacity-units-01"
+          "style_version": "20260806-front-batch10-01"
         },
         {
           "label": "通知推送",
@@ -681,9 +681,9 @@
           "icon": "qwrt_modules",
           "path": "/app/#/system/startup",
           "module": "native/system-settings.js",
-          "module_version": "20260805-mount-capacity-units-01",
+          "module_version": "20260806-front-batch10-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260805-mount-capacity-units-01"
+          "style_version": "20260806-front-batch10-01"
         },
         {
           "label": "计划任务",
@@ -692,9 +692,9 @@
           "icon": "log_center",
           "path": "/app/#/system/crontab",
           "module": "native/system-settings.js",
-          "module_version": "20260805-mount-capacity-units-01",
+          "module_version": "20260806-front-batch10-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260805-mount-capacity-units-01"
+          "style_version": "20260806-front-batch10-01"
         },
         {
           "label": "终端",
@@ -727,9 +727,9 @@
           "icon": "advanced_plugins",
           "path": "/app/#/system/advanced",
           "module": "native/system-settings.js",
-          "module_version": "20260805-mount-capacity-units-01",
+          "module_version": "20260806-front-batch10-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260805-mount-capacity-units-01"
+          "style_version": "20260806-front-batch10-01"
         },
         {
           "label": "高可用性",
@@ -751,9 +751,9 @@
           "icon": "wan",
           "path": "/app/#/system/flash",
           "module": "native/system-settings.js",
-          "module_version": "20260805-mount-capacity-units-01",
+          "module_version": "20260806-front-batch10-01",
           "style": "/static/css/system-settings.css",
-          "style_version": "20260805-mount-capacity-units-01"
+          "style_version": "20260806-front-batch10-01"
         },
         {
           "label": "外观",

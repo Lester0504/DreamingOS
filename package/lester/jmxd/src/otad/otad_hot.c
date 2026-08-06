@@ -9,8 +9,22 @@
 #define OTAD_HOT_MAX_DELETIONS 256
 #define OTAD_HOT_MAX_SPACE_GATES (OTAD_HOT_MAX_PAYLOADS + 1)
 
+/*
+ * Where the package bytes come from. A direct ubus caller names a path inside
+ * the whitelist; a web upload has no path at all and is identified by upload_id,
+ * so it arrives as an already-open fd from the staging area. Everything below
+ * reads through this, which is what keeps the whitelist from having to grow a
+ * staging entry just so the browser path can work.
+ */
+struct otad_hot_source {
+    const char *path;
+    int fd;
+    uint64_t size;
+};
+
 struct otad_hot_info {
     char path[OTAD_MAX_PATH];
+    int fd;
     uint64_t size;
     struct json_object *manifest;
 };
@@ -160,7 +174,53 @@ static void hot_info_done(struct otad_hot_info *info)
     }
 }
 
-static int hot_header_read(const char *path, struct otad_hot_info *info,
+/*
+ * Open the package for reading regardless of which way it was named. Returns a
+ * borrowed fd for an upload-backed source (owned by the staged upload) and a
+ * freshly opened one for a path, which is why the caller is told whether to
+ * close it.
+ */
+static int hot_source_open(const struct otad_hot_source *src, int *owned)
+{
+    *owned = 0;
+    if (!src)
+        return -1;
+    /*
+     * A named path is always opened here and always checked against the
+     * whitelist. Only a source with no path at all uses the fd, which is how an
+     * upload-backed package is read without ever being given a device path.
+     */
+    if (src->path) {
+        if (!hot_package_path_allowed(src->path))
+            return -1;
+        *owned = 1;
+        return open(src->path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    }
+    return src->fd >= 0 ? src->fd : -1;
+}
+
+/*
+ * Reopen the package an already-parsed info refers to. A path wins over the fd
+ * when both are set: that keeps a zero-initialised info (fd == 0, which is stdin
+ * and therefore a *valid* descriptor) from being read as though stdin held the
+ * package.
+ *
+ * The whitelist is deliberately not re-checked here. It was already enforced when
+ * hot_header_read() accepted this path, and these callers run after that, so
+ * re-checking would only reject paths the parser already vouched for.
+ */
+static int hot_info_fd(const struct otad_hot_info *info, int *owned)
+{
+    *owned = 0;
+    if (info->path[0]) {
+        *owned = 1;
+        return open(info->path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    }
+    return info->fd >= 0 ? info->fd : -1;
+}
+
+static int hot_header_read(const struct otad_hot_source *src,
+                           struct otad_hot_info *info,
                            char *error, size_t error_len)
 {
     char *header = NULL, *p, *end;
@@ -168,32 +228,48 @@ static int hot_header_read(const char *path, struct otad_hot_info *info,
     unsigned long json_len;
     struct stat st;
     int fd = -1;
+    int owned = 0;
     size_t off = 0;
 
     memset(info, 0, sizeof(*info));
-    if (!hot_package_path_allowed(path) || stat(path, &st) != 0 ||
-        !S_ISREG(st.st_mode) || st.st_size < (off_t)OTAD_HOT_HEADER_BYTES) {
+    info->fd = -1;
+    /*
+     * An upload-backed source was already stat'ed, size-checked and hashed by
+     * otad_staged_upload_open(); a path source has to be checked here.
+     */
+    if (!src || (src->path ? !hot_package_path_allowed(src->path)
+                           : src->fd < 0)) {
+        snprintf(error, error_len, "hot_update_path_invalid");
+        return -1;
+    }
+    fd = hot_source_open(src, &owned);
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size < (off_t)OTAD_HOT_HEADER_BYTES) {
+        if (owned && fd >= 0)
+            close(fd);
         snprintf(error, error_len, "hot_update_path_invalid");
         return -1;
     }
     header = malloc(OTAD_HOT_HEADER_BYTES + 1);
     if (!header) {
+        if (owned)
+            close(fd);
         snprintf(error, error_len, "out_of_memory");
         return -1;
     }
-    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0)
-        goto invalid;
     while (off < OTAD_HOT_HEADER_BYTES) {
-        ssize_t n = read(fd, header + off, OTAD_HOT_HEADER_BYTES - off);
+        ssize_t n = pread(fd, header + off, OTAD_HOT_HEADER_BYTES - off,
+                          (off_t)off);
         if (n < 0 && errno == EINTR)
             continue;
         if (n <= 0)
             break;
         off += (size_t)n;
     }
-    close(fd);
+    if (owned)
+        close(fd);
     fd = -1;
+    owned = 0;
     header[off] = '\0';
     if (off != OTAD_HOT_HEADER_BYTES ||
         strncmp(header, OTAD_HOT_MAGIC, strlen(OTAD_HOT_MAGIC)))
@@ -223,11 +299,13 @@ static int hot_header_read(const char *path, struct otad_hot_info *info,
         hot_info_done(info);
         return -1;
     }
-    snprintf(info->path, sizeof(info->path), "%s", path);
+    if (src->path)
+        snprintf(info->path, sizeof(info->path), "%s", src->path);
+    info->fd = src->path ? -1 : src->fd;
     return 0;
 
 invalid:
-    if (fd >= 0)
+    if (owned && fd >= 0)
         close(fd);
     free(header);
 invalid_no_header:
@@ -321,7 +399,8 @@ static int hot_payloads_verify(const struct otad_hot_info *info,
                                struct otad_hot_file *files, size_t count,
                                char *error, size_t error_len)
 {
-    int fd = open(info->path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int owned = 0;
+    int fd = hot_info_fd(info, &owned);
     size_t i;
 
     if (fd < 0) {
@@ -334,11 +413,13 @@ static int hot_payloads_verify(const struct otad_hot_info *info,
         if (hot_hash_fd_range(fd, files[i].offset, files[i].size, md5, sha) != 0 ||
             strcasecmp(md5, files[i].md5) || strcasecmp(sha, files[i].sha256)) {
             snprintf(error, error_len, "hot_update_payload_integrity_mismatch");
-            close(fd);
+            if (owned)
+                close(fd);
             return -1;
         }
     }
-    close(fd);
+    if (owned)
+        close(fd);
     return 0;
 }
 
@@ -554,7 +635,18 @@ static int hot_space_gates_check(struct otad_hot_file *files, size_t count,
                 uint64_t artifact_inodes = gate->required_inodes >
                     OTAD_SPACE_SAFETY_INODES
                     ? gate->required_inodes - OTAD_SPACE_SAFETY_INODES : 0;
-                (void)otad_space_gate_check(gate->path,
+                /*
+                 * The path has to be copied out first. otad_space_gate_check()
+                 * clears the gate it writes into before it reads the path, so
+                 * passing gate->path directly hands it an empty string the
+                 * moment the memset lands, and statvfs("") fails. That turned
+                 * every package with two payloads on one filesystem into
+                 * statvfs_failed, which is every real package.
+                 */
+                char gate_path[OTAD_MAX_PATH];
+
+                snprintf(gate_path, sizeof(gate_path), "%s", gate->path);
+                (void)otad_space_gate_check(gate_path,
                                             "hot_update_payloads",
                                             gate->artifact_bytes + files[i].size,
                                             artifact_inodes > UINT64_MAX - file_inodes
@@ -577,8 +669,15 @@ static int hot_space_gates_check(struct otad_hot_file *files, size_t count,
     return failed ? -1 : 0;
 }
 
+/*
+ * A closed-gate answer. Every field a caller uses to decide whether the package
+ * may be installed reads false here, and release_gate_reason names the specific
+ * precondition that failed rather than a blanket "trust gate closed" - the old
+ * fixed reason sent operators to provision keys even when keys were fine.
+ */
 static void hot_release_trust_fields(struct json_object *resp,
-                                     int integrity_verified)
+                                     int integrity_verified,
+                                     const char *reason)
 {
     json_object_object_add(resp, "verified", json_object_new_boolean(0));
     json_object_object_add(resp, "integrity_verified",
@@ -590,100 +689,177 @@ static void hot_release_trust_fields(struct json_object *resp,
     json_object_object_add(resp, "policy_passed", json_object_new_boolean(0));
     json_object_object_add(resp, "safe_to_apply_now", json_object_new_boolean(0));
     otad_json_add_string(resp, "release_gate", "closed");
-    /*
-     * Distinct from the full firmware path on purpose. Full firmware apply is
-     * implemented and now gated on real trust state. Hot update's writer is
-     * still compiled out (#if 0 in hot_apply_files), so no trust configuration
-     * makes this reachable, and saying "trust gate closed" would send an
-     * operator to provision keys that cannot help.
-     */
     otad_json_add_string(resp, "release_gate_reason",
-                         "hot_update_writer_disabled_in_build");
+                         reason && reason[0] ? reason
+                                            : "hot_update_release_signature_required");
 }
 
 static struct json_object *hot_release_trust_error(const char *message,
-                                                   int integrity_verified)
+                                                   int integrity_verified,
+                                                   const char *reason)
 {
     struct json_object *resp = otad_error("hot_update_release_trust_gate_closed",
                                           message);
 
-    hot_release_trust_fields(resp, integrity_verified);
+    hot_release_trust_fields(resp, integrity_verified, reason);
     return resp;
 }
 
-static struct json_object *hot_verify_internal(const char *path)
+static void hot_describe_package(struct json_object *resp,
+                                 const struct otad_hot_info *info,
+                                 size_t count, size_t deletion_count,
+                                 const struct otad_hot_space_gates *gates)
 {
-    struct otad_hot_info info;
+    struct json_object *actions = NULL;
+
+    otad_json_add_string(resp, "artifact_type", "hot_update");
+    otad_json_add_string(resp, "firmware_type",
+                         otad_json_str(info->manifest, "firmware_type", ""));
+    otad_json_add_string(resp, "package_id",
+                         otad_json_str(info->manifest, "package_id", ""));
+    otad_json_add_string(resp, "to_version",
+                         otad_json_str(info->manifest, "to_version", ""));
+    json_object_object_add(resp, "firmware_size_bytes",
+                           json_object_new_int64((int64_t)info->size));
+    json_object_object_add(resp, "payload_count", json_object_new_int((int)count));
+    json_object_object_add(resp, "deletion_count",
+                           json_object_new_int((int)deletion_count));
+    json_object_object_add(resp, "slot_required", json_object_new_boolean(0));
+    if (gates)
+        json_object_object_add(resp, "space_gates", hot_space_gates_json(gates));
+    if (json_object_object_get_ex(info->manifest, "service_actions", &actions) && actions)
+        json_object_object_add(resp, "service_actions", json_object_get(actions));
+}
+
+/*
+ * Everything verify and apply must agree on, run once. Returns 0 when the
+ * package is structurally sound, its payload bytes hash as claimed, and the
+ * targets on disk are the baseline the package was built against. On failure it
+ * hands back the closed-gate response the caller should return as-is; the
+ * caller owns nothing else.
+ *
+ * Signature verification is deliberately not part of this: it needs the parsed
+ * manifest, and keeping it in the callers makes the ordering visible - integrity
+ * first, then authenticity, then (apply only) the writer.
+ */
+static int hot_preflight(const struct otad_hot_source *src,
+                         struct otad_hot_info *info,
+                         struct otad_hot_file **files_out, size_t *count_out,
+                         struct otad_hot_deletion **deletions_out,
+                         size_t *deletion_count_out,
+                         struct otad_hot_space_gates *gates,
+                         struct json_object **error_resp)
+{
     struct otad_hot_file *files = NULL;
     struct otad_hot_deletion *deletions = NULL;
     struct json_object *validation = NULL;
     struct json_object *resp;
     char error[128] = "";
-    struct otad_hot_space_gates gates;
     size_t count = 0;
     size_t deletion_count = 0;
 
-    memset(&gates, 0, sizeof(gates));
-    if (hot_header_read(path, &info, error, sizeof(error)) != 0) {
+    *files_out = NULL;
+    *count_out = 0;
+    *deletions_out = NULL;
+    *deletion_count_out = 0;
+    *error_resp = NULL;
+    memset(gates, 0, sizeof(*gates));
+    if (hot_header_read(src, info, error, sizeof(error)) != 0) {
         resp = hot_release_trust_error(
-            "hot-update package diagnostic failed and release trust gate is closed", 0);
+            "hot-update package diagnostic failed and release trust gate is closed",
+            0, "hot_update_package_header_invalid");
         otad_json_add_string(resp, "diagnostic_error", error);
-        return resp;
+        *error_resp = resp;
+        return -1;
     }
-    validation = otad_check_manifest(info.manifest);
+    validation = otad_check_manifest(info->manifest);
     if (!validation || !otad_json_bool(validation, "validated", 0)) {
         resp = hot_release_trust_error(
-            "hot-update manifest validation failed and release trust gate is closed", 0);
+            "hot-update manifest validation failed and release trust gate is closed",
+            0, "hot_update_manifest_contract_invalid");
         if (validation)
             json_object_object_add(resp, "validation", validation);
-        hot_info_done(&info);
-        return resp;
+        hot_info_done(info);
+        *error_resp = resp;
+        return -1;
     }
     json_object_put(validation);
-    if (hot_payloads_parse(&info, &files, &count, error, sizeof(error)) != 0 ||
-        hot_deletions_parse(&info, files, count, &deletions, &deletion_count,
+    if (hot_payloads_parse(info, &files, &count, error, sizeof(error)) != 0 ||
+        hot_deletions_parse(info, files, count, &deletions, &deletion_count,
                             error, sizeof(error)) != 0 ||
-        hot_space_gates_check(files, count, &gates, 0) != 0 ||
-        hot_payloads_verify(&info, files, count, error, sizeof(error)) != 0 ||
+        hot_space_gates_check(files, count, gates, 0) != 0 ||
+        hot_payloads_verify(info, files, count, error, sizeof(error)) != 0 ||
         hot_targets_verify_base(files, count, error, sizeof(error)) != 0 ||
         hot_deletions_verify_base(deletions, deletion_count, error, sizeof(error)) != 0) {
         free(files);
         free(deletions);
-        hot_info_done(&info);
-        if (!error[0] && hot_space_gate_failed(&gates)) {
+        if (!error[0] && hot_space_gate_failed(gates)) {
             resp = hot_release_trust_error(
                 "hot-update target filesystem space diagnostic failed and release trust gate is closed",
-                0);
-            json_object_object_add(resp, "space_gates",
-                                   hot_space_gates_json(&gates));
+                0, "hot_update_target_space_insufficient");
+            json_object_object_add(resp, "space_gates", hot_space_gates_json(gates));
             otad_json_add_string(resp, "diagnostic_error",
-                                 hot_space_gate_failed(&gates)->error);
-            return resp;
+                                 hot_space_gate_failed(gates)->error);
+            hot_info_done(info);
+            *error_resp = resp;
+            return -1;
         }
         resp = hot_release_trust_error(
-            "hot-update payload integrity diagnostic failed and release trust gate is closed", 0);
+            "hot-update payload integrity diagnostic failed and release trust gate is closed",
+            0, error[0] ? error : "hot_update_payload_integrity_failed");
         otad_json_add_string(resp, "diagnostic_error", error);
-        return resp;
+        hot_info_done(info);
+        *error_resp = resp;
+        return -1;
     }
-    resp = hot_release_trust_error(
-        "hot-update structure and payload integrity are valid but release signature verification is unavailable",
-        1);
-    json_object_object_add(resp, "validated", json_object_new_boolean(1));
-    otad_json_add_string(resp, "artifact_type", "hot_update");
-    otad_json_add_string(resp, "firmware_type", otad_json_str(info.manifest, "firmware_type", ""));
-    otad_json_add_string(resp, "package_id", otad_json_str(info.manifest, "package_id", ""));
-    otad_json_add_string(resp, "to_version", otad_json_str(info.manifest, "to_version", ""));
-    json_object_object_add(resp, "firmware_size_bytes", json_object_new_int64((int64_t)info.size));
-    json_object_object_add(resp, "payload_count", json_object_new_int((int)count));
-    json_object_object_add(resp, "deletion_count", json_object_new_int((int)deletion_count));
-    json_object_object_add(resp, "slot_required", json_object_new_boolean(0));
-    json_object_object_add(resp, "space_gates", hot_space_gates_json(&gates));
-    {
-        struct json_object *actions = NULL;
+    *files_out = files;
+    *count_out = count;
+    *deletions_out = deletions;
+    *deletion_count_out = deletion_count;
+    return 0;
+}
 
-        if (json_object_object_get_ex(info.manifest, "service_actions", &actions) && actions)
-            json_object_object_add(resp, "service_actions", json_object_get(actions));
+static struct json_object *hot_verify_internal(const struct otad_hot_source *src)
+{
+    struct otad_hot_info info;
+    struct otad_hot_file *files = NULL;
+    struct otad_hot_deletion *deletions = NULL;
+    struct json_object *resp = NULL;
+    struct json_object *evidence = NULL;
+    struct otad_hot_space_gates gates;
+    char trust_error[OTAD_MAX_TEXT] = "";
+    size_t count = 0;
+    size_t deletion_count = 0;
+    int trusted;
+
+    if (hot_preflight(src, &info, &files, &count, &deletions, &deletion_count,
+                      &gates, &resp) != 0)
+        return resp;
+    trusted = otad_hot_release_trust_verify(info.manifest, &evidence, trust_error,
+                                            sizeof(trust_error)) == 0;
+    if (!trusted) {
+        resp = hot_release_trust_error(
+            "hot-update payload integrity is valid but the release signature was not accepted",
+            1, trust_error);
+        otad_json_add_string(resp, "diagnostic_error", trust_error);
+    } else {
+        resp = json_object_new_object();
+        json_object_object_add(resp, "ok", json_object_new_boolean(1));
+        json_object_object_add(resp, "verified", json_object_new_boolean(1));
+        json_object_object_add(resp, "integrity_verified", json_object_new_boolean(1));
+        json_object_object_add(resp, "authenticity_verified", json_object_new_boolean(1));
+        json_object_object_add(resp, "signature_required", json_object_new_boolean(1));
+        json_object_object_add(resp, "signature_verified", json_object_new_boolean(1));
+        json_object_object_add(resp, "target_compatible", json_object_new_boolean(1));
+        json_object_object_add(resp, "policy_passed", json_object_new_boolean(1));
+        json_object_object_add(resp, "safe_to_apply_now", json_object_new_boolean(1));
+        otad_json_add_string(resp, "release_gate", "open");
+        otad_json_add_string(resp, "release_gate_reason", "");
     }
+    json_object_object_add(resp, "validated", json_object_new_boolean(1));
+    if (evidence)
+        json_object_object_add(resp, "release_trust", evidence);
+    hot_describe_package(resp, &info, count, deletion_count, &gates);
     free(files);
     free(deletions);
     hot_info_done(&info);
@@ -776,27 +952,11 @@ static int hot_stage_and_install(const struct otad_hot_info *info,
                                  struct otad_hot_deletion *deletions,
                                  size_t deletion_count,
                                  struct otad_space_gate *failed_gate,
-                                 char *error, size_t error_len) __attribute__((unused));
-
-static int hot_stage_and_install(const struct otad_hot_info *info,
-                                 struct otad_hot_file *files, size_t count,
-                                 struct otad_hot_deletion *deletions,
-                                 size_t deletion_count,
-                                 struct otad_space_gate *failed_gate,
                                  char *error, size_t error_len)
 {
-    (void)info;
-    (void)files;
-    (void)count;
-    (void)deletions;
-    (void)deletion_count;
-    (void)failed_gate;
-    snprintf(error, error_len, "hot_update_release_trust_gate_closed");
-    return -1;
-
-#if 0
     struct otad_hot_space_gates gates;
     int src = -1;
+    int src_owned = 0;
     size_t i;
 
     if (hot_space_gates_check(files, count, &gates, 1) != 0) {
@@ -808,7 +968,7 @@ static int hot_stage_and_install(const struct otad_hot_info *info,
                  failed && failed->error[0] ? failed->error : "space_gate_failed");
         return -1;
     }
-    src = open(info->path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    src = hot_info_fd(info, &src_owned);
     if (src < 0) {
         snprintf(error, error_len, "hot_update_open_failed");
         return -1;
@@ -834,7 +994,8 @@ static int hot_stage_and_install(const struct otad_hot_info *info,
             goto fail;
         }
     }
-    close(src);
+    if (src_owned)
+        close(src);
     src = -1;
     for (i = 0; i < count; i++) {
         struct stat st;
@@ -892,12 +1053,11 @@ static int hot_stage_and_install(const struct otad_hot_info *info,
     return 0;
 
 fail:
-    if (src >= 0)
+    if (src_owned && src >= 0)
         close(src);
     hot_deletions_rollback(deletions, deletion_count);
     hot_rollback(files, count);
     return -1;
-#endif
 }
 
 static int hot_run_restart(const char *service)
@@ -949,14 +1109,8 @@ static void hot_restart_timer_cb(struct uloop_timeout *timeout)
             ;
 }
 
-static int hot_schedule_restarts(struct json_object *manifest) __attribute__((unused));
-
 static int hot_schedule_restarts(struct json_object *manifest)
 {
-    (void)manifest;
-    return -1;
-
-#if 0
     struct json_object *arr = NULL;
     size_t i, count;
 
@@ -978,7 +1132,6 @@ static int hot_schedule_restarts(struct json_object *manifest)
     g_hot_restart_timer.cb = hot_restart_timer_cb;
     uloop_timeout_set(&g_hot_restart_timer, 500);
     return 0;
-#endif
 }
 
 static int update_magic_is_hot(const char *path)
@@ -998,21 +1151,326 @@ static int update_magic_is_hot(const char *path)
            !memcmp(magic, OTAD_HOT_MAGIC, strlen(OTAD_HOT_MAGIC));
 }
 
+/*
+ * Same question as update_magic_is_hot(), asked of an fd. A web upload has no
+ * path to hand over, so the package type has to be read out of the staged bytes
+ * themselves.
+ */
+static int update_magic_is_hot_fd(int fd)
+{
+    char magic[sizeof(OTAD_HOT_MAGIC)] = "";
+    ssize_t n;
+
+    if (fd < 0)
+        return 0;
+    n = pread(fd, magic, strlen(OTAD_HOT_MAGIC), 0);
+    return n == (ssize_t)strlen(OTAD_HOT_MAGIC) &&
+           !memcmp(magic, OTAD_HOT_MAGIC, strlen(OTAD_HOT_MAGIC));
+}
+
+/*
+ * Record a verified hot package in the operation ledger and hand back the
+ * operation status, so the web chain gets the same shape it gets for firmware:
+ * verify returns an operation_id, apply presents that id and nothing else. This
+ * is what makes a browser-uploaded hot package appliable without webd ever
+ * naming a device path.
+ */
+static struct json_object *hot_verify_upload(const char *upload_id,
+                                             struct otad_staged_upload *upload)
+{
+    struct otad_hot_source src = { NULL, upload->fd, upload->size };
+    struct otad_trust_binding binding;
+    struct json_object *resp;
+    char operation_id[OTAD_OPERATION_ID_LEN + 1] = "";
+    char error[160] = "";
+
+    resp = hot_verify_internal(&src);
+    if (!resp)
+        return NULL;
+    /*
+     * Only a package that actually passed both gates earns a ledger entry. A
+     * refusal is returned as-is: there is nothing to apply later, so creating an
+     * operation for it would only invite a pointless apply attempt.
+     */
+    if (!otad_json_bool(resp, "ok", 0) ||
+        !otad_json_bool(resp, "signature_verified", 0) ||
+        otad_release_trust_binding_get(resp, &binding, NULL, 0) != 0)
+        return resp;
+    if (otad_operation_create("hot_update", "preflight", upload_id, NULL,
+                              operation_id, error, sizeof(error)) != 0) {
+        otad_json_add_string(resp, "operation_error", error);
+        return resp;
+    }
+    if (otad_operation_set_source(operation_id, upload->size,
+                                  upload->sha256) != 0 ||
+        otad_operation_commit_hot_preflight(
+            operation_id, "", otad_json_str(resp, "to_version", ""),
+            otad_json_str(resp, "package_id", ""), &binding, resp) != 0) {
+        (void)otad_operation_update(operation_id, "failed", 100,
+                                    "hot_update_operation_persist_failed",
+                                    "the verified hot package could not be recorded",
+                                    NULL);
+        otad_json_add_string(resp, "operation_error",
+                             "hot_update_operation_persist_failed");
+        return resp;
+    }
+    otad_json_add_string(resp, "operation_id", operation_id);
+    return resp;
+}
+
 struct json_object *otad_update_verify(struct json_object *body)
 {
     const char *path = otad_json_str(body, "path", "");
+    const char *upload_id = otad_json_str(body, "upload_id", "");
 
-    if (update_magic_is_hot(path))
-        return hot_verify_internal(path);
+    if (update_magic_is_hot(path)) {
+        struct otad_hot_source src = { path, -1, 0 };
+
+        return hot_verify_internal(&src);
+    }
+    /*
+     * The web chain never sends a path - it cannot, webd refuses it - so a hot
+     * package uploaded through the browser is only recognisable from the staged
+     * bytes. Anything that is not a hot package falls through to the firmware
+     * verifier exactly as before.
+     */
+    if (!path[0] && upload_id[0]) {
+        struct otad_staged_upload upload;
+        char error[160] = "";
+
+        if (otad_staged_upload_open(upload_id, &upload, error,
+                                    sizeof(error)) == 0) {
+            if (update_magic_is_hot_fd(upload.fd)) {
+                struct json_object *resp = hot_verify_upload(upload_id, &upload);
+
+                otad_staged_upload_close(&upload);
+                return resp;
+            }
+            otad_staged_upload_close(&upload);
+        }
+    }
     return otad_firmware_verify(body);
+}
+
+static struct json_object *hot_apply_internal(const struct otad_hot_source *src)
+{
+    struct otad_hot_info info;
+    struct otad_hot_file *files = NULL;
+    struct otad_hot_deletion *deletions = NULL;
+    struct json_object *resp = NULL;
+    struct json_object *evidence = NULL;
+    struct otad_hot_space_gates gates;
+    struct otad_space_gate failed_gate;
+    char trust_error[OTAD_MAX_TEXT] = "";
+    char error[128] = "";
+    size_t count = 0;
+    size_t deletion_count = 0;
+    size_t i;
+    int restart_scheduled;
+
+    if (hot_preflight(src, &info, &files, &count, &deletions, &deletion_count,
+                      &gates, &resp) != 0) {
+        otad_state_set("state", "failed");
+        otad_state_set("last_error", otad_json_str(resp, "release_gate_reason",
+                                                  "hot_update_preflight_failed"));
+        return resp;
+    }
+    /*
+     * Authenticity before the writer, always. A package that only passes the
+     * integrity checks above is self-consistent, which says nothing about who
+     * built it.
+     */
+    if (otad_hot_release_trust_verify(info.manifest, &evidence, trust_error,
+                                      sizeof(trust_error)) != 0) {
+        resp = hot_release_trust_error(
+            "hot-update apply refused: the release signature was not accepted",
+            1, trust_error);
+        otad_json_add_string(resp, "diagnostic_error", trust_error);
+        if (evidence)
+            json_object_object_add(resp, "release_trust", evidence);
+        hot_describe_package(resp, &info, count, deletion_count, &gates);
+        free(files);
+        free(deletions);
+        hot_info_done(&info);
+        otad_state_set("state", "failed");
+        otad_state_set("last_error", trust_error);
+        return resp;
+    }
+    memset(&failed_gate, 0, sizeof(failed_gate));
+    otad_state_set("state", "applying_hot_update");
+    otad_state_set("last_error", "");
+    if (hot_stage_and_install(&info, files, count, deletions, deletion_count,
+                              &failed_gate, error, sizeof(error)) != 0) {
+        resp = otad_error(error[0] ? error : "hot_update_apply_failed",
+                          "hot-update apply failed and the previous files were restored");
+        json_object_object_add(resp, "rolled_back", json_object_new_boolean(1));
+        json_object_object_add(resp, "applied", json_object_new_boolean(0));
+        if (failed_gate.path[0])
+            otad_space_gate_add_json(resp, &failed_gate);
+        if (evidence)
+            json_object_object_add(resp, "release_trust", evidence);
+        hot_describe_package(resp, &info, count, deletion_count, &gates);
+        free(files);
+        free(deletions);
+        hot_info_done(&info);
+        otad_state_set("state", "failed");
+        otad_state_set("last_error", error[0] ? error : "hot_update_apply_failed");
+        return resp;
+    }
+    restart_scheduled = hot_schedule_restarts(info.manifest) == 0;
+    resp = json_object_new_object();
+    json_object_object_add(resp, "ok", json_object_new_boolean(1));
+    json_object_object_add(resp, "applied", json_object_new_boolean(1));
+    json_object_object_add(resp, "verified", json_object_new_boolean(1));
+    json_object_object_add(resp, "integrity_verified", json_object_new_boolean(1));
+    json_object_object_add(resp, "authenticity_verified", json_object_new_boolean(1));
+    json_object_object_add(resp, "signature_verified", json_object_new_boolean(1));
+    json_object_object_add(resp, "requires_reboot", json_object_new_boolean(0));
+    json_object_object_add(resp, "slot_required", json_object_new_boolean(0));
+    otad_json_add_string(resp, "release_gate", "open");
+    /*
+     * The restarts run from a timer 500ms after this reply, so replacing webd
+     * does not cut the connection carrying its own result. Say which files
+     * changed here: after the restart the caller may not get another chance to
+     * ask.
+     */
+    json_object_object_add(resp, "restart_scheduled",
+                           json_object_new_boolean(restart_scheduled));
+    {
+        struct json_object *installed = json_object_new_array();
+        struct json_object *removed = json_object_new_array();
+
+        for (i = 0; i < count; i++) {
+            struct json_object *item = json_object_new_object();
+
+            otad_json_add_string(item, "target_path", files[i].target);
+            otad_json_add_string(item, "sha256", files[i].sha256);
+            json_object_object_add(item, "size",
+                                   json_object_new_int64((int64_t)files[i].size));
+            json_object_array_add(installed, item);
+        }
+        for (i = 0; i < deletion_count; i++)
+            json_object_array_add(removed,
+                                  json_object_new_string(deletions[i].target));
+        json_object_object_add(resp, "installed", installed);
+        json_object_object_add(resp, "removed", removed);
+    }
+    if (evidence)
+        json_object_object_add(resp, "release_trust", evidence);
+    hot_describe_package(resp, &info, count, deletion_count, &gates);
+    otad_state_set("state", restart_scheduled ? "restarting_components" : "idle");
+    otad_state_set("last_error", "");
+    otad_state_set("last_hot_update_package",
+                   otad_json_str(info.manifest, "package_id", ""));
+    otad_state_set("last_hot_update_version",
+                   otad_json_str(info.manifest, "to_version", ""));
+    free(files);
+    free(deletions);
+    hot_info_done(&info);
+    return resp;
+}
+
+/*
+ * Apply a hot package that was verified through the web chain. The caller holds
+ * only an operation_id; the upload it was verified against comes back out of the
+ * ledger, and the trust binding recorded at verify time is re-checked against
+ * the staged bytes before the writer runs, so a package cannot be swapped
+ * between verify and apply.
+ */
+static struct json_object *hot_apply_operation(const char *operation_id,
+                                               const struct otad_operation_work *work)
+{
+    struct otad_staged_upload upload;
+    struct otad_hot_source src;
+    struct json_object *resp;
+    char error[160] = "";
+    int rc;
+
+    if (!work->authenticity_verified || !work->target_compatible ||
+        !work->signing_key_id[0] || work->trust_policy_version < 1) {
+        resp = hot_release_trust_error(
+            "hot-update apply requires a preflight that verified the release signature",
+            0, "hot_update_release_trust_gate_closed");
+        (void)otad_operation_update(operation_id, "failed", 100,
+                                    "hot_update_release_trust_gate_closed",
+                                    "hot apply requires a preflight that verified publisher authenticity",
+                                    NULL);
+        otad_json_add_string(resp, "operation_id", operation_id);
+        return resp;
+    }
+    rc = otad_operation_claim_hot_apply(operation_id);
+    if (rc == -2)
+        return otad_error("hot_update_operation_in_progress",
+                          "another hot-update apply is already writing");
+    if (rc != 0)
+        return otad_error("operation_claim_failed",
+                          "the hot-update preflight could not transition to writing");
+    if (otad_staged_upload_open(work->upload_id, &upload, error,
+                                sizeof(error)) != 0) {
+        (void)otad_operation_update(operation_id, "failed", 100,
+                                    error[0] ? error : "staging_upload_unavailable",
+                                    "the verified hot-update upload is no longer available",
+                                    NULL);
+        return otad_error(error[0] ? error : "staging_upload_unavailable",
+                          "the verified hot-update upload is no longer available");
+    }
+    /*
+     * The upload is re-hashed by otad_staged_upload_open() and the signature is
+     * re-verified inside hot_apply_internal(), so what gets written is checked
+     * again here rather than trusted from the preflight record.
+     */
+    if (upload.size != work->source_size ||
+        strcasecmp(upload.sha256, work->source_sha256)) {
+        otad_staged_upload_close(&upload);
+        (void)otad_operation_update(operation_id, "failed", 100,
+                                    "hot_update_source_binding_mismatch",
+                                    "the staged upload no longer matches the verified preflight",
+                                    NULL);
+        return otad_error("hot_update_source_binding_mismatch",
+                          "the staged upload no longer matches the verified preflight");
+    }
+    src.path = NULL;
+    src.fd = upload.fd;
+    src.size = upload.size;
+    resp = hot_apply_internal(&src);
+    otad_staged_upload_close(&upload);
+    if (resp && otad_json_bool(resp, "applied", 0))
+        (void)otad_operation_update(operation_id, "success", 100, "", "", resp);
+    else
+        (void)otad_operation_update(
+            operation_id, "failed", 100,
+            otad_json_str(resp, "error", "hot_update_apply_failed"),
+            "hot-update apply did not complete", resp);
+    if (resp)
+        otad_json_add_string(resp, "operation_id", operation_id);
+    return resp;
 }
 
 struct json_object *otad_update_apply(struct json_object *body)
 {
     const char *path = otad_json_str(body, "path", "");
+    const char *operation_id = otad_json_str(body, "operation_id", "");
 
-    if (!update_magic_is_hot(path))
-        return otad_firmware_apply(body);
-    return hot_release_trust_error(
-        "hot-update apply is disabled until release signatures can be verified", 0);
+    if (update_magic_is_hot(path)) {
+        struct otad_hot_source src = { path, -1, 0 };
+
+        return hot_apply_internal(&src);
+    }
+    /*
+     * A hot operation_id resolves to the upload its preflight verified. Anything
+     * else - including an unknown id - falls through to the firmware apply, which
+     * owns the error reporting for ids it does not recognise either.
+     */
+    if (!path[0] && operation_id[0]) {
+        struct otad_operation_work work;
+
+        if (otad_operation_get_work(operation_id, &work) == 0 &&
+            !strcmp(work.kind, "hot_update")) {
+            if (strcmp(work.action, "preflight") || strcmp(work.state, "pending"))
+                return otad_error("operation_not_pending_preflight",
+                                  "hot-update apply requires a successful pending preflight");
+            return hot_apply_operation(operation_id, &work);
+        }
+    }
+    return otad_firmware_apply(body);
 }

@@ -19442,6 +19442,23 @@ static struct json_object *dw_audit_api_flow_host_rollup(struct json_object *req
      * tiebreaker to make the ordering deterministic across pages.
      */
     int offset = dw_json_get_int(req, "offset", dw_json_get_int(req, "skip", 0));
+    /*
+     * Let a paging caller decline the window COUNT(*) it does not need.
+     *
+     * The exact count is the same number on every page - it measures the
+     * window, not the page - yet the offset>0 branch below recomputes it for
+     * each one. Measured on 30.1 over a 24h/284k-row window, that is 186-202ms
+     * per page against a 412-469ms group query, so a two-page walk spends
+     * ~390ms producing one figure twice and discarding the first copy: webd's
+     * pager keeps window_rows from the last page only.
+     *
+     * Default is 0, so every existing caller keeps the exact count and this
+     * cannot quietly change an unpaged reply. When set, window_rows is left at
+     * the page sum and window_rows_source says "skipped_by_request" instead of
+     * pretending to be authoritative - a caller must not read a page total as
+     * a window total without knowing that is what it got.
+     */
+    int skip_window_count = dw_json_get_int(req, "skip_window_count", 0);
     const char *external_pred_sql = dw_audit_flow_external_predicate_sql();
     const char *table = NULL;
     const char *ts_col = NULL;
@@ -19606,7 +19623,15 @@ static struct json_object *dw_audit_api_flow_host_rollup(struct json_object *req
      * coverage against it would see a plausible-looking ratio built from the
      * wrong denominator. Any paged request therefore pays for the exact count.
      */
-    if (rows_seen >= top || offset > 0) {
+    if (skip_window_count) {
+        /*
+         * Caller opted out. Report the page sum and label it honestly; the
+         * caller is responsible for taking window_rows from a page that did
+         * compute it (webd's pager asks page 1 for the exact count).
+         */
+        window_rows = counted_flows + excluded_empty_flows;
+        window_rows_exact_source = "skipped_by_request";
+    } else if (rows_seen >= top || offset > 0) {
         snprintf(sql, sizeof(sql),
             "SELECT COUNT(*) FROM %s WHERE %s BETWEEN ?1 AND ?2 AND %s",
             table, ts_col, external_pred_sql);
@@ -22832,6 +22857,27 @@ static int dw_handle_route_config_set(struct ubus_context *ctx, struct ubus_obje
     return 0;
 }
 
+static int dw_handle_route_policy_set(struct ubus_context *ctx, struct ubus_object *obj,
+                                      struct ubus_request_data *req, const char *method,
+                                      struct blob_attr *msg)
+{
+    struct json_object *in = NULL;
+    struct json_object *payload = NULL;
+    struct json_object *resp;
+    char *msg_json = NULL;
+
+    (void)obj;
+    (void)method;
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0)
+        return 0;
+    resp = jmx_api_route_policy_set(payload);
+    dw_send_json(ctx, req, resp);
+    json_object_put(resp);
+    json_object_put(in);
+    if (msg_json) free(msg_json);
+    return 0;
+}
+
 
 
 /* count total conntrack entries */
@@ -25108,6 +25154,108 @@ static int dw_handle_wan_config_save(struct ubus_context *ctx, struct ubus_objec
     return 0;
 }
 
+/* Read-only carrier vocabulary for WAN forms. No arguments, no writes. */
+static int dw_handle_network_carriers(struct ubus_context *ctx, struct ubus_object *obj,
+                                      struct ubus_request_data *req, const char *method,
+                                      struct blob_attr *msg)
+{
+    (void)obj; (void)method; (void)msg;
+    struct json_object *data = json_object_new_object();
+    struct json_object *resp;
+
+    json_object_object_add(data, "carriers", jmx_netconfig_carrier_values());
+    resp = jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+    dw_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return 0;
+}
+
+/* Redial one WAN. Runtime action only: no config is written, so a caller that
+ * just wants the line to come back does not have to re-save the whole WAN.
+ *
+ * wait_ms bounds how long we block waiting for the line to come up. The reply
+ * distinguishes three outcomes rather than collapsing them into ok/not-ok,
+ * because a pppoe redial commonly outlives any reasonable HTTP timeout and
+ * reporting "failed" for a dial that is still in progress is worse than saying
+ * so plainly:
+ *   ok=true,  applied=true,  state=up       came back up, l3_device names it
+ *   ok=true,  applied=false, state=pending  redial issued, not up yet -- poll
+ *   ok=false, applied=false, error=...      disabled line, bad id, no such WAN
+ *
+ * `applied` is the contract the web layer reads: it is true only when the line
+ * is verifiably back up, so a caller cannot render "issued" as "connected".
+ */
+static int dw_handle_wan_reconnect(struct ubus_context *ctx, struct ubus_object *obj,
+                                   struct ubus_request_data *req, const char *method,
+                                   struct blob_attr *msg)
+{
+    (void)obj; (void)method;
+    char *msg_json = NULL;
+    struct json_object *in = NULL, *payload = NULL;
+    struct json_object *data = json_object_new_object();
+    char l3_device[64] = "";
+    const char *id;
+    int wait_ms, rc;
+
+    if (dw_parse_write_payload(ctx, req, msg, &msg_json, &in, &payload) != 0) {
+        json_object_put(data);
+        return 0;
+    }
+    id = dw_json_get_string(payload, "id", "");
+    wait_ms = dw_json_get_int(payload, "wait_ms", 8000);
+    rc = jmx_netconfig_wan_reconnect(id, wait_ms, l3_device, sizeof(l3_device));
+
+    json_object_object_add(data, "id", json_object_new_string(id ? id : ""));
+    json_object_object_add(data, "rc", json_object_new_int(rc));
+    json_object_object_add(data, "waited_ms", json_object_new_int(wait_ms));
+    if (rc == 0) {
+        json_object_object_add(data, "ok", json_object_new_boolean(1));
+        json_object_object_add(data, "applied", json_object_new_boolean(1));
+        json_object_object_add(data, "state", json_object_new_string("up"));
+        json_object_object_add(data, "l3_device", json_object_new_string(l3_device));
+    } else if (rc == JMX_NETCONFIG_WAN_RECONNECT_TIMEOUT) {
+        json_object_object_add(data, "ok", json_object_new_boolean(1));
+        json_object_object_add(data, "applied", json_object_new_boolean(0));
+        json_object_object_add(data, "state", json_object_new_string("pending"));
+        json_object_object_add(data, "reason",
+            json_object_new_string("redial issued; line has not come up yet"));
+    } else if (rc == JMX_NETCONFIG_WAN_RECONNECT_DISABLED) {
+        /* Named reason, not a generic invalid_request: the caller has to be able
+         * to tell "this line is switched off" from "your request was wrong". */
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        json_object_object_add(data, "applied", json_object_new_boolean(0));
+        json_object_object_add(data, "state", json_object_new_string("error"));
+        json_object_object_add(data, "error", json_object_new_string("line_disabled"));
+        json_object_object_add(data, "message",
+            json_object_new_string("线路已停用，无法重连；请先启用该 WAN"));
+        json_object_object_add(data, "field", json_object_new_string("enabled"));
+    } else {
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        json_object_object_add(data, "applied", json_object_new_boolean(0));
+        json_object_object_add(data, "state", json_object_new_string("error"));
+        json_object_object_add(data, "error", json_object_new_string("wan_not_found"));
+        json_object_object_add(data, "message",
+            json_object_new_string("未找到该 WAN 线路"));
+        json_object_object_add(data, "field", json_object_new_string("id"));
+    }
+
+    struct json_object *resp = jmx_gen_api_response_data(
+        (rc == 0 || rc == JMX_NETCONFIG_WAN_RECONNECT_TIMEOUT) ?
+            API_CODE_SUCCESS : API_CODE_ERROR, data);
+    dw_send_json(ctx, req, resp);
+    if (rc == 0 || rc == JMX_NETCONFIG_WAN_RECONNECT_TIMEOUT) {
+        struct json_object *evt = json_object_new_object();
+        json_object_object_add(evt, "id", json_object_new_string(id ? id : ""));
+        json_object_object_add(evt, "action", json_object_new_string("reconnect"));
+        jmx_events_emit("wan.status", "updated", evt);
+        json_object_put(evt);
+    }
+    json_object_put(resp);
+    json_object_put(in);
+    free(msg_json);
+    return 0;
+}
+
 static int dw_handle_wan_config_delete(struct ubus_context *ctx, struct ubus_object *obj,
                                        struct ubus_request_data *req, const char *method,
                                        struct blob_attr *msg)
@@ -25920,10 +26068,18 @@ static int dw_json_budget_walk(struct json_object *value, unsigned int depth,
 {
     enum json_type type;
 
-    if (!value) {
-        *reason = "invalid_json_value";
-        return -1;
-    }
+    /* json-c represents a JSON null as a NULL pointer, so an object member or
+     * array element that is null arrives here as NULL. That is a legal value,
+     * not a malformed document: this walker only enforces size and depth
+     * budgets, and per-field validators decide what a null means for their
+     * own key. Rejecting it whole-document made round-tripping impossible --
+     * dreamingwrt_system_settings_get returns version_error/backup_size/
+     * last_backup_at/auto_backup as null, so simply reading the settings and
+     * writing them back (which is what saving a hostname does) failed with
+     * invalid_json_value. The root object is type-checked by the caller
+     * before this walk starts, so a NULL here is always a nested null. */
+    if (!value)
+        return 0;
     if (depth > DW_JSON_MAX_DEPTH) {
         *reason = "json_depth_exceeded";
         return -1;
@@ -31214,6 +31370,7 @@ static struct ubus_method dw_methods[] = {
     UBUS_METHOD("route_reload", dw_handle_route_reload, dw_empty_policy),
     UBUS_METHOD("route_config_get", dw_handle_route_config_get, dw_empty_policy),
     UBUS_METHOD("route_config_set", dw_handle_route_config_set, dw_empty_policy),
+    UBUS_METHOD("route_policy_set", dw_handle_route_policy_set, dw_empty_policy),
     UBUS_METHOD("line_load", dw_handle_line_load, dw_empty_policy),
     UBUS_METHOD("line_health", dw_handle_line_health, dw_empty_policy),
     UBUS_METHOD("ipv6_load", dw_handle_ipv6_load, dw_empty_policy),
@@ -31261,6 +31418,8 @@ static struct ubus_method dw_methods[] = {
     UBUS_METHOD("wan_config_validate", dw_handle_wan_config_validate, dw_empty_policy),
     UBUS_METHOD("wan_config_save", dw_handle_wan_config_save, dw_empty_policy),
     UBUS_METHOD("wan_config_delete", dw_handle_wan_config_delete, dw_empty_policy),
+    UBUS_METHOD("wan_reconnect", dw_handle_wan_reconnect, dw_empty_policy),
+    UBUS_METHOD("network_carriers", dw_handle_network_carriers, dw_empty_policy),
     UBUS_METHOD("wan_delete", dw_handle_wan_delete, dw_empty_policy),
     UBUS_METHOD("lan_set", dw_handle_lan_set, dw_empty_policy),
     UBUS_METHOD("lan_enable", dw_handle_lan_enable, dw_empty_policy),

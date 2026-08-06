@@ -139,6 +139,7 @@ int jmx_db_prune_audit(int64_t now_ts, int64_t max_age_sec);
 int jmx_db_prune_traffic_buckets(int64_t now_ts, int64_t max_age_sec);
 int jmx_db_prune_interface_state(int64_t now_ts, int64_t max_age_sec);
 int jmx_db_prune_wan_health(int64_t now_ts, int64_t max_age_sec);
+int jmx_db_prune_wan_sessions(int64_t now_ts, int64_t max_age_sec);
 int jmx_db_prune_and_vacuum(void);
 
 struct json_object *jmx_db_api_audit_urls(struct json_object *req);
@@ -157,6 +158,9 @@ int  jmx_db_upsert_wan_profile(const char *ifname, const char *display_name,
 void jmx_db_update_wan_session(const char *wan_id, const char *ifname,
                                 const char *ip, const char *gateway,
                                 const char *access_mode, int online);
+/* End every open session row for wan_id (WAN deleted / disabled), so a
+ * same-named WAN created later starts its connection timer from zero. */
+void jmx_db_close_wan_session(const char *wan_id, const char *reason);
 int64_t jmx_db_wan_session_uptime(const char *wan_id, int64_t now_ts);
 int64_t jmx_db_wan_session_started_at(const char *wan_id);
 void jmx_db_add_wan_session_contract(struct json_object *obj,

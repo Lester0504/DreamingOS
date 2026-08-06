@@ -1,7 +1,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '20260804-speed-limit-two-tabs-02';
+  const VERSION = '20260806-lan-delete-gate-01';
   const STORAGE = Object.freeze({
     menu: 'dreamingwrt.shellWarm.menu.v4',
     theme: 'dreamingwrt.shellWarm.theme.v2'
@@ -9,19 +9,19 @@
   const MAX_AGE_MS = 10 * 60 * 1000;
   const STATIC_RESOURCES = Object.freeze([
     '/app/index.html',
-    '/static/ui-kit/dwrt-ui-kit.css?v=20260804-speed-limit-two-tabs-02',
+    '/static/ui-kit/dwrt-ui-kit.css?v=20260806-lan-delete-gate-01',
     '/static/ui-kit/dwrt-sampled-liquid-glass.css?v=20260730-safari-glass-lite-06',
-    '/static/css/menu-shell.css?v=20260804-speed-limit-two-tabs-02',
+    '/static/css/menu-shell.css?v=20260806-lan-delete-gate-01',
     '/static/css/dwrt-theme.css?v=20260722-03',
     '/static/ui-kit/dwrt-control-material.css?v=20260719-16',
     '/static/js/menu-icons.js?v=20260722-auth-control-01',
     '/static/js/device-images.js?v=20260723-airview-radio-sheet-01',
     '/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260730-safari-glass-lite-06',
     '/static/ui-kit/lucide.min.js?v=1.25.0',
-    '/static/ui-kit/dwrt-ui-kit.js?v=20260804-speed-limit-two-tabs-02',
-    '/static/js/dwrt-session-gate.js?v=20260804-speed-limit-two-tabs-02',
+    '/static/ui-kit/dwrt-ui-kit.js?v=20260806-lan-delete-gate-01',
+    '/static/js/dwrt-session-gate.js?v=20260806-lan-delete-gate-01',
     '/static/js/dwrt-data-registry.js?v=20260721-02',
-    '/static/js/menu-shell.js?v=20260804-speed-limit-two-tabs-02'
+    '/static/js/menu-shell.js?v=20260806-lan-delete-gate-01'
   ]);
 
   function write(key, value) {

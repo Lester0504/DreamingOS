@@ -1,8 +1,35 @@
 const FLOW_ENGINE_TABS = [
   { id: 'engine', label: '引擎状态' },
   { id: 'qos', label: 'QoS 引擎' },
-  { id: 'capacity', label: '容量与健康' }
+  { id: 'capacity', label: '容量与健康' },
+  { id: 'balance', label: '多线负载' }
 ];
+
+/*
+ * 多线负载算法。取值不是设计稿上编的，是 dreamingwrt-core 里 route_rule.sticky_mode
+ * 实际接受的七个字面量（默认值 'hash_src_dst'）：
+ *   hash_src / hash_src_dst / hash_src_sport / hash_src_dst_dport
+ *   weighted_new_flow_rr / rx_rate / conn_count
+ * 前四个是按连接特征做哈希，同一特征固定走同一条线；后三个按运行态选线，
+ * 会随流量波动切换。这个区别对用户是实质性的，所以分组展示而不是排成一片。
+ */
+const FLOW_BALANCE_ALGORITHMS = [
+  { id: 'hash_src_dst', label: '源 IP + 目的 IP', group: 'hash', recommended: true,
+    desc: '同一源与目标之间保持同一线路，减少访问同一站点时出口 IP 变化。' },
+  { id: 'hash_src_dst_dport', label: '源 IP + 目的 IP + 目的端口', group: 'hash',
+    desc: '连同目的端口一起固定，适合对会话稳定性敏感的应用。' },
+  { id: 'hash_src', label: '纯源 IP 固定', group: 'hash',
+    desc: '同一源 IP 完全固定到同一线路，适合需要出口绝对稳定的终端。' },
+  { id: 'hash_src_sport', label: '源 IP + 源端口', group: 'hash',
+    desc: '同一源 IP 与源端口固定到同一线路。' },
+  { id: 'weighted_new_flow_rr', label: '加权轮询新建连接', group: 'runtime',
+    desc: '每个新连接按权重轮转分发，已建立的连接不迁移。' },
+  { id: 'rx_rate', label: '实时接收速率', group: 'runtime',
+    desc: '按线路瞬时接收速率选择新连接，可能随流量波动发生切换。' },
+  { id: 'conn_count', label: '实时连接数', group: 'runtime',
+    desc: '按线路当前连接总数选择新连接，不等同于按字节流量均衡。' }
+];
+const FLOW_BALANCE_DEFAULT_ALGORITHM = 'hash_src_dst';
 
 export function normalizeFlowEngineStatus(payload = {}) {
   const data = payload && typeof payload.data === 'object' && payload.data !== null ? payload.data : payload;
@@ -187,6 +214,27 @@ export function normalizeFlowWanHealth(payload = {}) {
   };
 }
 
+/*
+ * 多线负载的参与成员。取 /api/v1/network/wans —— 这是唯一能拿到真实线路与运营商的通端点。
+ * carrier 只做展示与「建议分组」用，不参与判定：拿不到就显示未知，不猜、不按线路名推断。
+ */
+export function normalizeFlowBalanceWans(payload = {}) {
+  const data = payload && typeof payload.data === 'object' && payload.data !== null ? payload.data : payload;
+  const list = Array.isArray(data.wans) ? data.wans : Array.isArray(data.items) ? data.items : [];
+  const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+  const text = (...values) => values.map((value) => String(value ?? '').trim()).find(Boolean) || '';
+  return list.map((item = {}, index) => ({
+    id: text(item.id, item.wan_id, item.ifname, `wan-${index + 1}`),
+    name: text(item.name, item.id, item.ifname),
+    carrier: text(item.carrier),
+    ifname: text(item.ifname, item.device),
+    enabled: item.enabled !== false,
+    weight: number(item.weight),
+    priority: number(item.priority),
+    role: text(item.role)
+  }));
+}
+
 export function normalizeFlowWanCapacity(payload = {}) {
   const data = payload && typeof payload.data === 'object' && payload.data !== null ? payload.data : payload;
   const list = Array.isArray(data.entries) ? data.entries : [];
@@ -274,7 +322,7 @@ export function mount(context = {}) {
     snapshots: {
       status: null, runtime: null, settings: null, qosSettings: null,
       qosClasses: null, applyJobs: null, wanCapacity: null, wanHealth: null, smart: null,
-      nftRevision: null
+      nftRevision: null, wans: null
     },
     status: null,
     runtime: null,
@@ -283,6 +331,11 @@ export function mount(context = {}) {
     applyJobs: [],
     wanCapacity: [],
     wanHealth: null,
+    wans: [],
+    /* 多线负载：当前算法与参与成员。后端没有写入端点，这里只承载「读回来的现状」，
+       用户的改动记在 balanceDraft 里，与 balance 分开，便于显示「已改动未保存」。 */
+    balance: null,
+    balanceDraft: null,
     smart: null,
     nftRevision: null,
     refreshing: false,
@@ -312,7 +365,9 @@ export function mount(context = {}) {
     ['flow.applyJobs', 'applyJobs'],
     ['flow.wanCapacity', 'wanCapacity'],
     ['flow.wanHealth', 'wanHealth'],
-    ['flow.smartControl', 'smart']
+    ['flow.smartControl', 'smart'],
+    /* 多线成员来自 network/wans —— 这是唯一能拿到真实线路与运营商的通端点。 */
+    ['network.wans', 'wans']
   ];
   const NFT_REGISTRY_SLOT = ['flow.nftRevision', 'nftRevision'];
   const REGISTRY_SLOTS = [...BASE_REGISTRY_SLOTS, NFT_REGISTRY_SLOT];
@@ -324,6 +379,7 @@ export function mount(context = {}) {
     if (value('qosSettings') !== undefined) state.qosSettings = normalizeFlowQosSettings(value('qosSettings'));
     if (value('qosClasses') !== undefined) state.qosClasses = normalizeFlowQosClasses(value('qosClasses'));
     if (value('applyJobs') !== undefined) state.applyJobs = normalizeFlowApplyJobs(value('applyJobs'));
+    if (value('wans') !== undefined) state.wans = normalizeFlowBalanceWans(value('wans'));
     if (value('wanCapacity') !== undefined) state.wanCapacity = normalizeFlowWanCapacity(value('wanCapacity'));
     if (value('wanHealth') !== undefined) state.wanHealth = normalizeFlowWanHealth(value('wanHealth'));
     if (value('smart') !== undefined) state.smart = normalizeFlowSmartControl(value('smart'));
@@ -581,9 +637,145 @@ export function mount(context = {}) {
     return `<section class="policy-entity-section"><header><div><h2>线路容量</h2><p>来自 <code>flowd/wan-capacity</code> 与 <code>flow-control</code>。</p></div></header>${content}${declared}</section>`;
   }
 
+  /* 草稿：首次进入以「读回来的现状」为准；后端没有读端点时退回默认算法与已启用线路。 */
+  function balanceDraft() {
+    if (state.balanceDraft) return state.balanceDraft;
+    const current = state.balance;
+    state.balanceDraft = {
+      algorithm: current?.algorithm || FLOW_BALANCE_DEFAULT_ALGORITHM,
+      members: Array.isArray(current?.members)
+        ? [...current.members]
+        : state.wans.filter((wan) => wan.enabled).map((wan) => wan.id)
+    };
+    return state.balanceDraft;
+  }
+
+  function balanceDirty() {
+    const draft = balanceDraft();
+    const base = state.balance;
+    if (!base) return false;
+    const same = draft.members.length === (base.members?.length || 0)
+      && draft.members.every((id) => base.members.includes(id));
+    return draft.algorithm !== base.algorithm || !same;
+  }
+
+  /*
+   * 多线负载写入能力。后端 route_rule.sticky_mode 与 route_rule_wan 都在 config.db 里，
+   * 但 webd 没有注册任何对应路由（实测 flowd/multi-wan、routing/multi-wan 等均 404，
+   * 且 dreamingwrt.routed 的方法表里没有相关项）。所以这里恒为不可写，
+   * 直到 capabilities 出现 flow_balance_write —— 放一个点了没反应或假装成功的保存按钮，
+   * 比一个明确禁用并说明原因的按钮更糟。
+   */
+  function balanceWritable() {
+    return capabilities.flow_balance_write === true;
+  }
+
+  function balanceAlgorithmCardsMarkup() {
+    const draft = balanceDraft();
+    const card = (algorithm) => {
+      const active = draft.algorithm === algorithm.id;
+      return `<button type="button" class="flow-balance-algorithm dwrt-kit-glass-surface ${active ? 'is-active' : ''}" role="radio" aria-checked="${active ? 'true' : 'false'}" data-flow-balance-algorithm="${escapeHtml(algorithm.id)}">
+        <span class="flow-balance-algorithm-head">
+          <strong>${escapeHtml(algorithm.label)}</strong>
+          ${algorithm.recommended ? '<span class="flow-balance-tag">推荐</span>' : ''}
+          ${active ? statusBadge('当前选择', 'success') : ''}
+        </span>
+        <span class="flow-balance-algorithm-desc">${escapeHtml(algorithm.desc)}</span>
+        <code class="flow-balance-algorithm-value">${escapeHtml(algorithm.id)}</code>
+      </button>`;
+    };
+    const group = (id, title, hint) => {
+      const items = FLOW_BALANCE_ALGORITHMS.filter((algorithm) => algorithm.group === id);
+      return `<div class="flow-balance-algorithm-group">
+        <div class="flow-balance-group-head"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(hint)}</span></div>
+        <div class="flow-balance-algorithm-grid" role="radiogroup" aria-label="${escapeHtml(title)}">${items.map(card).join('')}</div>
+      </div>`;
+    };
+    return `<section class="policy-entity-section">
+      <header><div><h2>分流算法</h2><p>写入 <code>route_rule.sticky_mode</code>，同一时间只生效一种。</p></div></header>
+      ${group('hash', '按连接特征固定', '同一特征始终走同一条线路，连接不会中途迁移。')}
+      ${group('runtime', '按运行态选线', '按线路当前负载挑选新连接，可能随流量波动切换。')}
+    </section>`;
+  }
+
+  function balanceMembersMarkup() {
+    if (!state.wans.length) {
+      return `<section class="policy-entity-section"><header><div><h2>参与成员</h2></div></header>${statePanel('empty', '没有可用线路', '未从 network/wans 读到任何 WAN，先在网络配置里添加线路。')}</section>`;
+    }
+    const draft = balanceDraft();
+    const carrierLabel = (carrier) => ({ unicom: '联通', mobile: '移动', telecom: '电信', edu: '教育网' })[carrier] || (carrier ? carrier : '运营商未标注');
+    const tiles = state.wans.map((wan) => {
+      const on = draft.members.includes(wan.id);
+      return `<label class="flow-balance-member dwrt-kit-glass-surface ${on ? 'is-active' : ''}">
+        <input type="checkbox" data-flow-balance-member="${escapeHtml(wan.id)}" ${on ? 'checked' : ''}>
+        <span class="flow-balance-member-body">
+          <span class="flow-balance-member-name">${escapeHtml(wan.name)}</span>
+          <span class="flow-balance-member-meta">${escapeHtml(carrierLabel(wan.carrier))}${wan.ifname ? ` · ${escapeHtml(wan.ifname)}` : ''}</span>
+        </span>
+        <span class="flow-balance-member-side">${wan.enabled ? '' : statusBadge('线路已停用', 'warning')}${statusBadge(`权重 ${formatInteger(wan.weight || 0)}`, 'muted')}</span>
+      </label>`;
+    }).join('');
+
+    /* 建议分组：只在真的存在同运营商多线时才给，不凭线路名编。 */
+    const byCarrier = new Map();
+    state.wans.forEach((wan) => {
+      if (!wan.carrier) return;
+      byCarrier.set(wan.carrier, [...(byCarrier.get(wan.carrier) || []), wan.id]);
+    });
+    const presets = [...byCarrier.entries()]
+      .filter(([, ids]) => ids.length > 1)
+      .map(([carrier, ids]) => `<button type="button" class="flow-balance-preset" data-flow-balance-preset="${escapeHtml(ids.join(','))}">${escapeHtml(carrierLabel(carrier))} ${ids.length} 条</button>`);
+    presets.push(`<button type="button" class="flow-balance-preset" data-flow-balance-preset="${escapeHtml(state.wans.map((wan) => wan.id).join(','))}">全部 ${state.wans.length} 条线路</button>`);
+
+    const none = draft.members.length === 0
+      ? `<div class="policy-entity-alert is-warning" role="status"><strong>没有选中任何线路</strong><span>至少保留一条，否则多线负载没有可用出口。</span></div>`
+      : '';
+    return `<section class="policy-entity-section">
+      <header><div><h2>参与成员</h2><p>勾选的线路接收新连接；运营商自动规则仍优先匹配。</p></div></header>
+      ${none}
+      <div class="flow-balance-member-grid">${tiles}</div>
+      <div class="flow-balance-presets"><span>建议分组</span>${presets.join('')}</div>
+    </section>`;
+  }
+
+  function balanceActionBarMarkup() {
+    const draft = balanceDraft();
+    const selected = FLOW_BALANCE_ALGORITHMS.find((algorithm) => algorithm.id === draft.algorithm);
+    const writable = balanceWritable();
+    const blocked = !writable || draft.members.length === 0;
+    const hint = !writable
+      ? '后端尚未提供多线负载的写入接口，当前仅供查看'
+      : draft.members.length === 0
+        ? '至少选择一条线路'
+        : balanceDirty() ? '有未保存的改动' : '与当前配置一致';
+    return `<div class="flow-balance-actionbar dwrt-kit-glass-surface">
+      <div class="flow-balance-actionbar-text">
+        <strong>${escapeHtml(selected?.label || draft.algorithm)}</strong>
+        <span>已选 ${formatInteger(draft.members.length)} / ${formatInteger(state.wans.length)} 条线路 · ${escapeHtml(hint)}</span>
+      </div>
+      <button type="button" class="policy-primary" data-flow-balance-save ${blocked ? 'disabled' : ''}>保存并应用</button>
+    </div>`;
+  }
+
+  function balanceMarkup() {
+    if (!state.wans.length && !state.snapshots.wans) {
+      return statePanel('loading', '正在读取线路', '等待 network/wans 快照。');
+    }
+    /*
+     * 这一条如实说明现状，不含糊：数据在 config.db 的 route_rule / route_rule_wan 里，
+     * 缺的是 Web API。写清楚缺什么，用户才知道这不是他操作错了。
+     */
+    const readonly = balanceWritable() ? '' : `<div class="policy-entity-alert is-warning" role="status">
+      <strong>当前只能查看，无法保存</strong>
+      <span>分流算法与参与成员存放在 <code>route_rule.sticky_mode</code> 与 <code>route_rule_wan</code>，但 Web API 尚未提供读写路由，能力位 <code>flow_balance_write</code> 未开启。已提交后端补齐；在那之前下面的选择不会下发。</span>
+    </div>`;
+    return `${readonly}${balanceAlgorithmCardsMarkup()}${balanceMembersMarkup()}${balanceActionBarMarkup()}`;
+  }
+
   function tabContentMarkup() {
     if (state.tab === 'qos') return `${qosConflictMarkup()}${qosSettingsMarkup()}${qosClassesMarkup()}${smartPrioritiesMarkup()}`;
     if (state.tab === 'capacity') return `${wanHealthMarkup()}${wanCapacityMarkup()}`;
+    if (state.tab === 'balance') return balanceMarkup();
     return `${summaryMarkup()}${engineDetailMarkup()}${nftRevisionMarkup()}${countersMarkup()}${applyJobsMarkup()}`;
   }
 
@@ -673,6 +865,38 @@ export function mount(context = {}) {
       }
       return;
     }
+
+    const algorithm = event.target.closest?.('[data-flow-balance-algorithm]');
+    if (algorithm) {
+      const next = algorithm.getAttribute('data-flow-balance-algorithm');
+      if (next && FLOW_BALANCE_ALGORITHMS.some((item) => item.id === next)) {
+        balanceDraft().algorithm = next;
+        renderPage();
+      }
+      return;
+    }
+
+    const preset = event.target.closest?.('[data-flow-balance-preset]');
+    if (preset) {
+      const ids = String(preset.getAttribute('data-flow-balance-preset') || '').split(',').filter(Boolean);
+      /* 快选只认真实存在的线路 id，避免 preset 与线路变更之间产生幽灵成员。 */
+      balanceDraft().members = ids.filter((id) => state.wans.some((wan) => wan.id === id));
+      renderPage();
+      return;
+    }
+  }
+
+  function onChange(event) {
+    const member = event.target.closest?.('[data-flow-balance-member]');
+    if (!member) return;
+    const id = member.getAttribute('data-flow-balance-member');
+    if (!id) return;
+    const draft = balanceDraft();
+    const chosen = new Set(draft.members);
+    if (member.checked) chosen.add(id); else chosen.delete(id);
+    /* 顺序跟随线路列表，避免提交顺序随点击顺序漂移。 */
+    draft.members = state.wans.map((wan) => wan.id).filter((wanId) => chosen.has(wanId));
+    renderPage();
   }
 
   function subscribe(key, slot) {
@@ -688,6 +912,7 @@ export function mount(context = {}) {
   stage?.classList.add('is-flow-engine');
   root.replaceChildren(pageHost, overlayHost);
   root.addEventListener('click', onClick);
+  root.addEventListener('change', onChange);
   const unsubscribers = REGISTRY_SLOTS.map(([key, slot]) => subscribe(key, slot)).filter(Boolean);
   render();
   if (registry) Promise.allSettled(BASE_REGISTRY_SLOTS.map(([key]) => registry.request(key, { signal })))
@@ -722,6 +947,7 @@ export function mount(context = {}) {
       if (state.renderFrame) window.cancelAnimationFrame(state.renderFrame);
       unsubscribers.forEach((unsubscribe) => unsubscribe());
       root.removeEventListener('click', onClick);
+      root.removeEventListener('change', onChange);
       window.DWRT_UI_KIT?.unmount?.(root);
       root.replaceChildren();
       root.classList.remove('route-workspace', 'flow-engine-route-host');

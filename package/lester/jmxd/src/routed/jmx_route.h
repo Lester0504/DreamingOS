@@ -103,6 +103,7 @@ struct json_object *jmx_api_route_status(struct json_object *req_obj);
 struct json_object *jmx_api_route_reload(struct json_object *req_obj);
 struct json_object *jmx_api_route_config_get(struct json_object *req_obj);
 struct json_object *jmx_api_route_config_set(struct json_object *req_obj);
+struct json_object *jmx_api_route_policy_set(struct json_object *req_obj);
 int jmx_route_sync_config(void);
 void jmx_route_health_tick(void);
 int jmx_route_counter_tick(void);

@@ -977,6 +977,22 @@ static void routed_sync_wan_tables(sqlite3 *db)
 
     if (!db || !routed_table_present(db, "route_wan"))
         return;
+    /*
+     * routed_db_open() runs on every ubus call, so the steady state has to be
+     * cheap: one query that asks whether any WAN lacks a matching row, and an
+     * early return when none does.
+     */
+    if (sqlite3_prepare_v2(db,
+            "SELECT 1 FROM route_wan w WHERE NOT EXISTS("
+            "SELECT 1 FROM route_table t WHERE t.id=w.name AND t.table_id=w.table_id"
+            ") LIMIT 1", -1, &st, NULL) != SQLITE_OK)
+        return;
+    changed = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    st = NULL;
+    if (!changed)
+        return;
+    changed = 0;
     if (sqlite3_prepare_v2(db,
             "SELECT name,table_id FROM route_wan ORDER BY position",
             -1, &st, NULL) != SQLITE_OK)

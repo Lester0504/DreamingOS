@@ -28,6 +28,13 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+/*
+ * Parser for the QCA vendor channel listing. Header-only dependency: the
+ * implementation lives in its own translation unit so the catalogue fallback
+ * stays testable apart from the collectors in this file.
+ */
+#include "apd_vendor_chanlist.h"
+
 #ifndef IFNAMSIZ
 #define IFNAMSIZ 16
 #endif
@@ -4568,13 +4575,22 @@ static char *apd_channel_line_trim(char *line)
     return line;
 }
 
-static struct json_object *apd_channel_catalog_new(const char *reason,
-                                                   int64_t observed_at)
+/*
+ * `source` is a parameter rather than the literal "iw_phy" it used to be,
+ * because the vendor fallback below fills the same object from
+ * `wlanconfig <if> list chan`. Leaving it hardcoded would have made a catalogue
+ * built from vendor output report itself as iw_phy, which is the "data source
+ * lies about itself" failure the handoff for this fallback called out
+ * explicitly.
+ */
+static struct json_object *apd_channel_catalog_new_source(const char *source,
+                                                          const char *reason,
+                                                          int64_t observed_at)
 {
     struct json_object *catalog = json_object_new_object();
 
     json_object_object_add(catalog, "source",
-                           json_object_new_string("iw_phy"));
+                           json_object_new_string(source ? source : "iw_phy"));
     json_object_object_add(catalog, "scope",
                            json_object_new_string("runtime"));
     json_object_object_add(catalog, "observed_at",
@@ -4586,6 +4602,12 @@ static struct json_object *apd_channel_catalog_new(const char *reason,
                                json_object_new_string(reason));
     json_object_object_add(catalog, "channels", json_object_new_array());
     return catalog;
+}
+
+static struct json_object *apd_channel_catalog_new(const char *reason,
+                                                   int64_t observed_at)
+{
+    return apd_channel_catalog_new_source("iw_phy", reason, observed_at);
 }
 
 /* Channel width support is taken only from explicit iw phy capability
@@ -4804,6 +4826,144 @@ static void apd_channel_catalog_parse(const char *text,
     free(copy);
 }
 
+/*
+ * Builds a channel catalogue from `wlanconfig <if> list chan` for a radio that
+ * `iw phy` did not describe.
+ *
+ * Returns 0 when a catalogue was attached to the radio, -1 when the caller
+ * should fall back to recording the original iw-phy reason. A failure here is
+ * deliberately quiet: the vendor tool is absent on mac80211-only builds, and
+ * that is not an error worth overwriting the real reason with.
+ *
+ * Width handling follows the parser's conservative rule: a channel is claimed
+ * at a width only when the tool printed the matching capability token, so a
+ * 2.4 GHz channel that reports vendor VHT is not promoted to 80 MHz.
+ */
+static int apd_channel_catalog_vendor_fallback(struct json_object *radio,
+                                               const char *regdomain,
+                                               int64_t observed_at,
+                                               const char *iw_reason)
+{
+    const char *wlanconfig = apd_find_wlanconfig();
+    const char *iw = apd_find_iw();
+    struct apd_command_result inventory = { 0 };
+    struct apd_command_result listing = { 0 };
+    struct apd_neighbor_target target;
+    char reason[APD_NEIGHBOR_REASON_LEN + 1] = { 0 };
+    struct apd_vendor_chan_set set;
+    struct json_object *catalog = NULL;
+    struct json_object *channels = NULL;
+    struct json_object *id = NULL;
+    const char *radio_id;
+    size_t i;
+    int rc = -1;
+
+    (void)iw_reason;
+    if (!radio || !wlanconfig || !wlanconfig[0] || !iw || !iw[0])
+        return -1;
+    if (!json_object_object_get_ex(radio, "id", &id) || !id)
+        return -1;
+    radio_id = json_object_get_string(id);
+    if (!radio_id || !radio_id[0])
+        return -1;
+
+    {
+        char *const argv[] = { (char *)iw, "dev", NULL };
+
+        if (apd_readonly_command(iw, argv, &inventory) != 0)
+            goto done;
+    }
+    if (apd_neighbor_target_from_iw(inventory.text, radio_id, &target,
+                                    reason) != 0)
+        goto done;
+    {
+        char *const argv[] = {
+            (char *)wlanconfig, target.interface, "list", "chan", NULL
+        };
+
+        if (apd_readonly_command(wlanconfig, argv, &listing) != 0)
+            goto done;
+    }
+
+    memset(&set, 0, sizeof(set));
+    if (apd_vendor_chanlist_parse(listing.text, &set) != 0)
+        goto done;
+
+    catalog = apd_channel_catalog_new_source("wlanconfig_list_chan", NULL,
+                                             observed_at);
+    if (!catalog)
+        goto done;
+    if (regdomain && regdomain[0])
+        json_object_object_add(catalog, "regdomain",
+                               json_object_new_string(regdomain));
+    /*
+     * The interface the catalogue was read from is recorded because, unlike the
+     * iw-phy path, this data is per-VAP rather than per-wiphy. Without it a
+     * reader cannot tell which of a radio's interfaces answered.
+     */
+    json_object_object_add(catalog, "interface",
+                           json_object_new_string(target.interface));
+    if (set.truncated)
+        json_object_object_add(catalog, "truncated",
+                               json_object_new_boolean(1));
+    json_object_object_get_ex(catalog, "channels", &channels);
+    if (!channels) {
+        json_object_put(catalog);
+        goto done;
+    }
+    for (i = 0; i < set.count; i++) {
+        const struct apd_vendor_channel *src = &set.items[i];
+        struct json_object *channel = json_object_new_object();
+        struct json_object *widths;
+
+        json_object_object_add(channel, "channel",
+                               json_object_new_int(src->channel));
+        json_object_object_add(channel, "frequency_mhz",
+                               json_object_new_int(src->freq_mhz));
+        /*
+         * The vendor listing has no disabled/no-IR notion, so those flags are
+         * reported false rather than omitted: the iw-phy path always emits
+         * them, and a reader that treats "absent" as "unknown" would otherwise
+         * see two different shapes for the same field depending on source.
+         */
+        json_object_object_add(channel, "disabled",
+                               json_object_new_boolean(0));
+        json_object_object_add(channel, "no_ir", json_object_new_boolean(0));
+        json_object_object_add(channel, "radar_detection",
+                               json_object_new_boolean(src->dfs ? 1 : 0));
+        if (src->mode[0])
+            json_object_object_add(channel, "mode",
+                                   json_object_new_string(src->mode));
+        widths = json_object_new_array();
+        if (src->width_20)
+            json_object_array_add(widths, json_object_new_int(20));
+        if (src->width_40)
+            json_object_array_add(widths, json_object_new_int(40));
+        if (src->width_80)
+            json_object_array_add(widths, json_object_new_int(80));
+        if (src->width_160)
+            json_object_array_add(widths, json_object_new_int(160));
+        if (json_object_array_length(widths))
+            json_object_object_add(channel, "supported_widths_mhz", widths);
+        else
+            json_object_put(widths);
+        if (src->center_80)
+            json_object_object_add(channel, "center_channel_80",
+                                   json_object_new_int(src->center_80));
+        if (src->center_160)
+            json_object_object_add(channel, "center_channel_160",
+                                   json_object_new_int(src->center_160));
+        json_object_array_add(channels, channel);
+    }
+    json_object_object_add(radio, "channel_catalog", catalog);
+    rc = 0;
+
+done:
+    apd_command_result_free(&listing);
+    apd_command_result_free(&inventory);
+    return rc;
+}
+
 static void apd_reg_domain(const char *path, char *out, size_t out_len)
 {
     struct apd_command_result result = { 0 };
@@ -4846,16 +5006,32 @@ static void apd_collect_channel_catalogs(const char *path,
     if (!failure)
         apd_channel_catalog_parse(result.text, radios, regdomain,
                                   observed_at);
+    /*
+     * Vendor fallback for radios `iw phy` did not describe.
+     *
+     * QCA driver builds answer `iw phy` without a channel list while still
+     * reporting a full catalogue through `wlanconfig <if> list chan`. The old
+     * code recorded "wiphy_not_in_iw_phy_output" and stopped there, which read
+     * as "the driver cannot report channels" when in fact only the probe was
+     * wrong.
+     *
+     * The interface for a radio comes from the same `iw dev` inventory the
+     * survey and neighbor collectors already use, so a radio with no usable AP
+     * interface falls through to the original reason rather than guessing a
+     * name.
+     */
     for (i = 0; radios && i < json_object_array_length(radios); i++) {
         struct json_object *radio = json_object_array_get_idx(radios, i);
         struct json_object *existing = NULL;
+        const char *reason = failure ? failure : "wiphy_not_in_iw_phy_output";
 
         if (json_object_object_get_ex(radio, "channel_catalog", &existing))
             continue;
+        if (apd_channel_catalog_vendor_fallback(radio, regdomain, observed_at,
+                                                reason) == 0)
+            continue;
         json_object_object_add(radio, "channel_catalog",
-            apd_channel_catalog_new(failure ? failure :
-                                    "wiphy_not_in_iw_phy_output",
-                                    observed_at));
+            apd_channel_catalog_new(reason, observed_at));
     }
     apd_command_result_free(&result);
 }

@@ -38,6 +38,7 @@
 #include <dirent.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <regex.h>
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
@@ -426,6 +427,207 @@ static const char *get_app_name(int appid)
             return g_app_names[i].name;
     }
     return "";
+}
+
+/*
+ * Host -> app_id resolution against the signature database.
+ *
+ * af_active_host has no appid column. Its 8th field is AppProto, a protocol
+ * class (values like 1 and 2), and the URL audit stream used to write that
+ * field into a slot the reader parsed as "appid" before handing it to
+ * get_app_name(). Since the app catalog's ids start at 100000001, that lookup
+ * could only ever return "", which is exactly what the live device showed:
+ * every get_url_audit row came back {"appid": 2, "app_name": ""}.
+ *
+ * The catalog is already loaded from this same database (load_app_names), and
+ * dpi_rule lives beside the app table, so the hostname can be resolved here
+ * without linking the full signature module into this small daemon. The scoring
+ * mirrors nc_sig_pattern_match_score() in jmx_signature_update.c: exact 100,
+ * dot-boundary suffix 95, regex 90, substring 85. Keep the two in agreement.
+ */
+
+/* Reject rule patterns that are clearly not hostnames (header fragments, hex
+ * escapes, binary signatures). Mirrors nc_sig_pattern_is_host_candidate(). */
+static int audit_pattern_is_host_candidate(const char *pattern)
+{
+    static const char *suffixes[] = {
+        ".com", "\\.com", ".cn", "\\.cn", ".net", "\\.net",
+        ".org", "\\.org", ".tv", "\\.tv", ".cc", "\\.cc",
+        ".io", "\\.io", ".app", "\\.app", ".cloud", "\\.cloud",
+        ".top", "\\.top", ".vip", "\\.vip", ".me", "\\.me",
+        NULL
+    };
+    int has_alpha = 0;
+
+    if (!pattern || !pattern[0] || !strchr(pattern, '.'))
+        return 0;
+    if (strstr(pattern, "\\x") || strstr(pattern, "Host:") ||
+        strstr(pattern, "User-Agent:") || strstr(pattern, "\r") ||
+        strstr(pattern, "\n"))
+        return 0;
+    for (const char *p = pattern; *p; p++) {
+        if (isalpha((unsigned char)*p)) {
+            has_alpha = 1;
+            break;
+        }
+    }
+    if (!has_alpha)
+        return 0;
+    for (int i = 0; suffixes[i]; i++) {
+        if (strstr(pattern, suffixes[i]))
+            return 1;
+    }
+    if (strstr(pattern, "(com|") || strstr(pattern, "|com)") ||
+        strstr(pattern, "(cn|") || strstr(pattern, "|cn)") ||
+        strstr(pattern, "(net|") || strstr(pattern, "|net)"))
+        return 1;
+    return 0;
+}
+
+static int audit_pattern_match_score(const char *host, const char *match_type,
+                                     const char *pattern)
+{
+    size_t host_len, pattern_len;
+
+    if (!host || !host[0] || !pattern || !pattern[0])
+        return 0;
+    if (!audit_pattern_is_host_candidate(pattern))
+        return 0;
+    if (!strcmp(host, pattern))
+        return 100;
+    host_len = strlen(host);
+    pattern_len = strlen(pattern);
+    if (host_len > pattern_len &&
+        host[host_len - pattern_len - 1] == '.' &&
+        !strcmp(host + host_len - pattern_len, pattern))
+        return 95;
+    if (match_type && !strcmp(match_type, "regex") && pattern_len >= 5) {
+        regex_t re;
+        int rc;
+
+        if (regcomp(&re, pattern, REG_EXTENDED | REG_NOSUB | REG_ICASE) != 0)
+            return 0;
+        rc = regexec(&re, host, 0, NULL, 0);
+        regfree(&re);
+        if (rc == 0)
+            return 90;
+    }
+    if (match_type && (!strcmp(match_type, "bm") || !strcmp(match_type, "bm_str") ||
+                       !strcmp(match_type, "contains"))) {
+        if (pattern_len >= 5 && strstr(host, pattern))
+            return 85;
+    }
+    return 0;
+}
+
+/*
+ * Small hostname -> app_id cache.
+ *
+ * The URL stream replays the same hosts constantly, and a miss costs a full
+ * dpi_rule scan (about 7k text rules on 30.1). Both hits and misses are cached:
+ * a host that resolves to nothing is the common case and must not be rescanned
+ * on every record.
+ */
+#define AUDIT_HOST_APP_CACHE_MAX 512
+static struct {
+    char host[256];
+    int app_id;
+    int64_t resolved_at;
+} g_host_app_cache[AUDIT_HOST_APP_CACHE_MAX];
+static int g_host_app_cache_count;
+static int g_host_app_cache_next;
+static uint64_t g_host_app_lookups;
+static uint64_t g_host_app_cache_hits;
+static uint64_t g_host_app_resolved;
+
+static int audit_host_app_cache_get(const char *host, int *app_id)
+{
+    for (int i = 0; i < g_host_app_cache_count; i++) {
+        if (!strcmp(g_host_app_cache[i].host, host)) {
+            *app_id = g_host_app_cache[i].app_id;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void audit_host_app_cache_put(const char *host, int app_id)
+{
+    int slot;
+
+    if (!host || !host[0])
+        return;
+    if (g_host_app_cache_count < AUDIT_HOST_APP_CACHE_MAX) {
+        slot = g_host_app_cache_count++;
+    } else {
+        /* Round-robin eviction: no access counters to maintain, and the working
+         * set is dominated by whatever the clients are talking to right now. */
+        slot = g_host_app_cache_next;
+        g_host_app_cache_next = (g_host_app_cache_next + 1) % AUDIT_HOST_APP_CACHE_MAX;
+    }
+    snprintf(g_host_app_cache[slot].host, sizeof(g_host_app_cache[slot].host), "%s", host);
+    g_host_app_cache[slot].app_id = app_id;
+    g_host_app_cache[slot].resolved_at = (int64_t)time(NULL);
+}
+
+/*
+ * Returns the resolved app_id, or 0 when the host matches no rule.
+ *
+ * 0 is a legitimate answer, not an error: some hosts genuinely have no signature
+ * (distro mirrors, for instance). Callers must render that as "unidentified"
+ * rather than substituting the hostname as an application name.
+ */
+static int audit_resolve_host_app_id(const char *host)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    int cached = 0;
+    int best_score = 0, best_app = 0, best_prio = 999999;
+
+    if (!host || !host[0] || !strchr(host, '.'))
+        return 0;
+    g_host_app_lookups++;
+    if (audit_host_app_cache_get(host, &cached) == 0) {
+        g_host_app_cache_hits++;
+        return cached;
+    }
+    if (!g_app_db_path[0])
+        return 0;
+    if (sqlite3_open_v2(g_app_db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db)
+            sqlite3_close(db);
+        return 0;
+    }
+    if (sqlite3_prepare_v2(db,
+            "SELECT r.app_id,COALESCE(r.match_type,''),COALESCE(r.pattern_text,''),"
+            "COALESCE(r.priority,50) FROM dpi_rule r "
+            "WHERE r.enabled=1 AND r.pattern_format='text' AND length(r.pattern_text)>=3 "
+            "ORDER BY r.priority ASC,length(r.pattern_text) DESC,r.rule_id ASC",
+            -1, &st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            int app_id = sqlite3_column_int(st, 0);
+            const char *match_type = (const char *)sqlite3_column_text(st, 1);
+            const char *pattern = (const char *)sqlite3_column_text(st, 2);
+            int prio = sqlite3_column_int(st, 3);
+            int score = audit_pattern_match_score(host, match_type, pattern);
+
+            if (score <= 0 || app_id <= 0)
+                continue;
+            if (score > best_score || (score == best_score && prio < best_prio)) {
+                best_score = score;
+                best_app = app_id;
+                best_prio = prio;
+                if (score >= 100)
+                    break;
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    audit_host_app_cache_put(host, best_app);
+    if (best_app > 0)
+        g_host_app_resolved++;
+    return best_app;
 }
 
 /* ---------- SQLite helpers ---------- */
@@ -1061,6 +1263,22 @@ static int handle_status(struct ubus_context *ctx, struct ubus_object *obj,
     blobmsg_add_u32(&g_b, "parse_dropped", (uint32_t)g_url_audit_state.parse_dropped);
     blobmsg_close_table(&g_b, stream);
 
+    /*
+     * Host -> app_id resolution counters. Reported so a low identification rate
+     * is visible as a signature-coverage question rather than being mistaken for
+     * the resolver not running at all.
+     */
+    {
+        void *ident = blobmsg_open_table(&g_b, "app_identification");
+        blobmsg_add_u32(&g_b, "lookups", (uint32_t)g_host_app_lookups);
+        blobmsg_add_u32(&g_b, "cache_hits", (uint32_t)g_host_app_cache_hits);
+        blobmsg_add_u32(&g_b, "resolved", (uint32_t)g_host_app_resolved);
+        blobmsg_add_u32(&g_b, "cache_entries", (uint32_t)g_host_app_cache_count);
+        blobmsg_add_string(&g_b, "source",
+                           g_app_db_path[0] ? "signature_dpi_rule" : "signature_db_unavailable");
+        blobmsg_close_table(&g_b, ident);
+    }
+
     ubus_send_reply(ctx, req, g_b.head);
     return UBUS_STATUS_OK;
 }
@@ -1253,8 +1471,14 @@ static int url_audit_seen_add(url_audit_hour_state_t *st, const char *key)
 static const char *url_audit_proto_label(int app_proto, int proto, int dst_port,
                                          char *buf, size_t buf_len)
 {
+    /*
+     * app_proto is af_active_host's AppProto column, a protocol class, not an
+     * application id. Labelling it "app:%d" made index files read as
+     * "application 2 had 101 visits" when the truth was "101 connections had
+     * AppProto=2". The prefix now says what the number actually is.
+     */
     if (app_proto > 0) {
-        snprintf(buf, buf_len, "app:%d", app_proto);
+        snprintf(buf, buf_len, "app_proto:%d", app_proto);
         return buf;
     }
     if (dst_port == 443) return "HTTPS";
@@ -1348,9 +1572,13 @@ static void url_audit_rebuild_from_stream(url_audit_hour_state_t *st)
     while (fgets(line, sizeof(line), fp)) {
         char ip[48] = {0}, mac[20] = {0}, host[256] = {0}, dst_ip[48] = {0};
         long ts = 0;
-        int appid = 0, proto = 0, dst_port = 0;
-        if (sscanf(line, "%47s\t%19s\t%ld\t%255s\t%d\t%d\t%47s\t%d",
-                   ip, mac, &ts, host, &appid, &proto, dst_ip, &dst_port) < 8) {
+        /* Field 5 is app_proto (protocol class), not an application id; the
+         * optional field 9 carries the resolved app_id. Compaction copies the
+         * line through verbatim, so both shapes survive unchanged. */
+        int app_proto = 0, proto = 0, dst_port = 0, app_id = 0;
+        if (sscanf(line, "%47s\t%19s\t%ld\t%255s\t%d\t%d\t%47s\t%d\t%d",
+                   ip, mac, &ts, host, &app_proto, &proto, dst_ip, &dst_port,
+                   &app_id) < 8) {
             st->parse_dropped++;
             continue;
         }
@@ -1359,7 +1587,7 @@ static void url_audit_rebuild_from_stream(url_audit_hour_state_t *st)
             continue;
         }
         char key[URL_AUDIT_KEY_LEN];
-        url_audit_make_key(key, sizeof(key), ip, mac, host, appid, proto, dst_port);
+        url_audit_make_key(key, sizeof(key), ip, mac, host, app_proto, proto, dst_port);
         int added = url_audit_seen_add(st, key);
         if (added < 0) {
             st->limit_dropped++;
@@ -1369,7 +1597,7 @@ static void url_audit_rebuild_from_stream(url_audit_hour_state_t *st)
             st->duplicate_dropped++;
             continue;
         }
-        url_audit_note_record(st, ip, mac, host, appid, proto, dst_port, 1);
+        url_audit_note_record(st, ip, mac, host, app_proto, proto, dst_port, 1);
         if (compact)
             fputs(line, compact);
     }
@@ -1490,9 +1718,20 @@ static int url_audit_write_host(url_audit_hour_state_t *st,
         return 0;
     }
 
-    fprintf(st->stream_fp, "%s\t%s\t%ld\t%s\t%d\t%d\t%s\t%d\n",
+    /*
+     * Field 5 stays app_proto for compatibility: existing hour files on disk are
+     * already written that way, and the reader must keep parsing them. The real
+     * app id goes into a new 9th field, so an old file simply yields app_id 0
+     * (correctly reported as unidentified) instead of being misread.
+     *
+     * Resolution happens here rather than at read time because the hostname is
+     * in hand and the result is cached; the reader processes the same host many
+     * times over.
+     */
+    fprintf(st->stream_fp, "%s\t%s\t%ld\t%s\t%d\t%d\t%s\t%d\t%d\n",
             host->src_ip, host->mac, (long)now, host->host,
-            host->app_proto, host->proto, host->dst_ip, host->dst_port);
+            host->app_proto, host->proto, host->dst_ip, host->dst_port,
+            audit_resolve_host_app_id(host->host));
     url_audit_note_record(st, host->src_ip, host->mac, host->host,
                           host->app_proto, host->proto, host->dst_port, 1);
     return 1;
@@ -1580,20 +1819,46 @@ static int handle_get_url_audit(struct ubus_context *ctx, struct ubus_object *ob
                 char line[1024];
                 int count = 0;
                 while (fgets(line, sizeof(line), fp) && count < 200) {
-                    /* TSV: ip mac timestamp host appid proto dst_ip dst_port */
+                    /*
+                     * TSV: ip mac timestamp host app_proto proto dst_ip dst_port [app_id]
+                     *
+                     * Field 5 is af_active_host's AppProto (a protocol class such
+                     * as 1 or 2), NOT an application id. It was previously parsed
+                     * into a variable named "appid" and passed to get_app_name(),
+                     * which could only ever return "" because the app catalog's
+                     * ids start at 100000001. Field 9 carries the real id.
+                     */
                     char ip[48] = {0}, mac[20] = {0}, host[256] = {0};
                     char dst_ip[48] = {0};
                     long ts = 0;
-                    int appid = 0, proto = 0, dst_port = 0;
-                    if (sscanf(line, "%47s\t%19s\t%ld\t%255s\t%d\t%d\t%47s\t%d",
-                               ip, mac, &ts, host, &appid, &proto,
-                               dst_ip, &dst_port) >= 4) {
+                    int app_proto = 0, proto = 0, dst_port = 0, app_id = 0;
+                    int fields = sscanf(line, "%47s\t%19s\t%ld\t%255s\t%d\t%d\t%47s\t%d\t%d",
+                                        ip, mac, &ts, host, &app_proto, &proto,
+                                        dst_ip, &dst_port, &app_id);
+                    if (fields >= 4) {
+                        const char *app_name;
+
+                        /* Records written before field 9 existed: resolve now so
+                         * history is not permanently unidentified. */
+                        if (fields < 9 && host[0])
+                            app_id = audit_resolve_host_app_id(host);
+                        app_name = app_id > 0 ? get_app_name(app_id) : "";
                         void *rec = blobmsg_open_table(&g_b, NULL);
                         blobmsg_add_u32(&g_b, "timestamp", (uint32_t)ts);
                         blobmsg_add_string(&g_b, "mac", mac);
                         blobmsg_add_string(&g_b, "ip", ip);
-                        blobmsg_add_u32(&g_b, "appid", appid);
-                        blobmsg_add_string(&g_b, "app_name", get_app_name(appid));
+                        blobmsg_add_u32(&g_b, "appid", (uint32_t)app_id);
+                        blobmsg_add_string(&g_b, "app_name", app_name);
+                        /*
+                         * Reported explicitly so a consumer can tell "no signature
+                         * matched this host" from "the field is missing", and so
+                         * nobody is tempted to substitute the hostname as an
+                         * application name again.
+                         */
+                        blobmsg_add_u8(&g_b, "app_identified", app_id > 0);
+                        blobmsg_add_string(&g_b, "app_name_source",
+                                           app_id > 0 ? "signature_dpi_rule" : "unidentified");
+                        blobmsg_add_u32(&g_b, "app_proto", (uint32_t)app_proto);
                         blobmsg_add_string(&g_b, "host", host);
                         blobmsg_close_table(&g_b, rec);
                         count++;

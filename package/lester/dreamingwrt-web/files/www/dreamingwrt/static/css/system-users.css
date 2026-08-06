@@ -30,7 +30,34 @@
 .system-users-route-host,
 .system-users-route-host * { box-sizing: border-box; }
 
-.system-users-shell { grid-template-rows: minmax(0, 1fr); }
+/*
+ * 壳层现在是「Tab 条 + 内容面板」两行。行数必须跟着子节点数走
+ * （design.md 规则 11 / 15(a)）：新增 Tab 条后仍写单行 `minmax(0,1fr)`，
+ * 两个子节点会挤进同一行、Tab 条压在表格上——F-75 存储概览与 F-81 策略表
+ * 都栽在同一处。
+ */
+.system-users-shell { grid-template-rows: auto minmax(0, 1fr); gap: 12px; }
+
+/* 内容面板本身要能收缩，否则表格卡的内部滚动失效（grid 子项 min-height 默认 auto）。 */
+.system-users-page-panel { min-height: 0; min-width: 0; display: grid; grid-template-rows: minmax(0, 1fr); }
+
+/*
+ * 用户要求「让这个 tab 宽一点占一行」。kit 的 `.dwrt-kit-page-tabs` 默认
+ * `width: fit-content`，三个 Tab 只占左侧一小段。这里只表达位置意图
+ * （占满一行、三个 Tab 均分），不改 kit 的高度、字号、内边距等几何
+ * ——那些由 `dwrt-kit-page-tabs` 统一负责（design.md 规则 27）。
+ * `system-power` 的窄屏规则已有同样的先例。
+ */
+/*
+ * 选择器必须双类提权。kit 的规则是 `.dwrt-kit-tabs.dwrt-kit-page-tabs`
+ * （权重 0,2,0）里的 `width: fit-content`，裸单类 `.system-users-page-tabs`
+ * 权重更低直接输掉：实测 nav 仍是 289px 而壳层 1276px，`width: 100%` 形同没写。
+ * 同一处提权要求见 design.md 规则 27 结尾。
+ */
+.dwrt-kit-tabs.system-users-page-tabs { width: 100%; }
+/* 三个 Tab 均分整行；min-width 要压过 kit 的 132px，否则窄屏下均分不动。 */
+.dwrt-kit-tabs.system-users-page-tabs .dwrt-kit-tab { flex: 1 1 0; min-width: 0; }
+
 .system-users-toolbar-actions { position: relative; }
 
 /* 控件收进表格工具条后，工具条要能换行，避免窄屏把计数挤出卡片。 */
@@ -110,13 +137,21 @@
 .system-users-table-meta button:hover { color: var(--app-text); background: var(--dwrt-interactive-hover-bg); }
 .dwrt-kit-table-title span.is-warning { color: #f5c166; }
 
+/* 整行可点开详情，所以行级要有 hover/focus 反馈。 */
+.system-users-table tbody tr.system-user-row { cursor: pointer; }
+.system-users-table tbody tr.system-user-row:hover { background: var(--dwrt-interactive-hover-bg, rgba(255,255,255,.045)); }
+.system-users-table tbody tr.system-user-row:focus-visible { outline: 2px solid rgba(74,153,255,.55); outline-offset: -2px; }
 .system-user-name { width: 100%; min-width: 0; display: grid; grid-template-columns: 34px minmax(0,1fr); align-items: center; gap: 10px; border: 0; padding: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
 .system-user-name > span:last-child { min-width: 0; display: grid; gap: 2px; }
 .system-user-name strong,
 .system-user-name small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .system-user-name small { color: var(--app-text-muted); font-size: 11px; }
 .system-user-avatar { position: relative; width: 32px; height: 32px; display: grid; place-items: center; flex: 0 0 auto; overflow: hidden; border-radius: var(--app-radius-compact, 8px); color: var(--app-text); background: rgba(75,145,255,0.16); box-shadow: inset 0 0 0 1px rgba(113,174,255,0.18); font-size: 13px; font-weight: 780; }
-.system-user-avatar.is-large { width: 52px; height: 52px; border-radius: 12px; font-size: 20px; }
+/*
+ * is-large 只用于详情抽屉身份区。参照图（用户 2026-08-04 补图）上是
+ * 靠左的蓝色圆角方块，不是圆形、也不是居中大头像，故沿用紧凑态的方形圆角。
+ */
+.system-user-avatar.is-large { width: 56px; height: 56px; border-radius: 12px; font-size: 22px; }
 .system-user-avatar img { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; display: block; border-radius: inherit; object-fit: cover; object-position: center; }
 .system-user-avatar img[hidden] { display: none; }
 .system-user-avatar-fallback { position: relative; z-index: 0; display: grid; place-items: center; width: 100%; height: 100%; line-height: 1; }
@@ -126,19 +161,220 @@
 .system-user-status.is-active i { background: #47d486; box-shadow: 0 0 8px rgba(71,212,134,.36); }
 .system-user-permissions { display: block; overflow: hidden; text-overflow: ellipsis; color: var(--app-text-secondary); }
 
-.system-users-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); --dwrt-kit-sheet-z: 70; }
-.system-users-drawer .dwrt-kit-sheet-header span { display: block; font-size: 10px; font-weight: 760; }
+/*
+ * 抽屉材质：照搬 AI 助手抽屉的三层结构（壁纸 / 材质 / 内容）。
+ *
+ * 原来这里挂的是 `policy-stable-glass`，但那个类被 policy-table.css 限定在
+ * `.policy-table-route-host` 作用域内，用户页取不到，抽屉实测
+ * `background-color: rgba(0,0,0,0)` + `backdrop-filter: none`，壁纸直接透上来。
+ * 现在自身透明，材质完全由内部两层承担，和 AI 抽屉同一套观感。
+ */
+.system-users-drawer {
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
+  --dwrt-kit-sheet-z: 70;
+  grid-template-rows: minmax(0, 1fr);
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+.system-users-drawer::before { display: none; }
+.system-users-drawer-wallpaper,
+.system-users-drawer-material { position: absolute; inset: 0; pointer-events: none; }
+.system-users-drawer-wallpaper { z-index: 0; overflow: hidden; background: #050710; }
+.system-users-drawer-wallpaper img {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  max-width: none;
+  display: block;
+  object-fit: cover;
+  object-position: 50% 50%;
+  pointer-events: none;
+}
+.system-users-drawer-material {
+  z-index: 1;
+  background:
+    radial-gradient(ellipse at 50% -16%, rgba(255,255,255,calc(var(--lg-highlight, .28) * .13)), transparent 54%),
+    rgb(var(--dwrt-glass-neutral-color, 10 16 25) / var(--dwrt-glass-neutral-density, .06));
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,calc(var(--lg-highlight, .28) * .88)),
+    inset 0 -24px 40px rgba(3,8,18,0.10);
+  backdrop-filter: blur(var(--dwrt-glass-base-blur, 3.2px)) saturate(var(--dwrt-glass-saturation, 140%));
+  -webkit-backdrop-filter: blur(var(--dwrt-glass-base-blur, 3.2px)) saturate(var(--dwrt-glass-saturation, 140%));
+}
+.system-users-drawer-content {
+  position: relative;
+  z-index: 2;
+  grid-row: 1 / -1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+.system-users-drawer .dwrt-kit-sheet-header span { display: block; font-size: 10px; font-weight: 760; letter-spacing: 0; }
 .system-users-drawer .dwrt-kit-sheet-header strong { display: block; margin-top: 2px; font-size: 17px; }
 .system-users-drawer-body { display: grid; align-content: start; gap: 18px; padding: 18px var(--dwrt-kit-sheet-padding-x); }
-.system-user-profile { display: flex; align-items: center; gap: 13px; padding-bottom: 16px; border-bottom: 1px solid rgba(255,255,255,.09); }
-.system-user-profile > div { display: grid; gap: 4px; }
-.system-user-profile strong { font-size: 17px; }
-.system-user-profile span { color: var(--app-text-muted); font-size: 12px; }
+/*
+ * Tab 正文的稳定容器。切 Tab 时只换它的 innerHTML，抽屉本身不重建
+ * （原先切一下就整页 render()，抽屉连同 portal 宿主一起销毁重建，
+ * 表现为「点一下就重新加载一下」）。
+ *
+ * 它必须把父级的 grid 间距透传下去：抽屉正文是 `display: grid; gap: 18px`，
+ * 多包一层普通 div 会让内部若干块变成这一层的子节点、彼此贴在一起，
+ * 所以这里自己也是同样的 grid，间距取同一个值。
+ */
+.system-user-detail-panel { display: grid; align-content: start; gap: 18px; min-width: 0; }
+/*
+ * 详情抽屉版式对齐 UniFi 参照图（用户 2026-08-04 补的 4 张截图，
+ * 交接单 Acceptance-to-Front-user-detail-drawer-unifi-layout-spec）。
+ *
+ * 注意：交接单原文规格第 1 条要求「整块居中竖排」，与参照图相反，
+ * 用户 2026-08-04 23:30 裁决按图修正。图上身份区是
+ * 「圆角方块头像靠左 + 右侧名字 + 名字下方状态」的左对齐横排，
+ * 身份区与键值区是两张独立卡片。
+ *
+ * 原先的三等分指标格已移除：「用户组 / 权限项 / 最后活动」三项
+ * 在下方键值列表里各自已出现一次，同一数据一屏两遍，删掉不丢信息。
+ */
+.system-user-profile { display: flex; align-items: center; justify-content: flex-start; text-align: start; gap: 14px; padding: 16px; border-radius: 14px; background: rgba(255,255,255,.03); box-shadow: inset 0 0 0 1px rgba(255,255,255,.06); }
+.system-user-profile-identity { min-width: 0; display: grid; justify-items: start; gap: 5px; }
+.system-user-profile-identity > strong { max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 17px; }
+.system-user-profile-identity > span { max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--app-text-muted); font-size: 12px; }
 .system-user-profile .system-user-avatar-fallback { color: inherit; font-size: inherit; }
+.system-user-profile-tags { display: flex; align-items: center; justify-content: flex-start; flex-wrap: wrap; gap: 6px; }
+.system-user-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  color: var(--app-text-secondary);
+  background: rgba(255,255,255,.055);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.08);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.system-user-tag.is-online { color: #8ce3b3; background: rgba(71,212,134,.12); box-shadow: inset 0 0 0 1px rgba(71,212,134,.20); }
+.system-user-tag.is-accent { color: #a8cbff; background: rgba(75,145,255,.14); box-shadow: inset 0 0 0 1px rgba(113,174,255,.20); }
+
+/*
+ * 参照图的键值列表没有分组标题，三组之间只用发丝线分隔。
+ * 标题保留在 DOM 里供屏幕阅读器使用，但视觉上隐藏。
+ * 键值区整体是与身份区并列的另一张卡。
+ */
+.system-users-visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+/* 三组键值合成一张连续卡，组间靠发丝线分隔，整卡最后一行不留线。 */
+.system-user-detail-card { display: grid; padding: 4px 16px; border-radius: 14px; background: rgba(255,255,255,.03); box-shadow: inset 0 0 0 1px rgba(255,255,255,.06); }
+.system-user-detail-card > .system-user-detail-group:last-child .system-user-detail-list > div:last-child { border-bottom: 0; }
+.system-user-detail-group { display: grid; }
 .system-user-detail-list { display: grid; }
-.system-user-detail-list > div { min-height: 52px; display: grid; grid-template-columns: 118px minmax(0,1fr); align-items: center; gap: 12px; border-bottom: 1px solid rgba(255,255,255,.07); }
-.system-user-detail-list span { color: var(--app-text-muted); font-size: 12px; }
-.system-user-detail-list strong { min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 680; }
+.system-user-detail-list > div { min-height: 44px; display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 11px 0; border-bottom: 1px solid rgba(255,255,255,.07); }
+.system-user-detail-list span { flex: 0 0 auto; color: var(--app-text-muted); font-size: 12px; white-space: nowrap; }
+.system-user-detail-list strong { min-width: 0; flex: 0 1 auto; overflow-wrap: anywhere; text-align: right; font-size: 13px; font-weight: 680; }
+
+/*
+ * 详情抽屉的 Tab 条（交接单 Front-user-detail-settings-tab-unifi-spec）。
+ * 形制复用 kit 的 dwrt-kit-tabs，这里只做抽屉内的尺寸收敛：
+ * 抽屉正文只有 411px 可用宽，页面级 Tab 的默认高度和内边距在这个宽度里会挤爆，
+ * 所以三颗 Tab 等分而不是按内容宽度排布。
+ */
+.system-user-detail-tabs { width: 100%; min-width: 0; flex: 0 0 auto; }
+.system-user-detail-tabs .dwrt-kit-tab { flex: 1 1 0; min-width: 0; height: 40px; padding: 0 8px; gap: 6px; font-size: 12.5px; }
+.system-user-detail-tabs .dwrt-kit-tab svg { width: 15px; height: 15px; flex: 0 0 auto; display: block; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.system-user-detail-tabs .dwrt-kit-tab span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.system-user-detail-tabs .dwrt-kit-tab:disabled { opacity: .42; cursor: not-allowed; }
+
+/*
+ * 「活动」Tab（交接单 Acceptance-to-Front-user-activity-tab-hardcoded-disabled）。
+ * 抽屉宽度是固定档位、与视口无关，所以栅格一律用容器自适应而不是媒体查询
+ * （design.md 规则 35b）：411px 抽屉不会触发 620px 断点。
+ * 材质沿用键值卡那一套，不新造玻璃。
+ */
+.system-user-activity { display: grid; align-content: start; gap: 12px; min-width: 0; }
+.system-user-activity-ranges,
+.system-user-activity-types { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.system-user-activity-range,
+.system-user-activity-type {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: rgba(255,255,255,.045);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.07);
+  color: var(--app-text-secondary);
+  font-size: 12px;
+  font-weight: 660;
+  cursor: pointer;
+}
+.system-user-activity-range.is-active,
+.system-user-activity-type.is-active { background: rgba(255,255,255,.13); box-shadow: inset 0 0 0 1px rgba(255,255,255,.16); color: var(--app-text-primary); }
+.system-user-activity-range:disabled,
+.system-user-activity-type:disabled { opacity: .5; cursor: progress; }
+.system-user-activity-type small { color: var(--app-text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.system-user-activity-window { display: grid; gap: 2px; color: var(--app-text-muted); font-size: 11.5px; line-height: 1.55; overflow-wrap: anywhere; }
+
+.system-user-activity-chart { display: grid; gap: 6px; padding: 12px 14px; border-radius: 12px; background: rgba(255,255,255,.03); box-shadow: inset 0 0 0 1px rgba(255,255,255,.06); }
+/* 条形用 flex 均分，桶数最多 31，不设最小宽度以免撑出横向滚动。 */
+.system-user-activity-bars { display: flex; align-items: flex-end; gap: 2px; height: 92px; min-width: 0; }
+.system-user-activity-bars > i { flex: 1 1 0; min-width: 0; height: var(--bar, 0%); min-height: 2px; border-radius: 3px 3px 0 0; background: linear-gradient(180deg, rgba(120,190,255,.92), rgba(80,140,235,.55)); }
+.system-user-activity-ticks { display: flex; justify-content: space-between; gap: 8px; color: var(--app-text-muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.system-user-activity-peak { color: var(--app-text-muted); font-size: 11px; }
+
+.system-user-activity-timeline { display: grid; gap: 8px; min-width: 0; }
+.system-user-activity-timeline ul { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; min-width: 0; }
+.system-user-activity-event {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 10px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 11px;
+  background: rgba(255,255,255,.028);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.055);
+}
+.system-user-activity-event-time { grid-column: 1 / -1; color: var(--app-text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.system-user-activity-event-body { display: grid; gap: 2px; min-width: 0; }
+.system-user-activity-event-body strong { font-size: 12.5px; font-weight: 680; overflow-wrap: anywhere; }
+.system-user-activity-event-body small { color: var(--app-text-muted); font-size: 11px; overflow-wrap: anywhere; }
+/* User-Agent 是调用方原文，可能很长：截断到两行，完整值仍在 DOM 里可选中。 */
+.system-user-activity-event-agent { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.system-user-activity-event > .system-user-tag { align-self: start; }
+.system-user-activity-note { color: var(--app-text-muted); font-size: 11px; }
+
+/* 设置卡沿用键值卡的材质，只把内边距还原成表单需要的量。 */
+.system-user-settings-card { gap: 12px; padding: 14px 16px 16px; }
+.system-user-settings-legend { margin: 0; color: var(--app-text-secondary); font-size: 12px; font-weight: 700; letter-spacing: 0; }
+/* 卡内只读行不再画卡，去掉最后一行的发丝线。 */
+.system-user-settings-readonly > div:last-child { border-bottom: 0; }
+.system-user-settings-readonly strong { display: inline-flex; align-items: baseline; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.system-user-settings-readonly strong small { color: var(--app-text-muted); font-size: 11px; font-weight: 600; }
+.system-users-form label > span small { display: block; margin-top: 2px; color: var(--app-text-muted); font-size: 11px; font-weight: 600; }
+
+/*
+ * 权限项多选。后端 permissions 是 11 个合法值的白名单（webd_directory_permissions_ok），
+ * 参照图那两个 `Full Management` 下拉在本项目里没有对应的可写维度，所以这里是复选组。
+ * 两列布局在 411px 下每列约 190px，够放「代理：配置」这类最长的标签。
+ */
+.system-user-permission-set { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; margin: 0; padding: 12px 0 0; border: 0; border-top: 1px solid rgba(255,255,255,.07); }
+.system-user-permission-set legend { grid-column: 1/-1; float: none; width: auto; padding: 0 0 8px; color: var(--app-text-secondary); font-size: 12px; font-weight: 700; }
+.system-user-permission-set legend small { margin-left: 6px; color: var(--app-text-muted); font-size: 11px; font-weight: 600; }
+.system-user-permission-set:disabled { opacity: .55; }
+.system-user-permission-choice { min-width: 0; display: grid; grid-template-columns: 16px minmax(0, 1fr); align-items: start; gap: 8px; cursor: pointer; }
+.system-user-permission-set:disabled .system-user-permission-choice { cursor: not-allowed; }
+.system-user-permission-choice input { width: 16px; height: 16px; margin: 1px 0 0; accent-color: #4a99ff; }
+.system-user-permission-choice > span { min-width: 0; display: grid; gap: 1px; color: var(--app-text); font-size: 12.5px; overflow-wrap: anywhere; }
+.system-user-permission-choice > span small { color: var(--app-text-muted); font-size: 10.5px; font-weight: 600; overflow-wrap: anywhere; }
+
+.system-user-settings-dirty { padding: 9px 12px; border-radius: 9px; color: #a8cbff; background: rgba(75,145,255,.10); box-shadow: inset 0 0 0 1px rgba(113,174,255,.18); font-size: 12px; }
+.system-user-settings-dirty[hidden] { display: none; }
 
 .system-users-form { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; }
 .system-users-form label { min-width: 0; display: grid; gap: 6px; }
@@ -159,7 +395,23 @@
 .system-user-group-list small,
 .system-users-import-list span,
 .system-users-import-summary span { color: var(--app-text-muted); font-size: 11px; }
-.system-users-empty { min-height: 180px; display: grid; place-items: center; color: var(--app-text-muted); }
+/* 空态原来被塞在 411px 的窄列里挤成一团，这里给它铺满抽屉正文宽度。 */
+.system-users-empty {
+  min-height: 150px;
+  display: grid;
+  place-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 22px 18px;
+  border-radius: 12px;
+  background: rgba(255,255,255,.022);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.055);
+  color: var(--app-text-muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+  text-align: center;
+  text-wrap: pretty;
+}
 .system-users-import-summary { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 
 @media (max-width: 900px) {
@@ -176,4 +428,7 @@
   .system-users-create-menu { left: 0; right: auto; width: 100%; }
   .system-users-form { grid-template-columns: 1fr; }
   .system-users-form label.is-wide { grid-column: auto; }
+  /* 390px 档：权限复选改单列，否则「代理：配置」这类标签会把复选框挤出卡片。 */
+  .system-user-permission-set { grid-template-columns: 1fr; }
+  .system-user-detail-tabs .dwrt-kit-tab { padding: 0 6px; font-size: 12px; }
 }

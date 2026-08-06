@@ -8,6 +8,7 @@
 #include "jmx_gateway_shadow.h"
 #include "jmx_config_schema.h"
 #include "jmx.h"
+#include "jmx_db.h"
 #include "jmx_uci.h"
 #include "jmx_route.h"
 #include "jmx_events.h"
@@ -67,6 +68,7 @@
 
 const char *nc_json_str_def(struct json_object *o, const char *k, const char *def);
 int nc_json_int_def(struct json_object *o, const char *k, int def);
+int64_t nc_json_int64_def(struct json_object *o, const char *k, int64_t def);
 int nc_json_bool_def(struct json_object *o, const char *k, int def);
 struct json_object *nc_json_array_from_text(const char *txt);
 static void nc_json_copy_key(struct json_object *dst, const char *dst_key,
@@ -3514,6 +3516,67 @@ static int nc_ip_in_subnet(const char *ip, const char *subnet_cidr)
     return (ntohl(net_addr.s_addr) & ntohl(mask)) == (ntohl(ip_addr.s_addr) & ntohl(mask));
 }
 
+/* The carrier vocabulary the data plane actually understands. carrier_id
+ * matches enum jmx_carrier_id, which is what the kernel module matches rules
+ * against, so a UI picker built from this list cannot produce a value routed
+ * will later reject. logo_key is a stable slug for artwork.
+ *
+ * One table, two consumers: the published enumeration and the validator. They
+ * used to disagree by omission -- carrier was published as a capability but
+ * never checked -- which is how a typo reached the save path and came back as
+ * a bare invalid_request. */
+static const struct nc_carrier_def {
+    const char *id;
+    int carrier_id;
+    const char *label;
+    const char *logo_key;
+} nc_carrier_defs[] = {
+    { "any",     JMX_CARRIER_ANY,     "不限",       "generic" },
+    { "telecom", JMX_CARRIER_TELECOM, "中国电信",   "ctcc"    },
+    { "unicom",  JMX_CARRIER_UNICOM,  "中国联通",   "cucc"    },
+    { "mobile",  JMX_CARRIER_MOBILE,  "中国移动",   "cmcc"    },
+    { "edu",     JMX_CARRIER_EDU,     "中国教育网", "cernet"  },
+    { "other",   JMX_CARRIER_OTHER,   "其他",       "generic" },
+};
+
+/* Accepts the canonical ids above plus the aliases routed's
+ * carrier_from_string() already understands, so a value that works in a policy
+ * rule is not rejected here. */
+static int nc_carrier_id_known(const char *carrier)
+{
+    static const char *const aliases[] = {
+        "ctcc", "cucc", "cmcc", "cernet", NULL
+    };
+    size_t i;
+
+    if (!carrier || !carrier[0])
+        return 1;
+    for (i = 0; i < sizeof(nc_carrier_defs) / sizeof(nc_carrier_defs[0]); i++)
+        if (!strcasecmp(carrier, nc_carrier_defs[i].id))
+            return 1;
+    for (i = 0; aliases[i]; i++)
+        if (!strcasecmp(carrier, aliases[i]))
+            return 1;
+    return 0;
+}
+
+struct json_object *jmx_netconfig_carrier_values(void)
+{
+    struct json_object *arr = json_object_new_array();
+    size_t i;
+
+    for (i = 0; i < sizeof(nc_carrier_defs) / sizeof(nc_carrier_defs[0]); i++) {
+        struct json_object *o = json_object_new_object();
+
+        json_object_object_add(o, "id", json_object_new_string(nc_carrier_defs[i].id));
+        json_object_object_add(o, "carrier_id", json_object_new_int(nc_carrier_defs[i].carrier_id));
+        json_object_object_add(o, "label", json_object_new_string(nc_carrier_defs[i].label));
+        json_object_object_add(o, "logo_key", json_object_new_string(nc_carrier_defs[i].logo_key));
+        json_object_array_add(arr, o);
+    }
+    return arr;
+}
+
 struct json_object *jmx_netconfig_wan_validate(struct json_object *wan_json)
 {
     struct json_object *errors = json_object_new_array();
@@ -3542,6 +3605,31 @@ struct json_object *jmx_netconfig_wan_validate(struct json_object *wan_json)
 
     if (gateway[0] && !nc_is_valid_ip(gateway))
         nc_add_field_error(errors, "wan.gateway", "invalid_ip", "gateway must be a valid IPv4 address");
+
+    /* carrier had no validation at all, so anything typed into the form was
+     * accepted here and then failed later with a flat invalid_request that
+     * named no field. Check it against the published vocabulary instead, and
+     * say which value was rejected. */
+    {
+        struct json_object *carrier_val = NULL;
+
+        if (json_object_object_get_ex(wan_json, "carrier", &carrier_val)) {
+            if (!carrier_val) {
+                nc_add_field_error(errors, "wan.carrier", "null_not_allowed",
+                    "carrier must be a string or omitted, not null");
+            } else if (json_object_is_type(carrier_val, json_type_string)) {
+                const char *carrier = json_object_get_string(carrier_val);
+
+                if (carrier && carrier[0] && !nc_carrier_id_known(carrier))
+                    nc_add_field_error(errors, "wan.carrier", "unknown_carrier",
+                        "carrier must be one of any, telecom, unicom, mobile, edu, other "
+                        "(see GET /api/v1/network/carriers)");
+            } else {
+                nc_add_field_error(errors, "wan.carrier", "invalid_type",
+                    "carrier must be a string");
+            }
+        }
+    }
 
     if (mtu < 576 || mtu > 9000)
         nc_add_field_error(errors, "wan.mtu", "out_of_range", "mtu must be between 576 and 9000");
@@ -3897,6 +3985,115 @@ int jmx_netconfig_wan_set_enabled(const char *id, int enabled)
     return rc;
 }
 
+/* Read the running l3 device of a uci interface via ubus. Returns 0 and fills
+ * out when the interface is up with a usable device, -1 otherwise. Caller must
+ * have validated section as a uci section name: it reaches a shell command. */
+static int nc_wan_runtime_l3_device(const char *section, char *out, size_t out_len)
+{
+    char command[192];
+    char line[4096];
+    struct json_object *root = NULL;
+    struct json_object *value = NULL;
+    FILE *fp;
+    int rc = -1;
+
+    if (!section || !out || !out_len)
+        return -1;
+    out[0] = '\0';
+    snprintf(command, sizeof(command),
+             "ubus -S call network.interface.%s status 2>/dev/null", section);
+    fp = popen(command, "r");
+    if (!fp)
+        return -1;
+    if (fgets(line, sizeof(line), fp))
+        root = json_tokener_parse(line);
+    pclose(fp);
+    if (root && json_object_object_get_ex(root, "l3_device", &value) && value) {
+        const char *device = json_object_get_string(value);
+
+        if (device && device[0] && if_nametoindex(device) > 0) {
+            snprintf(out, out_len, "%s", device);
+            rc = 0;
+        }
+    }
+    if (root)
+        json_object_put(root);
+    return rc;
+}
+
+/* Redial one WAN: ifdown then ifup on its uci interface section. Config is not
+ * touched, so this is a runtime action rather than a write to the ledger.
+ *
+ * Returns 0 when the interface came back up with an l3 device before the
+ * deadline, JMX_NETCONFIG_WAN_RECONNECT_TIMEOUT when the redial was issued but
+ * the line had not come up yet (the caller must report that honestly instead of
+ * calling it a failure -- pppoe routinely needs more than ten seconds),
+ * JMX_NETCONFIG_WAN_RECONNECT_DISABLED for a WAN that exists but is disabled,
+ * and -1 for a bad id or a WAN that does not exist.
+ *
+ * A disabled line is refused before ifdown/ifup runs. Redialling it would
+ * report "pending" forever -- ifup on a disabled uci section never yields an
+ * l3 device -- which reads to the caller as a slow success rather than a
+ * configuration problem.
+ *
+ * id reaches a shell command, so it is validated as a uci section name first. */
+int jmx_netconfig_wan_reconnect(const char *id, int wait_ms, char *state_out,
+                                size_t state_len)
+{
+    sqlite3_stmt *st = NULL;
+    char command[192];
+    int exists = 0;
+    int enabled = 0;
+    int waited = 0;
+    const int step_ms = 500;
+
+    if (state_out && state_len)
+        state_out[0] = '\0';
+    if (!nc_uci_section_name_ok(id))
+        return -1;
+    if (jmx_netconfig_db_init() != 0)
+        return -1;
+    if (nc_prepare(&st, "SELECT enabled FROM wan WHERE id=?1") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        exists = 1;
+        enabled = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (!exists)
+        return -1;
+    if (!enabled)
+        return JMX_NETCONFIG_WAN_RECONNECT_DISABLED;
+
+    snprintf(command, sizeof(command), "/sbin/ifdown %s >/dev/null 2>&1", id);
+    if (system(command) == -1)
+        return -1;
+    snprintf(command, sizeof(command), "/sbin/ifup %s >/dev/null 2>&1", id);
+    if (system(command) == -1)
+        return -1;
+
+    if (wait_ms < 0)
+        wait_ms = 0;
+    if (wait_ms > JMX_NETCONFIG_WAN_RECONNECT_MAX_WAIT_MS)
+        wait_ms = JMX_NETCONFIG_WAN_RECONNECT_MAX_WAIT_MS;
+    while (waited <= wait_ms) {
+        char l3_device[64] = "";
+
+        if (nc_wan_runtime_l3_device(id, l3_device, sizeof(l3_device)) == 0 &&
+            l3_device[0]) {
+            if (state_out && state_len)
+                snprintf(state_out, state_len, "%s", l3_device);
+            return 0;
+        }
+        if (waited == wait_ms)
+            break;
+        usleep((useconds_t)step_ms * 1000);
+        waited += step_ms;
+    }
+    return JMX_NETCONFIG_WAN_RECONNECT_TIMEOUT;
+}
+
 int jmx_netconfig_wan_delete(const char *id)
 {
     sqlite3_stmt *st = NULL;
@@ -3993,6 +4190,13 @@ int jmx_netconfig_wan_delete(const char *id)
     if (nc_exec("COMMIT") != 0)
         goto done;
     db_tx = 0;
+    /* The WAN is gone: end its open connection-time session (and those of its
+     * hybrid children) so a WAN recreated under the same id counts from zero
+     * instead of inheriting the deleted line's started_at. Runs after COMMIT
+     * because wan_session lives in the runtime DB, not this transaction. */
+    jmx_db_close_wan_session(id, "wan_deleted");
+    for (i = 0; i < hybrid_count; i++)
+        jmx_db_close_wan_session(hybrid_ids[i], "wan_deleted");
     rc = 0;
 
 done:
@@ -4159,13 +4363,91 @@ static void nc_lan_load_ipv6(const char *lan_id, struct json_object *lan_obj)
     json_object_object_add(lan_obj, "ipv6", ipv6);
 }
 
+/* True when an already-loaded network package has no interface section for
+ * this id. Split out so both the list annotation and the delete check ask the
+ * same question of the same source. */
+static int nc_lan_missing_in_uci_pkg(struct uci_package *pkg, const char *lan_id)
+{
+    struct uci_element *e;
+
+    if (!pkg || !lan_id || !lan_id[0])
+        return 0;
+    uci_foreach_element(&pkg->sections, e) {
+        struct uci_section *s = uci_to_section(e);
+
+        if (!s || strcmp(s->type, "interface") != 0)
+            continue;
+        if (!strcmp(s->e.name, lan_id))
+            return 0;
+    }
+    return 1;
+}
+
+/* True when config.db still holds this LAN but uci no longer does, i.e. the row
+ * is a ghost the data plane does not back. Fails closed: if uci cannot be read
+ * at all we report "not orphaned" so nothing treats a read error as licence to
+ * discard a live LAN. */
+static int nc_lan_is_orphaned(const char *lan_id)
+{
+    struct uci_context *ctx;
+    struct uci_package *pkg = NULL;
+    int orphaned = 0;
+
+    if (!lan_id || !lan_id[0])
+        return 0;
+    ctx = uci_alloc_context();
+    if (!ctx)
+        return 0;
+    if (uci_load(ctx, "network", &pkg) == UCI_OK && pkg) {
+        orphaned = nc_lan_missing_in_uci_pkg(pkg, lan_id);
+        uci_unload(ctx, pkg);
+    }
+    uci_free_context(ctx);
+    return orphaned;
+}
+
+/* Annotate a LAN row with whether the data plane still backs it. Adds
+ * orphaned=true plus a machine-readable reason when the uci interface section
+ * is gone, so the UI can show it as stale instead of presenting it as a normal
+ * LAN whose ports contradict network/ports ownership. Absent uci (no context,
+ * package failed to load) leaves the row unannotated rather than declaring
+ * every LAN an orphan. */
+static void nc_lan_mark_orphaned(struct uci_context *ctx,
+                                 struct uci_package *pkg,
+                                 const char *lan_id,
+                                 struct json_object *lan_obj)
+{
+    int orphaned;
+
+    (void)ctx;
+    if (!pkg || !lan_id || !lan_id[0] || !lan_obj)
+        return;
+    orphaned = nc_lan_missing_in_uci_pkg(pkg, lan_id);
+    json_object_object_add(lan_obj, "orphaned", json_object_new_boolean(orphaned));
+    if (orphaned)
+        json_object_object_add(lan_obj, "orphan_reason",
+                               json_object_new_string("uci_interface_section_missing"));
+}
+
 struct json_object *jmx_netconfig_lan_list(void)
 {
     struct json_object *data = json_object_new_object();
     struct json_object *arr = json_object_new_array();
     sqlite3_stmt *st = NULL;
+    struct uci_context *lctx = NULL;
+    struct uci_package *lpkg = NULL;
 
     if (jmx_netconfig_db_init() != 0) goto done;
+    /* config.db is the write ledger, but uci is what the data plane actually
+     * runs. When a LAN is removed outside of the web API (a hand edit of
+     * /etc/config/network, which users are forced into while no DELETE route
+     * exists) the ledger row survives and this list happily returned a LAN
+     * that has no uci section and no bridge -- a ghost whose ports then look
+     * claimed by both a LAN and a WAN. Load uci once here so each row can be
+     * annotated rather than silently trusted. */
+    lctx = uci_alloc_context();
+    if (lctx && uci_load(lctx, "network", &lpkg) != UCI_OK)
+        lpkg = NULL;
     if (nc_prepare(&st,
         "SELECT id,name,note,ifname,device,mode,parent_lan_id,vlan_id,"
         "mac_clone,speed,duplex,lan_visit,enabled "
@@ -4177,11 +4459,16 @@ struct json_object *jmx_netconfig_lan_list(void)
             nc_lan_load_addresses(lid, l);
             nc_lan_load_dhcp(lid, l);
             nc_lan_load_ipv6(lid, l);
+            nc_lan_mark_orphaned(lctx, lpkg, lid, l);
             json_object_array_add(arr, l);
         }
         sqlite3_finalize(st);
     }
 done:
+    if (lctx) {
+        if (lpkg) uci_unload(lctx, lpkg);
+        uci_free_context(lctx);
+    }
     json_object_object_add(data, "lans", arr);
     return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
 }
@@ -4529,7 +4816,16 @@ int jmx_netconfig_lan_delete(const char *id)
     if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
     st = NULL;
-    if (count > 0) return JMX_NETCONFIG_DELETE_PORTS_ATTACHED;
+    /* Refuse only while the ledger's ports are still really this LAN's. Once
+     * the uci interface section is gone the row is a ghost: its "attached"
+     * ports have already been taken over by whatever now owns them (a WAN, in
+     * the case that produced this fix), and refusing with lan_ports_attached
+     * left the user unable to clean it up from the web at all -- they had to
+     * hand-edit /etc/config/network. A ghost's port rows get dropped along
+     * with it below, so this stays a decision about the data plane rather than
+     * about a stale ledger. */
+    if (count > 0 && !nc_lan_is_orphaned(id))
+        return JMX_NETCONFIG_DELETE_PORTS_ATTACHED;
 
     if (nc_prepare(&st, "SELECT COUNT(*) FROM lan WHERE parent_lan_id=?1") != 0)
         return -1;
@@ -8668,12 +8964,39 @@ struct json_object *jmx_netconfig_capabilities(void)
 
     /* Carrier profile */
     json_object_object_add(data, "carrier_profile", json_object_new_boolean(1));
+    /* Enumerable carrier list, so the WAN form can offer a picker instead of a
+     * free-text box the user has to guess the spelling of. */
+    json_object_object_add(data, "carrier_enum", json_object_new_boolean(1));
+    json_object_object_add(data, "carrier_values", jmx_netconfig_carrier_values());
 
     /* Expected bandwidth */
     json_object_object_add(data, "expected_bandwidth", json_object_new_boolean(1));
 
     /* WAN DNS policy */
     json_object_object_add(data, "wan_dns_policy", json_object_new_boolean(1));
+
+    /*
+     * WAN redial: POST /api/v1/network/wans/{id}/reconnect. Runtime action only
+     * -- it does ifdown/ifup on the line's uci section and writes no config, so
+     * it is published separately from every wan_*_write key above.
+     *
+     * The frontend gates its per-line reconnect button on this key alone and
+     * must not probe by calling the route: an unregistered write path is refused
+     * 403 by the permission layer, indistinguishable from a registered one the
+     * caller may not use.
+     *
+     * wan_reconnect_wait_ms_max is the largest wait_ms the runtime will honour
+     * before it answers state=pending. webd clamps the HTTP-facing value lower
+     * than the core ceiling, so this reports the effective HTTP limit rather
+     * than JMX_NETCONFIG_WAN_RECONNECT_MAX_WAIT_MS.
+     */
+    json_object_object_add(data, "wan_reconnect", json_object_new_boolean(1));
+    json_object_object_add(data, "wan_reconnect_wait_ms_max",
+                           json_object_new_int(20000));
+    /* Disabled lines are refused with line_disabled instead of being redialled
+     * into a pending state that can never resolve. */
+    json_object_object_add(data, "wan_reconnect_requires_enabled",
+                           json_object_new_boolean(1));
 
     /* save_by_id: always supported (SQLite stable id) */
     json_object_object_add(data, "save_by_id", json_object_new_boolean(1));
@@ -11560,6 +11883,18 @@ int nc_json_int_def(struct json_object *o, const char *k, int def)
     struct json_object *v;
     if (!o || !json_object_object_get_ex(o, k, &v) || !v) return def;
     return json_object_get_int(v);
+}
+
+/*
+ * 64-bit variant, for values that are absolute unix timestamps.
+ * nc_json_int_def() returns int, which silently truncates past 2038 and would
+ * turn a far-future expiry into a past one — i.e. a rule that never applies.
+ */
+int64_t nc_json_int64_def(struct json_object *o, const char *k, int64_t def)
+{
+    struct json_object *v;
+    if (!o || !json_object_object_get_ex(o, k, &v) || !v) return def;
+    return (int64_t)json_object_get_int64(v);
 }
 
 int nc_json_bool_def(struct json_object *o, const char *k, int def)
@@ -20242,6 +20577,27 @@ out:
     return rc;
 }
 
+/*
+ * ip rule pref band owned by the PBR generator.
+ *
+ * Starts at 11000 rather than 10000 so it cannot collide with routed's per-WAN
+ * fwmark rules, which live at 10000 + (table_id % 1000) and therefore occupy
+ * 10000-10999 (jmx_route.c route_rule_priority). The cleanup loop and the rule
+ * emission below both derive from this constant so the two cannot drift apart:
+ * a cleanup band wider than the emission band deletes someone else's rules, and
+ * a narrower one leaves stale rules behind.
+ */
+#define NC_ADV_PBR_PREF_BASE 11000
+#define NC_ADV_PBR_PREF_SPAN 9000
+_Static_assert(NC_ADV_PBR_PREF_BASE + NC_ADV_PBR_PREF_SPAN - 1 <= 19999,
+               "PBR pref band must stay within 11000-19999");
+
+/* Pinned iif rules sit below the fwmark band and must be evaluated first. */
+#define NC_ADV_PIN_PREF_BASE 9000
+#define NC_ADV_PIN_PREF_SPAN 900
+_Static_assert(NC_ADV_PIN_PREF_BASE + NC_ADV_PIN_PREF_SPAN - 1 < NC_ADV_PBR_PREF_BASE,
+               "pin band must not overlap the fwmark band");
+
 static unsigned nc_adv_rule_mark(const char *id, int prio)
 {
     unsigned h = 2166136261u;
@@ -20404,10 +20760,23 @@ static int nc_adv_generate_runtime(FILE *script_path, FILE *nft_fp)
     if (step_rc != SQLITE_DONE || sqlite3_finalize(st) != SQLITE_OK)
         return -1;
     st = NULL;
-    /* Clear both bands this generator owns: 9000-9899 holds the pinned
-     * iif rules, 10000-19999 the fwmark rules. Missing the pin band would
-     * leave a stale pin behind on every re-apply. */
-    fprintf(script_path, "for p in $(seq 9000 9899) $(seq 10000 19999); do ip rule del pref $p 2>/dev/null || true; ip -6 rule del pref $p 2>/dev/null || true; done\n");
+    /*
+     * Clear only the bands this generator owns: 9000-9899 for the pinned iif
+     * rules and 11000-19999 for the fwmark rules. Missing the pin band would
+     * leave a stale pin behind on every re-apply.
+     *
+     * 10000-10999 is deliberately excluded. routed publishes the per-WAN fwmark
+     * rules there, at 10000 + (table_id % 1000) (jmx_route.c
+     * route_rule_priority), so table 101 is pref 10101 and table 102 is 10102.
+     * The old range covered those, and nothing in this script re-adds them, so
+     * every apply used to drop multi-WAN steering until routed's next 30s tick
+     * rebuilt it. The two rule sets do not actually conflict: routed marks with
+     * bit 16 (0x10001, 0x10002) while PBR marks are 0x7000-0x7fff matched with a
+     * /0xffff mask, so the only overlap was the pref numbering.
+     */
+    fprintf(script_path, "for p in $(seq %d %d) $(seq %d 19999); do ip rule del pref $p 2>/dev/null || true; ip -6 rule del pref $p 2>/dev/null || true; done\n",
+            NC_ADV_PIN_PREF_BASE, NC_ADV_PIN_PREF_BASE + NC_ADV_PIN_PREF_SPAN - 1,
+            NC_ADV_PBR_PREF_BASE);
 
     if(nc_prepare(&st,"SELECT family,destination,gateway,interface,route_table,metric,mtu,route_type FROM static_route WHERE enabled=1 ORDER BY metric,id")!=0)
         return -1;
@@ -20506,8 +20875,8 @@ static int nc_adv_generate_runtime(FILE *script_path, FILE *nft_fp)
             if(proto && (!strcmp(proto,"tcp")||!strcmp(proto,"udp"))) { fprintf(nft_fp," %s",proto); if(ports&&ports[0]&&strcmp(ports,"any")) fprintf(nft_fp," dport { %s }",ports); has=1; }
             if(!has) { sqlite3_finalize(st); return -1; }
             fprintf(nft_fp," meta mark set 0x%04x ct mark set 0x%04x comment \"dwrt-pbr:%s\"\n",mark,mark,id?id:"rule");
-            fprintf(script_path,"ip rule add pref %d fwmark 0x%04x/0xffff table %d\n",10000+(prio%9000),mark,tid);
-            fprintf(script_path,"ip -6 rule add pref %d fwmark 0x%04x/0xffff table %d\n",10000+(prio%9000),mark,tid);
+            fprintf(script_path,"ip rule add pref %d fwmark 0x%04x/0xffff table %d\n",NC_ADV_PBR_PREF_BASE+(prio%NC_ADV_PBR_PREF_SPAN),mark,tid);
+            fprintf(script_path,"ip -6 rule add pref %d fwmark 0x%04x/0xffff table %d\n",NC_ADV_PBR_PREF_BASE+(prio%NC_ADV_PBR_PREF_SPAN),mark,tid);
             /*
              * "Pin this interface to this WAN, keep it out of load balancing."
              *
@@ -20527,11 +20896,11 @@ static int nc_adv_generate_runtime(FILE *script_path, FILE *nft_fp)
             if (pin_wan && src_dev_count > 0) {
                 for (int d = 0; d < src_dev_count; d++) {
                     fprintf(script_path,"ip rule add pref %d iif ",
-                            9000+(prio%900));
+                            NC_ADV_PIN_PREF_BASE+(prio%NC_ADV_PIN_PREF_SPAN));
                     nc_shquote(script_path, src_devs[d]);
                     fprintf(script_path," table %d\n",tid);
                     fprintf(script_path,"ip -6 rule add pref %d iif ",
-                            9000+(prio%900));
+                            NC_ADV_PIN_PREF_BASE+(prio%NC_ADV_PIN_PREF_SPAN));
                     nc_shquote(script_path, src_devs[d]);
                     fprintf(script_path," table %d\n",tid);
                 }
@@ -22142,21 +22511,23 @@ static void nc_netctl_mac_norm(const char*in,char*out,size_t n){snprintf(out,n,"
 static int nc_netctl_url_https(const char*s){return s&&(!strncasecmp(s,"https://",8));}
 
 static int nc_netctl_upsert_rule(struct json_object*o,const char*type)
-{const char*id=nc_json_str_def(o,"id","");const char*name=nc_json_str_def(o,"name",id);if(!nc_valid_name(id)||!name[0]||strlen(name)>64||!nc_netctl_type_ok(type))return -1;sqlite3_stmt*st=NULL;sqlite3_int64 now=(sqlite3_int64)nc_now_s();if(nc_prepare(&st,"INSERT OR REPLACE INTO network_control_rule(id,type,enabled,name,priority,source,schedule,remark,hits,last_hit,created_at,updated_at,runtime_rule_id) VALUES(?,?,?,?,?,?,?,?,COALESCE((SELECT hits FROM network_control_rule WHERE id=?),0),COALESCE((SELECT last_hit FROM network_control_rule WHERE id=?),0),COALESCE((SELECT created_at FROM network_control_rule WHERE id=?),?),?,COALESCE(NULLIF(?,0),(SELECT runtime_rule_id FROM network_control_rule WHERE id=?),0))")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,type,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,3,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,4,name,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,5,nc_json_int_def(o,"priority",1000));sqlite3_bind_text(st,6,nc_json_str_def(o,"source","any"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(o,"schedule","always"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(o,"remark",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,9,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,10,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,11,id,-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,12,now);sqlite3_bind_int64(st,13,now);sqlite3_bind_int(st,14,nc_json_int_def(o,"runtime_rule_id",0));sqlite3_bind_text(st,15,id,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);}return 0;}
+{const char*id=nc_json_str_def(o,"id","");const char*name=nc_json_str_def(o,"name",id);if(!nc_valid_name(id)||!name[0]||strlen(name)>64||!nc_netctl_type_ok(type))return -1;sqlite3_stmt*st=NULL;sqlite3_int64 now=(sqlite3_int64)nc_now_s();if(nc_prepare(&st,"INSERT OR REPLACE INTO network_control_rule(id,type,enabled,name,priority,source,schedule,remark,hits,last_hit,created_at,updated_at,runtime_rule_id,expires) VALUES(?,?,?,?,?,?,?,?,COALESCE((SELECT hits FROM network_control_rule WHERE id=?),0),COALESCE((SELECT last_hit FROM network_control_rule WHERE id=?),0),COALESCE((SELECT created_at FROM network_control_rule WHERE id=?),?),?,COALESCE(NULLIF(?,0),(SELECT runtime_rule_id FROM network_control_rule WHERE id=?),0),?)")==0){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,type,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,3,nc_json_bool_def(o,"enabled",1));sqlite3_bind_text(st,4,name,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,5,nc_json_int_def(o,"priority",1000));sqlite3_bind_text(st,6,nc_json_str_def(o,"source","any"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,7,nc_json_str_def(o,"schedule","always"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,8,nc_json_str_def(o,"remark",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,9,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,10,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,11,id,-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,12,now);sqlite3_bind_int64(st,13,now);sqlite3_bind_int(st,14,nc_json_int_def(o,"runtime_rule_id",0));sqlite3_bind_text(st,15,id,-1,SQLITE_TRANSIENT);sqlite3_bind_int64(st,16,(sqlite3_int64)nc_json_int64_def(o,"expires",0));sqlite3_step(st);sqlite3_finalize(st);}return 0;}
 
 static void nc_netctl_add_rules_json(struct json_object*arr,const char*type,const char*sql)
-    {sqlite3_stmt*st=NULL;if(nc_prepare(&st,sql)==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();nc_add_text(o,"id",st,0);json_object_object_add(o,"enabled",json_object_new_boolean(sqlite3_column_int(st,1)));nc_add_text(o,"name",st,2);json_object_object_add(o,"priority",json_object_new_int(sqlite3_column_int(st,3)));nc_add_text(o,"source",st,4);nc_add_text(o,"schedule",st,5);nc_add_text(o,"remark",st,6);json_object_object_add(o,"hits",json_object_new_int64(sqlite3_column_int64(st,7)));json_object_object_add(o,"last_hit",json_object_new_int64(sqlite3_column_int64(st,8)));int c=9;if(!strcmp(type,"connection_limit")){nc_add_text(o,"protocol",st,c++);nc_add_text(o,"wan_port",st,c++);json_object_object_add(o,"connection_limit",json_object_new_int(sqlite3_column_int(st,c++)));json_object_object_add(o,"burst",json_object_new_int(sqlite3_column_int(st,c++)));nc_add_text(o,"action",st,c++);}else if(!strcmp(type,"mac")){nc_add_text(o,"mode",st,c++);nc_add_text(o,"mac",st,c++);nc_add_text(o,"terminal_name",st,c++);}else if(!strcmp(type,"url_access")){nc_add_text(o,"mode",st,c++);nc_add_text(o,"domains",st,c++);nc_add_text(o,"match_type",st,c++);nc_add_text(o,"action",st,c++);}else if(!strcmp(type,"url_rewrite")){nc_add_text(o,"match_mode",st,c++);nc_add_text(o,"source_url",st,c++);nc_add_text(o,"dest_url",st,c++);nc_add_text(o,"exclude",st,c++);json_object_object_add(o,"ratio",json_object_new_int(sqlite3_column_int(st,c++)));if(nc_netctl_url_https(json_object_get_string(json_object_object_get(o,"source_url"))))json_object_object_add(o,"runtime_warning",json_object_new_string("unsupported_https_rewrite"));}else if(!strcmp(type,"app")){json_object_object_add(o,"app_ids",nc_json_array_from_text((const char*)sqlite3_column_text(st,c++)));json_object_object_add(o,"apps",nc_json_array_from_text((const char*)sqlite3_column_text(st,c++)));nc_add_text(o,"destination",st,c++);nc_add_text(o,"action",st,c++);json_object_object_add(o,"filter_quic",json_object_new_boolean(sqlite3_column_int(st,c++)));}else if(!strcmp(type,"terminal_limit")){nc_add_text(o,"limit_type",st,c++);nc_add_text(o,"line",st,c++);nc_add_text(o,"address",st,c++);nc_add_text(o,"protocol",st,c++);nc_add_text(o,"speed_mode",st,c++);nc_add_text(o,"src_port",st,c++);nc_add_text(o,"dest_port",st,c++);json_object_object_add(o,"upload_mbps",json_object_new_double(sqlite3_column_double(st,c++)));json_object_object_add(o,"download_mbps",json_object_new_double(sqlite3_column_double(st,c++)));}json_object_array_add(arr,o);}sqlite3_finalize(st);}}
+    {sqlite3_stmt*st=NULL;if(nc_prepare(&st,sql)==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();nc_add_text(o,"id",st,0);json_object_object_add(o,"enabled",json_object_new_boolean(sqlite3_column_int(st,1)));nc_add_text(o,"name",st,2);json_object_object_add(o,"priority",json_object_new_int(sqlite3_column_int(st,3)));nc_add_text(o,"source",st,4);nc_add_text(o,"schedule",st,5);nc_add_text(o,"remark",st,6);json_object_object_add(o,"hits",json_object_new_int64(sqlite3_column_int64(st,7)));json_object_object_add(o,"last_hit",json_object_new_int64(sqlite3_column_int64(st,8)));/* expires: 0 = never. Reported so the UI can show a lapse time and so an
+             * expired-but-retained rule is distinguishable from an active one. */
+            json_object_object_add(o,"expires",json_object_new_int64(sqlite3_column_int64(st,9)));json_object_object_add(o,"expired",json_object_new_boolean(sqlite3_column_int64(st,9)>0&&sqlite3_column_int64(st,9)<=(sqlite3_int64)nc_now_s()));int c=10;if(!strcmp(type,"connection_limit")){nc_add_text(o,"protocol",st,c++);nc_add_text(o,"wan_port",st,c++);json_object_object_add(o,"connection_limit",json_object_new_int(sqlite3_column_int(st,c++)));json_object_object_add(o,"burst",json_object_new_int(sqlite3_column_int(st,c++)));nc_add_text(o,"action",st,c++);}else if(!strcmp(type,"mac")){nc_add_text(o,"mode",st,c++);nc_add_text(o,"mac",st,c++);nc_add_text(o,"terminal_name",st,c++);}else if(!strcmp(type,"url_access")){nc_add_text(o,"mode",st,c++);nc_add_text(o,"domains",st,c++);nc_add_text(o,"match_type",st,c++);nc_add_text(o,"action",st,c++);}else if(!strcmp(type,"url_rewrite")){nc_add_text(o,"match_mode",st,c++);nc_add_text(o,"source_url",st,c++);nc_add_text(o,"dest_url",st,c++);nc_add_text(o,"exclude",st,c++);json_object_object_add(o,"ratio",json_object_new_int(sqlite3_column_int(st,c++)));if(nc_netctl_url_https(json_object_get_string(json_object_object_get(o,"source_url"))))json_object_object_add(o,"runtime_warning",json_object_new_string("unsupported_https_rewrite"));}else if(!strcmp(type,"app")){json_object_object_add(o,"app_ids",nc_json_array_from_text((const char*)sqlite3_column_text(st,c++)));json_object_object_add(o,"apps",nc_json_array_from_text((const char*)sqlite3_column_text(st,c++)));nc_add_text(o,"destination",st,c++);nc_add_text(o,"action",st,c++);json_object_object_add(o,"filter_quic",json_object_new_boolean(sqlite3_column_int(st,c++)));}else if(!strcmp(type,"terminal_limit")){nc_add_text(o,"limit_type",st,c++);nc_add_text(o,"line",st,c++);nc_add_text(o,"address",st,c++);nc_add_text(o,"protocol",st,c++);nc_add_text(o,"speed_mode",st,c++);nc_add_text(o,"src_port",st,c++);nc_add_text(o,"dest_port",st,c++);json_object_object_add(o,"upload_mbps",json_object_new_double(sqlite3_column_double(st,c++)));json_object_object_add(o,"download_mbps",json_object_new_double(sqlite3_column_double(st,c++)));}json_object_array_add(arr,o);}sqlite3_finalize(st);}}
 
 struct json_object *jmx_network_control_get(void)
 {
     if(jmx_netconfig_db_init()!=0)return jmx_gen_api_response_data(API_CODE_ERROR,NULL); nc_netctl_db_init(); struct json_object*d=json_object_new_object(); json_object_object_add(d,"ts",json_object_new_int64(nc_now_s())); sqlite3_stmt*st=NULL;
     if(nc_prepare(&st,"SELECT enabled,mode,default_action,schedule_default,apply_state,last_apply_at,appfilter_enabled,macfilter_enabled,record_enabled FROM network_control_global WHERE id=1")==0&&sqlite3_step(st)==SQLITE_ROW){struct json_object*g=json_object_new_object();json_object_object_add(g,"enabled",json_object_new_boolean(sqlite3_column_int(st,0)));json_object_object_add(g,"engine",json_object_new_string("jmx + nftables + tc"));nc_add_text(g,"mode",st,1);nc_add_text(g,"default_action",st,2);nc_add_text(g,"schedule_default",st,3);nc_add_text(g,"apply_state",st,4);json_object_object_add(g,"last_apply_at",json_object_new_int64(sqlite3_column_int64(st,5)));json_object_object_add(g,"appfilter_enabled",json_object_new_boolean(sqlite3_column_int(st,6)));json_object_object_add(g,"macfilter_enabled",json_object_new_boolean(sqlite3_column_int(st,7)));json_object_object_add(g,"record_enabled",json_object_new_boolean(sqlite3_column_int(st,8)));json_object_object_add(d,"global",g);sqlite3_finalize(st);} struct json_object*a;
-    a=json_object_new_array();nc_netctl_add_rules_json(a,"connection_limit","SELECT r.id,r.enabled,r.name,r.priority,r.source,r.schedule,r.remark,r.hits,r.last_hit,d.protocol,d.wan_port,d.connection_limit,d.burst,d.action FROM network_control_rule r JOIN network_control_connection_limit d ON d.rule_id=r.id WHERE r.type='connection_limit' ORDER BY r.priority,r.id");json_object_object_add(d,"connection_limits",a);
-    a=json_object_new_array();nc_netctl_add_rules_json(a,"mac","SELECT r.id,r.enabled,r.name,r.priority,r.source,r.schedule,r.remark,r.hits,r.last_hit,d.mode,d.mac,d.terminal_name FROM network_control_rule r JOIN network_control_mac_rule d ON d.rule_id=r.id WHERE r.type='mac' ORDER BY r.priority,r.id");json_object_object_add(d,"mac_rules",a);
-    a=json_object_new_array();nc_netctl_add_rules_json(a,"url_access","SELECT r.id,r.enabled,r.name,r.priority,r.source,r.schedule,r.remark,r.hits,r.last_hit,d.mode,d.domains,d.match_type,d.action FROM network_control_rule r JOIN network_control_url_access_rule d ON d.rule_id=r.id WHERE r.type='url_access' ORDER BY r.priority,r.id");json_object_object_add(d,"url_access_rules",a);
-    a=json_object_new_array();nc_netctl_add_rules_json(a,"url_rewrite","SELECT r.id,r.enabled,r.name,r.priority,r.source,r.schedule,r.remark,r.hits,r.last_hit,d.match_mode,d.source_url,d.dest_url,d.exclude,d.ratio FROM network_control_rule r JOIN network_control_url_rewrite_rule d ON d.rule_id=r.id WHERE r.type='url_rewrite' ORDER BY r.priority,r.id");json_object_object_add(d,"url_rewrite_rules",a);
-    a=json_object_new_array();nc_netctl_add_rules_json(a,"app","SELECT r.id,r.enabled,r.name,r.priority,r.source,r.schedule,r.remark,r.hits,r.last_hit,d.app_ids,d.apps,d.destination,d.action,d.filter_quic FROM network_control_rule r JOIN network_control_app_rule d ON d.rule_id=r.id WHERE r.type='app' ORDER BY r.priority,r.id");json_object_object_add(d,"app_rules",a);
-    a=json_object_new_array();nc_netctl_add_rules_json(a,"terminal_limit","SELECT r.id,r.enabled,r.name,r.priority,r.source,r.schedule,r.remark,r.hits,r.last_hit,d.limit_type,d.line,d.address,d.protocol,d.speed_mode,d.src_port,d.dest_port,d.upload_mbps,d.download_mbps FROM network_control_rule r JOIN network_control_terminal_limit d ON d.rule_id=r.id WHERE r.type='terminal_limit' ORDER BY r.priority,r.id");json_object_object_add(d,"terminal_limits",a);
+    a=json_object_new_array();nc_netctl_add_rules_json(a,"connection_limit","SELECT r.id,r.enabled,r.name,r.priority,r.source,r.schedule,r.remark,r.hits,r.last_hit,r.expires,d.protocol,d.wan_port,d.connection_limit,d.burst,d.action FROM network_control_rule r JOIN network_control_connection_limit d ON d.rule_id=r.id WHERE r.type='connection_limit' ORDER BY r.priority,r.id");json_object_object_add(d,"connection_limits",a);
+    a=json_object_new_array();nc_netctl_add_rules_json(a,"mac","SELECT r.id,r.enabled,r.name,r.priority,r.source,r.schedule,r.remark,r.hits,r.last_hit,r.expires,d.mode,d.mac,d.terminal_name FROM network_control_rule r JOIN network_control_mac_rule d ON d.rule_id=r.id WHERE r.type='mac' ORDER BY r.priority,r.id");json_object_object_add(d,"mac_rules",a);
+    a=json_object_new_array();nc_netctl_add_rules_json(a,"url_access","SELECT r.id,r.enabled,r.name,r.priority,r.source,r.schedule,r.remark,r.hits,r.last_hit,r.expires,d.mode,d.domains,d.match_type,d.action FROM network_control_rule r JOIN network_control_url_access_rule d ON d.rule_id=r.id WHERE r.type='url_access' ORDER BY r.priority,r.id");json_object_object_add(d,"url_access_rules",a);
+    a=json_object_new_array();nc_netctl_add_rules_json(a,"url_rewrite","SELECT r.id,r.enabled,r.name,r.priority,r.source,r.schedule,r.remark,r.hits,r.last_hit,r.expires,d.match_mode,d.source_url,d.dest_url,d.exclude,d.ratio FROM network_control_rule r JOIN network_control_url_rewrite_rule d ON d.rule_id=r.id WHERE r.type='url_rewrite' ORDER BY r.priority,r.id");json_object_object_add(d,"url_rewrite_rules",a);
+    a=json_object_new_array();nc_netctl_add_rules_json(a,"app","SELECT r.id,r.enabled,r.name,r.priority,r.source,r.schedule,r.remark,r.hits,r.last_hit,r.expires,d.app_ids,d.apps,d.destination,d.action,d.filter_quic FROM network_control_rule r JOIN network_control_app_rule d ON d.rule_id=r.id WHERE r.type='app' ORDER BY r.priority,r.id");json_object_object_add(d,"app_rules",a);
+    a=json_object_new_array();nc_netctl_add_rules_json(a,"terminal_limit","SELECT r.id,r.enabled,r.name,r.priority,r.source,r.schedule,r.remark,r.hits,r.last_hit,r.expires,d.limit_type,d.line,d.address,d.protocol,d.speed_mode,d.src_port,d.dest_port,d.upload_mbps,d.download_mbps FROM network_control_rule r JOIN network_control_terminal_limit d ON d.rule_id=r.id WHERE r.type='terminal_limit' ORDER BY r.priority,r.id");json_object_object_add(d,"terminal_limits",a);
     if(nc_prepare(&st,"SELECT anti_share_enabled,ttl_value,dns_hijack_protect,block_proxy_vpn,block_unknown_quic,scope,schedule FROM network_control_other WHERE id=1")==0&&sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();json_object_object_add(o,"anti_share_enabled",json_object_new_boolean(sqlite3_column_int(st,0)));json_object_object_add(o,"ttl_value",json_object_new_int(sqlite3_column_int(st,1)));json_object_object_add(o,"dns_hijack_protect",json_object_new_boolean(sqlite3_column_int(st,2)));json_object_object_add(o,"block_proxy_vpn",json_object_new_boolean(sqlite3_column_int(st,3)));json_object_object_add(o,"block_unknown_quic",json_object_new_boolean(sqlite3_column_int(st,4)));nc_add_text(o,"scope",st,5);nc_add_text(o,"schedule",st,6);json_object_object_add(d,"other_control",o);sqlite3_finalize(st);} a=json_object_new_array();nc_rulesd_add_whitelist(a,"app");json_object_object_add(d,"app_whitelist",a);a=json_object_new_array();nc_rulesd_add_whitelist(a,"mac");json_object_object_add(d,"mac_whitelist",a);a=json_object_new_array(); if(nc_prepare(&st,"SELECT id,ts,rule_id,type,client,source,target,action,reason,bytes FROM network_control_event ORDER BY ts DESC LIMIT 100")==0){while(sqlite3_step(st)==SQLITE_ROW){struct json_object*o=json_object_new_object();json_object_object_add(o,"id",json_object_new_int(sqlite3_column_int(st,0)));json_object_object_add(o,"ts",json_object_new_int64(sqlite3_column_int64(st,1)));nc_add_text(o,"rule_id",st,2);nc_add_text(o,"type",st,3);nc_add_text(o,"client",st,4);nc_add_text(o,"source",st,5);nc_add_text(o,"target",st,6);nc_add_text(o,"action",st,7);nc_add_text(o,"reason",st,8);json_object_object_add(o,"bytes",json_object_new_int64(sqlite3_column_int64(st,9)));json_object_array_add(a,o);}sqlite3_finalize(st);} json_object_object_add(d,"recent_events",a); return jmx_gen_api_response_data(API_CODE_SUCCESS,d);
 }
 
@@ -22164,7 +22535,33 @@ struct json_object *jmx_network_control_get(void)
 #define NC_NETCTL_SAVE_DETAIL_END sqlite3_step(st);sqlite3_finalize(st);}}}
 
 static int nc_netctl_save_connection(struct json_object*arr){NC_NETCTL_SAVE_DETAIL_BEGIN(arr,"connection_limit","INSERT OR REPLACE INTO network_control_connection_limit(rule_id,protocol,wan_port,connection_limit,burst,action) VALUES(?,?,?,?,?,?)")sqlite3_bind_text(st,2,nc_json_str_def(o,"protocol","tcp,udp"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(o,"wan_port","any"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,4,nc_json_int_def(o,"connection_limit",600));sqlite3_bind_int(st,5,nc_json_int_def(o,"burst",80));sqlite3_bind_text(st,6,nc_json_str_def(o,"action","limit"),-1,SQLITE_TRANSIENT);NC_NETCTL_SAVE_DETAIL_END return 0;}
-static int nc_netctl_save_mac(struct json_object*arr){if(arr&&json_object_is_type(arr,json_type_array)){int n=json_object_array_length(arr);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);char mac[32];const char*source=nc_json_str_def(o,"source","any");nc_netctl_mac_norm(nc_json_str_def(o,"mac",""),mac,sizeof(mac));if(strcmp(source,"any")&&!nc_netctl_mac_ok(mac))return -1;if(nc_netctl_upsert_rule(o,"mac")!=0)return -1;sqlite3_stmt*st=NULL;if(nc_prepare(&st,"INSERT OR REPLACE INTO network_control_mac_rule(rule_id,mode,mac,terminal_name) VALUES(?,?,?,?)")==0){sqlite3_bind_text(st,1,nc_json_str_def(o,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(o,"mode","deny"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,mac,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"terminal_name",""),-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);}}}return 0;}
+/*
+ * True when `mac` already belongs to an ACL rule other than `rule_id`.
+ *
+ * Upstream enforces one rule per MAC with a UNIQUE column. Here the uniqueness
+ * has to be checked explicitly because the row is keyed by rule_id, so two rules
+ * could carry the same MAC and both would render into nftables. Passing the
+ * rule's own id keeps an update to an existing rule from conflicting with itself.
+ */
+static int nc_netctl_mac_conflict(const char *mac, const char *rule_id)
+{
+    sqlite3_stmt *st = NULL;
+    int conflict = 0;
+
+    if (!mac || !mac[0])
+        return 0;
+    if (nc_prepare(&st,
+            "SELECT 1 FROM network_control_mac_rule WHERE mac=?1 AND rule_id<>?2 LIMIT 1") != 0)
+        return 0;
+    sqlite3_bind_text(st, 1, mac, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, rule_id ? rule_id : "", -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW)
+        conflict = 1;
+    sqlite3_finalize(st);
+    return conflict;
+}
+
+static int nc_netctl_save_mac(struct json_object*arr){if(arr&&json_object_is_type(arr,json_type_array)){int n=json_object_array_length(arr);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);char mac[32];const char*source=nc_json_str_def(o,"source","any");nc_netctl_mac_norm(nc_json_str_def(o,"mac",""),mac,sizeof(mac));if(strcmp(source,"any")&&!nc_netctl_mac_ok(mac))return -1;if(nc_netctl_mac_conflict(mac,nc_json_str_def(o,"id","")))return -1;if(nc_netctl_upsert_rule(o,"mac")!=0)return -1;sqlite3_stmt*st=NULL;if(nc_prepare(&st,"INSERT OR REPLACE INTO network_control_mac_rule(rule_id,mode,mac,terminal_name) VALUES(?,?,?,?)")==0){sqlite3_bind_text(st,1,nc_json_str_def(o,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,nc_json_str_def(o,"mode","deny"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,mac,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"terminal_name",""),-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);}}}return 0;}
 static int nc_netctl_save_url_access(struct json_object*arr){NC_NETCTL_SAVE_DETAIL_BEGIN(arr,"url_access","INSERT OR REPLACE INTO network_control_url_access_rule(rule_id,mode,domains,match_type,action) VALUES(?,?,?,?,?)")sqlite3_bind_text(st,2,nc_json_str_def(o,"mode","blacklist"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(o,"domains",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"match_type","domain"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"action","block"),-1,SQLITE_TRANSIENT);NC_NETCTL_SAVE_DETAIL_END return 0;}
 static int nc_netctl_save_url_rewrite(struct json_object*arr){NC_NETCTL_SAVE_DETAIL_BEGIN(arr,"url_rewrite","INSERT OR REPLACE INTO network_control_url_rewrite_rule(rule_id,match_mode,source_url,dest_url,exclude,ratio) VALUES(?,?,?,?,?,?)")sqlite3_bind_text(st,2,nc_json_str_def(o,"match_mode","domain"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,nc_json_str_def(o,"source_url",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"dest_url",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"exclude",""),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,6,nc_json_int_def(o,"ratio",100));NC_NETCTL_SAVE_DETAIL_END return 0;}
 static int nc_netctl_save_app(struct json_object*arr){if(!arr||!json_object_is_type(arr,json_type_array))return 0;int n=json_object_array_length(arr);for(int i=0;i<n;i++){struct json_object*o=json_object_array_get_idx(arr,i);if(nc_netctl_upsert_rule(o,"app")!=0)return -1;struct json_object*v=NULL;json_object_object_get_ex(o,"app_ids",&v);char*ids=nc_json_array_to_string(v,nc_json_str_def(o,"app_ids",""));json_object_object_get_ex(o,"apps",&v);char*apps=nc_json_array_to_string(v,nc_json_str_def(o,"apps",""));sqlite3_stmt*st=NULL;if(nc_prepare(&st,"INSERT OR REPLACE INTO network_control_app_rule(rule_id,app_ids,apps,destination,action,filter_quic) VALUES(?,?,?,?,?,?)")==0){sqlite3_bind_text(st,1,nc_json_str_def(o,"id",""),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,ids?ids:"",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,apps?apps:"",-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,nc_json_str_def(o,"destination","any"),-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,nc_json_str_def(o,"action","block"),-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,6,nc_json_int_def(o,"filter_quic",0));sqlite3_step(st);sqlite3_finalize(st);}if(ids)free(ids);if(apps)free(apps);}return 0;}
@@ -23559,19 +23956,189 @@ done:
 }
 
 /* ── nft rule generation from network_control rules ─────────────── */
+
+/*
+ * Strict "HH:MM" validator. Deliberately rejects anything that is not exactly
+ * five characters of the expected shape, because the value is interpolated into
+ * the generated nft ruleset and a loose check here would let arbitrary text
+ * reach the parser.
+ */
+static int nc_netctl_hhmm_ok(const char *s)
+{
+    int hh, mm;
+
+    if (!s || strlen(s) != 5 || s[2] != ':')
+        return 0;
+    if (!isdigit((unsigned char)s[0]) || !isdigit((unsigned char)s[1]) ||
+        !isdigit((unsigned char)s[3]) || !isdigit((unsigned char)s[4]))
+        return 0;
+    hh = (s[0] - '0') * 10 + (s[1] - '0');
+    mm = (s[3] - '0') * 10 + (s[4] - '0');
+    /* 24:00 is accepted as an end-of-day marker; nft treats it as midnight. */
+    if (hh == 24)
+        return mm == 0;
+    return hh <= 23 && mm <= 59;
+}
+
+
+/*
+ * Translate a stored schedule into an nft match clause.
+ *
+ * Storage format is either the literal "always" (or empty) or the JSON array
+ * already used by nc_rulesd_add_time_rules():
+ *
+ *   [{"weekdays":[1,2,3,4,5],"start_time":"18:00","end_time":"22:00"}]
+ *
+ * Writes the clause (leading space included) into `out` and returns 0. An
+ * always-on schedule yields an empty string. Returns -1 when the schedule
+ * cannot be represented, and the caller must then refuse to emit the rule
+ * rather than silently dropping the time restriction — a MAC block whose
+ * schedule was ignored would apply 24/7 instead of during the chosen window.
+ *
+ * Only the first entry is translated. nft matches one rule against one
+ * expression, so several disjoint windows need several rules; that is why
+ * multi-window schedules are rejected here instead of being partially applied.
+ *
+ * Timezone note, verified on 30.1 with nft v1.1.6 (--debug=netlink):
+ * nft converts "18:00" to seconds-of-day in UTC using the timezone of the
+ * process that parses the ruleset, and the kernel then matches UTC. So the
+ * clause is written in local time on purpose and must be parsed by a process
+ * whose timezone matches the device. A window that crosses UTC midnight after
+ * the shift is handled by nft itself, which inverts it into a "range neq"
+ * expression, so no wrap handling is needed here.
+ */
+static int nc_nft_schedule_clause(const char *schedule, char *out, size_t out_len)
+{
+    struct json_object *parsed = NULL, *entry, *days, *v;
+    const char *start, *end;
+    int written, day_count, i;
+    size_t used = 0;
+
+    if (!out || out_len == 0)
+        return -1;
+    out[0] = '\0';
+    if (!schedule || !schedule[0] || !strcmp(schedule, "always"))
+        return 0;
+    if (schedule[0] != '[')
+        return -1;
+    parsed = json_tokener_parse(schedule);
+    if (!parsed || !json_object_is_type(parsed, json_type_array)) {
+        if (parsed) json_object_put(parsed);
+        return -1;
+    }
+    if (json_object_array_length(parsed) != 1) {
+        json_object_put(parsed);
+        return -1;
+    }
+    entry = json_object_array_get_idx(parsed, 0);
+    if (!entry || !json_object_is_type(entry, json_type_object)) {
+        json_object_put(parsed);
+        return -1;
+    }
+
+    start = json_object_object_get_ex(entry, "start_time", &v) && v ?
+            json_object_get_string(v) : NULL;
+    end = json_object_object_get_ex(entry, "end_time", &v) && v ?
+          json_object_get_string(v) : NULL;
+    if (!nc_netctl_hhmm_ok(start) || !nc_netctl_hhmm_ok(end)) {
+        json_object_put(parsed);
+        return -1;
+    }
+    /*
+     * A window covering the whole day is the same as no restriction. Emitting
+     * it as a range would be harmless but pointless, and 00:00-23:59 shifted
+     * out of local time is exactly the wrapping case, so skip it.
+     */
+    if (!(!strcmp(start, "00:00") && (!strcmp(end, "23:59") || !strcmp(end, "24:00")))) {
+        written = snprintf(out + used, out_len - used,
+                           " meta hour \"%s\"-\"%s\"", start, end);
+        if (written < 0 || (size_t)written >= out_len - used) {
+            json_object_put(parsed);
+            return -1;
+        }
+        used += (size_t)written;
+    }
+
+    if (json_object_object_get_ex(entry, "weekdays", &days) && days &&
+        json_object_is_type(days, json_type_array)) {
+        day_count = json_object_array_length(days);
+        /* All seven days present means no weekday restriction to express. */
+        if (day_count > 0 && day_count < 7) {
+            static const char *const names[7] = {
+                "Sunday", "Monday", "Tuesday", "Wednesday",
+                "Thursday", "Friday", "Saturday"
+            };
+            int seen[7] = { 0 };
+            int emitted = 0;
+
+            written = snprintf(out + used, out_len - used, " meta day { ");
+            if (written < 0 || (size_t)written >= out_len - used) {
+                json_object_put(parsed);
+                return -1;
+            }
+            used += (size_t)written;
+            for (i = 0; i < day_count; i++) {
+                struct json_object *d = json_object_array_get_idx(days, i);
+                int n;
+
+                if (!d || !json_object_is_type(d, json_type_int)) {
+                    json_object_put(parsed);
+                    return -1;
+                }
+                n = json_object_get_int(d);
+                if (n < 0 || n > 6 || seen[n]) {
+                    json_object_put(parsed);
+                    return -1;
+                }
+                seen[n] = 1;
+                written = snprintf(out + used, out_len - used, "%s\"%s\"",
+                                   emitted ? ", " : "", names[n]);
+                if (written < 0 || (size_t)written >= out_len - used) {
+                    json_object_put(parsed);
+                    return -1;
+                }
+                used += (size_t)written;
+                emitted++;
+            }
+            written = snprintf(out + used, out_len - used, " }");
+            if (written < 0 || (size_t)written >= out_len - used) {
+                json_object_put(parsed);
+                return -1;
+            }
+            used += (size_t)written;
+        } else if (day_count > 7) {
+            json_object_put(parsed);
+            return -1;
+        }
+    }
+
+    json_object_put(parsed);
+    return 0;
+}
+
 static int nc_nft_gen_mac_rules(FILE *fp)
 {
     sqlite3_stmt *st = NULL;
     int count = 0;
     int step_rc;
+    int64_t now = nc_now_s();
 
-    if (!fp || nc_prepare(&st, "SELECT d.mac, r.name, d.mode FROM network_control_rule r JOIN network_control_mac_rule d ON d.rule_id=r.id WHERE r.type='mac' AND r.enabled=1 ORDER BY r.priority, r.id") != 0)
+    /*
+     * Expired rules are filtered in SQL (expires=0 means "never"), so a
+     * temporary block stops taking effect on the next ruleset regeneration
+     * without needing its row deleted. The row is kept on purpose: the user can
+     * see and re-arm a rule that lapsed.
+     */
+    if (!fp || nc_prepare(&st, "SELECT d.mac, r.name, d.mode, r.schedule, r.expires FROM network_control_rule r JOIN network_control_mac_rule d ON d.rule_id=r.id WHERE r.type='mac' AND r.enabled=1 AND (r.expires=0 OR r.expires>?1) ORDER BY r.priority, r.id") != 0)
         return -1;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
     while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
             const char *mac = (const char*)sqlite3_column_text(st, 0);
             const char *name = (const char*)sqlite3_column_text(st, 1);
             const char *mode = (const char*)sqlite3_column_text(st, 2);
+            const char *schedule = (const char*)sqlite3_column_text(st, 3);
             const unsigned char *p;
+            char when[256];
 
             if (!nc_netctl_mac_ok(mac) || !name || strlen(name) > 128 ||
                 !mode || (strcmp(mode, "deny") && strcmp(mode, "block") &&
@@ -23580,11 +24147,20 @@ static int nc_nft_gen_mac_rules(FILE *fp)
             for (p = (const unsigned char *)name; *p; p++)
                 if (*p < 0x20 || *p == 0x7f)
                     goto fail;
+            /*
+             * Fail the whole generation rather than emit a rule without its
+             * time restriction: a block that was meant for 18:00-22:00 would
+             * otherwise silently apply all day.
+             */
+            if (nc_nft_schedule_clause(schedule, when, sizeof(when)) != 0)
+                goto fail;
             if(!strcmp(mode, "deny") || !strcmp(mode, "block")) {
-                if (fprintf(fp, "\t\tether saddr %s drop  # %s\n", mac, name) < 0)
+                if (fprintf(fp, "\t\tether saddr %s%s drop  # %s\n",
+                            mac, when, name) < 0)
                     goto fail;
             } else if(!strcmp(mode, "allow")) {
-                if (fprintf(fp, "\t\tether saddr %s accept  # %s\n", mac, name) < 0)
+                if (fprintf(fp, "\t\tether saddr %s%s accept  # %s\n",
+                            mac, when, name) < 0)
                     goto fail;
             }
             count++;

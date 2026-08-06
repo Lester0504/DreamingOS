@@ -37,6 +37,41 @@ def c_function(text: str, signature: str) -> str:
     return c_function_at(text, text.index(signature))
 
 
+def strip_c_comments(text: str) -> str:
+    """Blank out /* */ and // comments, preserving length and line structure.
+
+    Ordering assertions below use str.index() to compare call-site offsets. The
+    worker's opening comment mentions otad_operation_reverify_trust_binding() by
+    name, so a raw index() matched the comment instead of the call and reported an
+    ordering violation that does not exist in the code. Replacing comment bytes
+    with spaces keeps every other offset identical.
+    """
+    out = []
+    index = 0
+    length = len(text)
+    while index < length:
+        pair = text[index:index + 2]
+        if pair == "/*":
+            end = text.find("*/", index + 2)
+            if end == -1:
+                out.append(" " * (length - index))
+                break
+            block = text[index:end + 2]
+            out.append("".join(ch if ch == "\n" else " " for ch in block))
+            index = end + 2
+        elif pair == "//":
+            end = text.find("\n", index)
+            if end == -1:
+                out.append(" " * (length - index))
+                break
+            out.append(" " * (end - index))
+            index = end
+        else:
+            out.append(text[index])
+            index += 1
+    return "".join(out)
+
+
 def c_function_containing(text: str, needle: str) -> tuple[str, str]:
     """Return the unique C function containing a production invariant marker."""
     needle_pos = text.index(needle)
@@ -210,10 +245,16 @@ assert "topology.topology_digest" in binding
 assert "work->topology_digest" in binding
 
 worker = c_function(FIRMWARE, "static int otad_firmware_apply_worker(")
-staging_open = worker.index("otad_staged_upload_open(")
-staging_size = worker.index("upload.size != work->source_size")
-staging_hash = worker.index("upload.sha256, work->source_sha256")
-trust_call = worker.index("otad_operation_reverify_trust_binding(")
+# Ordering is checked against the comment-free text so a call named in a comment
+# cannot be mistaken for the call itself.
+worker_code = strip_c_comments(worker)
+assert "otad_operation_reverify_trust_binding(" in worker_code, (
+    "the reverify call must be real code, not only mentioned in a comment"
+)
+staging_open = worker_code.index("otad_staged_upload_open(")
+staging_size = worker_code.index("upload.size != work->source_size")
+staging_hash = worker_code.index("upload.sha256, work->source_sha256")
+trust_call = worker_code.index("otad_operation_reverify_trust_binding(")
 assert staging_open < staging_size < trust_call
 assert staging_open < staging_hash < trust_call
 for target_boundary in (
@@ -221,7 +262,7 @@ for target_boundary in (
     "otad_grubenv_prepare_target(",
     "open(target, O_WRONLY",
 ):
-    assert trust_call < worker.index(target_boundary), (
+    assert trust_call < worker_code.index(target_boundary), (
         f"worker must reverify binding before {target_boundary}"
     )
 

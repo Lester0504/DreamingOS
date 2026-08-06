@@ -46,7 +46,7 @@ assert '"statvfs_failed"' in COMMON
 validate = between(
     FIRMWARE,
     "static int otad_firmware_validate_fd",
-    "static struct json_object *otad_operation_status_by_id",
+    "struct json_object *otad_operation_status_by_id",
 )
 assert validate.index("otad_ab_topology_discover(") < validate.index(
     "otad_inactive_capacity_gate("
@@ -60,7 +60,9 @@ assert '"filesystem"' in COMMON
 assert "statvfs(" not in between(
     FIRMWARE,
     "static int otad_inactive_capacity_gate",
-    "static void otad_current_release_version",
+    # End anchor: this function returns int now, not void. The old anchor made the
+    # slice start-to-end lookup fail, which read as a contract violation.
+    "static int otad_current_release_version",
 ), "full firmware replaces the slot image and must not inspect old filesystem free space"
 
 apply_worker = between(

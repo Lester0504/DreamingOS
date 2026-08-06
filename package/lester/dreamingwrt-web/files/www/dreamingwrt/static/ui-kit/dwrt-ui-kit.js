@@ -339,7 +339,34 @@
    * 这里让 portal 里的抽屉把事件按原宿主重放：克隆一个同类型事件派发到宿主上，并把
    * `target` 指回真实的抽屉内节点，页面既有的委托无需改动即可继续工作。
    */
-  const DELEGATED_EVENTS = ['click', 'input', 'change', 'submit', 'keydown'];
+  /*
+   * 转发名单必须同时包含**原生事件**与**Kit 自己派发的组件事件**。
+   *
+   * 只列原生事件时，抽屉被搬进 portal 后组件事件到不了页面的委托，表现为静默丢数据
+   * 而不是报错：区域抽屉里选中「网络 / 接口」后保存，POST body 的 `members` 是空数组
+   * （`policy-regions.js` 把 `dwrt-combobox-change` 绑在 root 上，
+   * 而 combobox 从自己的根派发，抽屉已不是 root 的后代），界面上完全看不出异常 ——
+   * 下拉标签照常显示选中项。见
+   * todo/2026-08-06/Handoff/HandoffWorker-to-Front-kit-delegated-events-drop-custom-events.md
+   *
+   * 全站扫过一遍 `addEventListener('dwrt-*')`：下面六个组件事件都有页面绑在 root 上，
+   * 抽屉里用到就会中招（combobox / grid-select / grid-activate 在 policy-regions.js，
+   * disclosure 在 vpn-config.js 与 appearance-settings.js，segment 在
+   * appearance-settings.js 与 gateway-shadow.js，tab-change 在 network-services.js、
+   * user-authentication.js、storage-file-services.js 等）。
+   * `table-sort` 与 `virtual-window-change` 目前无人监听，但同属组件事件，
+   * 一并纳入，免得下一个把表格放进抽屉的人再踩一遍。
+   *
+   * `dwrt-sheet-focus-restored` **刻意不在名单里**：它派发在 sheet 自身（见
+   * elevateSheet 的焦点恢复），若加进来会被本抽屉的转发器接住再重放，形成回环。
+   * 名单只放「组件 → 页面」方向的事件，不放抽屉自己的生命周期事件。
+   */
+  const DELEGATED_EVENTS = [
+    'click', 'input', 'change', 'submit', 'keydown',
+    'dwrt-combobox-change', 'dwrt-disclosure-change', 'dwrt-segment-change',
+    'dwrt-tab-change', 'dwrt-grid-select', 'dwrt-grid-activate',
+    'dwrt-table-sort', 'dwrt-virtual-window-change'
+  ];
 
   function bindSheetDelegation(sheet, state) {
     /*

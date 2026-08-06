@@ -582,6 +582,8 @@ static const struct route_risk g_route_risks[] = {
 
     /* Policy runtime and Policy Engine table/catalog aggregations. */
     { "/api/v1/route_status",                       "GET", JMX_RISK_LOW },
+    { "/api/v1/network/wan-policy",                 "GET", JMX_RISK_LOW },
+    { "/api/v1/network/wan-policy",                 "POST,PUT", JMX_RISK_MEDIUM },
     { "/api/v1/policy-engine/policy-table/preview", "GET,POST,PUT,PATCH", JMX_RISK_LOW },
     { "/api/v1/policy-engine/policy-table/",        "GET,POST,PUT,PATCH,DELETE", JMX_RISK_MEDIUM },
     { "/api/v1/policy-engine/policy-table",         "GET", JMX_RISK_LOW },

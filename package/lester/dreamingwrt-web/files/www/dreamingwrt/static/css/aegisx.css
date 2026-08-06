@@ -160,6 +160,12 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-content-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }
 .aegisx-geo-drawer .aegisx-drawer-body { width: 100%; max-width: 100%; overflow-x: hidden; }
 .aegisx-honeypot-modal-layer { --dwrt-kit-modal-z: 74; }
+/*
+ * 确认卡必须盖在弹窗之上。kit 的 modal 层默认 --dwrt-kit-modal-z:72，而本页把蜜罐与证书
+ * 弹窗抬到了 74，于是「保存」弹出的确认卡反而被压在弹窗下面：按钮可见但点击落到弹窗上，
+ * 实测命中的是 .aegisx-honeypot-service-grid，确认永远点不动。这里把确认卡单独抬到 76。
+ */
+.dwrt-kit-confirmation-layer { --dwrt-kit-modal-z: 76; }
 .aegisx-honeypot-modal { --dwrt-kit-modal-width: 680px; }
 .aegisx-honeypot-modal .dwrt-kit-modal-header { min-height: 76px; padding-inline: 28px; }
 .aegisx-honeypot-modal .dwrt-kit-modal-header h2 { font-size: 18px; }
@@ -171,6 +177,43 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-honeypot-modal-body input,
 .aegisx-honeypot-modal-body select { height: 48px; font-size: var(--dwrt-type-body, 14px); }
 .aegisx-honeypot-manager { --dwrt-kit-modal-width: 720px; }
+
+/*
+ * 蜜罐的服务多选与名额提示。
+ * 服务原先根本不在界面上（硬编码 ssh/http/ftp/dns 直接提交），
+ * 现在按后端 capabilities 逐项渲染，不支持的置灰。
+ * 圆角与配色一律走 token，不自画材质（DESIGN.md 第 270 行）。
+ */
+.aegisx-honeypot-services { display: grid; gap: 8px; }
+.aegisx-honeypot-services > span { color: var(--app-text-secondary); font-size: 12px; font-weight: 700; }
+.aegisx-honeypot-service-grid {
+  display: grid;
+  /* 自适应列数：窄屏两列、宽屏四列，不写死断点。 */
+  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+  gap: 8px;
+}
+.aegisx-honeypot-service {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--app-text-muted) 26%, transparent);
+  border-radius: var(--app-radius-compact);
+  background-color: color-mix(in srgb, var(--app-text) 5%, transparent);
+}
+.aegisx-honeypot-service > input { flex: 0 0 auto; width: 16px; height: 16px; margin: 0; }
+/* 覆盖上面 .aegisx-honeypot-modal-body input 的 48px：那条是给文本框和下拉的，
+   复选框套上去会变成一个巨大的方块。 */
+.aegisx-honeypot-modal-body .aegisx-honeypot-service > input { height: 16px; }
+.aegisx-honeypot-service > span { display: grid; gap: 2px; min-width: 0; }
+.aegisx-honeypot-service strong { font-size: var(--dwrt-type-body, 14px); font-weight: 700; }
+.aegisx-honeypot-service small { color: var(--app-text-muted); font-size: var(--dwrt-type-meta, 12px); }
+/* 后端未提供的服务：置灰但仍可读，并说明原因，不直接从列表里抹掉 —— 
+   看不见的选项会让人以为前端漏做了。 */
+.aegisx-honeypot-service.is-unavailable { opacity: .55; }
+.aegisx-honeypot-limit { color: var(--app-text-muted); font-size: var(--dwrt-type-meta, 12px); }
+.aegisx-honeypot-warn { color: var(--app-warning, #f0a33c); font-size: var(--dwrt-type-meta, 12px); }
 .aegisx-certificate-modal-layer { --dwrt-kit-modal-z: 74; }
 .aegisx-certificate-modal { --dwrt-kit-modal-width: 680px; }
 .aegisx-certificate-modal .dwrt-kit-modal-header { min-height: 76px; padding-inline: 28px; }

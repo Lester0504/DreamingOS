@@ -51,13 +51,19 @@ assert "out->schema_version != 3" in parse
 assert "schema_version != 3" in FIRMWARE
 
 validate = FIRMWARE[FIRMWARE.index("static int otad_firmware_validate_fd"):]
-validate = validate[:validate.index("static struct json_object *otad_operation_status_by_id")]
+validate = validate[:validate.index("struct json_object *otad_operation_status_by_id")]
 assert validate.index("otad_verify_payload_fd(fd, &info->rootfs") < validate.index(
     "otad_release_trust_verify(fd, info->firmware_size, info->json"
 )
 assert validate.index("otad_release_trust_verify(fd, info->firmware_size, info->json") < validate.index(
-    "otad_firmware_release_gate(resp, error, error_len)"
+    # Called as (resp, NULL, 0): `error` already carries the specific failure from
+    # otad_release_trust_verify(), and passing it would overwrite that with the
+    # generic gate string.
+    "otad_firmware_release_gate(resp, NULL, 0)"
 )
-assert validate.rstrip().endswith("return -1;\n}")
+# Validation can now succeed, so the region ends on "return 0;". The property worth
+# pinning is that preflight blockers still produce a failure.
+assert validate.rstrip().endswith("return 0;\n}")
+assert 'snprintf(error, error_len, "preflight_blockers_present")' in validate
 
 print("ok: full-slot release verifier binds Ed25519 statement, target, payload and policy while writes remain closed")

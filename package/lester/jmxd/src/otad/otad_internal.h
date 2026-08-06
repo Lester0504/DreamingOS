@@ -48,9 +48,20 @@
 #ifndef OTAD_RELEASE_NEW_PATH
 #define OTAD_RELEASE_NEW_PATH "/etc/dreamingos-release.json"
 #endif
+#ifndef OTAD_TRUST_POLICY_PATH
 #define OTAD_TRUST_POLICY_PATH "/etc/dreamingwrt/ota-trust/policy.json"
+#endif
+#ifndef OTAD_TRUST_KEY_DIR
 #define OTAD_TRUST_KEY_DIR "/etc/dreamingwrt/ota-trust/keys"
+#endif
+#ifndef OTAD_OPENWRT_RELEASE_PATH
+#define OTAD_OPENWRT_RELEASE_PATH "/etc/openwrt_release"
+#endif
+#ifndef OTAD_SYSINFO_DIR
+#define OTAD_SYSINFO_DIR "/tmp/sysinfo"
+#endif
 #define OTAD_RELEASE_STATEMENT_TYPE "dreamingwrt.full_slot_release.v1"
+#define OTAD_HOT_STATEMENT_TYPE "dreamingwrt.hot_update.v1"
 #define OTAD_RUNTIME_ABI_VERSION "1"
 #define OTAD_BOOT_SCHEMA_VERSION 2
 #define OTAD_STATE_SCHEMA_VERSION 2
@@ -97,6 +108,23 @@ struct otad_space_gate {
     char path[OTAD_MAX_PATH];
     char error[64];
     char reason[128];
+};
+
+/*
+ * A finalized upload held open in the staging area. The caller gets an fd whose
+ * bytes have already been hashed against the recorded sha256, plus the lock that
+ * keeps the staging directory from being reaped underneath it. Sharing this with
+ * the hot-update path is what lets a web upload be identified by upload_id
+ * instead of a device path, so the path whitelist stays as narrow as it is.
+ */
+struct otad_staged_upload {
+    int rootfd;
+    int dirfd;
+    int lockfd;
+    int fd;
+    uint64_t size;
+    time_t expires_at;
+    char sha256[65];
 };
 
 struct otad_operation_work {
@@ -207,6 +235,18 @@ int otad_release_trust_verify(int firmware_fd, uint64_t firmware_size,
                               struct json_object *firmware_info,
                               struct json_object **evidence_out,
                               char *error, size_t error_len);
+/*
+ * Hot updates carry their own signed statement. The full-slot verifier cannot
+ * be reused directly: it demands schema_version 3, a payload_region covering
+ * everything after the firmware header, and a build_id downgrade comparison,
+ * none of which a hot package has. What is shared is the part that matters -
+ * the trust policy, the key allow list, ed25519 verification and the device
+ * target match - so this entry point reuses those and binds the signature to
+ * the manifest whose per-payload sha256 digests the writer then enforces.
+ */
+int otad_hot_release_trust_verify(struct json_object *manifest,
+                                 struct json_object **evidence_out,
+                                 char *error, size_t error_len);
 int otad_release_trust_binding_get(struct json_object *result_or_evidence,
                                    struct otad_trust_binding *binding,
                                    char *error, size_t error_len);
@@ -256,6 +296,13 @@ int otad_operation_commit_preflight(const char *operation_id,
                                     const struct otad_trust_binding *binding,
                                     const char *topology_digest,
                                     struct json_object *result);
+int otad_operation_commit_hot_preflight(const char *operation_id,
+                                        const char *from_version,
+                                        const char *to_version,
+                                        const char *package_id,
+                                        const struct otad_trust_binding *binding,
+                                        struct json_object *result);
+int otad_operation_claim_hot_apply(const char *operation_id);
 int otad_operation_reverify_trust_binding(
     int fd, uint64_t expected_size, const struct otad_operation_work *work,
     char *error, size_t error_len);
@@ -266,6 +313,7 @@ int otad_operation_complete_confirmed_boot(
     const char *expected_build_id,
     char operation_id[OTAD_OPERATION_ID_LEN + 1]);
 struct json_object *otad_operation_status(struct json_object *body);
+struct json_object *otad_operation_status_by_id(const char *operation_id);
 void otad_operations_reconcile_workers(void);
 int otad_inventory_replace_file(const char *path, const char *owner_pkg,
                                 const char *class_name, const struct stat *st,
@@ -284,6 +332,10 @@ struct json_object *otad_safe_not_implemented(const char *op);
 struct json_object *otad_firmware_verify(struct json_object *body);
 struct json_object *otad_firmware_apply(struct json_object *body);
 struct json_object *otad_firmware_preflight(struct json_object *body);
+int otad_staged_upload_open(const char *upload_id,
+                            struct otad_staged_upload *upload,
+                            char *error, size_t error_len);
+void otad_staged_upload_close(struct otad_staged_upload *upload);
 int otad_operation_worker(const char *operation_id);
 struct json_object *otad_update_verify(struct json_object *body);
 struct json_object *otad_update_apply(struct json_object *body);

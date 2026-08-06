@@ -32,6 +32,14 @@ struct uci_package;
 #define JMX_NETCONFIG_DELETE_SNAPSHOT_FAILED -8
 #define JMX_NETCONFIG_DELETE_MANAGEMENT_PATH -9
 
+/* Redial issued, but the line had not come back up before the deadline. Not a
+ * failure: pppoe often needs longer than any sane HTTP timeout. */
+#define JMX_NETCONFIG_WAN_RECONNECT_TIMEOUT      -20
+/* The WAN exists but is administratively disabled. Refused outright rather than
+ * ifdown/ifup'd into a "pending" that can never resolve. */
+#define JMX_NETCONFIG_WAN_RECONNECT_DISABLED     -21
+#define JMX_NETCONFIG_WAN_RECONNECT_MAX_WAIT_MS  30000
+
 /* lifecycle */
 int  jmx_netconfig_db_init(void);
 void jmx_netconfig_db_close(void);
@@ -92,6 +100,10 @@ int jmx_netconfig_wan_configured(const char *id, const char *ifname);
 struct json_object *jmx_netconfig_wan_get(const char *id);
 int  jmx_netconfig_wan_set(struct json_object *wan_json);
 int  jmx_netconfig_wan_set_enabled(const char *id, int enabled);
+int  jmx_netconfig_wan_reconnect(const char *id, int wait_ms, char *state_out,
+                                 size_t state_len);
+/* Enumerable carrier vocabulary (id / carrier_id / label / logo_key). */
+struct json_object *jmx_netconfig_carrier_values(void);
 int  jmx_netconfig_wan_delete(const char *id);
 struct json_object *jmx_netconfig_wan_save_apply_result(struct json_object *wan_json);
 struct json_object *jmx_netconfig_wan_delete_result(const char *id);
@@ -528,6 +540,7 @@ struct json_object *jmx_lxc_container_logs(const char *name, struct json_object 
 const char *nc_json_str(struct json_object *o, const char *k, const char *def);
 const char *nc_json_str_def(struct json_object *o, const char *k, const char *def);
 int nc_json_int_def(struct json_object *o, const char *k, int def);
+int64_t nc_json_int64_def(struct json_object *o, const char *k, int64_t def);
 int nc_json_bool_def(struct json_object *o, const char *k, int def);
 int nc_exec(const char *sql);
 int nc_prepare(sqlite3_stmt **st, const char *sql);
