@@ -2027,18 +2027,55 @@ static void apd_airtime_parse_line(char *line, struct apd_airtime_stats *stats)
  * `wifi%u` spelling. */
 #define APD_ARPHRD_IEEE80211_RADIO 801
 
-static int apd_airtime_radio_netdev(unsigned int wiphy_index, char *out,
-                                    size_t out_size)
+/*
+ * Distinguishes the ways this lookup can come up empty. The caller turns these
+ * into reason codes, and the difference matters: a wiphy that owns netdevs but
+ * none of ARPHRD type 801 is an MLD pseudo-PHY, which aggregates the real
+ * radios and has no radio netdev of its own. That is normal hardware topology,
+ * not a failed probe, and reporting it as "unresolved" reads as a defect.
+ *
+ * Observed on 31.31 (Xiaomi BE10000 / QWRT): phy_index 0 owns `MLD1` and
+ * `mld-wifi0`, both type 1, while phy_index 1..3 each own exactly one type-801
+ * netdev (`wifi0`/`wifi1`/`wifi2`).
+ */
+enum apd_radio_netdev_status {
+    APD_RADIO_NETDEV_OK = 0,
+    APD_RADIO_NETDEV_SYSFS_UNREADABLE,
+    APD_RADIO_NETDEV_NO_NETDEV_FOR_WIPHY,
+    APD_RADIO_NETDEV_AGGREGATE_ONLY,
+    APD_RADIO_NETDEV_AMBIGUOUS,
+};
+
+static const char *apd_radio_netdev_reason(enum apd_radio_netdev_status status)
+{
+    switch (status) {
+    case APD_RADIO_NETDEV_OK:
+        return NULL;
+    case APD_RADIO_NETDEV_SYSFS_UNREADABLE:
+        return "apstats_sysfs_net_class_unreadable";
+    case APD_RADIO_NETDEV_NO_NETDEV_FOR_WIPHY:
+        return "apstats_no_netdev_for_wiphy";
+    case APD_RADIO_NETDEV_AGGREGATE_ONLY:
+        return "mld_pseudo_phy_has_no_radio_netdev";
+    case APD_RADIO_NETDEV_AMBIGUOUS:
+        return "apstats_multiple_radio_netdevs_for_wiphy";
+    }
+    return "apstats_radio_netdev_unresolved";
+}
+
+static enum apd_radio_netdev_status apd_airtime_radio_netdev(
+        unsigned int wiphy_index, char *out, size_t out_size)
 {
     DIR *directory = opendir(APD_NET_CLASS_PATH);
     struct dirent *entry;
     int found = 0;
+    int owned_netdevs = 0;
 
     if (!directory)
-        return -1;
+        return APD_RADIO_NETDEV_SYSFS_UNREADABLE;
     if (!out || out_size == 0) {
         closedir(directory);
-        return -1;
+        return APD_RADIO_NETDEV_SYSFS_UNREADABLE;
     }
     while ((entry = readdir(directory)) != NULL) {
         char path[PATH_MAX];
@@ -2053,6 +2090,11 @@ static int apd_airtime_radio_netdev(unsigned int wiphy_index, char *out,
             apd_neighbor_read_uint_file(path, &observed) != 0 ||
             observed != wiphy_index)
             continue;
+        /*
+         * Counted before the type filter so the caller can tell "this wiphy has
+         * no interfaces at all" from "it has interfaces, just no radio netdev".
+         */
+        owned_netdevs++;
         if (snprintf(path, sizeof(path), "%s/%s/type", APD_NET_CLASS_PATH,
                      entry->d_name) >= (int)sizeof(path) ||
             apd_neighbor_read_uint_file(path, &type) != 0 ||
@@ -2066,7 +2108,13 @@ static int apd_airtime_radio_netdev(unsigned int wiphy_index, char *out,
         found = 1;
     }
     closedir(directory);
-    return found == 1 ? 0 : -1;
+    if (found == 1)
+        return APD_RADIO_NETDEV_OK;
+    if (found == -1)
+        return APD_RADIO_NETDEV_AMBIGUOUS;
+    if (owned_netdevs > 0)
+        return APD_RADIO_NETDEV_AGGREGATE_ONLY;
+    return APD_RADIO_NETDEV_NO_NETDEV_FOR_WIPHY;
 }
 
 static int apd_airtime_collect(const char *path, const char *radio_netdev,
@@ -2334,13 +2382,18 @@ static int apd_survey_scan_collect(const char *path, const char *radio_id,
      * missing survey does not also suppress airtime. */
     memset(&airtime, 0, sizeof(airtime));
     airtime_attempted = 1;
-    if (apd_airtime_radio_netdev(target.wiphy_index, airtime_netdev,
-                                 sizeof(airtime_netdev)) != 0)
-        snprintf(airtime.reason, sizeof(airtime.reason), "%s",
-                 "apstats_radio_netdev_unresolved");
-    else if (apd_airtime_collect(apd_find_apstats(), airtime_netdev,
-                                 &airtime) == 0)
-        have_airtime = 1;
+    {
+        enum apd_radio_netdev_status netdev_status =
+            apd_airtime_radio_netdev(target.wiphy_index, airtime_netdev,
+                                     sizeof(airtime_netdev));
+
+        if (netdev_status != APD_RADIO_NETDEV_OK)
+            snprintf(airtime.reason, sizeof(airtime.reason), "%s",
+                     apd_radio_netdev_reason(netdev_status));
+        else if (apd_airtime_collect(apd_find_apstats(), airtime_netdev,
+                                     &airtime) == 0)
+            have_airtime = 1;
+    }
     if (apd_survey_collect_raw(path, target.interface, target.frequency_mhz,
                                &raw) != 0 || !raw.complete) {
         reason = raw.reason[0] ? raw.reason : reason;
@@ -2874,6 +2927,13 @@ enum apd_hostapd_request_result {
     APD_HOSTAPD_REQUEST_TIMEOUT = -2,
     APD_HOSTAPD_REQUEST_TOO_LARGE = -3,
     APD_HOSTAPD_REQUEST_TOTAL_TIMEOUT = -4,
+    /*
+     * A zero-length reply. QSDK's hostapd ends a station walk this way instead
+     * of answering "FAIL", so for STA-FIRST / STA-NEXT this is the normal end
+     * of the list rather than an error. Kept distinct from _FAILED because
+     * recvmsg() returning 0 and returning -1 mean opposite things here.
+     */
+    APD_HOSTAPD_REQUEST_EMPTY = -5,
 };
 
 struct apd_hostapd_station_observation {
@@ -3180,10 +3240,75 @@ static void apd_hostapd_clear(void *data, size_t length)
         *bytes++ = 0;
 }
 
+/*
+ * Which step of the control-socket exchange failed.
+ *
+ * Every failure path in apd_hostapd_request() used to collapse into one
+ * APD_HOSTAPD_REQUEST_FAILED, which the caller then rendered as the single
+ * reason "hostapd_station_query_failed". On a QSDK AP that string appeared on
+ * 15 BSSes while 29 stations had in fact been collected, so a reader could
+ * neither tell what went wrong nor that most of the data was good. Recording
+ * the stage lets the reason name the actual cause.
+ */
+enum apd_hostapd_stage {
+    APD_HOSTAPD_STAGE_NONE = 0,
+    APD_HOSTAPD_STAGE_ARGUMENTS,
+    APD_HOSTAPD_STAGE_SOCKET,
+    APD_HOSTAPD_STAGE_CLOEXEC,
+    APD_HOSTAPD_STAGE_LOCAL_PATH,
+    APD_HOSTAPD_STAGE_BIND,
+    APD_HOSTAPD_STAGE_LOCAL_VERIFY,
+    APD_HOSTAPD_STAGE_CHMOD,
+    APD_HOSTAPD_STAGE_CONNECT,
+    APD_HOSTAPD_STAGE_SEND,
+    APD_HOSTAPD_STAGE_POLL,
+    APD_HOSTAPD_STAGE_RECV,
+    APD_HOSTAPD_STAGE_RESPONSE_EMBEDDED_NUL,
+};
+
+static const char *apd_hostapd_stage_reason(enum apd_hostapd_stage stage,
+                                            const char *operation)
+{
+    int station = operation && strcmp(operation, "status") != 0;
+
+    switch (stage) {
+    case APD_HOSTAPD_STAGE_NONE:
+        break;
+    case APD_HOSTAPD_STAGE_ARGUMENTS:
+        return "hostapd_request_arguments_invalid";
+    case APD_HOSTAPD_STAGE_SOCKET:
+        return "hostapd_local_socket_create_failed";
+    case APD_HOSTAPD_STAGE_CLOEXEC:
+        return "hostapd_local_socket_cloexec_failed";
+    case APD_HOSTAPD_STAGE_LOCAL_PATH:
+        return "hostapd_local_socket_path_too_long";
+    case APD_HOSTAPD_STAGE_BIND:
+        return "hostapd_local_socket_bind_failed";
+    case APD_HOSTAPD_STAGE_LOCAL_VERIFY:
+        return "hostapd_local_socket_untrusted";
+    case APD_HOSTAPD_STAGE_CHMOD:
+        return "hostapd_local_socket_chmod_failed";
+    case APD_HOSTAPD_STAGE_CONNECT:
+        return "hostapd_control_socket_connect_failed";
+    case APD_HOSTAPD_STAGE_SEND:
+        return "hostapd_control_socket_send_failed";
+    case APD_HOSTAPD_STAGE_POLL:
+        return "hostapd_control_socket_poll_failed";
+    case APD_HOSTAPD_STAGE_RECV:
+        return station ? "hostapd_station_response_read_failed" :
+                         "hostapd_status_response_read_failed";
+    case APD_HOSTAPD_STAGE_RESPONSE_EMBEDDED_NUL:
+        return station ? "hostapd_station_response_malformed" :
+                         "hostapd_status_response_malformed";
+    }
+    return NULL;
+}
+
 static int apd_hostapd_request(const char *remote_path, const char *command,
                                char *response, size_t response_capacity,
                                size_t *response_len,
-                               int64_t collection_deadline)
+                               int64_t collection_deadline,
+                               enum apd_hostapd_stage *stage_out)
 {
     struct sockaddr_un local = { .sun_family = AF_UNIX };
     struct sockaddr_un remote = { .sun_family = AF_UNIX };
@@ -3195,40 +3320,59 @@ static int apd_hostapd_request(const char *remote_path, const char *command,
     int fd = -1;
     int64_t deadline;
     int rc = APD_HOSTAPD_REQUEST_FAILED;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
     int bound = 0;
     int local_verified = 0;
     int written;
     ssize_t received;
     size_t command_len;
 
+    if (stage_out)
+        *stage_out = APD_HOSTAPD_STAGE_NONE;
     if (!remote_path || !command || !response || response_capacity < 2 ||
-        !response_len || strlen(remote_path) >= sizeof(remote.sun_path))
+        !response_len || strlen(remote_path) >= sizeof(remote.sun_path)) {
+        if (stage_out)
+            *stage_out = APD_HOSTAPD_STAGE_ARGUMENTS;
         return APD_HOSTAPD_REQUEST_FAILED;
+    }
     command_len = strlen(command);
-    if (!command_len || command_len > 64U)
+    if (!command_len || command_len > 64U) {
+        if (stage_out)
+            *stage_out = APD_HOSTAPD_STAGE_ARGUMENTS;
         return APD_HOSTAPD_REQUEST_FAILED;
+    }
     memcpy(remote.sun_path, remote_path, strlen(remote_path) + 1);
     fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (fd < 0)
+    if (fd < 0) {
+        if (stage_out)
+            *stage_out = APD_HOSTAPD_STAGE_SOCKET;
         return APD_HOSTAPD_REQUEST_FAILED;
+    }
+    stage = APD_HOSTAPD_STAGE_CLOEXEC;
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0)
         goto done;
     written = snprintf(local.sun_path, sizeof(local.sun_path),
                        "%s/dreamingwrt-apd-%ld-%d", APD_HOSTAPD_LOCAL_DIR,
                        (long)getpid(), fd);
+    stage = APD_HOSTAPD_STAGE_LOCAL_PATH;
     if (written < 0 || (size_t)written >= sizeof(local.sun_path))
         goto done;
+    stage = APD_HOSTAPD_STAGE_BIND;
     if (bind(fd, (struct sockaddr *)&local, sizeof(local)) != 0)
         goto done;
     bound = 1;
+    stage = APD_HOSTAPD_STAGE_LOCAL_VERIFY;
     if (lstat(local.sun_path, &local_st) != 0 || !S_ISSOCK(local_st.st_mode) ||
         local_st.st_uid != getuid())
         goto done;
     local_verified = 1;
+    stage = APD_HOSTAPD_STAGE_CHMOD;
     if (chmod(local.sun_path, S_IRUSR | S_IWUSR) != 0)
         goto done;
+    stage = APD_HOSTAPD_STAGE_CONNECT;
     if (connect(fd, (struct sockaddr *)&remote, sizeof(remote)) != 0)
         goto done;
+    stage = APD_HOSTAPD_STAGE_SEND;
     if (send(fd, command, command_len, MSG_NOSIGNAL) != (ssize_t)command_len)
         goto done;
     deadline = apd_monotonic_ms() + APD_HOSTAPD_TIMEOUT_MS;
@@ -3255,8 +3399,10 @@ static int apd_hostapd_request(const char *remote_path, const char *command,
                  APD_HOSTAPD_REQUEST_TOTAL_TIMEOUT : APD_HOSTAPD_REQUEST_TIMEOUT;
             goto done;
         }
-        if (poll_rc < 0 || !(pfd.revents & POLLIN))
+        if (poll_rc < 0 || !(pfd.revents & POLLIN)) {
+            stage = APD_HOSTAPD_STAGE_POLL;
             goto done;
+        }
         break;
     }
     memset(&msg, 0, sizeof(msg));
@@ -3265,19 +3411,37 @@ static int apd_hostapd_request(const char *remote_path, const char *command,
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
     received = recvmsg(fd, &msg, 0);
-    if (received <= 0)
+    if (received == 0) {
+        /*
+         * An empty datagram is a real reply, not a read error. Whether it means
+         * "end of list" or "unexpected" depends on the command, so that call is
+         * left to the caller.
+         */
+        rc = APD_HOSTAPD_REQUEST_EMPTY;
+        *response_len = 0;
+        response[0] = '\0';
         goto done;
+    }
+    if (received < 0) {
+        stage = APD_HOSTAPD_STAGE_RECV;
+        goto done;
+    }
     if ((msg.msg_flags & MSG_TRUNC) || (size_t)received > APD_HOSTAPD_RESPONSE_LIMIT) {
         rc = APD_HOSTAPD_REQUEST_TOO_LARGE;
         goto done;
     }
-    if (memchr(response, '\0', (size_t)received) != NULL)
+    if (memchr(response, '\0', (size_t)received) != NULL) {
+        stage = APD_HOSTAPD_STAGE_RESPONSE_EMBEDDED_NUL;
         goto done;
+    }
     response[received] = '\0';
     *response_len = (size_t)received;
     rc = APD_HOSTAPD_REQUEST_OK;
+    stage = APD_HOSTAPD_STAGE_NONE;
 
 done:
+    if (stage_out && rc != APD_HOSTAPD_REQUEST_OK)
+        *stage_out = stage;
     if (fd >= 0)
         close(fd);
     if (bound && local_verified && lstat(local.sun_path, &cleanup_st) == 0 &&
@@ -3304,7 +3468,8 @@ static int apd_hostapd_socket_alive(const char *directory, const char *name)
                                 sizeof(remote_path)) != 0)
         return 0;
     return apd_hostapd_request(remote_path, "PING", response, sizeof(response),
-                               &response_len, 0) == APD_HOSTAPD_REQUEST_OK &&
+                               &response_len, 0, NULL) ==
+               APD_HOSTAPD_REQUEST_OK &&
            response_len > 0;
 }
 
@@ -3484,7 +3649,8 @@ static int apd_hostapd_is_unknown_command(const char *response)
     return response && !strncmp(response, "UNKNOWN COMMAND", 15);
 }
 
-static const char *apd_hostapd_request_reason(int rc, const char *operation)
+static const char *apd_hostapd_request_reason(int rc, const char *operation,
+                                             enum apd_hostapd_stage stage)
 {
     if (rc == APD_HOSTAPD_REQUEST_TOTAL_TIMEOUT)
         return "hostapd_collection_timeout";
@@ -3494,6 +3660,24 @@ static const char *apd_hostapd_request_reason(int rc, const char *operation)
     if (rc == APD_HOSTAPD_REQUEST_TOO_LARGE)
         return !strcmp(operation, "status") ? "hostapd_status_response_too_large" :
                                                "hostapd_station_response_too_large";
+    /*
+     * Only STATUS reaches here with an empty reply; the station walk treats it
+     * as end-of-list before asking for a reason.
+     */
+    if (rc == APD_HOSTAPD_REQUEST_EMPTY)
+        return !strcmp(operation, "status") ? "hostapd_status_response_empty" :
+                                              "hostapd_station_response_empty";
+    /*
+     * Prefer the stage-specific cause. The generic strings below remain only as
+     * a last resort for a failure that recorded no stage at all, so a caller
+     * never sees "query_failed" when the real cause is known.
+     */
+    {
+        const char *staged = apd_hostapd_stage_reason(stage, operation);
+
+        if (staged)
+            return staged;
+    }
     return !strcmp(operation, "status") ? "hostapd_status_query_failed" :
                                            "hostapd_station_query_failed";
 }
@@ -3509,13 +3693,14 @@ static int apd_hostapd_collect_bss(const char *remote_path,
     size_t response_len = 0;
     int rc;
     int partial_mlo = 0;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
 
     rc = apd_hostapd_request(remote_path, "STATUS", response,
                              response_capacity, &response_len,
-                             collection_deadline);
+                             collection_deadline, &stage);
     if (rc != APD_HOSTAPD_REQUEST_OK) {
         apd_hostapd_set_reason(bss->reason, sizeof(bss->reason),
-                               apd_hostapd_request_reason(rc, "status"));
+                               apd_hostapd_request_reason(rc, "status", stage));
         return -1;
     }
     if (apd_hostapd_is_unknown_command(response)) {
@@ -3557,10 +3742,23 @@ static int apd_hostapd_collect_bss(const char *remote_path,
         response_len = 0;
         rc = apd_hostapd_request(remote_path, command, response,
                                  response_capacity, &response_len,
-                                 collection_deadline);
+                                 collection_deadline, &stage);
+        /*
+         * Two spellings of "no more stations".
+         *
+         * Mainline hostapd answers "FAIL"; the QSDK build on this AP replies
+         * with a zero-length datagram instead. Verified on 31.31, where every
+         * VAP ended its walk this way - ath01 after 21 stations, ath02 on the
+         * very first STA-FIRST. Treating the empty reply as a read failure made
+         * all 14 BSSes report incomplete even though 29 stations had been read,
+         * so the end-of-list case is handled here alongside FAIL.
+         */
+        if (rc == APD_HOSTAPD_REQUEST_EMPTY)
+            goto end_of_list;
         if (rc != APD_HOSTAPD_REQUEST_OK) {
             apd_hostapd_set_reason(bss->reason, sizeof(bss->reason),
-                                   apd_hostapd_request_reason(rc, "station"));
+                                   apd_hostapd_request_reason(rc, "station",
+                                                              stage));
             return -1;
         }
         if (apd_hostapd_is_unknown_command(response)) {
@@ -3569,6 +3767,7 @@ static int apd_hostapd_collect_bss(const char *remote_path,
             return -1;
         }
         if (apd_hostapd_is_fail(response)) {
+end_of_list:
             if (bss->has_reported_station_count &&
                 bss->reported_station_count != (int)bss->station_count) {
                 apd_hostapd_set_reason(bss->reason, sizeof(bss->reason),
@@ -3976,6 +4175,18 @@ static struct json_object *apd_collect_hostapd(int phy_count,
         json_object_object_add(item, "station_count",
                                json_object_new_int((int)raw->station_count));
         json_object_object_add(item, "complete", json_object_new_boolean(raw->complete));
+        /*
+         * A BSS that failed partway still carries every station it did read.
+         * `complete` alone cannot express that, and a reader treating it as
+         * "no usable data" discards a full station list - observed on 31.31,
+         * where 15 BSSes reported incomplete while 29 stations had been
+         * collected. This says explicitly whether the rows below are usable.
+         */
+        json_object_object_add(item, "stations_usable",
+            json_object_new_boolean(raw->station_count > 0));
+        json_object_object_add(item, "station_coverage",
+            json_object_new_string(raw->complete ? "complete" :
+                raw->station_count > 0 ? "partial" : "none"));
         apd_json_nullable_string(item, "reason", raw->reason[0] ? raw->reason : NULL);
         if (raw->has_mld_address) {
             json_object_object_add(item, "mld_address",
@@ -4426,13 +4637,18 @@ static struct json_object *apd_survey_json(const char *path,
         double vendor_pct = 0.0;
 
         memset(&stats, 0, sizeof(stats));
-        if (apd_airtime_radio_netdev(wiphy_index, radio_netdev,
-                                     sizeof(radio_netdev)) != 0)
-            snprintf(stats.reason, sizeof(stats.reason), "%s",
-                     "apstats_radio_netdev_unresolved");
-        else if (apd_airtime_collect(apd_find_apstats(), radio_netdev,
-                                     &stats) == 0)
-            available = 1;
+        {
+            enum apd_radio_netdev_status netdev_status =
+                apd_airtime_radio_netdev(wiphy_index, radio_netdev,
+                                         sizeof(radio_netdev));
+
+            if (netdev_status != APD_RADIO_NETDEV_OK)
+                snprintf(stats.reason, sizeof(stats.reason), "%s",
+                         apd_radio_netdev_reason(netdev_status));
+            else if (apd_airtime_collect(apd_find_apstats(), radio_netdev,
+                                         &stats) == 0)
+                available = 1;
+        }
         {
             struct json_object *air = apd_airtime_json(&stats, available,
                                                        radio_netdev);

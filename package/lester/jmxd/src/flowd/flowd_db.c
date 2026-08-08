@@ -878,6 +878,7 @@ struct json_object *flowd_status_json(void)
     json_object_object_add(geoip, "geoip_dir_present", json_object_new_boolean(flowd_dir_exists(s.geoip_dir)));
     json_object_object_add(geoip, "runtime_dir_present", json_object_new_boolean(flowd_dir_exists(s.runtime_dir)));
     json_object_object_add(resp, "geoip", geoip);
+    json_object_object_add(resp, "smart_path", flowd_qoe_status_json());
     signature_datasets = flowd_signature_datasets_load();
     json_object_object_add(resp, "signature_datasets", signature_datasets);
     flowd_status_metadata_load(errors, &ok, last_error, sizeof(last_error), &updated_at);

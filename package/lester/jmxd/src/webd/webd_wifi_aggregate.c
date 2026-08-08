@@ -562,6 +562,338 @@ static const char *wifi_normalized_band(const char *raw)
     return raw;
 }
 
+/*
+ * QSDK writes a numeric band code into UCI (`option band '3'`), which is a
+ * driver-internal encoding rather than anything a caller can interpret. It used
+ * to be forwarded verbatim, so the UI rendered a band literally named "3".
+ *
+ * Only the codes actually observed on the managed AP are translated. An unknown
+ * code returns "" rather than a guess: reporting no band is honest, while
+ * mapping an unrecognised number onto a plausible band would put a wrong
+ * frequency in front of the user.
+ */
+static const char *wifi_band_from_uci_code(const char *raw)
+{
+    if (!raw || !raw[0])
+        return "";
+    if (!strcmp(raw, "1"))
+        return "2.4GHz";
+    if (!strcmp(raw, "2"))
+        return "5GHz";
+    if (!strcmp(raw, "3"))
+        return "6GHz";
+    return "";
+}
+
+/*
+ * True when `value` is one of the driver's numeric band codes rather than a
+ * band name. Used to decide whether a desired-view band needs translating.
+ */
+static int wifi_band_is_uci_code(const char *raw)
+{
+    return raw && raw[0] && raw[1] == '\0' && raw[0] >= '0' && raw[0] <= '9';
+}
+
+/*
+ * Finds the runtime radio that owns a desired-view radio id.
+ *
+ * The two views use different identifier spaces - desired uses UCI section
+ * names (`wifi0`), runtime uses phy names (`phy1`) - so joining them by id is
+ * wrong. What makes an exact join possible is that the runtime radio's
+ * `interfaces[]` list contains the UCI section name itself: on the managed AP,
+ * `phy1` lists `wifi0` alongside its `athN` VAPs. Verified on 31.31, where each
+ * `wifiN` appears under exactly one phy:
+ *
+ *   phy1 -> ath05..ath0, wifi0     phy2 -> ath15..ath1, wifi1
+ *   phy3 -> ath21, ath2,  wifi2    phy0 -> MLD1, mld-wifi0   (no wifiN)
+ *
+ * That also means the MLD pseudo-PHY cannot be matched by accident: it carries
+ * no UCI section name at all.
+ *
+ * Returns NULL when there is no unambiguous match, so the caller can say the
+ * views were not aligned instead of inventing values.
+ */
+static struct json_object *wifi_runtime_radio_for_desired(
+        struct json_object *runtime_radios, const char *desired_id)
+{
+    struct json_object *match = NULL;
+    size_t i, j;
+
+    if (!runtime_radios || !desired_id || !desired_id[0])
+        return NULL;
+    for (i = 0; i < json_object_array_length(runtime_radios); i++) {
+        struct json_object *radio = json_object_array_get_idx(runtime_radios, i);
+        struct json_object *interfaces = wifi_child_array(radio, "interfaces");
+
+        for (j = 0; interfaces && j < json_object_array_length(interfaces); j++) {
+            struct json_object *iface = json_object_array_get_idx(interfaces, j);
+            const char *name = wifi_string(iface, "interface", "");
+
+            if (name[0] && !strcmp(name, desired_id)) {
+                /* Two phys claiming one UCI section would make the join
+                 * ambiguous; refuse rather than pick the first. */
+                if (match && match != radio)
+                    return NULL;
+                match = radio;
+            }
+        }
+    }
+    return match;
+}
+
+/*
+ * Fills band / width / tx_power on desired-view radios from the runtime
+ * snapshot, and records where each value came from.
+ *
+ * The desired view is the UCI config, which simply has no width_mhz or
+ * txpower_dbm field, so `wifi_normalize_aliases()` had nothing to alias and
+ * both columns rendered empty. The values do exist - one level up, in the
+ * runtime snapshot - so the fix is to merge them rather than to synthesise
+ * anything.
+ *
+ * Every field that gets filled is attributed via `*_source`, and a radio that
+ * could not be aligned gets an explicit reason. A caller must be able to tell a
+ * measured value from a missing one without guessing.
+ */
+static void wifi_desired_merge_runtime(struct json_object *desired_radios,
+                                       struct json_object *runtime_radios)
+{
+    size_t i;
+
+    if (!desired_radios)
+        return;
+    for (i = 0; i < json_object_array_length(desired_radios); i++) {
+        struct json_object *radio = json_object_array_get_idx(desired_radios, i);
+        struct json_object *runtime;
+        const char *raw_band;
+        const char *id;
+
+        if (!radio || !json_object_is_type(radio, json_type_object))
+            continue;
+        id = wifi_string(radio, "id", "");
+
+        /*
+         * Translate the driver band code first, so a radio keeps a usable band
+         * even when no runtime match exists.
+         */
+        raw_band = wifi_string(radio, "band", "");
+        if (wifi_band_is_uci_code(raw_band)) {
+            const char *named = wifi_band_from_uci_code(raw_band);
+
+            json_object_object_del(radio, "band");
+            if (named[0]) {
+                json_object_object_add(radio, "band",
+                                       json_object_new_string(named));
+                json_object_object_add(radio, "band_source",
+                    json_object_new_string("uci_band_code"));
+            } else {
+                json_object_object_add(radio, "band_reason",
+                    json_object_new_string("uci_band_code_unrecognised"));
+            }
+        }
+
+        runtime = wifi_runtime_radio_for_desired(runtime_radios, id);
+        if (!runtime) {
+            /*
+             * Do not overwrite a reason already set above. An unrecognised UCI
+             * band code is a more specific explanation than "not aligned", and
+             * clobbering it would replace the actual cause with a generic one.
+             */
+            if (!wifi_child(radio, "band") && !wifi_child(radio, "band_reason"))
+                json_object_object_add(radio, "band_reason",
+                    json_object_new_string(
+                        runtime_radios ? "desired_not_aligned_to_runtime_radio" :
+                                         "runtime_snapshot_unavailable"));
+            if (!wifi_child(radio, "width") && !wifi_child(radio, "width_mhz") &&
+                !wifi_child(radio, "width_reason"))
+                json_object_object_add(radio, "width_reason",
+                    json_object_new_string(
+                        runtime_radios ? "desired_not_aligned_to_runtime_radio" :
+                                         "runtime_snapshot_unavailable"));
+            if (!wifi_child(radio, "tx_power") &&
+                !wifi_child(radio, "txpower_dbm") &&
+                !wifi_child(radio, "tx_power_reason"))
+                json_object_object_add(radio, "tx_power_reason",
+                    json_object_new_string(
+                        runtime_radios ? "desired_not_aligned_to_runtime_radio" :
+                                         "runtime_snapshot_unavailable"));
+            continue;
+        }
+
+        json_object_object_add(radio, "runtime_radio_id",
+            json_object_new_string(wifi_string(runtime, "id", "")));
+
+        if (!wifi_child(radio, "band") && wifi_child(runtime, "band")) {
+            json_object_object_add(radio, "band",
+                json_object_get(wifi_child(runtime, "band")));
+            json_object_object_add(radio, "band_source",
+                json_object_new_string("managed_ap_runtime_snapshot"));
+        }
+        if (!wifi_child(radio, "width") && !wifi_child(radio, "width_mhz") &&
+            wifi_child(runtime, "width_mhz")) {
+            json_object_object_add(radio, "width_mhz",
+                json_object_get(wifi_child(runtime, "width_mhz")));
+            json_object_object_add(radio, "width_source",
+                json_object_new_string("managed_ap_runtime_snapshot"));
+        }
+        /*
+         * `channel` in the desired view is the UCI setting, which is literally
+         * "auto" on any radio left on automatic selection. That is a real
+         * configuration value, not a missing one, so it stays - but a caller
+         * asking "which channel is this radio on" needs the operating channel
+         * too, and the runtime snapshot has it (phy3 operates on 33 while UCI
+         * says auto). Publish it separately so neither meaning is lost.
+         */
+        if (wifi_child(runtime, "channel")) {
+            char desired_channel[32];
+
+            /*
+             * Copy before deleting: wifi_string() hands back a pointer into
+             * the json object, and json_object_object_del() frees it, so
+             * reading it afterwards is a use-after-free.
+             */
+            snprintf(desired_channel, sizeof(desired_channel), "%s",
+                     wifi_string(radio, "channel", ""));
+
+            if (!wifi_child(radio, "operating_channel")) {
+                json_object_object_add(radio, "operating_channel",
+                    json_object_get(wifi_child(runtime, "channel")));
+                json_object_object_add(radio, "operating_channel_source",
+                    json_object_new_string("managed_ap_runtime_snapshot"));
+            }
+            /*
+             * Only an unusable desired channel gets replaced. Overwriting a
+             * pinned channel would hide a mismatch between what was asked for
+             * and what the radio actually does.
+             */
+            if (!desired_channel[0] || !strcmp(desired_channel, "auto") ||
+                !strcmp(desired_channel, "0")) {
+                json_object_object_del(radio, "channel");
+                json_object_object_add(radio, "channel",
+                    json_object_get(wifi_child(runtime, "channel")));
+                json_object_object_add(radio, "channel_source",
+                    json_object_new_string("managed_ap_runtime_snapshot"));
+                if (desired_channel[0])
+                    json_object_object_add(radio, "channel_desired",
+                        json_object_new_string(desired_channel));
+            }
+        }
+        if (!wifi_child(radio, "tx_power") &&
+            !wifi_child(radio, "txpower_dbm") &&
+            wifi_child(runtime, "txpower_dbm")) {
+            json_object_object_add(radio, "txpower_dbm",
+                json_object_get(wifi_child(runtime, "txpower_dbm")));
+            json_object_object_add(radio, "tx_power_source",
+                json_object_new_string("managed_ap_runtime_snapshot"));
+        }
+        /*
+         * The runtime radio object itself carries no txpower_dbm, but its VAPs
+         * do (`interfaces[].txpower_dbm` is 24 on every AP-type VAP of phy3).
+         * A radio's transmit power is a property of the radio, so the VAP
+         * readings are only usable when they agree; if two VAPs on one phy
+         * report different power, there is no single radio-level answer and
+         * saying so beats picking one.
+         */
+        if (!wifi_child(radio, "tx_power") &&
+            !wifi_child(radio, "txpower_dbm")) {
+            struct json_object *ifaces = wifi_child_array(runtime, "interfaces");
+            struct json_object *found = NULL;
+            int conflict = 0;
+            size_t k;
+
+            for (k = 0; ifaces && k < json_object_array_length(ifaces); k++) {
+                struct json_object *iface =
+                    json_object_array_get_idx(ifaces, k);
+                struct json_object *power = wifi_child(iface, "txpower_dbm");
+
+                if (!power)
+                    continue;
+                if (found && json_object_get_int(found) !=
+                             json_object_get_int(power)) {
+                    conflict = 1;
+                    break;
+                }
+                if (!found)
+                    found = power;
+            }
+            if (conflict)
+                json_object_object_add(radio, "tx_power_reason",
+                    json_object_new_string(
+                        "managed_ap_vap_txpower_disagrees"));
+            else if (found) {
+                json_object_object_add(radio, "txpower_dbm",
+                    json_object_get(found));
+                json_object_object_add(radio, "tx_power_source",
+                    json_object_new_string("managed_ap_runtime_vap_txpower"));
+            }
+        }
+        /*
+         * Neither the radio nor any of its VAPs reported power: say so instead
+         * of leaving the field silently absent.
+         */
+        if (!wifi_child(radio, "tx_power") &&
+            !wifi_child(radio, "txpower_dbm") &&
+            !wifi_child(radio, "tx_power_reason"))
+            json_object_object_add(radio, "tx_power_reason",
+                json_object_new_string("managed_ap_reports_no_radio_txpower"));
+    }
+}
+
+/*
+ * Gives desired-view SSIDs the band of the radio they sit on.
+ *
+ * The UCI SSID sections carry no band field at all, so a caller had no way to
+ * label an SSID by frequency without inferring one - which is exactly the
+ * fabrication the companion frontend handoff reported. The relation is already
+ * explicit and needs no guessing: an SSID's `radio_id` is the desired radio id
+ * (`wifi0`), so once the radios have a band the SSIDs can inherit it.
+ *
+ * Must run after wifi_desired_merge_runtime(), otherwise the radios have no
+ * band to inherit.
+ */
+static void wifi_desired_ssid_bands(struct json_object *desired_ssids,
+                                    struct json_object *desired_radios)
+{
+    size_t i, j;
+
+    if (!desired_ssids || !desired_radios)
+        return;
+    for (i = 0; i < json_object_array_length(desired_ssids); i++) {
+        struct json_object *ssid = json_object_array_get_idx(desired_ssids, i);
+        const char *radio_id;
+
+        if (!ssid || !json_object_is_type(ssid, json_type_object))
+            continue;
+        if (wifi_child(ssid, "band"))
+            continue;
+        radio_id = wifi_string(ssid, "radio_id", "");
+        if (!radio_id[0]) {
+            json_object_object_add(ssid, "band_reason",
+                json_object_new_string("ssid_has_no_radio_id"));
+            continue;
+        }
+        for (j = 0; j < json_object_array_length(desired_radios); j++) {
+            struct json_object *radio = json_object_array_get_idx(desired_radios, j);
+
+            if (strcmp(wifi_string(radio, "id", ""), radio_id))
+                continue;
+            if (wifi_child(radio, "band")) {
+                json_object_object_add(ssid, "band",
+                    json_object_get(wifi_child(radio, "band")));
+                json_object_object_add(ssid, "band_source",
+                    json_object_new_string("inherited_from_radio"));
+            } else {
+                json_object_object_add(ssid, "band_reason",
+                    json_object_new_string("radio_band_unavailable"));
+            }
+            break;
+        }
+        if (!wifi_child(ssid, "band") && !wifi_child(ssid, "band_reason"))
+            json_object_object_add(ssid, "band_reason",
+                json_object_new_string("radio_id_not_found_in_desired_radios"));
+    }
+}
+
 static struct json_object *wifi_collect_bands(struct json_object *radios)
 {
     struct json_object *bands = json_object_new_array();
@@ -2253,6 +2585,27 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
             if (!source_ssids) source_ssids = wifi_child_array(snapshot, "ssids");
             desired_available |= desired &&
                 (wifi_child_array(desired, "radios") || wifi_child_array(desired, "ssids"));
+            /*
+             * Merge the runtime snapshot's band / width / tx_power into the
+             * desired view before appending.
+             *
+             * This branch runs when the AP reports no runtime *status*, but the
+             * snapshot's `radios[]` is still present and still carries those
+             * fields - the desired view is the UCI config, which has no
+             * width_mhz or txpower_dbm at all. Without this merge the band,
+             * width and tx-power columns were empty even though the values were
+             * sitting one level up in the same response.
+             *
+             * Only the desired branch is touched. The runtime branch above
+             * already has complete fields, and changing it would risk
+             * regressing wifi/status's runtime_radios.
+             */
+            if (source_radios == wifi_child_array(desired, "radios"))
+                wifi_desired_merge_runtime(source_radios,
+                                           wifi_child_array(snapshot, "radios"));
+            if (source_ssids == wifi_child_array(desired, "ssids"))
+                wifi_desired_ssid_bands(source_ssids,
+                                        wifi_child_array(desired, "radios"));
             wifi_append_remote(radios, source_radios, WEBD_WIFI_RADIO,
                                ap_id, ap_name, model, image_url, image_model_match,
                                online, stale, 0,
@@ -2482,6 +2835,64 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
             wifi_capability_reason(capabilities, *write,
                                    "managed_ap_transaction_pending");
         }
+    }
+    /*
+     * Publish the write capability per scope alongside the flat bits above.
+     *
+     * The flat bits are deliberately left exactly as they are: a managed AP
+     * present means every write is refused, because the AP-side transaction
+     * (validate, push, read back, roll back on failure) is not implemented and
+     * opening the entry point would turn "atomic configuration" into "possibly
+     * half applied". Nothing here relaxes that.
+     *
+     * What the flat bits cannot express is *which* target is blocked. Today the
+     * question is moot on 30.1, whose local_wifi reports no_phy_detected, so
+     * there is no local write path to lose. It stops being moot the moment a
+     * controller has its own PHY and also adopts an AP: the loop above would
+     * refuse local writes too, purely because a remote AP cannot do
+     * transactions. That is the trap the acceptance handoff for this asked to
+     * avoid, and recording the scopes now means the eventual fix does not also
+     * have to invent the contract.
+     *
+     * `write_scopes.local.supported` follows the local PHY only, so it stays
+     * false on this device for the honest reason rather than by inheriting the
+     * managed-AP one.
+     */
+    {
+        struct json_object *scopes = json_object_new_object();
+        struct json_object *local_scope = json_object_new_object();
+        struct json_object *managed_scope = json_object_new_object();
+        int has_managed = ac_items && json_object_array_length(ac_items) > 0;
+        int local_present = local_radio_count > 0 || local_ssid_count > 0;
+
+        json_object_object_add(local_scope, "present",
+                               json_object_new_boolean(local_present));
+        json_object_object_add(local_scope, "supported",
+                               json_object_new_boolean(0));
+        json_object_object_add(local_scope, "reason",
+            json_object_new_string(local_present ?
+                "local_write_path_not_implemented" :
+                "no_local_phy_detected"));
+
+        json_object_object_add(managed_scope, "present",
+                               json_object_new_boolean(has_managed));
+        json_object_object_add(managed_scope, "supported",
+                               json_object_new_boolean(0));
+        json_object_object_add(managed_scope, "reason",
+            json_object_new_string(has_managed ?
+                "managed_ap_transaction_pending" :
+                "no_managed_ap_adopted"));
+
+        json_object_object_add(scopes, "local", local_scope);
+        json_object_object_add(scopes, "managed_ap", managed_scope);
+        /*
+         * States plainly that the flat bits above are the AND of both scopes,
+         * so a reader knows they are not scope-aware and must not infer "local
+         * is writable" from anything here.
+         */
+        json_object_object_add(scopes, "flat_bits_are_scope_agnostic",
+                               json_object_new_boolean(1));
+        json_object_object_add(capabilities, "write_scopes", scopes);
     }
 
     if (runtime_status) {

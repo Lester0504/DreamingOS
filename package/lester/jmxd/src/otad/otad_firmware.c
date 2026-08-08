@@ -1830,6 +1830,7 @@ static void otad_operation_process_done(struct uloop_process *process, int statu
                                     "firmware operation worker exited before reaching reboot state",
                                     NULL);
     json_object_put(operation);
+    otad_slot_status_cache_invalidate();
     memset(&g_otad_operation_process, 0, sizeof(g_otad_operation_process));
     g_otad_operation_process_id[0] = '\0';
 }
@@ -1954,6 +1955,7 @@ struct json_object *otad_firmware_apply(struct json_object *body)
     if (rc != 0)
         return otad_error("operation_claim_failed",
                           "preflight operation could not transition to writing");
+    otad_slot_status_cache_invalidate();
     if (otad_firmware_worker_start(operation_id) != 0) {
         (void)otad_operation_update(operation_id, "failed", 100,
                                     "operation_worker_start_failed",
@@ -1995,6 +1997,7 @@ struct json_object *otad_confirm_boot(struct json_object *body)
         return otad_error("supervisor_unhealthy", "dreamingwrt-init health check failed");
     if (otad_grubenv_promote(current) != 0)
         return otad_error("grubenv_confirm_failed", "failed to promote pending slot to active");
+    otad_slot_status_cache_invalidate();
     otad_state_get("pending_operation_id", expected_operation_id,
                    sizeof(expected_operation_id), "");
     operation_rc = otad_operation_complete_confirmed_boot(
@@ -2170,6 +2173,7 @@ struct json_object *otad_firmware_rollback(struct json_object *body)
     otad_state_set("pending_slot", "");
     otad_state_set("pending_operation_id", "");
     otad_state_set("state", "rollback_pending_reboot");
+    otad_slot_status_cache_invalidate();
     {
         struct json_object *resp = json_object_new_object();
         json_object_object_add(resp, "ok", json_object_new_boolean(1));
@@ -2216,12 +2220,199 @@ static void otad_topology_missing_evidence(struct json_object *missing,
     json_object_array_add(missing, json_object_new_string(value));
 }
 
-struct json_object *otad_slot_status_json(void)
+enum otad_status_probe_state {
+    OTAD_STATUS_PROBE_NONE = 0,
+    OTAD_STATUS_PROBE_VERIFIED,
+    OTAD_STATUS_PROBE_STALE,
+    OTAD_STATUS_PROBE_UNAVAILABLE,
+};
+
+struct otad_status_probe_cache {
+    int valid;
+    int ever_verified;
+    enum otad_status_probe_state state;
+    uint64_t generation;
+    int64_t probed_at;
+    int64_t probed_monotonic_ms;
+    uint64_t ota_metadata_fingerprint;
+    struct otad_ab_topology topology;
+    char error[128];
+};
+
+static struct otad_status_probe_cache g_otad_status_probe_cache;
+static uint64_t g_otad_status_probe_generation = 1;
+
+static int64_t otad_status_monotonic_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return otad_now_s() * 1000;
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int64_t otad_status_probe_age_ms(int64_t now_ms)
+{
+    int64_t age = now_ms - g_otad_status_probe_cache.probed_monotonic_ms;
+
+    return age > 0 ? age : 0;
+}
+
+static void otad_status_fingerprint_bytes(uint64_t *fingerprint,
+                                          const void *data, size_t len)
+{
+    const unsigned char *bytes = data;
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        *fingerprint ^= bytes[i];
+        *fingerprint *= UINT64_C(1099511628211);
+    }
+}
+
+static void otad_status_fingerprint_column(uint64_t *fingerprint,
+                                           sqlite3_stmt *st, int column)
+{
+    int type = sqlite3_column_type(st, column);
+
+    otad_status_fingerprint_bytes(fingerprint, &type, sizeof(type));
+    if (type == SQLITE_INTEGER) {
+        int64_t value = sqlite3_column_int64(st, column);
+
+        otad_status_fingerprint_bytes(fingerprint, &value, sizeof(value));
+    } else if (type == SQLITE_TEXT) {
+        const void *value = sqlite3_column_text(st, column);
+        int len = sqlite3_column_bytes(st, column);
+
+        otad_status_fingerprint_bytes(fingerprint, &len, sizeof(len));
+        if (value && len > 0)
+            otad_status_fingerprint_bytes(fingerprint, value, (size_t)len);
+    }
+}
+
+static int otad_status_ota_metadata_fingerprint(uint64_t *fingerprint)
+{
+    static const char state_sql[] =
+        "SELECT key,value FROM ota_state WHERE key IN ("
+        "'active_slot','pending_slot','pending_operation_id',"
+        "'slot_a_valid','slot_b_valid') ORDER BY key";
+    static const char slots_sql[] =
+        "SELECT slot_name,version,build_id,state,boot_attempts,last_boot_at,"
+        "last_good_at,last_error,rootfs_sha256 FROM ota_slots ORDER BY slot_name";
+    sqlite3_stmt *st;
+    uint64_t value = UINT64_C(1469598103934665603);
+    int rc;
+    int column;
+
+    if (!fingerprint || !g_otad_config_db)
+        return -1;
+    st = otad_config_prepare(state_sql);
+    if (!st)
+        return -1;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        for (column = 0; column < 2; column++)
+            otad_status_fingerprint_column(&value, st, column);
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE)
+        return -1;
+
+    st = otad_config_prepare(slots_sql);
+    if (!st)
+        return -1;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        for (column = 0; column < 9; column++)
+            otad_status_fingerprint_column(&value, st, column);
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE)
+        return -1;
+    *fingerprint = value;
+    return 0;
+}
+
+static int otad_status_topology_identity_equal(
+    const struct otad_ab_topology *a, const struct otad_ab_topology *b)
+{
+#define SAME(field) !strcmp((a)->field, (b)->field)
+    return a && b && SAME(current_slot) && SAME(inactive_slot) &&
+        SAME(root_a) && SAME(root_b) && SAME(boot) && SAME(data) &&
+        SAME(root_a_partuuid) && SAME(root_b_partuuid) &&
+        SAME(boot_partuuid) && SAME(data_partuuid) &&
+        SAME(root_a_devno) && SAME(root_b_devno) &&
+        SAME(root_a_fstype) && SAME(root_b_fstype) &&
+        a->root_a_size == b->root_a_size &&
+        a->root_b_size == b->root_b_size &&
+        a->boot_size == b->boot_size && a->data_size == b->data_size;
+#undef SAME
+}
+
+void otad_slot_status_cache_invalidate(void)
+{
+    g_otad_status_probe_cache.valid = 0;
+    g_otad_status_probe_generation++;
+    if (!g_otad_status_probe_generation)
+        g_otad_status_probe_generation = 1;
+}
+
+static void otad_status_probe_store_verified(
+    const struct otad_ab_topology *topology, int64_t now_ms,
+    uint64_t ota_metadata_fingerprint)
+{
+    g_otad_status_probe_cache.valid = 1;
+    g_otad_status_probe_cache.ever_verified = 1;
+    g_otad_status_probe_cache.state = OTAD_STATUS_PROBE_VERIFIED;
+    g_otad_status_probe_cache.generation = g_otad_status_probe_generation;
+    g_otad_status_probe_cache.probed_at = otad_now_s();
+    g_otad_status_probe_cache.probed_monotonic_ms = now_ms;
+    g_otad_status_probe_cache.ota_metadata_fingerprint =
+        ota_metadata_fingerprint;
+    g_otad_status_probe_cache.topology = *topology;
+    g_otad_status_probe_cache.error[0] = '\0';
+}
+
+static void otad_status_probe_store_failure(
+    const struct otad_ab_topology *topology, const char *error, int64_t now_ms,
+    uint64_t ota_metadata_fingerprint)
+{
+    g_otad_status_probe_cache.valid = 1;
+    g_otad_status_probe_cache.state =
+        g_otad_status_probe_cache.ever_verified ?
+            OTAD_STATUS_PROBE_STALE : OTAD_STATUS_PROBE_UNAVAILABLE;
+    g_otad_status_probe_cache.generation = g_otad_status_probe_generation;
+    g_otad_status_probe_cache.probed_at = otad_now_s();
+    g_otad_status_probe_cache.probed_monotonic_ms = now_ms;
+    g_otad_status_probe_cache.ota_metadata_fingerprint =
+        ota_metadata_fingerprint;
+    if (topology)
+        g_otad_status_probe_cache.topology = *topology;
+    else
+        memset(&g_otad_status_probe_cache.topology, 0,
+               sizeof(g_otad_status_probe_cache.topology));
+    snprintf(g_otad_status_probe_cache.error,
+             sizeof(g_otad_status_probe_cache.error), "%s",
+             error && error[0] ? error : "ab_topology_readonly_evidence_incomplete");
+}
+
+static const char *otad_status_probe_source(
+    enum otad_status_probe_state state, int live)
+{
+    if (live && state == OTAD_STATUS_PROBE_VERIFIED)
+        return "live";
+    if (state == OTAD_STATUS_PROBE_VERIFIED)
+        return "cached";
+    if (state == OTAD_STATUS_PROBE_STALE)
+        return "stale";
+    return "unavailable";
+}
+
+struct json_object *otad_slot_status_json(int force_refresh)
 {
     struct json_object *o = json_object_new_object();
     struct json_object *probes = json_object_new_object();
     struct json_object *missing = json_object_new_array();
     struct otad_ab_topology topology;
+    struct otad_ab_topology identity;
     char current[2] = "";
     char inactive[2] = "";
     char target[OTAD_MAX_PATH] = "";
@@ -2234,19 +2425,81 @@ struct json_object *otad_slot_status_json(void)
     char topology_error[128] = "";
     char boot_state_error[128] = "";
     struct otad_ab_topology verified_topology;
-    int topology_verified = otad_ab_topology_readonly_probe(
-        &topology, topology_error, sizeof(topology_error)) == 0;
+    enum otad_status_probe_state probe_state = OTAD_STATUS_PROBE_NONE;
+    int64_t now_ms = otad_status_monotonic_ms();
+    int64_t probe_age_ms = 0;
+    uint64_t ota_metadata_fingerprint = 0;
+    int cache_ttl_ms = OTAD_STATUS_PROBE_CACHE_TTL_MS;
+    int identity_verified;
+    int ota_metadata_verified;
+    int topology_verified = 0;
     int boot_state_verified = 0;
+    int live_probe = 0;
 
-    if (topology_verified &&
-        otad_ab_topology_discover(&verified_topology, boot_state_error,
-                                  sizeof(boot_state_error)) == 0 &&
-        otad_ab_boot_state_readonly_verify(&verified_topology,
-                                           boot_state_error,
-                                           sizeof(boot_state_error)) == 0) {
-        topology = verified_topology;
-        boot_state_verified = 1;
+    memset(&topology, 0, sizeof(topology));
+    memset(&identity, 0, sizeof(identity));
+    memset(&verified_topology, 0, sizeof(verified_topology));
+    identity_verified = otad_ab_topology_readonly_probe(
+        &identity, topology_error, sizeof(topology_error)) == 0;
+    ota_metadata_verified =
+        otad_status_ota_metadata_fingerprint(&ota_metadata_fingerprint) == 0;
+
+    if (force_refresh)
+        otad_slot_status_cache_invalidate();
+    if (g_otad_status_probe_cache.valid) {
+        probe_age_ms = otad_status_probe_age_ms(now_ms);
+        cache_ttl_ms = g_otad_status_probe_cache.state ==
+            OTAD_STATUS_PROBE_VERIFIED ? OTAD_STATUS_PROBE_CACHE_TTL_MS :
+            OTAD_STATUS_PROBE_FAILURE_TTL_MS;
+        if (!identity_verified || !ota_metadata_verified ||
+            ota_metadata_fingerprint !=
+                g_otad_status_probe_cache.ota_metadata_fingerprint ||
+            !otad_status_topology_identity_equal(
+                &identity, &g_otad_status_probe_cache.topology) ||
+            probe_age_ms > cache_ttl_ms) {
+            otad_slot_status_cache_invalidate();
+        }
     }
+
+    if (g_otad_status_probe_cache.valid) {
+        topology = g_otad_status_probe_cache.topology;
+        probe_state = g_otad_status_probe_cache.state;
+        topology_verified = identity_verified;
+        boot_state_verified = topology_verified &&
+            probe_state == OTAD_STATUS_PROBE_VERIFIED;
+        snprintf(boot_state_error, sizeof(boot_state_error), "%s",
+                 g_otad_status_probe_cache.error);
+    } else if (identity_verified &&
+               otad_ab_topology_discover(&verified_topology, boot_state_error,
+                                         sizeof(boot_state_error)) == 0 &&
+               otad_ab_boot_state_readonly_verify(&verified_topology,
+                                                  boot_state_error,
+                                                  sizeof(boot_state_error)) == 0) {
+        topology = verified_topology;
+        topology_verified = 1;
+        boot_state_verified = 1;
+        live_probe = 1;
+        otad_status_probe_store_verified(&topology, now_ms,
+                                         ota_metadata_fingerprint);
+        probe_state = OTAD_STATUS_PROBE_VERIFIED;
+        probe_age_ms = 0;
+    } else {
+        const char *error = topology_error[0] ? topology_error : boot_state_error;
+
+        topology = identity;
+        topology_verified = identity_verified;
+        boot_state_verified = 0;
+        live_probe = identity_verified;
+        otad_status_probe_store_failure(identity_verified ? &identity : NULL,
+                                        error, now_ms,
+                                        ota_metadata_fingerprint);
+        probe_state = g_otad_status_probe_cache.state;
+        probe_age_ms = 0;
+        if (!boot_state_error[0])
+            snprintf(boot_state_error, sizeof(boot_state_error), "%s",
+                     g_otad_status_probe_cache.error);
+    }
+
     int supported = topology_verified && boot_state_verified;
     int inactive_bootable_verified = boot_state_verified &&
         topology.inactive_slot_bootable_verified;
@@ -2286,6 +2539,14 @@ struct json_object *otad_slot_status_json(void)
                                inactive_bootable_verified));
     json_object_object_add(o, "boot_state_readonly_verified",
                            json_object_new_boolean(boot_state_verified));
+    otad_json_add_string(o, "probe_source",
+                         otad_status_probe_source(probe_state, live_probe));
+    json_object_object_add(o, "probed_at", json_object_new_int64(
+        g_otad_status_probe_cache.probed_at));
+    json_object_object_add(o, "probe_age_ms", json_object_new_int64(
+        probe_age_ms));
+    json_object_object_add(o, "probe_generation", json_object_new_int64(
+        (int64_t)g_otad_status_probe_cache.generation));
     otad_json_add_string(o, "boot_state_reason",
                          boot_state_verified ? "" :
                          (boot_state_error[0] ? boot_state_error :
@@ -2298,7 +2559,8 @@ struct json_object *otad_slot_status_json(void)
     otad_json_add_string(probes, "data_device", data);
     otad_json_add_string(probes, "topology_digest",
                          boot_state_verified ? topology.topology_digest : "");
-    otad_json_add_string(probes, "reason", topology_error);
+    otad_json_add_string(probes, "reason",
+                         topology_error[0] ? topology_error : boot_state_error);
     if (!topology_verified)
         otad_topology_missing_evidence(missing, topology_error);
     else if (!boot_state_verified)

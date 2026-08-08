@@ -199,10 +199,11 @@ static int otad_status_query_inventory(char *last_error, size_t last_error_len,
     return ok;
 }
 
-struct json_object *otad_status_json(void)
+struct json_object *otad_status_json(struct json_object *body)
 {
     struct json_object *resp = json_object_new_object();
-    struct json_object *slot_status = otad_slot_status_json();
+    struct json_object *slot_status = otad_slot_status_json(
+        otad_json_bool(body, "refresh", 0));
     struct json_object *dependencies = json_object_new_object();
     struct json_object *datasets = json_object_new_object();
     char state[64];

@@ -76,6 +76,8 @@
 #define OTAD_FIRMWARE_HEADER_NAME "firmware_info.json\n"
 #define OTAD_BOOT_CONFIRM_DELAY_MS 120000
 #define OTAD_REBOOT_RETRY_DELAY_MS 30000
+#define OTAD_STATUS_PROBE_CACHE_TTL_MS 300000
+#define OTAD_STATUS_PROBE_FAILURE_TTL_MS 30000
 #define OTAD_OPERATION_ID_LEN 36
 #define OTAD_UPLOAD_ID_LEN 36
 #define OTAD_OPERATION_OPTIONS_MAX 1024
@@ -324,7 +326,7 @@ int otad_inventory_add_unknown(const char *path, const char *reason,
                                const char *suggested_action, const struct stat *st,
                                int will_preserve);
 
-struct json_object *otad_status_json(void);
+struct json_object *otad_status_json(struct json_object *body);
 struct json_object *otad_check_manifest(struct json_object *body);
 struct json_object *otad_inventory_scan(struct json_object *body);
 struct json_object *otad_unknowns_json(struct json_object *body);
@@ -341,7 +343,8 @@ struct json_object *otad_update_verify(struct json_object *body);
 struct json_object *otad_update_apply(struct json_object *body);
 struct json_object *otad_firmware_rollback(struct json_object *body);
 struct json_object *otad_confirm_boot(struct json_object *body);
-struct json_object *otad_slot_status_json(void);
+struct json_object *otad_slot_status_json(int force_refresh);
+void otad_slot_status_cache_invalidate(void);
 void otad_confirm_timer_start(void);
 void otad_reconcile_boot_state(void);
 int otad_hot_target_allowed(const char *firmware_type, const char *path);

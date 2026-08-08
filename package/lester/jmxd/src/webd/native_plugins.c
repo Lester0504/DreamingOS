@@ -133,6 +133,112 @@ static int path_has_segment(const char *path, const char *segment)
 }
 
 /*
+ * Prefix/exact helpers for the permission gate.
+ *
+ * These deliberately work on the plugin-relative suffix rather than the full
+ * request path, because that is what the daemon's requiredPermission() sees.
+ * Matching the full path would also match the plugin id itself: a plugin
+ * literally named "nodes" would otherwise make every one of its routes look
+ * node-scoped.
+ */
+static int native_path_equals(const char *suffix, const char *want)
+{
+    if (!suffix || !want)
+        return 0;
+    return !strcmp(suffix, want);
+}
+
+static int native_path_has_prefix(const char *suffix, const char *prefix)
+{
+    size_t len;
+
+    if (!suffix || !prefix || !(len = strlen(prefix)))
+        return 0;
+    return !strncmp(suffix, prefix, len);
+}
+
+static int native_path_has_suffix(const char *suffix, const char *tail)
+{
+    size_t sl, tl;
+
+    if (!suffix || !tail)
+        return 0;
+    sl = strlen(suffix);
+    tl = strlen(tail);
+    return sl >= tl && !strcmp(suffix + sl - tl, tail);
+}
+
+/* GET /nodes/... exposes node credentials; the daemon grades it secrets. */
+static int native_path_is_node_scoped(const char *suffix)
+{
+    return native_path_has_prefix(suffix, "/nodes/");
+}
+
+/* The cached subscription payload contains node credentials. */
+static int native_path_is_subscription_raw(const char *suffix)
+{
+    return native_path_has_prefix(suffix, "/subscriptions/") &&
+           native_path_has_suffix(suffix, "/raw");
+}
+
+/* Any write under /data-plane/ swaps the running configuration. */
+static int native_path_is_data_plane(const char *suffix)
+{
+    return native_path_has_prefix(suffix, "/data-plane/");
+}
+
+/*
+ * A restore replaces the encrypted secret store together with the structured
+ * state. Mirrors backupRestorePath() on the daemon side.
+ */
+/*
+ * The shape is POST /backups/{id}/restore — exactly three segments, with a
+ * resource id in the middle that may not contain a slash. Matching a looser
+ * pattern such as "any path containing restore" would be wrong in both
+ * directions: it would pull the operate-tier "restore" routes up into secrets,
+ * and it would still miss nothing, since this is the only restore the daemon
+ * grades as credential access.
+ */
+static int native_path_is_backup_restore(const char *method, const char *suffix)
+{
+    const char *id, *rest;
+    size_t id_len;
+
+    if (!method || strcmp(method, "POST") || !suffix)
+        return 0;
+    if (!native_path_has_prefix(suffix, "/backups/"))
+        return 0;
+    id = suffix + strlen("/backups/");
+    rest = strchr(id, '/');
+    if (!rest)
+        return 0;
+    id_len = (size_t)(rest - id);
+    if (!id_len)
+        return 0;
+    return !strcmp(rest, "/restore");
+}
+
+/*
+ * Writes under /nodes/ are credential access, except the probe family and
+ * wan-policy, which the daemon lets the operate tier handle. Keeping the
+ * exception list here rather than relying on segment order matters: "probe"
+ * also appears in the operate list, and without this carve-out a node probe
+ * would be graded secrets and refused for an operator.
+ */
+static int native_path_is_node_write_secret(const char *suffix)
+{
+    if (!native_path_has_prefix(suffix, "/nodes/"))
+        return 0;
+    if (native_path_has_suffix(suffix, "/probe") ||
+        native_path_has_suffix(suffix, "/service-probe") ||
+        native_path_has_suffix(suffix, "/profile-probe") ||
+        native_path_has_suffix(suffix, "/ip-quality-probe") ||
+        native_path_has_suffix(suffix, "/wan-policy"))
+        return 0;
+    return 1;
+}
+
+/*
  * Split "/api/v1/plugins/native/<id>[/<suffix>]" into the plugin id and the
  * remaining suffix. Returns 0 on success, -1 when the path does not name a
  * plugin.
@@ -431,9 +537,55 @@ const char *webd_native_required_permission(const char *method, const char *path
      * dreamingproxy-only ordering, so existing permission grants keep their
      * exact meaning: secrets outrank apply, apply outranks operate, and
      * anything else that writes is "configure". */
+    /*
+     * The classification below mirrors requiredPermission() in
+     * dreamingproxy/internal/api/api.go. The daemon is the authority; webd is
+     * a pre-filter in front of it, so webd must never be stricter than the
+     * daemon or a request the daemon would allow dies at 403 before reaching
+     * it — and never looser in a way that turns a daemon refusal into a
+     * confusing error class.
+     *
+     * That is exactly what had happened: webd's operate list held 5 segments
+     * where the daemon's holds 17, so POST .../service/restart and
+     * .../overview/egress/refresh were graded "configure". An App device is an
+     * operator, operator does not carry configure, and every one of those
+     * operations was refused by webd without the daemon ever seeing it.
+     * restart was the worst of them: start and stop passed, restart did not.
+     *
+     * Keep the two lists in step. jmxd/tests/native_plugin_permission_parity_fixture.c
+     * reads both files and fails when they diverge.
+     */
     if (!strcmp(method, "GET") || !strcmp(method, "HEAD")) {
-        action = (path_has_segment(path, "audit-events") ||
-                  path_has_segment(path, "diagnostics")) ? "audit" : "read";
+        /*
+         * Credential-bearing reads. The daemon grades these "secrets"; webd
+         * used to grade them "read", so it forwarded a request the daemon then
+         * refused. Fail-closed either way, but the caller saw
+         * permission_denied instead of plugin_permission_denied and the audit
+         * record carried the wrong required_permission.
+         */
+        if (native_path_is_node_scoped(suffix) ||
+            native_path_equals(suffix, "/data-plane/candidate") ||
+            native_path_equals(suffix, "/data-plane/last-known-good") ||
+            native_path_is_subscription_raw(suffix))
+            action = "secrets";
+        else
+            action = (path_has_segment(path, "audit-events") ||
+                      path_has_segment(path, "diagnostics")) ? "audit" : "read";
+    } else if (native_path_is_data_plane(suffix)) {
+        /* Any write below /data-plane/ swaps the running configuration. */
+        action = "apply";
+    } else if (native_path_is_backup_restore(method, suffix)) {
+        /*
+         * A full restore replaces the encrypted secret store along with the
+         * structured state, so it is credential access rather than routine
+         * maintenance. Ordered before the operate list on purpose: "restore"
+         * appears in both, and the daemon resolves it as secrets.
+         */
+        action = "secrets";
+    } else if (native_path_is_node_write_secret(suffix)) {
+        /* Writes under /nodes/ carry node credentials, except the probe
+         * variants and wan-policy which the daemon lets operate handle. */
+        action = "secrets";
     } else if (path_has_segment(path, "secret") ||
                path_has_segment(path, "secrets") ||
                path_has_segment(path, "credentials")) {
@@ -441,10 +593,26 @@ const char *webd_native_required_permission(const char *method, const char *path
     } else if (path_has_segment(path, "apply") ||
                path_has_segment(path, "rollback")) {
         action = "apply";
+    } else if (path_has_segment(path, "simulate")) {
+        /* Simulation only explains the compiled rule order; it mutates
+         * nothing, and the daemon grades it read. */
+        action = "read";
     } else if (path_has_segment(path, "probe") ||
+               path_has_segment(path, "service-probe") ||
+               path_has_segment(path, "profile-probe") ||
+               path_has_segment(path, "probe-profile-batch") ||
+               path_has_segment(path, "ip-quality-probe") ||
+               path_has_segment(path, "failover-preflight") ||
+               path_has_segment(path, "select") ||
                path_has_segment(path, "probe-jobs") ||
+               path_has_segment(path, "ip-quality-probe-jobs") ||
+               path_has_segment(path, "refresh") ||
+               path_has_segment(path, "restore") ||
+               path_has_segment(path, "connections") ||
+               path_has_segment(path, "connection-history") ||
                path_has_segment(path, "start") ||
                path_has_segment(path, "stop") ||
+               path_has_segment(path, "restart") ||
                path_has_segment(path, "update")) {
         action = "operate";
     } else {

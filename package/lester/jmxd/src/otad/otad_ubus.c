@@ -20,12 +20,14 @@ static int otad_handle_status(struct ubus_context *ctx, struct ubus_object *obj,
                               struct ubus_request_data *req, const char *method,
                               struct blob_attr *msg)
 {
+    struct json_object *body = otad_json_from_blob(msg);
     struct json_object *resp;
-    (void)obj; (void)method; (void)msg;
+    (void)obj; (void)method;
 
-    resp = otad_status_json();
+    resp = otad_status_json(otad_payload_or_self(body));
     otad_send_json(ctx, req, resp);
     json_object_put(resp);
+    json_object_put(body);
     return UBUS_STATUS_OK;
 }
 

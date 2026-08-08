@@ -24,8 +24,26 @@
 #include "jmx_conntrack.h"
 #include "jmx_log.h"
 #include "jmx.h"
+#include "jmx_stats.h"
 
 static struct hlist_head af_conn_table[AF_CONN_HASH_SIZE];
+
+/*
+ * Live entry count, maintained alongside the table so cache_stats does not
+ * have to walk 256 buckets under the lock on every read.  Guarded by
+ * af_conn_lock, like the table itself.
+ */
+static u32 af_conn_count;
+
+u32 af_conn_live_count(void)
+{
+	u32 count;
+
+	spin_lock_bh(&af_conn_lock);
+	count = af_conn_count;
+	spin_unlock_bh(&af_conn_lock);
+	return count;
+}
 
 DEFINE_SPINLOCK(af_conn_lock);
 
@@ -52,6 +70,8 @@ static void af_conn_cleanup(void)
 		{
 			hlist_del(&p->node);
 			kfree(p);
+			jmx_stats_pool_free(JMX_POOL_CONN);
+			af_conn_count--;
 		}
 	}
     spin_unlock(&af_conn_lock);
@@ -65,8 +85,10 @@ static af_conn_t *af_conn_add(u32 src_ip, u32 dst_ip, u16 src_port,
     hash = af_conn_hash(src_ip, dst_ip, src_port, dst_port, protocol);
     conn = kmalloc(sizeof(af_conn_t), GFP_ATOMIC);
     if (!conn) {
+        jmx_stats_pool_alloc_fail(JMX_POOL_CONN);
         return NULL;
     }
+    jmx_stats_pool_alloc(JMX_POOL_CONN);
     
     conn->src_ip = src_ip;
     conn->dst_ip = dst_ip;
@@ -81,6 +103,7 @@ static af_conn_t *af_conn_add(u32 src_ip, u32 dst_ip, u16 src_port,
     conn->state = AF_CONN_NEW;
     conn->last_jiffies = jiffies;
     hlist_add_head(&conn->node, &af_conn_table[hash]);
+    af_conn_count++;
     AF_LMT_INFO("add new conn ok...%pI4:%d->%pI4:%d %d\n",
         &conn->src_ip, conn->src_port, &conn->dst_ip, conn->dst_port, conn->protocol);
     return conn;
@@ -157,6 +180,8 @@ void af_conn_clean_timeout(void)
                  &conn->src_ip, conn->src_port, &conn->dst_ip, conn->dst_port, conn->protocol);
                 hlist_del(&(conn->node));
                 kfree(conn);
+                jmx_stats_pool_free(JMX_POOL_CONN);
+                af_conn_count--;
             }
         }
         last_bucket = i;

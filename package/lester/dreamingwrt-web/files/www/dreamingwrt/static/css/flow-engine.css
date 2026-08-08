@@ -200,31 +200,46 @@
   font-family: var(--app-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
 }
 
-/* ── 多线负载 ──────────────────────────────────────────────────────────────
-   材质沿用本项目的 token 与 kit 表面，不引入设计稿里的 rgba 玻璃与 32px 圆角。
-   算法卡是单选，用 role=radio 而不是把它做成一排按钮；固定档位的尺寸靠
-   grid 轨道与 min-height 稳住，hover 与选中态都不改变盒子尺寸，避免布局跳动。 */
-.flow-balance-algorithm-group { display: grid; gap: 10px; }
-.flow-balance-algorithm-group + .flow-balance-algorithm-group { margin-block-start: 18px; }
-.flow-balance-group-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
-.flow-balance-group-head > strong { color: var(--app-text); font-size: 13px; font-weight: 700; }
-.flow-balance-group-head > span { color: var(--app-text-muted); font-size: 12px; }
-
-.flow-balance-algorithm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+/* Multi-WAN controls use backend-provided modes and stable kit surfaces. */
+/* demo 是固定 3 列。用 auto-fit 会在宽视口下算出 5 列，8 张卡排成 5+3、
+   末行留空洞，卡片高度也参差不齐 —— 这正是用户说的「UI 挺糟糕」。 */
+.flow-balance-algorithm-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .flow-balance-algorithm {
-  min-width: 0; min-height: 108px;
-  display: grid; align-content: start; gap: 7px;
+  position: relative; overflow: hidden;
+  min-width: 0; min-height: 118px;
+  display: grid; grid-template-rows: auto 1fr auto; gap: 7px;
   border-radius: var(--app-radius-control, 12px);
-  padding: 14px 16px;
+  padding: 16px 18px;
   color: var(--app-text);
   font: inherit; text-align: start; cursor: pointer;
-  transition: background .18s ease, border-color .18s ease;
+  transition: background .18s ease, border-color .18s ease, transform .18s cubic-bezier(.25, 1, .5, 1);
 }
-.flow-balance-algorithm:hover { border-color: color-mix(in srgb, var(--app-text) 22%, transparent); }
+.flow-balance-algorithm:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--app-text) 22%, transparent);
+  transform: translateY(-2px);
+}
+.flow-balance-algorithm:disabled { opacity: .62; cursor: not-allowed; }
 .flow-balance-algorithm.is-active {
   border-color: color-mix(in srgb, var(--app-accent) 55%, transparent);
-  background: color-mix(in srgb, var(--app-accent) 12%, transparent);
 }
+/* demo 用背景色 + 右上角背光灯表达选中，但这两者在本项目里都画不出来：
+   `.dwrt-shared-glass-cutout` 被 menu-shell.css 以 `background: transparent !important`
+   强制挖空，实测选中卡的 background 与 ::after 背景都被压成透明。
+   所以选中态只能走边框、字重与徽章这些不被挖空覆盖的通道。 */
+.flow-balance-algorithm.is-active > .flow-balance-algorithm-head > strong { font-weight: 800; }
+.flow-balance-algorithm.is-active > .flow-balance-algorithm-value {
+  color: var(--app-text);
+  border-color: color-mix(in srgb, var(--app-accent) 45%, transparent);
+}
+/* 运行中但草稿已改到别处：保留一条细边，说明「真正在跑的是这张」。 */
+.flow-balance-algorithm.is-running:not(.is-active) {
+  border-color: color-mix(in srgb, var(--app-success, #30d158) 42%, transparent);
+}
+.flow-balance-algorithm-flags { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.flow-balance-algorithm-fallback {
+  margin: 10px 0 0; color: var(--app-text-muted); font-size: 12px;
+}
+.flow-balance-algorithm-fallback > code { font-family: var(--app-font-mono, ui-monospace, monospace); }
 .flow-balance-algorithm-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .flow-balance-algorithm-head > strong { font-size: 14px; font-weight: 700; }
 .flow-balance-algorithm-desc { color: var(--app-text-secondary, var(--app-text-muted)); font-size: 12px; line-height: 1.5; }
@@ -236,31 +251,51 @@
   background: color-mix(in srgb, var(--app-text) 6%, transparent);
   font-family: var(--app-font-mono, ui-monospace, monospace); font-size: 11px;
 }
-.flow-balance-tag {
-  border-radius: var(--app-radius-compact, 8px);
-  padding: 2px 7px;
-  color: var(--app-accent);
-  background: color-mix(in srgb, var(--app-accent) 14%, transparent);
-  font-size: 11px; font-weight: 700;
-}
-
-.flow-balance-member-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
+/* demo 是固定 2 列；auto-fit 会把 4 条线路挤成一行，指标没有空间显示。 */
+.flow-balance-member-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .flow-balance-member {
-  min-width: 0; min-height: 62px;
-  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px;
+  min-width: 0; min-height: 76px;
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 14px;
   border-radius: var(--app-radius-control, 12px);
-  padding: 12px 16px;
+  padding: 14px 18px;
   cursor: pointer;
   transition: background .18s ease, border-color .18s ease;
 }
 .flow-balance-member.is-active {
   border-color: color-mix(in srgb, var(--app-accent) 45%, transparent);
-  background: color-mix(in srgb, var(--app-accent) 9%, transparent);
 }
+.flow-balance-member.is-disabled { opacity: .62; cursor: not-allowed; }
 .flow-balance-member-body { min-width: 0; display: grid; gap: 2px; }
 .flow-balance-member-name { color: var(--app-text); font-family: var(--app-font-mono, ui-monospace, monospace); font-size: 14px; font-weight: 700; overflow-wrap: anywhere; }
 .flow-balance-member-meta { color: var(--app-text-muted); font-size: 11px; overflow-wrap: anywhere; }
 .flow-balance-member-side { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+
+/* 后端每条 WAN 都给了延迟/丢包/实时速率/连接数，原先只显示「权重 100」，
+   把真实指标排成一行等宽数字，便于跨线路纵向比较。 */
+.flow-balance-member-metrics {
+  grid-column: 2 / -1;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-block-start: 2px;
+}
+.flow-balance-member-metric {
+  display: inline-flex; align-items: baseline; gap: 4px;
+  color: var(--app-text-muted); font-size: 11px;
+}
+.flow-balance-member-metric > b {
+  color: var(--app-text);
+  font-family: var(--app-font-mono, ui-monospace, monospace);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px; font-weight: 700;
+}
+.flow-balance-member-metric.is-warn > b { color: var(--app-warning, #d08700); }
+
+/* 固定列数需要自己的中段退化：3 列在 1180px 以下会把描述文字压成竖条。 */
+@media (max-width: 1180px) {
+  .flow-balance-algorithm-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 900px) {
+  .flow-balance-member-grid { grid-template-columns: minmax(0, 1fr); }
+}
 
 .flow-balance-presets { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-block-start: 12px; }
 .flow-balance-presets > span { color: var(--app-text-muted); font-size: 12px; font-weight: 600; }
@@ -272,17 +307,39 @@
   color: var(--app-text); background: transparent;
   font: inherit; font-size: 12px; cursor: pointer;
 }
-.flow-balance-preset:hover { background: color-mix(in srgb, var(--app-text) 7%, transparent); }
+.flow-balance-preset:not(:disabled):hover { background: color-mix(in srgb, var(--app-text) 7%, transparent); }
+.flow-balance-preset:disabled { opacity: .62; cursor: not-allowed; }
+/* 当前选择恰好等于某个快选分组时点亮它，让「现在是哪一组」可见。 */
+.flow-balance-preset.is-active {
+  border-color: color-mix(in srgb, var(--app-accent) 55%, transparent);
+  background: color-mix(in srgb, var(--app-accent) 16%, transparent);
+  font-weight: 700;
+}
 
 .flow-balance-actionbar {
+  position: sticky; inset-block-end: 0; z-index: 5;
   display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
   border-radius: var(--app-radius-control, 12px);
   padding: 14px 18px;
+  margin-block-start: 16px;
 }
+/* 这里刻意不声明 background / backdrop-filter。
+
+   `.dwrt-shared-glass-cutout` 被 menu-shell.css 用 `background: transparent !important`
+   强制挖空，材质由共享采样层统一提供（design.md：路由 CSS 可保留几何与高度，
+   但不能另画中心）。在页面里抬密度或自绘不透明底都会被 !important 压掉，
+   实测无效，而且违反材质契约。仅保留阴影用于层次。 */
+.flow-balance-actionbar { box-shadow: var(--dwrt-glass-shadow-raised, 0 -2px 24px rgb(0 0 0 / 22%)); }
 .flow-balance-actionbar-text { min-width: 0; display: grid; gap: 3px; }
 .flow-balance-actionbar-text > strong { color: var(--app-text); font-size: 14px; font-weight: 700; }
 .flow-balance-actionbar-text > span { color: var(--app-text-muted); font-size: 12px; overflow-wrap: anywhere; }
 .flow-balance-actionbar [data-flow-balance-save][disabled] { opacity: .5; cursor: not-allowed; }
+
+/* sticky 动作条停在滚动容器底沿，会压住最后一行成员卡片（实测遮掉 wan / wan2）。
+   容器自身的 36px 底部留白不足以容纳它，所以让含动作条的这一段自己让出高度。 */
+.flow-engine-tab-content:has(> .flow-balance-actionbar) {
+  padding-block-end: 84px;
+}
 
 
 @media (max-width: 760px) {

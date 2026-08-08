@@ -11,6 +11,7 @@
 #include <linux/workqueue.h>
 #include "jmx_v3_ac.h"
 #include "jmx_v3_rules.h"
+#include "jmx_stats.h"
 
 #define JMX_V3_MAX_RULES  16384U
 #define JMX_V3_MAX_STEPS  262144U
@@ -72,6 +73,14 @@ struct jmx_v3_rule_set_k {
 	struct jmx_v3_port_k *ports;
 	struct jmx_v3_ac *ac;
 	struct jmx_v3_ac_stats ac_stats;
+	/*
+	 * Per-rule match counters, parallel to rules[] and owned by this set.
+	 * Keeping them here rather than in a global table means a rule-set
+	 * swap cannot carry a count from a retired generation onto a new rule
+	 * that happens to land at the same index.  atomic64 because the match
+	 * path runs concurrently on every CPU under rcu_read_lock() only.
+	 */
+	atomic64_t *match_cnt;
 };
 
 struct jmx_v3_transaction {
@@ -120,6 +129,7 @@ static void free_set(struct jmx_v3_rule_set_k *set)
 	kvfree(set->rules);
 	kvfree(set->steps);
 	kvfree(set->ports);
+	kvfree(set->match_cnt);
 	kfree(set);
 }
 
@@ -338,16 +348,21 @@ int jmx_v3_tx_begin(u32 owner_portid, u32 generation,
 	set->declared_caps = caps;
 	memcpy(set->catalog_digest, begin->catalog_digest,
 	       sizeof(set->catalog_digest));
-	if (rules)
+	if (rules) {
 		set->rules = kvmalloc_array(rules, sizeof(*set->rules),
 					    GFP_KERNEL | __GFP_ZERO);
+		/* Zeroed allocation gives every rule a starting count of 0. */
+		set->match_cnt = kvmalloc_array(rules, sizeof(*set->match_cnt),
+						GFP_KERNEL | __GFP_ZERO);
+	}
 	if (steps)
 		set->steps = kvmalloc_array(steps, sizeof(*set->steps),
 					    GFP_KERNEL | __GFP_ZERO);
 	if (ports)
 		set->ports = kvmalloc_array(ports, sizeof(*set->ports),
 					    GFP_KERNEL | __GFP_ZERO);
-	if ((rules && !set->rules) || (steps && !set->steps) ||
+	if ((rules && (!set->rules || !set->match_cnt)) ||
+	    (steps && !set->steps) ||
 	    (ports && !set->ports)) {
 		set_error(reason, detail, JMX_V3_REASON_NO_MEMORY, 0);
 		rc = -ENOMEM;
@@ -779,8 +794,10 @@ int jmx_v3_tx_commit(u32 owner_portid, u32 generation,
 	rcu_assign_pointer(v3_active, set);
 	mutex_unlock(&v3_update_lock);
 	if (old) {
+		jmx_stats_rcu_retire_begin();
 		synchronize_rcu();
 		free_set(old);
+		jmx_stats_rcu_retire_end();
 	}
 	pr_info("jmx_v3_LOAD: status=committed generation=%u mode=%u rules=%u steps=%u ports=%u nodes=%u edges=%u outputs=%u duplicate_payloads=%u owner_portid=%u\n",
 		generation, mode, rule_count, step_count, port_count,
@@ -1037,6 +1054,14 @@ static int evaluate_first(void *opaque, u32 rule_index, u16 step_index,
 				 previous_end, work_budget);
 	if (matched <= 0)
 		return matched;
+	/*
+	 * A fully matched rule, counted here regardless of whether it goes on
+	 * to win the priority contest below.  This is the honest reading of
+	 * "this signature matched traffic"; crediting only the winner would
+	 * hide a rule that fires constantly but is always outranked.
+	 */
+	if (ctx->set->match_cnt)
+		atomic64_inc(&ctx->set->match_cnt[rule_index]);
 	if (rule->priority < ctx->best_priority ||
 	    (rule->priority == ctx->best_priority &&
 	     rule->signature_rule_id < ctx->best_rule_id)) {
@@ -1100,4 +1125,48 @@ out:
 u32 jmx_v3_appid_for_commit(u32 appid, u8 mode)
 {
 	return mode == JMX_V3_MODE_ACTIVE ? appid : 0;
+}
+
+/*
+ * Copy the active set's per-rule counters out for /proc reading.
+ *
+ * Called with rows == NULL to learn the row count, then again with storage.
+ * The set can be swapped between those two calls, so the second call clamps
+ * to max_rows and returns what it actually wrote; the caller compares the two
+ * and reports the real number rather than padding the tail.
+ */
+int jmx_v3_rule_match_snapshot(struct jmx_stats_rule_row *rows, u32 max_rows,
+			       u32 *out_generation)
+{
+	const struct jmx_v3_rule_set_k *set;
+	u32 i, n;
+
+	rcu_read_lock();
+	set = rcu_dereference(v3_active);
+	if (!set) {
+		rcu_read_unlock();
+		if (out_generation)
+			*out_generation = 0;
+		return 0;
+	}
+	n = set->rule_count;
+	if (out_generation)
+		*out_generation = set->generation;
+	if (!rows) {
+		rcu_read_unlock();
+		return (int)n;
+	}
+	if (n > max_rows)
+		n = max_rows;
+	for (i = 0; i < n; i++) {
+		const struct jmx_v3_rule_k *rule = &set->rules[i];
+
+		rows[i].signature_rule_id = rule->signature_rule_id;
+		rows[i].appid = rule->appid;
+		rows[i].priority = rule->priority;
+		rows[i].match_cnt = set->match_cnt ?
+			(u64)atomic64_read(&set->match_cnt[i]) : 0;
+	}
+	rcu_read_unlock();
+	return (int)n;
 }

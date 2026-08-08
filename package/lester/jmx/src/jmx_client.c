@@ -37,6 +37,7 @@
 #include "jmx_utils.h"
 #include "jmx.h"
 #include "k_json.h"
+#include "jmx_stats.h"
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 #define JMX_FROM_TIMER(var, timer_ptr, timer_field) \
@@ -75,6 +76,16 @@ static void init_client_timer(af_client_info_t *client);
 static void stop_client_timer(af_client_info_t *client);
 static af_client_info_t *nf_client_add(unsigned char *mac);
 
+u32 af_client_live_count(void)
+{
+	u32 count;
+
+	AF_CLIENT_LOCK_R();
+	count = total_client;
+	AF_CLIENT_UNLOCK_R();
+	return count;
+}
+
 static void af_client_release(af_client_info_t *client)
 {
 	int i;
@@ -87,9 +98,11 @@ static void af_client_release(af_client_info_t *client)
 		hlist_for_each_entry_safe(info, n, &client->visit_info_hash[i], hlist) {
 			hlist_del(&info->hlist);
 			kfree(info);
+			jmx_stats_pool_free(JMX_POOL_VISIT_INFO);
 		}
 	}
 	kfree(client);
+	jmx_stats_pool_free(JMX_POOL_CLIENT);
 }
 
 void af_client_put(af_client_info_t *client)
@@ -273,8 +286,10 @@ static af_client_info_t *nf_client_add(unsigned char *mac)
 	if (node == NULL)
 	{
 		AF_ERROR("kmalloc failed\n");
+		jmx_stats_pool_alloc_fail(JMX_POOL_CLIENT);
 		return NULL;
 	}
+	jmx_stats_pool_alloc(JMX_POOL_CLIENT);
 
 	memset(node, 0, sizeof(af_client_info_t));
 	refcount_set(&node->refs, 1);
@@ -358,8 +373,11 @@ app_visit_info_t *get_or_create_visit_info(af_client_info_t *node, unsigned int 
 		return info;
 
 	info = (app_visit_info_t *)kmalloc(sizeof(app_visit_info_t), GFP_ATOMIC);
-	if (!info)
+	if (!info) {
+		jmx_stats_pool_alloc_fail(JMX_POOL_VISIT_INFO);
 		return NULL;
+	}
+	jmx_stats_pool_alloc(JMX_POOL_VISIT_INFO);
 
 	memset(info, 0, sizeof(app_visit_info_t));
 	info->app_id = app_id;
@@ -439,6 +457,7 @@ static void check_expired_visit_info(af_client_info_t *node)
 	hlist_for_each_entry_safe(info, n, &expired, hlist) {
 		hlist_del(&info->hlist);
 		kfree(info);
+		jmx_stats_pool_free(JMX_POOL_VISIT_INFO);
 	}
 }
 

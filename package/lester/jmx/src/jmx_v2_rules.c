@@ -15,6 +15,7 @@
 #include <linux/workqueue.h>
 #include "jmx_v2_rules.h"
 #include "jmx_v2_ac.h"
+#include "jmx_stats.h"
 
 /* ── Internal rule node ── */
 
@@ -68,6 +69,24 @@ static struct delayed_work rules_tx_expire_work;
 
 #define ACTIVE_SET()  (&rule_sets[READ_ONCE(active_idx)])
 #define STAGING_SET() (&rule_sets[1 - READ_ONCE(active_idx)])
+
+/*
+ * Live rule count of the *active* set, for cache_stats.  The staging set is
+ * deliberately excluded: the cache row describes what packets are matched
+ * against right now.  mem_stats accounts for both, which is why that pool's
+ * cross-check is informational rather than strict.
+ */
+u32 jmx_v2_rule_live_count(void)
+{
+	struct jmx_v2_rule_set_k *s;
+	u32 count;
+
+	read_lock_bh(&active_generation_lock);
+	s = ACTIVE_SET();
+	count = s ? s->count : 0;
+	read_unlock_bh(&active_generation_lock);
+	return count;
+}
 
 static inline uint32_t hash_appid(uint32_t appid)
 {
@@ -170,6 +189,7 @@ void jmx_v2_rules_exit(void)
 						  &rule_sets[i].buckets[j], hnode) {
 				hlist_del(&r->hnode);
 				kfree(r);
+				jmx_stats_pool_free(JMX_POOL_V2_RULE);
 			}
 		}
 		rule_sets[i].count = 0;
@@ -201,6 +221,7 @@ static void jmx_v2_rule_set_clear(struct jmx_v2_rule_set_k *s)
 		hlist_for_each_entry_safe(r, tmp, &s->buckets[i], hnode) {
 			hlist_del(&r->hnode);
 			kfree(r);
+			jmx_stats_pool_free(JMX_POOL_V2_RULE);
 		}
 	}
 	s->count = 0;
@@ -259,8 +280,10 @@ static int jmx_v2_rule_add_locked(const jmx_v2_rule_t *in)
 		write_lock_bh(&s->lock);
 		s->rejected_nomem++;
 		write_unlock_bh(&s->lock);
+		jmx_stats_pool_alloc_fail(JMX_POOL_V2_RULE);
 		return -ENOMEM;
 	}
+	jmx_stats_pool_alloc(JMX_POOL_V2_RULE);
 
 	r->appid = in->appid;
 	r->rule_id = in->rule_id;
@@ -420,6 +443,7 @@ int jmx_v2_rules_commit(uint32_t owner_portid, uint32_t version)
 		hlist_for_each_entry_safe(r, tmp, &old->buckets[i], hnode) {
 			hlist_del(&r->hnode);
 			kfree(r);
+			jmx_stats_pool_free(JMX_POOL_V2_RULE);
 		}
 	}
 	old->count = 0;

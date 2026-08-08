@@ -98,6 +98,9 @@ typedef struct jmx_rule_set {
 #define JMX_V2_MAX_MATCH    256
 #define JMX_V2_HASH_BUCKETS 256
 
+/* Published for cache_stats so it reports the real bucket count. */
+#define JMX_V2_RULE_BUCKETS JMX_V2_HASH_BUCKETS
+
 /*
  * Connmark for NFQUEUE routing.
  * Kernel sets this on conntrack when fast-path DPI fails.

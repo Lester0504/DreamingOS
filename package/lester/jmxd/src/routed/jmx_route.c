@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <ctype.h>
 #include <stdint.h>
 #include <errno.h>
@@ -83,6 +84,21 @@ struct route_sync_wan_map {
     char ifname[JMX_ROUTE_HEALTH_IFNAME_LEN];
 };
 
+struct route_network_wan_runtime {
+    char name[JMX_ROUTE_HEALTH_IFNAME_LEN];
+    char proto[16];
+    char configured_ifname[JMX_ROUTE_HEALTH_IFNAME_LEN];
+    char l3_ifname[JMX_ROUTE_HEALTH_IFNAME_LEN];
+    char gateway[64];
+    uint32_t weight;
+    uint8_t online;
+};
+
+struct route_network_wan_snapshot {
+    size_t count;
+    struct route_network_wan_runtime wans[JMX_ROUTE_MAX_WAN_IFACES];
+};
+
 struct route_adv_sync_stats {
     int checked;
     int synced;
@@ -95,6 +111,8 @@ struct route_adv_sync_stats {
 static struct route_health_state g_route_health[JMX_ROUTE_HEALTH_MAX_STATES];
 static uint32_t g_route_health_generation;
 static uint8_t g_route_auto_carriers[JMX_ROUTE_MAX_WAN_IFACES + 1];
+static struct route_network_wan_snapshot g_route_network_wans;
+static int g_route_network_wans_ready;
 
 static int jmx_route_nl_send(int fd, const void *data, int len)
 {
@@ -155,6 +173,38 @@ int jmx_route_nl_carrier_add(int nl_fd, uint32_t network, uint32_t mask, uint8_t
     msg.mask = mask;
     msg.carrier_id = carrier_id;
     return jmx_route_nl_send(nl_fd, &msg, sizeof(msg));
+}
+
+int jmx_route_nl_appcat_flush(int nl_fd)
+{
+    struct { int32_t action; uint32_t count; } __packed msg = {
+        .action = JMX_NL_ACT_APPCAT_FLUSH,
+        .count = 0,
+    };
+    return jmx_route_nl_send(nl_fd, &msg, sizeof(msg));
+}
+
+int jmx_route_nl_appcat_batch(int nl_fd, const struct jmx_appcat_rec *recs,
+                              uint32_t count)
+{
+    struct jmx_appcat_batch msg;
+    int wire_len;
+
+    if (!recs || !count || count > JMX_APPCAT_BATCH_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+    msg.action = JMX_NL_ACT_APPCAT_ADD;
+    msg.count = count;
+    memcpy(msg.recs, recs, count * sizeof(*recs));
+
+    /* Send only the populated prefix so the kernel's payload-derived record
+     * cap matches the advertised count exactly. */
+    wire_len = (int)(offsetof(struct jmx_appcat_batch, recs) +
+                     count * sizeof(*recs));
+    return jmx_route_nl_send(nl_fd, &msg, wire_len);
 }
 
 int jmx_route_nl_wan_register(int nl_fd, uint8_t wan_id, const char *name,
@@ -297,7 +347,11 @@ static uint32_t parse_u32_opt(struct uci_section *s, const char *name, uint32_t 
 static uint32_t parse_weight_opt(struct uci_section *s, uint32_t def);
 static int jmx_route_apply_system_route(const char *ifname, uint32_t fwmark,
                                         uint32_t table_id, const char *gateway);
+static void jmx_route_cleanup_system_route(uint32_t table_id);
 static int jmx_route_sync_json(struct json_object *config);
+static void route_rule_from_json(struct json_object *rule,
+                                 struct jmx_route_rule_wire *out,
+                                 int default_prio);
 
 static const char *json_get_str(struct json_object *obj, const char *key, const char *def)
 {
@@ -954,6 +1008,74 @@ static int route_section_disabled(struct uci_section *s)
     return 0;
 }
 
+static int route_network_wan_snapshot_get(struct route_network_wan_snapshot *snapshot)
+{
+    struct uci_context *ctx;
+    struct uci_package *pkg = NULL;
+    struct uci_element *e;
+    int rc = 0;
+
+    if (!snapshot)
+        return -1;
+    memset(snapshot, 0, sizeof(*snapshot));
+    ctx = uci_alloc_context();
+    if (!ctx)
+        return -1;
+    if (uci_load(ctx, "network", &pkg) != UCI_OK) {
+        uci_free_context(ctx);
+        return -1;
+    }
+
+    uci_foreach_element(&pkg->sections, e) {
+        struct uci_section *s = uci_to_section(e);
+        struct route_network_wan_runtime *wan;
+        const char *name;
+        const char *proto;
+        const char *configured_ifname;
+        int online = 0;
+
+        if (!s || strcmp(s->type, "interface") != 0)
+            continue;
+        name = s->e.name;
+        proto = uci_opt(s, "proto");
+        if (!route_network_iface_is_wan(name, proto) || route_section_disabled(s))
+            continue;
+        if (snapshot->count >= JMX_ROUTE_MAX_WAN_IFACES) {
+            rc = -1;
+            break;
+        }
+        wan = &snapshot->wans[snapshot->count];
+        if (route_ifstatus_runtime(name, wan->l3_ifname,
+                                   sizeof(wan->l3_ifname), wan->gateway,
+                                   sizeof(wan->gateway), &online) != 0) {
+            rc = -1;
+            break;
+        }
+        configured_ifname = route_wan_ifname_option(s);
+        snprintf(wan->name, sizeof(wan->name), "%s", name);
+        snprintf(wan->proto, sizeof(wan->proto), "%s", proto ? proto : "");
+        snprintf(wan->configured_ifname, sizeof(wan->configured_ifname), "%s",
+                 configured_ifname ? configured_ifname : "");
+        wan->weight = parse_weight_opt(s, 1);
+        wan->online = online ? 1 : 0;
+        snapshot->count++;
+    }
+
+    uci_unload(ctx, pkg);
+    uci_free_context(ctx);
+    return rc;
+}
+
+static int route_network_wan_runtime_changed(
+    struct route_network_wan_snapshot *current)
+{
+    if (route_network_wan_snapshot_get(current) != 0)
+        return -1;
+    if (!g_route_network_wans_ready)
+        return 1;
+    return memcmp(current, &g_route_network_wans, sizeof(*current)) != 0;
+}
+
 static void route_sync_wan_map_add(struct route_sync_wan_map *map, size_t map_len,
                                    int *map_count, uint8_t id, const char *name,
                                    const char *ifname, uint32_t fwmark,
@@ -986,6 +1108,21 @@ static void route_sync_wan_map_add(struct route_sync_wan_map *map, size_t map_le
     (*map_count)++;
 }
 
+/* True when a WAN with this UCI section name was already registered in this
+ * sync pass, so the UCI top-up path can skip it and stay idempotent. */
+static int route_sync_wan_registered_by_name(const struct route_sync_wan_map *map,
+                                             int map_count, const char *name)
+{
+    int i;
+
+    if (!map || !name || !name[0])
+        return 0;
+    for (i = 0; i < map_count; i++)
+        if (map[i].id && !strcmp(map[i].name, name))
+            return 1;
+    return 0;
+}
+
 static void route_sync_wan_map_set_carrier(struct route_sync_wan_map *map,
                                            int map_count, uint8_t id,
                                            uint8_t carrier_id)
@@ -1002,6 +1139,22 @@ static void route_sync_wan_map_set_carrier(struct route_sync_wan_map *map,
 
 #define JMX_ROUTE_DNS_NFT_PATH "/etc/dreamingwrt/dns_domain_route.nft"
 #define JMX_ROUTE_DNS_NFT_TABLE "dreamingwrt_dns_route"
+
+#define JMX_ROUTE_IPV6_MW_TABLE "dreamingwrt_npt"
+
+/*
+ * IPv6 multi-WAN is only real when the SNAT66 table is actually loaded.
+ * Four carrier /60s advertised as SLAAC prefixes let clients choose their own
+ * source address, and therefore their own egress, which bypasses scheduling
+ * entirely. The ULA + SNAT66 path is what hands that decision back to us, so
+ * report live dataplane state rather than a compile-time constant: the UI must
+ * not claim a capability the dataplane does not have.
+ */
+static int route_ipv6_multiwan_active(void)
+{
+	return nc_run_quiet("nft list table ip6 " JMX_ROUTE_IPV6_MW_TABLE
+			    " >/dev/null 2>&1") == 0;
+}
 
 static int route_dns_domain_nft_table_exists(void)
 {
@@ -1377,6 +1530,17 @@ static int route_sync_network_wans(int fd, int *errors,
         return 0;
     }
 
+    /* WANs already registered from config.db keep their id; mark them used so a
+     * UCI-only WAN cannot be handed an id that is taken, and so we can skip it
+     * below instead of re-registering it. */
+    if (map && map_count) {
+        int m;
+
+        for (m = 0; m < *map_count && (size_t)m < map_len; m++)
+            if (map[m].id)
+                used[map[m].id] = 1;
+    }
+
     uci_foreach_element(&pkg->sections, e) {
         struct uci_section *s = uci_to_section(e);
         const char *name, *proto, *ifname, *gw_cfg;
@@ -1393,6 +1557,10 @@ static int route_sync_network_wans(int fd, int *errors,
         name = s->e.name;
         proto = uci_opt(s, "proto");
         if (!route_network_iface_is_wan(name, proto) || route_section_disabled(s))
+            continue;
+        /* Already registered from config.db (matched by section name): the
+         * explicit ledger wins, do not register a second time. */
+        if (route_sync_wan_registered_by_name(map, map_count ? *map_count : 0, name))
             continue;
         id = route_wan_id_from_name(name, used, next_id);
         if (!id)
@@ -1430,8 +1598,13 @@ static int route_sync_network_wans(int fd, int *errors,
                 system_gateway = NULL;
             if (jmx_route_nl_wan_health(fd, id, online ? 1 : 0) != 0 && errors)
                 (*errors)++;
-            if (jmx_route_apply_system_route(route_ifname, fwmark, table_id, system_gateway) != 0 && errors)
-                (*errors)++;
+            if (online) {
+                if (jmx_route_apply_system_route(route_ifname, fwmark, table_id,
+                                                 system_gateway) != 0 && errors)
+                    (*errors)++;
+            } else {
+                jmx_route_cleanup_system_route(table_id);
+            }
             count++;
             LOG_WARN("jmx_route: fallback registered network WAN id=%u name=%s ifname=%s gateway=%s health=%d",
                      id, name ? name : "", route_ifname ? route_ifname : "",
@@ -3228,7 +3401,8 @@ struct json_object *jmx_api_route_config_get(struct json_object *req_obj)
         "hash_src_dst_dport,hash_src_dst,weighted_new_flow_rr,least_rx_load_normalized,least_active_conn_normalized,hash_src,hash_src_sport"));
     json_object_object_add(capabilities, "weighted_members", json_object_new_boolean(1));
     json_object_object_add(capabilities, "all_down_actions", json_object_new_string("main_route"));
-    json_object_object_add(capabilities, "ipv6_multiwan", json_object_new_boolean(0));
+    json_object_object_add(capabilities, "ipv6_multiwan",
+                           json_object_new_boolean(route_ipv6_multiwan_active()));
     json_object_object_add(capabilities, "config_authority",
                            json_object_new_string("config.db"));
     json_object_object_add(capabilities, "transactional_apply",
@@ -3320,6 +3494,293 @@ fail:
                            json_object_new_string("config.db"));
     errno = saved_errno;
     return jmx_gen_api_response_data(API_CODE_ERROR, data);
+}
+
+/*
+ * Change the load-balance selector without rebuilding the whole route graph.
+ * route_config_set is intentionally a full transactional replace and its
+ * runtime sync flushes all kernel rules and WAN registrations.  That is the
+ * right primitive for structural edits, but it is unnecessarily disruptive
+ * for a selector change: the kernel replaces a rule with the same priority in
+ * place and keeps its counters/conntrack marks.  Persist the complete config
+ * in the same DB transaction, then replace only the generic default rule.
+ *
+ * WAN-policy modes are intentionally carrier-neutral.  Legacy auto-carrier
+ * rules are disabled when this contract is applied so a higher-priority
+ * operator match cannot silently bypass the selected all-uplink policy.
+ */
+static int route_policy_rule_eligible(struct json_object *rule)
+{
+    struct json_object *wan_ids = NULL;
+    uint32_t prio;
+
+    if (!rule || !json_object_is_type(rule, json_type_object))
+        return 0;
+    prio = json_get_u32(rule, "prio", 0);
+    if (prio < 1000)
+        return 0;
+    if (!json_object_object_get_ex(rule, "wan_ids", &wan_ids) ||
+        !json_object_is_type(wan_ids, json_type_array))
+        return 0;
+    return json_object_array_length(wan_ids) > 1;
+}
+
+static int route_policy_auto_carrier_rule(struct json_object *rule)
+{
+    const char *selection;
+
+    if (!rule || !json_object_is_type(rule, json_type_object))
+        return 0;
+    selection = json_get_str(rule, "wan_selection", "");
+    return !strcmp(selection, "auto_carrier");
+}
+
+static int route_policy_apply_rule(int fd, struct json_object *rule);
+
+static int route_policy_reconcile_rule(int fd, struct json_object *rule)
+{
+    if (route_policy_auto_carrier_rule(rule)) {
+        uint16_t prio = (uint16_t)json_get_u32(rule, "prio", 0);
+
+        if (!prio)
+            return -1;
+        if (!json_get_u32(rule, "enabled", 1))
+            return jmx_route_nl_rule_del(fd, prio);
+    }
+    return route_policy_apply_rule(fd, rule);
+}
+
+static int route_policy_apply_rule(int fd, struct json_object *rule)
+{
+    struct jmx_route_rule_wire wire;
+    int i;
+
+    route_rule_from_json(rule, &wire, (int)json_get_u32(rule, "prio", 1000));
+    if (wire.carrier_id != JMX_CARRIER_ANY && wire.wan_count == 0) {
+        for (i = 1; i <= JMX_ROUTE_MAX_WAN_IFACES &&
+                    wire.wan_count < JMX_ROUTE_MAX_WAN_IFACES; i++) {
+            if (g_route_auto_carriers[i] == wire.carrier_id)
+                wire.wan_ids[wire.wan_count++] = (uint8_t)i;
+        }
+    }
+    if (!wire.enabled || wire.wan_count == 0 ||
+        wire.sticky_mode > JMX_STICKY_CONN_CNT)
+        return -1;
+    return jmx_route_nl_rule_add(fd, &wire);
+}
+
+struct json_object *jmx_api_route_policy_set(struct json_object *req_obj)
+{
+    struct json_object *config = NULL;
+    struct json_object *rules = NULL;
+    struct json_object *previous = NULL;
+    struct json_object *readback = NULL;
+    struct jmx_route_db_tx *tx = NULL;
+    struct json_object *mode_obj = NULL;
+    struct json_object *requested_ids = NULL;
+    const char *mode_name = NULL;
+    const char *algorithm;
+    char error[160] = "";
+    int mode;
+    int fd = -1;
+    int i;
+    int changed = 0;
+    int disabled_carrier_rules = 0;
+    int carrier_neutral = 0;
+
+    if (!req_obj || !json_object_is_type(req_obj, json_type_object)) {
+        snprintf(error, sizeof(error), "%s", "request must be an object");
+        errno = EINVAL;
+        goto fail;
+    }
+    if (json_object_object_get_ex(req_obj, "mode", &mode_obj) &&
+        json_object_is_type(mode_obj, json_type_string))
+        mode_name = json_object_get_string(mode_obj);
+    else if (json_object_object_get_ex(req_obj, "algorithm", &mode_obj) &&
+             json_object_is_type(mode_obj, json_type_string))
+        mode_name = json_object_get_string(mode_obj);
+    if (!mode_name || !mode_name[0]) {
+        snprintf(error, sizeof(error), "%s", "mode is required");
+        errno = EINVAL;
+        goto fail;
+    }
+    if (json_object_object_get_ex(req_obj, "carrier_neutral", &mode_obj) && mode_obj &&
+        (json_object_is_type(mode_obj, json_type_boolean) ||
+         json_object_is_type(mode_obj, json_type_int)))
+        carrier_neutral = json_object_get_boolean(mode_obj) ? 1 : 0;
+    if (!strcmp(mode_name, "load_balance"))
+        mode_name = "new_conn";
+    mode = sticky_mode_from_string(mode_name);
+    if (mode < 0 || mode > JMX_STICKY_CONN_CNT || mode == JMX_STICKY_5TUPLE) {
+        snprintf(error, sizeof(error), "%s", "unsupported WAN policy mode");
+        errno = EOPNOTSUPP;
+        goto fail;
+    }
+    algorithm = sticky_mode_algorithm((uint8_t)mode);
+    if (!algorithm) {
+        snprintf(error, sizeof(error), "%s", "unsupported WAN policy mode");
+        errno = EOPNOTSUPP;
+        goto fail;
+    }
+    if (json_object_object_get_ex(req_obj, "wan_ids", &requested_ids)) {
+        uint8_t seen[JMX_ROUTE_MAX_WAN_IFACES + 1] = {0};
+        int count;
+
+        if (!json_object_is_type(requested_ids, json_type_array) ||
+            (count = json_object_array_length(requested_ids)) < 2 ||
+            count > JMX_ROUTE_MAX_WAN_IFACES) {
+            snprintf(error, sizeof(error), "%s", "wan_ids must contain 2 to 8 WAN ids");
+            errno = EINVAL;
+            goto fail;
+        }
+        for (i = 0; i < count; i++) {
+            struct json_object *value = json_object_array_get_idx(requested_ids, i);
+            int id;
+
+            if (!value || !json_object_is_type(value, json_type_int) ||
+                (id = json_object_get_int(value)) <= 0 ||
+                id > JMX_ROUTE_MAX_WAN_IFACES || seen[id]) {
+                snprintf(error, sizeof(error), "%s", "wan_ids contains an invalid or duplicate id");
+                errno = EINVAL;
+                goto fail;
+            }
+            seen[id] = 1;
+        }
+    }
+    if (jmx_route_db_config_get(&config) != 0 || !config ||
+        !json_object_object_get_ex(config, "rules", &rules) ||
+        !json_object_is_type(rules, json_type_array)) {
+        snprintf(error, sizeof(error), "%s", "route config is unavailable");
+        errno = EIO;
+        goto fail;
+    }
+    for (i = 0; i < json_object_array_length(rules); i++) {
+        struct json_object *rule = json_object_array_get_idx(rules, i);
+
+        if (carrier_neutral && route_policy_auto_carrier_rule(rule)) {
+            if (json_get_u32(rule, "enabled", 1)) {
+                json_object_object_del(rule, "enabled");
+                json_object_object_add(rule, "enabled", json_object_new_int(0));
+                disabled_carrier_rules++;
+            }
+            continue;
+        }
+        if (!route_policy_rule_eligible(rule))
+            continue;
+        if (requested_ids) {
+            json_object_object_del(rule, "wan_ids");
+            json_object_object_add(rule, "wan_ids", json_object_get(requested_ids));
+            json_object_object_del(rule, "wan_selection");
+            json_object_object_add(rule, "wan_selection",
+                                   json_object_new_string("explicit"));
+        }
+        json_object_object_del(rule, "sticky_mode");
+        json_object_object_del(rule, "algorithm");
+        json_object_object_add(rule, "sticky_mode", json_object_new_string(algorithm));
+        json_object_object_add(rule, "algorithm", json_object_new_string(algorithm));
+        changed++;
+    }
+    if (!changed) {
+        snprintf(error, sizeof(error), "%s", "no eligible multi-WAN rules found");
+        errno = ENOENT;
+        goto fail;
+    }
+
+    if (jmx_route_db_replace_begin(config, &tx, &previous, &readback,
+                                   error, sizeof(error)) != 0)
+        goto fail;
+    fd = route_open_nl();
+    if (fd < 0) {
+        snprintf(error, sizeof(error), "%s", "route netlink is unavailable");
+        errno = EIO;
+        goto rollback;
+    }
+    rules = NULL;
+    json_object_object_get_ex(readback, "rules", &rules);
+    for (i = 0; rules && i < json_object_array_length(rules); i++) {
+        struct json_object *rule = json_object_array_get_idx(rules, i);
+        if (!route_policy_rule_eligible(rule) &&
+            !(carrier_neutral && route_policy_auto_carrier_rule(rule)))
+            continue;
+        if (route_policy_reconcile_rule(fd, rule) != 0) {
+            snprintf(error, sizeof(error), "%s", "runtime policy apply failed");
+            errno = EIO;
+            goto rollback;
+        }
+    }
+    close(fd);
+    fd = -1;
+    if (jmx_route_db_replace_commit(tx) != 0) {
+        tx = NULL;
+        snprintf(error, sizeof(error), "%s", "config.db commit failed");
+        errno = EIO;
+        if (previous) {
+            struct json_object *old_rules = NULL;
+            fd = route_open_nl();
+            if (fd >= 0 && json_object_object_get_ex(previous, "rules", &old_rules)) {
+                for (i = 0; i < json_object_array_length(old_rules); i++) {
+                    struct json_object *rule = json_object_array_get_idx(old_rules, i);
+                    if (route_policy_rule_eligible(rule) ||
+                        (carrier_neutral && route_policy_auto_carrier_rule(rule)))
+                        (void)route_policy_reconcile_rule(fd, rule);
+                }
+            }
+            if (fd >= 0) close(fd);
+            fd = -1;
+        }
+        goto fail;
+    }
+    tx = NULL;
+    json_object_object_add(readback, "ok", json_object_new_boolean(1));
+    json_object_object_add(readback, "runtime_applied", json_object_new_boolean(1));
+    json_object_object_add(readback, "apply_disruption",
+                           json_object_new_string("new_connections_only"));
+    json_object_object_add(readback, "selected_mode",
+                           json_object_new_string(algorithm));
+    json_object_object_add(readback, "updated_rule_count",
+                           json_object_new_int(changed));
+    json_object_object_add(readback, "disabled_carrier_rule_count",
+                           json_object_new_int(disabled_carrier_rules));
+    json_object_object_add(readback, "carrier_neutral",
+                           json_object_new_boolean(carrier_neutral));
+    if (config) json_object_put(config);
+    if (previous) json_object_put(previous);
+    return route_json_ok(readback);
+
+rollback:
+    if (fd >= 0) close(fd);
+    if (tx) {
+        jmx_route_db_replace_rollback(tx);
+        tx = NULL;
+    }
+    /* Restore only the rules touched by this operation. */
+    if (previous) {
+        struct json_object *old_rules = NULL;
+        fd = route_open_nl();
+        if (fd >= 0 && json_object_object_get_ex(previous, "rules", &old_rules)) {
+            for (i = 0; i < json_object_array_length(old_rules); i++) {
+                struct json_object *rule = json_object_array_get_idx(old_rules, i);
+                if (route_policy_rule_eligible(rule) ||
+                    (carrier_neutral && route_policy_auto_carrier_rule(rule)))
+                    (void)route_policy_reconcile_rule(fd, rule);
+            }
+        }
+        if (fd >= 0) close(fd);
+    }
+fail:
+    if (fd >= 0) close(fd);
+    if (tx) jmx_route_db_replace_rollback(tx);
+    if (config) json_object_put(config);
+    if (previous) json_object_put(previous);
+    if (readback) json_object_put(readback);
+    {
+        struct json_object *data = json_object_new_object();
+        json_object_object_add(data, "ok", json_object_new_boolean(0));
+        json_object_object_add(data, "error", json_object_new_string(
+            error[0] ? error : strerror(errno ? errno : EIO)));
+        json_object_object_add(data, "runtime_applied", json_object_new_boolean(0));
+        return jmx_gen_api_response_data(API_CODE_ERROR, data);
+    }
 }
 
 struct json_object *jmx_api_route_status(struct json_object *req_obj)
@@ -4155,6 +4616,88 @@ static int jmx_route_load_builtin_carriers(int fd, int *errors)
     return count;
 }
 
+/*
+ * Push the appid -> category mapping into the kernel.
+ *
+ * The kernel counts forwarded bytes per WAN per category, but the category
+ * only exists in the signature database, so without this the whole table
+ * collapses into Unknown.  Rows are sent in batches to keep the number of
+ * netlink round trips proportional to the app count / JMX_APPCAT_BATCH_MAX
+ * rather than to the app count itself.
+ */
+static int jmx_route_load_app_categories(int fd, int *errors)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    struct jmx_appcat_rec batch[JMX_APPCAT_BATCH_MAX];
+    char path[512];
+    uint32_t pending = 0;
+    int count = 0;
+    int rc;
+
+    if (jmx_route_signature_db_path(path, sizeof(path)) != 0) {
+        if (errors)
+            (*errors)++;
+        return 0;
+    }
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        LOG_WARN("jmx_route: cannot open signature db for app categories: %s", path);
+        if (db)
+            sqlite3_close(db);
+        if (errors)
+            (*errors)++;
+        return 0;
+    }
+
+    if (sqlite3_prepare_v2(db,
+        "SELECT app_id,COALESCE(category_id,0) FROM app WHERE enabled=1",
+        -1, &st, NULL) != SQLITE_OK) {
+        LOG_WARN("jmx_route: app table missing in signature db: %s", path);
+        sqlite3_close(db);
+        if (errors)
+            (*errors)++;
+        return 0;
+    }
+
+    if (jmx_route_nl_appcat_flush(fd) != 0 && errors)
+        (*errors)++;
+
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        uint32_t appid = (uint32_t)sqlite3_column_int64(st, 0);
+        int category_id = sqlite3_column_int(st, 1);
+
+        if (!appid)
+            continue;
+        batch[pending].appid = appid;
+        batch[pending].category_id = (uint16_t)category_id;
+        pending++;
+        if (pending == JMX_APPCAT_BATCH_MAX) {
+            if (jmx_route_nl_appcat_batch(fd, batch, pending) == 0)
+                count += (int)pending;
+            else if (errors)
+                (*errors)++;
+            pending = 0;
+        }
+    }
+    if (pending) {
+        if (jmx_route_nl_appcat_batch(fd, batch, pending) == 0)
+            count += (int)pending;
+        else if (errors)
+            (*errors)++;
+    }
+
+    if (rc != SQLITE_DONE) {
+        LOG_WARN("jmx_route: app category scan failed in signature db: %s", path);
+        if (errors)
+            (*errors)++;
+    }
+
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    LOG_WARN("jmx_route: pushed %d app categories from %s", count, path);
+    return count;
+}
+
 #define JMX_ROUTE_STATE_FILE "/tmp/jmx_route.state"
 static unsigned route_rule_priority(uint32_t table_id)
 {
@@ -4345,7 +4888,9 @@ static int jmx_route_sync_json(struct json_object *config)
     int configured_rules_expected = 0;
     int configured_rules_added = 0;
     struct route_sync_wan_map wan_map[JMX_ROUTE_MAX_WAN_IFACES];
+    struct route_network_wan_snapshot runtime_snapshot;
     int wan_map_count = 0;
+    int runtime_snapshot_valid;
     int i;
 
     if (!config || !json_object_is_type(config, json_type_object)) {
@@ -4353,6 +4898,7 @@ static int jmx_route_sync_json(struct json_object *config)
         return -1;
     }
     memset(wan_map, 0, sizeof(wan_map));
+    runtime_snapshot_valid = route_network_wan_snapshot_get(&runtime_snapshot) == 0;
 
     fd = route_open_nl();
     if (fd < 0)
@@ -4373,6 +4919,9 @@ static int jmx_route_sync_json(struct json_object *config)
     }
     jmx_route_cleanup_old_system_routes();
     carrier_count += jmx_route_load_builtin_carriers(fd, &sync_errors);
+    /* Refresh the kernel's appid -> category map on the same trigger as the
+     * carrier prefixes; both come from the signature database. */
+    jmx_route_load_app_categories(fd, &sync_errors);
 
     json_object_object_get_ex(config, "carrier_prefixes", &prefixes);
     for (i = 0; prefixes && i < json_object_array_length(prefixes); i++) {
@@ -4448,24 +4997,34 @@ static int jmx_route_sync_json(struct json_object *config)
                 route_detect_wan_carrier(name, route_ifname));
             if (jmx_route_nl_wan_health(fd, id, health) != 0)
                 sync_errors++;
-            if (jmx_route_apply_system_route(route_ifname, fwmark, table_id,
-                                             system_gateway) != 0)
+            if (runtime_ok && !runtime_online) {
+                jmx_route_cleanup_system_route(table_id);
+            } else if (jmx_route_apply_system_route(route_ifname, fwmark, table_id,
+                                                    system_gateway) != 0) {
                 sync_errors++;
+            }
             wan_count++;
         } else {
             sync_errors++;
         }
     }
 
-    if (wan_count == 0) {
-        int fallback_wans = route_sync_network_wans(fd, &sync_errors,
-                                                    wan_map, JMX_ROUTE_MAX_WAN_IFACES,
-                                                    &wan_map_count);
+    /* Top up from UCI unconditionally, not only when config.db has no WANs.
+     * A WAN added through the web UI lands in /etc/config/network but is not
+     * written into route_wan, so gating this on wan_count == 0 left every WAN
+     * beyond the ones already in the ledger unregistered: dialled up with a
+     * real address, yet invisible to the scheduler (no fwmark rule, empty
+     * table). route_sync_network_wans() skips names already registered above
+     * and reserves their ids, so repeating this is idempotent. */
+    {
+        int uci_wans = route_sync_network_wans(fd, &sync_errors,
+                                              wan_map, JMX_ROUTE_MAX_WAN_IFACES,
+                                              &wan_map_count);
 
-        if (fallback_wans > 0) {
-            wan_count += fallback_wans;
-            LOG_WARN("jmx_route: config.db has no explicit WANs; fallback network wans=%d",
-                     fallback_wans);
+        if (uci_wans > 0) {
+            wan_count += uci_wans;
+            LOG_WARN("jmx_route: registered %d WAN(s) present in uci network but missing from route_wan",
+                     uci_wans);
         }
     }
 
@@ -4530,6 +5089,13 @@ static int jmx_route_sync_json(struct json_object *config)
             if (wan_map[i].id <= JMX_ROUTE_MAX_WAN_IFACES)
                 g_route_auto_carriers[wan_map[i].id] = wan_map[i].carrier_id;
         }
+    }
+    if (runtime_snapshot_valid) {
+        /* Consume this edge even when another route component failed. Retrying
+         * a full flush every 30 seconds is more disruptive than surfacing the
+         * error and leaving an explicit route_reload available for recovery. */
+        g_route_network_wans = runtime_snapshot;
+        g_route_network_wans_ready = 1;
     }
     close(fd);
     if (sync_errors)
@@ -4640,8 +5206,10 @@ void jmx_route_health_tick(void)
 {
     struct json_object *config = NULL;
     struct json_object *wans = NULL;
+    struct route_network_wan_snapshot runtime_snapshot;
     int fd;
     int i;
+    int runtime_changed;
 
     g_route_health_generation++;
     if (g_route_health_generation == 0)
@@ -4695,7 +5263,10 @@ void jmx_route_health_tick(void)
 
     route_health_prune_states();
     close(fd);
-    if (route_auto_carrier_mapping_changed(config))
+    runtime_changed = route_network_wan_runtime_changed(&runtime_snapshot);
+    if (runtime_changed > 0)
+        LOG_WARN("jmx_route: WAN runtime topology changed; resyncing route configuration");
+    if (runtime_changed > 0 || route_auto_carrier_mapping_changed(config))
         (void)jmx_route_sync_json(config);
     json_object_put(config);
 }

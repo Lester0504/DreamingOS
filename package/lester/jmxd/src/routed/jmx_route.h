@@ -29,6 +29,26 @@ enum jmx_carrier_id {
 #define JMX_NL_ACT_ROUTE_CLEAR_HITS 36
 #define JMX_NL_ACT_CARRIER_FLUSH    40
 #define JMX_NL_ACT_CARRIER_ADD      41
+#define JMX_NL_ACT_APPCAT_FLUSH     42
+#define JMX_NL_ACT_APPCAT_ADD       43
+
+/*
+ * appid -> category push.  The kernel needs the mapping to keep the per-WAN
+ * per-category counters in /proc/dreamingwrt/jmx/wan<N>/proto_stats; the
+ * category itself only exists in the signature database.
+ */
+#define JMX_APPCAT_BATCH_MAX 512
+
+struct jmx_appcat_rec {
+    uint32_t appid;
+    uint16_t category_id;
+} __packed;
+
+struct jmx_appcat_batch {
+    int32_t  action;
+    uint32_t count;
+    struct jmx_appcat_rec recs[JMX_APPCAT_BATCH_MAX];
+} __packed;
 
 enum jmx_route_sticky_mode {
     JMX_STICKY_NEW_CONN = 0,
@@ -91,6 +111,9 @@ int jmx_route_nl_rule_flush(int nl_fd);
 int jmx_route_nl_rule_clear_hits(int nl_fd, uint16_t prio);
 int jmx_route_nl_carrier_flush(int nl_fd);
 int jmx_route_nl_carrier_add(int nl_fd, uint32_t network, uint32_t mask, uint8_t carrier_id);
+int jmx_route_nl_appcat_flush(int nl_fd);
+int jmx_route_nl_appcat_batch(int nl_fd, const struct jmx_appcat_rec *recs,
+                              uint32_t count);
 
 struct json_object *jmx_api_route_wan_register(struct json_object *req_obj);
 struct json_object *jmx_api_route_wan_unregister(struct json_object *req_obj);
