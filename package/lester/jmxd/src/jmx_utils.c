@@ -336,3 +336,52 @@ void update_jmx_proc_u32_value(char *key, u_int32_t value){
     sprintf(buf, "%u", value);
     update_jmx_proc_value(key, buf);
 }
+
+/*
+ * UCI config generators write values as  option name 'value' . A single quote
+ * inside the value closes the string, and a newline starts a fresh option line,
+ * so a value carrying either one can append arbitrary options to the generated
+ * file. UCI offers no escape sequence inside a single-quoted string, which is
+ * why these characters are rejected instead of rewritten.
+ */
+int jmx_uci_value_ok(const char *s)
+{
+    const unsigned char *p;
+
+    if (!s)
+        return 0;
+    for (p = (const unsigned char *)s; *p; p++) {
+        if (*p == '\'' || *p == '\n' || *p == '\r' || *p < 0x20)
+            return 0;
+    }
+    return 1;
+}
+
+/*
+ * Generator-side fallback. The entry-point check is the real defence; this
+ * exists so a row written before that check landed cannot inject into a file
+ * we are generating right now. Dangerous bytes are dropped rather than kept,
+ * because a truncated SSID is a visible, recoverable problem while an injected
+ * option silently rewrites the encryption settings.
+ *
+ * Returns buf on success. Returns "" when there is no room to work with, so
+ * the caller can pass the result straight into fprintf() without a NULL check.
+ */
+const char *jmx_uci_value_sanitize(const char *s, char *buf, size_t buf_len)
+{
+    size_t out = 0;
+    const unsigned char *p;
+
+    if (!buf || buf_len == 0)
+        return "";
+    buf[0] = '\0';
+    if (!s)
+        return buf;
+    for (p = (const unsigned char *)s; *p && out + 1 < buf_len; p++) {
+        if (*p == '\'' || *p == '\n' || *p == '\r' || *p < 0x20)
+            continue;
+        buf[out++] = (char)*p;
+    }
+    buf[out] = '\0';
+    return buf;
+}

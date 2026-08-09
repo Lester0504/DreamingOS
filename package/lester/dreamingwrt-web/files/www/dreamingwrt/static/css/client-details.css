@@ -377,6 +377,40 @@
   letter-spacing: 0.01em;
 }
 
+/* 「仅 IPv6」「无 IPv4」「随机 MAC」三个如实标注。用中性色而非警示色：
+   它们说明的是「这个空值是真相」，不是故障，也不代表设备可疑。
+   letter-spacing 保持 0（design.md 要求），不随视口缩放字号。 */
+.client-ipv4-absent {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.client-ipv4-absent-tag,
+.client-random-mac-tag {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  height: 20px;
+  margin-left: 6px;
+  padding: 0 7px;
+  border-radius: 999px;
+  color: rgba(255,255,255,0.72);
+  background: rgba(255,255,255,0.10);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.14);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 860;
+  letter-spacing: 0;
+  white-space: nowrap;
+  cursor: help;
+}
+
+.client-ipv4-absent .client-ipv4-absent-tag {
+  margin-left: 0;
+}
+
 .client-copy-token {
   position: relative;
   display: inline-flex;
@@ -566,6 +600,36 @@
 
 .client-rate-value.is-active {
   text-shadow: 0 0 12px color-mix(in srgb, currentColor 34%, transparent);
+}
+
+/* 今日字节格。数值与「今日无流量」共用一个格子，后者明显更宽，
+   所以这里不设 min-width，只保证不换行、跟随所在列的颜色。 */
+.client-bytes-value {
+  display: inline-flex;
+  justify-content: flex-end;
+  max-width: 100%;
+  color: inherit;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 「今日无流量」是后端给出的有效结论，不是缺数据，所以只压一点对比度，
+   不做成 `--` 那种明显的空态。 */
+.client-bytes-value.is-idle {
+  opacity: 0.62;
+  font-weight: 600;
+}
+
+/* 后端没给口径字段时才是真的未知。 */
+.client-bytes-value.is-unknown {
+  opacity: 0.45;
+}
+
+.client-detail-card-note {
+  margin: 10px 0 0;
+  color: var(--app-text-muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .client-empty {
@@ -3533,6 +3597,22 @@
   justify-content: center;
   color: inherit;
   font-variant-numeric: tabular-nums;
+}
+
+.route-client-details .client-bytes-value {
+  min-width: 0;
+  width: 100%;
+  display: inline-flex;
+  justify-content: center;
+  color: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 详情页信息栅格里的字节值左对齐，跟同一栅格里其它 strong 值一致；
+   表格里的居中规则只对表格生效。 */
+.client-detail-list .client-bytes-value {
+  width: auto;
+  justify-content: flex-start;
 }
 
 .client-column-filter-layer {

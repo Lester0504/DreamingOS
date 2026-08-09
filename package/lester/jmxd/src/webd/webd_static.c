@@ -6,6 +6,15 @@
 #include "webd_static.h"
 
 #define WEBD_PUBLIC_ROOT "/www/dreamingwrt"
+/*
+ * Client image uploads are stored on the persisted /etc/dreamingwrt tree so they
+ * survive a firmware upgrade, but they keep their historical /luci-static URL.
+ * Serve that prefix from the persistent directory first and fall back to the old
+ * /www location so images uploaded by an earlier build still resolve.
+ */
+#define WEBD_CLIENT_UPLOAD_URL "/luci-static/dreamingwrt/uploads/clients/"
+#define WEBD_CLIENT_UPLOAD_ROOT "/etc/dreamingwrt/uploads/clients"
+#define WEBD_CLIENT_UPLOAD_LEGACY_ROOT "/www/luci-static/dreamingwrt/uploads/clients"
 
 static int webd_static_rel_ok(const char *rel)
 {
@@ -75,6 +84,10 @@ int webd_send_static(int fd, const char *path, const char *method, int accepts_g
         root = WEBD_PUBLIC_ROOT "/login";
         fallback_root = "/www/login";
         rel = path + 7;
+    } else if (!strncmp(path, WEBD_CLIENT_UPLOAD_URL, strlen(WEBD_CLIENT_UPLOAD_URL))) {
+        root = WEBD_CLIENT_UPLOAD_ROOT;
+        fallback_root = WEBD_CLIENT_UPLOAD_LEGACY_ROOT;
+        rel = path + strlen(WEBD_CLIENT_UPLOAD_URL);
     } else if (!strncmp(path, "/luci-static/", 13)) {
         root = "/www/luci-static";
         rel = path + 13;

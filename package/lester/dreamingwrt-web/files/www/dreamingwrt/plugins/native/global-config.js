@@ -6,12 +6,11 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
-  const VERSION = '20260806-wan-policy-01';
+  const VERSION = '20260806-wan-policy-location-04';
   const MODULE_CLASS = 'global-config-route-host';
   const ENDPOINTS = {
     overview: '/api/v1/network/overview',
     settingsOverview: '/api/v1/network/settings-overview',
-    wanPolicy: '/api/v1/network/wan-policy',
     global: '/api/v1/network/global',
     lans: '/api/v1/network/lans',
     wans: '/api/v1/network/wans',
@@ -65,7 +64,6 @@ export function mount(context = {}) {
   const state = {
     mounted: true, loading: true, refreshing: false, seq: 0, error: '', source: '',
     overview: {}, settingsOverview: {}, capabilities: {}, capabilitiesKnown: false, capabilitiesError: '', global: {}, globalDraft: {}, ports: [], profiles: [], lans: [], wans: [],
-    wanPolicy: {}, wanPolicyDraft: {}, wanPolicyKnown: false, wanPolicyError: '', wanPolicyNotice: '', wanPolicySaving: false,
     radius: [], radiusKnown: false, radiusError: '',
     query: '', status: 'all', kind: 'all', speed: 'all', poe: 'all', vlan: 'all', anomalyMin: 0, anomalyMax: 100, statistics: true,
     visibleColumns: new Set(DEFAULT_COLUMNS), sortKey: 'port', sortDirection: 'asc',
@@ -74,7 +72,7 @@ export function mount(context = {}) {
     globalTab: 'internet',
     bulkDraft: { speed: 0, duplex: 'full', autoneg: true }, bulkInitial: { speed: 0, duplex: 'full', autoneg: true }, bulkPreview: null,
     saving: false, notice: '', globalNotice: '', timer: 0, statsTimer: 0, statsRefreshing: false, preferencesLoaded: false,
-    advancedOpen: new Set(['wan-policy']), pollTimer: 0
+    advancedOpen: new Set(), pollTimer: 0
   };
   let searchTimer = 0;
   let interfaceInstances = new Map();
@@ -474,58 +472,6 @@ export function mount(context = {}) {
     });
     return normalized;
   }
-  function wanKernelId(wan = {}, index = 0) {
-    const explicit = Number(wan.kernel_wan_id ?? wan.route_wan_id ?? wan.wan_id_number);
-    if (Number.isInteger(explicit) && explicit > 0) return explicit;
-    const token = firstText(wan.id, wan.ifname, wan.name);
-    const match = token.match(/^wan(\d*)$/i);
-    if (match) return match[1] ? Number(match[1]) : 1;
-    return index + 1;
-  }
-  function normalizeWanPolicy(payload = {}) {
-    const ids = asArray(payload.wan_ids).map(Number).filter((id) => Number.isInteger(id) && id > 0);
-    return {
-      mode: firstText(payload.mode, payload.algorithm),
-      algorithm: firstText(payload.algorithm, payload.mode),
-      available_modes: asArray(payload.available_modes).map((mode) => ({
-        id: firstText(mode.id, mode.algorithm),
-        label: firstText(mode.label, mode.id, mode.algorithm),
-        description: firstText(mode.description)
-      })).filter((mode) => mode.id),
-      wan_ids: [...new Set(ids)],
-      wans: asArray(payload.wans).map((wan, index) => ({
-        ...wan,
-        id: Number(wan.id ?? wan.kernel_wan_id ?? index + 1),
-        name: firstText(wan.name, wan.ifname, 'WAN ' + (index + 1)),
-        carrier: firstText(wan.carrier, wan.carrier_name),
-        online: wan.online !== false && wan.health !== false,
-        connections: firstNumber(wan.active_conn, wan.connections, wan.conn_count)
-      })).filter((wan) => Number.isInteger(wan.id) && wan.id > 0),
-      write_supported: payload.write_supported === true,
-      member_selection: payload.member_selection === true,
-      existing_connections: firstText(payload.existing_connections, 'unchanged')
-    };
-  }
-  function applyWanPolicy(result, preserveDraft = false) {
-    if (result?.status === 'fulfilled') {
-      const next = normalizeWanPolicy(result.value || {});
-      state.wanPolicy = next;
-      if (!preserveDraft) state.wanPolicyDraft = clone(next);
-      state.wanPolicyKnown = true;
-      state.wanPolicyError = '';
-      return;
-    }
-    const status = Number(result?.reason?.status) || 0;
-    state.wanPolicyKnown = false;
-    state.wanPolicy = {};
-    if (!preserveDraft) state.wanPolicyDraft = {};
-    if (status === 404 || status === 405 || status === 501) state.wanPolicyError = `WAN 策略接口未实现（HTTP ${status}）`;
-    else if (status === 401) state.wanPolicyError = '会话已失效，请重新登录后读取 WAN 策略';
-    else if (status === 403) state.wanPolicyError = '当前账号没有读取 WAN 策略的权限';
-    else if (status >= 500) state.wanPolicyError = `WAN 策略读取失败：后端错误 HTTP ${status}`;
-    else if (status) state.wanPolicyError = `WAN 策略读取失败：HTTP ${status}`;
-    else state.wanPolicyError = `WAN 策略读取失败：${firstText(result?.reason?.message, '网络不可用')}`;
-  }
   // Write capabilities for gateway port assignment ride on the
   // /api/v1/topology/node/ports response. When that request fails we must not
   // report "the backend does not implement it": the capability is simply unknown.
@@ -637,16 +583,14 @@ export function mount(context = {}) {
       fetchResource('global-topology-ports', ENDPOINTS.topologyPorts),
       fetchResource('global-port-profiles', ENDPOINTS.profiles),
       fetchResource('global-port-preferences', `${ENDPOINTS.preferences}?view=network.global.ports`),
-      fetchResource('global-radius', ENDPOINTS.radius),
-      fetchResource('global-wan-policy', ENDPOINTS.wanPolicy)
+      fetchResource('global-radius', ENDPOINTS.radius)
     ]);
     if (!state.mounted || seq !== state.seq) return;
     const value = (index) => results[index].status === 'fulfilled' ? results[index].value : {};
     mergeData(value(0), value(1), value(2), value(3), value(4), value(5), value(6), value(7), value(8));
     state.capabilitiesError = capabilityProbeError(results[6]);
     applyRadius(results[9]);
-    applyWanPolicy(results[10], wanPolicyDirty());
-    const failed = results.map((result, index) => result.status === 'rejected' && ![1,3,4,8,9,10].includes(index) ? ['网络概览', '设置摘要', '全局设置', '网络列表', '互联网列表', '端口状态', '端口邻居', '配置文件', '列偏好', 'RADIUS', 'WAN 策略'][index] : '').filter(Boolean);
+    const failed = results.map((result, index) => result.status === 'rejected' && ![1,3,4,8,9].includes(index) ? ['网络概览', '设置摘要', '全局设置', '网络列表', '互联网列表', '端口状态', '端口邻居', '配置文件', '列偏好', 'RADIUS'][index] : '').filter(Boolean);
     state.error = failed.length ? `${failed.join('、')}读取失败` : '';
     state.loading = false;
     state.refreshing = false;
@@ -992,84 +936,9 @@ export function mount(context = {}) {
   function cap(key) { return state.capabilities[key] !== false; }
   function strictCap(key) { return state.capabilities[key] === true; }
   function globalDirty() { return JSON.stringify(state.globalDraft) !== JSON.stringify(state.global); }
-  function wanPolicyDirty() {
-    return JSON.stringify({ mode: state.wanPolicyDraft.mode, wan_ids: state.wanPolicyDraft.wan_ids }) !==
-      JSON.stringify({ mode: state.wanPolicy.mode, wan_ids: state.wanPolicy.wan_ids });
-  }
-  function wanPolicyLines() {
-    const policyLines = asArray(state.wanPolicyDraft.wans || state.wanPolicy.wans);
-    return policyLines.length ? policyLines : state.wans.map((wan, index) => ({
-      ...wan,
-      id: wanKernelId(wan, index),
-      name: firstText(wan.name, wan.ifname, 'WAN ' + (index + 1)),
-      carrier: firstText(wan.carrier, wan.carrierName),
-      connections: firstNumber(wan.active_conn, wan.connections, wan.conn_count)
-    }));
-  }
-  function wanPolicyModeOptions() {
-    return asArray(state.wanPolicyDraft.available_modes || state.wanPolicy.available_modes);
-  }
-  function wanPolicyMemberMarkup() {
-    const lines = wanPolicyLines();
-    const selected = new Set((state.wanPolicyDraft.wan_ids || []).map(Number));
-    if (!lines.length) return '<div class="dwrt-kit-table-empty">暂无可用 WAN 线路</div>';
-    return '<div class="global-wan-policy-members">' + lines.map((wan) => {
-      const id = Number(wan.id);
-      const label = firstText(wan.name, 'WAN ' + id);
-      const carrier = firstText(wan.carrier, '互联网');
-      const conn = formatCount(wan.connections);
-      return '<label class="global-wan-policy-member"><input type="checkbox" data-wan-policy-member="' + id + '" ' +
-        (selected.has(id) ? 'checked' : '') + '><span><strong>' + escapeHtml(label) + '</strong><small>' +
-        escapeHtml(carrier + ' · ' + conn + ' 条连接') + '</small></span></label>';
-    }).join('') + '</div>';
-  }
-  function wanPolicyMarkup() {
-    if (!state.wanPolicyKnown) return advancedAvailabilityNote(firstText(state.wanPolicyError, 'WAN 策略接口不可用；不会模拟保存。'));
-    const options = wanPolicyModeOptions();
-    const selectedMode = firstText(state.wanPolicyDraft.mode, state.wanPolicy.mode);
-    const selected = options.find((item) => item.id === selectedMode) || options[0] || {};
-    const writeEnabled = !state.wanPolicySaving;
-    const lines = wanPolicyLines();
-    const selectedIds = new Set((state.wanPolicyDraft.wan_ids || []).map(Number));
-    const carriers = new Map();
-    lines.forEach((wan) => {
-      const carrier = firstText(wan.carrier, '互联网');
-      if (!carriers.has(carrier)) carriers.set(carrier, []);
-      carriers.get(carrier).push(Number(wan.id));
-    });
-    return '<div class="global-wan-policy-editor">' +
-      '<fieldset class="global-advanced-choice"><legend>负载均衡模式</legend><div class="global-wan-policy-modes">' +
-      options.map((mode) => '<label class="global-wan-policy-mode"><input type="radio" name="wan-policy-mode" value="' +
-        escapeHtml(mode.id) + '" data-wan-policy-mode ' + (selectedMode === mode.id ? 'checked' : '') +
-        (writeEnabled ? '' : ' disabled') + '><span><strong>' + escapeHtml(mode.label) + '</strong><small>' +
-        escapeHtml(mode.description) + '</small></span></label>').join('') +
-      '</div></fieldset>' +
-      '<div class="global-wan-policy-current"><strong>' + escapeHtml(selected.label || selectedMode || '未选择') +
-      '</strong><small>' + escapeHtml(selected.description || '新连接按所选策略选择线路；已有连接不迁移。') + '</small></div>' +
-      '<div class="global-advanced-subsection"><div class="global-section-heading"><div><h4>默认多线成员</h4>' +
-      '<small>勾选的线路接收新连接；运营商自动规则仍优先匹配</small></div><span>' + selectedIds.size + ' / ' +
-      lines.length + '</span></div>' + wanPolicyMemberMarkup() + '</div>' +
-      '<div class="global-wan-policy-presets"><span>建议分组</span>' +
-      [...carriers.entries()].map(([carrier, ids]) => '<button type="button" class="global-inline-action" data-wan-policy-preset="' +
-        ids.join(',') + '"' + (ids.length >= 2 ? '' : ' disabled') + '>' + escapeHtml(carrier + ' ' + ids.join('+')) +
-        '</button>').join('') +
-      '<button type="button" class="global-inline-action" data-wan-policy-preset="' +
-      lines.map((wan) => wan.id).join(',') + '"' + (lines.length >= 2 ? '' : ' disabled') + '>全部线路</button></div>' +
-      '<div class="global-wan-policy-actions"><small>切换只影响新建连接，不会迁移已有连接，也不会 flush 全部 WAN。</small>' +
-      '<button type="button" class="policy-primary" data-wan-policy-save ' +
-      (wanPolicyDirty() && writeEnabled && selectedIds.size >= 2 ? '' : ' disabled') + '>' +
-      (state.wanPolicySaving ? '正在应用' : '保存策略') + '</button></div>' +
-      (state.wanPolicyNotice ? '<div class="global-notice ' + (/失败|错误|不可/.test(state.wanPolicyNotice) ? 'is-error' : '') +
-        '">' + escapeHtml(state.wanPolicyNotice) + '</div>' : '') + '</div>';
-  }
   function internetSettingsMarkup() {
-    const policyWritable = strictCap('wan_policy_write') || strictCap('wan_load_balance_write');
     const mode = firstText(state.global.wan_mode, state.settingsOverview.wan_mode, 'failover');
-    return `<section class="global-settings-section"><h3>WAN 模式</h3><div class="global-mode-options">
-      <label><input type="radio" name="global-wan-mode" value="failover" ${mode !== 'load_balance' ? 'checked' : ''} ${policyWritable ? '' : 'disabled'}><span><strong>仅故障转移</strong><small>主线路故障时切换到备用线路</small></span></label>
-      <label><input type="radio" name="global-wan-mode" value="load_balance" ${mode === 'load_balance' ? 'checked' : ''} ${policyWritable ? '' : 'disabled'}><span><strong>负载均衡</strong><small>按线路权重分配新连接</small></span></label>
-    </div>${policyWritable ? '' : '<div class="global-contract-note">当前后端尚未提供 WAN 模式、优先级与权重的事务合同，因此只展示真实线路，不模拟保存。</div>'}</section>
-    <section class="global-settings-section"><div class="global-section-heading"><h3>互联网线路</h3><span>${state.wans.length} 条</span></div><div class="global-wan-policy-list">${state.wans.length ? state.wans.map((wan, index) => {
+    return `<section class="global-settings-section"><div class="global-section-heading"><h3>互联网线路</h3><span>${state.wans.length} 条</span></div><div class="global-wan-policy-list">${state.wans.length ? state.wans.map((wan, index) => {
       const role = firstText(wan.role, wan.advanced?.failover ? 'failover' : index === 0 ? 'primary' : 'backup');
       const priority = firstNumber(wan.priority, wan.metric, index + 1);
       const weight = optionalNumber(wan.weight, wan.load_balance_weight);
@@ -1109,9 +978,6 @@ export function mount(context = {}) {
       </h3>
       <div id="${panelId}" class="global-advanced-module-body" role="region" aria-labelledby="${triggerId}" ${open ? '' : 'hidden'}>${body}</div>
     </section>`;
-  }
-  function advancedWanPolicyMarkup() {
-    return wanPolicyMarkup();
   }
   function advancedLineServicesMarkup() {
     return `<div class="global-advanced-fields">
@@ -1166,7 +1032,6 @@ export function mount(context = {}) {
       <section class="global-advanced-panel dwrt-kit-glass-surface">
         <header class="global-advanced-panel-header"><div><span>${icon('settings')}</span><strong>高级网络设置</strong></div><small data-global-save-state>${globalDirty() ? '存在尚未保存的更改' : '当前配置已同步'}</small></header>
         <div class="global-advanced-modules">
-          ${advancedGroup('wan-policy', 'internet', 'WAN 策略', `${state.wans.length} 条线路`, advancedWanPolicyMarkup())}
           ${advancedGroup('line-services', 'route', '线路服务', '流量、测速与 SLA', advancedLineServicesMarkup())}
           ${advancedGroup('network-behavior', 'network', '网络行为', '安全、发现与组播', advancedNetworkBehaviorMarkup())}
           ${advancedGroup('switching', 'ports', '交换与环路保护', 'STP 与端口能力', advancedSwitchingMarkup())}
@@ -1324,53 +1189,6 @@ export function mount(context = {}) {
     root?.querySelectorAll('[data-global-save-state], .global-advanced-savebar small').forEach((label) => {
       label.textContent = globalDirty() ? '存在尚未保存的更改' : '当前配置已同步';
     });
-  }
-  function selectWanPolicyMember(id, checked) {
-    const current = new Set((state.wanPolicyDraft.wan_ids || []).map(Number));
-    if (checked) current.add(Number(id)); else current.delete(Number(id));
-    state.wanPolicyDraft.wan_ids = [...current].sort((a, b) => a - b);
-    state.wanPolicyNotice = '';
-    render();
-  }
-  function selectWanPolicyPreset(value) {
-    state.wanPolicyDraft.wan_ids = String(value || '').split(',').map(Number)
-      .filter((id) => Number.isInteger(id) && id > 0);
-    state.wanPolicyNotice = '';
-    render();
-  }
-  async function saveWanPolicy() {
-    if (!wanPolicyDirty() || state.wanPolicySaving) return;
-    const ids = (state.wanPolicyDraft.wan_ids || []).map(Number).filter((id) => Number.isInteger(id) && id > 0);
-    if (ids.length < 2) {
-      state.wanPolicyNotice = '至少选择两条 WAN 线路';
-      render();
-      return;
-    }
-    state.wanPolicySaving = true;
-    state.wanPolicyNotice = '';
-    render();
-    try {
-      const result = await requestJson(ENDPOINTS.wanPolicy, {
-        method: 'PUT',
-        body: JSON.stringify({ mode: state.wanPolicyDraft.mode, wan_ids: ids })
-      });
-      state.wanPolicy = {
-        ...state.wanPolicy,
-        mode: state.wanPolicyDraft.mode,
-        algorithm: state.wanPolicyDraft.mode,
-        wan_ids: ids
-      };
-      state.wanPolicyDraft = clone(state.wanPolicy);
-      state.wanPolicySaving = false;
-      state.wanPolicyNotice = '策略已应用；已有连接保持原出口';
-      await load(true);
-      state.wanPolicyNotice = '策略已应用；已有连接保持原出口';
-      render();
-    } catch (error) {
-      state.wanPolicySaving = false;
-      state.wanPolicyNotice = '保存失败：' + firstText(error.message, 'unknown');
-      render();
-    }
   }
   function refreshPortPreviewButton() {
     const preview = root?.querySelector('[data-port-preview]');
@@ -1548,23 +1366,6 @@ export function mount(context = {}) {
         if (panel) panel.hidden = !active;
       });
     }));
-    root.querySelectorAll('[data-global-wan-mode]').forEach((input)=>input.addEventListener('change',()=>{
-      state.globalDraft.wan_mode = input.value;
-      state.globalNotice = '';
-      refreshGlobalSaveButton();
-    }));
-    root.querySelectorAll('[data-wan-policy-mode]').forEach((input) => input.addEventListener('change', () => {
-      state.wanPolicyDraft.mode = input.value;
-      state.wanPolicyNotice = '';
-      render();
-    }));
-    root.querySelectorAll('[data-wan-policy-member]').forEach((input) => input.addEventListener('change', () => {
-      selectWanPolicyMember(input.dataset.wanPolicyMember, input.checked);
-    }));
-    root.querySelectorAll('[data-wan-policy-preset]').forEach((button) => button.addEventListener('click', () => {
-      selectWanPolicyPreset(button.dataset.wanPolicyPreset);
-    }));
-    root.querySelectorAll('[data-wan-policy-save]').forEach((button) => button.addEventListener('click', saveWanPolicy));
     root.querySelectorAll('[data-global-setting]').forEach((input)=>input.addEventListener('change',()=>{const key=input.dataset.globalSetting;if(key==='port-autoneg'){state.portDraft.autoneg=input.checked;state.portPreview=null;refreshPortPreviewButton();}else if(key==='port-enabled'){state.portDraft.enabled=input.checked;state.portPreview=null;refreshPortPreviewButton();}else if(key==='bulk-autoneg'){state.bulkDraft.autoneg=input.checked;state.bulkPreview=null;}else{state.globalDraft[key]=input.type==='checkbox'?input.checked:input.type==='number'?Number(input.value):input.value;state.globalNotice='';if(key==='bridge_stp'&&state.pageTab==='advanced'){const dependent=root.querySelector('[data-global-dependent="bridge_stp"]');if(dependent){dependent.hidden=!input.checked;dependent.classList.toggle('is-open',input.checked);}input.setAttribute('aria-expanded',String(input.checked));}refreshGlobalSaveButton();}}));
     root.querySelectorAll('[data-port-draft]').forEach((input)=>input.addEventListener('change',()=>{state.portDraft[input.dataset.portDraft]=input.dataset.portDraft==='speed'?Number(input.value):input.value;state.portPreview=null;refreshPortPreviewButton();}));
     root.querySelectorAll('[data-bulk-field]').forEach((input)=>input.addEventListener('change',()=>{state.bulkDraft[input.dataset.bulkField]=input.dataset.bulkField==='speed'?Number(input.value):input.value;state.bulkPreview=null;}));

@@ -168,31 +168,80 @@ static int path_is_mountpoint(const char *path)
     return 0;
 }
 
-static int persistent_store_ready(void)
+/*
+ * The gate waits for the persistent store to be *mounted and writable*, and
+ * deliberately does not wait for /etc/dreamingwrt/config.db.
+ *
+ * config.db has exactly one creator in the whole tree -- jmx_netconfig_db_init()
+ * in dreamingwrt-core, where sqlite3_open() creates the file and nc_schema()
+ * builds the tables. Neither the installer nor any package drops it on disk.
+ * Requiring it here therefore deadlocked first boot: the supervisor refused to
+ * start any component until the file appeared, and the only process that could
+ * ever create it was the component being refused. procd respawned init every
+ * ~65s forever, so a freshly installed machine never came up and could not
+ * self-heal.
+ *
+ * Mount readiness is a real precondition and stays: starting core against the
+ * pre-bind rootfs directory would create the database in the wrong place and it
+ * would vanish under the bind mount.
+ */
+enum persist_gate_state {
+    PERSIST_GATE_READY = 0,
+    PERSIST_GATE_NO_MOUNT,
+    PERSIST_GATE_NOT_WRITABLE,
+};
+
+static enum persist_gate_state persistent_store_state(void)
 {
     struct stat st;
 
+    /* No persist script means this image keeps /etc/dreamingwrt on rootfs. */
     if (access(DWRT_PERSIST_INIT, X_OK) != 0)
-        return 1;
-    return path_is_mountpoint(DWRT_PERSIST_MOUNT) &&
-           stat(DWRT_CONFIG_DB, &st) == 0 && S_ISREG(st.st_mode) &&
-           access(DWRT_CONFIG_DB, R_OK | W_OK) == 0;
+        return PERSIST_GATE_READY;
+    if (!path_is_mountpoint(DWRT_PERSIST_MOUNT))
+        return PERSIST_GATE_NO_MOUNT;
+    if (stat(DWRT_PERSIST_MOUNT, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        access(DWRT_PERSIST_MOUNT, R_OK | W_OK | X_OK) != 0)
+        return PERSIST_GATE_NOT_WRITABLE;
+    return PERSIST_GATE_READY;
+}
+
+static const char *persist_gate_reason(enum persist_gate_state state)
+{
+    switch (state) {
+    case PERSIST_GATE_READY:
+        return "ready";
+    case PERSIST_GATE_NO_MOUNT:
+        return "mount_not_ready";
+    case PERSIST_GATE_NOT_WRITABLE:
+        return "mount_not_writable";
+    }
+    return "unknown";
+}
+
+static int persistent_store_ready(void)
+{
+    return persistent_store_state() == PERSIST_GATE_READY ? 1 : 0;
 }
 
 static int wait_for_persistent_store(void)
 {
+    enum persist_gate_state state;
     int waited;
 
-    if (persistent_store_ready())
+    state = persistent_store_state();
+    if (state == PERSIST_GATE_READY)
         return 0;
     fprintf(stderr,
-            "dreamingwrt-init: waiting for persistent store mount=%s config=%s\n",
-            DWRT_PERSIST_MOUNT, DWRT_CONFIG_DB);
+            "dreamingwrt-init: waiting for persistent store mount=%s reason=%s "
+            "(config db %s is created by dreamingwrt-core and is not waited for)\n",
+            DWRT_PERSIST_MOUNT, persist_gate_reason(state), DWRT_CONFIG_DB);
     for (waited = 0; waited < DWRT_PERSIST_WAIT_SECONDS; waited++) {
         if (g_stop_requested)
             return -1;
         sleep(1);
-        if (persistent_store_ready()) {
+        state = persistent_store_state();
+        if (state == PERSIST_GATE_READY) {
             fprintf(stderr,
                     "dreamingwrt-init: persistent store ready after %ds\n",
                     waited + 1);
@@ -200,8 +249,10 @@ static int wait_for_persistent_store(void)
         }
     }
     fprintf(stderr,
-            "dreamingwrt-init: persistent store unavailable after %ds; refusing to start components\n",
-            DWRT_PERSIST_WAIT_SECONDS);
+            "dreamingwrt-init: persistent store unavailable after %ds reason=%s "
+            "mount=%s; refusing to start components\n",
+            DWRT_PERSIST_WAIT_SECONDS, persist_gate_reason(state),
+            DWRT_PERSIST_MOUNT);
     return -1;
 }
 

@@ -1433,21 +1433,40 @@ export function mount(context = {}) {
   /*
    * 删除被拒时后端回的是错误码。原样显示 lan_ports_attached 这种字面量等于没解释，
    * 所以这里把已知的几个翻成人话；未知码仍如实透出原文，不猜、不吞。
-   * 取值来自 dreamingwrt-core 的字面量（lan_ports_attached / lan_delete_failed）。
+   *
+   * 取值是 jmx_netconfig_lan_delete_result() 那个 switch 的全集（jmx_netconfig_db.c
+   * :15825-15835），逐条与源码核对过。曾经写在这里的 lan_not_found / lan_is_default
+   * 后端从来不返回——真实的码是 not_found 与 protected_management_lan，所以那两个键
+   * 是永不命中的死键，已删除，不要凭直觉加回来。
+   *
+   * 同一套字面量也是 GET /network/lans 每条 lans[] 上 delete_blocked_reason 的取值
+   * （nc_lan_delete_block_reason()，同文件 :4468），所以这张表既能解释「删除被拒」，
+   * 也能解释「列表阶段为什么不可删」。
    */
   const DELETE_ERROR_TEXT = {
+    not_found: '后端找不到这个网络，可能已被其他会话删除，刷新后再看。',
+    protected_management_lan: '这是受保护的管理网络，后端不允许从这里删除。',
+    last_enabled_lan: '这是最后一个启用的 LAN，删掉就没有内网了，后端拒绝删除。',
     lan_ports_attached: '该 LAN 仍有物理端口挂在它的网桥上，后端拒绝删除。请先在「物理接口」里把端口移出，再重试。',
-    lan_delete_failed: '后端执行删除失败，配置未改动。',
-    lan_not_found: '后端找不到这个 LAN，可能已被其他会话删除，刷新后再看。',
-    lan_is_default: '这是默认管理网络，后端不允许删除。'
+    child_lans_attached: '还有子 LAN 挂在这个网络下，后端拒绝删除。请先删除或改挂这些子 LAN。',
+    ipam_network_attached: '地址管理（IPAM）里仍有网段绑在这个 LAN 上，后端拒绝删除。请先解除该绑定。',
+    management_reachability_risk: '你当前的管理地址就在这个 LAN 里，删掉会切断自己的连接，后端已阻止。请从其他网络登录后再删。',
+    snapshot_failed: '删除前的配置备份没做成功，后端为安全起见中止了删除，配置未改动。',
+    lan_delete_failed: '后端执行删除失败，配置未改动。'
   };
 
   function deleteErrorText(error) {
     const code = firstText(error?.code, error?.payload?.error, error?.payload?.code);
     if (DELETE_ERROR_TEXT[code]) return DELETE_ERROR_TEXT[code];
-    /* 有些路径把码直接塞进 message，这里再兜一层，免得用户看到裸字面量。 */
+    /*
+     * 有些路径把码直接塞进 message，这里再兜一层，免得用户看到裸字面量。
+     * 用词边界匹配而不是裸 includes()：表里的 not_found 是个通用词，裸包含会把
+     * wan_not_found / user_not_found 这类别的码也翻成 LAN 的文案。`_` 算单词字符，
+     * 所以 \bnot_found\b 不会命中 wan_not_found，正是想要的行为。
+     */
     const message = firstText(error?.message);
-    const hit = Object.keys(DELETE_ERROR_TEXT).find((key) => message === key || message.includes(key));
+    const hit = Object.keys(DELETE_ERROR_TEXT).find((key) => message === key
+      || new RegExp(`\\b${key}\\b`).test(message));
     return hit ? DELETE_ERROR_TEXT[hit] : '';
   }
 

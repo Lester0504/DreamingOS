@@ -1035,6 +1035,90 @@ html[data-theme-resolved="light"] .dwrt-risk-meter {
   }
 }
 
+/* 纵向 tab：一栏卡片式导航，收编自 dreamingproxy。
+
+   只覆盖排布与圆角，材质完全沿用 `.dwrt-kit-tabs` 与 `--dwrt-active-pill-bg`，
+   因此 `prefers-reduced-motion` / `prefers-reduced-transparency` / `prefers-contrast`
+   三个分支都由既有 `.dwrt-kit-tabs` / `.dwrt-kit-tab` 选择器直接覆盖，无需重复声明。
+
+   `dwrt-ui-kit.js` 一行都不用改：`updateTabs()` 读的是 `offsetLeft/offsetTop` 并对
+   x/y 两轴都做弹簧，滑块自动跟着竖排走。
+
+   横向那套的两个默认值必须在这里翻掉，否则纵排会坏：
+     `overflow: hidden`  会把滑块和竖列裁掉 → visible
+     `border-radius: 999px` 竖排下会变成胶囊两头的怪弧 → 卡片圆角 */
+.dwrt-kit-tabs.dwrt-kit-vertical-tabs {
+  --dwrt-vertical-tab-min-height: 44px;
+  width: 100%;
+  min-height: 0;
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  padding: 6px;
+  border-radius: var(--app-radius-card, 18px);
+  overflow: visible;
+}
+
+.dwrt-kit-vertical-tabs .dwrt-kit-tab {
+  min-width: 0;
+  height: auto;
+  min-height: var(--dwrt-vertical-tab-min-height);
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  border-radius: var(--app-radius-control, 12px);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.dwrt-kit-vertical-tabs .dwrt-kit-tab > i,
+.dwrt-kit-vertical-tabs .dwrt-kit-tab > svg {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+}
+
+.dwrt-kit-vertical-tabs .dwrt-kit-tab > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 计数用等宽数字 + 独立胶囊底，数字变化时标签不会左右跳动。 */
+.dwrt-kit-vertical-tabs .dwrt-kit-tab > b {
+  min-width: 22px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.10);
+  font-size: 12px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.dwrt-kit-vertical-tabs .dwrt-kit-tab-pill {
+  border-radius: var(--app-radius-control, 12px);
+}
+
+/* 高光片默认是胶囊两头的 999px 弧，套在 12px 方角滑块上会露出弧形边。 */
+.dwrt-kit-vertical-tabs .dwrt-kit-tab-pill::before {
+  border-radius: var(--app-radius-control, 12px) var(--app-radius-control, 12px) 9px 9px;
+}
+
+/* 纵栏挤掉主表格时退化成横排。阈值由调用方决定（纵栏宽度是页面级决策），
+   调用方加 `.dwrt-kit-vertical-tabs-collapsed` 即可，kit 不钉死断点。 */
+.dwrt-kit-tabs.dwrt-kit-vertical-tabs.dwrt-kit-vertical-tabs-collapsed {
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.dwrt-kit-vertical-tabs.dwrt-kit-vertical-tabs-collapsed::-webkit-scrollbar { display: none; }
+
 /* 页面级容器专用：含 height: 100%，会把自身撑满可用高度。
    只允许每个页面/标签页用一次，且必须是最外层的滚动或布局容器。
    卡片、面板、行内块请只用 .dwrt-kit-glass-surface 取材质，

@@ -2261,28 +2261,67 @@ struct json_object *jmx_signature_db_status(struct json_object *cfg)
 struct json_object *jmx_signature_db_apps(struct json_object *cfg)
 {
     sqlite3 *db = NULL; sqlite3_stmt *st = NULL; int limit = 200, offset = 0; const char *q = "";
+    const char *category = "";
     struct json_object *d = json_object_new_object(), *arr = json_object_new_array();
     int ok = 0, step_rc = SQLITE_DONE;
+    int total = -1;
     if (cfg) {
         limit = nc_json_int_def(cfg, "limit", 200);
         offset = nc_json_int_def(cfg, "offset", 0);
         q = nc_json_str_def(cfg, "q",
             nc_json_str_def(cfg, "search",
             nc_json_str_def(cfg, "search_text", "")));
+        /*
+         * Category is matched on the slug, which is what every row of this
+         * response already carries. Taking the slug means a caller can feed a
+         * value straight back from a previous page instead of maintaining its
+         * own slug->category_id table. "all" and "" both mean unfiltered, so a
+         * UI with an "all categories" tab needs no special case.
+         */
+        category = nc_json_str_def(cfg, "category_slug",
+                   nc_json_str_def(cfg, "category", ""));
     }
+    if (category && !strcmp(category, "all")) category = "";
+    if (!category) category = "";
     if (limit <= 0 || limit > 1000) limit = 200; if (offset < 0) offset = 0;
     { char path[512] = {0}; (void)nc_signature_db_path(path, sizeof(path)); json_object_object_add(d, "path", json_object_new_string(path)); }
     if (nc_sig_open(&db) != 0) { json_object_object_add(d, "ok", json_object_new_boolean(0)); json_object_object_add(d, "apps", arr); return jmx_gen_api_response_data(API_CODE_ERROR, d); }
+    /*
+     * Filter predicate, kept identical between the page query and the COUNT
+     * below. If the two ever drift, total stops describing the set being
+     * paged through, which is worse than having no total at all.
+     */
+#define NC_SIG_APPS_WHERE \
+    "WHERE a.enabled=1 AND (?1='' OR a.name LIKE '%'||?1||'%' OR a.normalized_name LIKE '%'||?1||'%') " \
+    "AND (?4='' OR c.slug=?4) "
+    /*
+     * total is the full size of the filtered set, so the caller can page
+     * without inferring the last page from "returned < limit", which is
+     * ambiguous exactly when the set size is a multiple of limit.
+     */
+    {
+        sqlite3_stmt *cst = NULL;
+        const char *csql = "SELECT COUNT(*) FROM app a "
+                           "LEFT JOIN app_category c ON c.category_id=a.category_id "
+                           NC_SIG_APPS_WHERE;
+        if (sqlite3_prepare_v2(db, csql, -1, &cst, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(cst, 1, q, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(cst, 4, category, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(cst) == SQLITE_ROW) total = sqlite3_column_int(cst, 0);
+        }
+        if (cst) sqlite3_finalize(cst);
+    }
     const char *sql = "SELECT a.app_id,a.name,COALESCE(c.slug,''),COALESCE(c.name,''),COALESCE(a.family,''),"
                       "COALESCE(ai.icon_key,''),COALESCE(ia.icon_file,''),"
                       "(SELECT COUNT(*) FROM dpi_rule r WHERE r.app_id=a.app_id AND r.enabled=1) AS rules "
                       "FROM app a LEFT JOIN app_category c ON c.category_id=a.category_id "
                       "LEFT JOIN app_icon ai ON ai.app_id=a.app_id "
                       "LEFT JOIN icon_asset ia ON ia.icon_key=ai.icon_key "
-                      "WHERE a.enabled=1 AND (?1='' OR a.name LIKE '%'||?1||'%' OR a.normalized_name LIKE '%'||?1||'%') "
+                      NC_SIG_APPS_WHERE
                       "ORDER BY a.app_id LIMIT ?2 OFFSET ?3";
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, q, -1, SQLITE_TRANSIENT); sqlite3_bind_int(st, 2, limit); sqlite3_bind_int(st, 3, offset);
+        sqlite3_bind_text(st, 4, category, -1, SQLITE_TRANSIENT);
         while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) { struct json_object *o = json_object_new_object();
             json_object_object_add(o, "app_id", json_object_new_int(sqlite3_column_int(st,0)));
             nc_add_text(o, "name", st, 1);
@@ -2298,9 +2337,20 @@ struct json_object *jmx_signature_db_apps(struct json_object *cfg)
             json_object_array_add(arr, o); }
         ok = (step_rc == SQLITE_DONE);
     }
+#undef NC_SIG_APPS_WHERE
     if (!ok) json_object_object_add(d, "error", json_object_new_string("signature_query_failed"));
     if (st) sqlite3_finalize(st); sqlite3_close(db);
     json_object_object_add(d, "ok", json_object_new_boolean(ok)); json_object_object_add(d, "limit", json_object_new_int(limit)); json_object_object_add(d, "offset", json_object_new_int(offset)); json_object_object_add(d, "apps", arr);
+    /* Echo the applied filter so a caller can tell a server-side filter from
+     * a parameter that was silently ignored, the failure this endpoint had. */
+    json_object_object_add(d, "category_slug", json_object_new_string(category));
+    if (total >= 0) {
+        int returned = (int)json_object_array_length(arr);
+
+        json_object_object_add(d, "total", json_object_new_int(total));
+        json_object_object_add(d, "has_more",
+                               json_object_new_boolean(offset + returned < total));
+    }
     return jmx_gen_api_response_data(ok ? API_CODE_SUCCESS : API_CODE_ERROR, d);
 }
 
@@ -2309,16 +2359,33 @@ struct json_object *jmx_signature_db_rules(struct json_object *cfg)
     sqlite3 *db = NULL; sqlite3_stmt *st = NULL; int limit = 200, offset = 0, app_id = 0;
     struct json_object *d = json_object_new_object(), *arr = json_object_new_array();
     int ok = 0, step_rc = SQLITE_DONE;
+    int total = -1;
     if (cfg) { limit = nc_json_int_def(cfg, "limit", 200); offset = nc_json_int_def(cfg, "offset", 0); app_id = nc_json_int_def(cfg, "app_id", 0); }
     if (limit <= 0 || limit > 1000) limit = 200; if (offset < 0) offset = 0;
     if (nc_sig_open(&db) != 0) { json_object_object_add(d, "ok", json_object_new_boolean(0)); json_object_object_add(d, "rules", arr); return jmx_gen_api_response_data(API_CODE_ERROR, d); }
+    /*
+     * Filter predicate, shared verbatim between the COUNT and the page query.
+     * If the two drift, total stops describing the set being paged through,
+     * which is worse than reporting no total at all.
+     */
+#define NC_SIG_RULES_WHERE "WHERE r.enabled=1 AND (?1=0 OR r.app_id=?1) "
+    {
+        sqlite3_stmt *cst = NULL;
+        const char *csql = "SELECT COUNT(*) FROM dpi_rule r " NC_SIG_RULES_WHERE;
+        if (sqlite3_prepare_v2(db, csql, -1, &cst, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(cst, 1, app_id);
+            if (sqlite3_step(cst) == SQLITE_ROW) total = sqlite3_column_int(cst, 0);
+        }
+        if (cst) sqlite3_finalize(cst);
+    }
     const char *sql = "SELECT r.rule_id,r.app_id,COALESCE(a.name,''),COALESCE(r.proto,''),COALESCE(r.direction,''),COALESCE(r.match_type,''),COALESCE(r.pattern_format,''),COALESCE(r.pattern_text,''),COALESCE(r.pattern_hex,''),r.offset,r.priority,r.pkt_seq,"
                       "COALESCE(c.slug,''),COALESCE(c.name,''),COALESCE(a.family,''),COALESCE(ai.icon_key,''),COALESCE(ia.icon_file,'') "
                       "FROM dpi_rule r LEFT JOIN app a ON a.app_id=r.app_id "
                       "LEFT JOIN app_category c ON c.category_id=a.category_id "
                       "LEFT JOIN app_icon ai ON ai.app_id=a.app_id "
                       "LEFT JOIN icon_asset ia ON ia.icon_key=ai.icon_key "
-                      "WHERE r.enabled=1 AND (?1=0 OR r.app_id=?1) ORDER BY r.priority,r.rule_id LIMIT ?2 OFFSET ?3";
+                      NC_SIG_RULES_WHERE
+                      "ORDER BY r.priority,r.rule_id LIMIT ?2 OFFSET ?3";
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_int(st, 1, app_id); sqlite3_bind_int(st, 2, limit); sqlite3_bind_int(st, 3, offset);
         while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) { struct json_object *o = json_object_new_object();
@@ -2344,9 +2411,17 @@ struct json_object *jmx_signature_db_rules(struct json_object *cfg)
             json_object_array_add(arr, o); }
         ok = (step_rc == SQLITE_DONE);
     }
+#undef NC_SIG_RULES_WHERE
     if (!ok) json_object_object_add(d, "error", json_object_new_string("signature_query_failed"));
     if (st) sqlite3_finalize(st); sqlite3_close(db);
     json_object_object_add(d, "ok", json_object_new_boolean(ok)); json_object_object_add(d, "app_id", json_object_new_int(app_id)); json_object_object_add(d, "limit", json_object_new_int(limit)); json_object_object_add(d, "offset", json_object_new_int(offset)); json_object_object_add(d, "rules", arr);
+    if (total >= 0) {
+        int returned = (int)json_object_array_length(arr);
+
+        json_object_object_add(d, "total", json_object_new_int(total));
+        json_object_object_add(d, "has_more",
+                               json_object_new_boolean(offset + returned < total));
+    }
     return jmx_gen_api_response_data(ok ? API_CODE_SUCCESS : API_CODE_ERROR, d);
 }
 

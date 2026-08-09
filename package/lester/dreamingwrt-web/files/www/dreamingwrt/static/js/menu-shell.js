@@ -1,5 +1,13 @@
 (() => {
-  const VERSION = '20260802-sheet-portal-scope-01';
+  /*
+   * 这个常量不只是壳层自己的版本号：routeModuleCacheUrl() 里的 shellVersioned 白名单
+   * （global-config / network-interface-config / system-settings / network-services /
+   * policy-status / user-authentication / vpn-config）**忽略 main.json 的
+   * module_version，统一用这里的 VERSION 作缓存键**。所以改了这些模块的代码却只 bump
+   * main.json，浏览器仍会拿缓存里的旧模块 —— 编辑 LAN/WAN 抽屉的改动就这样在 30.1 上
+   * 看不到。凡改动白名单里的模块，必须同时提升这个值。
+   */
+  const VERSION = '20260808-region-ink-uses-painted-density-01';
   const STATIC_MENU_URL = '/static/menu/main.json';
   const RUNTIME_MENU_URL = '/dynamic/menu/1.json';
   const MENU_URLS = window.DWRT_RUNTIME_MENU === false || document.documentElement.dataset.runtimeMenu === 'false'
@@ -32,6 +40,16 @@
   const SYSTEM_HEALTH_DEFAULT_RANGE = '1h';
   const SYSTEM_HEALTH_HISTORY_ENDPOINT = '/api/v1/system/health/history';
   const SYSTEM_TRAFFIC_HISTORY_ENDPOINT = '/api/v1/dashboard/traffic/history';
+  const STORAGE_OVERVIEW_ENDPOINT = '/api/v1/storage/overview';
+  /* storage/overview only honours 1h / 1d / 7d. Asking it for 1w or 1m returns a
+     1h window while still reporting range:"1h", so the disk cards would silently
+     disagree with the toolbar. The longest window it actually serves is used
+     instead, and the card states which window it got. */
+  const STORAGE_RANGE_BY_HEALTH_RANGE = { '1h': '1h', '1d': '1d', '1w': '7d', '1m': '7d' };
+  const SYSTEM_HEALTH_DISK_COLORS = ['#56a8ff', '#54d69a', '#f1ba55', '#ef7888', '#ad8cff', '#54c9d4'];
+  function storageRangeForHealthRange(rangeId) {
+    return STORAGE_RANGE_BY_HEALTH_RANGE[String(rangeId || '')] || '1h';
+  }
   const MONITOR_DATA_PAGES = {
     systemHealth: {
       id: 'system-health',
@@ -116,7 +134,7 @@
     dashboard: {
       url: '/static/js/dashboard.js',
       globalName: 'DWRTDashboard',
-      version: '20260726-poll-discipline-05'
+      version: '20260808-conn-truth-01'
     },
     topology: {
       url: '/static/js/unifi-topology.js',
@@ -126,33 +144,33 @@
     lineStatus: {
       url: '/static/js/line-status.js',
       globalName: 'DWRTLineStatus',
-      version: '20260723-line-health-history-01'
+      version: '20260808-conn-truth-01'
     },
     clientDetails: {
       url: '/static/js/client-details.js',
       globalName: 'DWRTClientDetails',
-      version: '20260802-sheet-portal-scope-01'
+      version: '20260806-front-batch10-01'
     },
     insightsFlows: {
       url: '/static/js/insights-flows.js',
       globalName: 'DWRTInsightsFlows',
-      version: '20260802-sheet-portal-scope-01'
+      version: '20260808-audit-evidence-semantic-01'
     },
   };
   const PAGE_STYLES = {
     lineStatus: [
-      { url: '/static/css/line-status.css', version: '20260723-line-health-history-01' }
+      { url: '/static/css/line-status.css', version: '20260808-conn-truth-01' }
     ],
     clientDetails: [
-      { url: '/static/css/client-details.css', version: '20260802-sheet-portal-scope-01' }
+      { url: '/static/css/client-details.css', version: '20260806-front-batch10-01' }
     ],
     insightsFlows: [
-      { url: '/static/css/insights-flows.css', version: '20260802-sheet-portal-scope-01' }
+      { url: '/static/css/insights-flows.css', version: '20260808-audit-evidence-semantic-01' }
     ],
   };
   const GLOBAL_AI_ASSETS = Object.freeze({
-    module: { url: '/plugins/native/ai-assistant.js', version: '20260802-sheet-portal-scope-01' },
-    style: { url: '/static/css/ai-assistant.css', version: '20260802-sheet-portal-scope-01' }
+    module: { url: '/plugins/native/ai-assistant.js', version: '20260803-client-detail-fullbleed-01' },
+    style: { url: '/static/css/ai-assistant.css', version: '20260805-kit-material-radius-01' }
   });
 
   let topologyVisibilityTimer = 0;
@@ -509,7 +527,8 @@
         scheduleGlassCardsRender,
         shouldDeferRender,
         realtime: window.DWRTRealtime,
-        session: window.DWRT_SESSION
+        session: window.DWRT_SESSION,
+        connTruth: window.DWRTConnTruth
       });
     }
     return dashboardPage;
@@ -539,7 +558,8 @@
         formatLatency,
         carrierMarkup,
         shouldDeferRender,
-        realtime: window.DWRTRealtime
+        realtime: window.DWRTRealtime,
+        connTruth: window.DWRTConnTruth
       });
     }
     return lineStatusPage;
@@ -864,6 +884,16 @@
     ].filter(Boolean).map(String))];
   }
 
+  // Route keys are the shared identity for a menu entry. mergeStaticRouteResources used
+  // to keep this comparison in a local closure, which is why the first native-plugin
+  // merge attempt threw a ReferenceError from outside that scope and emptied the menu.
+  // It lives at module level now so every merge path can use the same rule.
+  function itemsShareRouteKey(left, right) {
+    if (!left || !right) return false;
+    const leftKeys = new Set(routeModuleKeys(left).map(String));
+    return routeModuleKeys(right).some((key) => leftKeys.has(String(key)));
+  }
+
   function flattenMenuItems(items, out = []) {
     (items || []).forEach((item) => {
       if (!item || typeof item !== 'object') return;
@@ -918,16 +948,119 @@
       });
   }
 
+  // Ported native plugins ship a manifest, a module and an api_prefix, but nothing ever
+  // pulled them into the sidebar, so #/plugins/native/<id> matched no menu entry and the
+  // router fell through to the first item. Manifest icon names come from the plugin side
+  // and are not guaranteed to exist in window.DWRT_MENU_ICON; unknown names fall back to
+  // the generic glyph, so map the known ones onto real shell icons.
+  const NATIVE_PLUGINS_URL = '/api/v1/plugins/native';
+  const NATIVE_PLUGIN_GROUP_ID = 'native-plugins';
+  const NATIVE_PLUGIN_ICON_ALIAS = {
+    proxy: 'policy_routes',
+    shield: 'policy_aegisx',
+    route: 'policy_routes',
+    split: 'dns',
+    dns: 'dns',
+    folder: 'storage_files',
+    network: 'vpn',
+    'key-round': 'authentication_accounts',
+    // Plugin manifests name icons in lucide terms; anything absent from
+    // menu-icons.js falls through iconSvg() to the default glyph, which is how
+    // qBittorrent lost its icon while still looking "present" in the sidebar.
+    download: 'storage_mounts'
+  };
+
+  function nativePluginMenuItem(plugin) {
+    if (!plugin || typeof plugin !== 'object') return null;
+    const id = String(plugin.id || '').trim();
+    if (!id || !/^[A-Za-z0-9._-]+$/.test(id)) return null;
+    if (plugin.installed === false || plugin.enabled === false) return null;
+    const path = normalizeRoutePath(String(plugin.path || `/app/#/plugins/native/${id}`).trim());
+    if (!routeHashFromPath(path).startsWith('#/plugins/native/')) return null;
+    if (!safePluginModuleUrl(plugin.module)) return null;
+    const rawIcon = String(plugin.icon || '').trim();
+    return {
+      id: `native-${id}`,
+      label: String(plugin.label || id),
+      func_name: `native_plugin_${id.replace(/[^A-Za-z0-9]+/g, '_')}`,
+      icon: NATIVE_PLUGIN_ICON_ALIAS[rawIcon] || rawIcon || 'advanced_plugins',
+      path,
+      module: plugin.module,
+      module_version: plugin.module_version || '',
+      style: plugin.style || '',
+      style_version: plugin.style_version || '',
+      native_plugin: true
+    };
+  }
+
+  async function loadNativePluginMenuItems(source) {
+    const url = typeof source === 'string' && source.trim() ? source.trim() : NATIVE_PLUGINS_URL;
+    if (!url.startsWith('/api/')) return [];
+    try {
+      // /api/v1/plugins/native requires a bearer token. readJson sends no auth header,
+      // so it returns 401 and the sidebar silently keeps only its builtin children --
+      // which looks exactly like "the merge did not run". Authenticated API reads go
+      // through readRuntimeJson.
+      const payload = await readRuntimeJson(url);
+      const data = unwrapApiData(payload) || {};
+      const list = Array.isArray(data.plugins) ? data.plugins : Array.isArray(data) ? data : [];
+      const seen = new Set();
+      return list.map(nativePluginMenuItem).filter((item) => {
+        if (!item || seen.has(item.id)) return false;
+        seen.add(item.id);
+        return true;
+      });
+    } catch (_) {
+      // A plugin listing failure must not take the whole menu down; builtin routes stay
+      // usable and the plugin group keeps its static children.
+      return [];
+    }
+  }
+
+  function mergeNativePluginItems(items, pluginItems) {
+    const base = Array.isArray(items) ? items : [];
+    if (!Array.isArray(pluginItems) || !pluginItems.length) return base;
+    const groupIndex = base.findIndex((item) => item && itemKey(item) === NATIVE_PLUGIN_GROUP_ID);
+    if (groupIndex < 0) return base;
+    const group = base[groupIndex];
+    const children = [...(group.children || [])];
+    // Static children already declare Docker/LXC/quick tools; a manifest entry for the
+    // same route updates it in place rather than adding a duplicate sibling.
+    pluginItems.forEach((pluginItem) => {
+      const index = children.findIndex((child) => itemsShareRouteKey(child, pluginItem)
+        || itemPath(child) === itemPath(pluginItem));
+      if (index >= 0) children[index] = { ...children[index], ...pluginItem };
+      else children.push(pluginItem);
+    });
+    // Index-based replacement, not reference equality: an upstream shallow copy would
+    // make `item === group` miss everywhere and silently drop every plugin.
+    const next = base.slice();
+    // The group ships `availability: unavailable` gated on `native_plugin_overview`, a
+    // capability the backend has never sent, so capabilityEnabled() was permanently false
+    // and the group stayed `unavailable` even with installed+enabled plugins merged in.
+    // The plugin listing is the authority on whether this group has anything to show, so
+    // a successful merge promotes availability instead of waiting for a bit that never
+    // arrives. Without this, one failed listing plus capability-filtered static children
+    // empties `children` and `filterItems()` marks the whole group disabled.
+    // `group_entry` keeps the group non-routable: it owns no module, so letting it become
+    // a normal route would fall through to renderRoutePlaceholder() and dump a bare path
+    // instead of the "pick an installed plugin" guidance the entry is meant to give.
+    next[groupIndex] = {
+      ...group,
+      children,
+      availability: 'available',
+      group_entry: true
+    };
+    return next;
+  }
+
   function mergeStaticRouteResources(runtimeItems, staticItems) {
     const resourceKeys = ['module', 'module_version', 'style', 'style_version', 'resource_version', 'capability', 'availability', 'unavailable_reason'];
     const references = new Map();
     flattenMenuItems(staticItems).forEach((item) => {
       routeModuleKeys(item).forEach((key) => references.set(String(key), item));
     });
-    const sharesRouteKey = (left, right) => {
-      const leftKeys = new Set(routeModuleKeys(left).map(String));
-      return routeModuleKeys(right).some((key) => leftKeys.has(String(key)));
-    };
+    const sharesRouteKey = itemsShareRouteKey;
     const cloneFrontendItem = (item) => ({
       ...item,
       children: (item.children || []).map(cloneFrontendItem)
@@ -992,7 +1125,22 @@
           : { hidePages: [], hideFuncs: [], disabledCapabilities: [], capabilities: {} };
         const merged = mergeMenuConfig(normalized, runtimeConfig);
         state.capabilities = { ...(merged.capabilities || {}) };
-        state.menu = filterItems(normalized.items, merged);
+        const builtinMenu = filterItems(normalized.items, merged);
+        state.menu = builtinMenu;
+        if (includeRuntimeConfig) {
+          // Merge plugins after filtering the builtin tree so a bad plugin payload can
+          // never remove a builtin entry, and keep the builtin result if the merged tree
+          // would come back with fewer top-level items for any reason.
+          try {
+            const pluginItems = await loadNativePluginMenuItems(raw && raw.plugins_source);
+            if (pluginItems.length) {
+              const withPlugins = filterItems(mergeNativePluginItems(normalized.items, pluginItems), merged);
+              if (withPlugins.length >= builtinMenu.length) state.menu = withPlugins;
+            }
+          } catch (_) {
+            state.menu = builtinMenu;
+          }
+        }
         buildRouteModuleManifest();
         state.source = url;
         if (menuSource) {
@@ -1016,20 +1164,32 @@
     return queryIndex >= 0 ? value.slice(0, queryIndex) : value;
   }
 
+  // endsWith made "#/plugins/native/dns" match "#/plugins/native/smartdns". The four
+  // shipped plugin ids happen not to be suffixes of each other, but plugins keep being
+  // added, so compare on a path boundary instead of a bare suffix.
+  function routeHashMatches(item, target) {
+    const path = routeHashFromPath(itemPath(item));
+    if (!path || !target) return false;
+    if (path === target) return true;
+    return path.endsWith(target) && path.charAt(path.length - target.length - 1) === '/';
+  }
+
   function findByHash(hash) {
     const target = cleanRouteHash(hash);
     for (const primary of state.menu) {
       for (const secondary of primary.children || []) {
-        if (itemPath(secondary).endsWith(target)) return { primary, secondary };
+        if (routeHashMatches(secondary, target)) return { primary, secondary };
       }
-      if (itemPath(primary).endsWith(target)) return { primary, secondary: null };
+      if (routeHashMatches(primary, target)) return { primary, secondary: null };
       if (primary.id === 'insights' && target.startsWith('#/insights/')) {
-        const matched = (primary.children || []).find((secondary) => itemPath(secondary).endsWith(target));
+        const matched = (primary.children || []).find((secondary) => routeHashMatches(secondary, target));
         return { primary, secondary: matched || null };
       }
       if (primary.id === 'log-center' && (target === '#/logs' || target === '#/logs/' || target.startsWith('#/logs/'))) return { primary, secondary: null };
     }
-    return { primary: state.menu[0] || null, secondary: null };
+    // Never silently render route A as page B. Rendering the first menu item for an
+    // unknown hash is what made the missing plugin routes look like a random redirect.
+    return { primary: null, secondary: null, unresolved: true, requestedHash: target };
   }
 
   function commitRoute(path) {
@@ -1822,6 +1982,9 @@
   }
 
   function routeContentSignature(parts = {}) {
+    // Unknown routes share the same empty `current`, so keying on key+path alone made
+    // every distinct bad hash look like the same route and skipped the re-render.
+    if (parts.routeNotFound) return `not-found:${parts.requestedHash || ''}`;
     if (parts.dashboardRoute) return 'dashboard';
     if (parts.topologyRoute) return 'topology';
     if (parts.lineStatusRoute) return 'monitor:line-status';
@@ -1829,7 +1992,12 @@
     if (parts.insightsDetailRoute) return `insights:${parts.insightsActivityRoute ? `activity:${parts.insightsActivitySection || 'overview'}` : 'flows'}`;
     if (parts.insightsHomeRoute) return 'insights:home';
     if (parts.monitorDataConfig) return `monitor-data:${parts.monitorDataConfig.id}`;
-    return `route:${parts.currentKey || ''}:${parts.currentPath || ''}`;
+    // Availability belongs in the signature: the plugin merge resolves after the first
+    // paint and can flip an item from unavailable to available at the same key and path.
+    // Keyed on key+path alone, routeChanged stayed false and the already-rendered
+    // "不可用" panel was never replaced, so a landing on #/plugins/native kept showing
+    // the stale state even though the sidebar had already corrected itself.
+    return `route:${parts.currentKey || ''}:${parts.currentPath || ''}:${parts.currentAvailability || ''}`;
   }
 
   function renderInsightsHomePage() {
@@ -2084,7 +2252,68 @@
       connections: latestConnections,
       forwardPps,
       avgLatency: latestLatency,
-      uptime: firstNumber(system.uptime)
+      uptime: firstNumber(system.uptime),
+      disk: storageHistorySeries(historyPayload && historyPayload.storage)
+    };
+  }
+
+  /* storage/overview returns one flat row per disk per timestamp. The disk cards
+     need a series per disk, so rows are grouped by disk id and aligned on the
+     shared timeline. A metric whose column is entirely null is reported as
+     unavailable rather than drawn as a flat zero line. */
+  function storageHistorySeries(payload) {
+    const rows = asArray(payload && payload.history);
+    const disks = asArray(payload && payload.disks);
+    const names = new Map();
+    disks.forEach((disk) => {
+      const id = String((disk && (disk.id ?? disk.disk_id ?? disk.name)) ?? '').trim();
+      if (id) names.set(id, String(disk.name || disk.model || id));
+    });
+    const stamps = [];
+    const seen = new Set();
+    rows.forEach((row) => {
+      const ts = Number(row && row.ts);
+      if (!Number.isFinite(ts) || seen.has(ts)) return;
+      seen.add(ts);
+      stamps.push(ts);
+    });
+    stamps.sort((left, right) => left - right);
+    const index = new Map(stamps.map((ts, position) => [ts, position]));
+    const byDisk = new Map();
+    const pick = (row, key) => {
+      const value = Number(row && row[key]);
+      return Number.isFinite(value) ? value : null;
+    };
+    rows.forEach((row) => {
+      const ts = Number(row && row.ts);
+      const position = index.get(ts);
+      if (position === undefined) return;
+      const id = String((row && (row.disk_id ?? row.id)) ?? '').trim() || 'disk';
+      let entry = byDisk.get(id);
+      if (!entry) {
+        entry = {
+          id,
+          name: names.get(id) || id,
+          read: new Array(stamps.length).fill(null),
+          write: new Array(stamps.length).fill(null),
+          readLatency: new Array(stamps.length).fill(null),
+          writeLatency: new Array(stamps.length).fill(null)
+        };
+        byDisk.set(id, entry);
+      }
+      entry.read[position] = pick(row, 'read_bps');
+      entry.write[position] = pick(row, 'write_bps');
+      entry.readLatency[position] = pick(row, 'read_latency_ms');
+      entry.writeLatency[position] = pick(row, 'write_latency_ms');
+    });
+    const series = [...byDisk.values()];
+    const has = (keys) => series.some((entry) => keys.some((key) => entry[key].some((value) => value !== null)));
+    return {
+      stamps,
+      series,
+      range: String((payload && payload.range) || ''),
+      ioAvailable: has(['read', 'write']),
+      latencyAvailable: has(['readLatency', 'writeLatency'])
     };
   }
 
@@ -2134,6 +2363,14 @@
       ${systemHealthChartCard('packets', '转发 PPS', [{ label: '转发 PPS', color: '#7866ff' }])}
       ${systemHealthChartCard('connections', '网络连接数', [{ label: '网络连接数', color: '#ff78bd' }])}
       ${systemHealthChartCard('latency', '平均延迟(ms)', [{ label: '平均延迟', color: '#f59f00' }])}
+      ${systemHealthChartCard('diskIo', '磁盘 I/O', (summary.disk && summary.disk.series || []).flatMap((entry, index) => [
+        { label: `${entry.name} 读取`, color: SYSTEM_HEALTH_DISK_COLORS[(index * 2) % SYSTEM_HEALTH_DISK_COLORS.length] },
+        { label: `${entry.name} 写入`, color: SYSTEM_HEALTH_DISK_COLORS[(index * 2 + 1) % SYSTEM_HEALTH_DISK_COLORS.length] }
+      ]))}
+      ${systemHealthChartCard('diskLatency', '读写延迟(ms)', (summary.disk && summary.disk.series || []).flatMap((entry, index) => [
+        { label: `${entry.name} 读取`, color: SYSTEM_HEALTH_DISK_COLORS[(index * 2) % SYSTEM_HEALTH_DISK_COLORS.length] },
+        { label: `${entry.name} 写入`, color: SYSTEM_HEALTH_DISK_COLORS[(index * 2 + 1) % SYSTEM_HEALTH_DISK_COLORS.length] }
+      ]))}
     </section>`;
   }
 
@@ -2259,6 +2496,10 @@
     if (id === 'performance') return `${Math.round(num)}%`;
     if (id === 'network') return formatRate(num / 8);
     if (id === 'latency') return `${Math.round(num)} ms`;
+    // read_bps / write_bps are already bytes per second, unlike the network card
+    // whose payload is bits, so this must not divide by 8.
+    if (id === 'diskIo') return formatRate(num);
+    if (id === 'diskLatency') return `${num >= 10 ? Math.round(num) : num.toFixed(2).replace(/\.?0+$/, '')} ms`;
     if (id === 'packets') return `${formatInteger(Math.round(num))} pps`;
     return formatInteger(Math.round(num));
   }
@@ -2369,7 +2610,54 @@
     if (id === 'network') return { ...base, color: ['#3631b5', '#178b25'], yAxis: { ...base.yAxis, axisLabel: { ...base.yAxis.axisLabel, formatter: (value) => formatRate(Number(value) / 8) } }, series: [line('上行速率', points.map((p) => systemHealthMetricValue(page, p, 'up', 'upMax') * 8), '#3631b5'), line('下行速率', points.map((p) => systemHealthMetricValue(page, p, 'down', 'downMax') * 8), '#178b25')] };
     if (id === 'connections') return { ...base, color: ['#ff78bd'], series: [line('网络连接数', points.map((p) => systemHealthMetricValue(page, p, 'connections', 'connectionsMax')), '#ff78bd', true)] };
     if (id === 'latency') return { ...base, color: ['#f59f00'], yAxis: { ...base.yAxis, axisLabel: { ...base.yAxis.axisLabel, formatter: (value) => `${Math.round(Number(value) || 0)}` } }, series: [line('平均延迟', points.map((p) => page && page.systemHealthMetric === 'peak' ? Math.max(Number(p.latencyMax) || 0, Number(p.latency) || 0) : Number(p.latency) || 0), '#f59f00', true)] };
+    if (id === 'diskIo' || id === 'diskLatency') return systemHealthDiskChartOption(id, summary, base, axisColor, rangeId);
     return base;
+  }
+
+  /* The disk cards run on their own timeline: storage/overview samples at a
+     different cadence than system/health, so reusing the health x-axis would
+     stretch the disk series across the wrong timestamps. */
+  function systemHealthDiskChartOption(id, summary, base, axisColor, rangeId) {
+    const disk = summary.disk || { stamps: [], series: [] };
+    const latency = id === 'diskLatency';
+    const available = latency ? disk.latencyAvailable : disk.ioAvailable;
+    const empty = (text) => ({
+      ...base,
+      legend: { ...base.legend, show: false },
+      xAxis: { ...base.xAxis, data: [] },
+      series: [],
+      graphic: [{ type: 'text', left: 'center', top: 'middle', style: { text, fill: axisColor, fontSize: 12 } }]
+    });
+    if (!disk.stamps.length) return empty('等待磁盘历史样本');
+    if (!available) return empty(latency ? '后端未提供逐盘读写延迟' : '后端未提供逐盘读写 I/O');
+    const labels = systemHealthAxisLabels(disk.stamps.map((ts) => ({ ts })), rangeId);
+    const series = [];
+    disk.series.forEach((entry, index) => {
+      const readColor = SYSTEM_HEALTH_DISK_COLORS[(index * 2) % SYSTEM_HEALTH_DISK_COLORS.length];
+      const writeColor = SYSTEM_HEALTH_DISK_COLORS[(index * 2 + 1) % SYSTEM_HEALTH_DISK_COLORS.length];
+      const readData = latency ? entry.readLatency : entry.read;
+      const writeData = latency ? entry.writeLatency : entry.write;
+      const shape = (name, data, color) => ({
+        name, type: 'line', smooth: true, symbol: 'none', showSymbol: false,
+        connectNulls: false, lineStyle: { width: 1.45, color }, itemStyle: { color }, data
+      });
+      if (readData.some((value) => value !== null)) series.push(shape(`${entry.name} 读取`, readData, readColor));
+      if (writeData.some((value) => value !== null)) series.push(shape(`${entry.name} 写入`, writeData, writeColor));
+    });
+    return {
+      ...base,
+      color: SYSTEM_HEALTH_DISK_COLORS,
+      grid: { ...base.grid, left: latency ? 56 : 76 },
+      xAxis: { ...base.xAxis, data: labels },
+      yAxis: {
+        ...base.yAxis,
+        axisLabel: {
+          ...base.yAxis.axisLabel,
+          formatter: (value) => (latency ? `${Math.round(Number(value) || 0)}` : formatRate(Number(value) || 0))
+        }
+      },
+      series
+    };
   }
 
   function renderSystemHealthCharts(page, summary) {
@@ -2525,7 +2813,10 @@
         fetchApiResource('health', '/api/v1/system/health'),
         fetchApiResource('status', '/api/v1/dashboard/status'),
         fetchApiResource('systemHistory', `${SYSTEM_HEALTH_HISTORY_ENDPOINT}?range=${encodeURIComponent(page.systemHealthRange || SYSTEM_HEALTH_DEFAULT_RANGE)}`),
-        fetchApiResource('trafficHistory', `${SYSTEM_TRAFFIC_HISTORY_ENDPOINT}?range=${encodeURIComponent(page.systemHealthRange || SYSTEM_HEALTH_DEFAULT_RANGE)}`)
+        fetchApiResource('trafficHistory', `${SYSTEM_TRAFFIC_HISTORY_ENDPOINT}?range=${encodeURIComponent(page.systemHealthRange || SYSTEM_HEALTH_DEFAULT_RANGE)}`),
+        // Per-disk I/O and latency moved here from the storage overview, where the
+        // same three time series sat beside capacity cards that are not history.
+        fetchApiResource('storageHistory', `${STORAGE_OVERVIEW_ENDPOINT}?range=${encodeURIComponent(storageRangeForHealthRange(page.systemHealthRange || SYSTEM_HEALTH_DEFAULT_RANGE))}`)
       ]);
     }
     page.loading = false;
@@ -2535,7 +2826,7 @@
     const errorText = errors[0] || '';
     if (page.kind === 'client-details') renderMonitorClientTable(page, get('clients'), errorText);
     else if (page.kind === 'audit-view') renderMonitorAuditTable(page, get('audit'), errorText);
-    else renderMonitorSystemTable(page, get('health'), get('status'), { system: get('systemHistory'), traffic: get('trafficHistory') }, errorText);
+    else renderMonitorSystemTable(page, get('health'), get('status'), { system: get('systemHistory'), traffic: get('trafficHistory'), storage: get('storageHistory') }, errorText);
     window.DWRT_UI_KIT?.mountAll(routePreview);
     scheduleGlassCardsRender(120);
   }
@@ -2759,6 +3050,52 @@
     window.DWRT_UI_KIT?.mount(routePreview);
   }
 
+  // A group entry is reachable but owns no page of its own: its value is its children.
+  // This is deliberately not renderUnavailableRoute() -- the group is available, and
+  // labelling it "不可用" is the exact wrong-status-bit problem this replaced.
+  function renderGroupEntryRoute(current, currentPath) {
+    if (!routePreview) return;
+    const label = current?.label || '当前分组';
+    const hint = firstText(current?.unavailable_reason, `请从 ${label} 下选择一个具体条目。`);
+    routePreview.className = 'route-preview route-workspace dwrt-kit-page-shell';
+    routePreview.dataset.dwrtComponent = 'page-shell';
+    routePreview.dataset.dwrtPageShell = 'focused-task';
+    routePreview.dataset.dwrtSurface = 'stable-glass';
+    routePreview.hidden = false;
+    // `empty` is the kit's default state and renders role="status"; the panel keeps the
+    // strong/p/small shape every other state panel uses instead of introducing new markup.
+    routePreview.innerHTML = `<section data-dwrt-component="state-panel" data-dwrt-state="empty" class="dwrt-kit-state-panel">
+      <strong>${escapeHtml(label)}</strong>
+      <p>${escapeHtml(hint)}</p>
+      <small>路由：${escapeHtml(routeHashFromPath(currentPath))}</small>
+    </section>`;
+    window.DWRT_UI_KIT?.mount(routePreview);
+  }
+
+  // findByHash() no longer falls back to the first menu item, but an unresolved route
+  // still reached activateRouteModule() with an empty item, so renderRoutePlaceholder()
+  // printed the derived path "#/menu/undefined" -- it neither says the page is missing
+  // nor reports what was actually requested. Name the failure and keep the asked-for
+  // hash visible, so a stale or mistyped link is diagnosable instead of just odd.
+  function renderNotFoundRoute(requestedHash) {
+    if (!routePreview) return;
+    const hash = routeHashFromPath(requestedHash) || String(requestedHash || '');
+    routePreview.className = 'route-preview route-workspace dwrt-kit-page-shell';
+    routePreview.dataset.dwrtComponent = 'page-shell';
+    routePreview.dataset.dwrtPageShell = 'focused-task';
+    routePreview.dataset.dwrtSurface = 'stable-glass';
+    routePreview.hidden = false;
+    routePreview.innerHTML = `<section data-dwrt-component="state-panel" data-dwrt-state="unavailable" class="dwrt-kit-state-panel">
+      <strong>页面不存在</strong>
+      <p>菜单里没有与该地址匹配的页面。链接可能已失效，或对应功能所需的插件未安装。</p>
+      <small>请求的路由：${escapeHtml(hash)}</small>
+      <button type="button" data-dwrt-component="button" data-route-not-found-action="dashboard">返回仪表盘</button>
+    </section>`;
+    routePreview.querySelector('[data-route-not-found-action="dashboard"]')
+      ?.addEventListener('click', () => routeTo('/app/#/dashboard'));
+    window.DWRT_UI_KIT?.mountAll(routePreview);
+  }
+
   function renderRouteModuleLoading(current, currentPath) {
     if (!routePreview) return;
     routePreview.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host');
@@ -2824,24 +3161,33 @@
           fetch: (name, url, retry = true) => fetchApiResource(name, url, retry, routeController.signal),
           request: async (name, url, init = {}) => {
             const hasBody = init.body !== undefined;
-            const response = await withApiSlot(() => window.DWRT_SESSION
-              ? window.DWRT_SESSION.fetch(url, {
-                ...init,
-                credentials: 'same-origin',
-                cache: 'no-store',
-                signal: routeController.signal,
-                headers: authHeaders({ Accept: 'application/json', ...(hasBody ? { 'Content-Type': 'application/json' } : {}), ...(init.headers || {}) }),
-                body: hasBody && typeof init.body !== 'string' ? JSON.stringify(init.body) : init.body
-              })
-              : fetch(url, {
-                ...init,
-                credentials: 'same-origin',
-                cache: 'no-store',
-                signal: routeController.signal,
-                headers: authHeaders({ Accept: 'application/json', ...(hasBody ? { 'Content-Type': 'application/json' } : {}), ...(init.headers || {}) }),
-                body: hasBody && typeof init.body !== 'string' ? JSON.stringify(init.body) : init.body
-              }), routeController.signal);
-            const text = await response.text();
+            // 模块可以自带 signal(例如叠一个客户端超时上限),它与路由取消信号合并,
+            // 而不是二选一 —— 离开路由必须仍然中断在途请求。
+            const merged = mergeAbortSignals(routeController.signal, init.signal);
+            let response;
+            let text;
+            try {
+              response = await withApiSlot(() => window.DWRT_SESSION
+                ? window.DWRT_SESSION.fetch(url, {
+                  ...init,
+                  credentials: 'same-origin',
+                  cache: 'no-store',
+                  signal: merged.signal,
+                  headers: authHeaders({ Accept: 'application/json', ...(hasBody ? { 'Content-Type': 'application/json' } : {}), ...(init.headers || {}) }),
+                  body: hasBody && typeof init.body !== 'string' ? JSON.stringify(init.body) : init.body
+                })
+                : fetch(url, {
+                  ...init,
+                  credentials: 'same-origin',
+                  cache: 'no-store',
+                  signal: merged.signal,
+                  headers: authHeaders({ Accept: 'application/json', ...(hasBody ? { 'Content-Type': 'application/json' } : {}), ...(init.headers || {}) }),
+                  body: hasBody && typeof init.body !== 'string' ? JSON.stringify(init.body) : init.body
+                }), merged.signal);
+              text = await response.text();
+            } finally {
+              merged.release();
+            }
             let json = {};
             if (text) {
               try { json = JSON.parse(text); } catch (_) { throw new Error(`${name}: invalid json`); }
@@ -3123,6 +3469,37 @@
   const API_LIMITER_MAX = 2;
   let apiLimiterActive = 0;
   const apiLimiterWaiters = [];
+
+  // 合并路由取消信号与调用方自带的 signal:任一方 abort 都要取消请求。
+  // 之前 api.request 在展开 init 之后又硬写一次 signal,后写的键胜出,模块传进来的
+  // signal 是静默失效的 —— 写的人以为加了超时,实际什么都没发生。
+  // 返回 { signal, release }:release 必须在请求收尾时调用,否则监听器会挂在长命的
+  // routeController 上,同一路由内每次请求都累积一个,直到离开路由才释放。
+  function mergeAbortSignals(primary, extra) {
+    if (!extra || extra === primary) return { signal: primary, release: () => {} };
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.any === 'function') {
+      return { signal: AbortSignal.any([primary, extra]), release: () => {} };
+    }
+    // AbortSignal.any 不可用时手工桥接。已 abort 的一方要立即生效,不能等事件。
+    const merged = new AbortController();
+    const sources = [primary, extra];
+    const already = sources.find((source) => source.aborted);
+    if (already) {
+      merged.abort(already.reason);
+      return { signal: merged.signal, release: () => {} };
+    }
+    const forward = (source) => () => merged.abort(source.reason);
+    const handlers = sources.map((source) => {
+      const handler = forward(source);
+      source.addEventListener('abort', handler, { once: true });
+      return { source, handler };
+    });
+    return {
+      signal: merged.signal,
+      release: () => handlers.forEach(({ source, handler }) => source.removeEventListener('abort', handler))
+    };
+  }
+
   async function withApiSlot(run, signal) {
     if (apiLimiterActive >= API_LIMITER_MAX) {
       await new Promise((resolve) => {
@@ -3286,9 +3663,26 @@
      from routes that scroll on their own. Both numbers are measured instead:
      how far the footer must stay clear of a page rail, and whether the route
      actually leaves the strip empty. */
-  const footerLayout = { frame: 0, observer: null, watched: null };
+  const footerLayout = { frame: 0, observer: null, watched: null, rail: null, columns: [] };
   const FOOTER_RAIL_DEPTH = 5;
   const FOOTER_RAIL_BUDGET = 240;
+  /* This scan runs on every layout pass, so it is capped. The scroller that matters
+     is a layout container near the top of the route, not something buried in a
+     table body. */
+  const FOOTER_SCROLLER_BUDGET = 400;
+
+  /* A rail sits to the left of a wider pane in the same row. Structure is a
+     steadier signal than a width ratio, which drifts with each route's clamp(). */
+  function hasWiderRightSibling(node, rect) {
+    for (let sibling = node.nextElementSibling; sibling; sibling = sibling.nextElementSibling) {
+      if (sibling.hidden) continue;
+      const style = getComputedStyle(sibling);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      const box = sibling.getBoundingClientRect();
+      if (box.width > rect.width && box.left >= rect.right - 2) return true;
+    }
+    return false;
+  }
 
   /* How far the footer must stay clear of a page-level rail. Detection is
      geometric rather than a list of class names, so a rail on any route is
@@ -3300,12 +3694,18 @@
      grid column of its own and never enters this search. */
   function footerRailInset() {
     const host = consoleStage;
-    if (!consolePageFooter || !consoleMain || !host) return 0;
+    if (!consolePageFooter || !consoleMain || !host) return { inset: 0, rail: null };
     const column = consoleMain.getBoundingClientRect();
     const band = consolePageFooter.getBoundingClientRect();
-    if (band.height <= 0) return 0;
+    if (band.height <= 0) return { inset: 0, rail: null };
     const minHeight = Math.max(180, host.clientHeight * 0.5);
+    /* A full-height rail stops one stage gutter short of the footer, so a fixed
+       4px window never saw it and the rule was drawn straight through the rail.
+       The reach is measured from the stage padding instead of guessed. */
+    const stagePad = parseFloat(getComputedStyle(host).paddingBottom);
+    const reach = Math.max(4, (Number.isFinite(stagePad) ? stagePad : 0) + 4);
     let inset = 0;
+    let rail = null;
     let budget = FOOTER_RAIL_BUDGET;
     let level = [...host.children];
     for (let depth = 0; depth < FOOTER_RAIL_DEPTH && level.length && budget > 0; depth += 1) {
@@ -3317,11 +3717,20 @@
         if (style.display === 'none' || style.visibility === 'hidden') continue;
         const rect = node.getBoundingClientRect();
         const hugsLeft = rect.left - column.left <= 24;
-        const isColumn = rect.width >= 120 && rect.width <= column.width * 0.45;
+        /* Width alone mislabels a wide rail such as the web-auth designer's
+           control column, so a rail that is clearly the narrow half of a
+           side-by-side split counts too. */
+        const isColumn = rect.width >= 120
+          && (rect.width <= column.width * 0.45
+            || (rect.width <= column.width * 0.5 && hasWiderRightSibling(node, rect)));
         const isTall = rect.height >= minHeight;
-        const meetsBand = rect.bottom >= band.top - 4;
+        const meetsBand = rect.bottom >= band.top - reach;
         if (hugsLeft && isColumn && isTall && meetsBand) {
-          inset = Math.max(inset, Math.round(rect.right - column.left));
+          const edge = Math.round(rect.right - column.left);
+          if (edge >= inset) {
+            inset = edge;
+            rail = node;
+          }
           continue;
         }
         // Wrappers are transparent to this search; only their children can be rails.
@@ -3329,15 +3738,93 @@
       }
       level = next;
     }
-    return inset;
+    return { inset, rail };
+  }
+
+  /* The columns sitting beside the measured rail. Each gets the band's height as
+     bottom padding so the band never sits on top of live content.
+
+     Padding works for both column shapes seen on these routes. A column that
+     scrolls gets a shorter viewport, so its last row can be scrolled clear. A
+     full-height overflow:hidden column shrinks by the padding too, which shortens
+     the inner scroller it wraps and has the same effect.
+
+     The one shape padding cannot save is a column that paints straight onto a
+     fixed-size surface, because its content is positioned rather than laid out:
+     topology's canvas is the case in point. Those return an empty list, which
+     tells the caller to keep the reserved strip and skip the overlay. */
+  function footerContentColumns(rail) {
+    const parent = rail && rail.parentElement;
+    if (!parent) return [];
+    const columns = [];
+    for (const sibling of parent.children) {
+      if (sibling === rail || !(sibling instanceof Element)) continue;
+      const style = getComputedStyle(sibling);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      const rect = sibling.getBoundingClientRect();
+      if (rect.width < 80 || rect.height < 80) continue;
+      /* A column that cannot reflow is not paddable: shrinking its box does not
+         move what it already painted or absolutely positioned, so the band would
+         cover that content for good. topology-canvas is the case in point -- it
+         hosts an absolutely positioned zoom container plus node/label layers, and
+         padding it just clipped the graph. Such columns abort the overlay so the
+         route keeps its reserved strip instead. */
+      const unpaddable = sibling.matches('.topology-canvas')
+        || Array.from(sibling.children).some((child) => {
+          const position = getComputedStyle(child).position;
+          return position === 'absolute' || position === 'fixed';
+        });
+      if (unpaddable) return [];
+      columns.push(sibling);
+    }
+    return columns;
   }
 
   function syncPageFooterLayout() {
     if (!consolePageFooter || !consoleMain) return;
     footerLayout.frame = 0;
-    const inset = footerRailInset();
+    const { inset, rail } = footerRailInset();
     consolePageFooter.style.setProperty('--console-footer-inset', `${inset}px`);
     consolePageFooter.dataset.railAvoid = inset > 0 ? 'true' : 'false';
+    /* The footer already steps aside this rail, so the reserved strip under the
+       rail is dead space and reads as a chunk sliced out of the side menu. It is
+       a fixed CSS length, so browser zoom magnifies it.
+
+       Growing just the rail does not work: .route-workspace clips at the stage
+       bottom, so a taller rail box is invisible and its last rows get cut off
+       instead (measured: hidden=58 with clipped filter labels). The strip is
+       released in CSS and the footer becomes an overlay; here we mark the column
+       beside the rail so it can reserve the band's height and keep its last row
+       reachable.
+
+       Skipped when that column cannot scroll -- topology's canvas is
+       overflow:hidden, so an overlay there would hide content for good. Those
+       routes keep the reserved strip. */
+    if (footerLayout.rail && footerLayout.rail !== rail) {
+      delete footerLayout.rail.dataset.footerRailBleed;
+    }
+    footerLayout.columns = footerLayout.columns || [];
+    footerLayout.columns.forEach((node) => { delete node.dataset.footerContentColumn; });
+    footerLayout.columns = [];
+    const overlayColumns = rail ? footerContentColumns(rail) : [];
+    const overlaySafe = inset > 0 && overlayColumns.length > 0;
+    if (rail && overlaySafe) {
+      rail.dataset.footerRailBleed = 'on';
+      overlayColumns.forEach((node) => {
+        node.dataset.footerContentColumn = 'on';
+        footerLayout.columns.push(node);
+      });
+    } else if (rail) {
+      delete rail.dataset.footerRailBleed;
+    }
+    footerLayout.rail = rail;
+    /* This flag drives the overlay in CSS, so it is only set when the overlay is
+       actually safe: a rail was measured AND the column beside it can scroll the
+       band clear. Setting it unconditionally would hide content on routes whose
+       content column is overflow:hidden. */
+    const html = document.documentElement;
+    if (inset > 0 && overlaySafe) html.dataset.footerAside = 'on';
+    else delete html.dataset.footerAside;
     // The reserved strip is only justified when the route leaves it empty. Once
     // content spills, the strip is content the footer displaced, so it is given
     // back and the footer trails the content instead.
@@ -3348,9 +3835,21 @@
     // resetPageFooterReserve(), and from there the strip can only be released.
     const root = document.documentElement;
     if (root.dataset.footerReserve === 'off') return;
+    /* The stage and main are not the only things that scroll. On insights/activity
+       the list scrolls inside a nested box, so neither outer box overflowed and the
+       strip was never released -- the footer kept a row the long list needed. Any
+       descendant that genuinely scrolls counts as content the strip is taking from,
+       which is what the user asked for: content first, footer yields. */
+    const nested = consoleStage
+      ? Array.from(consoleStage.querySelectorAll('*')).slice(0, FOOTER_SCROLLER_BUDGET).some((node) => {
+        if (node.scrollHeight - node.clientHeight <= 4) return false;
+        return /(auto|scroll)/.test(getComputedStyle(node).overflowY);
+      })
+      : false;
     const overflow = Math.max(
       consoleStage ? consoleStage.scrollHeight - consoleStage.clientHeight : 0,
-      consoleMain.scrollHeight - consoleMain.clientHeight
+      consoleMain.scrollHeight - consoleMain.clientHeight,
+      nested ? 5 : 0
     );
     if (overflow > 4) root.dataset.footerReserve = 'off';
   }
@@ -5462,7 +5961,13 @@
     const insightsActivityHashRoute = cleanHash.includes('/insights/activity');
     const insightsActivitySection = insightsActivityHashRoute ? (cleanHash.match(/#\/insights\/activity\/([^/?#]+)/) || [])[1] || 'overview' : '';
     const monitorDataHashConfig = monitorDataPageConfig(cleanHash);
-    const { primary, secondary } = findByHash(cleanHash);
+    const { primary, secondary, unresolved, requestedHash } = findByHash(cleanHash);
+    // An unresolved hash is only a real 404 when no hash-driven route claimed it: the
+    // dashboard/topology/insights/monitor routes below are matched on the hash itself and
+    // legitimately have no menu entry backing them.
+    const routeNotFound = unresolved === true
+      && !dashboardHashRoute && !topologyHashRoute && !lineStatusHashRoute
+      && !insightsFlowsHashRoute && !insightsActivityHashRoute && !monitorDataHashConfig;
     state.activePrimary = primary ? itemKey(primary) : null;
     state.activeSecondary = secondary ? itemKey(secondary) : null;
     renderPrimary(state.activePrimary);
@@ -5504,7 +6009,9 @@
       path: `/app/#${monitorDataHashConfig.hash}`
     } : {});
     if (pageEyebrow) pageEyebrow.textContent = primary && secondary ? primary.label : 'Console shell';
-    if (pageTitle) pageTitle.textContent = current.label || '控制台';
+    // A missing page titled "控制台" is the header half of the same silent-substitution
+    // problem: it reads as if the console page loaded normally.
+    if (pageTitle) pageTitle.textContent = routeNotFound ? '页面不存在' : (current.label || '控制台');
     const currentPath = itemPath(current);
     const dashboardRoute = dashboardHashRoute || (currentPath || '').includes('#/dashboard') || (itemKey(current) === 'dashboard' && !(current.children || []).length);
     const topologyRoute = topologyHashRoute || (currentPath || '').includes('#/monitor/topology') || itemKey(current) === 'topology';
@@ -5543,12 +6050,19 @@
       monitorDataConfig,
       currentKey,
       currentPath,
+      currentAvailability: `${current.availability || 'available'}${current.disabled ? ':disabled' : ''}${current.group_entry === true ? ':group' : ''}`,
       networkInterfaceConfigRoute,
-      systemSettingsRoute
+      systemSettingsRoute,
+      routeNotFound,
+      requestedHash
     });
     const routeChanged = state.activeRouteSignature !== routeSignature;
     if (pageDescription) {
-      pageDescription.textContent = current.slot
+      // The generic "只显示菜单与路由骨架" tail reads as a page that loaded fine but has
+      // no content yet, which contradicts the 404 panel right below it.
+      pageDescription.textContent = routeNotFound
+        ? '该地址没有对应的页面。请从左侧菜单选择功能，或确认对应插件是否已安装。'
+        : current.slot
         ? '插件本体安装并被 webd/jmxd 汇总到运行时菜单后，才会显示对应入口。未安装的插件不会出现在菜单里。'
         : dashboardRoute
           ? '设备详情卡片读取 webd/jmxd 真实状态；缺失的后端能力会显示为空态，不使用演示数据。'
@@ -5613,10 +6127,17 @@
       }
       clearRoutePageState();
       if (lineStatusRoute) renderLineStatusPage();
+      // Ahead of activateRouteModule(): an unresolved route owns no module, so leaving it
+      // to the placeholder is what printed "当前路径 #/menu/undefined".
+      else if (routeNotFound) renderNotFoundRoute(requestedHash || cleanHash);
       else if (clientDetailsRoute) renderClientDetailsPage();
       else if (insightsDetailRoute) renderInsightsFlowsPage(insightsActivityHashRoute || itemKey(current) === 'insights-activity' ? 'activity' : 'flows', insightsActivitySection);
       else if (insightsHomeRoute) renderInsightsHomePage();
       else if (monitorDataConfig) renderMonitorDataPage(monitorDataConfig.id);
+      // A group entry is available but owns no module of its own. Without this branch it
+      // would reach activateRouteModule(), find no module and render the bare-path
+      // placeholder, which reads like a broken page rather than "choose a child".
+      else if (current.group_entry === true && !routeModuleForItem(current)) renderGroupEntryRoute(current, currentPath);
       else if (current.availability === 'unavailable' || current.disabled) renderUnavailableRoute(current, currentPath);
       else activateRouteModule(current, currentPath);
     } else if (routeChanged) {
@@ -5690,15 +6211,39 @@
   function applyAdaptiveForeground(luma, contrast = 0) {
     const root = document.documentElement;
     const safeLuma = clamp(Number.isFinite(luma) ? luma : 0.18, 0, 1);
+    /* 这里刻意用基础密度，不用 over-light 折算后的密度。over-light 本身是由
+       「浅色前景 + 明暗混杂」推出来的，若判决再按它抬高后的密度折算，就成了
+       自我强化的环：密度越高→算得越暗→越倾向浅色字→密度继续保持在高档。
+       全局判决因此停在基础密度上，逐区域判决（applyAdaptiveRegion）才使用
+       实际画出的密度，因为那时 over-light 档位已经确定，不再参与推导。 */
     const density = clamp(state.liquidGlass.vars.neutralDensity ?? APP_LIQUID_GLASS.neutralDensity, 0, 0.35);
     const glassAdjustedLuma = safeLuma * (1 - density);
-    const mode = readableForegroundMode(glassAdjustedLuma, root.dataset.adaptiveForeground) === 'dark'
+    /* contrast 是采样得到的亮度标准差。吸收层按同一比例压暗背景，也压缩了
+       局部起伏，所以偏差要跟着 (1 - density) 缩放后再参与判决。 */
+    const glassAdjustedDeviation = clamp(Number.isFinite(contrast) ? contrast : 0, 0, 1) * (1 - density);
+    const mode = readableForegroundMode(glassAdjustedLuma, root.dataset.adaptiveForeground, glassAdjustedDeviation) === 'dark'
       ? 'dark-ink'
       : 'light-ink';
     root.style.setProperty('--adaptive-bg-luma', safeLuma.toFixed(3));
     root.style.setProperty('--adaptive-effective-luma', glassAdjustedLuma.toFixed(3));
+    root.style.setProperty('--adaptive-effective-deviation', glassAdjustedDeviation.toFixed(3));
     setAdaptiveForegroundPreset(mode);
     root.toggleAttribute('data-adaptive-mixed', contrast > 0.11);
+    syncAdaptiveGlassProfile();
+  }
+
+  /* A shared sampler must not cut a card out until its center layer can cover
+     it. Mixed bright wallpaper also uses the existing over-light profile: a
+     modest blur and absorption pass, not a route-owned second material. */
+  function syncAdaptiveGlassProfile() {
+    const root = document.documentElement;
+    const overLight = root.dataset.adaptiveForeground === 'light'
+      && root.hasAttribute('data-adaptive-mixed');
+    const next = overLight ? 'true' : 'false';
+    if (root.dataset.adaptiveOverLight === next) return;
+    root.dataset.adaptiveOverLight = next;
+    state.liquidGlass.materialVersion += 1;
+    scheduleGlassCardsRender(120);
   }
 
   function coverDrawArgs(image, viewportW, viewportH) {
@@ -5727,11 +6272,31 @@
       + integral[y0 * stride + x0];
   }
 
-  function readableForegroundMode(backgroundLuma, previous) {
+  /*
+   * 前景明暗判决。
+   *
+   * 原先只看平均亮度，这在不均匀壁纸上会给出可读性不成立的结论：默认壁纸的
+   * 均值是 0.299，深色前景对着它有 6.13:1，于是判成 dark；但同一张卡片内的
+   * 实测亮度从 0.003 跨到 0.97，亮处的深色文字只剩 1.92:1，远低于 AA 的 4.5:1。
+   * 采样器本来就算出了 deviation 与 dark/bright 占比（`adaptiveStatsForRects`），
+   * 只是判决没有用上，界面上就出现了「均值达标、实际读不出来」。
+   *
+   * 所以不均匀时按最坏局部判决：用 mean ± deviation 的两端各算一次对比度，
+   * 取较小值作为该前景的真实下限，谁的下限高就选谁。均匀壁纸仍按均值走，
+   * 行为不变。滞后也改成对下限生效，避免在两档之间来回跳。
+   */
+  function readableForegroundMode(backgroundLuma, previous, deviation = 0) {
     const darkInkLuma = 0.004;
     const lightInkLuma = 0.982;
-    const darkContrast = (backgroundLuma + 0.05) / (darkInkLuma + 0.05);
-    const lightContrast = (lightInkLuma + 0.05) / (backgroundLuma + 0.05);
+    const contrastAgainst = (luma, inkLuma) => (luma > inkLuma
+      ? (luma + 0.05) / (inkLuma + 0.05)
+      : (inkLuma + 0.05) / (luma + 0.05));
+    // 不均匀壁纸的可读性由最暗处与最亮处共同决定，取两端的较小对比度。
+    const spread = clamp(Number.isFinite(deviation) ? deviation : 0, 0, 0.5);
+    const lowLuma = clamp(backgroundLuma - spread, 0, 1);
+    const highLuma = clamp(backgroundLuma + spread, 0, 1);
+    const darkContrast = Math.min(contrastAgainst(lowLuma, darkInkLuma), contrastAgainst(highLuma, darkInkLuma));
+    const lightContrast = Math.min(contrastAgainst(lowLuma, lightInkLuma), contrastAgainst(highLuma, lightInkLuma));
     if (previous === 'dark' && darkContrast >= 4.5) return 'dark';
     if (previous === 'light' && lightContrast >= 4.5) return 'light';
     return darkContrast >= lightContrast ? 'dark' : 'light';
@@ -5848,6 +6413,13 @@
     '.topology-infra-wan-card',
     '.topology-infra-gateway-card',
     '.topology-infra-port-chip',
+    '.flow-engine-page-toolbar',
+    '.flow-engine-workbench > .policy-entity-alert',
+    '.flow-engine-tab-content > .policy-entity-section > header',
+    '.flow-engine-tab-content > .policy-entity-section > .policy-entity-alert',
+    '.flow-engine-tab-content > .policy-entity-section > .flow-engine-detail-list > div',
+    '.flow-balance-algorithm-fallback',
+    '.flow-balance-presets',
     '.dwrt-kit-tabs',
     '.dwrt-kit-tab',
     '.dwrt-kit-table-toolbar',
@@ -6145,6 +6717,7 @@
     element.removeAttribute('data-adaptive-region');
     element.removeAttribute('data-adaptive-mixed');
     element.style.removeProperty('--adaptive-region-luma');
+    element.style.removeProperty('--adaptive-region-deviation');
   }
 
   function adaptiveTargetsWithin(node) {
@@ -6179,7 +6752,8 @@
       bucket.push({
         mode,
         mixed: element.hasAttribute('data-adaptive-mixed'),
-        luma: element.style.getPropertyValue('--adaptive-region-luma')
+        luma: element.style.getPropertyValue('--adaptive-region-luma'),
+        deviation: element.style.getPropertyValue('--adaptive-region-deviation')
       });
       snapshots.set(key, bucket);
     });
@@ -6195,19 +6769,33 @@
       element.dataset.adaptiveRegion = snapshot.mode;
       element.toggleAttribute('data-adaptive-mixed', snapshot.mixed);
       if (snapshot.luma) element.style.setProperty('--adaptive-region-luma', snapshot.luma);
+      if (snapshot.deviation) element.style.setProperty('--adaptive-region-deviation', snapshot.deviation);
       state.liquidGlass.foregroundModes.set(element, snapshot.mode);
       state.liquidGlass.foregroundTargets.add(element);
     });
     return needsSample;
   }
 
+  /*
+   * 前景判决必须按共享层「实际画出来」的吸收密度折算，而不是基础密度。
+   * over-light 档位下 kit 会把密度抬到 0.32（base 0.06 + 0.26），页头背景
+   * 被压到 0.076 左右；若判决仍按 0.06 折算，就会算出「这块偏亮、用深色字」，
+   * 深字压深底，实测只有 2.34:1。这个函数是判决与材质之间唯一的换算点。
+   */
+  function effectiveNeutralDensity() {
+    const base = clamp(state.liquidGlass.vars.neutralDensity ?? APP_LIQUID_GLASS.neutralDensity, 0, 0.35);
+    if (document.documentElement.dataset.adaptiveOverLight !== 'true') return base;
+    return clamp(base + 0.26, 0, 0.46);
+  }
+
   function applyAdaptiveRegion(element, stats) {
     if (!element || !stats) return;
-    const density = clamp(state.liquidGlass.vars.neutralDensity ?? APP_LIQUID_GLASS.neutralDensity, 0, 0.35);
+    const density = effectiveNeutralDensity();
     let effectiveLuma = stats.mean * (1 - density);
     if (element.matches('.menu-item.active')) effectiveLuma = effectiveLuma * 0.88 + 0.12;
+    const effectiveDeviation = clamp(Number.isFinite(stats.deviation) ? stats.deviation : 0, 0, 1) * (1 - density);
     const previous = state.liquidGlass.foregroundModes.get(element);
-    const mode = readableForegroundMode(effectiveLuma, previous);
+    const mode = readableForegroundMode(effectiveLuma, previous, effectiveDeviation);
     if (previous && previous !== mode) {
       element.classList.add('dwrt-adaptive-foreground-snap');
       requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -6224,6 +6812,10 @@
     const lumaText = effectiveLuma.toFixed(3);
     if (element.style.getPropertyValue('--adaptive-region-luma') !== lumaText) {
       element.style.setProperty('--adaptive-region-luma', lumaText);
+    }
+    const deviationText = effectiveDeviation.toFixed(3);
+    if (element.style.getPropertyValue('--adaptive-region-deviation') !== deviationText) {
+      element.style.setProperty('--adaptive-region-deviation', deviationText);
     }
   }
 
@@ -6321,7 +6913,19 @@
     '.topology-shell',
     '.topology-canvas',
     '.topology-workspace',
-    '.dwrt-kit-sheet-overlay'
+    '.dwrt-kit-sheet-overlay',
+    /*
+     * 抽屉本体必须排除，不只是它的遮罩。
+     *
+     * 抽屉带 `.dwrt-kit-glass-surface`，正好命中 PAGE_GLASS_SELECTOR，于是这里
+     * 会给它加上 `dwrt-page-glass-surface`。那个类声明 `position: relative`，而它
+     * 在 dwrt-ui-kit.css 里排在 `.dwrt-kit-sheet` 之后、特异性相同，所以后者胜出，
+     * 把抽屉从 `fixed` 打回 `relative` —— 抽屉随即落到文档流里（实测 y=900，
+     * 正好在视口下沿之外），用户看到的就是「弹出之后立马闪退消失」。
+     *
+     * 抽屉的材质由 kit 自己负责，不需要页面级采样参与。
+     */
+    '.dwrt-kit-sheet'
   ].join(',');
 
   const PAGE_GLASS_SCOPES = ['main', 'rail', 'overlay'];
@@ -6386,6 +6990,7 @@
     return {
       ...state.liquidGlass.menuOptions,
       cornerRadius: 0,
+      overLight: document.documentElement.dataset.adaptiveOverLight === 'true',
       mapResolution: MENU_LIQUID_GLASS.mapResolution,
       trackMotion: false,
       trackScroll: false
@@ -6405,6 +7010,7 @@
     appMenuGlass?.before(sampler);
     sampler.addEventListener('dwrt:sampled-glass-ready', () => {
       appShell.classList.add('page-glass-ready');
+      scheduleGlassCardsRender(0, [scopeKey]);
     });
     const renderer = factory.create({
       root: sampler,
@@ -6876,6 +7482,7 @@
       scopes.forEach((scopeKey) => {
         const candidates = allCandidates.filter((card) => pageGlassScopeForElement(card) === scopeKey);
         const scope = canSample && candidates.length ? ensurePageGlassScope(scopeKey) : state.liquidGlass.pageScopes.get(scopeKey);
+        const sharedReady = Boolean(scope?.renderer && scope.sampler.dataset.glassReady === 'true');
         if (scope) {
           scope.reconcileCount += 1;
           scope.sampler.dataset.glassReconcileCount = String(scope.reconcileCount);
@@ -6883,7 +7490,7 @@
         candidates.forEach((card) => {
           card.classList.add('dwrt-page-glass-surface');
           card.dataset.pageGlassScope = scopeKey;
-          if (!scope || !canSample) {
+          if (!scope || !canSample || !sharedReady) {
             card.classList.remove('dwrt-page-liquid-glass', 'dwrt-shared-glass-cutout', 'canvas-ready');
             card.dataset.pageGlass = 'fallback';
             card.removeAttribute('data-glass-renderer');
@@ -6904,6 +7511,7 @@
           scope.mapSettlePending = false;
           return;
         }
+        if (sharedReady) scope.sampler.hidden = false;
         if (scope.materialVersion !== state.liquidGlass.materialVersion) {
           scope.renderer.update(pageGlassOptions());
           scope.materialVersion = state.liquidGlass.materialVersion;
@@ -6927,12 +7535,13 @@
           scope.mapSettlePending = state.liquidGlass.pageRouteTransition;
           schedulePageGlassDisplacementMap(scope, geometry, signature);
         }
-        scope.sampler.hidden = false;
+        scope.sampler.hidden = !sharedReady;
       });
       syncPageGlassCardResizeObservation(allCandidates);
       appShell.dataset.pageGlassSurfaceCount = String(allCandidates.length);
-      appShell.dataset.pageGlassSampledCount = String(canSample ? allCandidates.length : 0);
-      appShell.dataset.pageGlassRenderer = canSample && allCandidates.length
+      const sampledCount = allCandidates.filter((card) => card.classList.contains('dwrt-shared-glass-cutout')).length;
+      appShell.dataset.pageGlassSampledCount = String(sampledCount);
+      appShell.dataset.pageGlassRenderer = canSample && sampledCount
         ? 'scoped-shared-svg-explicit-sampling'
         : 'scoped-shared-css-stable-fallback';
     } finally {

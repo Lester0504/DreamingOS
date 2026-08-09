@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 
+import apd_test_deps
+
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/apd_config_recovery_fixture.c"
 RECOVERY = ROOT / "src/apd/apd_config_recovery.c"
@@ -16,16 +18,14 @@ JOURNAL = ROOT / "src/apd/apd_config_job_journal.c"
 
 
 def main() -> None:
-    prefix_raw = os.environ.get("APD_TEST_PREFIX", "")
-    prefix = (Path(prefix_raw) if prefix_raw else
-              Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c/0.19"))
-    if not (prefix / "include/json-c/json.h").is_file():
-        prefix = None
+    prefix, json_shared = apd_test_deps.resolve_json_prefix()
     extra = ([f"-I{prefix / 'include'}", f"-L{prefix / 'lib'}",
               f"-Wl,-rpath,{prefix / 'lib'}"] if prefix else [])
-    json_link = ([str(prefix / "lib/libjson-c.a")]
-                 if prefix and (prefix / "lib/libjson-c.a").is_file()
-                 else ["-ljson-c"])
+    # Only take the archive when no .so exists: the staging_dir .a is an LTO
+    # archive the host linker rejects.
+    json_link = (["-ljson-c"]
+                 if json_shared or not (prefix / "lib/libjson-c.a").is_file()
+                 else [str(prefix / "lib/libjson-c.a")])
     with tempfile.TemporaryDirectory(prefix="apd-config-recovery-") as raw:
         binary = Path(raw) / "fixture"
         command = [os.environ.get("CC", "cc"), "-std=c11",

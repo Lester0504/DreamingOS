@@ -139,6 +139,163 @@
   text-align: right;
 }
 
+/*
+ * Kernel column layout. The two connection columns share the tail of the row, so
+ * the conntrack column gives up width rather than pushing the table into a
+ * horizontal scroll at 1024px.
+ */
+.route-line-status .line-load-core.has-kernel-column {
+  min-width: 980px;
+}
+
+.route-line-status .line-load-core.has-kernel-column th:nth-child(6),
+.route-line-status .line-load-core.has-kernel-column td:nth-child(6) {
+  /*
+   * "conntrack 连接" measures 121px, so 13% (116-118px at 1024) clipped the
+   * header. The kernel column gives the width back; it holds a shorter label.
+   */
+  width: 15%;
+}
+
+.route-line-status .line-load-core.has-kernel-column th:nth-child(7),
+.route-line-status .line-load-core.has-kernel-column td:nth-child(7) {
+  width: 17%;
+  text-align: right;
+}
+
+.route-line-status .line-kernel-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+
+.route-line-status .line-kernel-value {
+  font-weight: 760;
+  font-variant-numeric: tabular-nums;
+}
+
+.route-line-status .line-kernel-unavailable {
+  color: var(--app-text-muted);
+  font-weight: 720;
+}
+
+.route-line-status .line-kernel-flag {
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(245, 166, 35, 0.14);
+  color: var(--dwrt-status-warn-text, #f7c66d);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 740;
+  white-space: nowrap;
+}
+
+.route-line-status .line-kernel-toggle {
+  padding: 2px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.09);
+  color: var(--app-text);
+  font-size: 11px;
+  font-weight: 740;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.route-line-status .line-kernel-toggle:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.route-line-status .line-kernel-detail-row > td {
+  padding: 0 8px 12px;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.route-line-status .line-kernel-detail {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.route-line-status .line-kernel-detail-meta {
+  font-size: 12px;
+  font-weight: 740;
+  /* Long meta strings wrap instead of stretching the table. */
+  overflow-wrap: anywhere;
+}
+
+.route-line-status .line-kernel-detail-notice {
+  color: var(--dwrt-status-warn-text, #f7c66d);
+  font-size: 12px;
+  font-weight: 720;
+  overflow-wrap: anywhere;
+}
+
+.route-line-status .line-kernel-detail-source {
+  color: var(--app-text-muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.route-line-status .line-kernel-category-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+
+.route-line-status .line-kernel-category-table th,
+.route-line-status .line-kernel-category-table td {
+  padding: 4px 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.route-line-status .line-kernel-category-table th:first-child,
+.route-line-status .line-kernel-category-table td:first-child {
+  width: 22%;
+  text-align: left;
+}
+
+.route-line-status .line-kernel-category-table tfoot td {
+  font-weight: 780;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.10);
+}
+
+.route-line-status .line-load-source-note {
+  margin: 12px 16px;
+  color: var(--app-text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/*
+ * The notices and the source note render inside .dwrt-kit-table-scroll, whose
+ * scroll width is set by the wide table (980px at 390px viewport). Left alone
+ * they stretch to that width and push the route host into horizontal overflow,
+ * even though the table itself is supposed to be the only thing that scrolls.
+ * Pinning them to the scroller's visible box keeps the overflow where it belongs.
+ */
+.route-line-status .dwrt-kit-table-scroll > .line-load-source-note,
+.route-line-status .dwrt-kit-table-scroll > .line-load-warning,
+.route-line-status .dwrt-kit-table-scroll > .line-status-error {
+  position: sticky;
+  left: 0;
+  width: calc(100% - 32px);
+  max-width: calc(100vw - 2 * var(--app-page-gutter-inline, 12px) - 32px);
+  box-sizing: border-box;
+}
+
 .route-line-status .ipv6-load-core th:nth-child(1),
 .route-line-status .ipv6-load-core td:nth-child(1) {
   width: 28%;
@@ -560,5 +717,30 @@
     height: 46px;
     padding: 0 16px;
     font-size: 14px;
+  }
+
+  /*
+   * The outer table already scrolls horizontally on narrow viewports, so the
+   * detail block is sized against the scrolled width rather than the viewport.
+   * Category rows drop to the two counters that matter at this width.
+   */
+  .route-line-status .line-kernel-detail {
+    padding: 10px;
+  }
+
+  .route-line-status .line-kernel-category-table th:nth-child(3),
+  .route-line-status .line-kernel-category-table td:nth-child(3),
+  .route-line-status .line-kernel-category-table th:nth-child(4),
+  .route-line-status .line-kernel-category-table td:nth-child(4) {
+    display: none;
+  }
+
+  .route-line-status .line-kernel-category-table th:first-child,
+  .route-line-status .line-kernel-category-table td:first-child {
+    width: 30%;
+  }
+
+  .route-line-status .line-load-source-note {
+    margin: 10px 12px;
   }
 }

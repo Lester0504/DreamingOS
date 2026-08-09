@@ -4,8 +4,17 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260805-storage-layout-toolbar-03';
+  const VERSION = '20260808-storage-raw-download-route-01';
   const ENDPOINT = '/api/v1/storage/files';
+  /* 写入是**单入口 + action 分发**，不是每功能一条 REST 路由：后端只有
+   * jmx_storage_files_mutate()，action 白名单仅 mkdir/create/write/rename
+   * （storage_files.c:1354）。路由字面量后端尚未接出（jmx_app_api.c 里只有两条 GET），
+   * 所以这里的路径仍待后端确认，见 Front-to-Backend-storage-files-mutate-route-literal.md。 */
+  const MUTATE_ENDPOINT = `${ENDPOINT}/mutate`;
+  /* 后端 action 白名单之外的一切写操作都**没有实现**：delete / upload / download_url /
+   * permissions / compress / extract / copy / move / install_package 全部不存在端点。
+   * 不要再预填这些路由——发出去只会打到一个未注册路径。 */
+  const MUTATE_ACTIONS = new Set(['mkdir', 'create', 'write', 'rename']);
   const MODULE_CLASS = 'storage-files-route-host';
   const stage = root?.closest('.console-stage');
   const TEXT_EXTENSIONS = new Set(['txt', 'js', 'ts', 'go', 'py', 'json', 'md', 'html', 'htm', 'css', 'sh', 'bash', 'c', 'cc', 'cpp', 'cxx', 'h', 'hpp', 'hxx', 'java', 'cs', 'php', 'rb', 'rs', 'swift', 'kt', 'kts', 'scala', 'pl', 'pm', 'lua', 'dart', 'yaml', 'yml', 'toml', 'ini', 'conf', 'log', 'rc', 'cfg']);
@@ -299,6 +308,17 @@ export function mount(context = {}) {
     return local[action] === true || state.capabilities[action] === true || state.capabilities[`file_${action}`] === true;
   }
 
+  /* 对齐后端 storage_files_safe_name()（storage_files.c:1200）：单个路径分量，
+   * 不能是 . 或 ..，不含控制字符、`/`、`\`，长度 <= NAME_MAX，且不能占用事务前缀。
+   * 这是提前拦一次以免用户点了才被拒；判定权仍在后端，前端不放宽任何一条。 */
+  function isSafeName(value) {
+    const name = String(value ?? '');
+    if (!name || name === '.' || name === '..') return false;
+    if (name.length > 255) return false;
+    if (name.startsWith('.dreamingwrt-tx-')) return false;
+    return !/[/\\]/.test(name) && !/[\u0000-\u001f]/.test(name);
+  }
+
   function icon(name) {
     const paths = {
       search: '<circle cx="11" cy="11" r="7"></circle><path d="m16.5 16.5 4 4"></path>',
@@ -487,7 +507,14 @@ export function mount(context = {}) {
 
   function renameDrawerBody() {
     const entry = state.editor.entry;
-    return `<div class="storage-file-target"><span>${icon(kindIcon(entry?.kind))}</span><div><strong>${escapeHtml(entry?.name || '--')}</strong><small>${escapeHtml(entry?.path || state.path)}</small></div></div><div class="storage-file-form">${field('新名称', 'name', state.editor.name, { wide: true })}</div>${!hasCapability('rename', entry) ? '<div class="storage-file-capability">后端重命名能力尚未开放。</div>' : ''}${state.notice ? noticeMarkup() : ''}`;
+    /* 后端 rename 前置检查要求目标是 regular file（:1474 判 S_ISREG），目录改不了名；
+     * new_name 走 safe_name()，含 / 直接拒，所以只能同目录改名，不能跨目录移动。 */
+    const unsupported = entry?.is_dir
+      ? '<div class="storage-file-capability">当前固件只支持文件改名，目录改名尚未开放。</div>'
+      : !hasCapability('rename', entry)
+        ? '<div class="storage-file-capability">后端重命名能力尚未开放。</div>'
+        : '';
+    return `<div class="storage-file-target"><span>${icon(kindIcon(entry?.kind))}</span><div><strong>${escapeHtml(entry?.name || '--')}</strong><small>${escapeHtml(entry?.path || state.path)}</small></div></div><div class="storage-file-form">${field('新名称', 'name', state.editor.name, { wide: true, help: '只能在当前目录内改名，不能含 / 。' })}</div>${unsupported}${state.notice ? noticeMarkup() : ''}`;
   }
 
   function permissionsDrawerBody() {
@@ -547,14 +574,17 @@ export function mount(context = {}) {
   }
 
   function drawerCanSave() {
-    if (state.drawer === 'new') return Boolean(state.editor.kind && state.editor.name && hasCapability(state.editor.kind === 'directory' ? 'mkdir' : 'create'));
+    if (state.drawer === 'new') return Boolean(state.editor.kind && isSafeName(state.editor.name) && hasCapability(state.editor.kind === 'directory' ? 'mkdir' : 'create'));
     if (state.drawer === 'upload') return state.editor.mode === 'url' ? Boolean(state.editor.url && state.editor.name && hasCapability('download_url')) : state.uploadFiles.length > 0 && hasCapability('upload');
-    if (state.drawer === 'rename') return Boolean(state.editor.name && hasCapability('rename', state.editor.entry));
+    /* 目录改名后端不支持，名字含 / 或 \ 会被 safe_name() 拒，两者都不给点保存。 */
+    if (state.drawer === 'rename') return Boolean(state.editor.name && !state.editor.entry?.is_dir && isSafeName(state.editor.name) && hasCapability('rename', state.editor.entry));
     if (state.drawer === 'permissions') return Boolean(state.editor.mode && hasCapability('permissions', state.editor.entry));
     if (state.drawer === 'compress') return Boolean(state.editor.name && hasCapability('compress'));
     if (state.drawer === 'extract') return Boolean(state.editor.destination && hasCapability('extract', state.editor.entry));
     if (state.drawer === 'delete') return Boolean((state.editor.entries || []).length && state.editor.entries.every((entry) => hasCapability('delete', entry)));
-    if (state.drawer === 'editor') return hasCapability('write', state.editor.entry) && !state.editor.loadingContent;
+    /* 没有 etag 就点不动保存：后端 write 必填 expected_etag（:1516），
+     * 少了它必然 expected_etag_required，让用户点了才失败是差的体验。 */
+    if (state.drawer === 'editor') return hasCapability('write', state.editor.entry) && !state.editor.loadingContent && Boolean(state.editor.etag);
     if (state.drawer === 'package') return hasCapability('install_package', state.editor.entry);
     return false;
   }
@@ -642,12 +672,14 @@ export function mount(context = {}) {
   function openDelete(entries) { if (entries.length) openDrawer('delete', { entries }); }
 
   async function openTextEditor(entry) {
-    openDrawer('editor', { entry, name: entry.name, content: '', loadingContent: true, contentError: '' });
+    openDrawer('editor', { entry, name: entry.name, content: '', etag: '', loadingContent: true, contentError: '' });
     if (!hasCapability('read', entry) && !hasCapability('preview', entry)) return;
     try {
       const payload = await requestJson(`${ENDPOINT}/content?path=${encodeURIComponent(apiPath(entry.path))}${state.rootId ? `&root_id=${encodeURIComponent(state.rootId)}` : ''}`);
       if (!state.mounted || state.drawer !== 'editor' || state.editor.entry?.id !== entry.id) return;
       state.editor.content = firstText(payload.content, payload.text);
+      /* 保存的前置条件就是这一次读回来的 etag，别处拿不到：列目录的 entry 不含 etag。 */
+      state.editor.etag = firstText(payload.etag);
       state.editor.loadingContent = false;
       render();
     } catch (error) {
@@ -670,6 +702,13 @@ export function mount(context = {}) {
       return '凭据或数据库文件，内容不予显示。密钥、证书与数据库文件按安全策略不下发。';
     }
     if (/content_protected/.test(message)) return '该文件受安全策略保护，内容不予显示。';
+    /* 403 优先判状态码：后端错误串是英文且带内部风险等级名（"'medium' risk action"），
+     * 不能漏给终端用户。必须排在 content_protected 之后——operator 以上读受保护路径
+     * 拿到的仍是 400 content_protected，两者对用户的后续动作完全不同：
+     * 这一条换个高权限账号就能看，那几条换谁都看不到。 */
+    if (error?.status === 403 || /forbidden/i.test(message)) {
+      return '当前账号没有查看文件内容的权限。目录可以浏览，读取内容需要更高权限的账号。';
+    }
     if (/text_too_large/.test(message)) return '文件超出可在线查看的大小上限，请下载后查看。';
     if (/not_utf8_text/.test(message)) return '该文件不是 UTF-8 文本，无法在编辑器中显示。';
     if (/mount_boundary_rejected/.test(message)) return '该文件属于另一个挂载点，需要从它自己的存储根打开。';
@@ -695,6 +734,20 @@ export function mount(context = {}) {
     load(target);
   }
 
+  /* 写入统一走这里。三条硬约束都在这一处收口，避免各调用点各写一遍写漏：
+   *   1. confirm 必须是 JSON 布尔 true，字符串 "true" 不算
+   *      （storage_files_json_bool() 严格要求 json_type_boolean，:1191）；
+   *   2. root_id 显式带上——省略时后端对 `/` 或空 path 会回落到 roots[0]（:433），
+   *      多根机器上会静默落错根，写错根比报错危险；
+   *   3. action 必须在白名单内，否则后端回 unsupported_action。 */
+  async function mutate(action, fields) {
+    if (!MUTATE_ACTIONS.has(action)) throw new Error(`unsupported_action: ${action}`);
+    return requestJson(MUTATE_ENDPOINT, {
+      method: 'POST',
+      body: JSON.stringify({ action, confirm: true, root_id: state.rootId, ...fields })
+    });
+  }
+
   async function submitDrawer() {
     if (!drawerCanSave() || state.saving) return;
     if (state.drawer === 'delete' && !state.confirmDelete) { state.confirmDelete = true; render(); return; }
@@ -703,31 +756,32 @@ export function mount(context = {}) {
     render();
     try {
       if (state.drawer === 'new') {
-        await requestJson(`${ENDPOINT}/${state.editor.kind === 'directory' ? 'directories' : 'entries'}`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, parent: apiPath(state.path), name: state.editor.name }) });
-      } else if (state.drawer === 'upload') {
-        if (state.editor.mode === 'url') {
-          await requestJson(`${ENDPOINT}/download-url`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, url: state.editor.url, destination: apiPath(joinPath(state.path, state.editor.name)) }) });
-        } else {
-          const data = new FormData();
-          data.append('path', apiPath(state.path));
-          if (state.rootId) data.append('root_id', state.rootId);
-          state.uploadFiles.forEach((file) => data.append('files', file, file.name));
-          await requestJson(`${ENDPOINT}/upload`, { method: 'POST', body: data });
-        }
+        /* 父目录走 `path`，新建项名走 `name`——后端在 :1398 用
+         * storage_files_join_path(display, name) 拼接，没有 `parent` 这个键。 */
+        await mutate(state.editor.kind === 'directory' ? 'mkdir' : 'create', {
+          path: apiPath(state.path),
+          name: state.editor.name,
+          ...(state.editor.kind === 'directory' ? {} : { content: '' })
+        });
       } else if (state.drawer === 'rename') {
-        await requestJson(`${ENDPOINT}/rename`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, path: apiPath(state.editor.entry.path), name: state.editor.name }) });
-      } else if (state.drawer === 'permissions') {
-        await requestJson(`${ENDPOINT}/permissions`, { method: 'PUT', body: JSON.stringify({ root_id: state.rootId, path: apiPath(state.editor.entry.path), mode: state.editor.mode, owner: state.editor.owner, group: state.editor.group }) });
-      } else if (state.drawer === 'compress') {
-        await requestJson(`${ENDPOINT}/compress`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, paths: selectedEntries().map((entry) => apiPath(entry.path)), format: state.editor.format, target: apiPath(joinPath(state.path, state.editor.name)) }) });
-      } else if (state.drawer === 'extract') {
-        await requestJson(`${ENDPOINT}/extract`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, path: apiPath(state.editor.entry.path), destination: apiPath(state.editor.destination) }) });
-      } else if (state.drawer === 'delete') {
-        await requestJson(`${ENDPOINT}/entries`, { method: 'DELETE', body: JSON.stringify({ root_id: state.rootId, paths: state.editor.entries.map((entry) => apiPath(entry.path)), confirm: true }) });
+        /* 同目录改名，字段是 `new_name`；发 `name` 会被判 invalid_name。 */
+        await mutate('rename', {
+          path: apiPath(state.editor.entry.path),
+          new_name: state.editor.name
+        });
       } else if (state.drawer === 'editor') {
-        await requestJson(`${ENDPOINT}/content`, { method: 'PUT', body: JSON.stringify({ root_id: state.rootId, path: apiPath(state.editor.entry.path), content: state.editor.content, expected_mtime: state.editor.entry.modified_unix || state.editor.entry.modified_at }) });
-      } else if (state.drawer === 'package') {
-        await requestJson(`${ENDPOINT}/install-package`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, path: apiPath(state.editor.entry.path), confirm: true }) });
+        /* expected_etag 只能来自读内容时返回的 etag（:1173），列表 entry 里没有这个字段；
+         * 拿 modified_unix 凑必然 revision_conflict。 */
+        await mutate('write', {
+          path: apiPath(state.editor.entry.path),
+          content: state.editor.content,
+          expected_etag: state.editor.etag
+        });
+      } else {
+        /* upload / permissions / compress / extract / delete / package 都没有后端端点。
+         * 它们的保存按钮本就被 capabilities 禁用，但这里显式拒绝：一旦哪天能力位先翻真、
+         * 端点还没接，落到这里会静默报「已完成」，那比报错难查得多。 */
+        throw new Error('unsupported_action');
       }
       if (!state.mounted) return;
       state.saving = false;
@@ -740,28 +794,43 @@ export function mount(context = {}) {
     } catch (error) {
       if (!state.mounted) return;
       state.saving = false;
-      state.notice = `操作失败：${firstText(error.message, '后端未接受操作')}`;
+      state.notice = mutateErrorText(error);
       state.noticeTone = 'error';
       render();
     }
   }
 
+  /* mutate 的失败码是有语义的，逐条译出来。尤其 revision_conflict 与 write_protected：
+   * 一个要用户重新打开文件，一个是安全策略拒绝，混成「操作失败」用户无从判断。 */
+  function mutateErrorText(error) {
+    const message = firstText(error?.message);
+    if (/revision_conflict/.test(message)) return '文件在你编辑期间已被改动，保存已取消。请关闭后重新打开该文件，确认最新内容再改。';
+    if (/expected_etag_required/.test(message)) return '缺少文件版本标记，保存已取消。请关闭后重新打开该文件再试。';
+    if (/write_protected/.test(message)) return '目标路径受写入保护，按安全策略不允许写入。';
+    if (/storage_root_read_only/.test(message)) return '该存储根是只读的，无法写入。';
+    if (/confirmation_required/.test(message)) return '该操作缺少确认标记，未执行。';
+    if (/unsupported_action/.test(message)) return '当前固件不支持该操作。';
+    if (/invalid_name/.test(message)) return '名称不合法：不能为空、不能含 / 或 \\、不能是 . 或 ..。';
+    if (/invalid_text_content/.test(message)) return '内容必须是 UTF-8 文本，且不超过 256 KiB。';
+    if (/invalid_relative_path/.test(message)) return '该路径不在当前存储根范围内。请切换到对应的存储位置。';
+    if (/directory_unavailable/.test(message)) return '目标目录无法安全打开，可能已被删除或没有权限。';
+    if (/filesystem_transaction_failed/.test(message)) return '文件系统事务失败，改动未提交。';
+    if (/storage_root_not_found/.test(message)) return '该路径不属于任何可访问的存储根。';
+    if (error?.status === 401) return '会话已过期，请重新登录后再操作。';
+    if (error?.status === 403) return '当前账号没有执行该写入操作的权限。';
+    if (error?.status === 404) return '后端尚未开放文件写入接口。';
+    return message ? `操作失败：${message}` : '操作失败。';
+  }
+
   async function pasteClipboard() {
     const clipboard = state.clipboard;
     if (!clipboard?.paths?.length) return;
-    const action = clipboard.action === 'cut' ? 'move' : 'copy';
-    if (!hasCapability(action)) return;
-    try {
-      await requestJson(`${ENDPOINT}/${action}`, { method: 'POST', body: JSON.stringify({ root_id: state.rootId, source_root_id: clipboard.sourceRootId || state.rootId, paths: clipboard.paths, destination: apiPath(state.path) }) });
-      if (clipboard.action === 'cut') state.clipboard = null;
-      state.notice = '粘贴操作已完成';
-      state.noticeTone = 'ok';
-      await load(state.path, true);
-    } catch (error) {
-      state.notice = `粘贴失败：${firstText(error.message)}`;
-      state.noticeTone = 'error';
-      render();
-    }
+    /* copy / move 在后端 action 白名单里不存在，端点也没有，而且跨根被架构挡住：
+     * 一次 mutate 只持有一个 root，RESOLVE_NO_XDEV + st_dev 校验使跨 dev 需要双根事务模型。
+     * 所以不发请求——粘贴按钮本就按 capabilities 禁用，这里只兜键盘快捷键等旁路入口。 */
+    state.notice = '当前固件不支持复制/移动。';
+    state.noticeTone = 'warning';
+    render();
   }
 
   function rememberSelection(action) {
@@ -783,7 +852,16 @@ export function mount(context = {}) {
       return;
     }
     const link = document.createElement('a');
-    link.href = `${ENDPOINT}/download?path=${encodeURIComponent(apiPath(entry.path))}${state.rootId ? `&root_id=${encodeURIComponent(state.rootId)}` : ''}&v=${VERSION}`;
+    /*
+     * 后端没有 /download 这条路由，字节流合并在 /raw 上：预览走默认的
+     * Content-Disposition: inline，下载加 ?disposition=attachment，
+     * 两者共用同一个处理器（jmx_app_perms.c 里注册的是 GET,HEAD /storage/files/raw）。
+     * 之前这里写 /download，只是因为 download 能力位恒为 false 才没暴露成 404。
+     */
+    link.href = `${ENDPOINT}/raw?path=${encodeURIComponent(apiPath(entry.path))}`
+      + `${state.rootId ? `&root_id=${encodeURIComponent(state.rootId)}` : ''}`
+      + `&disposition=attachment&v=${VERSION}`;
+    /* 后端已给出 attachment 与 filename，这里保留 download 属性只作为兜底。 */
     link.download = entry.name;
     link.click();
   }

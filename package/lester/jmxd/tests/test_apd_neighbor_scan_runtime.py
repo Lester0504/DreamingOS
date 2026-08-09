@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import tempfile
 
+import apd_test_deps
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -74,21 +76,10 @@ def main() -> None:
     production_contract()
     compiler = os.environ.get("CC") or shutil.which("clang") or shutil.which("cc")
     assert compiler, "C compiler is required"
-    configured_prefix = os.environ.get("APD_TEST_PREFIX", "")
-    if configured_prefix:
-        json_prefix = Path(configured_prefix)
-        assert (json_prefix / "include/json-c/json.h").is_file()
-        assert (json_prefix / "lib/libjson-c.so").is_file()
-    else:
-        json_prefix = None
-    json_candidates = [Path("/opt/homebrew/opt/json-c")]
-    json_candidates.extend(Path(value) for value in glob.glob(
-        "/opt/homebrew/var/homebrew/tmp/.cellar/json-c/*"
-    ))
-    json_prefix = json_prefix or next((value for value in json_candidates
-                                       if (value / "include/json-c/json.h").is_file() and
-                                          (value / "lib/libjson-c.a").is_file()), None)
-    assert json_prefix, "json-c headers and static library are required"
+    # json_shared decides how we link. Keying that off APD_TEST_PREFIX instead
+    # meant an unset variable forced the static path, which on the build host
+    # resolved to the staging_dir LTO archive and failed to link.
+    json_prefix, json_shared = apd_test_deps.resolve_json_prefix()
     with tempfile.TemporaryDirectory(prefix="apd-neighbor-") as raw:
         temp = Path(raw)
         ieee = temp / "ieee80211"
@@ -117,7 +108,7 @@ def main() -> None:
                 str(ROOT / "src/apd/apd_readonly_command.c"),
                 *([f"-L{json_prefix / 'lib'}",
                    f"-Wl,-rpath,{json_prefix / 'lib'}", "-ljson-c"]
-                  if configured_prefix else
+                  if json_shared else
                   [str(json_prefix / "lib/libjson-c.a")]),
                 "-o", str(binary),
             ],
@@ -129,7 +120,7 @@ def main() -> None:
         if compiled.returncode:
             raise AssertionError(compiled.stderr)
         env = os.environ.copy()
-        if configured_prefix:
+        if json_shared:
             env["LD_LIBRARY_PATH"] = str(json_prefix / "lib") + (
                 f":{env['LD_LIBRARY_PATH']}" if env.get("LD_LIBRARY_PATH") else "")
         result = subprocess.run(

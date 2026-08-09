@@ -610,6 +610,43 @@ static int tg_group_exists(sqlite3 *db, const char *id)
     return exists;
 }
 
+/*
+ * Group-id validation and existence for callers outside this file, so the MAC
+ * ACL write path can refuse a binding to a group that does not exist instead of
+ * storing a reference that renders no rule at all.
+ */
+static int64_t tg_count(sqlite3 *db, const char *sql, const char *id);
+
+int webd_terminal_group_id_ok(const char *id)
+{
+    return tg_id_ok(id);
+}
+
+int webd_terminal_group_exists(const char *id)
+{
+    sqlite3 *db = NULL;
+    int exists;
+
+    if (!tg_id_ok(id) || tg_open(&db) != 0)
+        return 0;
+    exists = tg_group_exists(db, id);
+    sqlite3_close(db);
+    return exists;
+}
+
+int webd_terminal_group_member_count(const char *id)
+{
+    sqlite3 *db = NULL;
+    int64_t count;
+
+    if (!tg_id_ok(id) || tg_open(&db) != 0)
+        return -1;
+    count = tg_count(db,
+        "SELECT COUNT(*) FROM terminal_group_member WHERE group_id=?1 AND mac<>''", id);
+    sqlite3_close(db);
+    return count < 0 ? -1 : (int)count;
+}
+
 static int64_t tg_count(sqlite3 *db, const char *sql, const char *id)
 {
     sqlite3_stmt *st = NULL;

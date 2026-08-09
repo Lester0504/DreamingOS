@@ -12,7 +12,7 @@ export function mount(context = {}) {
     return { name, ok, data: json?.data ?? json, raw: json, error: ok ? null : new Error(json?.error?.message || json?.message || response.statusText || 'request failed') };
   });
 
-  const VERSION = '20260805-mount-capacity-units-01';
+  const VERSION = '20260808-api-key-management-card-01';
   const MODULE_CLASS = 'system-settings-route-host';
   const ENDPOINT = '/api/v1/system/basic';
   const SAVE_ENDPOINTS = ['/api/v1/system/settings', '/api/v1/save_system_settings'];
@@ -79,6 +79,24 @@ export function mount(context = {}) {
     flashCapabilitiesLoading: false,
     flashCapabilitiesLoaded: false,
     flashCapabilitiesError: '',
+    /*
+     * 能力源 data 的顶层字段（热更新契约位就在这一层，不在 capabilities 里）。
+     * 同样三态：null = 未确认。
+     */
+    flashCapabilitiesData: null,
+    /*
+     * A/B 回滚与引导确认。后端 `GET /system/ota/status` 一直如实下发
+     * `rollback_enabled` / `rollback_reason` / `slot_status`，能力位也给了
+     * `rollback_firmware`，但前端此前完全没有消费方：升级一次性引导失败后
+     * 用户在 Web 上无法自救，只能 SSH。
+     *
+     * 与 flashCapabilities 同样分三态：null = 未探测（不断言不支持），
+     * 读到了才谈 rollback_enabled 真假。
+     */
+    otaStatus: null,
+    otaStatusLoading: false,
+    otaStatusLoaded: false,
+    otaStatusError: '',
     flashScheduledBackup: null,
     /*
      * `GET /flash/backup-policy` 的当前值。它是 high risk 路由，viewer 会 403 ——
@@ -90,6 +108,34 @@ export function mount(context = {}) {
     flashBackupPolicyLoaded: false,
     flashBackupPolicyError: '',
     flashSchedulePolicyDraft: null,
+    /*
+     * CPU 中断能力源与网卡调优观测源。
+     *
+     * 这两块此前完全没有消费方，页面把「不支持」写死在按钮 title 里，于是不管后端
+     * 实测出什么结论，用户看到的都是同一句话——而 30.1 实测五个 netdev_* sysctl
+     * 全部存在可写、`rps_cpus` 每队列可写、每个 IRQ 的 smp_affinity 可写且为
+     * `ffff`（从未绑核）。写死的那句话与事实相反。
+     *
+     * 三态与 flashCapabilities 同构：null = 未探测（不能断言不支持），
+     * 对象 = 读到了能力位，error 文案 = 来源请求失败。
+     * `netTuningSupported === false` 只在 404/501 时置位，表示这台设备上的 jmxd
+     * 还没有这个节点（后端已实现但未部署），此时走降级显示而不是空白。
+     */
+    cpuInterrupt: null,
+    cpuInterruptLoading: false,
+    cpuInterruptLoaded: false,
+    cpuInterruptError: '',
+    netTuning: null,
+    netTuningLoading: false,
+    netTuningLoaded: false,
+    netTuningError: '',
+    netTuningSupported: undefined,
+    /*
+     * softnet 计数器是自开机累计值，直接展示会让跑久的机器长期挂着告警。
+     * 这里留一份上次采样，`time_squeeze` 以两次采样的差值为主、累计值为辅。
+     */
+    netTuningPrevSample: null,
+    netTuningDelta: null,
     // 升级流水线：upload_id 由 /uploads/begin 下发，operation_id 由 verify 返回。
     flashFirmwareUpload: null,
     flashFirmwareProgress: 0,
@@ -100,6 +146,20 @@ export function mount(context = {}) {
     flashKeepSettings: null,
     flashWorking: '',
     flashConfirm: '',
+    /*
+     * 「应用固件」的确认弹窗。原来是按钮自己变成「再次点击确认应用」的双击确认：
+     * 用户在这一步真正要决定的是**什么时候重启**，而双击确认没有地方承载这个选择。
+     * 弹窗里三选一：立即重启 / 稍后手动重启 / 定时重启。
+     */
+    flashApplyDialog: false,
+    flashApplyRebootMode: 'now',
+    flashApplyScheduleDate: '',
+    flashApplyScheduleTime: '',
+    flashApplyScheduleError: '',
+    /* `GET /api/v1/system/power` 的 capabilities，用于判断定时重启能不能用。 */
+    flashPowerCapabilities: null,
+    /* 用户选了「立即重启」：写入完成（rebooting）后再由前端发起重启。 */
+    flashPendingReboot: false,
     flashMessage: '',
     flashError: '',
     operationWorking: '',
@@ -120,6 +180,25 @@ export function mount(context = {}) {
     qrGeneratorLoading: false,
     qrGeneratorError: '',
     deviceWorking: '',
+    /*
+     * API-Key 管理。`apiKeyPlaintext` 只在创建响应返回后短暂驻留内存，
+     * 供一次性展示用；不写 localStorage / sessionStorage / URL，
+     * 关闭一次性展示即置空，此后任何视图只出现 key_id。
+     */
+    apiKeys: null,
+    apiKeysLoading: false,
+    apiKeysError: '',
+    apiKeyDialog: '',
+    apiKeyWorking: '',
+    apiKeyError: '',
+    apiKeyDraft: null,
+    apiKeyPlaintext: '',
+    apiKeyCreated: null,
+    apiKeyConfirm: null,
+    apiKeyAuditFor: '',
+    apiKeyAudit: null,
+    apiKeyAuditLoading: false,
+    apiKeyAuditError: '',
     loading: true,
     error: '',
     saving: false,
@@ -465,12 +544,22 @@ export function mount(context = {}) {
       },
       flash: {
         ...flashSource,
-        current_firmware: stringOr(flashSource.current_firmware || general.version || 'Dreaming OS'),
+        /*
+         * `version` / `current_firmware` 取不到时后端给 null，并用 `version_error`
+         * 说明原因。这里不能再兜一个 'Dreaming OS' 字面量：验收单明确要求不显示假值，
+         * 读不到就如实空着，由渲染层显示错误原因。
+         */
+        current_firmware: stringOr(flashSource.current_firmware || general.version),
+        /* build_time 已从空串改为 Unix 秒（release 的 generated_at）。直接 String() 会把
+           一串时间戳数字打到页面上，必须按时间格式化。 */
         build_time: stringOr(flashSource.build_time),
         kernel: stringOr(flashSource.kernel),
         keep_settings: flashSource.keep_settings !== false,
+        /* last_backup_at / backup_size 现在可能是 null，语义是「从未备份」。
+           后端刻意不用 0，因为 0 会被当成一个真实的纪元时间戳渲染成 1970-01-01。
+           这里保持 0 / 空串，渲染层据此显示「尚无备份」。 */
         last_backup_at: Number(flashSource.last_backup_at || 0),
-        backup_size: stringOr(flashSource.backup_size)
+        backup_size: systemFlashBackupSizeLabel(flashSource.backup_size)
       },
       dreamingwrt: {
         ...dreamingwrt,
@@ -577,6 +666,8 @@ export function mount(context = {}) {
         ${systemLoadingStatus()}
         ${systemCurrentPanel(state.data)}
         ${systemBindingDialog()}
+        ${systemApiKeyDialog()}
+        ${systemFlashApplyDialog()}
         ${systemSettingsSavebar()}
       </div>
     `;
@@ -587,6 +678,8 @@ export function mount(context = {}) {
     ui.scheduleGlassCardsRender?.(160);
     restoreScrollState(scrollSnapshot);
     if (state.bindingDialog) focusBindingDialog();
+    if (state.apiKeyConfirm) focusApiKeyConfirmation();
+    else if (state.apiKeyDialog) focusBindingDialog();
   }
 
   function systemCurrentPanel(data) {
@@ -776,6 +869,38 @@ export function mount(context = {}) {
   }
 
   /*
+   * 热更新的契约位读在 `flash/capabilities` 的 data 顶层（不在 capabilities 里），
+   * 回答"这台设备支不支持、apply 是不是同步的、要不要重启"。
+   *
+   * 三态与 flashCap 一致：能力源没读到时返回 null 表示"未确认"，不能当成 false ——
+   * 按 design.md「Capability truth」第 4 条，能力源请求失败只能说未确认，
+   * 不得断言后端未实现。旧 webd 不下发这组键，那时页面应当什么都不显示。
+   */
+  function flashHotUpdateContract() {
+    const data = state.flashCapabilitiesData;
+    if (!data || typeof data !== 'object') return null;
+    if (!('hot_update_supported' in data)) return null;
+    return {
+      supported: data.hot_update_supported === true,
+      applyEnabled: data.hot_update_apply_enabled === true,
+      applyReason: stringOr(data.hot_update_apply_reason || ''),
+      uploadType: stringOr(data.hot_update_upload_type || 'firmware'),
+      artifactType: stringOr(data.hot_update_verify_artifact_type || 'hot_update'),
+      requiresReboot: data.hot_update_requires_reboot === true,
+      applyAsync: data.hot_update_apply_async === true,
+      statusEndpoint: stringOr(data.hot_update_status_endpoint || '')
+    };
+  }
+
+  /*
+   * 包类型由 otad 读魔术字节判定，前端只认 verify 回来的 artifact_type，
+   * 不让用户手选，也不按文件名猜。
+   */
+  function isHotUpdateOperation(op) {
+    return stringOr(op?.artifact_type || '') === 'hot_update';
+  }
+
+  /*
    * 后端 reason 是机器码，这里翻成人话。未收录的 code 原样显示，
    * 好过吞掉一个我们没预料到的原因。
    */
@@ -783,6 +908,14 @@ export function mount(context = {}) {
     no_active_release_key: '尚未配置发布签名公钥，暂不能应用固件。上传与校验不受影响。',
     otad_status_unavailable: 'otad 未返回状态，能力暂不可确认。',
     signing_key_unknown: '镜像签名密钥不在信任策略内，暂不能应用固件。',
+    /*
+     * 热更新专有原因码。写入器未实现时上传与校验仍然可用（`hot_update_verify` 恒为
+     * true），所以文案只否定「应用」这一步，不要写成整条链路不可用。
+     */
+    hot_update_writer_not_implemented: '设备的热更新写入器尚未实现，热更新包可以上传校验，但暂不能应用。',
+    hot_update_release_trust_gate_closed: '热更新包的发布签名未通过信任校验，暂不能应用。',
+    hot_update_operation_in_progress: '已有一个热更新正在写入，请等它结束后再试。',
+    hot_update_source_binding_mismatch: '暂存的安装包与校验时记录的不一致，请重新上传校验。',
     /*
      * `no_schedule_retention_or_snapshot_contract_implemented` 后端已不再下发（合同已落地，
      * `test_scheduled_backup_retention_contract.py:87` 反向断言它必须消失），故不再收录。
@@ -917,6 +1050,14 @@ export function mount(context = {}) {
     const uploadCap = flashCap('upload_firmware');
     const verifyCap = flashCap('verify_firmware');
     const applyCap = flashCap('apply_firmware');
+    /*
+     * 热更新与整包共用同一条上传通道和同两个路由，所以这里不新建第二个上传控件，
+     * 只在可用时说明同一个入口也收热更新包。包类型由 otad 读魔术字节判定，
+     * 用户不需要、也无法预先声明。
+     */
+    const hotVerifyCap = flashCap('hot_update_verify');
+    const hotApplyCap = flashCap('hot_update_apply');
+    const hotContract = flashHotUpdateContract();
     const capsUnknown = !state.flashCapabilitiesLoaded || !state.flashCapabilities;
     const canStage = uploadCap?.available === true && verifyCap?.available === true;
     const firmwareFile = state.flashFirmwareFile;
@@ -929,13 +1070,14 @@ export function mount(context = {}) {
         <section class="system-demo-panel system-flash-firmware-panel">
           <div class="system-flash-version-block">
             <span>当前版本</span>
-            <strong>${escapeHtml(systemFlashVersionLabel(f.current_firmware || data.general?.version || 'Dreaming OS'))}</strong>
+            <strong>${escapeHtml(systemFlashVersionLabel(f.current_firmware || data.general?.version) || systemVersionUnavailableText(data))}</strong>
             <em>${escapeHtml(systemFlashBuildLabel(f))}</em>
           </div>
           <div class="system-flash-firmware-actions">
             <div class="system-flash-card-copy">
               <strong>刷写新的固件镜像</strong>
               <p>选择兼容的 sysupgrade 镜像。执行前应先生成并下载配置备份。</p>
+              ${systemFlashHotUpdateHint({ hotVerifyCap, hotApplyCap, hotContract })}
             </div>
             <label class="system-flash-file-picker wide">
               <input type="file" accept=".bin,.img,.itb,application/octet-stream" data-system-flash-file="firmware">
@@ -952,6 +1094,7 @@ export function mount(context = {}) {
           </div>
         </section>
         ${systemFlashFirmwareOperationCard(applyCap)}
+        ${systemFlashRollbackPanel()}
         ${systemFlashPreserveCard()}
         ${systemSignatureUpdateCard(data)}
       </div>
@@ -976,9 +1119,71 @@ export function mount(context = {}) {
   }
 
   /*
+   * A/B 引导与回滚。A/B 升级的价值一半在「写坏了能回来」：此前页面只能应用固件，
+   * 一次性引导失败后没有任何 Web 途径触发回滚或确认引导。
+   *
+   * 能力三态与本页其它能力一致：未读到（不说不支持）/ 明确不可用（带 reason）/ 可用。
+   */
+  function systemFlashRollbackPanel() {
+    const cap = flashCap('rollback_firmware');
+    const slot = otaSlotStatus();
+    const pending = otaPendingSlot();
+    const busy = Boolean(state.flashWorking);
+    const statusUnknown = !state.otaStatusLoaded || !state.otaStatus;
+    const rollbackEnabled = state.otaStatus?.rollback_enabled === true;
+    const rollbackReason = stringOr(state.otaStatus?.rollback_reason);
+    const canRollback = cap?.available === true && rollbackEnabled;
+    const rows = [];
+    if (stringOr(slot.current_slot)) rows.push(['当前分区', stringOr(slot.current_slot)]);
+    if (stringOr(slot.inactive_slot)) rows.push(['备用分区', stringOr(slot.inactive_slot)]);
+    if (stringOr(slot.inactive_slot_state)) rows.push(['备用分区状态', stringOr(slot.inactive_slot_state)]);
+    return `
+      <section class="system-demo-panel system-flash-rollback-panel">
+        <div class="system-demo-panel-title">${systemSettingsIcon('restore')}<span>回滚与引导确认</span></div>
+        ${state.otaStatusLoading && statusUnknown ? '<p class="system-flash-capability-note">正在读取引导状态…</p>' : ''}
+        ${!state.otaStatusLoading && statusUnknown ? `<p class="system-flash-capability-note">${escapeHtml(state.otaStatusError || '引导状态尚未确认。这不代表设备不支持回滚，只是当前读不到状态。')}</p>` : ''}
+        ${rows.length ? `<div class="system-signature-meta-grid">
+          ${rows.map(([label, value]) => `<span><b>${escapeHtml(label)}</b><em>${escapeHtml(value)}</em></span>`).join('')}
+        </div>` : ''}
+        ${pending ? `<p class="system-flash-schedule-gap">分区 ${escapeHtml(pending)} 尚未确认引导。<strong>未确认将自动回落到上一个分区</strong>，届时本次升级不会生效。请在确认设备工作正常后点击「确认引导」。</p>` : ''}
+        <div class="system-flash-firmware-actions">
+          <button class="glass-btn" type="button" data-system-action="flash-ota-rollback" ${busy || !canRollback ? 'disabled' : ''}>${state.flashConfirm === 'ota-rollback' ? '再次点击确认回滚' : '回滚到上一版本'}</button>
+          ${pending ? `<button class="glass-btn glass-btn--primary" type="button" data-system-action="flash-ota-confirm-boot" ${busy ? 'disabled' : ''}>${state.flashConfirm === 'ota-confirm-boot' ? '再次点击确认' : '确认引导'}</button>` : ''}
+        </div>
+        ${cap && cap.available !== true ? `<small class="system-flash-capability-note">${escapeHtml(flashReasonText(cap.reason) || '设备当前不可回滚，后端未给出具体原因。')}</small>` : ''}
+        ${cap?.available === true && !statusUnknown && !rollbackEnabled ? `<small class="system-flash-capability-note">${escapeHtml(flashReasonText(rollbackReason) || '设备当前不可回滚：没有可回滚的上一版本，或引导状态不完整。')}</small>` : ''}
+      </section>
+    `;
+  }
+
+  /*
    * 三种状态各自的文案：能力未确认 / 能力为 false（带 reason）/ 能力为 true。
    * 「应用被签名闸门挡住」与「功能没做」是不同的事，不能共用一句话。
    */
+  /*
+   * 热更新入口提示。三态严格分开（design.md「Capability truth」第 4 条）：
+   *   能力源没读到     → 什么都不说，不能断言设备不支持
+   *   支持且可应用     → 说明同一个上传框也收热更新包
+   *   支持但不可应用   → 给后端原文对应的人话原因，仍说明可以上传校验
+   * 文案不硬编码可用与否，全部由能力位决定。
+   */
+  function systemFlashHotUpdateHint({ hotVerifyCap, hotApplyCap, hotContract }) {
+    // 未确认：旧 webd 不下发这组键，此时不显示任何热更新说法。
+    if (!hotVerifyCap && !hotApplyCap && !hotContract) return '';
+    if (hotContract && hotContract.supported !== true && hotApplyCap?.available !== true) {
+      const reason = flashReasonText(hotContract.applyReason || hotApplyCap?.reason || '');
+      return `<p class="system-flash-hot-hint">此处也接受热更新包，但设备暂不能应用：${escapeHtml(reason || '设备未说明原因。')}</p>`;
+    }
+    if (hotApplyCap?.available === true) {
+      return '<p class="system-flash-hot-hint">同一个上传框也接受热更新包：设备会自行识别包类型，热更新只替换其中的文件，不写入分区、不重启设备。</p>';
+    }
+    if (hotVerifyCap?.available === true) {
+      const reason = flashReasonText(hotApplyCap?.reason || hotContract?.applyReason || '');
+      return `<p class="system-flash-hot-hint">此处也接受热更新包，可以上传校验；应用当前不可用：${escapeHtml(reason || '设备未说明原因。')}</p>`;
+    }
+    return '';
+  }
+
   function systemFlashFirmwareCapabilityNote({ capsUnknown, uploadCap, verifyCap, applyCap, staging }) {
     if (state.flashCapabilitiesLoading && capsUnknown) {
       return '<small class="system-flash-capability-note">正在读取设备固件能力…</small>';
@@ -1007,6 +1212,12 @@ export function mount(context = {}) {
   const FLASH_OPERATION_STATE_TEXT = {
     validating: '校验中',
     verified: '校验通过',
+    /*
+     * 热更新 verify 通过后台账落在 `pending`（`otad_db.c:823` 的
+     * commit_hot_preflight 写的就是这个值），整包的 preflight 也一样。
+     * 不收录的话卡里直接显示机器码 pending，实测就是这样。
+     */
+    pending: '待应用',
     preflight_passed: '预检通过',
     writing: '写入中',
     rebooting: '等待重启',
@@ -1016,44 +1227,307 @@ export function mount(context = {}) {
   };
 
   /*
+   * 「正在安装」这一句太粗，用户看不出卡在哪一步、还要多久。整包写入的 state 全程
+   * 都是 `writing`，真正的进展信息藏在 progress 上：otad 在每个阶段结束时打一个点
+   * （`otad_firmware.c` 的 `otad_operation_update(..., "writing", N, ...)`）。
+   *
+   *   30  暂存镜像重新校验签名与哈希通过，准备写入
+   *   40  目标分区已打开并校验容量，开始写 rootfs
+   *   65  rootfs 写完并回读校验哈希一致
+   *   75  分区已扩容、fsck 通过并挂载
+   *   88  内核与版本元数据写入完成，已同步卸载
+   *   90  切到 rebooting：引导项已指向新分区
+   *
+   * 所以把 progress 映射成「当前在做什么」，而不是只显示一个百分比。这些文字对应的
+   * 是后端真实打点，不是前端编的进度条。
+   */
+  const FLASH_WRITING_STAGES = [
+    { at: 0, label: '准备写入', detail: '正在重新校验暂存镜像的签名与哈希' },
+    { at: 30, label: '校验通过', detail: '镜像可信，正在打开备用分区并检查容量' },
+    { at: 40, label: '写入系统分区', detail: '正在把 rootfs 写入备用分区，这一步最久' },
+    { at: 65, label: '回读校验', detail: '分区已写完，正在比对回读哈希' },
+    { at: 75, label: '整理文件系统', detail: '分区已扩容并挂载，正在写入内核与版本信息' },
+    { at: 88, label: '收尾', detail: '元数据已写入，正在同步并切换引导项' }
+  ];
+
+  function flashWritingStage(progress) {
+    const value = Number(progress);
+    if (!Number.isFinite(value)) return null;
+    let hit = FLASH_WRITING_STAGES[0];
+    for (const stage of FLASH_WRITING_STAGES) {
+      if (value >= stage.at) hit = stage;
+    }
+    return hit;
+  }
+
+  /*
+   * 一行「现在在做什么」。整包在 writing 阶段按 progress 细分；其余状态各自给一句
+   * 说明它意味着什么，尤其 rebooting —— 它不等于设备已经在重启，而是分区写完了、
+   * 等一次重启才切过去，这个区别决定用户该不该动手。
+   */
+  function flashOperationDetailText(op, hot) {
+    const opState = stringOr(op?.state || '');
+    if (!opState) return '';
+    if (opState === 'writing') {
+      if (hot) return '正在替换安装包里列出的文件。';
+      const stage = flashWritingStage(op?.progress);
+      return stage ? `${stage.label}：${stage.detail}。` : '';
+    }
+    if (opState === 'validating') return '正在校验镜像签名、机型兼容性与升级策略。';
+    if (opState === 'verified' || opState === 'preflight_passed') return '校验已通过，可以应用。';
+    if (opState === 'pending') return '校验结果已记录，等待你点击应用。';
+    if (opState === 'rebooting') {
+      return hot
+        ? '相关服务正在重启。'
+        : '备用分区已写完，引导项已指向新版本。设备重启后才会切换到新系统。';
+    }
+    if (opState === 'success') return hot ? '热更新已完成。' : '升级已完成，设备已运行新版本。';
+    if (opState === 'failed') return '本次升级失败，设备仍运行原版本。';
+    if (opState === 'cancelled') return '本次操作已取消，设备未发生变更。';
+    return '';
+  }
+
+  /*
    * 校验结果卡。只在真的产生了 operation 之后出现，展示后端给的判定位
    * （authenticity_verified / target_compatible / policy_passed）与 upload/operation id。
    * 「应用」按钮的开关只看 apply_firmware.available，不在前端另立一套结论。
+   *
+   * 包类型由 verify 回来的 artifact_type 分叉：整包是 ota_bin，热更新是 hot_update。
+   * 两者的口径不能混用 —— 热更新没有分区、不重启整机，照抄「写入分区 / 应用固件」
+   * 会误导用户；它的有效信息是改了几个文件、删了几个、重启哪些服务。
+   * 应用按钮也要跟着换门：热更新看 hot_update_apply，整包看 apply_firmware，
+   * 两条闸门相互独立（热更新只要发布签名信任，不要求 A/B 布局可切换）。
    */
   function systemFlashFirmwareOperationCard(applyCap) {
     const upload = state.flashFirmwareUpload;
     const op = state.flashFirmwareOperation;
     if (!upload && !op) return '';
+    const hot = isHotUpdateOperation(op);
+    // 热更新走自己的能力位；调用方传进来的是整包的，这里按类型改取。
+    const gateCap = hot ? flashCap('hot_update_apply') : applyCap;
     const state_text = FLASH_OPERATION_STATE_TEXT[stringOr(op?.state || '')] || stringOr(op?.state || '');
-    const canApply = applyCap?.available === true && Boolean(op?.operation_id);
+    const canApply = gateCap?.available === true && Boolean(op?.operation_id);
     const busy = Boolean(state.flashWorking);
     const rows = [];
-    if (upload?.filename) rows.push(['镜像文件', `${upload.filename}${upload.size_bytes ? ` · ${formatBytes(upload.size_bytes) || ''}` : ''}`]);
+    if (upload?.filename) rows.push([hot ? '安装包文件' : '镜像文件', `${upload.filename}${upload.size_bytes ? ` · ${formatBytes(upload.size_bytes) || ''}` : ''}`]);
     if (upload?.upload_id) rows.push(['upload_id', upload.upload_id]);
     if (upload?.sha256) rows.push(['SHA-256', upload.sha256]);
     if (op?.operation_id) rows.push(['operation_id', op.operation_id]);
     if (state_text) rows.push(['状态', `${state_text}${Number.isFinite(Number(op?.progress)) ? ` · ${Number(op.progress)}%` : ''}`]);
     if (op?.to_version) rows.push(['目标版本', op.to_version]);
-    if (op?.target_slot) rows.push(['写入分区', op.target_slot]);
+    /*
+     * 整包才有写入分区。热更新 slot_required 为 false，取而代之的是包标识与
+     * 文件改动量：这些是"这次会动什么"的真实答案。
+     */
+    if (hot) {
+      if (op?.package_id) rows.push(['安装包标识', op.package_id]);
+      if (Number.isFinite(Number(op?.payload_count))) rows.push(['更新文件', `${Number(op.payload_count)} 个`]);
+      if (Number.isFinite(Number(op?.deletion_count)) && Number(op.deletion_count) > 0) rows.push(['删除文件', `${Number(op.deletion_count)} 个`]);
+    } else if (op?.target_slot) {
+      rows.push(['写入分区', op.target_slot]);
+    }
     const checks = op ? [
       ['签名可信', op.authenticity_verified],
       ['机型兼容', op.target_compatible],
       ['策略通过', op.policy_passed]
     ].filter((entry) => entry[1] !== undefined && entry[1] !== null) : [];
     const failure = stringOr(op?.error_message || op?.error_code || '');
+    const detail = flashOperationDetailText(op, hot);
+    const percent = Number.isFinite(Number(op?.progress))
+      ? Math.max(0, Math.min(100, Math.round(Number(op.progress))))
+      : null;
+    const running = op ? !isFlashOperationTerminal(op) : false;
     return `
       <section class="system-demo-panel system-flash-firmware-operation">
-        <div class="system-demo-panel-title">${systemSettingsIcon('database')}<span>本次升级校验</span></div>
+        <div class="system-demo-panel-title">${systemSettingsIcon('database')}<span>${hot ? '本次热更新校验' : '本次升级校验'}</span></div>
+        ${hot ? '<p class="system-signature-note">这是一个热更新包：只替换其中列出的文件，不写入分区、不重启设备。</p>' : ''}
+        ${detail ? `<p class="system-flash-operation-detail${running ? ' is-running' : ''}">${escapeHtml(detail)}</p>` : ''}
+        ${percent !== null && running ? `
+          <div class="system-flash-operation-progress">
+            <div class="system-flash-operation-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}" aria-label="升级进度">
+              <i style="width:${percent}%"></i>
+            </div>
+            <b>${percent}%</b>
+          </div>` : ''}
         <div class="system-signature-meta-grid">
           ${rows.map(([label, value]) => `<span><b>${escapeHtml(label)}</b><em>${escapeHtml(String(value))}</em></span>`).join('')}
         </div>
         ${checks.length ? `<div class="system-mount-progress">${checks.map(([label, ok]) => `<span><i class="${ok === true ? 'ok' : 'warn'}"></i>${escapeHtml(label)}${ok === true ? '' : '：未通过'}</span>`).join('')}</div>` : ''}
+        ${hot ? systemFlashHotServiceActions(op) : ''}
+        ${hot ? systemFlashHotAppliedFiles(op) : ''}
         ${failure ? `<p class="system-signature-note invalid-file">${escapeHtml(failure)}</p>` : ''}
         <div class="system-flash-firmware-actions">
-          <button class="glass-btn glass-btn--primary" type="button" data-system-action="flash-apply-firmware" ${busy || !canApply ? 'disabled' : ''}>${state.flashConfirm === 'firmware-apply' ? '再次点击确认应用' : '应用固件'}</button>
-          ${applyCap && applyCap.available !== true ? `<small class="system-flash-capability-note">${escapeHtml(flashReasonText(applyCap.reason) || '设备暂不能应用固件。')}</small>` : ''}
+          <button class="glass-btn glass-btn--primary" type="button" data-system-action="flash-apply-firmware" ${busy || !canApply ? 'disabled' : ''}>${systemFlashApplyButtonLabel(hot)}</button>
+          ${gateCap && gateCap.available !== true ? `<small class="system-flash-capability-note">${escapeHtml(flashReasonText(gateCap.reason) || (hot ? '设备暂不能应用热更新。' : '设备暂不能应用固件。'))}</small>` : ''}
+          ${hot && !gateCap ? '<small class="system-flash-capability-note">设备未返回热更新应用能力，是否可应用暂不可确认。</small>' : ''}
         </div>
       </section>
+    `;
+  }
+
+  function systemFlashApplyButtonLabel(hot) {
+    if (state.flashWorking === 'firmware-apply') return hot ? '正在应用热更新…' : '正在应用固件…';
+    if (state.flashConfirm === 'firmware-apply') return '再次点击确认应用';
+    return hot ? '应用热更新' : '应用固件';
+  }
+
+  /*
+   * 应用固件的确认弹窗。
+   *
+   * 三种方式写盘过程完全相同，区别只在最后那一下重启由谁触发：
+   *
+   *   立即重启   写完后由前端调 `POST /api/v1/system/reboot`
+   *   稍后手动   什么都不做，设备继续跑旧分区，用户自己选时间
+   *   定时重启   建一条 `once` 电源计划（`POST /api/v1/system/power/schedules`，
+   *              `event: reboot`），到点由设备自己重启
+   *
+   * 为什么不用 otad 自带的 `auto_reboot`：那个开关是 **verify 时**落库的
+   * （`otad_operation_worker()` 从 options_json 读回来），而 verify 发生在用户做出
+   * 这个选择之前，本页一直传 `false`。apply 只接受 `operation_id`，多带字段会被
+   * `apply_requires_preflight_operation` 拒掉，所以改不回来。既然后端固定不自动重启，
+   * 「立即重启」就必须由前端显式发起，而不是假设后端会做。
+   *
+   * 定时重启也因此不是前端起个定时器（页面一关就没了），而是落到后端电源计划表里。
+   */
+  function systemFlashApplyDialog() {
+    if (!state.flashApplyDialog) return '';
+    const op = state.flashFirmwareOperation;
+    const hot = isHotUpdateOperation(op);
+    const mode = state.flashApplyRebootMode;
+    const busy = state.flashWorking === 'firmware-apply';
+    const version = stringOr(op?.to_version || '');
+    const slot = stringOr(op?.target_slot || '');
+    const scheduleCap = flashPowerScheduleAvailable();
+    const option = (value, title, desc, disabled = false, note = '') => `
+      <label class="system-flash-reboot-option${mode === value ? ' is-active' : ''}${disabled ? ' is-disabled' : ''}">
+        <input type="radio" name="flashRebootMode" value="${value}" ${mode === value ? 'checked' : ''} ${disabled || busy ? 'disabled' : ''} data-system-flash-reboot-mode="${value}">
+        <span class="glass-radio-dot" aria-hidden="true"></span>
+        <span class="system-flash-reboot-copy">
+          <b>${escapeHtml(title)}</b>
+          <em>${escapeHtml(desc)}</em>
+          ${note ? `<small>${escapeHtml(note)}</small>` : ''}
+        </span>
+      </label>`;
+    return `
+      <div class="dwrt-kit-modal-layer system-flash-apply-layer is-open" data-system-dialog="flash-apply">
+        <button class="dwrt-kit-modal-backdrop" type="button" aria-label="关闭升级确认窗口" data-system-action="flash-apply-close"></button>
+        <section class="dwrt-kit-modal system-binding-dialog system-flash-apply-dialog" role="dialog" aria-modal="true" aria-labelledby="systemFlashApplyTitle">
+          <header class="dwrt-kit-modal-header">
+            <div>
+              <h2 id="systemFlashApplyTitle">${hot ? '应用热更新' : '升级固件'}</h2>
+              <p>${hot ? '只替换安装包内列出的文件，不写入分区。' : '镜像写入备用分区，重启后切换到新版本。'}</p>
+            </div>
+            <button class="dwrt-kit-modal-close" type="button" aria-label="关闭" data-system-action="flash-apply-close">${systemSettingsIcon('close')}</button>
+          </header>
+          <div class="dwrt-kit-modal-body system-binding-body system-flash-apply-body">
+            ${version || slot ? `
+              <div class="system-signature-meta-grid">
+                ${version ? `<span><b>目标版本</b><em>${escapeHtml(version)}</em></span>` : ''}
+                ${slot ? `<span><b>写入分区</b><em>${escapeHtml(slot)}</em></span>` : ''}
+              </div>` : ''}
+            ${hot ? `
+              <p class="system-signature-note">热更新不重启设备，只重启受影响的服务。</p>
+            ` : `
+              <fieldset class="system-flash-reboot-modes">
+                <legend>重启方式</legend>
+                ${option('now', '立即重启', '写入完成后设备立刻重启，切换到新版本。')}
+                ${option('manual', '稍后手动重启', '只写入备用分区，保持当前版本运行，由你选时间重启。')}
+                ${option('schedule', '定时重启', '写入后不重启，到指定时间由设备自动重启完成升级。', !scheduleCap, scheduleCap ? '' : '设备未开放电源计划写入，暂不可用。')}
+              </fieldset>
+              ${mode === 'schedule' ? `
+                <div class="system-flash-reboot-schedule">
+                  <label><span>日期</span><input type="date" value="${escapeHtml(state.flashApplyScheduleDate)}" min="${escapeHtml(flashTodayValue())}" data-system-flash-schedule-date ${busy ? 'disabled' : ''}></label>
+                  <label><span>时间</span><input type="time" value="${escapeHtml(state.flashApplyScheduleTime)}" data-system-flash-schedule-time ${busy ? 'disabled' : ''}></label>
+                </div>
+                <p class="system-signature-note">会在「关机 / 重启」的电源计划里新增一条一次性重启，可在那里查看或取消。</p>
+              ` : ''}
+              ${state.flashApplyScheduleError ? `<p class="system-signature-note invalid-file">${escapeHtml(state.flashApplyScheduleError)}</p>` : ''}
+              <p class="system-signature-note">升级期间请勿断电。写入失败会保留当前分区，设备仍可启动。</p>
+            `}
+          </div>
+          <footer class="dwrt-kit-modal-footer">
+            <button class="system-demo-btn secondary" type="button" data-system-action="flash-apply-close" ${busy ? 'disabled' : ''}>取消</button>
+            <button class="glass-btn glass-btn--primary" type="button" data-system-action="flash-apply-confirm" ${busy ? 'disabled' : ''}>${busy ? '正在提交…' : (hot ? '确认应用' : flashApplyConfirmLabel(mode))}</button>
+          </footer>
+        </section>
+      </div>
+    `;
+  }
+
+  function flashApplyConfirmLabel(mode) {
+    if (mode === 'manual') return '写入，不重启';
+    if (mode === 'schedule') return '写入并定时重启';
+    return '升级并立即重启';
+  }
+
+  /*
+   * 切换重启方式要整段重绘弹窗（定时那两个输入框是按 mode 条件渲染的）。日期/时间
+   * 只写 state 不重绘 —— 重绘会把用户正在编辑的输入框连焦点一起换掉。
+   */
+  function onFlashRebootModeChange(event) {
+    const value = stringOr(event.currentTarget?.dataset?.systemFlashRebootMode || '');
+    if (!value || value === state.flashApplyRebootMode) return;
+    state.flashApplyRebootMode = value;
+    state.flashApplyScheduleError = '';
+    render();
+  }
+
+  function onFlashRebootScheduleChange(event) {
+    const el = event.currentTarget;
+    if (!el) return;
+    if (el.hasAttribute('data-system-flash-schedule-date')) state.flashApplyScheduleDate = stringOr(el.value);
+    else state.flashApplyScheduleTime = stringOr(el.value);
+    state.flashApplyScheduleError = '';
+  }
+
+  /* 今天（本地日期），给 `min` 和默认值用。不能用 toISOString，那是 UTC。 */
+  function flashTodayValue() {
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  }
+
+  /*
+   * 电源计划的写入能力。`GET /api/v1/system/power` 会自述 capabilities，
+   * 读不到时按"不确认"处理：宁可把定时重启置灰，也不要给一个点了才报错的选项。
+   */
+  function flashPowerScheduleAvailable() {
+    return state.flashPowerCapabilities?.schedule_create === true;
+  }
+
+  /*
+   * 会重启哪些服务。这条必须在"应用"之前就显示：重启在后端回复后 500ms 触发，
+   * 其中可能包含 webd 自己，页面会短暂断连 —— 事先不说，用户会把它读成失败。
+   */
+  function systemFlashHotServiceActions(op) {
+    const actions = op?.service_actions;
+    if (!actions) return '';
+    const names = Array.isArray(actions)
+      ? actions.map((item) => stringOr(typeof item === 'string' ? item : (item?.service || item?.name || ''))).filter(Boolean)
+      : Object.keys(actions).filter((key) => stringOr(key));
+    if (!names.length) return '';
+    return `<p class="system-signature-note">应用后会重启：${escapeHtml(names.join('、'))}。其中若包含管理服务，页面会短暂断开几秒再自动恢复，这不是失败。</p>`;
+  }
+
+  /*
+   * apply 成功后后端给出实际落地的文件清单（installed / removed）。展示它，
+   * 因为重启之后可能没有第二次机会再问。
+   */
+  function systemFlashHotAppliedFiles(op) {
+    const installed = Array.isArray(op?.installed) ? op.installed : [];
+    const removed = Array.isArray(op?.removed) ? op.removed : [];
+    if (!installed.length && !removed.length) return '';
+    const items = installed
+      .map((item) => stringOr(item?.target_path || ''))
+      .filter(Boolean)
+      .map((path) => `<li>已更新 ${escapeHtml(path)}</li>`)
+      .concat(removed.map((path) => `<li>已删除 ${escapeHtml(stringOr(path))}</li>`));
+    if (!items.length) return '';
+    return `
+      <details class="system-flash-hot-files">
+        <summary>本次改动的文件（${items.length}）</summary>
+        <ul>${items.join('')}</ul>
+      </details>
     `;
   }
 
@@ -1066,8 +1540,11 @@ export function mount(context = {}) {
     if (!current) { render(); return; }
     // 焦点落在卡内（例如「应用固件」按钮）时不替换，否则会打断用户操作。
     if (current.contains(document.activeElement)) return;
-    const applyCap = flashCap('apply_firmware');
-    const markup = systemFlashFirmwareOperationCard(applyCap);
+    /*
+     * 传整包的能力位即可：卡内部按 artifact_type 判定热更新时会自行改取
+     * hot_update_apply，不必在这里分叉。
+     */
+    const markup = systemFlashFirmwareOperationCard(flashCap('apply_firmware'));
     if (!markup) { current.remove(); return; }
     const template = document.createElement('template');
     template.innerHTML = markup;
@@ -1433,19 +1910,39 @@ export function mount(context = {}) {
 
   function systemFlashVersionLabel(value) {
     const raw = String(value || '').trim();
+    if (!raw) return '';
     const description = raw.match(/DISTRIB_DESCRIPTION\s*=\s*['"]([^'"]+)['"]/i);
     if (description) return description[1].trim();
     const id = raw.match(/DISTRIB_ID\s*=\s*['"]?([^'"\r\n]+)['"]?/i);
     if (id) return id[1].trim();
-    return raw || 'Dreaming OS';
+    return raw;
+  }
+
+  /* 版本读不到时说清是读不到，不要补一个 'Dreaming OS' 假值冒充版本号
+     （验收单 `system-basic-version-parse` 明确禁止假值）。后端用
+     `general.version_error` 给出原因，例如 release_version_unavailable。 */
+  function systemVersionUnavailableText(data = {}) {
+    const reason = stringOr(data.general?.version_error).trim();
+    if (reason === 'release_version_unavailable') return '版本信息不可用（设备未提供 release 版本）';
+    return reason ? `版本信息不可用（${reason}）` : '版本信息不可用';
   }
 
   function systemFlashBuildLabel(f = {}) {
     const build = String(f.build_time || '').trim();
-    if (build) return build;
+    /* build_time 现在是 Unix 秒。纯数字要格式化成可读时间，否则页面上是一串时间戳；
+       老固件仍可能回一个已经排版好的字符串，那种原样透出。 */
+    if (build) return /^\d{9,13}$/.test(build) ? (formatTimestamp(build) || build) : build;
     const kernel = String(f.kernel || '').trim();
     const version = kernel.match(/Linux version\s+(\S+)/i);
     return version ? `Linux ${version[1]}` : (kernel || '未返回构建信息');
+  }
+
+  /* backup_size 可能是 null（从未备份）、字节数，或旧固件排版好的字符串。
+     null 要落到空串让调用方显示「尚无备份」，绝不能变成 NaN 或 0 字节。 */
+  function systemFlashBackupSizeLabel(value) {
+    if (value === undefined || value === null || value === '') return '';
+    if (typeof value === 'number' || /^\d+$/.test(String(value).trim())) return formatBytes(value);
+    return String(value);
   }
 
   function systemGeneralZramPanel(data) {
@@ -1546,6 +2043,7 @@ export function mount(context = {}) {
     const cpus = Array.isArray(a.cpu_interrupts) ? a.cpu_interrupts : [];
     const nics = Array.isArray(a.nic_interrupts) ? a.nic_interrupts : [];
     return `
+      ${systemAdvancedTuningCapabilityCard()}
       <section class="dwrt-kit-table-wrap system-table-card system-advanced-table-card">
         <div class="dwrt-kit-table-toolbar">
           <div class="dwrt-kit-table-title"><strong>CPU 中断</strong><span>查看 CPU 频率、负载和软硬中断状态</span></div>
@@ -1558,30 +2056,465 @@ export function mount(context = {}) {
           </table>
         </div>
       </section>
+      ${systemAdvancedSoftirqCard()}
+      ${systemAdvancedNicInterruptCard(nics)}
+      ${systemAdvancedNicTuningCard()}
+    `;
+  }
+
+  /* ── CPU 中断 / 网卡调优：能力位与实测值渲染 ───────────────────────────────
+   *
+   * 这一段的全部判据都来自后端实测能力位，不再在页面里写死结论。三种状态必须
+   * 分开表达，混同其中任意两种就会让页面说假话：
+   *
+   *   1. 内核没有这个接口   —— 软/硬中断"开关"就是这种。Linux 不提供按核关闭
+   *                            softirq/hardirq 的接口，照实说明原因即可。
+   *   2. 可调但本期未开放写入 —— netdev_budget / smp_affinity / rps_cpus 都是这种。
+   *                            必须显示当前值 + 「需评审后开放」，不能写「不支持」。
+   *   3. 能力未确认         —— 能力源请求失败或该固件还没这个节点。只说没确认。
+   */
+
+  /*
+   * 后端 reason 是机器码（linux_has_no_per_cpu_softirq_switch 之类）。直接摊给用户
+   * 等于没解释，所以在这里翻成人话；未收录的码原样显示，好过吞掉。
+   */
+  const TUNING_REASON_TEXT = {
+    linux_has_no_per_cpu_softirq_switch: 'Linux 未提供按 CPU 关闭 softirq 的接口，中断计数只能观测',
+    linux_has_no_per_cpu_hardirq_switch: 'Linux 未提供按 CPU 关闭 hardirq 的接口，中断计数只能观测',
+    kernel_managed_affinity_or_read_only: '该 IRQ 由内核托管或只读，无法改写亲和性',
+    tuning_writes_require_separate_approval: '写入调优参数会影响转发路径，需单独评审后开放',
+    no_writable_irq_affinity: '本机没有可写的 IRQ 亲和性',
+    rps_cpus_absent_for_rx_queue: '该接口的 RX 队列未导出 rps_cpus',
+    no_rx_queue_exposed_in_sysfs: 'sysfs 未导出 RX 队列，无法分流',
+    rps_cpus_read_only: 'rps_cpus 存在但内核标记为只读'
+  };
+
+  function tuningReasonText(raw) {
+    const key = stringOr(raw);
+    if (!key) return '';
+    return TUNING_REASON_TEXT[key] || key;
+  }
+
+  /* 后端能力位。null = 未确认，此时所有 *_supported 读出来都是 undefined。 */
+  function tuningCap(key) {
+    const source = state.cpuInterrupt;
+    if (!source || typeof source !== 'object') return undefined;
+    const value = source[key];
+    return typeof value === 'boolean' ? value : undefined;
+  }
+
+  function tuningReason(key) {
+    const source = state.cpuInterrupt;
+    if (!source || typeof source !== 'object') return '';
+    return tuningReasonText(source[key]);
+  }
+
+  /*
+   * 「可调但未开放写入」的统一措辞。
+   * 之所以单独抽出来：这句话是本次缺陷的正解，散落成多份副本迟早会有一份退回
+   * 「不支持」。
+   */
+  const TUNING_READONLY_NOTE = '当前可调，本期仅只读展示，开放写入需评审';
+
+  function systemAdvancedTuningCapabilityCard() {
+    const unresolved = !state.cpuInterrupt;
+    const softToggle = tuningCap('softirq_toggle_supported');
+    const hardToggle = tuningCap('hardirq_toggle_supported');
+    const writableIrq = finiteNumber(state.cpuInterrupt?.writable_irq_count, NaN);
+    /*
+     * 能力位缺失时回落到同一份响应里的实测证据，而不是直接认输说"未确认"。
+     *
+     * 30.1 现在跑的 jmxd 还没有 `*_tunable_supported` 这两个新键，但它已经如实给出
+     * `writable_irq_count: 35`——亲和性可写这件事是实测出来的，没有理由不说。
+     * 软中断参数的证据在 net-tuning 的 netdev_budget.writable；该节点在旧固件上
+     * 是 404，那时才真的没有依据，如实说未确认。
+     */
+    const budgetKnob = state.netTuning?.softirq?.knobs?.netdev_budget;
+    const softTunable = tuningCap('softirq_tunable_supported')
+      ?? (budgetKnob ? budgetKnob.writable === true : undefined);
+    const affinityTunable = tuningCap('affinity_tunable_supported')
+      ?? (Number.isFinite(writableIrq) ? writableIrq > 0 : undefined);
+    const rows = [
+      /*
+       * 开关类：恒 false 是事实，但原因必须是"内核没有这个接口"，
+       * 而不是"后端没实现合同"——后者把责任说错了，也暗示以后会有。
+       */
+      ['按核关闭软中断', softToggle, tuningReason('softirq_toggle_reason') || 'Linux 未提供按 CPU 关闭 softirq 的接口', 'absent'],
+      ['按核关闭硬中断', hardToggle, tuningReason('hardirq_toggle_reason') || 'Linux 未提供按 CPU 关闭 hardirq 的接口', 'absent'],
+      ['软中断参数（netdev_budget 等）', softTunable, TUNING_READONLY_NOTE, 'tunable'],
+      ['硬中断亲和性（smp_affinity）', affinityTunable,
+        Number.isFinite(writableIrq) && writableIrq > 0
+          ? `${formatInteger(writableIrq)} 个 IRQ 可写，${TUNING_READONLY_NOTE}`
+          : TUNING_READONLY_NOTE, 'tunable']
+    ];
+    return `
+      <section class="system-demo-panel system-advanced-panel">
+        <div class="system-advanced-title">${systemSettingsIcon('lab')}<span>可调面探测结果</span></div>
+        ${state.cpuInterruptError ? `<div class="system-inline-error">${escapeHtml(state.cpuInterruptError)}</div>` : ''}
+        <div class="system-advanced-cap-list">
+          ${rows.map(([label, supported, reason, kind]) => systemAdvancedCapRow(label, supported, reason, kind, unresolved)).join('')}
+        </div>
+        <div class="system-advanced-footer">
+          <span class="system-advanced-cap-note">${escapeHtml(state.cpuInterruptLoading || state.netTuningLoading ? '正在读取实测能力…' : '结论来自设备实测，不是固定文案')}</span>
+          <button class="glass-btn glass-btn--ghost" type="button" data-system-action="advanced-tuning-refresh" ${state.cpuInterruptLoading || state.netTuningLoading ? 'disabled' : ''}>${state.cpuInterruptLoading || state.netTuningLoading ? '读取中…' : '重新探测'}</button>
+        </div>
+      </section>
+    `;
+  }
+
+  /*
+   * 一条能力行。`kind` 决定 supported=false 怎么说：
+   *   absent  —— 内核没有这个接口，说明原因，这是终局结论。
+   *   tunable —— 实测不可写，才说"当前不可写"，并给出原因。
+   * supported=undefined 一律走"未确认"，不允许退化成否定。
+   */
+  function systemAdvancedCapRow(label, supported, reason, kind, unresolved) {
+    let cls = 'is-unknown';
+    let text = '未确认';
+    /*
+     * 未确认时绝不能沿用 reason —— reason 写的是"当前可调"，和"未确认"贴在同一行
+     * 会自相矛盾，读者只会取信其中一句。这里只说没依据。
+     */
+    let note = unresolved ? '能力源未读到，暂不下结论' : '设备未上报该能力位，暂不下结论';
+    if (supported === true) {
+      cls = 'is-on';
+      text = kind === 'tunable' ? '可调（只读）' : '支持';
+      note = reason;
+    } else if (supported === false) {
+      cls = kind === 'absent' ? 'is-absent' : 'is-off';
+      text = kind === 'absent' ? '内核无此接口' : '当前不可写';
+      note = reason;
+    }
+    return `
+      <div class="system-advanced-cap-row">
+        <strong>${escapeHtml(label)}</strong>
+        <span class="system-advanced-state ${cls}">${escapeHtml(text)}</span>
+        <em>${escapeHtml(note)}</em>
+      </div>
+    `;
+  }
+
+  /* softirq sysctl 实测值 + softnet 计数。数据源是 net-tuning。 */
+  function systemAdvancedSoftirqCard() {
+    const knobs = state.netTuning?.softirq?.knobs;
+    const summary = state.netTuning?.softirq?.softnet_summary;
+    const delta = state.netTuningDelta;
+    const order = ['netdev_budget', 'netdev_budget_usecs', 'netdev_max_backlog', 'busy_poll', 'busy_read'];
+    const labels = {
+      netdev_budget: '每轮 softirq 处理包数上限',
+      netdev_budget_usecs: '每轮 softirq 时间上限（微秒）',
+      netdev_max_backlog: '积压队列上限',
+      busy_poll: 'busy_poll',
+      busy_read: 'busy_read'
+    };
+    const body = knobs && typeof knobs === 'object'
+      ? order.filter((key) => knobs[key]).map((key) => {
+        const knob = knobs[key] || {};
+        const present = knob.present === true;
+        const writable = knob.writable === true;
+        const value = present ? stringOr(knob.value ?? knob.raw) : '';
+        return `
+          <div class="system-advanced-knob-row">
+            <strong>${escapeHtml(labels[key] || key)}</strong>
+            <code>${escapeHtml(key)}</code>
+            <span class="system-advanced-knob-value">${escapeHtml(present && value !== '' ? value : '—')}</span>
+            <span class="system-advanced-state ${present ? (writable ? 'is-on' : 'is-off') : 'is-absent'}">${escapeHtml(present ? (writable ? '可调（只读）' : '只读') : '内核无此项')}</span>
+            <em>${escapeHtml(present ? (writable ? TUNING_READONLY_NOTE : (tuningReasonText(knob.write_reason) || '内核标记为只读')) : (tuningReasonText(knob.write_reason) || '本内核未导出该 sysctl'))}</em>
+          </div>
+        `;
+      }).join('')
+      : '';
+    return `
+      <section class="system-demo-panel system-advanced-panel">
+        <div class="system-advanced-title">${systemSettingsIcon('antenna')}<span>软中断参数与积压计数</span></div>
+        ${systemAdvancedNetTuningNotice()}
+        ${body || (state.netTuning ? '<div class="system-advanced-cap-note">设备未导出 net.core 软中断参数。</div>' : '')}
+        ${summary ? `
+          <div class="system-advanced-softnet-grid">
+            ${systemAdvancedSoftnetTile('处理包数', summary.processed, delta?.processed, delta?.span_s)}
+            ${systemAdvancedSoftnetTile('丢包数', summary.dropped, delta?.dropped, delta?.span_s)}
+            ${systemAdvancedSoftnetTile('预算耗尽次数', summary.time_squeeze, delta?.time_squeeze, delta?.span_s)}
+          </div>
+          ${systemAdvancedSoftnetVerdict(summary, delta)}
+        ` : ''}
+      </section>
+    `;
+  }
+
+  function systemAdvancedSoftnetTile(label, total, deltaValue, spanSeconds) {
+    const totalNumber = finiteNumber(total, NaN);
+    const hasDelta = Number.isFinite(deltaValue);
+    const totalText = Number.isFinite(totalNumber) ? formatInteger(totalNumber) : '—';
+    /* 间隔缺失（两次采样 ts 相同）时不留半句话。 */
+    const spanText = Number.isFinite(spanSeconds) && spanSeconds > 0 ? `间隔 ${formatInteger(spanSeconds)}s 内新增` : '两次探测间新增';
+    return `
+      <div class="system-advanced-softnet-tile">
+        <em>${escapeHtml(label)}</em>
+        <strong>${escapeHtml(hasDelta ? `+${formatInteger(deltaValue)}` : totalText)}</strong>
+        <span>${escapeHtml(hasDelta ? `${spanText}｜开机累计 ${totalText}` : '开机累计值，再次探测后显示增量')}</span>
+      </div>
+    `;
+  }
+
+  /*
+   * budget_exhausted 与 backlog_dropping 是两种严重度，不能合成一个健康灯：
+   * 前者是"调 budget 也许有收益"，后者是"积压已经溢出、真的在丢包"。
+   */
+  function systemAdvancedSoftnetVerdict(summary, delta) {
+    const squeezeTotal = finiteNumber(summary.time_squeeze, 0);
+    const dropTotal = finiteNumber(summary.dropped, 0);
+    const squeezeDelta = Number.isFinite(delta?.time_squeeze) ? delta.time_squeeze : NaN;
+    const dropDelta = Number.isFinite(delta?.dropped) ? delta.dropped : NaN;
+    const lines = [];
+    /*
+     * 三档，不能压成两档：
+     *   本次采样内还在增长        —— 现在就有优化空间
+     *   累计非零但本次没再增长    —— 历史遗留，不能说成"从未发生"
+     *   累计为零                  —— 真的没发生过
+     * 中间那档最容易被写丢，而它恰恰是跑久了的机器最常见的状态。
+     */
+    if (Number.isFinite(squeezeDelta) && squeezeDelta > 0) {
+      lines.push(['is-hint', `本次采样内 softirq 预算被耗尽 ${formatInteger(squeezeDelta)} 次，提高 netdev_budget 可能有收益（有优化空间，不是故障）。`]);
+    } else if (squeezeTotal > 0) {
+      lines.push(['is-hint', `开机以来 softirq 预算共被耗尽 ${formatInteger(squeezeTotal)} 次${Number.isFinite(squeezeDelta) ? '，本次采样内未再增加' : ''}；属历史累计，可作为是否调 netdev_budget 的参考。`]);
+    } else {
+      lines.push(['is-ok', 'softirq 预算从未被耗尽，当前无需调整 netdev_budget。']);
+    }
+    if (Number.isFinite(dropDelta) && dropDelta > 0) {
+      lines.push(['is-warn', `本次采样内积压队列丢包 ${formatInteger(dropDelta)} 个，已经在丢包，严重度高于预算耗尽。`]);
+    } else if (dropTotal > 0) {
+      lines.push(['is-warn', `开机以来积压队列累计丢包 ${formatInteger(dropTotal)} 个${Number.isFinite(dropDelta) ? '，本次采样内未再增加' : ''}。`]);
+    } else {
+      lines.push(['is-ok', '积压队列无丢包。']);
+    }
+    return `<div class="system-advanced-verdict-list">${lines.map(([cls, text]) => `<p class="system-advanced-verdict ${cls}">${escapeHtml(text)}</p>`).join('')}</div>`;
+  }
+
+  /* net-tuning 不可用时的降级说明。未部署 ≠ 内核不支持，措辞必须分开。 */
+  function systemAdvancedNetTuningNotice() {
+    if (state.netTuning) return '';
+    if (state.netTuningLoading) return '<div class="system-advanced-cap-note">正在读取软中断与网卡调优数据…</div>';
+    if (state.netTuningError) return `<div class="system-inline-error">${escapeHtml(state.netTuningError)}</div>`;
+    return '<div class="system-advanced-cap-note">尚未读取调优数据。</div>';
+  }
+
+  /*
+   * 网卡硬中断表。mac / bus_id / driver / 队列数优先取 nic_interrupts 自带字段；
+   * 该固件还没下发时回落到 net-tuning 的 interfaces[] 同名接口，两边都没有才显示 —。
+   * 虚拟口（virtio 管理口）的 bus_id / driver 本来就是 null，属正常，不标异常。
+   */
+  function systemAdvancedNicInterruptCard(nics) {
+    const heads = ['网卡', 'MAC', '总线地址', '驱动', '队列数(RX/TX)', 'IRQ', '队列', 'CPU 亲和性', '状态'];
+    return `
       <section class="dwrt-kit-table-wrap system-table-card system-advanced-table-card">
         <div class="dwrt-kit-table-toolbar">
-          <div class="dwrt-kit-table-title"><strong>网卡硬中断</strong><span>查看网卡 IRQ、队列和 CPU 亲和性</span></div>
+          <div class="dwrt-kit-table-title"><strong>网卡硬中断</strong><span>网卡身份、IRQ、队列与当前 CPU 亲和性</span></div>
           <span class="dwrt-kit-table-count">${formatInteger(nics.length)} 个队列</span>
         </div>
         <div class="dwrt-kit-table-scroll system-advanced-table-scroll" data-system-scroll="advanced-nic-table">
           <table class="dwrt-kit-table system-advanced-nic-table" aria-label="网卡硬中断">
-            <thead><tr>${['网卡', 'IRQ', '队列', 'CPU 亲和性', '状态'].map((item) => `<th scope="col">${escapeHtml(item)}</th>`).join('')}</tr></thead>
-            <tbody>${nics.length ? nics.map((item) => `<tr><td>${escapeHtml(item.ifname || item.name || '-')}</td><td>${escapeHtml(item.irq || '-')}</td><td>${escapeHtml(item.queue || '-')}</td><td>${escapeHtml(item.affinity || '-')}</td><td>${systemAdvancedStateBadge(item.enabled !== false)}</td></tr>`).join('') : '<tr><td colspan="5" class="dwrt-kit-table-empty">等待后端返回网卡硬中断状态。</td></tr>'}</tbody>
+            <thead><tr>${heads.map((item) => `<th scope="col">${escapeHtml(item)}</th>`).join('')}</tr></thead>
+            <tbody>${nics.length ? nics.map(systemAdvancedNicRow).join('') : `<tr><td colspan="${heads.length}" class="dwrt-kit-table-empty">等待后端返回网卡硬中断状态。</td></tr>`}</tbody>
           </table>
         </div>
       </section>
     `;
   }
 
+  function systemAdvancedNicRow(item) {
+    const ifname = stringOr(item.ifname || item.name);
+    const iface = systemAdvancedIfaceTuning(ifname);
+    const pick = (key) => {
+      const own = item[key];
+      if (own !== undefined && own !== null && own !== '') return stringOr(own);
+      const fallback = iface ? iface[key] : undefined;
+      return fallback !== undefined && fallback !== null && fallback !== '' ? stringOr(fallback) : '';
+    };
+    /*
+     * 「字段缺失」和「这就是个虚拟口」必须分开。
+     *
+     * 缺失有两种成因：该固件的 jmxd 还没下发这些字段（30.1 现状），或接口在
+     * net-tuning 的 interfaces[] 里也找不到。这时只能显示"未提供"。
+     * 只有确实从 interfaces[] 里读到了该接口、而它的 bus_id/driver 明确是 null，
+     * 才能断言"虚拟接口"——那是后端的实测结论。
+     * 把缺失显示成"虚拟接口"会把 PCI 物理网卡说成虚拟口，是同一类假话。
+     */
+    const identityKnown = (key) => {
+      const own = item[key];
+      if (own !== undefined) return true;
+      return Boolean(iface) && Object.prototype.hasOwnProperty.call(iface, key);
+    };
+    const identityText = (key) => {
+      const value = pick(key);
+      if (value !== '') return value;
+      return identityKnown(key) ? '虚拟接口' : '未提供';
+    };
+    const mac = pick('mac');
+    /* MAC 用等宽体便于逐段核对；「未提供」是中文说明，套等宽体会挤成一小块灰字。 */
+    const macCell = mac
+      ? `<code>${escapeHtml(mac)}</code>`
+      : escapeHtml(identityKnown('mac') ? '—' : '未提供');
+    const rx = pick('rx_queues');
+    const tx = pick('tx_queues');
+    const queues = rx !== '' || tx !== '' ? `${rx === '' ? '—' : rx} / ${tx === '' ? '—' : tx}` : '—';
+    return `<tr>
+      <td>${escapeHtml(ifname || '-')}</td>
+      <td>${macCell}</td>
+      <td>${escapeHtml(identityText('bus_id'))}</td>
+      <td>${escapeHtml(identityText('driver'))}</td>
+      <td>${escapeHtml(queues)}</td>
+      <td>${escapeHtml(stringOr(item.irq) || '-')}</td>
+      <td>${escapeHtml(stringOr(item.queue) || '-')}</td>
+      <td>${systemAdvancedAffinityCell(item)}</td>
+      <td>${systemAdvancedStateBadge(item.enabled !== false)}</td>
+    </tr>`;
+  }
+
+  /*
+   * 亲和性单元格。
+   *
+   * `nic_interrupts.affinity` 优先取 `effective_affinity_list`，那是内核"实际投递到
+   * 哪个核"的结果（常常是单核，如 15），不是配置值。判断有没有绑核必须看
+   * `smp_affinity`——它才是允许集合。两者不能混用：拿 effective 判定会把从未绑核的
+   * IRQ 说成已绑在某个核上，正好搞反。
+   *
+   * 掩码全 f（或覆盖全部在线核）意味着"未绑核 / 全核可响应"，这是事实陈述而非缺陷；
+   * 此前页面只显示裸数值，用户无法判断有没有绑过。
+   */
+  function systemAdvancedAffinityCell(item) {
+    const effective = stringOr(item.affinity);
+    const irqDetail = systemAdvancedIrqDetail(item.irq);
+    const mask = stringOr(item.smp_affinity ?? irqDetail?.smp_affinity);
+    const shown = mask || effective;
+    if (!shown) return '—';
+    const unpinned = mask ? systemAdvancedAffinityIsUnpinned(mask) : false;
+    const parts = [];
+    if (unpinned) parts.push('未绑核 / 全核可响应');
+    else if (mask) parts.push('已限定在部分 CPU');
+    if (effective && effective !== mask) parts.push(`当前投递 CPU ${effective}`);
+    return `<span class="system-advanced-affinity">${escapeHtml(shown)}${parts.length ? `<em>${escapeHtml(parts.join('｜'))}</em>` : ''}</span>`;
+  }
+
+  /* 按 IRQ 号取 cpu-interrupt 里的明细，用于补 smp_affinity 掩码与可写性。 */
+  function systemAdvancedIrqDetail(irq) {
+    const list = state.cpuInterrupt?.irqs;
+    if (!Array.isArray(list)) return null;
+    const target = finiteNumber(irq, NaN);
+    if (!Number.isFinite(target)) return null;
+    return list.find((entry) => entry && finiteNumber(entry.irq, NaN) === target) || null;
+  }
+
+  /*
+   * 判断是否"未绑核"。两种形态都要认：
+   *   十六进制掩码 ffff —— /proc/irq/N/smp_affinity
+   *   CPU 列表 0-15    —— smp_affinity_list / effective_affinity_list
+   * 只有能确定覆盖全部在线核时才标注，判不准就不标，免得说错。
+   */
+  function systemAdvancedAffinityIsUnpinned(raw) {
+    const text = String(raw).trim();
+    const cpuCount = finiteNumber(state.cpuInterrupt?.cpu_count, NaN);
+    if (/^[0-9a-f]+(,[0-9a-f]+)*$/i.test(text) && !/-/.test(text)) {
+      const hex = text.replace(/,/g, '');
+      if (/^f+$/i.test(hex)) return true;
+      if (Number.isFinite(cpuCount) && cpuCount > 0) {
+        // 掩码里的 1 位数等于在线核数，即全核可响应。
+        let bits = 0;
+        for (const ch of hex) {
+          const digit = parseInt(ch, 16);
+          if (!Number.isFinite(digit)) return false;
+          bits += ((digit & 1) ? 1 : 0) + ((digit & 2) ? 1 : 0) + ((digit & 4) ? 1 : 0) + ((digit & 8) ? 1 : 0);
+        }
+        return bits >= cpuCount;
+      }
+      return false;
+    }
+    const range = text.match(/^0-(\d+)$/);
+    if (range && Number.isFinite(cpuCount) && cpuCount > 0) return Number(range[1]) === cpuCount - 1;
+    return false;
+  }
+
+  function systemAdvancedIfaceTuning(ifname) {
+    if (!ifname) return null;
+    const list = state.netTuning?.interfaces;
+    if (!Array.isArray(list)) return null;
+    return list.find((entry) => entry && stringOr(entry.ifname) === ifname) || null;
+  }
+
+  /*
+   * 每接口 RPS 能力。能力按接口分别显示：virtio 管理口只有 1 个队列，
+   * 天然无法像多队列物理口那样分散到多核，用一个全局结论覆盖所有口就是说错话。
+   */
+  function systemAdvancedNicTuningCard() {
+    const list = Array.isArray(state.netTuning?.interfaces) ? state.netTuning.interfaces : [];
+    if (!state.netTuning) return '';
+    const heads = ['网卡', '驱动', '多队列', 'RX/TX 队列', 'RPS 能力', '当前 rps_cpus'];
+    return `
+      <section class="dwrt-kit-table-wrap system-table-card system-advanced-table-card">
+        <div class="dwrt-kit-table-toolbar">
+          <div class="dwrt-kit-table-title"><strong>接收端分流（RPS）</strong><span>按接口分别探测，单队列虚拟口与多队列物理口结论不同</span></div>
+          <span class="dwrt-kit-table-count">${formatInteger(list.length)} 个接口</span>
+        </div>
+        <div class="dwrt-kit-table-scroll system-advanced-table-scroll" data-system-scroll="advanced-rps-table">
+          <table class="dwrt-kit-table system-advanced-rps-table" aria-label="接收端分流">
+            <thead><tr>${heads.map((item) => `<th scope="col">${escapeHtml(item)}</th>`).join('')}</tr></thead>
+            <tbody>${list.length ? list.map(systemAdvancedRpsRow).join('') : `<tr><td colspan="${heads.length}" class="dwrt-kit-table-empty">设备未导出可分流的接口。</td></tr>`}</tbody>
+          </table>
+        </div>
+      </section>
+    `;
+  }
+
+  function systemAdvancedRpsRow(iface) {
+    const supported = iface.rps_supported === true;
+    const writable = iface.rps_writable === true;
+    const reason = tuningReasonText(iface.rps_reason);
+    const queues = Array.isArray(iface.rx_queue_rps) ? iface.rx_queue_rps : [];
+    const masks = queues.filter((q) => q && q.present).map((q) => `rx-${q.queue}: ${stringOr(q.rps_cpus) || '—'}`);
+    let capCls = 'is-absent';
+    let capText = '内核未导出';
+    if (supported && writable) { capCls = 'is-on'; capText = '可调（只读）'; }
+    else if (supported) { capCls = 'is-off'; capText = '只读'; }
+    return `<tr>
+      <td>${escapeHtml(stringOr(iface.ifname) || '-')}</td>
+      <td>${escapeHtml(stringOr(iface.driver) || (Object.prototype.hasOwnProperty.call(iface, 'driver') ? '虚拟接口' : '未提供'))}</td>
+      <td>${escapeHtml(iface.multi_queue === true ? '是' : '否（单队列）')}</td>
+      <td>${escapeHtml(`${formatInteger(finiteNumber(iface.rx_queues, 0))} / ${formatInteger(finiteNumber(iface.tx_queues, 0))}`)}</td>
+      <td><span class="system-advanced-state ${capCls}">${escapeHtml(capText)}</span><em class="system-advanced-cap-inline">${escapeHtml(supported && writable ? TUNING_READONLY_NOTE : reason)}</em></td>
+      <td>${masks.length ? `<code>${escapeHtml(masks.join('｜'))}</code>` : '—'}</td>
+    </tr>`;
+  }
+
   function systemAdvancedCpuRow(cpu) {
     const id = cpu.id ?? cpu.cpu ?? '-';
     const softEnabled = cpu.soft_irq_enabled !== false;
     const hardEnabled = cpu.hard_irq_enabled !== false;
+    /*
+     * 「关闭软/硬中断」这两个按钮原先 disabled + title 写死「后端未提供合同」，
+     * 暗示后端缺功能、以后会补。事实是 Linux 根本没有按核关闭 softirq/hardirq 的
+     * 接口（后端实测 *_toggle_supported 恒 false 并带 reason），所以这里不再摆一个
+     * 永远点不动的动作按钮，改为如实说明：中断计数是观测量，不是开关。
+     * 能力位未确认时只说未确认。
+     */
+    const toggleAbsent = tuningCap('softirq_toggle_supported') === false || tuningCap('hardirq_toggle_supported') === false;
+    const note = state.cpuInterrupt
+      ? (toggleAbsent ? '内核无按核开关接口' : '仅可观测')
+      : '能力未确认';
+    const usage = finiteNumber(cpu.usage_percent, NaN);
     return `<tr>
-      <td>${escapeHtml(`CPU${id}`)}</td><td>${escapeHtml(cpu.frequency || cpu.freq || '-')}</td><td>${escapeHtml(cpu.usage || cpu.usage_percent || '-')}</td><td>${escapeHtml(cpu.physical_id ?? cpu.package_id ?? '-')}</td><td>${escapeHtml(cpu.core_id ?? '-')}</td>
-      <td>${systemAdvancedStateBadge(softEnabled)}</td><td>${systemAdvancedStateBadge(hardEnabled)}</td>
-      <td><span class="system-advanced-row-actions"><button type="button" disabled title="后端当前只支持 IRQ smp_affinity，未提供 CPU 软中断开关合同">${softEnabled ? '关闭软中断' : '开启软中断'}</button><button type="button" disabled title="后端当前只支持 IRQ smp_affinity，未提供 CPU 硬中断开关合同">${hardEnabled ? '关闭硬中断' : '开启硬中断'}</button></span></td>
+      <td>${escapeHtml(`CPU${id}`)}</td><td>${escapeHtml(cpu.frequency || cpu.freq || '-')}</td><td>${escapeHtml(cpu.usage || (Number.isFinite(usage) ? `${usage.toFixed(1)}%` : '-'))}</td><td>${escapeHtml(cpu.physical_id ?? cpu.package_id ?? '-')}</td><td>${escapeHtml(cpu.core_id ?? '-')}</td>
+      <td>${systemAdvancedIrqObservedBadge(softEnabled, cpu.softirq_ticks)}</td><td>${systemAdvancedIrqObservedBadge(hardEnabled, cpu.hardirq_ticks)}</td>
+      <td><span class="system-advanced-cap-inline">${escapeHtml(note)}</span></td>
     </tr>`;
+  }
+
+  /*
+   * 软/硬中断列是「在线且可观测」，不是「开启/关闭」。有 tick 计数就把它显示出来，
+   * 否则用户看到一个"开启"却不知道依据是什么。
+   */
+  function systemAdvancedIrqObservedBadge(online, ticks) {
+    const value = finiteNumber(ticks, NaN);
+    const text = online ? (Number.isFinite(value) ? `在线 · ${formatInteger(value)}` : '在线') : '离线';
+    return `<span class="system-advanced-state ${online ? 'is-on' : 'is-off'}">${escapeHtml(text)}</span>`;
   }
 
   function systemAdvancedStateBadge(enabled) {
@@ -2139,6 +3072,7 @@ export function mount(context = {}) {
         </div>
         <div class="system-admin-security-grid">
           ${systemCloudAccessPanel(twofa, apiData)}
+          ${systemApiKeyPanel()}
         </div>
       </div>
     `;
@@ -2319,9 +3253,418 @@ export function mount(context = {}) {
     `;
   }
 
+  /* ── API-Key 管理 ── */
+
+  const SYSTEM_API_KEY_TIERS = [
+    ['read_only', '只读', '只能调用读取类接口。'],
+    ['control', '读写控制', '可修改设备配置，能力接近管理员。']
+  ];
+
+  /* 建议轮换的阈值。用户要的是提示、不是强制，所以只在列表里加一个柔和标记。 */
+  const SYSTEM_API_KEY_AGE_HINT_DAYS = 90;
+
+  function systemApiKeyTierLabel(tier) {
+    const found = SYSTEM_API_KEY_TIERS.find(([id]) => id === String(tier || ''));
+    return found ? found[1] : String(tier || '未知');
+  }
+
+  function systemApiKeyDays(seconds) {
+    const value = Number(seconds || 0);
+    if (value <= 0) return 0;
+    return Math.max(0, Math.floor((Date.now() / 1000 - value) / 86400));
+  }
+
+  /*
+   * key 的「最近使用」可能是几天前，而 relativeSeconds() 到小时就封顶
+   * （「128 小时前」读起来没有意义），所以这里超过一天按天说。
+   */
+  function systemApiKeyWhenText(ts) {
+    const value = Number(ts || 0);
+    if (value <= 0) return '从未使用';
+    const diff = Math.max(0, Math.floor(Date.now() / 1000) - value);
+    if (diff < 86400) return relativeSeconds(value);
+    const days = Math.floor(diff / 86400);
+    if (days < 30) return `${days} 天前`;
+    return systemApiKeyAuditTime(value);
+  }
+
+  function systemApiKeyExpiryText(row) {
+    const expires = Number(row?.expires_at || 0);
+    if (expires <= 0) return '长期有效';
+    const remain = Math.ceil((expires - Date.now() / 1000) / 86400);
+    if (remain <= 0) return '已过期';
+    return `${remain} 天后过期`;
+  }
+
+  function systemApiKeyStateMeta(row) {
+    /* 状态取后端 `state`，不在前端重算，避免与服务端放行判定漂移。 */
+    const value = String(row?.state || '');
+    if (value === 'revoked') return { tone: 'revoked', label: '已吊销' };
+    if (value === 'expired') return { tone: 'expired', label: '已过期' };
+    return { tone: 'active', label: '生效中' };
+  }
+
+  function systemApiKeyPanel() {
+    const rows = Array.isArray(state.apiKeys) ? state.apiKeys : [];
+    const unreadable = state.apiKeys === null && !state.apiKeysLoading;
+    const active = rows.filter((row) => String(row?.state || '') === 'active').length;
+    const pill = unreadable
+      ? { tone: 'pending', text: '列表不可读' }
+      : { tone: active ? 'ready' : 'pending', text: `${active} 把生效中` };
+    return `
+      <section class="system-demo-panel system-api-key-panel">
+        <header class="system-admin-access-header">
+          <div class="system-demo-panel-title">${systemSettingsIcon('key')}<span>API-Key 管理</span></div>
+          <em class="system-admin-access-pill ${pill.tone}">${escapeHtml(pill.text)}</em>
+        </header>
+        <div class="system-admin-access-section">
+          <span class="system-admin-access-legend">对外访问凭据</span>
+          <p class="system-admin-access-note">供外部程序不经网页会话调用本机 API。明文密钥只在创建时返回一次，之后只能看到 key_id。<strong>建议定期更换，降低泄漏后的暴露时长。</strong></p>
+          <div class="system-api-key-toolbar">
+            <button class="system-demo-btn primary" type="button" data-system-action="api-key-create-open" ${state.apiKeyWorking ? 'disabled' : ''}>新建 API-Key</button>
+            <button class="system-demo-btn secondary" type="button" data-system-action="api-key-refresh" ${state.apiKeysLoading ? 'disabled' : ''}>${state.apiKeysLoading ? '读取中…' : '刷新'}</button>
+          </div>
+          ${state.apiKeyError ? `<div class="system-inline-error">${escapeHtml(state.apiKeyError)}</div>` : ''}
+          ${systemApiKeyListMarkup(rows, unreadable)}
+        </div>
+      </section>
+    `;
+  }
+
+  function systemApiKeyListMarkup(rows, unreadable) {
+    if (state.apiKeysLoading && !rows.length) {
+      return `<div class="system-api-key-empty" role="status">正在读取 API-Key 列表…</div>`;
+    }
+    if (unreadable) {
+      return `<div class="system-api-key-empty is-error">读不到 API-Key 列表${state.apiKeysError ? `：${escapeHtml(state.apiKeysError)}` : ''}。这不代表没有 key，只是当前查询失败。</div>`;
+    }
+    if (!rows.length) {
+      return `<div class="system-api-key-empty">尚未创建 API-Key。外部程序需要调用本机 API 时，在上方新建一把。</div>`;
+    }
+    return `
+      <div class="system-api-key-table-wrap">
+        <div class="dwrt-kit-table-scroll" data-system-scroll="api-keys">
+          <table class="dwrt-kit-table system-api-key-table">
+            <thead>
+              <tr>
+                <th scope="col">名称 / key_id</th>
+                <th scope="col">权限档</th>
+                <th scope="col">有效期</th>
+                <th scope="col">最近使用</th>
+                <th scope="col">来源限制</th>
+                <th scope="col">状态</th>
+                <th scope="col" class="system-api-key-ops-col">操作</th>
+              </tr>
+            </thead>
+            <tbody>${rows.map(systemApiKeyRow).join('')}</tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
+
+  function systemApiKeyRow(row) {
+    const keyId = String(row?.key_id || '');
+    const meta = systemApiKeyStateMeta(row);
+    const ageDays = systemApiKeyDays(row?.created_at);
+    const lastUsed = Number(row?.last_used_at || 0);
+    const lastIp = String(row?.last_used_ip || '');
+    const allowIps = String(row?.allow_ips || '').trim();
+    const busy = String(state.apiKeyWorking || '').endsWith(`:${keyId}`);
+    const stale = ageDays >= SYSTEM_API_KEY_AGE_HINT_DAYS && meta.tone === 'active';
+    return `
+      <tr>
+        <td>
+          <div class="system-api-key-name">
+            <strong>${escapeHtml(row?.name || '未命名')}</strong>
+            <code>${escapeHtml(keyId)}</code>
+          </div>
+        </td>
+        <td>${escapeHtml(systemApiKeyTierLabel(row?.tier))}</td>
+        <td>
+          <div class="system-api-key-cell-stack">
+            <span>${escapeHtml(systemApiKeyExpiryText(row))}</span>
+            <em class="${stale ? 'is-hint' : ''}">已使用 ${formatInteger(ageDays)} 天${stale ? ' · 建议更换' : ''}</em>
+          </div>
+        </td>
+        <td>
+          <div class="system-api-key-cell-stack">
+            <span>${escapeHtml(systemApiKeyWhenText(lastUsed))}</span>
+            <em>${lastIp ? escapeHtml(lastIp) : '无来源记录'}</em>
+          </div>
+        </td>
+        <td>${allowIps ? `<span class="system-api-key-ips">${escapeHtml(allowIps)}</span>` : '<em class="system-api-key-muted">不限制</em>'}</td>
+        <td><span class="system-api-key-state is-${meta.tone}">${escapeHtml(meta.label)}</span></td>
+        <td class="system-api-key-ops-col">
+          <div class="system-api-key-ops">
+            <button class="system-demo-btn compact-btn secondary" type="button" data-system-action="api-key-audit" data-api-key-id="${escapeHtml(keyId)}">审计</button>
+            ${meta.tone === 'revoked' ? '' : `<button class="system-demo-btn compact-btn secondary danger" type="button" data-system-action="api-key-revoke" data-api-key-id="${escapeHtml(keyId)}" ${busy ? 'disabled' : ''}>吊销</button>`}
+            <button class="system-demo-btn compact-btn secondary danger" type="button" data-system-action="api-key-delete" data-api-key-id="${escapeHtml(keyId)}" ${busy ? 'disabled' : ''}>删除</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }
+
   function systemBindingDialog() {
     if (page !== 'admin' || !state.bindingDialog) return '';
     return state.bindingDialog === 'otp' ? systemOtpBindingDialog() : systemAppBindingDialog();
+  }
+
+  /*
+   * API-Key 弹窗组：新建表单、明文一次性展示、审计轨迹。
+   * 三者互斥，同一时刻只渲染一个；危险操作的二次确认走 Kit 的 confirmationMarkup。
+   */
+  function systemApiKeyDialog() {
+    if (page !== 'admin') return '';
+    if (state.apiKeyConfirm) return systemApiKeyConfirmMarkup();
+    if (state.apiKeyDialog === 'create') return systemApiKeyCreateDialog();
+    if (state.apiKeyDialog === 'created') return systemApiKeyRevealDialog();
+    if (state.apiKeyDialog === 'audit') return systemApiKeyAuditDialog();
+    return '';
+  }
+
+  function systemApiKeyConfirmMarkup() {
+    const pending = state.apiKeyConfirm || {};
+    const revoking = pending.action === 'revoke';
+    const name = String(pending.name || pending.keyId || '');
+    const description = revoking
+      ? `吊销后这把 key 立即失效，正在使用它的外部程序会开始收到拒绝。审计记录会保留。`
+      : `删除后这把 key 从列表消失且无法恢复，正在使用它的外部程序会开始收到拒绝。已产生的审计记录仍会保留。`;
+    const markup = ui.confirmationMarkup?.({
+      id: 'system-api-key-confirmation',
+      action: `api-key-${revoking ? 'revoke' : 'delete'}`,
+      tone: 'danger',
+      title: `确认${revoking ? '吊销' : '删除'}「${name}」`,
+      description,
+      confirmLabel: state.apiKeyWorking ? '正在提交' : `确认${revoking ? '吊销' : '删除'}`,
+      cancelLabel: '返回',
+      disabled: Boolean(state.apiKeyWorking)
+    });
+    return markup || '';
+  }
+
+  function systemApiKeyCreateDialog() {
+    const draft = state.apiKeyDraft || apiKeyDraftDefaults();
+    const nameOk = Boolean(String(draft.name || '').trim());
+    const busy = state.apiKeyWorking === 'create';
+    return `
+      <div class="dwrt-kit-modal-layer system-api-key-layer is-open" data-system-dialog="api-key-create">
+        <button class="dwrt-kit-modal-backdrop" type="button" aria-label="关闭新建 API-Key 窗口" data-system-action="api-key-close"></button>
+        <section class="dwrt-kit-modal system-binding-dialog system-api-key-dialog" role="dialog" aria-modal="true" aria-labelledby="systemApiKeyCreateTitle">
+          <header class="dwrt-kit-modal-header">
+            <div>
+              <h2 id="systemApiKeyCreateTitle">新建 API-Key</h2>
+              <p>创建后明文密钥只显示一次，请当场复制保存。</p>
+            </div>
+            <button class="dwrt-kit-modal-close" type="button" aria-label="关闭" data-system-action="api-key-close">${systemSettingsIcon('close')}</button>
+          </header>
+          <div class="dwrt-kit-modal-body system-binding-body system-api-key-form">
+            <label class="system-admin-input-group">
+              <span>名称备注</span>
+              <input class="system-glass-input" type="text" maxlength="64" value="${escapeHtml(draft.name || '')}" placeholder="例如：家庭助理只读采集" data-system-api-key-field="name" autofocus>
+            </label>
+            <div class="system-api-key-field">
+              <span class="system-api-key-field-label">权限档</span>
+              <div class="system-api-key-segment" role="radiogroup" aria-label="权限档">
+                ${SYSTEM_API_KEY_TIERS.map(([id, label]) => `
+                  <button class="system-api-key-segment-btn ${draft.tier === id ? 'is-active' : ''}" type="button" role="radio" aria-checked="${draft.tier === id ? 'true' : 'false'}" data-system-api-key-segment="tier" data-system-api-key-value="${escapeHtml(id)}">${escapeHtml(label)}</button>
+                `).join('')}
+              </div>
+              <em class="system-api-key-field-hint">${escapeHtml((SYSTEM_API_KEY_TIERS.find(([id]) => id === draft.tier) || SYSTEM_API_KEY_TIERS[0])[2])}</em>
+            </div>
+            <div class="system-api-key-field">
+              <span class="system-api-key-field-label">有效期</span>
+              <div class="system-api-key-segment" role="radiogroup" aria-label="有效期">
+                ${[['', '长期'], ['30', '30 天'], ['90', '90 天'], ['365', '365 天']].map(([value, label]) => `
+                  <button class="system-api-key-segment-btn ${String(draft.expires_days || '') === value ? 'is-active' : ''}" type="button" role="radio" aria-checked="${String(draft.expires_days || '') === value ? 'true' : 'false'}" data-system-api-key-segment="expires_days" data-system-api-key-value="${escapeHtml(value)}">${escapeHtml(label)}</button>
+                `).join('')}
+              </div>
+              <em class="system-api-key-field-hint">选择「长期」则不自动过期，建议定期更换。</em>
+            </div>
+            <label class="system-admin-input-group">
+              <span>来源 IP 白名单（可选）</span>
+              <input class="system-glass-input" type="text" value="${escapeHtml(draft.allow_ips || '')}" placeholder="留空为不限制，例如 192.168.30.0/24, 10.0.0.5" data-system-api-key-field="allow_ips">
+            </label>
+            <div class="system-api-key-warning">
+              ${systemSettingsIcon('warning')}
+              <div>
+                <strong>这是一把可被程序直接使用的凭据</strong>
+                <span>读写档的 key 能修改设备配置，泄漏后可能造成配置被改或数据受损。请只发给可信程序，并按需限制来源 IP。具体可调用范围由后端权限表决定。</span>
+              </div>
+            </div>
+            ${state.apiKeyError ? `<div class="system-inline-error">${escapeHtml(state.apiKeyError)}</div>` : ''}
+          </div>
+          <footer class="dwrt-kit-modal-footer">
+            <button class="system-demo-btn secondary" type="button" data-system-action="api-key-close">取消</button>
+            <button class="system-demo-btn primary" type="button" data-system-action="api-key-create-submit" ${(!nameOk || busy) ? 'disabled' : ''}>${busy ? '创建中…' : '创建'}</button>
+          </footer>
+        </section>
+      </div>`;
+  }
+
+  /*
+   * 明文一次性展示。值只从 state 内存读，不落任何持久化存储，
+   * 关闭窗口即清空（closeApiKeyDialog）。
+   */
+  function systemApiKeyRevealDialog() {
+    const created = state.apiKeyCreated || {};
+    const plain = String(state.apiKeyPlaintext || '');
+    return `
+      <div class="dwrt-kit-modal-layer system-api-key-layer is-open" data-system-dialog="api-key-created">
+        <button class="dwrt-kit-modal-backdrop" type="button" aria-label="关闭密钥展示窗口" data-system-action="api-key-close"></button>
+        <section class="dwrt-kit-modal system-binding-dialog system-api-key-dialog" role="dialog" aria-modal="true" aria-labelledby="systemApiKeyRevealTitle">
+          <header class="dwrt-kit-modal-header">
+            <div>
+              <h2 id="systemApiKeyRevealTitle">API-Key 已创建</h2>
+              <p>「${escapeHtml(created.name || '')}」· ${escapeHtml(systemApiKeyTierLabel(created.tier))}</p>
+            </div>
+            <button class="dwrt-kit-modal-close" type="button" aria-label="关闭" data-system-action="api-key-close">${systemSettingsIcon('close')}</button>
+          </header>
+          <div class="dwrt-kit-modal-body system-binding-body">
+            <div class="system-api-key-reveal-warning">
+              ${systemSettingsIcon('warning')}
+              <span><strong>关闭后无法再次查看。</strong>密钥只在本次响应中返回，路由器只保存它的摘要，没有任何途径可以重新读出明文。</span>
+            </div>
+            <div class="system-api-key-reveal-box">
+              <code data-system-api-key-plain>${escapeHtml(plain)}</code>
+              <button class="system-demo-btn compact-btn" type="button" data-system-action="api-key-copy">复制</button>
+            </div>
+            <div class="system-api-key-reveal-meta">
+              <span><b>key_id</b><em>${escapeHtml(created.key_id || '')}</em></span>
+              <span><b>有效期</b><em>${Number(created.expires_at || 0) > 0 ? escapeHtml(systemApiKeyExpiryText(created)) : '长期有效'}</em></span>
+            </div>
+          </div>
+          <footer class="dwrt-kit-modal-footer">
+            <button class="system-demo-btn primary" type="button" data-system-action="api-key-close">我已保存，关闭</button>
+          </footer>
+        </section>
+      </div>`;
+  }
+
+  function systemApiKeyAuditDialog() {
+    const keyId = String(state.apiKeyAuditFor || '');
+    const rows = Array.isArray(state.apiKeyAudit) ? state.apiKeyAudit : [];
+    return `
+      <div class="dwrt-kit-modal-layer system-api-key-layer is-open" data-system-dialog="api-key-audit">
+        <button class="dwrt-kit-modal-backdrop" type="button" aria-label="关闭审计记录窗口" data-system-action="api-key-close"></button>
+        <section class="dwrt-kit-modal system-binding-dialog system-api-key-audit-dialog" role="dialog" aria-modal="true" aria-labelledby="systemApiKeyAuditTitle">
+          <header class="dwrt-kit-modal-header">
+            <div>
+              <h2 id="systemApiKeyAuditTitle">API-Key 审计记录</h2>
+              <p>key_id ${escapeHtml(keyId)} · 最近 100 条，按时间倒序</p>
+            </div>
+            <button class="dwrt-kit-modal-close" type="button" aria-label="关闭" data-system-action="api-key-close">${systemSettingsIcon('close')}</button>
+          </header>
+          <div class="dwrt-kit-modal-body system-api-key-audit-body">
+            ${systemApiKeyAuditTable(rows)}
+          </div>
+          <footer class="dwrt-kit-modal-footer">
+            <button class="system-demo-btn secondary" type="button" data-system-action="api-key-audit-refresh" ${state.apiKeyAuditLoading ? 'disabled' : ''}>${state.apiKeyAuditLoading ? '读取中…' : '刷新'}</button>
+            <button class="system-demo-btn primary" type="button" data-system-action="api-key-close">关闭</button>
+          </footer>
+        </section>
+      </div>`;
+  }
+
+  function systemApiKeyAuditTable(rows) {
+    if (state.apiKeyAuditLoading && !rows.length) {
+      return `<div class="system-api-key-empty" role="status">正在读取审计记录…</div>`;
+    }
+    if (state.apiKeyAudit === null) {
+      return `<div class="system-api-key-empty is-error">读不到审计记录${state.apiKeyAuditError ? `：${escapeHtml(state.apiKeyAuditError)}` : ''}。</div>`;
+    }
+    if (!rows.length) {
+      return `<div class="system-api-key-empty">这把 key 还没有产生审计记录。</div>`;
+    }
+    return `
+      <div class="system-api-key-table-wrap">
+        <div class="dwrt-kit-table-scroll" data-system-scroll="api-key-audit">
+          <table class="dwrt-kit-table system-api-key-audit-table">
+            <thead>
+              <tr>
+                <th scope="col">时间</th>
+                <th scope="col">操作</th>
+                <th scope="col">目标</th>
+                <th scope="col">来源 IP</th>
+                <th scope="col">User-Agent</th>
+                <th scope="col">结果</th>
+              </tr>
+            </thead>
+            <tbody>${rows.map(systemApiKeyAuditRow).join('')}</tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
+
+  /*
+   * 审计行。`source_ip` 与 `user_agent` 都是请求方可控输入，后端原样存原样返回，
+   * 所以这里必须全部走 escapeHtml，绝不能拼进 innerHTML —— 否则审计页就是一个
+   * 直接面向管理员的存储型 XSS 入口。UA 很长，列内截断，完整值走项目自有 tooltip。
+   */
+  function systemApiKeyAuditRow(row) {
+    const failure = String(row?.failure_reason || '');
+    const result = String(row?.result || '');
+    const tone = systemApiKeyAuditTone(result, failure);
+    const ua = String(row?.user_agent || '');
+    const ip = String(row?.source_ip || row?.peer_ip || '');
+    return `
+      <tr class="${tone.rowClass}">
+        <td>${escapeHtml(systemApiKeyAuditTime(row?.ts))}</td>
+        <td>${escapeHtml(row?.action || '')}</td>
+        <td class="system-api-key-audit-target">${escapeHtml(row?.target || '')}</td>
+        <td>${ip ? escapeHtml(ip) : '<em class="system-api-key-muted">未记录</em>'}</td>
+        <td class="system-api-key-audit-ua">${ua ? `<span data-dwrt-tooltip="${escapeHtml(ua)}">${escapeHtml(ua)}</span>` : '<em class="system-api-key-muted">未记录</em>'}</td>
+        <td><span class="system-api-key-audit-result is-${tone.tone}">${escapeHtml(tone.label)}</span></td>
+      </tr>
+    `;
+  }
+
+  function systemApiKeyAuditTime(ts) {
+    const value = Number(ts || 0);
+    if (value <= 0) return '未记录';
+    try {
+      /* 补零的固定宽度格式，等宽数字下各行时间列能对齐扫读。 */
+      return new Date(value * 1000).toLocaleString('zh-CN', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false
+      });
+    } catch (_) {
+      return String(value);
+    }
+  }
+
+  /*
+   * 拒绝原因用后端稳定的机器可读值分类（webd_api_key_result_str 那套），
+   * 不靠 result 文案猜。命中不了就原样显示，不假装认识。
+   */
+  function systemApiKeyAuditTone(result, failure) {
+    const reason = String(failure || '').toLowerCase();
+    const map = {
+      scope_denied: '越权',
+      forbidden_route: '禁止路由',
+      expired: '已过期',
+      revoked: '已吊销',
+      rate_limited: '限速',
+      ip_not_allowed: '来源不许可',
+      unknown: '未知 key',
+      malformed: '格式错误',
+      not_presented: '未提供凭据',
+      db_error: '存储错误'
+    };
+    if (reason && map[reason]) return { tone: 'denied', label: map[reason], rowClass: 'is-failed' };
+    if (reason) return { tone: 'denied', label: reason, rowClass: 'is-failed' };
+    /* 成功类结果统一说人话，不把 `ok` / `200` 这类机器值直接摊给用户。 */
+    const success = {
+      ok: '成功', success: '成功', allowed: '允许', created: '已创建',
+      revoked: '已吊销', deleted: '已删除', 200: '成功'
+    };
+    const key = String(result || '').toLowerCase();
+    if (success[key]) return { tone: 'ok', label: success[key], rowClass: '' };
+    if (!result) return { tone: 'ok', label: '成功', rowClass: '' };
+    return { tone: 'denied', label: result, rowClass: 'is-failed' };
   }
 
   function systemOtpBindingDialog() {
@@ -2509,6 +3852,17 @@ export function mount(context = {}) {
     }));
   }
 
+  /* 确认层叠在最上面，焦点必须落在它里面，否则 Tab 会走到被遮住的表单上。 */
+  function focusApiKeyConfirmation() {
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const dialog = root?.querySelector('.dwrt-kit-confirmation');
+      const target = dialog?.querySelector('[data-dwrt-confirm-accept]:not(:disabled), [data-dwrt-confirm-cancel]');
+      if (target instanceof HTMLElement && !dialog.contains(document.activeElement)) {
+        try { target.focus({ preventScroll: true }); } catch (_) { target.focus(); }
+      }
+    }));
+  }
+
   function openBindingDialog(kind) {
     state.bindingDialog = kind === 'app' ? 'app' : 'otp';
     state.saveError = '';
@@ -2543,6 +3897,19 @@ export function mount(context = {}) {
     if (event.key === 'Escape' && state.bindingDialog) {
       event.preventDefault();
       closeBindingDialog();
+      return;
+    }
+    if (event.key !== 'Escape') return;
+    /* 确认弹窗叠在其它 API-Key 弹窗之上，Escape 先退确认层再退弹窗本体。 */
+    if (state.apiKeyConfirm) {
+      event.preventDefault();
+      state.apiKeyConfirm = null;
+      render();
+      return;
+    }
+    if (state.apiKeyDialog) {
+      event.preventDefault();
+      closeApiKeyDialog();
     }
   }
 
@@ -2894,11 +4261,28 @@ export function mount(context = {}) {
     root.querySelectorAll('[data-system-flash-keep-settings]').forEach((el) => {
       el.addEventListener('change', onFlashKeepSettingsChange);
     });
+    root.querySelectorAll('[data-system-flash-reboot-mode]').forEach((el) => {
+      el.addEventListener('change', onFlashRebootModeChange);
+    });
+    root.querySelectorAll('[data-system-flash-schedule-date]').forEach((el) => {
+      el.addEventListener('change', onFlashRebootScheduleChange);
+    });
+    root.querySelectorAll('[data-system-flash-schedule-time]').forEach((el) => {
+      el.addEventListener('change', onFlashRebootScheduleChange);
+    });
     root.querySelectorAll('[data-system-signature-upload]').forEach((el) => {
       el.addEventListener('change', onSignatureUpdateFileSelect);
     });
     root.querySelectorAll('[data-system-schedule-field]').forEach((el) => {
       el.addEventListener('change', onFlashScheduleFieldChange);
+    });
+    /*
+     * 新建表单的字段单独绑定，不走 data-system-field —— 那条路径会写进
+     * state.data 并让底部保存条以为有未保存的系统设置，而 key 是即时创建的，
+     * 不属于保存条管辖的内容。
+     */
+    root.querySelectorAll('[data-system-api-key-field]').forEach((el) => {
+      el.addEventListener('input', onApiKeyDraftInput);
     });
   }
 
@@ -3175,6 +4559,8 @@ export function mount(context = {}) {
       state.flashError = '';
       render();
       if (state.flashTab === 'firmware' && !state.flashPreserveAvailable && !state.flashPreserveLoading) loadFlashPreserveConfig();
+      // 回滚面板在固件页，引导状态跟着这个页签按需读一次。
+      if (state.flashTab === 'firmware' && !state.otaStatusLoaded && !state.otaStatusLoading) loadOtaStatus();
       if (state.flashTab === 'operations' && !state.flashBackupsLoaded && !state.flashBackupsLoading) loadFlashBackups();
       if (state.flashTab === 'operations' && !state.flashBackupPolicyLoaded && !state.flashBackupPolicyLoading) loadFlashBackupPolicy();
       if (!state.flashCapabilitiesLoaded && !state.flashCapabilitiesLoading) loadFlashCapabilities();
@@ -3185,6 +4571,11 @@ export function mount(context = {}) {
     if (advancedTabBtn && root.contains(advancedTabBtn)) {
       setAdvancedTab(advancedTabBtn.dataset.systemAdvancedTab || 'performance');
       render();
+      /*
+       * CPU 页签的能力位与调优观测按需拉一次。它们是这一屏的权威来源，
+       * 不能等 system/basic 的概览字段替它们下结论。
+       */
+      if (state.advancedTab === 'cpu') loadAdvancedTuningSources();
       event.preventDefault();
       return;
     }
@@ -3197,6 +4588,30 @@ export function mount(context = {}) {
       return;
     }
     const action = event.target.closest('[data-system-action]');
+    /* Kit 确认弹窗的接受/取消：沿用 Kit 的 data 属性，不另造一套确认交互。 */
+    const confirmAccept = event.target.closest('[data-dwrt-confirm-accept]');
+    if (confirmAccept && root.contains(confirmAccept) && state.apiKeyConfirm) {
+      event.preventDefault();
+      commitApiKeyConfirm();
+      return;
+    }
+    const confirmCancel = event.target.closest('[data-dwrt-confirm-cancel]');
+    if (confirmCancel && root.contains(confirmCancel) && state.apiKeyConfirm) {
+      event.preventDefault();
+      state.apiKeyConfirm = null;
+      render();
+      return;
+    }
+    const apiKeySegment = event.target.closest('[data-system-api-key-segment]');
+    if (apiKeySegment && root.contains(apiKeySegment)) {
+      event.preventDefault();
+      state.apiKeyDraft = {
+        ...(state.apiKeyDraft || apiKeyDraftDefaults()),
+        [apiKeySegment.dataset.systemApiKeySegment]: apiKeySegment.dataset.systemApiKeyValue || ''
+      };
+      render();
+      return;
+    }
     if (!action || !root.contains(action)) return;
     const name = action.dataset.systemAction;
     event.preventDefault();
@@ -3216,6 +4631,15 @@ export function mount(context = {}) {
     else if (name === 'api-approve-pairing') approveAppPairing();
     else if (name === 'api-cancel-pairing') cancelAppPairing();
     else if (name === 'api-revoke-device') revokeAppDevice(action.dataset.apiId || '');
+    else if (name === 'api-key-create-open') openApiKeyCreate();
+    else if (name === 'api-key-close') closeApiKeyDialog();
+    else if (name === 'api-key-refresh') loadApiKeys(true);
+    else if (name === 'api-key-create-submit') createApiKey();
+    else if (name === 'api-key-copy') copyApiKeyPlaintext(action);
+    else if (name === 'api-key-revoke') openApiKeyConfirm('revoke', action.dataset.apiKeyId || '');
+    else if (name === 'api-key-delete') openApiKeyConfirm('delete', action.dataset.apiKeyId || '');
+    else if (name === 'api-key-audit') openApiKeyAudit(action.dataset.apiKeyId || '');
+    else if (name === 'api-key-audit-refresh') loadApiKeyAudit(state.apiKeyAuditFor, true);
     else if (name === 'cloud-copy-fingerprint') copyFingerprintValue(action);
     else if (startupServiceActionFromDataset(name)) handleStartupServiceAction(action.dataset.serviceName || '', startupServiceActionFromDataset(name));
     else if (name === 'mount-generate-config') handleMountOperation('generate');
@@ -3228,11 +4652,17 @@ export function mount(context = {}) {
     else if (name === 'flash-delete-archive') deleteFlashArchive(action.dataset.backupId || '');
     else if (name === 'flash-upload-verify') uploadAndVerifyFirmware();
     else if (name === 'flash-apply-firmware') applyFirmwareOperation();
+    else if (name === 'flash-apply-close') closeFlashApplyDialog();
+    else if (name === 'flash-apply-confirm') confirmFlashApply();
     else if (name === 'flash-factory-reset') factoryResetFlash();
+    else if (name === 'flash-ota-rollback') rollbackFirmware();
+    else if (name === 'flash-ota-confirm-boot') confirmOtaBoot();
     else if (name === 'flash-save-preserve') saveFlashPreserveConfig();
     else if (name === 'flash-save-backup-policy') saveFlashBackupPolicy();
     else if (name === 'signature-apply-package') applySignatureUpdate();
     else if (name === 'advanced-kernel-restore-defaults') restoreAdvancedKernelDefaults();
+    /* 重新探测可调面。第二次采样才能算出 time_squeeze 增量，所以强制重发。 */
+    else if (name === 'advanced-tuning-refresh') loadAdvancedTuningSources(true);
   }
 
   function addNtpServer() {
@@ -3383,6 +4813,118 @@ export function mount(context = {}) {
     return result?.data && typeof result.data === 'object' ? result.data : (result || {});
   }
 
+  /*
+   * 调优能力源的失败分类。与 flashCapabilityFailureText 同一套判据，但措辞落在
+   * 「调优观测」上：404/501 是这台设备的 jmxd 还没带这个节点（后端已实现未部署），
+   * 401 是会话失效，403 是权限不足——三者都不等于"内核不支持调优"。
+   */
+  function netTuningFailureText(error) {
+    const status = Number(error?.status || 0);
+    const code = stringOr(error?.payload?.error?.code || error?.payload?.code || '');
+    if (code === 'method_not_registered') return '当前固件的 jmxd 尚未提供网卡/软中断观测接口，先按已有数据降级显示。';
+    if (status === 404 || status === 405 || status === 501) return '当前固件的 jmxd 尚未提供网卡/软中断观测接口，先按已有数据降级显示。';
+    if (status === 401) return '会话已失效，请重新登录后再查看调优数据。';
+    if (status === 403) return '当前账号权限不足，无法读取调优观测数据。';
+    if (status >= 500) return `设备返回错误（${status}），调优数据暂不可确认。`;
+    if (!status) return '网络不可用，调优数据暂不可确认。';
+    return `调优数据暂不可确认（${status}）。`;
+  }
+
+  /*
+   * `GET /system/advanced/cpu-interrupt` 是中断可调面的权威来源：它按实测给出
+   * softirq/hardirq 开关是否存在（Linux 没有这种接口，恒 false 且带 reason）、
+   * netdev_budget 是否可写、是否存在可写的 smp_affinity。
+   *
+   * 页面必须区分「内核没有这个接口」和「可调但本期未开放写入」——把后者显示成
+   * 「不支持」正是用户报的那个缺陷。
+   */
+  async function loadCpuInterrupt() {
+    if (state.cpuInterruptLoading) return;
+    state.cpuInterruptLoading = true;
+    state.cpuInterruptError = '';
+    render();
+    try {
+      const payload = flashPayload(await fetchJson('/api/v1/system/advanced/cpu-interrupt'));
+      state.cpuInterrupt = payload && typeof payload === 'object' ? payload : {};
+      state.cpuInterruptLoaded = true;
+    } catch (error) {
+      // null 表示"未确认"。写空对象会被下游读成"能力位全 false"，也就是又一次说假话。
+      state.cpuInterrupt = null;
+      state.cpuInterruptError = netTuningFailureText(error);
+    } finally {
+      state.cpuInterruptLoading = false;
+      render();
+    }
+  }
+
+  /*
+   * `GET /system/advanced/net-tuning`：softirq sysctl 实测值、softnet 每核计数、
+   * 网卡身份与 RPS 能力。只读源，viewer 可读。
+   *
+   * 404/501 单独记在 netTuningSupported=false：那是"这台设备的 jmxd 还没这个节点"，
+   * 页面走降级（继续用 system/basic 里的 nic_interrupts），不崩也不显示空白。
+   */
+  async function loadNetTuning() {
+    if (state.netTuningLoading) return;
+    state.netTuningLoading = true;
+    state.netTuningError = '';
+    render();
+    try {
+      const payload = flashPayload(await fetchJson('/api/v1/system/advanced/net-tuning'));
+      const next = payload && typeof payload === 'object' ? payload : {};
+      state.netTuningDelta = netTuningComputeDelta(state.netTuningPrevSample, next);
+      state.netTuningPrevSample = netTuningSampleOf(next);
+      state.netTuning = next;
+      state.netTuningSupported = true;
+      state.netTuningLoaded = true;
+    } catch (error) {
+      const status = Number(error?.status || 0);
+      const code = stringOr(error?.payload?.error?.code || error?.payload?.code || '');
+      state.netTuning = null;
+      state.netTuningSupported = (status === 404 || status === 405 || status === 501 ||
+        code === 'method_not_registered') ? false : undefined;
+      state.netTuningError = netTuningFailureText(error);
+    } finally {
+      state.netTuningLoading = false;
+      render();
+    }
+  }
+
+  /* softnet 累计计数器的一次采样，用于算差值。 */
+  function netTuningSampleOf(payload) {
+    const summary = payload?.softirq?.softnet_summary;
+    if (!summary || typeof summary !== 'object') return null;
+    return {
+      ts: finiteNumber(payload?.ts, 0),
+      processed: finiteNumber(summary.processed, NaN),
+      dropped: finiteNumber(summary.dropped, NaN),
+      time_squeeze: finiteNumber(summary.time_squeeze, NaN)
+    };
+  }
+
+  /*
+   * 两次采样之差。累计值对跑了几十天的机器永远非零，会变成一条读不出信息的常亮告警；
+   * 差值才回答"现在还在不在挤压"。首次采样没有前值，返回 null 并如实说明。
+   */
+  function netTuningComputeDelta(prev, payload) {
+    const now = netTuningSampleOf(payload);
+    if (!prev || !now) return null;
+    const span = now.ts - prev.ts;
+    const diff = (key) => {
+      const a = finiteNumber(prev[key], NaN);
+      const b = finiteNumber(now[key], NaN);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) return NaN;
+      // 计数器回绕或设备重启会让差值为负，那时只能说"不可比"，不能显示负数。
+      return b < a ? NaN : b - a;
+    };
+    return {
+      span_s: Number.isFinite(span) && span > 0 ? span : NaN,
+      processed: diff('processed'),
+      dropped: diff('dropped'),
+      time_squeeze: diff('time_squeeze')
+    };
+  }
+
   async function createFlashBackup() {
     // 判据与按钮 disabled 必须同源，否则按钮可点但函数第一行就静默返回。
     if (state.flashWorking || !flashBackupCapability('flash_backup_create', 'create_backup')) return;
@@ -3522,10 +5064,18 @@ export function mount(context = {}) {
         auto_reboot: false
       }));
       state.flashFirmwareOperation = flashOperationFromResponse(verify);
+      const hot = isHotUpdateOperation(state.flashFirmwareOperation);
       state.flashMessage = state.flashFirmwareOperation
-        ? '固件校验已完成，结果见下方「本次升级校验」。'
-        : '固件校验已提交，但设备未返回 operation_id。';
-      if (state.flashFirmwareOperation && !isFlashOperationTerminal(state.flashFirmwareOperation)) {
+        ? (hot
+          ? '这是热更新包，校验已完成，结果见下方「本次热更新校验」。'
+          : '固件校验已完成，结果见下方「本次升级校验」。')
+        : '校验已提交，但设备未返回 operation_id。';
+      /*
+       * 热更新的 apply 是同步的（能力源 hot_update_apply_async 为 false），
+       * 台账只在调用返回后一次性翻成 success/failed，中途轮询拿不到任何进展，
+       * 只会让卡片空转。整包仍按原样轮询。
+       */
+      if (state.flashFirmwareOperation && !hot && !isFlashOperationTerminal(state.flashFirmwareOperation)) {
         startFlashOperationPolling();
       }
     } catch (error) {
@@ -3548,6 +5098,102 @@ export function mount(context = {}) {
     if (status === 404 || status === 405 || status === 501) return '设备未实现该接口。';
     if (!status) return message || '网络不可用。';
     return message || code || `请求失败（${status}）`;
+  }
+
+  /*
+   * A/B 引导状态。字段名以 30.1 实测响应为准（`slot_status.pending_slot`、
+   * `current_slot`、`active_slot`），不是交接单里写的 `boot_pending_slot`；
+   * 实测该响应也没有 tries 计数字段，所以页面不编造「剩余次数」。
+   */
+  async function loadOtaStatus() {
+    if (state.otaStatusLoading) return;
+    state.otaStatusLoading = true;
+    state.otaStatusError = '';
+    render();
+    try {
+      state.otaStatus = flashPayload(await fetchJson('/api/v1/system/ota/status')) || {};
+      state.otaStatusLoaded = true;
+    } catch (error) {
+      // null 表示未确认。写空对象会被读成「设备明确不支持回滚」，那是另一件事。
+      state.otaStatus = null;
+      state.otaStatusError = `引导状态未能读取：${flashRequestErrorText(error)}`;
+    } finally {
+      state.otaStatusLoading = false;
+      render();
+    }
+  }
+
+  function otaSlotStatus() {
+    const s = state.otaStatus?.slot_status;
+    return s && typeof s === 'object' ? s : {};
+  }
+
+  /* 待确认引导：pending_slot 非空即代表新槽尚未确认。未确认时 A/B 方案会在
+     tries 用尽后自动回落到旧槽——用户以为升级成功了，下次重启却回到旧版本，
+     所以这一步必须在页面上可见。 */
+  function otaPendingSlot() {
+    return stringOr(otaSlotStatus().pending_slot).trim();
+  }
+
+  /*
+   * 回滚会切换引导分区并重启，属高危操作，沿用页面既有的 flashConfirm 二次确认模式。
+   * 能力判定只取目标端点自身：capabilities 的 rollback_firmware 与 ota/status 的
+   * rollback_enabled，前端不另立判据（design.md「Capability truth」第 1 条）。
+   */
+  async function rollbackFirmware() {
+    if (state.flashWorking) return;
+    if (!flashCapAvailable('rollback_firmware')) return;
+    if (state.otaStatusLoaded && state.otaStatus?.rollback_enabled !== true) return;
+    if (state.flashConfirm !== 'ota-rollback') {
+      state.flashConfirm = 'ota-rollback';
+      state.flashMessage = '回滚会切换引导分区并重启设备，回到上一个已安装的版本，请再次点击确认。';
+      state.flashError = '';
+      render();
+      return;
+    }
+    state.flashConfirm = '';
+    state.flashWorking = 'ota-rollback';
+    state.flashMessage = '';
+    state.flashError = '';
+    render();
+    try {
+      await postJson('/api/v1/system/ota/rollback', {});
+      state.flashMessage = '回滚已提交，设备会切换引导分区并重启。重启期间页面会短暂断开。';
+    } catch (error) {
+      state.flashError = `回滚失败：${flashRequestErrorText(error)}`;
+    } finally {
+      state.flashWorking = '';
+      state.otaStatusLoaded = false;
+      render();
+      loadOtaStatus();
+    }
+  }
+
+  async function confirmOtaBoot() {
+    if (state.flashWorking || !otaPendingSlot()) return;
+    if (state.flashConfirm !== 'ota-confirm-boot') {
+      state.flashConfirm = 'ota-confirm-boot';
+      state.flashMessage = '确认引导会把当前分区标记为可信，不再自动回落，请再次点击确认。';
+      state.flashError = '';
+      render();
+      return;
+    }
+    state.flashConfirm = '';
+    state.flashWorking = 'ota-confirm-boot';
+    state.flashMessage = '';
+    state.flashError = '';
+    render();
+    try {
+      await postJson('/api/v1/system/ota/confirm-boot', {});
+      state.flashMessage = '引导已确认，设备不会再自动回落到上一个分区。';
+    } catch (error) {
+      state.flashError = `确认引导失败：${flashRequestErrorText(error)}`;
+    } finally {
+      state.flashWorking = '';
+      state.otaStatusLoaded = false;
+      render();
+      loadOtaStatus();
+    }
   }
 
   function isFlashOperationTerminal(op) {
@@ -3586,6 +5232,11 @@ export function mount(context = {}) {
         const terminal = isFlashOperationTerminal(state.flashFirmwareOperation);
         if (terminal) render();
         else patchFlashOperationCard();
+        /*
+         * `rebooting` 不是终态（还要等重启结果），但它正是"写完了、可以重启"的那一刻，
+         * 所以重启判定必须放在终态判断之外，否则选了立即重启也永远不会触发。
+         */
+        maybeRebootAfterFlash();
         if (!terminal) startFlashOperationPolling();
       } catch (_) {
         // 单次轮询失败不改判定，也不清掉已有结果；下一拍继续。
@@ -3596,34 +5247,189 @@ export function mount(context = {}) {
 
   /*
    * 应用固件。只接受已校验出的 operation_id，后端明确拒绝在这一步传 upload_id。
+   *
+   * 热更新与整包共用这条路径（同一个 apply 路由、同样只带 operation_id），
+   * 差别只在把哪条能力位当闸门、二次确认怎么说、以及要不要轮询。
    */
   async function applyFirmwareOperation() {
     const operationId = stringOr(state.flashFirmwareOperation?.operation_id || '');
     if (state.flashWorking || !operationId) return;
-    if (!flashCapAvailable('apply_firmware')) return;
-    if (state.flashConfirm !== 'firmware-apply') {
-      state.flashConfirm = 'firmware-apply';
-      state.flashMessage = '应用固件会写入备用分区并可能重启设备，请再次点击确认。';
-      state.flashError = '';
-      render();
-      return;
-    }
+    const hot = isHotUpdateOperation(state.flashFirmwareOperation);
+    if (!flashCapAvailable(hot ? 'hot_update_apply' : 'apply_firmware')) return;
+    /*
+     * 二次确认从"再点一次同一个按钮"改成弹窗。risk 仍是 high，确认没有被弱化 ——
+     * 只是这一步用户真正要决定的是**什么时候重启**，双击确认没有地方承载这个选择。
+     */
+    openFlashApplyDialog();
+  }
+
+  function openFlashApplyDialog() {
+    const later = new Date(Date.now() + 10 * 60 * 1000);
+    const pad = (value) => String(value).padStart(2, '0');
     state.flashConfirm = '';
+    state.flashApplyDialog = true;
+    state.flashApplyRebootMode = 'now';
+    state.flashApplyScheduleError = '';
+    /* 默认十分钟后，用户不改也是有效值，不会一打开就是空字段。 */
+    if (!state.flashApplyScheduleDate) state.flashApplyScheduleDate = flashTodayValue();
+    if (!state.flashApplyScheduleTime) state.flashApplyScheduleTime = `${pad(later.getHours())}:${pad(later.getMinutes())}`;
+    state.flashMessage = '';
+    state.flashError = '';
+    render();
+    loadFlashPowerCapabilities();
+  }
+
+  function closeFlashApplyDialog() {
+    if (state.flashWorking === 'firmware-apply') return;
+    state.flashApplyDialog = false;
+    state.flashApplyScheduleError = '';
+    render();
+  }
+
+  /*
+   * 读电源计划能力。只读一次并缓存 —— 能力位不会在一次会话里变。读失败不写成
+   * "不支持"，保持 null，由调用方按「未确认」把定时重启置灰，而不是给一个点了才报错的选项。
+   */
+  async function loadFlashPowerCapabilities() {
+    if (state.flashPowerCapabilities) return;
+    try {
+      const payload = await fetchJson('/api/v1/system/power');
+      const caps = payload?.data?.capabilities || payload?.capabilities;
+      if (!state.mounted || !caps || typeof caps !== 'object') return;
+      state.flashPowerCapabilities = caps;
+      if (state.flashApplyDialog) render();
+    } catch (_) {
+      /* 读不到就保持未确认，定时重启维持置灰。 */
+    }
+  }
+
+  /*
+   * 建一条一次性重启计划，走「关机 / 重启」页同一条契约：`period: 'once'` 必须带
+   * `date`，且不能带 weekdays / month_day —— 后端 `power_schedule_validate()`
+   * 对这三者是互斥校验，多带一个会被整条拒掉。
+   */
+  async function createFlashRebootSchedule(version) {
+    const name = version ? `升级到 ${version} 后重启` : '固件升级后重启';
+    await postJson('/api/v1/system/power/schedules', {
+      confirm: true,
+      name: name.slice(0, 60),
+      event: 'reboot',
+      period: 'once',
+      date: stringOr(state.flashApplyScheduleDate),
+      time: stringOr(state.flashApplyScheduleTime),
+      note: '由固件升级创建，到点重启以切换到新版本。',
+      enabled: true
+    });
+  }
+
+  function flashScheduleValidationError() {
+    const date = stringOr(state.flashApplyScheduleDate);
+    const time = stringOr(state.flashApplyScheduleTime);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return '请选择重启日期。';
+    if (!/^\d{2}:\d{2}$/.test(time)) return '请选择重启时间。';
+    const target = new Date(`${date}T${time}`);
+    if (Number.isNaN(target.getTime())) return '重启时间无效，请重新选择。';
+    if (target.getTime() <= Date.now()) return '重启时间必须晚于当前时间。';
+    return '';
+  }
+
+  async function confirmFlashApply() {
+    const operationId = stringOr(state.flashFirmwareOperation?.operation_id || '');
+    if (state.flashWorking || !operationId) return;
+    const hot = isHotUpdateOperation(state.flashFirmwareOperation);
+    if (!flashCapAvailable(hot ? 'hot_update_apply' : 'apply_firmware')) return;
+    const mode = hot ? 'now' : state.flashApplyRebootMode;
+    if (mode === 'schedule') {
+      const invalid = flashScheduleValidationError();
+      if (invalid) { state.flashApplyScheduleError = invalid; render(); return; }
+      if (!flashPowerScheduleAvailable()) {
+        state.flashApplyScheduleError = '设备未开放电源计划写入，无法定时重启。';
+        render();
+        return;
+      }
+    }
+    state.flashApplyScheduleError = '';
     state.flashWorking = 'firmware-apply';
     state.flashMessage = '';
     state.flashError = '';
     render();
+    const version = stringOr(state.flashFirmwareOperation?.to_version || '');
+    /*
+     * 定时重启的计划必须在 apply **之前**建好：apply 之后设备可能已经在重启路径上，
+     * 那时再写计划未必落得下去，用户就会拿到一个"写完了但永远不切换"的设备。
+     */
+    if (mode === 'schedule') {
+      try {
+        await createFlashRebootSchedule(version);
+      } catch (error) {
+        state.flashWorking = '';
+        state.flashApplyScheduleError = `定时重启计划创建失败：${flashRequestErrorText(error)}`;
+        render();
+        return;
+      }
+    }
     try {
       const payload = flashPayload(await postJson('/api/v1/system/flash/firmware/apply', { operation_id: operationId }));
+      state.flashApplyDialog = false;
       if (stringOr(payload.operation_id || '')) state.flashFirmwareOperation = payload;
-      state.flashMessage = '固件应用已提交，进度见下方状态。';
-      if (!isFlashOperationTerminal(state.flashFirmwareOperation)) startFlashOperationPolling();
+      const appliedHot = isHotUpdateOperation(state.flashFirmwareOperation);
+      if (appliedHot) {
+        /*
+         * 同步返回即为终态，不轮询。重启在回复后 500ms 触发，可能包含管理服务本身，
+         * 所以这句要把"页面可能短暂断连"说在前面。
+         */
+        state.flashMessage = payload.restart_scheduled === true
+          ? '热更新已应用，相关服务正在重启。若页面短暂无响应属正常，稍候会自动恢复。'
+          : '热更新已应用。本次没有需要重启的服务。';
+      } else {
+        state.flashMessage = flashApplySubmittedText(mode);
+        /*
+         * 「立即重启」要等写完再重启，不能在这里就发 —— apply 是异步的，此刻分区还在写，
+         * 现在重启等于把升级写坏。记下意图，由轮询在 rebooting/success 时触发。
+         */
+        state.flashPendingReboot = mode === 'now';
+        if (!isFlashOperationTerminal(state.flashFirmwareOperation)) startFlashOperationPolling();
+        else maybeRebootAfterFlash();
+      }
     } catch (error) {
-      state.flashError = `固件应用失败：${flashRequestErrorText(error)}`;
+      state.flashError = `${hot ? '热更新应用失败' : '固件应用失败'}：${flashRequestErrorText(error)}`;
     } finally {
       state.flashWorking = '';
       render();
     }
+  }
+
+  function flashApplySubmittedText(mode) {
+    if (mode === 'manual') {
+      return '固件正在写入备用分区，写完后不会自动重启。你可以在「关机 / 重启」里手动重启以切换到新版本。';
+    }
+    if (mode === 'schedule') {
+      const when = `${stringOr(state.flashApplyScheduleDate)} ${stringOr(state.flashApplyScheduleTime)}`.trim();
+      return `固件正在写入备用分区。已创建一次性重启计划${when ? `（${when}）` : ''}，设备到点会自动重启完成升级。`;
+    }
+    return '固件正在写入备用分区，写完后设备会自动重启，届时页面会断开几分钟。';
+  }
+
+  /*
+   * 写入完成后触发重启（只在用户选了「立即重启」时）。
+   *
+   * 判据是 otad 把 operation 推到 `rebooting`（progress 90，`otad_firmware.c:1753`）：
+   * 那一刻备用分区已写完、回读校验通过、引导项已指向新分区，重启是安全的。
+   * `success` 也一并接受，以防轮询正好跨过 rebooting 那一拍。
+   */
+  async function maybeRebootAfterFlash() {
+    if (!state.flashPendingReboot) return;
+    const opState = stringOr(state.flashFirmwareOperation?.state || '');
+    if (opState !== 'rebooting' && opState !== 'success') return;
+    state.flashPendingReboot = false;
+    try {
+      await postJson('/api/v1/system/reboot', { confirm: true });
+      state.flashMessage = '固件已写入，设备正在重启以切换到新版本。页面会断开几分钟，之后请手动刷新。';
+    } catch (error) {
+      /* 重启没发出去不等于升级失败：分区已经写好了，说清楚下一步怎么做。 */
+      state.flashError = `固件已写入备用分区，但重启请求失败：${flashRequestErrorText(error)}。可到「关机 / 重启」手动重启完成升级。`;
+    }
+    render();
   }
 
   async function factoryResetFlash() {
@@ -3688,6 +5494,8 @@ export function mount(context = {}) {
       const payload = flashPayload(await fetchJson('/api/v1/system/flash/capabilities'));
       const caps = payload.capabilities;
       state.flashCapabilities = caps && typeof caps === 'object' ? caps : {};
+      // 顶层契约位（热更新那组）与 capabilities 同源同一次请求，一起留存。
+      state.flashCapabilitiesData = payload && typeof payload === 'object' ? payload : null;
       state.flashScheduledBackup = {
         supported: payload.scheduled_backup_supported === true,
         reason: stringOr(payload.scheduled_backup_reason || ''),
@@ -3708,6 +5516,7 @@ export function mount(context = {}) {
     } catch (error) {
       // 失败时不写入空能力表：null 表示"未确认"，空对象会被读成"全都不可用"。
       state.flashCapabilities = null;
+      state.flashCapabilitiesData = null;
       state.flashCapabilitiesError = flashCapabilityFailureText(error);
     } finally {
       state.flashCapabilitiesLoading = false;
@@ -4035,6 +5844,51 @@ export function mount(context = {}) {
   }
 
   /*
+   * API-Key 列表。后端 `GET /api/v1/auth/api-keys` 返回 `data.items[]`，
+   * 每行已带 `state`（active / expired / revoked）与 `revoked` / `expired` 布尔，
+   * 前端直接用后端的判定，不再自己比一遍时间戳 —— 两边算法一旦漂移，
+   * 界面上的「有效」会和服务端的实际放行结果对不上。
+   */
+  async function loadApiKeys(shouldRender = false) {
+    state.apiKeysLoading = true;
+    try {
+      const result = await fetchJson('/api/v1/auth/api-keys');
+      const payload = result?.data && typeof result.data === 'object' ? result.data : result;
+      state.apiKeys = Array.isArray(payload?.items) ? payload.items : [];
+      state.apiKeysError = '';
+    } catch (error) {
+      /* 读不到就说读不到，不用空数组冒充「还没有 key」。 */
+      state.apiKeys = null;
+      state.apiKeysError = error?.message || 'api key list unavailable';
+    } finally {
+      state.apiKeysLoading = false;
+      if (shouldRender) render();
+    }
+  }
+
+  /*
+   * 单把 key 的审计轨迹。key 被删除后轨迹仍在（后端按 api_key_id 查
+   * api_audit_log），所以这里不要求 key 还存在于列表里。
+   */
+  async function loadApiKeyAudit(keyId, shouldRender = true) {
+    if (!keyId) return;
+    state.apiKeyAuditLoading = true;
+    if (shouldRender) render();
+    try {
+      const result = await fetchJson(`/api/v1/auth/api-keys/${encodeURIComponent(keyId)}/audit?limit=100`);
+      const payload = result?.data && typeof result.data === 'object' ? result.data : result;
+      state.apiKeyAudit = Array.isArray(payload?.items) ? payload.items : [];
+      state.apiKeyAuditError = '';
+    } catch (error) {
+      state.apiKeyAudit = null;
+      state.apiKeyAuditError = error?.message || 'audit trail unavailable';
+    } finally {
+      state.apiKeyAuditLoading = false;
+      if (shouldRender) render();
+    }
+  }
+
+  /*
    * 云端中继状态与路由器身份。两个接口都是只读 GET，各自失败互不影响：
    * 拿不到 status 时面板会显示「状态不可读」，而不是假装中继未启用。
    */
@@ -4252,6 +6106,179 @@ export function mount(context = {}) {
     }
   }
 
+  /* ── API-Key 写操作 ── */
+
+  function apiKeyDraftDefaults() {
+    return { name: '', tier: 'read_only', expires_days: '', allow_ips: '' };
+  }
+
+  /*
+   * 表单输入只更新 state.apiKeyDraft，不整页 rerender —— 每敲一个字符重绘会让
+   * 输入框失焦（design.md 系统设置子页规则 6 记的就是这个坑）。
+   * 创建按钮的禁用态因此单独更新。
+   */
+  function onApiKeyDraftInput(event) {
+    const el = event.currentTarget;
+    if (!el) return;
+    const field = el.dataset.systemApiKeyField;
+    if (!field) return;
+    state.apiKeyDraft = { ...(state.apiKeyDraft || apiKeyDraftDefaults()), [field]: el.value };
+    const submit = root.querySelector('[data-system-action="api-key-create-submit"]');
+    if (submit) submit.disabled = !String(state.apiKeyDraft.name || '').trim() || Boolean(state.apiKeyWorking);
+  }
+
+  function openApiKeyConfirm(action, keyId) {
+    if (!keyId) return;
+    const row = (Array.isArray(state.apiKeys) ? state.apiKeys : []).find((item) => String(item?.key_id || '') === keyId);
+    state.apiKeyConfirm = { action, keyId, name: String(row?.name || keyId) };
+    state.apiKeyError = '';
+    render();
+  }
+
+  function openApiKeyAudit(keyId) {
+    if (!keyId) return;
+    state.apiKeyAuditFor = keyId;
+    state.apiKeyAudit = [];
+    state.apiKeyAuditError = '';
+    state.apiKeyDialog = 'audit';
+    loadApiKeyAudit(keyId, true);
+  }
+
+  /*
+   * 复制明文。只从内存中的 state.apiKeyPlaintext 读，不额外留副本；
+   * 剪贴板不可用时退回选中复制。不写 localStorage / sessionStorage，也不进任何日志。
+   */
+  async function copyApiKeyPlaintext(button) {
+    const value = String(state.apiKeyPlaintext || '');
+    if (!value || !button) return;
+    let ok = false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(value);
+        ok = true;
+      }
+    } catch (_) {
+      ok = false;
+    }
+    if (!ok) ok = copyFingerprintFallback(value);
+    if (button.dataset.systemCopyBusy === '1') return;
+    button.dataset.systemCopyBusy = '1';
+    const original = button.textContent;
+    button.textContent = ok ? '已复制' : '复制失败';
+    button.classList.add(ok ? 'is-copied' : 'is-copy-failed');
+    window.setTimeout(() => {
+      button.textContent = original;
+      button.classList.remove('is-copied', 'is-copy-failed');
+      delete button.dataset.systemCopyBusy;
+    }, ok ? 1100 : 1400);
+  }
+
+  function openApiKeyCreate() {
+    state.apiKeyDraft = apiKeyDraftDefaults();
+    state.apiKeyError = '';
+    state.apiKeyDialog = 'create';
+    render();
+  }
+
+  /*
+   * 关闭任一 API-Key 弹窗。明文 key 在这里被清掉：这是它唯一的生命周期终点，
+   * 内存之外没有第二份副本，关掉就真的再也读不到了。
+   */
+  function closeApiKeyDialog() {
+    state.apiKeyDialog = '';
+    state.apiKeyDraft = null;
+    state.apiKeyPlaintext = '';
+    state.apiKeyCreated = null;
+    state.apiKeyConfirm = null;
+    state.apiKeyError = '';
+    state.apiKeyAuditFor = '';
+    state.apiKeyAudit = null;
+    state.apiKeyAuditError = '';
+    render();
+  }
+
+  async function createApiKey() {
+    const draft = state.apiKeyDraft || apiKeyDraftDefaults();
+    const name = String(draft.name || '').trim();
+    if (!name || state.apiKeyWorking) return;
+    const days = Number(draft.expires_days || 0);
+    const body = {
+      name,
+      tier: draft.tier === 'control' ? 'control' : 'read_only',
+      allow_ips: String(draft.allow_ips || '').trim()
+    };
+    /*
+     * 留空即长期有效（用户 08-07 拍板：允许长期 key，不强制过期）。
+     * 后端要的是绝对时间戳（秒），且拒绝过去的时间，所以按天换算。
+     */
+    if (days > 0) body.expires_at = Math.floor(Date.now() / 1000) + Math.round(days * 86400);
+    state.apiKeyWorking = 'create';
+    state.apiKeyError = '';
+    render();
+    try {
+      const result = await postJson('/api/v1/auth/api-keys', body);
+      const payload = result?.data && typeof result.data === 'object' ? result.data : result;
+      state.apiKeyPlaintext = String(payload?.api_key || '');
+      state.apiKeyCreated = {
+        key_id: String(payload?.key_id || ''),
+        name: String(payload?.name || name),
+        tier: String(payload?.tier || body.tier),
+        expires_at: Number(payload?.expires_at || 0)
+      };
+      state.apiKeyDialog = 'created';
+      state.apiKeyDraft = null;
+      await loadApiKeys(false);
+    } catch (error) {
+      state.apiKeyError = apiKeyErrorText(error);
+    } finally {
+      state.apiKeyWorking = '';
+      render();
+    }
+  }
+
+  async function commitApiKeyConfirm() {
+    const pending = state.apiKeyConfirm;
+    if (!pending || state.apiKeyWorking) return;
+    const { action, keyId } = pending;
+    state.apiKeyWorking = `${action}:${keyId}`;
+    render();
+    try {
+      if (action === 'revoke') {
+        await postJson(`/api/v1/auth/api-keys/${encodeURIComponent(keyId)}/revoke`, {});
+      } else {
+        await fetchJson(`/api/v1/auth/api-keys/${encodeURIComponent(keyId)}`, { method: 'DELETE' });
+      }
+      state.apiKeyConfirm = null;
+      state.apiKeyError = '';
+      await loadApiKeys(false);
+    } catch (error) {
+      state.apiKeyError = apiKeyErrorText(error);
+    } finally {
+      state.apiKeyWorking = '';
+      render();
+    }
+  }
+
+  /*
+   * 后端错误码转人话。命中不了就原样透出后端消息，不编一句更好听的
+   * ——猜错原因比说不清原因更难排查。
+   */
+  function apiKeyErrorText(error) {
+    const code = String(error?.payload?.error?.code || '');
+    const map = {
+      invalid_name: '名称不合法：只能包含字母、数字、空格和 - _ .，且不能为空。',
+      invalid_tier: '权限档不合法。',
+      invalid_allow_ips: 'IP 白名单格式不对：请用逗号分隔的 IP 或 CIDR。',
+      expires_at_in_past: '有效期必须是将来的时间。',
+      scope_too_long: '权限范围文档过长。',
+      key_not_found: '这把 key 已经不存在了，列表可能不是最新的。',
+      api_key_create_failed: '后端创建失败，key 未生成。',
+      api_key_store_unavailable: 'key 存储不可读。',
+      api_key_self_management_forbidden: 'API-Key 不能用来管理 API-Key，请用网页会话身份操作。'
+    };
+    return map[code] || error?.message || '操作失败';
+  }
+
   async function loadSystemSettings() {
     const loadId = ++state.seq;
     state.loading = true;
@@ -4266,7 +6293,7 @@ export function mount(context = {}) {
       state.saveError = '';
       render();
       if (page === 'admin') {
-        await Promise.allSettled([loadTwofaStatus(false), loadAppDevices(false), loadCloudStatus(false)]);
+        await Promise.allSettled([loadTwofaStatus(false), loadAppDevices(false), loadCloudStatus(false), loadApiKeys(false)]);
         if (!state.mounted || loadId !== state.seq) return;
         render();
       }
@@ -4282,6 +6309,8 @@ export function mount(context = {}) {
       render();
     }
     if (page === 'flash' && state.flashTab === 'firmware') loadFlashPreserveConfig();
+    /* 直接进入固件页（不经过页签点击）时也要读引导状态，否则回滚面板永远停在「未确认」。 */
+    if (page === 'flash' && state.flashTab === 'firmware') loadOtaStatus();
     if (page === 'flash' && state.flashTab === 'operations') loadFlashBackups();
     /* 定时备份卡的当前值。403 不影响控件渲染，只影响"当前值"的展示。 */
     if (page === 'flash' && state.flashTab === 'operations') loadFlashBackupPolicy();
@@ -4290,6 +6319,17 @@ export function mount(context = {}) {
      * 而且它自己就是权威，不等任何概览接口先放行。
      */
     if (page === 'flash') loadFlashCapabilities();
+    /* 直接进入 CPU 中断页（不经过页签点击）时也要拉能力源，否则这一屏只有概览字段。 */
+    if (page === 'advanced' && state.advancedTab === 'cpu') loadAdvancedTuningSources();
+  }
+
+  /*
+   * CPU 中断页的两个源。手动刷新时允许重复请求（净调优计数需要第二次采样才能算差值），
+   * 首次进入时避免与并发请求撞车。
+   */
+  function loadAdvancedTuningSources(force = false) {
+    if (force || (!state.cpuInterruptLoaded && !state.cpuInterruptLoading)) loadCpuInterrupt();
+    if (force || (!state.netTuningLoaded && !state.netTuningLoading && state.netTuningSupported !== false)) loadNetTuning();
   }
 
 

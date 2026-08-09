@@ -23,8 +23,8 @@
     upRate: { label: '上行速率', unit: 'rate', metric: 'upRate' },
     downRate: { label: '下行速率', unit: 'rate', metric: 'downRate' },
     connections: { label: '连接数', unit: 'count', metric: 'connections' },
-    upTotal: { label: '累计上行', unit: 'bytes', metric: 'upBytes' },
-    downTotal: { label: '累计下行', unit: 'bytes', metric: 'downBytes' }
+    upTotal: { label: '今日上行', unit: 'bytes', metric: 'upBytes' },
+    downTotal: { label: '今日下行', unit: 'bytes', metric: 'downBytes' }
   };
   const CLIENT_TABLE_COLUMNS = [
     { key: 'name', label: '备注', className: 'client-name-col' },
@@ -34,8 +34,8 @@
     { key: 'upRate', label: '上行速率', numeric: true, tone: 'up' },
     { key: 'downRate', label: '下行速率', numeric: true, tone: 'down' },
     { key: 'connections', label: '连接数', numeric: true },
-    { key: 'upTotal', label: '累计上行', numeric: true, tone: 'up' },
-    { key: 'downTotal', label: '累计下行', numeric: true, tone: 'down' },
+    { key: 'upTotal', label: '今日上行', numeric: true, tone: 'up' },
+    { key: 'downTotal', label: '今日下行', numeric: true, tone: 'down' },
     { key: 'onlineTime', label: '在线时间', numeric: true }
   ];
   const CLIENT_TABLE_COLUMN_KEYS = CLIENT_TABLE_COLUMNS.map((column) => column.key);
@@ -581,6 +581,26 @@
       return `${vendor}/${type}`;
     }
 
+    /* 随机化 MAC（本地管理位置位）不含 OUI，任何厂商库都查不到，所以厂商为空是**如实**的，
+       不是数据缺失。30.1 上多数手机/平板都是这种地址，不加标注用户会当成陌生入侵设备。
+       后端用 `mac_randomized` 直接给出这个事实位，前端不再自己解析 MAC 位去猜。
+       注意：这是正常的隐私行为，不得据此把设备标成可疑或降权。 */
+    function macIsRandomized(client = {}) {
+      return client.mac_randomized === true;
+    }
+
+    function vendorHasRealValue(client = {}) {
+      const fingerprint = client.fingerprint && typeof client.fingerprint === 'object' ? client.fingerprint : {};
+      return Boolean(firstText(client.vendor_name, client.vendor, client.manufacturer, client.brand, fingerprint.vendor));
+    }
+
+    function vendorTypeCellMarkup(client = {}) {
+      const text = escapeHtml(client.vendorType || '--');
+      if (!macIsRandomized(client) || vendorHasRealValue(client)) return text;
+      const hint = '设备使用随机化 MAC 地址（不含厂商 OUI），因此查不到厂商，属手机/平板的正常隐私行为';
+      return `${text}<em class="client-random-mac-tag" data-dwrt-tooltip="${escapeHtml(hint)}" title="${escapeHtml(hint)}">随机 MAC</em>`;
+    }
+
     function brandSlugFromText(...values) {
       const text = values.map((value) => firstText(value)).filter(Boolean).join(' ').trim();
       if (!text) return '';
@@ -921,6 +941,84 @@
       return firstNumber(client.down_bytes, client.today_down_bytes, client.today_down, client.rx_bytes);
     }
 
+    /**
+     * 字节口径一律跟随后端自述，不写死。后端 2026-08-07 明确 `clients[].tx_bytes`/`rx_bytes`
+     * 是「当日」估算值（速率积分，本地午夜归零），不是终身累计；同一天内若切到
+     * 内核计数器差值，`bytes_window`/`bytes_estimated` 会跟着变，所以每次渲染都重新读，
+     * 不缓存。后端未表态时按最保守的「估算」处理。
+     */
+    const BYTES_WINDOW_LABELS = {
+      today: '今日',
+      lifetime: '累计',
+      total: '累计',
+      session: '本次连接'
+    };
+
+    function bytesWindow(client = {}) {
+      return firstText(client.bytes_window, client.byte_window).trim().toLowerCase();
+    }
+
+    function bytesWindowLabel(client = {}) {
+      return BYTES_WINDOW_LABELS[bytesWindow(client)] || '今日';
+    }
+
+    function bytesEstimated(client = {}) {
+      if (client.bytes_estimated === false) return false;
+      if (client.bytes_estimated === true) return true;
+      if (client.bytes_exact === true) return false;
+      return true;
+    }
+
+    function bytesSource(client = {}) {
+      return firstText(client.bytes_source, client.byte_source).trim();
+    }
+
+    /**
+     * 值为 0 且后端给出了 `bytes_source` 时，那是真实的「今日无流量」结论，
+     * 不是缺数据 —— 渲染成「暂无数据」会让 24 台没跑流量的终端看起来像后端坏了。
+     */
+    function bytesConclusive(client = {}, family = 'ipv4') {
+      /* IPv6 行例外：后端自述 `ipv6_bytes_supported: false`
+         （`jmx_per_client_accounting_is_family_agnostic`），即按族拆分的字节数根本不存在。
+         那一格的 0 不是「今日无流量」，把它写成结论等于替后端编了一个它没做的判断。 */
+      if (family === 'ipv6' && client.ipv6_bytes_supported === false) return false;
+      return Boolean(bytesSource(client)) && Boolean(bytesWindow(client));
+    }
+
+    function bytesResetLabel(client = {}) {
+      const reset = firstText(client.bytes_reset_at, client.byte_reset_at).trim().toLowerCase();
+      if (reset === 'local_midnight') return '本地午夜归零';
+      if (reset === 'never') return '不归零';
+      return reset ? `归零点：${reset}` : '';
+    }
+
+    function bytesCellText(value, client = {}, family = 'ipv4') {
+      const num = Math.max(0, Number(value) || 0);
+      if (num > 0) return `${bytesEstimated(client) ? '约 ' : ''}${formatBytes(num)}`;
+      if (bytesConclusive(client, family)) return `${bytesWindowLabel(client)}无流量`;
+      return '--';
+    }
+
+    function bytesCellTitle(client = {}, family = 'ipv4') {
+      if (family === 'ipv6' && client.ipv6_bytes_supported === false) {
+        const reason = firstText(client.ipv6_bytes_reason);
+        return `后端未按 IPv4/IPv6 分别统计字节数，因此这一列没有 IPv6 口径的值${reason ? `（${reason}）` : ''}`;
+      }
+      const parts = [`${bytesWindowLabel(client)}用量`];
+      if (bytesEstimated(client)) parts.push('按采样速率积分估算，采样间隙与 core 重启期间的流量会丢失，不可用于计费或配额');
+      const reset = bytesResetLabel(client);
+      if (reset) parts.push(reset);
+      const source = bytesSource(client);
+      if (source) parts.push(`来源：${source}`);
+      return parts.join('；');
+    }
+
+    function bytesCellMarkup(value, client = {}, className = '', family = 'ipv4') {
+      const num = Math.max(0, Number(value) || 0);
+      const stateClass = num > 0 ? 'is-active' : (bytesConclusive(client, family) ? 'is-idle' : 'is-unknown');
+      return `<span class="client-bytes-value ${className} ${stateClass}" title="${escapeHtml(bytesCellTitle(client, family))}">${escapeHtml(bytesCellText(num, client, family))}</span>`;
+    }
+
     function deviceTypeIconKey(client = {}) {
       const text = [
         deviceType(client),
@@ -1218,7 +1316,36 @@
 
     function familyIpCellMarkup(client = {}, family = 'ipv4') {
       if (family === 'ipv6') return ipv6Cell(ipv6Parts(client));
-      return copyToken(client.ip || '--', client.ip || '--', [{ label: 'IPv4', value: client.ip || '--' }]);
+      /*
+       * 后端不再把「没有 IPv4」写成 `0.0.0.0` 哨兵，纯 IPv6 设备的 `ip` 现在是空串
+       * （`ipv4_available: false` + `ipv4_reason` 说明成因）。空串不能渲染成空白单元格
+       * 或 `--`：那台设备是真实在线的，只是没有 IPv4。这里退回展示它的 IPv6 地址，
+       * 并如实标注，用户才不会读成「数据缺失」。
+       */
+      if (!firstText(client.ip)) {
+        const parts = ipv6Parts(client);
+        const v6 = firstText(parts.global, parts.local);
+        const reason = ipv4MissingReason(client);
+        if (v6) {
+          return `<span class="client-ipv4-absent">
+            ${copyToken(compact(v6, 18), v6, [{ label: 'IPv6', value: v6 }])}
+            <em class="client-ipv4-absent-tag" data-dwrt-tooltip="${escapeHtml(reason)}" title="${escapeHtml(reason)}">仅 IPv6</em>
+          </span>`;
+        }
+        return `<span class="client-ipv4-absent-tag" data-dwrt-tooltip="${escapeHtml(reason)}" title="${escapeHtml(reason)}">无 IPv4</span>`;
+      }
+      return copyToken(client.ip, client.ip, [{ label: 'IPv4', value: client.ip }]);
+    }
+
+    /* `ipv4_reason` 是后端给的成因，三种取值各自含义不同，不要合并成一句「无地址」。
+       `ipv4_stored_placeholder` 是诊断字段，按后端要求不展示给用户。 */
+    function ipv4MissingReason(client = {}) {
+      const reasons = {
+        ipv6_only_client_no_ipv4_address_observed: '该设备只使用 IPv6，未观测到 IPv4 地址',
+        no_ipv4_address_observed_for_mac: '未观测到该 MAC 的 IPv4 地址',
+        offline_no_ipv4_address_recorded: '设备离线期间没有记录到 IPv4 地址'
+      };
+      return reasons[firstText(client.ipv4_reason)] || '未观测到该设备的 IPv4 地址';
     }
 
     function ipv6Cell(parts) {
@@ -1257,7 +1384,7 @@
             ${isIpv6 ? '<em class="client-ipv6-badge">IPv6</em>' : ''}
           </span>`;
       } else if (key === 'vendorType') {
-        html = escapeHtml(client.vendorType || '--');
+        html = vendorTypeCellMarkup(client);
       } else if (key === 'ip') {
         html = familyIpCellMarkup(client, family);
       } else if (key === 'mac') {
@@ -1269,9 +1396,9 @@
       } else if (key === 'connections') {
         html = escapeHtml(formatInteger(familyMetric(client, family, 'connections')));
       } else if (key === 'upTotal') {
-        html = escapeHtml(formatBytes(familyMetric(client, family, 'upBytes')));
+        html = bytesCellMarkup(familyMetric(client, family, 'upBytes'), client, 'rate-up', family);
       } else if (key === 'downTotal') {
-        html = escapeHtml(formatBytes(familyMetric(client, family, 'downBytes')));
+        html = bytesCellMarkup(familyMetric(client, family, 'downBytes'), client, 'rate-down', family);
       } else if (key === 'onlineTime') {
         html = escapeHtml(onlineDurationLabel(client));
       }
@@ -1382,6 +1509,32 @@
       return changed;
     }
 
+    /**
+     * 字节格显示的是「今日估算」，文案与状态类都依赖 client 的口径字段，
+     * 所以增量刷新不能像普通数字那样直接往 td 里写 textContent —— 那会把
+     * 「约」前缀、「今日无流量」和 tooltip 一起冲掉。
+     */
+    function patchBytesNode(row, column, value, client, family = 'ipv4') {
+      const cell = row && row.querySelector(`[data-column="${column}"]`);
+      if (!cell) return false;
+      const node = cell.querySelector('.client-bytes-value');
+      if (!node) return false;
+      const num = Math.max(0, Number(value) || 0);
+      let changed = setTextIfChanged(node, bytesCellText(num, client, family));
+      const title = bytesCellTitle(client, family);
+      if (node.getAttribute('title') !== title) {
+        node.setAttribute('title', title);
+        changed = true;
+      }
+      const state = num > 0 ? 'is-active' : (bytesConclusive(client, family) ? 'is-idle' : 'is-unknown');
+      if (!node.classList.contains(state)) {
+        node.classList.remove('is-active', 'is-idle', 'is-unknown');
+        node.classList.add(state);
+        changed = true;
+      }
+      return changed;
+    }
+
     function patchClientRowMetrics(row, client, family = 'ipv4') {
       if (!row || !client) return false;
       let changed = false;
@@ -1402,8 +1555,8 @@
         }
       }
       changed = setTextIfChanged(row.querySelector('[data-column="connections"]'), formatInteger(connections)) || changed;
-      changed = setTextIfChanged(row.querySelector('[data-column="upTotal"]'), formatBytes(upBytes)) || changed;
-      changed = setTextIfChanged(row.querySelector('[data-column="downTotal"]'), formatBytes(downBytes)) || changed;
+      changed = patchBytesNode(row, 'upTotal', upBytes, client, family) || changed;
+      changed = patchBytesNode(row, 'downTotal', downBytes, client, family) || changed;
       changed = setTextIfChanged(row.querySelector('[data-column="onlineTime"]'), onlineDurationLabel(client)) || changed;
       if (row.classList.contains('is-offline') === Boolean(client.online)) {
         row.classList.toggle('is-offline', !client.online);
@@ -3585,11 +3738,21 @@
           ['接入方式', usefulInfoText(merged.link_type, merged.interface, merged.network, merged.ssid) || '--'],
           ['识别置信度', usefulInfoText(merged.fingerprint_confidence, profile.confidence) || '--']
         ];
+        const upToday = familyMetric(merged, 'ipv4', 'upBytes');
+        const downToday = familyMetric(merged, 'ipv4', 'downBytes');
+        const windowLabel = bytesWindowLabel(merged);
+        const trafficNote = [
+          bytesEstimated(merged) ? '按采样速率积分估算，不可用于计费或配额' : '来自计数器，精确值',
+          bytesResetLabel(merged)
+        ].filter(Boolean).join(' · ');
         return `<section class="client-detail-card dwrt-kit-glass-surface">
           <div class="client-detail-card-head"><strong>信息详情</strong><span>DHCP、邻居表、指纹和用户覆盖信息</span></div>
           <div class="client-detail-list client-detail-list-grid">
             ${infoRows.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')}
+            <div><span>${escapeHtml(windowLabel)}上传</span><strong>${bytesCellMarkup(upToday, merged, 'rate-up')}</strong></div>
+            <div><span>${escapeHtml(windowLabel)}下载</span><strong>${bytesCellMarkup(downToday, merged, 'rate-down')}</strong></div>
           </div>
+          ${trafficNote ? `<p class="client-detail-card-note is-muted">${escapeHtml(`${windowLabel}用量：${trafficNote}`)}</p>` : ''}
         </section>`;
       }
       if (tab === 'protocol') {
@@ -3759,8 +3922,8 @@
             <div class="client-filter-grid">
               <label><span>连接数</span><input type="number" min="0" data-client-filter-min-connections value="${escapeHtml(page.filters.minConnections || '')}" placeholder="大于等于"></label>
               <label><span>VLAN</span><input data-client-filter-vlan value="${escapeHtml(page.filters.vlan || '')}" placeholder="VLAN ID"></label>
-              <label><span>累计上行 GB</span><input type="number" min="0" data-client-filter-min-up value="${escapeHtml(page.filters.minUpGb || '')}" placeholder="大于等于"></label>
-              <label><span>累计下行 GB</span><input type="number" min="0" data-client-filter-min-down value="${escapeHtml(page.filters.minDownGb || '')}" placeholder="大于等于"></label>
+              <label><span>今日上行 GB</span><input type="number" min="0" data-client-filter-min-up value="${escapeHtml(page.filters.minUpGb || '')}" placeholder="大于等于"></label>
+              <label><span>今日下行 GB</span><input type="number" min="0" data-client-filter-min-down value="${escapeHtml(page.filters.minDownGb || '')}" placeholder="大于等于"></label>
               <label><span>协议版本</span><select data-client-filter-ip-version>
                 <option value="" ${!page.filters.ipVersion ? 'selected' : ''}>全部</option>
                 <option value="ipv4" ${page.filters.ipVersion === 'ipv4' ? 'selected' : ''}>仅 IPv4</option>

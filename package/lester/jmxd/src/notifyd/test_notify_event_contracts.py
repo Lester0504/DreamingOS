@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import copy
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -60,6 +61,35 @@ def c_function(source: str, marker: str) -> str:
                 return source[start : i + 1]
         i += 1
     raise AssertionError(f"unterminated C function: {marker}")
+
+
+def catalog_event_rows(notifyd: str) -> list:
+    """Rows of notifyd_event_definitions[] only.
+
+    Scoped to that one initializer on purpose: the file also holds a category
+    table whose rows look like `{ "SYSTEM", "System" },`, and a plain
+    startswith('{ "') scan swallows those too, which is part of how the old
+    hardcoded totals drifted without anyone noticing what they counted.
+    """
+    lines = notifyd.splitlines()
+    start = next(
+        i for i, line in enumerate(lines)
+        if "notifyd_event_definitions[] = {" in line
+    )
+    rows = []
+    for line in lines[start + 1:]:
+        stripped = line.strip()
+        if stripped.startswith("};"):
+            break
+        if not (stripped.startswith('{ "') and stripped.endswith("},")):
+            continue
+        fields = re.findall(r'"([^"]*)"', stripped)
+        available = re.search(r",\s*(\d+)\s*\},$", stripped)
+        assert available, f"unparsable catalog row: {stripped}"
+        assert len(fields) == 8, f"unexpected field count in catalog row: {stripped}"
+        rows.append(fields + [available.group(1)])
+    assert rows, "notifyd_event_definitions[] parsed as empty"
+    return rows
 
 
 def test_route_health_source_reaches_logd_and_notifyd_contracts():
@@ -158,19 +188,48 @@ def test_pending_events_stay_unavailable_without_true_source():
     pending = {
         "SECURITY_DETECTION": "aegis_suricata_event_bridge_pending",
         "APPLICATION_UPDATE_FAILED": "otad_failure_event_producer_pending",
-        "WAN_DOWN": "confirmed_wan_reachability_producer_pending",
     }
     for event_code, reason in pending.items():
         line = next(line for line in notifyd.splitlines() if f'{{ "{event_code}",' in line)
         assert f'"{reason}"' in line
         assert line.rstrip().endswith("0 },")
-    definitions = [
-        line.strip()
-        for line in notifyd.splitlines()
-        if line.strip().startswith('{ "') and line.strip().endswith("},")
-    ]
-    assert sum(line.endswith("1 },") for line in definitions) == 18
-    assert sum(line.endswith("0 },") for line in definitions) == 17
+    """
+    WAN_DOWN used to sit in `pending` above with
+    reason="confirmed_wan_reachability_producer_pending". It has a real producer
+    now, so the assertion was inverted: see dw_emit_connectivity_transition_event()
+    in src/jmx_dreamingwrt_api.c, which enqueues WAN_DOWN / WAN_RESTORED into
+    notifyd off healthd's debounced reachability edge (healthd probes ping then
+    TCP:443 every 30 s and only flips `internet` to 0 after 3 consecutive
+    failures -- check_internet_connectivity() in src/healthd/check_main.c).
+    Assert the availability positively so a regression back to unavailable, or a
+    producer rename, still fails here.
+    """
+    for event_code in ("WAN_DOWN", "WAN_RESTORED"):
+        line = next(line for line in notifyd.splitlines() if f'{{ "{event_code}",' in line)
+        assert '"dreamingwrt-core"' in line
+        assert "producer_pending" not in line
+        assert line.rstrip().endswith("1 },")
+
+    """
+    This used to assert bare totals (18 available / 17 unavailable). The catalog
+    has grown to 53 events since, so the numbers only recorded a moment in time
+    and went red on every legitimate addition. Assert the invariant that actually
+    matters instead: `available` must agree with whether a producer exists, so no
+    row can claim an event will arrive while naming nobody to send it, and none
+    can be parked as pending without saying what is missing.
+    """
+    definitions = catalog_event_rows(notifyd)
+    assert len(definitions) > 40
+    for row in definitions:
+        event_code, producer, reason, available = (
+            row[0], row[3], row[6], row[-1],
+        )
+        if available == "1":
+            assert producer, f"{event_code} is available with no producer"
+            assert not reason, f"{event_code} is available but still carries reason {reason!r}"
+        else:
+            assert not producer, f"{event_code} is unavailable yet names producer {producer!r}"
+            assert reason, f"{event_code} is unavailable without saying what is missing"
 
 
 def route_health_body(event: str, level: str, title: str, state: str, ts: int) -> dict:

@@ -472,6 +472,44 @@ static void nc_setup_add_gate_contract(struct json_object *d, int wizard_done)
             json_object_new_string("accounts_exist_but_setup_state_was_never_completed_wizard_may_be_offered_not_forced"));
     json_object_object_add(d, "login_capability_source",
                            json_object_new_string("/api/v1/session/init"));
+
+    /*
+     * Say out loud which fields must not be used for gating.
+     *
+     * The new fields above were added next to the old ones without ever
+     * marking the old ones, so every consumer had to already know which set to
+     * read, and reading the wrong one produced a defect. That is not a
+     * hypothetical: the frontend gate read `initialized`/`wizard_required` and
+     * pushed the whole console into the first-run wizard on a device whose own
+     * response said `setup_gate_required: false`.
+     *
+     * The legacy values are deliberately NOT changed here. `first_run` and
+     * `initialized` still answer "did the wizard run to completion", which the
+     * App's new-device contract depends on, and flipping them is a product
+     * decision for the user rather than something to slip into a bug fix. What
+     * changes is that the response now names the authoritative field, so a
+     * consumer can discover the right judgement from the payload instead of
+     * from tribal knowledge.
+     *
+     * Machine-readable on purpose: a frontend can assert against
+     * setup_gate_field rather than hardcoding a field name.
+     */
+    {
+        struct json_object *deprecated = json_object_new_array();
+
+        json_object_array_add(deprecated, json_object_new_string("first_run"));
+        json_object_array_add(deprecated, json_object_new_string("initialized"));
+        json_object_array_add(deprecated, json_object_new_string("wizard_required"));
+        json_object_array_add(deprecated,
+                              json_object_new_string("router_setup_initialized"));
+        json_object_object_add(d, "gate_fields_deprecated", deprecated);
+    }
+    json_object_object_add(d, "setup_gate_field",
+                           json_object_new_string("setup_gate_required"));
+    json_object_object_add(d, "gate_fields_deprecated_note",
+        json_object_new_string("these_report_wizard_completion_only_and_must_not_gate_the_console_read_setup_gate_required"));
+    json_object_object_add(d, "usability_field",
+                           json_object_new_string("config_ready"));
 }
 
 static void nc_setup_add_state_json(struct json_object *d)

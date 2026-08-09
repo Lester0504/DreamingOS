@@ -13,6 +13,27 @@
   const TAB_STORAGE_KEY = 'dreamingwrt.web.lineStatus.tab';
   const LINE_STATUS_HASH = '#/monitor/line-status';
   const VPN_PROTOCOLS = ['PPTP', 'L2TP', 'OpenVPN', 'IPSec VPN', 'IKEv2/IPSec', 'WireGuard'];
+  /*
+   * Kernel runtime fields, listed once so the realtime merge can preserve them.
+   * They only exist on the REST line-load projection.
+   */
+  const KERNEL_FIELDS = Object.freeze([
+    'kernel_active_conn',
+    'kernel_active_conn_valid',
+    'kernel_active_conn_semantics',
+    'kernel_active_conn_source',
+    'kernel_active_conn_stale_possible',
+    'kernel_tx_packets',
+    'kernel_rx_packets',
+    'kernel_tx_bytes',
+    'kernel_rx_bytes',
+    'kernel_stats_observed_at',
+    'kernel_stats_reason',
+    'kernel_proc_id',
+    'kernel_categories',
+    'kernel_categories_source',
+    'kernel_categories_reason'
+  ]);
 
   function fallbackEscape(value) {
     return String(value === undefined || value === null ? '' : value)
@@ -78,6 +99,13 @@
     const scheduleGlassCardsRender = context.scheduleGlassCardsRender || (() => {});
     const mountUiKit = context.mountUiKit || ((target) => window.DWRT_UI_KIT?.mountAll(target));
     const realtime = context.realtime || window.DWRTRealtime;
+    /*
+     * Shared normalizer for the two different connection numbers. It is required
+     * rather than reimplemented locally, because the whole point of this page's
+     * connection columns is that conntrack attribution and the JMX kernel gauge
+     * stay distinguishable.
+     */
+    const connTruth = context.connTruth || window.DWRTConnTruth || null;
 
     let page = null;
 
@@ -95,28 +123,24 @@
     }
 
     function connectionCountOf(source = {}, ...fallbacks) {
-      const fields = [
-        'connections',
-        'conn_count',
-        'conntrack_count',
-        'active_connections',
-        'active_conntrack',
-        'connection_count',
-        'session_count',
-        'sessions',
-        'flow_count',
-        'flows',
-        'ct_count',
-        'nf_conntrack_count',
-        'stable_connections'
-      ];
-      for (const field of fields) {
-        if (!Object.prototype.hasOwnProperty.call(source, field)) continue;
-        const raw = source[field];
-        if (raw === undefined || raw === null || raw === '') continue;
-        const num = Number(raw);
-        if (Number.isFinite(num)) return num;
-      }
+      /*
+       * conntrack attribution only. The old chain reached as far as
+       * `nf_conntrack_count` (a global total) and `flows`, so a WAN row could end
+       * up showing a number that was never per-WAN. The shared normalizer keeps
+       * the field set to names that actually mean per-WAN conntrack attribution;
+       * `kernel_active_conn` is deliberately not among them.
+       */
+      const count = connTruth
+        ? connTruth.conntrackCount(source)
+        : (() => {
+          for (const field of ['connections', 'conn_count', 'conntrack_count', 'active_connections', 'connection_count']) {
+            if (!Object.prototype.hasOwnProperty.call(source, field)) continue;
+            const num = Number(source[field]);
+            if (Number.isFinite(num)) return num;
+          }
+          return null;
+        })();
+      if (count !== null) return count;
       return firstNumber(...fallbacks);
     }
 
@@ -308,6 +332,18 @@
         connections: ipv6Mode
           ? connectionCountOf(line, line.ipv6_connections, line.v6_connections, line.ip6_connections)
           : connectionCountOf(line),
+        /*
+         * Source of the conntrack column, so the header/tooltip can name it
+         * instead of leaving "连接数" ambiguous.
+         */
+        conntrack: connTruth ? connTruth.conntrackTruth(line) : null,
+        /*
+         * Kernel forwarding stats stay in their own field. IPv6 mode gets no
+         * kernel projection at all: /monitor/ipv6-load carries no kernel_* nodes,
+         * and borrowing the IPv4 gauge would be the exact cross-plane mixing this
+         * page must avoid.
+         */
+        kernel: ipv6Mode || !connTruth ? null : connTruth.kernelRuntime(line),
         uptime: firstNumber(line.uptime, line.online_seconds),
         ipv6Only: Boolean(line.ipv6_only || line.ipv6Only || line.family === 'ipv6' || line.address_family === 'ipv6')
       };
@@ -377,6 +413,13 @@
     function hasUsefulTrafficLine(line) {
       const type = String(line?.type || '').toLowerCase();
       if (type !== 'wan') return true;
+      /*
+       * A WAN the kernel is actively counting is real, even when the config
+       * ledger has not caught up. wan3/wan4 were dropped this way: no rate rows
+       * yet, generic name, so the placeholder filter removed them while
+       * /proc/dreamingwrt/jmx was reporting thousands of flows for them.
+       */
+      if (line.kernel && line.kernel.valid) return true;
       if (!isGenericWanName(line.name) || !isGenericWanName(line.id)) return true;
       if (firstText(line.carrier_key, line.carrier_name, line.carrier, line.carrier_logo, line.ip, line.ipv6, line.linkSpeed)) return true;
       if (firstText(line.note) && firstText(line.note) !== firstText(line.ifname)) return true;
@@ -433,17 +476,120 @@
       </span>`;
     }
 
+    /*
+     * conntrack attribution cell. The count keeps its historical position, but the
+     * tooltip names the source so it can no longer be read as "all connections on
+     * this WAN".
+     */
+    function conntrackCellMarkup(line) {
+      const truth = line.conntrack;
+      const count = truth && truth.valid ? truth.count : line.connections;
+      const parts = [];
+      if (truth) {
+        if (truth.source) parts.push(`来源 ${truth.source}`);
+        if (truth.state) parts.push(`状态 ${truth.state}`);
+        if (truth.reason) parts.push(`口径 ${truth.reason}`);
+        if (truth.markMatches !== null) parts.push(`ctmark 命中 ${truth.markMatches}`);
+        if (truth.localIgnored !== null) parts.push(`本机探针排除 ${truth.localIgnored}`);
+      }
+      const tip = parts.length ? parts.join(' · ') : 'conntrack 公网地址归属统计';
+      return `<span class="line-connections" data-line-tooltip="${escapeHtml(tip)}" tabindex="0">${escapeHtml(Number(count || 0).toLocaleString('en-US'))}</span>`;
+    }
+
+    /*
+     * Kernel gauge cell. A missing proc row renders as 不可用 and an unconfirmed
+     * semantics renders the number with its caveat attached; neither falls back to
+     * the conntrack column and neither prints 0.
+     */
+    function kernelCellMarkup(line, rowKey) {
+      const runtime = line.kernel;
+      if (!runtime || !runtime.valid) {
+        const reason = runtime && runtime.reason ? `：${runtime.reason}` : '';
+        return `<span class="line-kernel-unavailable" data-line-tooltip="${escapeHtml(`内核转发统计不可用${reason}`)}" tabindex="0">${escapeHtml(connTruth ? connTruth.UNAVAILABLE_TEXT : '不可用')}</span>`;
+      }
+      const tipParts = [`语义 ${runtime.semanticsLabel}`];
+      if (runtime.source) tipParts.push(`来源 ${runtime.source}`);
+      if (runtime.procId) tipParts.push(`proc ${runtime.procId}`);
+      if (runtime.stalePossible) tipParts.push('合计超过全局 conntrack，可能存在残留');
+      const value = connTruth.formatInteger(runtime.activeConn);
+      const flag = runtime.confirmed ? '' : '<em class="line-kernel-flag">语义未确认</em>';
+      const hasDetail = runtime.categories.length > 0;
+      return `<span class="line-kernel-cell">
+        <span class="line-kernel-value" data-line-tooltip="${escapeHtml(tipParts.join(' · '))}" tabindex="0">${escapeHtml(value)}</span>
+        ${flag}
+        ${hasDetail ? `<button type="button" class="line-kernel-toggle" data-kernel-toggle="${escapeHtml(rowKey)}" aria-expanded="false">类别明细</button>` : ''}
+      </span>`;
+    }
+
+    /*
+     * Category detail row. Rows pass through exactly as the kernel reported them,
+     * Unknown included, and the Total line is the sum of those rows so it can be
+     * compared against the backend rather than recomputed from a reclassification.
+     */
+    function kernelDetailRow(line, rowKey) {
+      const runtime = line.kernel;
+      if (!runtime || !runtime.valid || !runtime.categories.length) return '';
+      const open = page?.expandedKernelRows?.has(rowKey);
+      const total = connTruth.categoryTotal(runtime.categories);
+      const rows = runtime.categories.map((row) => `
+        <tr>
+          <td>${escapeHtml(row.category)}</td>
+          <td>${escapeHtml(connTruth.formatInteger(row.activeConn))}</td>
+          <td>${escapeHtml(connTruth.formatInteger(row.txPackets))}</td>
+          <td>${escapeHtml(connTruth.formatInteger(row.rxPackets))}</td>
+          <td>${escapeHtml(connTruth.formatBytes(row.txBytes))}</td>
+          <td>${escapeHtml(connTruth.formatBytes(row.rxBytes))}</td>
+        </tr>`).join('');
+      const meta = [
+        `内核连接 ${connTruth.formatInteger(runtime.activeConn)}`,
+        runtime.confirmed ? `语义 ${runtime.semanticsLabel}` : runtime.semanticsLabel,
+        `发包 ${connTruth.formatInteger(runtime.txPackets)}`,
+        `收包 ${connTruth.formatInteger(runtime.rxPackets)}`,
+        `发送 ${connTruth.formatBytes(runtime.txBytes)}`,
+        `接收 ${connTruth.formatBytes(runtime.rxBytes)}`
+      ].join(' · ');
+      const notice = connTruth.kernelNotice(runtime);
+      return `
+        <tr class="line-kernel-detail-row" data-kernel-detail="${escapeHtml(rowKey)}" ${open ? '' : 'hidden'}>
+          <td colspan="7">
+            <div class="line-kernel-detail">
+              <div class="line-kernel-detail-meta">${escapeHtml(meta)}</div>
+              ${notice ? `<div class="line-kernel-detail-notice">${escapeHtml(notice)}</div>` : ''}
+              <div class="line-kernel-detail-source">${escapeHtml(runtime.categoriesSource || '')}</div>
+              <table class="line-kernel-category-table">
+                <thead><tr><th>类别</th><th>连接</th><th>发包</th><th>收包</th><th>发送</th><th>接收</th></tr></thead>
+                <tbody>${rows}</tbody>
+                <tfoot><tr>
+                  <td>Total</td>
+                  <td>${escapeHtml(connTruth.formatInteger(total.activeConn))}</td>
+                  <td>${escapeHtml(connTruth.formatInteger(total.txPackets))}</td>
+                  <td>${escapeHtml(connTruth.formatInteger(total.rxPackets))}</td>
+                  <td>${escapeHtml(connTruth.formatBytes(total.txBytes))}</td>
+                  <td>${escapeHtml(connTruth.formatBytes(total.rxBytes))}</td>
+                </tr></tfoot>
+              </table>
+            </div>
+          </td>
+        </tr>`;
+    }
+
     function lineLoadRows(lines, options = {}) {
-      return groupTraffic(lines).flatMap((group) => group.lines).map((line) => `
+      const withKernel = Boolean(options.showKernel);
+      return groupTraffic(lines).flatMap((group) => group.lines).map((line) => {
+        const rowKey = firstText(line.id, line.ifname, line.name) || 'line';
+        return `
         <tr class="line-load-data-row ${escapeHtml(line.type || 'line')}">
           <td data-label="线路">${lineName(line, Boolean(options.showIpv6))}</td>
           <td data-label="上行速率" class="rate-up">${escapeHtml(formatRate(line.upRate))}</td>
           <td data-label="累计上行" class="rate-up total-up">${escapeHtml(formatBytes(line.upBytes))}</td>
           <td data-label="下行速率" class="rate-down">${escapeHtml(formatRate(line.downRate))}</td>
           <td data-label="累计下行" class="rate-down total-down">${escapeHtml(formatBytes(line.downBytes))}</td>
-          <td data-label="连接数"><span class="line-connections">${Number(line.connections || 0).toLocaleString()}</span></td>
+          <td data-label="conntrack 连接">${conntrackCellMarkup(line)}</td>
+          ${withKernel ? `<td data-label="内核连接">${kernelCellMarkup(line, rowKey)}</td>` : ''}
         </tr>
-      `).join('');
+        ${withKernel ? kernelDetailRow(line, rowKey) : ''}
+      `;
+      }).join('');
     }
 
     function normalizeLineLoad(data) {
@@ -713,7 +859,7 @@
             <td data-label="累计上行" class="rate-up total-up">${escapeHtml(formatBytes(line.upBytes))}</td>
             <td data-label="下行速率" class="rate-down">${escapeHtml(formatRate(line.downRate))}</td>
             <td data-label="累计下行" class="rate-down total-down">${escapeHtml(formatBytes(line.downBytes))}</td>
-            <td data-label="连接数"><span class="line-connections">${Number(line.connections || 0).toLocaleString()}</span></td>
+            <td data-label="隧道连接"><span class="line-connections">${Number(line.connections || 0).toLocaleString()}</span></td>
           </tr>
         `).join('') : '<tr class="vpn-empty-line-row"><td></td><td colspan="6">无活动隧道</td></tr>'}
       `).join('');
@@ -736,7 +882,7 @@
         return {
           count: rows.length,
           html: `${warning}<table class="dwrt-kit-table line-load-core ipv6-load-core">
-            <thead><tr><th>线路</th><th>上行速率</th><th>累计上行</th><th>下行速率</th><th>累计下行</th><th>连接数</th></tr></thead>
+            <thead><tr><th>线路</th><th>上行速率</th><th>累计上行</th><th>下行速率</th><th>累计下行</th><th>conntrack 连接</th></tr></thead>
             <tbody>${rows.length ? lineLoadRows(rows, { showIpv6: true }) : '<tr><td colspan="6">后端暂未返回 IPv6 负载数据。</td></tr>'}</tbody>
           </table>`
         };
@@ -748,17 +894,31 @@
         return {
           count: total,
           html: `${warning}<table class="dwrt-kit-table line-load-core vpn-status-core">
-            <thead><tr><th>协议</th><th>线路</th><th>上行速率</th><th>累计上行</th><th>下行速率</th><th>累计下行</th><th>连接数</th></tr></thead>
+            <thead><tr><th>协议</th><th>线路</th><th>上行速率</th><th>累计上行</th><th>下行速率</th><th>累计下行</th><th>隧道连接</th></tr></thead>
             <tbody>${vpnRows(groups)}</tbody>
           </table>`
         };
       }
       const rows = normalizeLineLoad(data);
+      const aggregate = connTruth ? connTruth.kernelAggregate(data) : null;
+      /*
+       * The kernel column only appears when the snapshot is actually available.
+       * An unavailable snapshot gets one honest page-level notice instead of four
+       * rows of 不可用.
+       */
+      const showKernel = Boolean(aggregate && aggregate.available === true);
+      const kernelNotice = aggregate && aggregate.available === false
+        ? `<div class="line-load-warning">内核转发统计不可用${aggregate.reason ? `：${escapeHtml(aggregate.reason)}` : ''}</div>`
+        : '';
+      const semanticsNotice = showKernel && (aggregate.stalePossible || aggregate.semantics === 'unknown')
+        ? `<div class="line-load-warning">内核连接语义未确认（${escapeHtml(aggregate.semantics)}${aggregate.stalePossible ? '，各 WAN 合计超过全局 conntrack，可能存在残留' : ''}）。该列不能当作实时 conntrack 连接数。</div>`
+        : '';
+      const sourceNote = `<div class="line-load-source-note">连接数分两套口径：<strong>conntrack 归属</strong>${aggregate && aggregate.conntrackSource ? `（${escapeHtml(aggregate.conntrackSource)}）` : ''}统计公网地址归属；<strong>内核转发</strong>来自 JMX proc 计数，两者不可互换。</div>`;
       return {
         count: rows.length,
-        html: `<table class="dwrt-kit-table line-load-core">
-          <thead><tr><th>线路</th><th>上行速率</th><th>累计上行</th><th>下行速率</th><th>累计下行</th><th>连接数</th></tr></thead>
-          <tbody>${rows.length ? lineLoadRows(rows) : '<tr><td colspan="6">后端暂未返回线路负载数据。</td></tr>'}</tbody>
+        html: `${kernelNotice}${semanticsNotice}${sourceNote}<table class="dwrt-kit-table line-load-core${showKernel ? ' has-kernel-column' : ''}">
+          <thead><tr><th>线路</th><th>上行速率</th><th>累计上行</th><th>下行速率</th><th>累计下行</th><th title="conntrack 公网地址归属统计">conntrack 连接</th>${showKernel ? '<th title="JMX 内核转发计数">内核连接</th>' : ''}</tr></thead>
+          <tbody>${rows.length ? lineLoadRows(rows, { showKernel }) : `<tr><td colspan="${showKernel ? 7 : 6}">后端暂未返回线路负载数据。</td></tr>`}</tbody>
         </table>`
       };
     }
@@ -871,13 +1031,28 @@
       });
       const mergedRows = realtimeRows.map((wan, index) => {
         const current = existingByKey.get(wanMergeKey(wan)) || existingByKey.get(firstText(wan.ifname).toLowerCase()) || existingByKey.get(firstText(wan.name).toLowerCase()) || {};
-        return {
+        const merged = {
           ...current,
           ...wan,
           type: firstText(wan.type, current.type, 'wan'),
           order: wan.order || current.order || index + 1,
           connections: preferredConnectionCount(wan, current)
         };
+        /*
+         * wan.metrics is the conntrack/rate plane; dw_apply_wan_kernel_runtime()
+         * only runs on the REST line-load path, so WS frames carry no kernel_*
+         * fields at all. Spreading the frame over the REST row would therefore
+         * blank the kernel column every time a frame arrived, and the column
+         * would read as "unavailable" while the proc nodes were perfectly fine.
+         * Retain the REST kernel projection unless the frame actually carries one.
+         */
+        if (!Object.prototype.hasOwnProperty.call(wan, 'kernel_active_conn')) {
+          KERNEL_FIELDS.forEach((field) => {
+            if (Object.prototype.hasOwnProperty.call(current, field)) merged[field] = current[field];
+            else delete merged[field];
+          });
+        }
+        return merged;
       });
       const key = Array.isArray(existingData.interfaces) ? 'interfaces' : Array.isArray(existingData.items) ? 'items' : Array.isArray(existingData.lines) ? 'lines' : Array.isArray(existingData.wans) ? 'wans' : 'interfaces';
       return { ...existingData, ...realtimePayload, [key]: mergedRows };
@@ -1064,6 +1239,12 @@
         lastWsAt: 0,
         healthContractReady: false,
         configuredWanKeys: new Set(),
+        /*
+         * Expanded category rows are page state, not markup state: the panel
+         * re-renders every 5 seconds and an expansion stored only in the DOM
+         * would collapse under the user.
+         */
+        expandedKernelRows: new Set(),
         systemUptime: 0,
         systemUptimeAt: 0,
         lastHealthContractAt: 0,
@@ -1073,6 +1254,23 @@
       root.querySelectorAll('.line-status-tabs .dwrt-kit-tab').forEach((button) => {
         button.addEventListener('click', () => selectPanel(button.dataset.value || PANELS[0].id));
       });
+      /*
+       * Delegated so it survives the periodic innerHTML rewrite of the table.
+       * Toggling only flips page state plus the matching row, so it does not
+       * trigger a full re-render or disturb scroll position.
+       */
+      page.onKernelToggle = (event) => {
+        const button = event.target.closest('[data-kernel-toggle]');
+        if (!button || !page) return;
+        const key = button.getAttribute('data-kernel-toggle') || '';
+        const detail = page.table && page.table.querySelector(`[data-kernel-detail="${CSS.escape(key)}"]`);
+        const open = page.expandedKernelRows.has(key);
+        if (open) page.expandedKernelRows.delete(key);
+        else page.expandedKernelRows.add(key);
+        button.setAttribute('aria-expanded', open ? 'false' : 'true');
+        if (detail) detail.hidden = open;
+      };
+      root.addEventListener('click', page.onKernelToggle);
       mountUiKit(root);
       bindLineTooltips();
       subscribeRealtime();
@@ -1086,6 +1284,7 @@
       if (!page) return;
       page.active = false;
       unsubscribeRealtime();
+      if (page.onKernelToggle) root.removeEventListener('click', page.onKernelToggle);
       root.removeEventListener('pointerover', page.onTooltipOver);
       root.removeEventListener('pointermove', page.onTooltipMove);
       root.removeEventListener('pointerout', page.onTooltipOut);

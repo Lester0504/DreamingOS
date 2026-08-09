@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
@@ -1611,6 +1612,228 @@ static void wifi_environment_copy(struct json_object *out,
         json_object_object_add(out, to, json_object_get(value));
 }
 
+/*
+ * BSSID vendor enrichment.
+ *
+ * apd cannot resolve a vendor: the OUI table lives on the controller, not on
+ * the AP, so every scanned neighbour arrives with vendor=null and
+ * vendor_reason="controller_enrichment_pending". This is the controller side of
+ * that contract. The lookup is deliberately self-contained instead of calling
+ * jmx_ht_match_mac(): that symbol lives in jmx_hosttype.o, which is linked into
+ * dreamingwrt-core but not into webd, and pulling it in would drag the core's
+ * logging and signature plumbing into this translation unit.
+ *
+ * The table is nmap's, already shipped for client identification, and is loaded
+ * once on first use. webd is a single-threaded uloop process, so the cache
+ * needs no lock.
+ */
+#define WIFI_OUI_TABLE_PATH "/usr/share/nmap/nmap-mac-prefixes"
+
+struct wifi_oui_entry {
+    uint32_t prefix;    /* first three MAC bytes, big-endian */
+    const char *vendor; /* points into wifi_oui_strings */
+};
+
+static struct wifi_oui_entry *wifi_oui_entries;
+static char *wifi_oui_strings;
+static size_t wifi_oui_count;
+static int wifi_oui_load_attempted;
+
+static const char *wifi_oui_table_path(void)
+{
+    const char *override = getenv("DREAMINGWRT_OUI_PREFIX_PATH");
+
+    return override && override[0] ? override : WIFI_OUI_TABLE_PATH;
+}
+
+static int wifi_oui_entry_cmp(const void *a, const void *b)
+{
+    uint32_t left = ((const struct wifi_oui_entry *)a)->prefix;
+    uint32_t right = ((const struct wifi_oui_entry *)b)->prefix;
+
+    if (left < right)
+        return -1;
+    return left > right ? 1 : 0;
+}
+
+/* Splits "AABBCC Vendor Name" into its prefix and a trimmed vendor name. */
+static int wifi_oui_parse_line(char *line, uint32_t *prefix, char **vendor,
+                               size_t *vendor_len)
+{
+    unsigned int bytes[3];
+    char *space = strchr(line, ' ');
+    size_t length;
+
+    if (!space || space - line != 6)
+        return 0;
+    if (sscanf(line, "%2x%2x%2x", &bytes[0], &bytes[1], &bytes[2]) != 3)
+        return 0;
+    space++;
+    while (*space == ' ' || *space == '\t')
+        space++;
+    length = strlen(space);
+    while (length > 0 && (space[length - 1] == '\n' || space[length - 1] == '\r' ||
+                          space[length - 1] == ' ' || space[length - 1] == '\t'))
+        length--;
+    if (length == 0)
+        return 0;
+    *prefix = ((uint32_t)bytes[0] << 16) | ((uint32_t)bytes[1] << 8) |
+              (uint32_t)bytes[2];
+    *vendor = space;
+    *vendor_len = length;
+    return 1;
+}
+
+static void wifi_oui_table_release(void)
+{
+    free(wifi_oui_entries);
+    wifi_oui_entries = NULL;
+    free(wifi_oui_strings);
+    wifi_oui_strings = NULL;
+    wifi_oui_count = 0;
+}
+
+static void wifi_oui_table_load(void)
+{
+    const char *path = wifi_oui_table_path();
+    FILE *file;
+    char line[256];
+    size_t rows = 0;
+    size_t bytes = 0;
+    char *pool;
+    size_t loaded = 0;
+
+    wifi_oui_load_attempted = 1;
+    file = fopen(path, "r");
+    if (!file)
+        return;
+    while (fgets(line, sizeof(line), file)) {
+        uint32_t prefix;
+        char *vendor;
+        size_t vendor_len;
+
+        if (!wifi_oui_parse_line(line, &prefix, &vendor, &vendor_len))
+            continue;
+        rows++;
+        bytes += vendor_len + 1;
+    }
+    if (rows == 0) {
+        fclose(file);
+        return;
+    }
+    wifi_oui_entries = calloc(rows, sizeof(*wifi_oui_entries));
+    wifi_oui_strings = malloc(bytes);
+    if (!wifi_oui_entries || !wifi_oui_strings) {
+        fclose(file);
+        wifi_oui_table_release();
+        return;
+    }
+    rewind(file);
+    pool = wifi_oui_strings;
+    while (fgets(line, sizeof(line), file) && loaded < rows) {
+        uint32_t prefix;
+        char *vendor;
+        size_t vendor_len;
+
+        if (!wifi_oui_parse_line(line, &prefix, &vendor, &vendor_len))
+            continue;
+        memcpy(pool, vendor, vendor_len);
+        pool[vendor_len] = '\0';
+        wifi_oui_entries[loaded].prefix = prefix;
+        wifi_oui_entries[loaded].vendor = pool;
+        pool += vendor_len + 1;
+        loaded++;
+    }
+    fclose(file);
+    if (loaded == 0) {
+        wifi_oui_table_release();
+        return;
+    }
+    qsort(wifi_oui_entries, loaded, sizeof(*wifi_oui_entries),
+          wifi_oui_entry_cmp);
+    wifi_oui_count = loaded;
+}
+
+static const char *wifi_oui_lookup(uint32_t prefix)
+{
+    size_t low = 0;
+    size_t high;
+
+    if (!wifi_oui_load_attempted)
+        wifi_oui_table_load();
+    if (!wifi_oui_entries || wifi_oui_count == 0)
+        return NULL;
+    high = wifi_oui_count - 1;
+    while (low <= high) {
+        size_t mid = low + (high - low) / 2;
+        uint32_t have = wifi_oui_entries[mid].prefix;
+
+        if (have == prefix)
+            return wifi_oui_entries[mid].vendor;
+        if (have < prefix)
+            low = mid + 1;
+        else if (mid == 0)
+            break;
+        else
+            high = mid - 1;
+    }
+    return NULL;
+}
+
+/* Parses the first three bytes of "aa:bb:cc:dd:ee:ff". */
+static int wifi_bssid_prefix(const char *bssid, uint32_t *prefix)
+{
+    unsigned int bytes[3];
+
+    if (!bssid || !prefix)
+        return 0;
+    if (sscanf(bssid, "%2x:%2x:%2x", &bytes[0], &bytes[1], &bytes[2]) != 3)
+        return 0;
+    *prefix = ((uint32_t)bytes[0] << 16) | ((uint32_t)bytes[1] << 8) |
+              (uint32_t)bytes[2];
+    return 1;
+}
+
+/*
+ * Fills the row's vendor from the OUI table and keeps vendor_reason honest: a
+ * randomised BSSID stays unresolvable by definition, and a real prefix the
+ * table does not carry is a different fact from "not implemented yet".
+ *
+ * The row always ends up carrying a vendor key. wifi_environment_copy() drops
+ * a JSON null, so apd's explicit "vendor": null would otherwise vanish from the
+ * row and read as a field nobody ever reported.
+ */
+static void wifi_environment_resolve_vendor(struct json_object *row,
+                                            struct json_object *item,
+                                            const char *bssid)
+{
+    uint32_t prefix = 0;
+    const char *vendor;
+
+    if (wifi_string(item, "vendor", "")[0])
+        return;
+    if (wifi_bool(item, "locally_administered", 0)) {
+        /* Randomised BSSID: apd's reason is already terminal, keep it. */
+        wifi_replace_null(row, "vendor");
+        return;
+    }
+    if (!wifi_bssid_prefix(bssid, &prefix)) {
+        wifi_replace_null(row, "vendor");
+        wifi_replace_string(row, "vendor_reason", "bssid_unparsable");
+        return;
+    }
+    vendor = wifi_oui_lookup(prefix);
+    if (vendor && vendor[0]) {
+        wifi_replace_string(row, "vendor", vendor);
+        wifi_replace_string(row, "vendor_reason", "oui_prefix_match");
+        return;
+    }
+    wifi_replace_null(row, "vendor");
+    wifi_replace_string(row, "vendor_reason",
+                        wifi_oui_count ? "oui_prefix_not_in_table" :
+                                         "oui_table_unavailable");
+}
+
 static void wifi_environment_interference_add(
     struct json_object *data, struct json_object *interference,
     struct json_object *item, const char *job_id, const char *ap_id,
@@ -1664,6 +1887,7 @@ static void wifi_environment_interference_add(
     wifi_environment_copy(row, item, "security", "security");
     wifi_environment_copy(row, item, "vendor", "vendor");
     wifi_environment_copy(row, item, "vendor_reason", "vendor_reason");
+    wifi_environment_resolve_vendor(row, item, bssid);
     wifi_environment_copy(row, item, "complete", "complete");
     wifi_environment_copy(row, item, "missing_fields", "missing_fields");
     json_object_object_add(row, "sample_complete",

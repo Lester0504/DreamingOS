@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../src/storage/storage_files.h"
 
@@ -22,10 +23,49 @@ int main(int argc, char **argv)
     struct json_object *response;
     int mutate_mode = argc > 1 && !strcmp(argv[1], "mutate");
     int content_mode = argc > 1 && !strcmp(argv[1], "content");
-    int offset = (content_mode || mutate_mode) ? 1 : 0;
+    int stream_mode = argc > 1 && !strcmp(argv[1], "stream");
+    int offset = (content_mode || mutate_mode || stream_mode) ? 1 : 0;
     const char *root_id = argc > 1 + offset ? argv[1 + offset] : "";
     const char *path = argc > 2 + offset ? argv[2 + offset] : "/";
     const char *search = argc > 3 + offset ? argv[3 + offset] : "";
+
+    /* Byte-stream open: reports what the HTTP layer needs (size, name, first
+     * bytes actually readable) instead of a JSON body, since the real route
+     * streams the descriptor rather than serialising the file. */
+    if (stream_mode) {
+        struct storage_files_stream stream;
+        const char *reason = "";
+        struct json_object *out = json_object_new_object();
+
+        if (storage_files_open_stream(root_id, path, &stream, &reason) != 0) {
+            json_object_object_add(out, "ok", json_object_new_boolean(0));
+            json_object_object_add(out, "reason", json_object_new_string(reason));
+        } else {
+            unsigned char head[8];
+            ssize_t got = read(stream.fd, head, sizeof(head));
+            char hex[32] = "";
+
+            for (ssize_t i = 0; i < got && i < 4; i++)
+                snprintf(hex + strlen(hex), sizeof(hex) - strlen(hex),
+                         "%02x", head[i]);
+            json_object_object_add(out, "ok", json_object_new_boolean(1));
+            json_object_object_add(out, "size_bytes",
+                                   json_object_new_int64((int64_t)stream.size_bytes));
+            json_object_object_add(out, "basename",
+                                   json_object_new_string(stream.basename));
+            json_object_object_add(out, "root_id",
+                                   json_object_new_string(stream.root_id));
+            json_object_object_add(out, "display_path",
+                                   json_object_new_string(stream.display_path));
+            json_object_object_add(out, "bytes_read",
+                                   json_object_new_int((int)got));
+            json_object_object_add(out, "head_hex", json_object_new_string(hex));
+            close(stream.fd);
+        }
+        puts(json_object_to_json_string_ext(out, JSON_C_TO_STRING_PLAIN));
+        json_object_put(out);
+        return 0;
+    }
 
     if (mutate_mode) {
         struct json_object *payload = json_tokener_parse(

@@ -76,6 +76,7 @@ int main(void)
     sqlite3 *db = NULL;
     struct json_object *result;
     struct json_object *points;
+    struct json_object *fallback;
     struct json_object *item;
     int fd = mkstemp(path);
 
@@ -100,12 +101,15 @@ int main(void)
     sqlite3_close(db);
 
     result = jmx_client_protocol_history_query(path, "AA:BB:CC:DD:EE:FF", 900, 300);
-    assert(json_object_get_boolean(field(result, "available")));
-    assert(json_object_get_boolean(field(result, "supported")));
+    assert(!json_object_get_boolean(field(result, "available")));
+    assert(!json_object_get_boolean(field(result, "supported")));
     assert(!json_object_get_boolean(field(result, "complete")));
     assert(!json_object_get_boolean(field(result, "first_sample_counted")));
     assert(!json_object_get_boolean(field(result, "counter_reset_counted")));
-    points = field(result, "points");
+    fallback = field(result, "fallback");
+    assert(json_object_get_boolean(field(fallback, "available")));
+    assert(!json_object_get_boolean(field(fallback, "supported")));
+    points = field(fallback, "points");
     assert(json_object_array_length(points) == 2);
 
     item = find_item(points, 760, 101);
@@ -124,8 +128,10 @@ int main(void)
     json_object_put(result);
 
     result = jmx_client_protocol_history_query(path, "22:33:44:55:66:77", 2000, 300);
-    assert(json_object_get_boolean(field(result, "supported")));
-    points = field(result, "points");
+    assert(!json_object_get_boolean(field(result, "supported")));
+    fallback = field(result, "fallback");
+    assert(json_object_get_boolean(field(fallback, "available")));
+    points = field(fallback, "points");
     assert(json_object_array_length(points) == JMX_CLIENT_PROTOCOL_HISTORY_MAX_POINTS);
     assert(json_object_get_int64(field(json_object_array_get_idx(points, 0), "ts")) == 1727);
     assert(json_object_get_int64(field(json_object_array_get_idx(

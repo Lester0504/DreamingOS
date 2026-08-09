@@ -25,4 +25,11 @@ int jmx_parse_time_str(const char *time_str, jmx_time_period_t *periods, int max
 int jmx_update_proc_value(const char *key, const char *value);
 void update_jmx_proc_value(char *key, char *value);
 void update_jmx_proc_u32_value(char *key, u_int32_t value);
+
+/* UCI single-quoted values cannot escape a quote, so a value containing one
+ * has to be rejected rather than rewritten. jmx_uci_value_ok() is the check to
+ * run at every write-API entry point; jmx_uci_value_sanitize() is the last-ditch
+ * screen for config generators reading rows that predate the check. */
+int jmx_uci_value_ok(const char *s);
+const char *jmx_uci_value_sanitize(const char *s, char *buf, size_t buf_len);
 #endif

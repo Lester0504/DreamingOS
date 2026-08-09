@@ -360,6 +360,44 @@ static int cloud_identity_load_router_id(const unsigned char *kex_public_key,
     return 0;
 }
 
+/*
+ * Exports the derived relay id to CLOUD_RELAY_ROUTER_ID_PATH.
+ *
+ * Public metadata, so 0644 rather than the 0600 used for key material: the id
+ * is what the relay routes on and it is handed to Apps during pairing.
+ *
+ * Rewritten only when the content actually differs. Identity is loaded on every
+ * start, and this file lives on flash, so an unconditional write would cost an
+ * erase cycle per boot for a value that changes only when the keys do.
+ */
+static void cloud_identity_publish_relay_router_id(const char *relay_router_id)
+{
+    char buffer[CLOUD_ROUTER_ID_MAX + 2] = {0};
+    FILE *fp;
+
+    if (!relay_router_id || !relay_router_id[0])
+        return;
+    fp = fopen(CLOUD_RELAY_ROUTER_ID_PATH, "re");
+    if (fp) {
+        if (fgets(buffer, sizeof(buffer), fp)) {
+            size_t length = strlen(buffer);
+
+            while (length && (buffer[length - 1] == '\n' ||
+                              buffer[length - 1] == '\r' ||
+                              buffer[length - 1] == ' '))
+                buffer[--length] = '\0';
+        }
+        fclose(fp);
+        if (!strcmp(buffer, relay_router_id))
+            return;
+    }
+    if (cloud_identity_write_secret(CLOUD_RELAY_ROUTER_ID_PATH,
+                                    (const unsigned char *)relay_router_id,
+                                    strlen(relay_router_id), 0644) != 0)
+        fprintf(stderr, "[%s] could not publish relay_router_id to %s\n",
+                CLOUD_SERVICE_NAME, CLOUD_RELAY_ROUTER_ID_PATH);
+}
+
 int cloud_identity_load(struct cloud_identity *out)
 {
     struct cloud_identity identity;
@@ -461,6 +499,17 @@ int cloud_identity_load(struct cloud_identity *out)
                         sizeof(identity.signing_private_key));
         return -1;
     }
+
+    /*
+     * Publish the wire id so components that cannot derive it themselves can
+     * still address the relay. notifyd needs exactly this: the relay looks its
+     * tunnel token up by the enrolled id, so posting the local UUID is refused
+     * with router_unauthorized.
+     *
+     * Not fatal on failure. It is a convenience export, and losing it must not
+     * stop the tunnel from coming up, which is the capability users notice.
+     */
+    cloud_identity_publish_relay_router_id(identity.relay_router_id);
 
     g_identity = identity;
     g_identity_loaded = 1;

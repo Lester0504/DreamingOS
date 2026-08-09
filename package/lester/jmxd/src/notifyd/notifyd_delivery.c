@@ -146,11 +146,20 @@ static int notifyd_webhook_headers(struct json_object *options, struct curl_slis
 }
 
 #define NOTIFYD_ROUTER_ID_PATH "/etc/dreamingwrt/cloud/router_id"
+/*
+ * The relay authenticates ingest by looking the tunnel token up under the id the
+ * router enrolled with, which is always the key fingerprint. On a router whose
+ * local router_id is still a legacy UUID the two differ, and posting the UUID is
+ * refused with 401 router_unauthorized. So this file is preferred, and
+ * NOTIFYD_ROUTER_ID_PATH is only the fallback for a router where the local id is
+ * already the derived one.
+ */
+#define NOTIFYD_RELAY_ROUTER_ID_PATH "/etc/dreamingwrt/cloud/relay_router_id"
 
-/* Read the cloud router id written by the enrollment flow.  notifyd has no ubus
+/* Read a cloud router id file written by the enrollment flow.  notifyd has no ubus
  * dependency on webd, and this file is the same source webd itself uses, so
  * reading it directly avoids a startup ordering dependency. */
-static int notifyd_router_id_load(char *out, size_t out_len)
+static int notifyd_router_id_load_from(const char *path, char *out, size_t out_len)
 {
     FILE *fp;
     size_t n;
@@ -158,7 +167,7 @@ static int notifyd_router_id_load(char *out, size_t out_len)
     if (!out || out_len == 0)
         return 0;
     out[0] = '\0';
-    fp = fopen(NOTIFYD_ROUTER_ID_PATH, "re");
+    fp = fopen(path, "re");
     if (!fp)
         return 0;
     if (!fgets(out, (int)out_len, fp)) {
@@ -171,6 +180,14 @@ static int notifyd_router_id_load(char *out, size_t out_len)
     while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' '))
         out[--n] = '\0';
     return out[0] != '\0';
+}
+
+/* Prefer the enrolled (key-derived) id; fall back to the local one. */
+static int notifyd_router_id_load(char *out, size_t out_len)
+{
+    if (notifyd_router_id_load_from(NOTIFYD_RELAY_ROUTER_ID_PATH, out, out_len))
+        return 1;
+    return notifyd_router_id_load_from(NOTIFYD_ROUTER_ID_PATH, out, out_len);
 }
 
 /* Map the native notify payload onto the relay ingest contract.  Deliberately a

@@ -1177,6 +1177,110 @@ struct json_object *jmx_storage_files_content(const char *root_id,
     return jmx_gen_api_response_data(STORAGE_FILES_API_SUCCESS, data);
 }
 
+/* Byte-stream open for the raw/download route.
+ *
+ * Returns a read-only descriptor instead of a JSON body: the caller streams the
+ * bytes itself, because a video does not fit in a ubus message and must not be
+ * buffered into one.  Every guard the JSON content path applies is applied here
+ * in the same order -- root discovery, relative-path validation, the content
+ * deny-list, then storage_files_open_regular()'s nofollow / no-xdev open.  The
+ * two limits that are specific to *text* (256 KiB and UTF-8 validity) are the
+ * only ones deliberately absent, since refusing binary is precisely what this
+ * entry point exists to lift.
+ *
+ * On success the descriptor is positioned at offset 0 and the caller owns it.
+ * On failure nothing is opened and *reason is a stable machine code, chosen from
+ * the same vocabulary jmx_storage_files_content() already returns so the HTTP
+ * layer does not invent a second error dialect.
+ */
+int storage_files_open_stream(const char *root_id, const char *path,
+                              struct storage_files_stream *out,
+                              const char **reason)
+{
+    struct storage_file_root roots[STORAGE_FILES_MAX_ROOTS];
+    const struct storage_file_root *root;
+    struct stat st;
+    char relative[PATH_MAX], display[PATH_MAX];
+    const char *base;
+    int root_count, fd;
+
+    if (reason)
+        *reason = "";
+    if (!out || (root_id && strlen(root_id) >= sizeof(roots[0].id)) ||
+        !path || !path[0] || strlen(path) >= PATH_MAX) {
+        if (reason)
+            *reason = "invalid_request";
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    out->fd = -1;
+    root_count = storage_files_discover_roots(roots, STORAGE_FILES_MAX_ROOTS);
+    if (root_count < 0) {
+        if (reason)
+            *reason = "mount_inventory_unavailable";
+        return -1;
+    }
+    root = storage_files_select_root(roots, root_count, root_id, path);
+    if (!root) {
+        if (reason)
+            *reason = "storage_root_not_found";
+        return -1;
+    }
+    if (storage_files_relative_path(root, path, relative, sizeof(relative),
+                                    display, sizeof(display)) != 0 ||
+        !relative[0]) {
+        if (reason)
+            *reason = "invalid_relative_path";
+        return -1;
+    }
+    base = strrchr(display, '/');
+    base = base ? base + 1 : display;
+    /* Refuse before opening, exactly as the JSON content path does: a
+     * credential store or live database must not become downloadable just
+     * because the transport changed from JSON to a byte stream. */
+    if (storage_files_content_denied(display, base, reason))
+        return -1;
+    fd = storage_files_open_regular(root, relative, &st);
+    if (fd < 0) {
+        if (reason)
+            *reason = errno == EXDEV ? "mount_boundary_rejected" :
+                                       "file_unavailable";
+        return -1;
+    }
+    /* storage_files_open_regular() opens O_NONBLOCK so a fifo cannot stall the
+     * open; it also guarantees S_ISREG, so clearing the flag here cannot block
+     * on anything.  Streaming wants blocking reads. */
+    {
+        int flags = fcntl(fd, F_GETFL);
+
+        if (flags >= 0)
+            (void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    }
+    out->fd = fd;
+    out->size_bytes = (uint64_t)st.st_size;
+    out->modified_unix = (int64_t)st.st_mtime;
+    out->inode = (uint64_t)st.st_ino;
+    snprintf(out->root_id, sizeof(out->root_id), "%s", root->id);
+    snprintf(out->display_path, sizeof(out->display_path), "%s", display);
+    /* A single component cannot exceed NAME_MAX on any filesystem we admit as a
+     * root, so this cannot trip in practice; it is a hard check rather than a
+     * truncating copy because the basename becomes a Content-Disposition
+     * filename, and a silently shortened name is a wrong name. */
+    {
+        size_t base_len = strlen(base);
+
+        if (base_len >= sizeof(out->basename)) {
+            close(fd);
+            out->fd = -1;
+            if (reason)
+                *reason = "invalid_relative_path";
+            return -1;
+        }
+        memcpy(out->basename, base, base_len + 1U);
+    }
+    return 0;
+}
+
 static const char *storage_files_json_string(struct json_object *object,
                                              const char *key)
 {

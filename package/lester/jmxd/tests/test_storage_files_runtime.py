@@ -27,6 +27,11 @@ def content(binary: Path, root_id: str, path: Path) -> dict:
     return data(run(binary, "content", root_id, str(path)))
 
 
+def stream(binary: Path, root_id: str, path: Path) -> dict:
+    """Byte-stream open. Returns the fixture's own object, not a data envelope."""
+    return run(binary, "stream", root_id, str(path))
+
+
 def mutate(binary: Path, payload: dict) -> dict:
     return data(run(binary, "mutate", json.dumps(payload, separators=(",", ":"))))
 
@@ -239,6 +244,40 @@ def main() -> None:
         assert content(binary, root_id, mount / "binary.bin")["error"] == "not_utf8_text"
         assert content(binary, root_id, mount / "invalid.txt")["error"] == "not_utf8_text"
         assert content(binary, root_id, mount / "large.txt")["error"] == "text_too_large"
+
+        # The byte stream exists precisely to serve what the text endpoint above
+        # refuses. If these three ever start failing the same way /content does,
+        # image and video preview and file download are all dead again.
+        for name, expect_size in (("binary.bin", 12),
+                                  ("invalid.txt", 5),
+                                  ("large.txt", 256 * 1024 + 1)):
+            opened = stream(binary, root_id, mount / name)
+            assert opened["ok"] is True, f"{name} must stream: {opened}"
+            assert opened["size_bytes"] == expect_size, (name, opened)
+            assert opened["basename"] == name
+            assert opened["root_id"] == root_id
+            assert opened["bytes_read"] > 0, (
+                f"{name} opened but read nothing; the descriptor must be "
+                "positioned at offset 0 and blocking")
+        # First bytes really are the file's own, so the descriptor is not
+        # mid-file or pointed somewhere else.
+        assert stream(binary, root_id, mount / "binary.bin")["head_hex"] == "6265666f"
+
+        # Guards the stream must keep, in the same shape the text path reports
+        # them: escaping the root, following a symlink out, leaving the mount.
+        for invalid, expected in (
+            (mount / "escape", {"invalid_relative_path",
+                                "mount_boundary_rejected", "file_unavailable"}),
+            (mount / ".." / "outside.txt", {"invalid_relative_path",
+                                            "file_unavailable"}),
+            (mount / "folder", {"file_unavailable", "mount_boundary_rejected"}),
+            (mount / "pipe", {"file_unavailable", "mount_boundary_rejected"}),
+        ):
+            refused = stream(binary, root_id, invalid)
+            assert refused["ok"] is False, (str(invalid), refused)
+            assert refused["reason"] in expected, (str(invalid), refused)
+        # A directory and a fifo are not streamable: open_regular() enforces
+        # S_ISREG, so neither can be served as a file.
         assert content(binary, root_id, mount / "pipe")["error"] == "mount_boundary_rejected"
         assert content(binary, root_id, mount / "folder")["error"] == "mount_boundary_rejected"
         assert content(binary, root_id, mount / "escape")["error"] == "mount_boundary_rejected"

@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 
+import apd_test_deps
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src/apd/apd_radio_job_journal.c"
@@ -22,10 +24,16 @@ def dependency_prefix(name: str) -> Path:
     override = os.environ.get(f"APD_RADIO_JOB_{name.upper()}_PREFIX")
     if override:
         return Path(override)
-    result = subprocess.run(
-        ["brew", "--prefix", name], check=False, capture_output=True, text=True
-    )
-    if result.returncode == 0 and Path(result.stdout.strip()).exists():
+    # brew is absent on the build host and raised FileNotFoundError here, which
+    # aborted the test before any assertion ran.
+    try:
+        result = subprocess.run(
+            ["brew", "--prefix", name], check=False, capture_output=True,
+            text=True
+        )
+    except OSError:
+        result = None
+    if result and result.returncode == 0 and Path(result.stdout.strip()).exists():
         return Path(result.stdout.strip())
     candidates = sorted(
         Path(path)
@@ -39,12 +47,19 @@ def dependency_prefix(name: str) -> Path:
     )
     if candidates:
         return candidates[-1]
-    return Path("/usr")
+    header = "json-c/json.h" if name == "json-c" else "sqlite3.h"
+    library = "json-c" if name == "json-c" else "sqlite3"
+    prefix, _ = apd_test_deps.resolve_prefix(library, header)
+    return prefix
 
 
 def compile_fixture(output: Path) -> None:
     json_c = dependency_prefix("json-c")
     sqlite = dependency_prefix("sqlite")
+    # Link the .so when present; the staging_dir .a is an LTO archive.
+    json_archive = json_c / "lib/libjson-c.a"
+    json_link = (str(json_archive) if json_archive.is_file() and
+                 not (json_c / "lib/libjson-c.so").is_file() else "-ljson-c")
     command = [
         os.environ.get("CC", "cc"),
         "-std=c11",
@@ -53,9 +68,11 @@ def compile_fixture(output: Path) -> None:
         f"-I{json_c / 'include'}",
         f"-I{sqlite / 'include'}",
         str(FIXTURE), str(SOURCE),
+        f"-L{json_c / 'lib'}",
+        f"-Wl,-rpath,{json_c / 'lib'}",
         f"-L{sqlite / 'lib'}",
         f"-Wl,-rpath,{sqlite / 'lib'}",
-        str(json_c / "lib/libjson-c.a"), "-lsqlite3", "-o", str(output),
+        json_link, "-lsqlite3", "-o", str(output),
     ]
     subprocess.run(command, check=True, capture_output=True, text=True)
 

@@ -149,6 +149,48 @@ int flowd_db_init(void)
         "'/etc/dreamingwrt/geoip/GeoLite2-Country.mmdb','GeoLite2-Country',1,1,'',"
         "'{\"url\":\"https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb\",\"repo\":\"P3TERX/GeoLite.mmdb\",\"asset\":\"GeoLite2-Country.mmdb\"}',0,0)") != 0)
         return flowd_db_init_fail();
+    /* The city DB was installed by hand on existing devices, so it had no source row
+     * and could not be refreshed or scheduled through the API at all.  Seed it with
+     * update_enabled=0: the artifact is ~66 MB and the user should opt in explicitly. */
+    if (flowd_exec(g_flowd_config_db,
+        "INSERT OR IGNORE INTO flowd_geoip_sources"
+        "(id,name,type,path,edition,enabled,auto_update,license_ref,meta_json,created_at,updated_at) "
+        "VALUES('p3terx-geolite2-city','P3TERX GeoLite2 City','github-mmdb',"
+        "'/etc/dreamingwrt/geoip/GeoLite2-City.mmdb','GeoLite2-City',1,0,'',"
+        "'{\"url\":\"https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb\",\"repo\":\"P3TERX/GeoLite.mmdb\",\"asset\":\"GeoLite2-City.mmdb\"}',0,0)") != 0)
+        return flowd_db_init_fail();
+    /* Scheduled-update state.  auto_update predates this and means "allow the
+     * boot-time bootstrap download"; it is deliberately left alone so existing rows
+     * keep their meaning.  update_enabled is the separate periodic-refresh switch. */
+    {
+        static const char *const geoip_sched_cols[] = {
+            "ALTER TABLE flowd_geoip_sources ADD COLUMN update_enabled INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE flowd_geoip_sources ADD COLUMN update_interval_s INTEGER NOT NULL DEFAULT 604800",
+            "ALTER TABLE flowd_geoip_sources ADD COLUMN update_window_start_h INTEGER NOT NULL DEFAULT 3",
+            "ALTER TABLE flowd_geoip_sources ADD COLUMN update_window_end_h INTEGER NOT NULL DEFAULT 5",
+            "ALTER TABLE flowd_geoip_sources ADD COLUMN last_check_at INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE flowd_geoip_sources ADD COLUMN last_success_at INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE flowd_geoip_sources ADD COLUMN next_run_at INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE flowd_geoip_sources ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE flowd_geoip_sources ADD COLUMN remote_etag TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE flowd_geoip_sources ADD COLUMN remote_last_modified TEXT NOT NULL DEFAULT ''",
+            NULL
+        };
+        size_t i;
+
+        for (i = 0; geoip_sched_cols[i]; i++) {
+            char *err = NULL;
+            int rc = sqlite3_exec(g_flowd_config_db, geoip_sched_cols[i], NULL, NULL, &err);
+
+            if (rc != SQLITE_OK && (!err || !strstr(err, "duplicate column name"))) {
+                fprintf(stderr, "[dreamingwrt-flowd] add geoip schedule column failed: %s\n",
+                        err ? err : sqlite3_errmsg(g_flowd_config_db));
+                sqlite3_free(err);
+                return flowd_db_init_fail();
+            }
+            sqlite3_free(err);
+        }
+    }
 
     if (flowd_exec(g_flowd_config_db,
         "CREATE TABLE IF NOT EXISTS flowd_country_policies ("
@@ -996,6 +1038,50 @@ struct json_object *flowd_settings_update(struct json_object *body)
     return resp;
 }
 
+/* Next scheduled check, snapped into the allowed maintenance window.
+ *
+ * The window is expressed in local hours.  start==end means "no window", i.e. the
+ * interval alone decides.  A window that wraps midnight (start 22, end 5) is
+ * supported.  Returning the un-snapped time when localtime() is unavailable is
+ * deliberate: a missing timezone should delay a refresh, not cancel it forever.
+ */
+int64_t flowd_geoip_next_run_from(int64_t now, int interval_s,
+                                  int window_start_h, int window_end_h)
+{
+    int64_t target;
+    struct tm tm_buf;
+    time_t t;
+    int i;
+
+    if (interval_s < FLOWD_GEOIP_UPDATE_INTERVAL_MIN_S)
+        interval_s = FLOWD_GEOIP_UPDATE_INTERVAL_MIN_S;
+    target = now + interval_s;
+    if (window_start_h == window_end_h)
+        return target;
+    if (window_start_h < 0 || window_start_h > 23 || window_end_h < 0 || window_end_h > 23)
+        return target;
+
+    /* Walk forward an hour at a time until the slot lands inside the window.  A
+     * window is at least one hour wide, so this terminates well before the bound. */
+    for (i = 0; i < 48; i++) {
+        int hour;
+        int inside;
+
+        t = (time_t)target;
+        if (!localtime_r(&t, &tm_buf))
+            return target;
+        hour = tm_buf.tm_hour;
+        if (window_start_h < window_end_h)
+            inside = hour >= window_start_h && hour < window_end_h;
+        else
+            inside = hour >= window_start_h || hour < window_end_h;
+        if (inside)
+            return target;
+        target += 3600;
+    }
+    return target;
+}
+
 static void flowd_source_row_json(struct json_object *arr, sqlite3_stmt *st)
 {
     const char *meta_s = (const char *)sqlite3_column_text(st, 8);
@@ -1016,6 +1102,16 @@ static void flowd_source_row_json(struct json_object *arr, sqlite3_stmt *st)
     json_object_object_add(o, "last_import_at", json_object_new_int64(sqlite3_column_int64(st, 10)));
     json_object_object_add(o, "last_import_status", flowd_sqlite_text_json(st, 11));
     json_object_object_add(o, "last_error", flowd_sqlite_text_json(st, 12));
+    json_object_object_add(o, "update_enabled", json_object_new_boolean(sqlite3_column_int(st, 13)));
+    json_object_object_add(o, "update_interval_s", json_object_new_int64(sqlite3_column_int64(st, 14)));
+    json_object_object_add(o, "update_window_start_h", json_object_new_int(sqlite3_column_int(st, 15)));
+    json_object_object_add(o, "update_window_end_h", json_object_new_int(sqlite3_column_int(st, 16)));
+    json_object_object_add(o, "last_check_at", json_object_new_int64(sqlite3_column_int64(st, 17)));
+    json_object_object_add(o, "last_success_at", json_object_new_int64(sqlite3_column_int64(st, 18)));
+    json_object_object_add(o, "next_run_at", json_object_new_int64(sqlite3_column_int64(st, 19)));
+    json_object_object_add(o, "consecutive_failures", json_object_new_int(sqlite3_column_int(st, 20)));
+    json_object_object_add(o, "remote_etag", flowd_sqlite_text_json(st, 21));
+    json_object_object_add(o, "remote_last_modified", flowd_sqlite_text_json(st, 22));
     json_object_array_add(arr, o);
 }
 
@@ -1029,7 +1125,10 @@ struct json_object *flowd_geoip_sources_json(void)
 
     st = flowd_config_prepare(
         "SELECT id,name,type,path,edition,enabled,auto_update,license_ref,meta_json,updated_at,"
-        "last_import_at,last_import_status,last_error FROM flowd_geoip_sources ORDER BY id");
+        "last_import_at,last_import_status,last_error,update_enabled,update_interval_s,"
+        "update_window_start_h,update_window_end_h,last_check_at,last_success_at,next_run_at,"
+        "consecutive_failures,remote_etag,remote_last_modified "
+        "FROM flowd_geoip_sources ORDER BY id");
     if (st) {
         while ((rc = sqlite3_step(st)) == SQLITE_ROW)
             flowd_source_row_json(arr, st);
@@ -1053,7 +1152,9 @@ static int flowd_geoip_source_load_existing(const char *id,
                                             char *edition, size_t edition_len,
                                             int *enabled, int *auto_update,
                                             char *license_ref, size_t license_ref_len,
-                                            char *meta_json, size_t meta_json_len)
+                                            char *meta_json, size_t meta_json_len,
+                                            int *update_enabled, int *update_interval_s,
+                                            int *window_start_h, int *window_end_h)
 {
     sqlite3_stmt *st;
     int rc;
@@ -1061,7 +1162,8 @@ static int flowd_geoip_source_load_existing(const char *id,
     if (!flowd_id_ok(id))
         return -1;
     st = flowd_config_prepare(
-        "SELECT name,type,path,edition,enabled,auto_update,license_ref,meta_json "
+        "SELECT name,type,path,edition,enabled,auto_update,license_ref,meta_json,"
+        "update_enabled,update_interval_s,update_window_start_h,update_window_end_h "
         "FROM flowd_geoip_sources WHERE id=?1");
     if (!st)
         return -1;
@@ -1084,6 +1186,14 @@ static int flowd_geoip_source_load_existing(const char *id,
                  sqlite3_column_text(st, 6) ? (const char *)sqlite3_column_text(st, 6) : "");
         snprintf(meta_json, meta_json_len, "%s",
                  sqlite3_column_text(st, 7) ? (const char *)sqlite3_column_text(st, 7) : "{}");
+        if (update_enabled)
+            *update_enabled = sqlite3_column_int(st, 8) ? 1 : 0;
+        if (update_interval_s)
+            *update_interval_s = sqlite3_column_int(st, 9);
+        if (window_start_h)
+            *window_start_h = sqlite3_column_int(st, 10);
+        if (window_end_h)
+            *window_end_h = sqlite3_column_int(st, 11);
         sqlite3_finalize(st);
         return 1;
     }
@@ -1104,6 +1214,11 @@ static int flowd_geoip_source_save_one(struct json_object *src)
     const char *id, *name, *type, *path, *edition, *license_ref;
     const char *meta_s = meta_json_buf;
     int enabled, auto_update, ok = 0;
+    int update_enabled = 0;
+    int update_interval_s = FLOWD_GEOIP_UPDATE_INTERVAL_DEFAULT_S;
+    int window_start_h = 3;
+    int window_end_h = 5;
+    int64_t next_run_at;
     int64_t now = flowd_now_s();
 
     if (!src || !json_object_is_type(src, json_type_object))
@@ -1120,7 +1235,9 @@ static int flowd_geoip_source_save_one(struct json_object *src)
                                                     edition_buf, sizeof(edition_buf),
                                                     &enabled, &auto_update,
                                                     license_ref_buf, sizeof(license_ref_buf),
-                                                    meta_json_buf, sizeof(meta_json_buf));
+                                                    meta_json_buf, sizeof(meta_json_buf),
+                                                    &update_enabled, &update_interval_s,
+                                                    &window_start_h, &window_end_h);
         if (existing < 0)
             return -1;
     }
@@ -1131,9 +1248,20 @@ static int flowd_geoip_source_save_one(struct json_object *src)
     license_ref = flowd_json_str(src, "license_ref", license_ref_buf);
     enabled = flowd_json_bool(src, "enabled", enabled);
     auto_update = flowd_json_bool(src, "auto_update", auto_update);
+    update_enabled = flowd_json_bool(src, "update_enabled", update_enabled);
+    update_interval_s = flowd_json_int(src, "update_interval_s", update_interval_s);
+    window_start_h = flowd_json_int(src, "update_window_start_h", window_start_h);
+    window_end_h = flowd_json_int(src, "update_window_end_h", window_end_h);
     if (!flowd_id_ok(id) || !flowd_text_ok(name, 128) || !flowd_path_ok(path) ||
         !flowd_token_ok(type, 32) || !flowd_text_ok(edition, 64) ||
         (license_ref[0] && !flowd_token_ok(license_ref, 128)))
+        return -1;
+    /* A too-short interval would hammer the mirror for a DB that upstream rebuilds
+     * weekly, so the floor is a day and the ceiling is a quarter. */
+    if (update_interval_s < FLOWD_GEOIP_UPDATE_INTERVAL_MIN_S ||
+        update_interval_s > FLOWD_GEOIP_UPDATE_INTERVAL_MAX_S)
+        return -1;
+    if (window_start_h < 0 || window_start_h > 23 || window_end_h < 0 || window_end_h > 23)
         return -1;
     if (strcmp(type, "maxmind-mmdb") && strcmp(type, "geolite2-mmdb") &&
         strcmp(type, "github-mmdb") &&
@@ -1147,12 +1275,19 @@ static int flowd_geoip_source_save_one(struct json_object *src)
     }
     st = flowd_config_prepare(
         "INSERT INTO flowd_geoip_sources"
-        "(id,name,type,path,edition,enabled,auto_update,license_ref,meta_json,created_at,updated_at) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10) "
+        "(id,name,type,path,edition,enabled,auto_update,license_ref,meta_json,created_at,updated_at,"
+        "update_enabled,update_interval_s,update_window_start_h,update_window_end_h,next_run_at) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10,?11,?12,?13,?14,?15) "
         "ON CONFLICT(id) DO UPDATE SET name=excluded.name,type=excluded.type,path=excluded.path,"
         "edition=excluded.edition,enabled=excluded.enabled,auto_update=excluded.auto_update,"
-        "license_ref=excluded.license_ref,meta_json=excluded.meta_json,updated_at=excluded.updated_at");
+        "license_ref=excluded.license_ref,meta_json=excluded.meta_json,updated_at=excluded.updated_at,"
+        "update_enabled=excluded.update_enabled,update_interval_s=excluded.update_interval_s,"
+        "update_window_start_h=excluded.update_window_start_h,"
+        "update_window_end_h=excluded.update_window_end_h,"
+        "next_run_at=excluded.next_run_at");
     if (st) {
+        next_run_at = update_enabled ? flowd_geoip_next_run_from(now, update_interval_s,
+                                                                window_start_h, window_end_h) : 0;
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 3, type, -1, SQLITE_TRANSIENT);
@@ -1163,6 +1298,11 @@ static int flowd_geoip_source_save_one(struct json_object *src)
         sqlite3_bind_text(st, 8, license_ref, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 9, meta_s, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 10, now);
+        sqlite3_bind_int(st, 11, update_enabled ? 1 : 0);
+        sqlite3_bind_int(st, 12, update_interval_s);
+        sqlite3_bind_int(st, 13, window_start_h);
+        sqlite3_bind_int(st, 14, window_end_h);
+        sqlite3_bind_int64(st, 15, next_run_at);
         ok = sqlite3_step(st) == SQLITE_DONE;
         sqlite3_finalize(st);
     }
@@ -1225,6 +1365,8 @@ struct json_object *flowd_geoip_import_status(struct json_object *body)
 {
     struct json_object *resp = flowd_geoip_sources_json();
     struct json_object *fs = json_object_new_object();
+    struct json_object *sched = json_object_new_object();
+    sqlite3_stmt *st;
     (void)body;
 
     json_object_object_add(fs, "configured_mmdb", json_object_new_boolean(flowd_file_exists(FLOWD_DEFAULT_MMDB)));
@@ -1235,6 +1377,34 @@ struct json_object *flowd_geoip_import_status(struct json_object *body)
     json_object_object_add(fs, "xt_geoip_le", json_object_new_boolean(flowd_dir_exists("/usr/share/xt_geoip/LE")));
     json_object_object_add(fs, "xt_geoip_be", json_object_new_boolean(flowd_dir_exists("/usr/share/xt_geoip/BE")));
     json_object_object_add(resp, "filesystem", fs);
+
+    /* Scheduler summary.  auto_update is the boot-time bootstrap switch and is
+     * reported per source; these are the periodic-refresh figures the UI needs. */
+    json_object_object_add(sched, "tick_interval_s", json_object_new_int(900));
+    json_object_object_add(sched, "interval_min_s",
+                           json_object_new_int(FLOWD_GEOIP_UPDATE_INTERVAL_MIN_S));
+    json_object_object_add(sched, "interval_max_s",
+                           json_object_new_int(FLOWD_GEOIP_UPDATE_INTERVAL_MAX_S));
+    json_object_object_add(sched, "interval_default_s",
+                           json_object_new_int(FLOWD_GEOIP_UPDATE_INTERVAL_DEFAULT_S));
+    json_object_object_add(sched, "backoff_base_s",
+                           json_object_new_int(FLOWD_GEOIP_UPDATE_BACKOFF_BASE_S));
+    json_object_object_add(sched, "backoff_max_s",
+                           json_object_new_int(FLOWD_GEOIP_UPDATE_BACKOFF_MAX_S));
+    json_object_object_add(sched, "due_now", json_object_new_int(flowd_geoip_scheduled_update_due()));
+    st = flowd_config_prepare(
+        "SELECT COUNT(*),COALESCE(MIN(CASE WHEN next_run_at>0 THEN next_run_at END),0) "
+        "FROM flowd_geoip_sources WHERE enabled=1 AND update_enabled=1");
+    if (st) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            json_object_object_add(sched, "scheduled_sources",
+                                   json_object_new_int(sqlite3_column_int(st, 0)));
+            json_object_object_add(sched, "next_run_at",
+                                   json_object_new_int64(sqlite3_column_int64(st, 1)));
+        }
+        sqlite3_finalize(st);
+    }
+    json_object_object_add(resp, "schedule", sched);
     return resp;
 }
 
@@ -1620,6 +1790,330 @@ int flowd_geoip_auto_import_once(void)
         json_object_put(resp);
     json_object_put(body);
     return ok ? 0 : -1;
+}
+
+/* ---------- scheduled GeoIP refresh ----------
+ *
+ * Distinct from the boot-time bootstrap above.  That one stops for good after six
+ * attempts and is skipped entirely once a valid DB exists, which is correct for
+ * "get a DB onto a fresh device" and useless for "keep the DB current".
+ */
+
+struct flowd_geoip_head {
+    char etag[192];
+    char last_modified[128];
+    curl_off_t length;
+};
+
+static size_t flowd_curl_header_cb(char *buf, size_t size, size_t nitems, void *userdata)
+{
+    struct flowd_geoip_head *h = userdata;
+    size_t len = size * nitems;
+    const char *val;
+    size_t name_len;
+    char *dst = NULL;
+    size_t dst_len = 0;
+    size_t i;
+
+    if (!h || len == 0)
+        return len;
+    if (len > 12 && !strncasecmp(buf, "etag:", 5)) {
+        name_len = 5;
+        dst = h->etag;
+        dst_len = sizeof(h->etag);
+    } else if (len > 15 && !strncasecmp(buf, "last-modified:", 14)) {
+        name_len = 14;
+        dst = h->last_modified;
+        dst_len = sizeof(h->last_modified);
+    } else {
+        return len;
+    }
+    val = buf + name_len;
+    len -= name_len;
+    while (len > 0 && (*val == ' ' || *val == '\t')) {
+        val++;
+        len--;
+    }
+    while (len > 0 && (val[len - 1] == '\r' || val[len - 1] == '\n' ||
+                       val[len - 1] == ' ' || val[len - 1] == '\t'))
+        len--;
+    if (len >= dst_len)
+        len = dst_len - 1;
+    /* Header values are attacker-influenced text that ends up in SQLite and then in
+     * a JSON response, so keep only printable ASCII. */
+    for (i = 0; i < len; i++)
+        dst[i] = (val[i] >= 0x20 && val[i] < 0x7f) ? val[i] : '_';
+    dst[len] = '\0';
+    return size * nitems;
+}
+
+static int flowd_geoip_probe_remote(const char *url, struct flowd_geoip_head *out,
+                                    char *err, size_t err_len)
+{
+    CURL *curl;
+    CURLcode cc;
+    long http_code = 0;
+
+    memset(out, 0, sizeof(*out));
+    out->length = -1;
+    if (!flowd_url_ok(url)) {
+        snprintf(err, err_len, "invalid_source_url");
+        return -1;
+    }
+    curl = curl_easy_init();
+    if (!curl) {
+        snprintf(err, err_len, "curl_init_failed");
+        return -1;
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "dreamingwrt-flowd/1.0");
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, flowd_curl_header_cb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, out);
+    cc = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &out->length);
+    curl_easy_cleanup(curl);
+    if (cc != CURLE_OK) {
+        snprintf(err, err_len, "probe_failed:http_%ld:%s", http_code, curl_easy_strerror(cc));
+        return -1;
+    }
+    return 0;
+}
+
+/* Free bytes on the filesystem that holds dst's directory. */
+static int flowd_geoip_free_bytes(const char *dst, unsigned long long *out)
+{
+    char dir[FLOWD_MAX_TEXT];
+    struct statvfs vfs;
+    char *slash;
+
+    snprintf(dir, sizeof(dir), "%s", dst);
+    slash = strrchr(dir, '/');
+    if (!slash || slash == dir)
+        return -1;
+    *slash = '\0';
+    if (statvfs(dir, &vfs) != 0)
+        return -1;
+    *out = (unsigned long long)vfs.f_bavail * (unsigned long long)vfs.f_frsize;
+    return 0;
+}
+
+static void flowd_geoip_note_check(const char *id, int64_t now, int success,
+                                   int changed, int interval_s,
+                                   int window_start_h, int window_end_h,
+                                   int consecutive_failures,
+                                   const struct flowd_geoip_head *head,
+                                   const char *err)
+{
+    sqlite3_stmt *st;
+    int64_t next_run;
+
+    if (success) {
+        next_run = flowd_geoip_next_run_from(now, interval_s, window_start_h, window_end_h);
+    } else {
+        /* Exponential backoff, capped.  Failing every tick is how the rulesd log-flood
+         * happened; this keeps a dead mirror from being retried hourly forever. */
+        int64_t delay = FLOWD_GEOIP_UPDATE_BACKOFF_BASE_S;
+        int i;
+
+        for (i = 1; i < consecutive_failures && delay < FLOWD_GEOIP_UPDATE_BACKOFF_MAX_S; i++)
+            delay *= 2;
+        if (delay > FLOWD_GEOIP_UPDATE_BACKOFF_MAX_S)
+            delay = FLOWD_GEOIP_UPDATE_BACKOFF_MAX_S;
+        next_run = now + delay;
+    }
+
+    st = flowd_config_prepare(
+        "UPDATE flowd_geoip_sources SET last_check_at=?2,next_run_at=?3,"
+        "consecutive_failures=?4,last_error=?5,"
+        "last_success_at=CASE WHEN ?6=1 THEN ?2 ELSE last_success_at END,"
+        "remote_etag=CASE WHEN ?7<>'' THEN ?7 ELSE remote_etag END,"
+        "remote_last_modified=CASE WHEN ?8<>'' THEN ?8 ELSE remote_last_modified END "
+        "WHERE id=?1");
+    if (!st)
+        return;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, now);
+    sqlite3_bind_int64(st, 3, next_run);
+    sqlite3_bind_int(st, 4, success ? 0 : consecutive_failures);
+    sqlite3_bind_text(st, 5, success ? "" : (err ? err : "update_failed"), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 6, success ? 1 : 0);
+    sqlite3_bind_text(st, 7, head ? head->etag : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, head ? head->last_modified : "", -1, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    (void)changed;
+}
+
+/* Refresh one source.  Returns 1 if a new DB was installed, 0 if the remote was
+ * unchanged or the check was skipped, -1 on failure. */
+static int flowd_geoip_refresh_source(const char *id, int force, char *err, size_t err_len)
+{
+    char target[FLOWD_MAX_TEXT];
+    char url[1024];
+    char edition[64];
+    char stored_etag[192] = "";
+    char stored_lm[128] = "";
+    struct flowd_geoip_head head;
+    sqlite3_stmt *st;
+    int64_t now = flowd_now_s();
+    int interval_s = FLOWD_GEOIP_UPDATE_INTERVAL_DEFAULT_S;
+    int window_start_h = 3, window_end_h = 5;
+    int failures = 0;
+    unsigned long long free_bytes = 0;
+    int installed = 0;
+
+    if (flowd_source_lookup(id, target, sizeof(target), url, sizeof(url),
+                            edition, sizeof(edition)) != 0) {
+        snprintf(err, err_len, "source_not_found");
+        return -1;
+    }
+    st = flowd_config_prepare(
+        "SELECT update_interval_s,update_window_start_h,update_window_end_h,"
+        "consecutive_failures,remote_etag,remote_last_modified "
+        "FROM flowd_geoip_sources WHERE id=?1");
+    if (st) {
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            interval_s = sqlite3_column_int(st, 0);
+            window_start_h = sqlite3_column_int(st, 1);
+            window_end_h = sqlite3_column_int(st, 2);
+            failures = sqlite3_column_int(st, 3);
+            snprintf(stored_etag, sizeof(stored_etag), "%s",
+                     sqlite3_column_text(st, 4) ? (const char *)sqlite3_column_text(st, 4) : "");
+            snprintf(stored_lm, sizeof(stored_lm), "%s",
+                     sqlite3_column_text(st, 5) ? (const char *)sqlite3_column_text(st, 5) : "");
+        }
+        sqlite3_finalize(st);
+    }
+    if (interval_s < FLOWD_GEOIP_UPDATE_INTERVAL_MIN_S)
+        interval_s = FLOWD_GEOIP_UPDATE_INTERVAL_DEFAULT_S;
+
+    if (flowd_geoip_probe_remote(url, &head, err, err_len) != 0) {
+        flowd_geoip_note_check(id, now, 0, 0, interval_s, window_start_h, window_end_h,
+                               failures + 1, NULL, err);
+        return -1;
+    }
+
+    /* Unchanged remote: record the check and skip the 66 MB transfer entirely.  This
+     * is the whole point of storing the validators. */
+    if (!force && flowd_file_exists(target) &&
+        ((head.etag[0] && stored_etag[0] && !strcmp(head.etag, stored_etag)) ||
+         (head.last_modified[0] && stored_lm[0] && !strcmp(head.last_modified, stored_lm)))) {
+        flowd_geoip_note_check(id, now, 1, 0, interval_s, window_start_h, window_end_h,
+                               0, &head, "");
+        fprintf(stderr, "[dreamingwrt-flowd] geoip %s unchanged upstream, skipping download\n", id);
+        snprintf(err, err_len, "unchanged");
+        return 0;
+    }
+
+    /* The temp file and the existing DB coexist until the rename, so the filesystem
+     * needs room for both. */
+    if (head.length > 0 && flowd_geoip_free_bytes(target, &free_bytes) == 0) {
+        unsigned long long needed = (unsigned long long)head.length + FLOWD_GEOIP_UPDATE_MIN_FREE_BYTES;
+
+        if (free_bytes < needed) {
+            snprintf(err, err_len, "insufficient_space:need_%llu:free_%llu", needed, free_bytes);
+            flowd_geoip_note_check(id, now, 0, 0, interval_s, window_start_h, window_end_h,
+                                   failures + 1, &head, err);
+            return -1;
+        }
+    }
+
+    /* flowd_download_mmdb_atomic writes a temp file, validates the MMDB marker and
+     * only then rename()s, so a torn or bogus download leaves the old DB in place. */
+    if (flowd_download_mmdb_atomic(url, target, err, err_len) != 0) {
+        flowd_geoip_note_check(id, now, 0, 0, interval_s, window_start_h, window_end_h,
+                               failures + 1, &head, err);
+        return -1;
+    }
+    installed = 1;
+    flowd_source_note_import(id, target, edition, "installed", "");
+    flowd_geoip_note_check(id, now, 1, 1, interval_s, window_start_h, window_end_h,
+                           0, &head, "");
+    fprintf(stderr, "[dreamingwrt-flowd] geoip %s updated: %s\n", id, target);
+    return installed;
+}
+
+int flowd_geoip_scheduled_update_due(void)
+{
+    sqlite3_stmt *st;
+    int due = 0;
+
+    st = flowd_config_prepare(
+        "SELECT COUNT(*) FROM flowd_geoip_sources "
+        "WHERE enabled=1 AND update_enabled=1 AND next_run_at>0 AND next_run_at<=?1");
+    if (!st)
+        return 0;
+    sqlite3_bind_int64(st, 1, flowd_now_s());
+    if (sqlite3_step(st) == SQLITE_ROW)
+        due = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return due;
+}
+
+int flowd_geoip_scheduled_update_run(void)
+{
+    char ids[8][FLOWD_MAX_ID];
+    sqlite3_stmt *st;
+    int64_t now = flowd_now_s();
+    int n = 0, i, installed = 0;
+
+    st = flowd_config_prepare(
+        "SELECT id FROM flowd_geoip_sources "
+        "WHERE enabled=1 AND update_enabled=1 AND next_run_at>0 AND next_run_at<=?1 "
+        "ORDER BY next_run_at LIMIT 8");
+    if (!st)
+        return -1;
+    sqlite3_bind_int64(st, 1, now);
+    while (sqlite3_step(st) == SQLITE_ROW && n < (int)(sizeof(ids) / sizeof(ids[0]))) {
+        const char *id = (const char *)sqlite3_column_text(st, 0);
+
+        if (id && id[0])
+            snprintf(ids[n++], FLOWD_MAX_ID, "%s", id);
+    }
+    sqlite3_finalize(st);
+
+    /* The statement is finalized before any network work: a refresh takes minutes and
+     * must not hold a read cursor open across it. */
+    for (i = 0; i < n; i++) {
+        char err[256] = "";
+
+        if (flowd_geoip_refresh_source(ids[i], 0, err, sizeof(err)) > 0)
+            installed++;
+    }
+    return installed;
+}
+
+struct json_object *flowd_geoip_update_check(struct json_object *body)
+{
+    const char *id = flowd_json_str(body, "id", FLOWD_DEFAULT_GEOIP_SOURCE_ID);
+    int force = flowd_json_bool(body, "force", 0);
+    char err[256] = "";
+    struct json_object *resp;
+    int rc;
+
+    if (!flowd_id_ok(id))
+        return flowd_error("invalid_id", "invalid geoip source id");
+    rc = flowd_geoip_refresh_source(id, force, err, sizeof(err));
+    resp = flowd_geoip_import_status(body);
+    flowd_response_set_ok(resp, rc >= 0);
+    json_object_object_add(resp, "checked", json_object_new_boolean(rc >= 0));
+    json_object_object_add(resp, "installed", json_object_new_boolean(rc > 0));
+    json_object_object_add(resp, "unchanged", json_object_new_boolean(rc == 0));
+    json_object_object_add(resp, "source_id", json_object_new_string(id));
+    if (rc < 0) {
+        json_object_object_add(resp, "error", json_object_new_string(err[0] ? err : "update_failed"));
+        json_object_object_add(resp, "message", json_object_new_string("GeoIP update check failed"));
+    }
+    return resp;
 }
 
 static void flowd_policy_row_json(struct json_object *arr, sqlite3_stmt *st)

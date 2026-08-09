@@ -37,6 +37,8 @@
 #define JMX_NL_ACT_ROUTE_CLEAR_HITS 36
 #define JMX_NL_ACT_CARRIER_FLUSH    40
 #define JMX_NL_ACT_CARRIER_ADD      41
+#define JMX_NL_ACT_APPCAT_FLUSH     42
+#define JMX_NL_ACT_APPCAT_ADD       43
 
 struct jmx_nl_wan_register_v1 {
 	int32_t action;
@@ -394,6 +396,43 @@ int jmx_v2_nl_handle(const char *data, int len, u32 portid,
 		if (len < (int)sizeof(*m)) return 1;
 		m = (void *)data;
 		jmx_carrier_prefix_add(m->network, m->mask, m->carrier_id);
+		return 1;
+	}
+
+	case JMX_NL_ACT_APPCAT_FLUSH:
+		jmx_app_cat_flush();
+		JMX_DEBUG_RATELIMITED(1, "jmx_route: app category map flushed\n");
+		return 1;
+
+	case JMX_NL_ACT_APPCAT_ADD: {
+		/* Batch payload: header then count x {appid, category_id}. */
+		struct appcat_hdr { int32_t action; u32 count; } __packed;
+		struct appcat_rec { u32 appid; u16 category_id; } __packed;
+		const struct appcat_hdr *h;
+		const struct appcat_rec *recs;
+		u32 i, count, max_recs;
+		int added = 0, rejected = 0;
+
+		if (len < (int)sizeof(*h))
+			return 1;
+		h = (const void *)data;
+		count = h->count;
+		max_recs = (u32)((len - sizeof(*h)) / sizeof(*recs));
+		if (count > max_recs) {
+			pr_warn("jmx_route: appcat batch truncated count=%u payload=%u\n",
+				count, max_recs);
+			count = max_recs;
+		}
+		recs = (const void *)(data + sizeof(*h));
+		for (i = 0; i < count; i++) {
+			if (jmx_app_cat_add(recs[i].appid, recs[i].category_id))
+				rejected++;
+			else
+				added++;
+		}
+		JMX_DEBUG_RATELIMITED(1,
+			"jmx_route: appcat batch added=%d rejected=%d total=%d\n",
+			added, rejected, jmx_app_cat_map_count());
 		return 1;
 	}
 

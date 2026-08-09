@@ -39,7 +39,7 @@ static int g_fingerprint_catalog_changed = 0;
 #define FINGERPRINT_CATALOG_VERSION 4
 #define FINGERPRINT_DB_APPLICATION_ID 1146570320
 #define FINGERPRINT_DB_SCHEMA_VERSION 1
-#define JMX_DB_SCHEMA_VERSION 7
+#define JMX_DB_SCHEMA_VERSION 8
 
 static int db_signature_db_path(char *path, size_t path_len)
 {
@@ -1036,6 +1036,47 @@ static int db_value_is_oui_only_signal(const char *key, const char *source)
  */
 #define DB_GENERIC_ROUTER_WEB_IMAGE \
     "/luci-static/dreamingwrt/fingerprint/images/engine-0/3797/257x257.png"
+
+/*
+ * Classify an image URL by extension so a client can tell "format I cannot
+ * decode" apart from "no image".
+ *
+ * Both look identical today: an Android client hands the bytes to
+ * BitmapFactory, gets NULL for an SVG, and falls back to a placeholder exactly
+ * as it would for a missing file. The platform has no SVG rasteriser, so it
+ * needs to know the format before fetching rather than after failing.
+ *
+ * Fingerprint rows are always PNG (all 33986 web_image/best_image values are
+ * generated as .../<engine>/<id>/257x257.png), so only user uploads can be
+ * vector: webd accepts png/jpeg/webp/gif/svg+xml.
+ */
+static const char *db_image_format_of(const char *url)
+{
+    const char *dot;
+
+    if (!url || !url[0])
+        return "";
+    dot = strrchr(url, '.');
+    if (!dot)
+        return "unknown";
+    if (!strcasecmp(dot, ".png"))  return "png";
+    if (!strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".jpeg")) return "jpeg";
+    if (!strcasecmp(dot, ".webp")) return "webp";
+    if (!strcasecmp(dot, ".gif"))  return "gif";
+    if (!strcasecmp(dot, ".svg"))  return "svg";
+    return "unknown";
+}
+
+/*
+ * Whether every mainstream mobile/web client can decode this format with no
+ * extra dependency. SVG is deliberately excluded: iOS had to add its own
+ * rasterisation pass and Android would need a third-party decoder.
+ */
+static int db_image_format_is_bitmap(const char *format)
+{
+    return format && (!strcmp(format, "png") || !strcmp(format, "jpeg") ||
+                      !strcmp(format, "webp") || !strcmp(format, "gif"));
+}
 
 static int db_ikuai_router_identity(const char *vendor,
                                     const char *device_type,
@@ -2405,6 +2446,10 @@ void db_startup_sig_match(void)
 
 static int db_apply_identity_aggregator(const char *mac)
 {
+    /* Only reader of client_identity_overrides: a stored user correction wins
+     * over detected fingerprint evidence. It is keyed by mac rather than
+     * client_id so the correction outlives a rebuilt clients row. Presentation
+     * overrides live in client_overrides and are not consulted here. */
     sqlite3_stmt *st = NULL;
     char best_name[256] = "", best_vendor[128] = "", best_type[64] = "unknown";
     char best_image[256] = "";
@@ -2811,6 +2856,37 @@ static int db_schema_v1(void)
         "CREATE INDEX IF NOT EXISTS idx_client_identity_signal_mac ON client_identity_signals(mac,last_seen);"
         "CREATE TABLE IF NOT EXISTS client_fingerprints ("
         " mac TEXT PRIMARY KEY, engine INTEGER, device_id INTEGER, vendor_id INTEGER, device_name TEXT, vendor_name TEXT, device_type TEXT, family TEXT, os_class TEXT, os_name TEXT, image_path TEXT, source TEXT NOT NULL, confidence INTEGER NOT NULL, evidence_json TEXT, updated_at INTEGER NOT NULL);"
+        /* client_identity_overrides and client_overrides look like two copies
+         * of one thing and are not. They are deliberately separate because
+         * they are keyed differently, and the key is the whole point:
+         *
+         *   client_identity_overrides  keyed by mac        identity
+         *   client_overrides           keyed by client_id  list presentation
+         *
+         * Identity has to be keyed by mac so it survives the clients row
+         * being rebuilt (re-provisioned database, reinstall, or any path that
+         * hands the same device a fresh client_id). Its table-only columns are
+         * engine / device_id / device_name, and its sole reader is
+         * db_apply_identity_aggregator(), which lets a user correction beat a
+         * detected fingerprint.
+         *
+         * Presentation state has to be keyed by client_id because it is about
+         * one row in the current inventory, not about a device: pinned and
+         * hidden are client_overrides-only for that reason. It has three
+         * readers -- client_select_sql, db_query_override(), and the online
+         * client count in jmx_dreamingwrt_api.c.
+         *
+         * Neither table is derived from the other and neither is dead, so do
+         * not "simplify" this by collapsing them: pinned/hidden must follow
+         * client_id while engine/device_id must follow mac, and forcing both
+         * onto one key deforms whichever set loses. A view does not work
+         * either -- both tables are written, in the same transaction, by
+         * jmx_db_api_client_override().
+         *
+         * The fields they do share (name, icon, device type, vendor, note) are
+         * written from the same request in that one transaction, and each side
+         * accepts both spellings of every shared field, so the two cannot drift
+         * apart. See the invariant note in jmx_db_api_client_override(). */
         "CREATE TABLE IF NOT EXISTS client_identity_overrides ("
         " mac TEXT PRIMARY KEY, nickname TEXT, engine INTEGER, device_id INTEGER, device_name TEXT, vendor_name TEXT, device_type TEXT, custom_image_path TEXT, note TEXT, updated_at INTEGER NOT NULL);"
         "CREATE TABLE IF NOT EXISTS fingerprint_devices ("
@@ -2819,7 +2895,19 @@ static int db_schema_v1(void)
         "CREATE TABLE IF NOT EXISTS fingerprint_model_aliases ("
         " alias_key TEXT PRIMARY KEY, device_name TEXT NOT NULL, vendor_name TEXT, device_type TEXT, updated_at INTEGER NOT NULL);"
         "CREATE TABLE IF NOT EXISTS client_overrides ("
-        " client_id INTEGER PRIMARY KEY, custom_name TEXT, custom_icon TEXT, custom_device_type TEXT, custom_vendor TEXT, pinned INTEGER NOT NULL DEFAULT 0, hidden INTEGER NOT NULL DEFAULT 0, note TEXT, updated_at INTEGER NOT NULL, FOREIGN KEY(client_id) REFERENCES clients(client_id) ON DELETE CASCADE);"
+        /* Presentation half of the override pair; the mac-keyed identity half
+         * is client_identity_overrides above, where the split is documented.
+         *
+         * No FOREIGN KEY on client_id, deliberately: these columns hold user
+         * intent (a chosen name, icon, or note), not runtime observation. A
+         * cascade from clients would let a routine inventory cleanup silently
+         * delete settings the user typed in, while the equivalent mac-keyed
+         * client_identity_overrides survived -- two tables of the same kind of
+         * data disagreeing about durability. mac is carried here so a row can
+         * be re-bound if the client row is ever dropped and re-created with a
+         * fresh client_id. */
+        " client_id INTEGER PRIMARY KEY, mac TEXT, custom_name TEXT, custom_icon TEXT, custom_device_type TEXT, custom_vendor TEXT, pinned INTEGER NOT NULL DEFAULT 0, hidden INTEGER NOT NULL DEFAULT 0, note TEXT, updated_at INTEGER NOT NULL);"
+        "CREATE INDEX IF NOT EXISTS idx_client_overrides_mac ON client_overrides(mac);"
         "CREATE TABLE IF NOT EXISTS client_network_state ("
         " client_id INTEGER PRIMARY KEY, ip TEXT, ipv6_json TEXT, interface TEXT, network TEXT, ssid TEXT, parent_mac TEXT, parent_id TEXT, port TEXT, link_type TEXT, link_speed TEXT, signal INTEGER, tx_rate INTEGER NOT NULL DEFAULT 0, rx_rate INTEGER NOT NULL DEFAULT 0, tx_bytes INTEGER NOT NULL DEFAULT 0, rx_bytes INTEGER NOT NULL DEFAULT 0, connections INTEGER NOT NULL DEFAULT 0, online INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, FOREIGN KEY(client_id) REFERENCES clients(client_id) ON DELETE CASCADE);"
         "CREATE INDEX IF NOT EXISTS idx_client_network_online ON client_network_state(online, updated_at);"
@@ -3057,6 +3145,74 @@ int jmx_db_init(void)
                         " last_reset_ts INTEGER NOT NULL DEFAULT 0,"
                         " sample_count INTEGER NOT NULL DEFAULT 0,"
                         " updated_at INTEGER NOT NULL DEFAULT 0);") != 0)
+                goto migration_failed;
+        }
+        /* Schema v8: drop the ON DELETE CASCADE from client_overrides and
+         * carry mac alongside client_id.
+         *
+         * custom_name / custom_icon / note are user intent, but the table hung
+         * off clients(client_id) with a cascade, so any future "prune old
+         * clients" DELETE would have silently taken the user's settings with
+         * it -- while the mac-keyed client_identity_overrides kept its copy.
+         * There is no such DELETE today, so this is preventive; the point is
+         * that adding one must not become a data-loss bug. */
+        if (version < 8) {
+            sqlite3_stmt *ck = NULL;
+            int has_cascade = 0;
+
+            if (db_prepare(&ck,
+                    "SELECT sql FROM sqlite_master WHERE type='table' "
+                    "AND name='client_overrides'") != 0)
+                goto migration_failed;
+            if (sqlite3_step(ck) == SQLITE_ROW) {
+                const char *ddl = (const char *)sqlite3_column_text(ck, 0);
+                if (ddl && strstr(ddl, "REFERENCES"))
+                    has_cascade = 1;
+            }
+            sqlite3_finalize(ck);
+            if (has_cascade) {
+                LOG_INFO("migrating client_overrides off ON DELETE CASCADE\n");
+                if (db_exec("ALTER TABLE client_overrides "
+                            "RENAME TO client_overrides_old;") != 0 ||
+                    db_exec("CREATE TABLE client_overrides ("
+                            " client_id INTEGER PRIMARY KEY, mac TEXT, "
+                            " custom_name TEXT, custom_icon TEXT, "
+                            " custom_device_type TEXT, custom_vendor TEXT, "
+                            " pinned INTEGER NOT NULL DEFAULT 0, "
+                            " hidden INTEGER NOT NULL DEFAULT 0, "
+                            " note TEXT, updated_at INTEGER NOT NULL);") != 0 ||
+                    /* Back-fill mac from the client row while it is still
+                     * there; rows whose client vanished earlier keep a NULL
+                     * mac rather than being dropped. */
+                    db_exec("INSERT OR IGNORE INTO client_overrides "
+                            "(client_id,mac,custom_name,custom_icon,"
+                            "custom_device_type,custom_vendor,pinned,hidden,"
+                            "note,updated_at) "
+                            "SELECT o.client_id,"
+                            "(SELECT c.mac FROM clients c "
+                            " WHERE c.client_id=o.client_id),"
+                            "o.custom_name,o.custom_icon,o.custom_device_type,"
+                            "o.custom_vendor,o.pinned,o.hidden,o.note,"
+                            "o.updated_at FROM client_overrides_old o;") != 0 ||
+                    db_exec("DROP TABLE client_overrides_old;") != 0)
+                    goto migration_failed;
+                LOG_INFO("client_overrides migration done\n");
+            } else if (!db_table_has_column("client_overrides", "mac")) {
+                /* Already free of the foreign key (a fresh v8 install, or a
+                 * table rebuilt by hand) but predating the mac column. Adding
+                 * it here rather than after the rebuild keeps the two paths
+                 * exclusive: the rebuild above already creates mac, and
+                 * re-adding it would fail with "duplicate column name". */
+                if (db_exec("ALTER TABLE client_overrides ADD COLUMN mac TEXT;") != 0)
+                    goto migration_failed;
+                if (db_exec("UPDATE client_overrides SET mac=("
+                            "SELECT c.mac FROM clients c "
+                            "WHERE c.client_id=client_overrides.client_id) "
+                            "WHERE mac IS NULL;") != 0)
+                    goto migration_failed;
+            }
+            if (db_exec("CREATE INDEX IF NOT EXISTS idx_client_overrides_mac "
+                        "ON client_overrides(mac);") != 0)
                 goto migration_failed;
         }
         if (db_set_schema_version(JMX_DB_SCHEMA_VERSION) != 0 || db_commit() != 0)
@@ -4882,6 +5038,8 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
         json_object_object_add(fp, "image", json_object_new_string(detected));
         json_object_object_add(fp, "detected_image", json_object_new_string(detected));
         json_object_object_add(fp, "effective_image", json_object_new_string(image));
+        json_object_object_add(fp, "image_format",
+                               json_object_new_string(db_image_format_of(detected)));
         json_object_object_add(o, "fingerprint", fp);
 
         json_object_object_add(o, "detected_image", json_object_new_string(detected));
@@ -4893,6 +5051,20 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
                                json_object_new_boolean(image_fallback));
         json_object_object_add(o, "image_fallback_reason",
                                json_object_new_string(image_fallback_reason));
+        /*
+         * Format of the effective image, so a client without an SVG rasteriser
+         * can skip the fetch instead of discovering the problem as a decode
+         * failure that is indistinguishable from a missing image.
+         */
+        {
+            const char *image_format = db_image_format_of(image);
+
+            json_object_object_add(o, "image_format",
+                                   json_object_new_string(image_format));
+            json_object_object_add(o, "image_is_bitmap",
+                                   json_object_new_boolean(
+                                       db_image_format_is_bitmap(image_format)));
+        }
     }
     {
         struct json_object *override_fields = json_object_new_array();
@@ -4984,6 +5156,22 @@ struct json_object *jmx_db_api_clients_observe(struct json_object *req)
 
 struct json_object *jmx_db_api_client_override(struct json_object *req)
 {
+    /* Sole writer of both override tables, and the reason they cannot diverge.
+     *
+     * One request updates client_overrides (client_id-keyed, presentation) and
+     * client_identity_overrides (mac-keyed, identity) inside one transaction,
+     * so either both land or neither does. The shared fields are read out of
+     * the same request object, and both sides accept either spelling of each
+     * one (custom_name/nickname, custom_icon/custom_image_path,
+     * custom_device_type/device_type, custom_vendor/vendor_name), so a caller
+     * that knows only one vocabulary still updates both tables.
+     *
+     * That symmetry is the invariant. If you add a shared field, add it to both
+     * upserts with both spellings; adding it to one only is how the two tables
+     * start telling different stories, which the UI cannot show and nobody can
+     * debug. Fields unique to one table (pinned/hidden here, engine/device_id
+     * there) are exempt -- they exist precisely because they belong to one key.
+     * See the note above the client_identity_overrides definition. */
     struct json_object *data = json_object_new_object();
     char mac[32] = {0};
     int64_t cid, ts = now_s();
@@ -4994,10 +5182,28 @@ struct json_object *jmx_db_api_client_override(struct json_object *req)
     }
     if (db_begin() != 0) return jmx_gen_api_response_data(API_CODE_ERROR, data);
     if (db_upsert_client(mac, "", "", "", "", "unknown", "", 0, ts, &cid) != 0) { db_rollback(); return jmx_gen_api_response_data(API_CODE_ERROR, data); }
+    /* Re-bind a surviving override to the current client_id.
+     *
+     * Since v8 an override outlives the clients row it was created for, so a
+     * device that disappears and comes back keeps its settings -- but it comes
+     * back under a fresh client_id, leaving the old override stranded on the
+     * previous one. Move it across before the upsert, keyed on mac, so the
+     * user's name and icon follow the device instead of being shadowed by a
+     * new empty row. Rows are matched by mac only, and clients.mac is UNIQUE,
+     * so this can never pull in another device's settings. */
     if (db_prepare(&st,
-        "INSERT INTO client_overrides(client_id,custom_name,custom_icon,custom_device_type,custom_vendor,pinned,hidden,note,updated_at) "
-        "VALUES(?1,NULLIF(?2,''),NULLIF(?3,''),NULLIF(?4,''),NULLIF(?5,''),?6,?7,NULLIF(?8,''),?9) "
+        "UPDATE OR REPLACE client_overrides SET client_id=?1 "
+        "WHERE mac=?2 AND client_id<>?1") != 0) { db_rollback(); return jmx_gen_api_response_data(API_CODE_ERROR, data); }
+    sqlite3_bind_int64(st, 1, cid);
+    sqlite3_bind_text(st, 2, mac, -1, SQLITE_TRANSIENT);
+    if (db_step_done(st) != 0) { sqlite3_finalize(st); db_rollback(); return jmx_gen_api_response_data(API_CODE_ERROR, data); }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (db_prepare(&st,
+        "INSERT INTO client_overrides(client_id,mac,custom_name,custom_icon,custom_device_type,custom_vendor,pinned,hidden,note,updated_at) "
+        "VALUES(?1,NULLIF(?17,''),NULLIF(?2,''),NULLIF(?3,''),NULLIF(?4,''),NULLIF(?5,''),?6,?7,NULLIF(?8,''),?9) "
         "ON CONFLICT(client_id) DO UPDATE SET "
+        "mac=COALESCE(NULLIF(excluded.mac,''), client_overrides.mac),"
         "custom_name=CASE WHEN ?10 THEN excluded.custom_name ELSE client_overrides.custom_name END,"
         "custom_icon=CASE WHEN ?11 THEN excluded.custom_icon ELSE client_overrides.custom_icon END,"
         "custom_device_type=CASE WHEN ?12 THEN excluded.custom_device_type ELSE client_overrides.custom_device_type END,"
@@ -5022,6 +5228,7 @@ struct json_object *jmx_db_api_client_override(struct json_object *req)
     sqlite3_bind_int(st, 14, db_json_has_key(req, "pinned"));
     sqlite3_bind_int(st, 15, db_json_has_key(req, "hidden"));
     sqlite3_bind_int(st, 16, db_json_has_key(req, "note"));
+    sqlite3_bind_text(st, 17, mac, -1, SQLITE_TRANSIENT);
     if (db_step_done(st) != 0) { sqlite3_finalize(st); db_rollback(); return jmx_gen_api_response_data(API_CODE_ERROR, data); }
     sqlite3_finalize(st);
     if (db_upsert_identity_override(mac, req) != 0 ||

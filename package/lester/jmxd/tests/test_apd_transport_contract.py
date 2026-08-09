@@ -18,18 +18,17 @@ import tempfile
 import threading
 import time
 
+import apd_test_deps
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src/apd/apd_transport.c"
 FIXTURE = ROOT / "tests/apd_transport_fixture.c"
 WIRE = ROOT / "src/ap_control_wire.c"
-_ENV_PREFIX = os.environ.get("APD_TEST_PREFIX", "")
-_ENV_OPENSSL = os.environ.get("APD_TEST_OPENSSL_PREFIX", "")
-JSON_PREFIX = (Path(_ENV_PREFIX) if _ENV_PREFIX else
-               Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c/0.19"))
-OPENSSL_PREFIX = (Path(_ENV_OPENSSL) if _ENV_OPENSSL else
-                  (JSON_PREFIX if _ENV_PREFIX else
-                   Path("/opt/homebrew/var/homebrew/tmp/.cellar/openssl@3/3.6.3")))
+# Resolved rather than hard-coded: the pinned Homebrew cellar paths below used
+# to be the only fallback, so this fixture could not link on the build host.
+JSON_PREFIX, JSON_SHARED = apd_test_deps.resolve_json_prefix()
+OPENSSL_PREFIX, _OPENSSL_SHARED = apd_test_deps.resolve_openssl_prefix()
 TOKEN = "A" * 43
 PROTOCOL = "ap-control.v1"
 PROTOCOL_V2 = "ap-control.v2"
@@ -461,13 +460,20 @@ def static_contract() -> None:
 
 def compile_fixture(binary: Path) -> None:
     compiler = shlex.split(os.environ.get("CC", "cc"))
-    json_archive = JSON_PREFIX / "lib/libjson-c.a"
-    assert json_archive.is_file()
+    # A staging_dir .a is an LTO archive the host linker cannot read, so link
+    # the .so when the prefix offers one.
+    if JSON_SHARED:
+        json_link = ["-L", str(JSON_PREFIX / "lib"),
+                     f"-Wl,-rpath,{JSON_PREFIX / 'lib'}", "-ljson-c"]
+    else:
+        json_archive = JSON_PREFIX / "lib/libjson-c.a"
+        assert json_archive.is_file()
+        json_link = [str(json_archive)]
     command(*compiler, "-std=c11",
             "-D_DARWIN_C_SOURCE" if sys.platform == "darwin" else "-D_GNU_SOURCE",
             "-Wall", "-Wextra", "-Werror", f"-I{ROOT / 'src'}",
             f"-I{JSON_PREFIX / 'include'}", f"-I{OPENSSL_PREFIX / 'include'}",
-            str(FIXTURE), str(WIRE), str(json_archive),
+            str(FIXTURE), str(WIRE), *json_link,
             f"-L{OPENSSL_PREFIX / 'lib'}",
             f"-Wl,-rpath,{OPENSSL_PREFIX / 'lib'}", "-lssl",
             "-lcrypto", "-lpthread", "-o", str(binary))

@@ -32,7 +32,14 @@
         overview: '/api/v1/network/overview',
         wans: '/api/v1/network/wans',
         ports: '/api/v1/network/ports',
-        clients: '/api/v1/clients'
+        clients: '/api/v1/clients',
+        /*
+         * Kernel forwarding stats. The dashboard's other endpoints carry no
+         * kernel_* fields at all, so the WAN cards' "连接数" was conntrack
+         * attribution with nothing to compare it against. This is the shared
+         * read-only snapshot; it is not a second source for the same number.
+         */
+        kernelRuntime: '/api/v1/system/advanced/kernel-runtime'
       };
       const DASHBOARD_RESOURCE_TTL_MS = {
         snapshot: 15000,
@@ -40,7 +47,8 @@
         wans: 5000,
         ports: 15000,
         clients: 15000,
-        system: 30000
+        system: 30000,
+        kernelRuntime: 15000
       };
       const DASHBOARD_RESOURCE_TIMEOUT_MS = {
         snapshot: 2500,
@@ -58,6 +66,11 @@
       const $ = (id) => document.getElementById(id);
       const realtime = context.realtime || window.DWRTRealtime;
       const session = context.session || window.DWRT_SESSION;
+      /*
+       * Shared connection-truth normalizer. conntrack attribution and the JMX
+       * kernel gauge are different numbers and must not be merged into one.
+       */
+      const connTruth = context.connTruth || window.DWRTConnTruth || null;
       const appShell = $('appShell');
       const consoleStage = document.querySelector('.console-stage');
       const routePreview = $('routePreview');
@@ -657,6 +670,7 @@
     const wansData = get('wans');
     const portsData = get('ports');
     const clientsData = get('clients');
+    const kernelRuntimeData = get('kernelRuntime');
     const system = {
       ...(snapshot.system || {}),
       ...(systemData.system || systemData || {})
@@ -674,7 +688,16 @@
       errors,
       system,
       lan,
-      wans: wans.map((wan, index) => normalizeWan(wan, index, snapshot.traffic || {}, system.uptime)),
+      wans: wans.map((wan, index) => normalizeWan(wan, index, snapshot.traffic || {}, system.uptime, kernelRuntimeData)),
+      kernelRuntime: connTruth ? connTruth.kernelAggregate({
+        kernel_stats_available: kernelRuntimeData.available,
+        kernel_stats_degraded: kernelRuntimeData.degraded,
+        kernel_active_conn_semantics: kernelRuntimeData.active_conn_semantics,
+        kernel_active_conn_stale_possible: kernelRuntimeData.active_conn_stale_possible,
+        kernel_active_conn_total: kernelRuntimeData.active_conn_total,
+        kernel_stats_observed_at: kernelRuntimeData.observed_at,
+        kernel_stats_reason: kernelRuntimeData.reason
+      }) : null,
       ports: asArray(portsData.ports).map(normalizePort).filter((port) => port.kind !== 'virtual'),
       traffic: snapshot.traffic || {},
       apps: normalizeDashboardApps(dashboardAppInputs(snapshot, clientsData), clientsData),
@@ -1749,7 +1772,23 @@
     };
   }
 
-  function normalizeWan(wan, index, fallbackTraffic = {}, systemUptime = 0) {
+  /*
+   * Match a WAN against the kernel-runtime snapshot. The snapshot keys rows by
+   * proc directory (wan1..wan4) while if_stats' first row is named `wan`, so an
+   * id-only match silently misses the first WAN. Both spellings are tried.
+   */
+  function kernelWanRow(kernelRuntimeData, id, index) {
+    const rows = asArray(kernelRuntimeData && kernelRuntimeData.wans);
+    if (!rows.length) return null;
+    const key = String(id || '').toLowerCase();
+    return rows.find((row) => {
+      const rowId = String(row && row.id || '').toLowerCase();
+      const statsName = String(row && row.if_stats_name || '').toLowerCase();
+      return (key && (rowId === key || statsName === key)) || Number(row && row.index) === index + 1;
+    }) || null;
+  }
+
+  function normalizeWan(wan, index, fallbackTraffic = {}, systemUptime = 0, kernelRuntimeData = {}) {
     const runtime = wan && typeof wan.runtime === 'object' ? wan.runtime : {};
     const id = firstText(wan.id, wan.name, wan.ifname, `wan${index + 1}`);
     const health = state.dashboard.wanHealthSamples.get(id) || {};
@@ -1797,6 +1836,43 @@
       latency: positiveNumber(wan.latency_ms, runtime.latency_ms, runtime.latency, health.latency_ms, health.latency),
       loss: firstNumber(wan.loss_pct, runtime.loss_pct, runtime.loss, health.loss_pct, health.loss),
       connections: firstNumber(runtime.connections, wan.connections, wan.conn_count),
+      /*
+       * conntrack attribution above; the kernel gauge stays in its own field so
+       * the card can label both instead of showing one number with no source.
+       * kernel-runtime spells its fields without the `kernel_` prefix, so they
+       * are mapped onto the shared contract shape before normalizing.
+       */
+      kernel: (() => {
+        if (!connTruth) return null;
+        const row = kernelWanRow(kernelRuntimeData, id, index);
+        const available = kernelRuntimeData && kernelRuntimeData.available === true;
+        if (!row || !available) {
+          return connTruth.kernelRuntime({
+            kernel_active_conn_valid: false,
+            kernel_stats_reason: firstText(
+              kernelRuntimeData && kernelRuntimeData.reason,
+              kernelRuntimeData && kernelRuntimeData.if_stats_reason,
+              row ? '' : 'wan_absent_from_if_stats'
+            )
+          });
+        }
+        return connTruth.kernelRuntime({
+          kernel_active_conn: row.active_conn,
+          kernel_active_conn_valid: true,
+          kernel_active_conn_semantics: firstText(row.active_conn_semantics, kernelRuntimeData.active_conn_semantics),
+          kernel_active_conn_source: firstText(row.if_stats_source, row.source),
+          kernel_active_conn_stale_possible: kernelRuntimeData.active_conn_stale_possible === true,
+          kernel_tx_packets: row.tx_packets,
+          kernel_rx_packets: row.rx_packets,
+          kernel_tx_bytes: row.tx_bytes,
+          kernel_rx_bytes: row.rx_bytes,
+          kernel_stats_observed_at: kernelRuntimeData.observed_at,
+          kernel_stats_reason: firstText(row.categories_reason, kernelRuntimeData.if_stats_reason),
+          kernel_proc_id: row.id,
+          kernel_categories: row.categories,
+          kernel_categories_source: row.source
+        });
+      })(),
       history: asArray(wan.status_history || wan.health_history || wan.history).length
         ? asArray(wan.status_history || wan.health_history || wan.history)
         : asArray(health.status_history || health.health_history || health.history),
@@ -3811,6 +3887,14 @@
       usageTitle: usageSummary && usageSummary.title || '',
       usageLabel: usageSummary && usageSummary.label || '',
       usageSource: usageSummary && usageSummary.source || '',
+      /*
+       * Kernel row presence is structure, not runtime text. Without this the card
+       * keeps its old shape when the proc snapshot appears or disappears, so the
+       * row would never show up until something else forced a rebuild.
+       */
+      kernelState: wan.kernel
+        ? `${wan.kernel.valid ? 'valid' : 'unavailable'}:${wan.kernel.confirmed ? 'confirmed' : 'unconfirmed'}`
+        : 'absent',
       probes: PROBE_TARGETS.map((target) => probeKey(wan.id, target.host)).join('|')
     };
   }
@@ -3832,8 +3916,41 @@
       const connectionsText = formatInteger(wan.connections);
       if (uptime && uptime.textContent !== uptimeText) uptime.textContent = uptimeText;
       if (connections && connections.textContent !== connectionsText) connections.textContent = connectionsText;
+      /*
+       * The kernel row is patched only from a real kernel projection. wan.metrics
+       * frames carry no kernel_* fields, so leaving the existing text in place is
+       * correct: blanking it would report the proc nodes as missing when they are
+       * simply not part of this topic.
+       */
+      const kernelCell = card.querySelector('[data-wan-runtime="kernelConnections"]');
+      if (kernelCell && connTruth && wan.kernel && wan.kernel.valid) {
+        const kernelText = wan.kernel.confirmed
+          ? connTruth.formatInteger(wan.kernel.activeConn)
+          : `${connTruth.formatInteger(wan.kernel.activeConn)}（${connTruth.UNCONFIRMED_TEXT}）`;
+        if (kernelCell.textContent !== kernelText) kernelCell.textContent = kernelText;
+      }
       updateWanThroughputMini(card.querySelector('.rail-throughput-card'), wan);
     });
+  }
+
+  /*
+   * Kernel forwarding row for a WAN card. Rendered only when the kernel snapshot
+   * has a usable row for this WAN: an unavailable node shows the reason, never 0
+   * and never the conntrack number from the row above.
+   */
+  function renderWanKernelRow(wan) {
+    const runtime = wan && wan.kernel;
+    if (!connTruth || !runtime) return '';
+    if (!runtime.valid) {
+      const reason = runtime.reason ? `：${runtime.reason}` : '';
+      return `<div class="rail-isp-row is-kernel"><span>内核转发连接</span><strong class="is-unavailable" data-dwrt-tooltip="${escapeHtml(`内核转发统计不可用${reason}`)}">${escapeHtml(connTruth.UNAVAILABLE_TEXT)}</strong></div>`;
+    }
+    const tip = [`语义 ${runtime.semanticsLabel}`, runtime.source ? `来源 ${runtime.source}` : '']
+      .filter(Boolean).join(' · ');
+    const value = runtime.confirmed
+      ? connTruth.formatInteger(runtime.activeConn)
+      : `${connTruth.formatInteger(runtime.activeConn)}（${connTruth.UNCONFIRMED_TEXT}）`;
+    return `<div class="rail-isp-row is-kernel"><span>内核转发连接</span><strong data-wan-runtime="kernelConnections" data-dwrt-tooltip="${escapeHtml(tip)}">${escapeHtml(value)}</strong></div>`;
   }
 
   function renderWanCards(wans) {
@@ -3862,7 +3979,8 @@
           <div class="rail-isp-row"><span>WAN IP</span><strong>${escapeHtml(wan.ip || '--')}</strong></div>
           <div class="rail-isp-row is-ipv6"><span>IPv6</span><strong data-dwrt-tooltip="${escapeHtml(wan.ipv6 || '--')}" aria-label="${escapeHtml(wan.ipv6 || '--')}">${escapeHtml(wan.ipv6 || '--')}</strong></div>
           <div class="rail-isp-row"><span>连接时间</span><strong data-wan-runtime="uptime">${escapeHtml(formatUptime(wan.uptime))}</strong></div>
-          <div class="rail-isp-row"><span>连接数</span><strong data-wan-runtime="connections">${escapeHtml(formatInteger(wan.connections))}</strong></div>
+          <div class="rail-isp-row"><span>连接数</span><strong data-wan-runtime="connections" data-dwrt-tooltip="conntrack 公网地址归属统计">${escapeHtml(formatInteger(wan.connections))}</strong></div>
+          ${renderWanKernelRow(wan)}
           ${renderWanThroughputMini(wan)}
           <div class="rail-probe-row">
             ${PROBE_TARGETS.map((target) => probeMarkup(wan, target)).join('')}

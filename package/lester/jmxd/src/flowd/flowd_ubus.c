@@ -207,6 +207,21 @@ static int flowd_handle_geoip_import(struct ubus_context *ctx, struct ubus_objec
     return UBUS_STATUS_OK;
 }
 
+static int flowd_handle_geoip_update_check(struct ubus_context *ctx, struct ubus_object *obj,
+                                           struct ubus_request_data *req, const char *method,
+                                           struct blob_attr *msg)
+{
+    struct json_object *body = flowd_json_from_blob(msg);
+    struct json_object *resp;
+    (void)obj; (void)method;
+
+    resp = flowd_geoip_update_check(flowd_payload_or_self(body));
+    flowd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    json_object_put(body);
+    return UBUS_STATUS_OK;
+}
+
 static int flowd_handle_country_policies_get(struct ubus_context *ctx, struct ubus_object *obj,
                                              struct ubus_request_data *req, const char *method,
                                              struct blob_attr *msg)
@@ -1037,6 +1052,7 @@ static const struct ubus_method flowd_methods[] = {
     UBUS_METHOD("geoip_source_delete", flowd_handle_geoip_source_delete, flowd_any_policy),
     UBUS_METHOD("geoip_import_status", flowd_handle_geoip_import_status, flowd_any_policy),
     UBUS_METHOD("geoip_import", flowd_handle_geoip_import, flowd_any_policy),
+    UBUS_METHOD("geoip_update_check", flowd_handle_geoip_update_check, flowd_any_policy),
     UBUS_METHOD("country_policies_get", flowd_handle_country_policies_get, flowd_any_policy),
     UBUS_METHOD("country_policy_set", flowd_handle_country_policy_set, flowd_any_policy),
     UBUS_METHOD("country_policy_delete", flowd_handle_country_policy_delete, flowd_any_policy),

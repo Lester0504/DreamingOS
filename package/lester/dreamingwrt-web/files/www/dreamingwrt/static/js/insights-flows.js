@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260808-audit-evidence-semantic-01';
   const PERIODS = {
     hour: { label: '1 小时', api: 'hour', ms: 3600000 },
     day: { label: '1 天', api: 'day', ms: 86400000 },
@@ -76,6 +76,10 @@
   };
   const LOCAL_MAP_VERSION = 'fastmonitor-apache2-20260709';
   const CYBER_ROUTE_LIMIT = 18;
+  /* The map does not need a 250ms refresh rate. Kept clear of the 420ms update
+     animation so one animation finishes before the next render starts. */
+  const MAP_RENDER_MIN_INTERVAL = 1000;
+  const mapRender = { frame: 0, timer: 0, lastAt: 0 };
 
   const FILTER_BODY_KEYS = {
     source: 'source_host',
@@ -129,9 +133,23 @@
       summaryEnabled: true,
       mapEnabled: true,
       mapScope: 'world',
+      /* Per-scope geo cache. Switching world/china used to null state.geo, so
+         every switch was a cold start; a visited scope now renders from cache
+         while it refreshes in the background. */
+      geoByScope: { world: null, china: null },
+      /* Geo fetch state for the map area only. The scope switch paints from
+         cache immediately, which means a slow or failed geo request leaves no
+         trace on screen: the old map just sits there looking current. This
+         drives an indicator inside the map shell, so a stall reads as "still
+         loading" rather than as fresh data. 'idle' | 'loading' | 'error'. */
+      mapFetch: 'idle',
+      mapFetchError: '',
       activityStatMetric: 'total',
       activityAnchor: 'client',
       activitySection: 'overview',
+      /* The 统计 switch: off hides the traffic chart and leaves the table alone
+         with the full board height. Mirrors mapEnabled on the flows tab. */
+      activityChartEnabled: true,
       trafficKind: 'all',
       risks: new Set(),
       actions: new Set(),
@@ -253,7 +271,20 @@
     }
 
     function bytesOf(item) {
-      return firstNumber(item.bytes, item.total_bytes, item.traffic_bytes, item.rx_bytes) + firstNumber(item.tx_bytes);
+      /*
+       * 后端给的 `bytes` 已经是双向合计，不是单向的。实测 30.1 `flows/summary`
+       * 与 `flows/geo` 的每一条都满足 `bytes == rx_bytes + tx_bytes`
+       * （目的地 30/30、客户端 4/4、应用 30/30、geo regions 20/20），
+       * 所以旧写法 `bytes + tx_bytes` 把上行又加了一遍：114.114.114.114
+       * 真实 94,016 被算成 130,953，down.debian7.com 33,146,677 被算成
+       * 33,766,949。榜单里字节越大的条目虚高越多，合计也就永远对不上
+       * `top_all_count_by_destination` 的字节合计。
+       *
+       * 正确取法：有显式合计就直接用，只有在没有合计字段时才用 rx + tx 拼。
+       */
+      const total = firstNumber(item.bytes, item.total_bytes, item.traffic_bytes);
+      if (total) return total;
+      return firstNumber(item.rx_bytes) + firstNumber(item.tx_bytes);
     }
 
     function countFromObject(map) {
@@ -261,16 +292,71 @@
       return Object.values(map).reduce((sum, value) => sum + firstNumber(value), 0);
     }
 
+    /*
+     * firstNumber() returns the first *finite* value, and both Number(null) and
+     * Number('') are 0, which is finite. So an absent-but-present key stops the
+     * chain and later aliases never get a turn. presentNumber() skips values
+     * that are not actually there, so a real 0 still counts while undefined /
+     * null / '' fall through to the next candidate.
+     */
+    function presentNumber(...values) {
+      for (const value of values) {
+        if (value === undefined || value === null || value === '') continue;
+        const number = Number(value);
+        if (Number.isFinite(number)) return number;
+      }
+      return 0;
+    }
+
+    /* First scope that actually carries one of these keys. Prevents an empty
+       earlier scope from resolving a bucket to 0 and hiding a populated one. */
+    function scopeWith(scopes, keys) {
+      for (const scope of scopes) {
+        if (!scope || typeof scope !== 'object') continue;
+        if (keys.some((key) => scope[key] !== undefined && scope[key] !== null && scope[key] !== '')) return scope;
+      }
+      return {};
+    }
+
+    const RISK_LOW_KEYS = ['low', 'LOW'];
+    const RISK_SUSPICIOUS_KEYS = ['suspicious', 'SUSPICIOUS', 'medium', 'MEDIUM'];
+    const RISK_SEVERE_KEYS = ['concerning_or_high', 'CONCERNING_OR_HIGH', 'concerning', 'CONCERNING',
+      'concern', 'CONCERN', 'high', 'HIGH', 'very_high', 'VERY_HIGH'];
+
+    const readRiskLow = (scope) => presentNumber(scope.low, scope.LOW);
+    const readRiskSuspicious = (scope) => presentNumber(scope.suspicious, scope.SUSPICIOUS, scope.medium, scope.MEDIUM);
+    /*
+     * The third card is "concerning + high", not "whichever of them we see
+     * first". Those are two distinct buckets, while `concern` is merely the
+     * backend's alias for `concerning` and must not be added on top of it.
+     * Prefer the backend's precomputed `concerning_or_high` (it cannot
+     * double-count); fall back to summing the two sides explicitly, picking
+     * each side's aliases by first-present. Reading these with a single
+     * first-finite chain is what let concerning=0 shadow a real high count.
+     */
+    const readRiskSevere = (scope) => presentNumber(
+      scope.concerning_or_high,
+      scope.CONCERNING_OR_HIGH,
+      presentNumber(scope.concerning, scope.CONCERNING, scope.concern, scope.CONCERN)
+        + presentNumber(scope.high, scope.HIGH, scope.very_high, scope.VERY_HIGH)
+    );
+
     function summaryCounts() {
       const data = state.summary || {};
       const allowed = data.allowed_count_by_risk || data.allowed || {};
       const blocked = data.blocked_count_by_risk || data.blocked || {};
-      const all = data.all_count_by_risk || data.risk || {};
-      const low = firstNumber(data.low, all.low, all.LOW, allowed.low, allowed.LOW) + firstNumber(blocked.low, blocked.LOW);
-      const suspicious = firstNumber(data.suspicious, data.medium, all.suspicious, all.SUSPICIOUS, all.medium, all.MEDIUM, allowed.suspicious, allowed.SUSPICIOUS) + firstNumber(blocked.suspicious, blocked.SUSPICIOUS);
-      const concern = firstNumber(data.concern, data.high, all.concern, all.CONCERN, all.high, all.HIGH, all.very_high, all.VERY_HIGH, allowed.concern, allowed.high) + firstNumber(blocked.concern, blocked.high, blocked.VERY_HIGH);
+      const all = data.all_count_by_risk || data.risk || data.risk_breakdown || {};
+      /* Every risk source being absent is not the same as a real count of zero.
+         Rendering 0 there claims "no risky traffic" when the truth is "the
+         backend never sent this", so the card has to be able to say so. */
+      const hasRiskSource = [data.all_count_by_risk, data.risk, data.risk_breakdown, data.allowed_count_by_risk, data.blocked_count_by_risk]
+        .some((source) => source && typeof source === 'object')
+        || [data.low, data.suspicious, data.medium, data.concern, data.high].some((value) => Number.isFinite(Number(value)) && value !== null && value !== '');
+      const low = readRiskLow(scopeWith([data, all, allowed], RISK_LOW_KEYS)) + readRiskLow(blocked);
+      const suspicious = readRiskSuspicious(scopeWith([data, all, allowed], RISK_SUSPICIOUS_KEYS)) + readRiskSuspicious(blocked);
+      const concern = readRiskSevere(scopeWith([data, all, allowed], RISK_SEVERE_KEYS)) + readRiskSevere(blocked);
       const total = firstNumber(data.total, data.total_count, data.flow_count, countFromObject(data.all_count_by_region), countFromObject(allowed) + countFromObject(blocked), low + suspicious + concern, state.flows.length);
-      return { total, low, suspicious, concern };
+      return { total, low, suspicious, concern, supported: hasRiskSource };
     }
 
     function topList(keys) {
@@ -343,15 +429,158 @@
       return firstText(city, province, country, point.country_code, point.ip, point.public_ip);
     }
 
-    function geoDestinationItems() {
-      const points = mapPoints();
-      if (!points.length) return [];
-      return dedupeTopItems(points.map((point) => ({
-        ...point,
-        __top_label: geoDestinationLabel(point),
-        bytes: firstNumber(point.bytes, point.total_bytes, point.traffic_bytes, point.rx_bytes + point.tx_bytes),
-        count: firstNumber(point.count, point.flow_count, point.total, point.value, 1)
-      })).filter((point) => point.__top_label), 'destination');
+    /*
+     * 「热门目的地」的地点名。用户 2026-08-04：「目的地应该是地方，例如美国洛杉矶」。
+     *
+     * 拼法是「国家 + 城市」，两者相同时不重复（香港 / 新加坡这类城邦实测
+     * `country_name` 与 `city_name` 都是「香港」「新加坡」，拼出来会变成「香港香港」）。
+     * 城市缺失时退到省/州，再退到只有国家 —— 实测美国那条就没有 city_name，
+     * 只能显示「美国」，这是 GeoIP 库的粒度问题，不是这里少读了字段。
+     */
+    function geoPlaceLabel(point) {
+      if (!point || typeof point !== 'object') return '';
+      const country = firstText(point.country_name, point.country_cn, point.country);
+      const city = firstText(point.city_name, point.city, point.cityName, point.locality);
+      const area = firstText(point.province_name, point.region_name, point.subdivision_name, point.province);
+      const local = firstText(city, area !== country ? area : '');
+      if (country && local && local !== country) return `${country}${local}`;
+      return firstText(country, local, point.country_code, '--');
+    }
+
+    /*
+     * 「热门目的地」的字节只能来自摘要，不能来自 geo 点位。
+     *
+     * 原先这里还有一个 `geoDestinationItems()`，把 geo 点位包装成列表项。
+     * 它已随本次修复一并删除：留着它，下一次「地图有数据就优先用地图」的三元表达式
+     * 就会被重新写回来。geo 点位现在只服务地图渲染（`mapPoints()` / `mapDisplayPoints()`）。
+     *
+     * geo 点位的 bytes 是后端按 `history_sample_limit:100` 采样累加出来的
+     * （实测 176 行样本 / 全窗口 300165 条 = 0.06%），响应里
+     * `capabilities.byte_accounting_exact:false` 与 `exact_window_bytes:false`
+     * 已明确声明这是采样值。实测同一时刻：geo 点位合计 2,024,295 字节，
+     * 而 `top_all_count_by_destination` 合计 15,591,142（本轮复测 42,095,511）,
+     * 所以旧写法把 15MB 显示成不到 2MB —— 用户原话「别告诉我这个路由器这么多天
+     * 上网数据不到 1M」。
+     *
+     * 维度也不是一回事：geo 是国家/地区（CN、US、SG），摘要是目的主机
+     * （ports.debian13.com、114.114.114.114）。卡片叫「热门目的地」就必须给主机维度。
+     */
+    function destinationTopItems() {
+      /*
+       * 用户 2026-08-04：「目的地应该是地方，例如美国洛杉矶」。
+       * 所以这张卡是地理维度。口径**跟随后端的自述字段，而不是写死**：
+       *
+       * 后端 2026-08-05 已把 region 字节改成全窗口精确聚合，同一份响应里自己声明了
+       * （30.1 实测）：
+       *
+       *   region_byte_source                 audit_flow_geo_summary_window_exact
+       *   bytes_are_sample_only              false
+       *   geo_region_bytes_window_exact      true
+       *   capabilities.byte_accounting_exact true
+       *   逐条 bytes_field_to_display        "bytes"      （另有 bytes_sampled 仅供诊断）
+       *
+       * 实测 regions 字节合计 75,093,167 对 window_bytes 75,454,736（差值是 unmappable
+       * 的零头），已经不是当初那个 2,024,295 的采样值。所以精确时必须显示字节 —— 
+       * 继续只报流数反而是另一种失真。
+       *
+       * 流数则相反：`flow_count` 是坐标采样行的条数（实测合计 192，
+       * `coordinate_sample_rows: 176`），而 `window_flow_count` 才是全窗口
+       * （合计 30,812 对 window_flow_rows 31,108）。旧写法把 60 条显示成美国一天的
+       * 全部流量，同样是拿采样值冒充总量。排序与显示都改用窗口值，缺失时才退回采样值。
+       */
+      const regions = asArray((state.geo && (state.geo.regions || state.geo.points)) || []);
+      if (!regions.length) return [];
+      /* 精确性由后端说，不由前端假设；采样时不显示字节，只报流数并打标。 */
+      const sampled = geoBytesAreSampled();
+      const merged = new Map();
+      regions.forEach((region) => {
+        const label = geoPlaceLabel(region);
+        if (!label || label === '--') return;
+        const key = `${firstText(region.country_code)}|${label}`;
+        const current = merged.get(key);
+        /* 窗口流数优先；`window_flow_count` 缺失的条目（实测 20 条里有 6 条）
+           才退回采样流数，此时它就是这条已知的全部。 */
+        const count = firstNumber(region.window_flow_count, region.flow_count, region.count);
+        const bytes = firstNumber(region.bytes, region.total_bytes);
+        if (current) {
+          current.flow_count += count;
+          current.count = current.flow_count;
+          current.bytes += bytes;
+          return;
+        }
+        merged.set(key, {
+          ...region,
+          __top_label: label,
+          /* 这个标记控制「是否禁止显示字节」，所以只在后端自述采样时才打。 */
+          __geo_sampled: sampled,
+          flow_count: count,
+          count,
+          bytes,
+          /* 精确时按字节排名（与显示的指标一致，进度条才不会和列表顺序打架）。 */
+          metric_type: sampled ? 'flow_count' : 'bytes'
+        });
+      });
+      return Array.from(merged.values()).sort((left, right) => (
+        sampled ? right.flow_count - left.flow_count : bytesOf(right) - bytesOf(left)
+      ));
+    }
+
+    /* 主机维度不再占用「热门目的地」这张卡，但数据本身仍要能看见。 */
+    function destinationHostTopItems() {
+      /* `top_destinations` 已被后端移除（`capabilities.deprecated_response_keys`），
+         留着是死候选，会让人以为后端还在发。排在最前的保留键必须留下：
+         topList() 取第一个命中的候选，删错顺序就取不到值。 */
+      return dedupeTopItems(topList(['top_all_count_by_destination', 'top_all_named_count_by_destination', 'destinations']), 'destination');
+    }
+
+    /*
+     * geo 不可用时（没装 MMDB、或全是私网流量）不能让这张卡变空白 —— 那会比
+     * 显示主机榜更糟。此时退回主机维度，指标口径也跟着回到摘要的精确字节。
+     */
+    function destinationCardItems() {
+      const places = destinationTopItems();
+      return places.length ? places : destinationHostTopItems();
+    }
+
+    /*
+     * 卡片头部的口径徽标。三种情形各有各的说法，不能共用一句话：
+     *
+     *   地点榜 + 后端声明精确   不标（字节就是全窗口值，标「抽样」等于自我否定）
+     *   地点榜 + 后端声明采样   标「抽样」，此时列表也只报流数不报字节
+     *   主机回退               标「主机」，说明这一屏不是地点维度
+     */
+    function destinationCardNote() {
+      if (destinationTopItems().length) return geoBytesAreSampled() ? '抽样' : '';
+      return '';
+    }
+
+    /*
+     * geo 字节是不是采样值，只能由后端自述决定。
+     *
+     * 判据要同时看两处：顶层（`bytes_are_sample_only` / `region_byte_source` /
+     * `geo_region_bytes_window_exact`）和 `capabilities`。旧写法只读
+     * `capabilities`，而 2026-08-05 之后后端把结论放在顶层，`capabilities` 里
+     * 另有一组作用域不同的标记；只读一半就会把已经精确的数据继续当采样值。
+     *
+     * 三态而非两态：明确说采样 → 采样；明确说精确 → 精确；两者都没有 → 按采样处理。
+     * 未知时保守，是因为把采样字节当成全窗口用量正是「不到 1M」那个缺陷的成因，
+     * 反过来只是少显示一个字节数，代价小得多。
+     */
+    function geoBytesAreSampled() {
+      const data = state.geo || {};
+      const caps = data.capabilities || {};
+      /* 任一处明确声明采样即为采样。 */
+      if (data.bytes_are_sample_only === true || caps.bytes_are_sample_only === true) return true;
+      if (data.region_bytes_sample_only === true || caps.region_bytes_sample_only === true) return true;
+      if (caps.geo_region_bytes_are_sample_only === true) return true;
+      /* 再看是否明确声明精确。`region_byte_source` 实测为
+         `audit_flow_geo_summary_window_exact`。 */
+      if (data.geo_region_bytes_window_exact === true || caps.geo_region_bytes_window_exact === true) return false;
+      if (/window_exact/.test(String(data.region_byte_source || caps.geo_region_byte_source || ''))) return false;
+      if (caps.byte_accounting_exact === true && caps.exact_window_bytes === true) return false;
+      if (data.bytes_are_sample_only === false && caps.byte_accounting_exact !== false) return false;
+      /* 未表态：按采样处理，不显示字节。 */
+      return true;
     }
 
     function flowItems(payload) {
@@ -435,8 +664,16 @@
 
     function mapRouteItems() {
       const routes = buildMapRoutes(state.geo, state.mapScope === 'china' ? null : state.summary, mapPoints(), localMapPoint());
-      if (state.mapScope !== 'china') return routes;
-      return routes.filter((route) => isChinaScopedMapPoint(route.from) && isChinaScopedMapPoint(route.to));
+      const scoped = state.mapScope === 'china'
+        ? routes.filter((route) => isChinaScopedMapPoint(route.from) && isChinaScopedMapPoint(route.to))
+        : routes;
+      /* 后端声明 `route_aggregation_supported` 时，聚合已经在服务端按语义键做完，
+         前端只负责把同坐标的多条弧视觉上分开；否则退回本地的分桶 + 角距合并。 */
+      return aggregateMapRoutes(
+        scoped,
+        state.mapScope === 'china' ? 'china' : 'world',
+        { backendAggregated: routeAggregationSupported(state.geo) }
+      );
     }
 
     function selectedValues(groupId) {
@@ -615,6 +852,9 @@
           flowChanged = true;
         } else if (topic === 'insights.flows.geo') {
           state.geo = payload;
+          // Keep the per-scope cache in step, otherwise switching away and back
+          // would render a snapshot older than what is already on screen.
+          state.geoByScope[state.mapScope] = payload;
           changed = true;
           flowChanged = true;
         } else if (topic === 'insights.activity.rate') {
@@ -739,11 +979,16 @@
       });
     }
 
-    function applyMapResults(requestSeq, geo, requestStartedAt) {
+    function applyMapResults(requestSeq, geo, requestStartedAt, scope) {
       if (!state.root || requestSeq !== state.refreshSeq || state.mode !== 'flows') return;
       const focusState = captureFocusState();
       const nextGeo = normalizePayload(geo);
-      if (nextGeo && !hasRealtimeSince('insights.flows.geo', requestStartedAt)) state.geo = nextGeo;
+      const requestScope = scope || state.mapScope;
+      if (nextGeo) state.geoByScope[requestScope] = nextGeo;
+      // A response for a scope the user has already left must not replace the map.
+      if (nextGeo && requestScope === state.mapScope && !hasRealtimeSince('insights.flows.geo', requestStartedAt)) {
+        state.geo = nextGeo;
+      }
       rememberErrors([geo]);
       if (state.loading) return;
       if (updateFlowsRealtimeDom()) {
@@ -755,6 +1000,78 @@
       restoreFocusState(focusState);
       scheduleGlassCardsRender?.(180);
       scheduleMapRender();
+    }
+
+    /* Scope switching only needs the geo endpoint. Routing it through refresh()
+       made it wait on insights_summary, which is the 30s call, and refresh()
+       silently returns while state.loading is set, so the click looked ignored. */
+    /*
+     * Map-area fetch status. Patches the existing node in place instead of
+     * calling render(): a full re-render would tear down and re-init the ECharts
+     * instance, which is the cost this whole change set exists to avoid.
+     */
+    function setMapFetchState(next, message = '') {
+      if (state.mapFetch === next && state.mapFetchError === message) return;
+      state.mapFetch = next;
+      state.mapFetchError = next === 'error' ? message : '';
+      updateMapStatusDom();
+    }
+
+    function mapStatusText() {
+      if (state.mapFetch === 'loading') return '正在获取地理流量…';
+      if (state.mapFetch === 'error') return state.mapFetchError || '地理流量获取失败';
+      return '';
+    }
+
+    /*
+     * design.md「请求失败必须按 HTTP 状态分类」：404/405/501 是接口未实现，
+     * 401 会话失效，403 权限不足，5xx 后端错误，无状态码才是网络不可用。
+     * 原始的 `Failed to fetch` 是浏览器内部字符串，对用户没有意义，不外显。
+     */
+    function geoFailureText(status, message) {
+      if (status === 401) return '地理流量获取失败：会话已失效，请重新登录';
+      if (status === 403) return '地理流量获取失败：当前账号无权读取';
+      if (status === 404 || status === 405 || status === 501) return '地理流量接口尚未接入';
+      if (status >= 500) return `地理流量获取失败：后端错误（${status}）`;
+      if (status > 0) return `地理流量获取失败（${status}）`;
+      if (/timeout|timed out/i.test(message)) return '地理流量获取超时，正在稍后重试';
+      return '地理流量获取失败：网络不可用';
+    }
+
+    function updateMapStatusDom() {
+      if (!state.root) return;
+      state.root.querySelectorAll('[data-insights-map-shell]').forEach((shell) => {
+        shell.classList.toggle('is-geo-pending', state.mapFetch === 'loading');
+        shell.classList.toggle('is-geo-failed', state.mapFetch === 'error');
+        const status = shell.querySelector('[data-insights-map-status]');
+        if (!status) return;
+        const text = state.mapFetch === 'loading'
+          ? '正在获取地理流量…'
+          : (state.mapFetch === 'error' ? (state.mapFetchError || '地理流量获取失败') : '');
+        status.textContent = text;
+        status.hidden = !text;
+      });
+    }
+
+    async function refreshMapOnly() {
+      if (!state.root || state.mode !== 'flows' || !state.mapEnabled) return;
+      const requestSeq = state.refreshSeq;
+      const requestStartedAt = Date.now();
+      const scope = state.mapScope;
+      /* Show the pending state in the map area only. Painting from cache first
+         is what makes the switch feel instant, but it also means an unfinished
+         request is invisible unless we say so here. */
+      setMapFetchState('loading');
+      const result = await fetchWithRetry('insights_geo', ENDPOINTS.geo(queryPeriod(), nowRange(), scope), 3, 550);
+      if (!state.root || state.mapScope !== scope) return;
+      if (result && result.ok) {
+        setMapFetchState('idle');
+      } else {
+        const status = Number(result && result.status || 0);
+        const message = String(result && result.error && result.error.message || '');
+        setMapFetchState('error', geoFailureText(status, message));
+      }
+      applyMapResults(requestSeq, result, requestStartedAt, scope);
     }
 
     async function refresh(options = {}) {
@@ -779,11 +1096,12 @@
       let geo = { ok: true, data: state.geo };
       let mapResultsSettled = false;
       if (state.mode === 'flows' && state.mapEnabled) {
-        fetchWithRetry('insights_geo', ENDPOINTS.geo(queryPeriod(), activeRange, state.mapScope), 3, 550)
+        const geoScope = state.mapScope;
+        fetchWithRetry('insights_geo', ENDPOINTS.geo(queryPeriod(), activeRange, geoScope), 3, 550)
           .then((nextGeoResult) => {
           geo = nextGeoResult;
           mapResultsSettled = true;
-          applyMapResults(requestSeq, geo, requestStartedAt);
+          applyMapResults(requestSeq, geo, requestStartedAt, geoScope);
           });
       }
       const summaryReq = state.mode === 'flows' && fetchApiResource
@@ -918,7 +1236,13 @@
       const selected = options.find(([id]) => id === state.activityStatMetric) || options[0];
       return `
         <section class="insights-filter-section insights-activity-stats">
-          <strong>统计</strong>
+          <label class="insights-switch-row">
+            <span>统计</span>
+            <span class="insights-switch">
+              <input type="checkbox" data-activity-chart-toggle ${state.activityChartEnabled ? 'checked' : ''}>
+              <span class="insights-switch-ui" aria-hidden="true"></span>
+            </span>
+          </label>
           <details class="insights-activity-stat-select">
             <summary class="insights-activity-stat-main">
               <span class="insights-activity-stat-icon" aria-hidden="true">${selected[3]}</span>
@@ -1129,41 +1453,245 @@
     function summaryMarkup() {
       if (!state.summaryEnabled) return '';
       const counts = summaryCounts();
-      const pct = (value) => counts.total ? `${Math.round(value / counts.total * 100)}%` : '0%';
+      const scope = riskCountScope();
       const totalRow = { id: 'total', label: '总计', value: counts.total, detail: '', icon: summaryTrafficSvg() };
+      /*
+       * 三档的措辞由两件事决定，顺序不能颠倒：
+       *   1. 有没有风险源 —— 没有就说「后端未提供」，不能印三个 0。
+       *   2. 统计范围覆没覆盖整窗口 —— 分子只覆盖抽样行时不得配全窗口分母，
+       *      那个百分比的分子分母不同源，等于宣称整窗口已查清。
+       * 覆盖率极低时 0 要读作「未检出」：0 是测量结果，未检出才是当前状态。
+       */
+      const pct = (value) => counts.total ? `${Math.round(value / counts.total * 1000) / 10}%` : '0%';
+      const riskDetail = (value) => {
+        if (!counts.supported) return '后端未提供';
+        if (!value && scope.unmeasured) return '未检出';
+        if (!scope.percentComparable) return formatInteger(value);
+        return `${formatInteger(value)} (${pct(value)})`;
+      };
       const riskRows = [
-        { id: 'low', label: '低', value: counts.low, detail: `${counts.low} (${pct(counts.low)})` },
-        { id: 'suspicious', label: '可疑', value: counts.suspicious, detail: `${counts.suspicious} (${pct(counts.suspicious)})` },
-        { id: 'concern', label: '令人担忧', value: counts.concern, detail: `${counts.concern} (${pct(counts.concern)})` }
+        { id: 'low', label: '低', value: counts.low, detail: riskDetail(counts.low) },
+        { id: 'suspicious', label: '可疑', value: counts.suspicious, detail: riskDetail(counts.suspicious) },
+        { id: 'concern', label: '令人担忧', value: counts.concern, detail: riskDetail(counts.concern) }
       ];
+      /*
+       * 摘要模块是通栏控制台的第一格，不再是一张独立玻璃卡。
+       * `data-insights-overview-card="summary"` 必须保留：`updateFlowsRealtimeDom()`
+       * 用它做增量 patch 的锚点，换掉钩子会让实时刷新静默失效。
+       */
       return `
-        <section class="insights-summary-section" aria-label="流量摘要">
-          <article class="insights-summary-card dwrt-glass-card insights-stable-glass" data-insights-overview-card="summary">
-            <div class="insights-card-content" data-insights-card-content>
-              <h2>流量摘要</h2>
+        <div class="insights-console-module insights-console-summary" data-insights-overview-card="summary">
+          <div class="insights-card-content" data-insights-card-content>
+            <div class="insights-console-head">
+              <span class="insights-console-title">流量摘要</span>
+              <span class="insights-console-count">${html(riskScopeBadge())}</span>
+            </div>
+            <div class="insights-console-body">
+              <div class="insights-console-total">
+                <span class="insights-console-total-mark" aria-hidden="true">${totalRow.icon}</span>
+                <strong>${html(formatInteger(totalRow.value))}</strong>
+                <span class="insights-console-total-unit">条流量</span>
+              </div>
               <div class="insights-summary-list">
-                <div class="insights-summary-row ${totalRow.id}">
-                  <span class="insights-summary-mark" aria-hidden="true">${totalRow.icon}</span>
-                  <span class="insights-summary-label">${html(totalRow.label)}</span>
-                  <strong>${html(formatInteger(totalRow.value))}</strong>
-                </div>
                 ${riskRows.map((row) => `
                   <div class="insights-summary-row insights-summary-risk-entry ${row.id}">
-                    <span class="dwrt-risk-bars insights-summary-risk-bars ${row.id}" aria-hidden="true"><i></i><i></i><i></i></span>
+                    <span class="insights-console-dot ${row.id}" aria-hidden="true"></span>
                     <span class="insights-summary-label">${html(row.label)}</span>
                     <strong>${html(row.detail)}</strong>
                   </div>
                 `).join('')}
               </div>
+              ${counts.supported && scope.note ? `
+                <p class="insights-summary-scope" data-insights-risk-scope-note${scope.unmeasured ? ' data-risk-scope-unmeasured="on"' : ''}${scope.detail ? ` data-dwrt-tooltip="${escapeAttr(scope.detail)}" title="${escapeAttr(scope.detail)}" tabindex="0"` : ''}>${html(scope.note)}${scope.noteRatio ? ` <b>${html(scope.noteRatio)}</b>` : ''}</p>` : ''}
             </div>
-          </article>
-        </section>`;
+          </div>
+        </div>`;
+    }
+
+    /*
+     * 三档风险数的**统计范围**。这里只回答一个问题：这三个数覆盖了窗口里的多少行，
+     * 以及由此还能不能拿全窗口总数当分母。
+     *
+     * 两种口径都实测过，且不能只认一种：
+     *   `risk_count_scope: "sampled_rows"`  — 抽样行。曾实测 `risk_count_sampled_rows: 1`
+     *     对 `risk_count_window_rows: 300046`，覆盖率 3.3e-06。此时「令人担忧 0」的真实
+     *     含义是「抽到的那 1 行不担忧，剩下 30 万行没看」。
+     *   `risk_count_scope: "window_rows_by_host"` — 按目的主机回卷整窗口，
+     *     `risk_count_is_window_total: true`。但 `is_window_total` 为真**不等于**全查清：
+     *     实测同时有 `risk_count_uncounted_rows: 52428`（无可解析目的主机的行）
+     *     与 `risk_graded_coverage_ratio: 0.0011`（真正拿到评级的只有 271 条流，
+     *     其余 247483 条落在 unknown）。
+     *
+     * 所以百分比可比性看的是**分子分母同源**（`counted` 是否等于窗口行数），
+     * 而不是 `is_window_total` 这个自述位；「未检出」看的是有没有真的评级过
+     * （`risk_graded_flows` / 覆盖率），因为大量 unknown 下的 0 不是一个测量结果。
+     */
+    function riskCountScope() {
+      const data = state.summary || {};
+      const all = data.all_count_by_risk || data.risk || data.risk_breakdown || {};
+      const windowRows = firstNumber(data.risk_count_window_rows, data.total, data.total_count);
+      const counted = firstNumber(data.risk_count_sampled_rows, data.risk_count_total);
+      const uncounted = firstNumber(data.risk_count_uncounted_rows);
+      const graded = presentNumber(data.risk_graded_flows, data.risk_matched_count);
+      const gradedRatio = presentNumber(data.risk_graded_coverage_ratio);
+      const ungraded = presentNumber(data.risk_ungraded_flows, all.unknown, all.UNKNOWN);
+      const hasGradedSignal = data.risk_graded_flows !== undefined || data.risk_matched_count !== undefined
+        || data.risk_graded_coverage_ratio !== undefined;
+      const scopeLabel = firstText(data.risk_count_scope);
+      /* 分子只覆盖 counted 行，分母是 windowRows。两者不等（或明确有未计入的行）
+         就不同源，此时百分比不成立。后端没给范围字段时不改变既有行为。 */
+      const scopeKnown = windowRows > 0 && (counted > 0 || uncounted > 0 || scopeLabel !== '');
+      const covered = counted > 0 ? Math.min(counted, windowRows) : Math.max(0, windowRows - uncounted);
+      const partial = scopeKnown && (uncounted > 0 || (counted > 0 && counted < windowRows));
+      /* 评级覆盖率极低：三档的 0 只说明「这几条没评上」，不是「窗口里没有」。 */
+      const unmeasured = hasGradedSignal
+        ? (graded <= 0 || (gradedRatio > 0 && gradedRatio < 0.01))
+        : (partial && windowRows > 0 && covered / windowRows < 0.01);
+      /*
+       * 可见的一行只说一件事：**这三个数一共覆盖了窗口里的多少行**。
+       * 用 `graded`（实测 271 = low 251 + high 20，正是三档之和）而不是
+       * `risk_count_sampled_rows`（247,754，其中 247,483 条是 unknown）——后者会
+       * 读成「82% 都查过了」，而真正拿到评级的只有千分之一。
+       *
+       * 长度是硬约束，不是排版偏好：摘要模块必须与其余三个模块等高
+       * （design.md 洞察控制台第 3 条），1440px 下这一列只有约 190px 宽。
+       * 早先写成两句完整叙述实测把模块顶到 308px（其余 207px），文字还溢出玻璃外，
+       * 标题也被长角标挤成「流」。所以：可见文字压到一行，
+       * `unknown` 的语义与未计入行数放进 tooltip，而不是删掉。
+       */
+      /* 覆盖数优先用「真正取得评级的流数」；后端没给这个字段时退回已统计行数，
+         否则旧后端会被说成「一条都没覆盖」。 */
+      const coverage = hasGradedSignal ? graded : covered;
+      /* `ratio` 单独拿出来，渲染时套一层 nowrap：1440px 下摘要列只有约 170px，
+         实测这个比例会断在斜杠处，分母被甩到下一行就又读成「覆盖 270 条」。 */
+      const ratio = windowRows > 0 ? `${formatInteger(coverage)} / ${formatInteger(windowRows)} 条` : '';
+      const note = !scopeKnown ? ''
+        : coverage <= 0 ? `分档未覆盖任何流量，${formatInteger(windowRows)} 条均未评级`
+        : partial || coverage < windowRows ? '分档仅覆盖'
+          : '';
+      const noteRatio = note === '分档仅覆盖' ? ratio : '';
+      /*
+       * tooltip 承载完整口径。`risk_unknown_meaning` 后端自述为「目的地不在已加载的
+       * 情报源中，**并非判定为安全**」，所以 unknown 既不能静默丢弃，也不能并入「低」。
+       *
+       * 渲染时同时写 `data-dwrt-tooltip` 与原生 `title`：kit 的 tooltip 由
+       * `mountUiKit()` 挂载，而摘要模块每次实时推送都走 `patchStableCard()` 的
+       * `replaceChildren`，新节点没有再挂过。实测悬浮拿不到玻璃 tooltip
+       * （`dwrt-kit-tooltip-trigger` 为 false），榜单名那一处同样如此——这是平台侧的
+       * 既有缺陷，已另开 Front-to-Front 交接单，这里先用原生 title 保底，
+       * 让完整口径无论挂载与否都读得到。`mountNativeTitleTooltip()` 会在挂载成功时
+       * 把 title 收走，两条路径不会重复弹。
+       */
+      const detail = [
+        note ? `风险分档只统计已取得情报评级的流量：${ratio}。` : '',
+        uncounted > 0 ? `其中 ${formatInteger(uncounted)} 条无可解析的目的主机，未进入统计。` : '',
+        ungraded > 0 ? `另有 ${formatInteger(ungraded)} 条目的地不在已加载的情报源中，属于未评级，而非判定为安全。` : ''
+      ].filter(Boolean).join('');
+      return {
+        windowRows,
+        counted,
+        covered,
+        graded,
+        ungraded,
+        partial,
+        unmeasured,
+        /* 分子分母同源才允许算百分比。 */
+        percentComparable: !scopeKnown || !partial,
+        /* 后端未表态时按采样处理（design.md 洞察控制台第 10 条的同一口径），
+           这也是改动前的行为，不因新增判据而变。 */
+        /* 角标留在标题行右端，只有 11px 且与标题争宽度，因此只放口径二字，
+           具体行数交给三档下方那一行——那才是这个比例该出现的视觉层级。 */
+        badge: !scopeKnown ? '抽样' : partial ? '抽样' : '全窗口',
+        note,
+        noteRatio,
+        detail
+      };
+    }
+
+    function riskScopeBadge() {
+      return riskCountScope().badge;
+    }
+
+    /*
+     * 榜单条目的图标。三个维度各有自己的真实来源，都不是前端凭空造的：
+     *
+     *   应用   后端在 `top_all_traffic_by_application` 里直接给了
+     *          `icon_url` / `icon_file` / `icon_key`（实测 `百度智能云` →
+     *          `/static/images/logo/baidu-smartcloud.svg`）。固件里 4694 个图标。
+     *          纯服务条目（https、tcp/11881，`identity_kind: "service"`）没有图标，
+     *          回落到协议字形，不硬塞一张不相干的图。
+     *   客户端 走全局的 `DWRT_DEVICE_IMAGES.resolve()`，与仪表盘/终端列表同一套
+     *          优先级（自定义 > 指纹 > 品牌 logo）。实测 `iKuaiOS router` 命中
+     *          指纹图 `/luci-static/.../3797/257x257.png`。
+     *   目的地 国旗，`/static/images/flags/<code>.svg`（固件里 258 面，
+     *          与 aegisx 的 `countryFlag()` 同一批资源）。
+     *
+     * 图标一律 `loading="lazy"`，加载失败就隐藏自己并把首字母兜底显示出来，
+     * 不让一个 404 在列表里留下破图占位。
+     */
+    function topItemIconMarkup(item, kind) {
+      const fallback = topItemIconFallback(item, kind);
+      const src = topItemIconSrc(item, kind);
+      if (!src) return `<span class="insights-rank-icon is-glyph" aria-hidden="true">${fallback}</span>`;
+      const shape = kind === 'destination' ? ' is-flag' : '';
+      return `<span class="insights-rank-icon${shape}" aria-hidden="true">`
+        + `<img src="${html(src)}" alt="" loading="lazy" decoding="async"`
+        + ` onerror="this.hidden=true;this.parentElement.classList.add('is-glyph')">`
+        + `<i>${fallback}</i></span>`;
+    }
+
+    function topItemIconSrc(item, kind) {
+      if (!item || typeof item !== 'object') return '';
+      if (kind === 'application') {
+        /* 服务类条目（https、dot、tcp/21385）不是应用，没有品牌图标可用。 */
+        if (item.identity_kind === 'service' && !firstText(item.icon_url, item.icon_file)) return '';
+        const direct = firstText(item.icon_url, item.icon, item.logo_url, item.logo);
+        if (direct) return normalizeIconUrl(direct);
+        const file = firstText(item.icon_file, item.icon_key && `${item.icon_key}.svg`);
+        return file ? `/static/images/logo/${encodeURIComponent(file)}` : '';
+      }
+      if (kind === 'client') {
+        const images = globalThis.DWRT_DEVICE_IMAGES;
+        if (images && typeof images.resolve === 'function') {
+          const resolved = images.resolve(item);
+          if (resolved && resolved.src) return resolved.src;
+        }
+        return normalizeIconUrl(firstText(item.icon_url, item.icon, item.image, item.image_url));
+      }
+      if (kind === 'destination') return countryFlagUrl(item);
+      return '';
+    }
+
+    function normalizeIconUrl(value) {
+      const source = firstText(value);
+      if (!source) return '';
+      const images = globalThis.DWRT_DEVICE_IMAGES;
+      if (images && typeof images.normalizeUrl === 'function') return images.normalizeUrl(source);
+      return source;
+    }
+
+    /* 国家代码 → 旗帜文件。只接受两位字母的 ISO 代码，其余一律不出图，
+     * 避免把 `region_code: "28"` 这类行政区代码拼成一个不存在的路径。 */
+    function countryFlagUrl(item) {
+      const code = firstText(item && item.country_code, item && item.country, item && item.countryCode)
+        .trim().toLowerCase();
+      return /^[a-z]{2}$/.test(code) ? `/static/images/flags/${code}.svg` : '';
+    }
+
+    function topItemIconFallback(item, kind) {
+      const name = topItemName(item, kind);
+      const first = String(name || '').trim().slice(0, 1).toUpperCase();
+      return html(first && first !== '-' ? first : '·');
     }
 
     function topItemName(item, kind) {
       if (item && item.__top_label) return item.__top_label;
       if (kind === 'destination') {
-        return firstText(geoDestinationLabel(item), item.destination, item.destination_name, item.destination_host, item.domain, item.host, item.region, item.country, item.ip, item.name, item.label, '--');
+        /* 地点优先（用户：「目的地应该是地方，例如美国洛杉矶」）。
+         * `__geo_sampled` 标记的条目来自 geo regions，直接用拼好的地点名；
+         * 其余（geo 不可用时的兜底路径）仍按主机/域名显示。 */
+        if (item && item.__geo_sampled) return geoPlaceLabel(item);
+        return firstText(item.destination, item.destination_name, item.destination_host, item.domain, item.host, item.ip, geoPlaceLabel(item), item.region, item.country, item.name, item.label, '--');
       }
       if (kind === 'client') {
         return firstText(item.client_name, item.hostname, item.name, item.display_name, item.mac, item.ip, '--');
@@ -1175,44 +1703,124 @@
     }
 
     function topItemMetric(item) {
+      /* 后端自述为采样的 geo 条目：字节与全窗口不可比，只报流数，
+         口径由卡片头部的「抽样」徽标说明。 */
+      if (item && item.__geo_sampled) return `${formatInteger(topItemCount(item))} 条`;
       if (hasTrafficBytes(item) || item.__top_has_bytes) {
         return formatBytes(bytesOf(item));
       }
       return formatInteger(firstNumber(item.count, item.flow_count, item.total, item.value));
     }
 
-    function topCard(title, empty, items, kind) {
+    /*
+     * 进度条的长度必须用**该模块自己的排名指标**归一化。
+     *
+     * 后端在每个条目上给了 `metric_type` / `ranking_basis`：目的地与客户端是
+     * `flow_count`（按流数排名），应用是 `bytes`（按字节排名）。若一律按 bytes
+     * 算宽度，应用榜没问题，但目的地榜的条长顺序会和列表顺序对不上——实测
+     * down.debian7.com 只有 146 条流却占 24MB，而 www.coway.com 有 672 条流
+     * 却只占 6MB，按字节画就是第三名的条最长，看起来像排序坏了。
+     */
+    function topItemWeight(item) {
+      const metric = firstText(item && item.metric_type, item && item.ranking_basis);
+      const bytes = bytesOf(item);
+      const count = topItemCount(item);
+      if (/byte|traffic/i.test(metric)) return bytes || count;
+      if (/count|hit|flow/i.test(metric)) return count || bytes;
+      return (hasTrafficBytes(item) || item.__top_has_bytes) ? (bytes || count) : (count || bytes);
+    }
+
+    /*
+     * `note` 是口径徽标，跟在计数徽标后面（如 `20 地区 · 抽样`）。
+     * 采样数据源不得无标注地渲染，这条与「流量摘要」的 `riskScopeBadge()` 同一套做法。
+     */
+    function topCard(title, empty, items, kind, note) {
+      const shown = items.slice(0, 5);
+      const peak = shown.reduce((max, item) => Math.max(max, topItemWeight(item)), 0);
+      const countText = items.length ? topCountLabel(items.length, kind) : empty;
+      const headText = items.length && note ? `${countText} · ${note}` : countText;
       return `
-        <article class="insights-top-card dwrt-glass-card insights-stable-glass" data-insights-overview-card="${html(kind)}">
+        <div class="insights-console-module insights-console-rank is-${html(kind)}" data-insights-overview-card="${html(kind)}">
           <div class="insights-card-content" data-insights-card-content>
-            <div class="insights-card-title">
-              <strong>${html(title)}</strong>
-              <span>${html(items.length ? `${items.length}` : empty)}</span>
+            <div class="insights-console-head">
+              <span class="insights-console-title">${html(title)}</span>
+              <span class="insights-console-count">${html(headText)}</span>
             </div>
-            ${items.length ? `
-              <div class="insights-list">
-                ${items.slice(0, 6).map((item) => `
-                  <div class="insights-list-item">
-                    <b>${html(topItemName(item, kind))}</b>
-                    <small>${html(topItemMetric(item))}</small>
-                  </div>`).join('')}
+            ${shown.length ? `
+              <div class="insights-console-list">
+                ${shown.map((item) => {
+                  const name = topItemName(item, kind);
+                  const weight = topItemWeight(item);
+                  /* 榜首恒为 100%，其余按比例；peak 为 0 时全部给最小可见宽度，
+                     否则一排空槽看起来像渲染失败。 */
+                  const ratio = peak > 0 ? Math.max(4, Math.round(weight / peak * 100)) : 4;
+                  return `
+                  <div class="insights-console-rank-item">
+                    <div class="insights-console-rank-info">
+                      ${topItemIconMarkup(item, kind)}
+                      <span class="insights-console-rank-name" data-dwrt-tooltip="${html(kind === 'application' && !activityIsRealApplication(item) ? `${name}\n${activityIdentityHint(item)}` : name)}">${html(name)}</span>
+                      ${kind === 'application' && !activityIsRealApplication(item) ? '<em class="insights-console-rank-unidentified">未识别</em>' : ''}
+                      <span class="insights-console-rank-metric">${html(topItemMetric(item))}</span>
+                    </div>
+                    <span class="insights-console-bar" aria-hidden="true"><i style="width:${ratio}%"></i></span>
+                  </div>`;
+                }).join('')}
               </div>` : `
               <div class="insights-empty insights-top-empty">
                 <span class="insights-empty-icon ${html(kind)}" aria-hidden="true">${emptyStateSvg(kind)}</span>
                 <strong>${html(empty)}</strong>
               </div>`}
           </div>
-        </article>`;
+        </div>`;
     }
 
+    /*
+     * 计数徽标的单位必须跟随**这一屏真正的维度**。目的地卡有两种形态：
+     * geo 可用时是地点榜（单位「地区」），geo 不可用时回退主机榜（单位「主机」）。
+     * 写死「地区」会在回退时把 `ports.debian13.com` 这类主机名说成地区。
+     */
+    function topCountLabel(count, kind) {
+      const unit = kind === 'destination'
+        ? (destinationTopItems().length ? '地区' : '主机')
+        : kind === 'client' ? '设备' : '应用';
+      return `${formatInteger(count)} ${unit}`;
+    }
+
+    /*
+     * 「热门应用」榜。`top_all_traffic_by_application` 里多数条目是 DPI 未命中的
+     * 协议/端口兜底（`https`、`dot`、`tcp:NNNN`），而它们字节数最大，必然排在前面
+     * ——30.1 实测 30 条里只有 6 条是真实应用，而前 5 名有 4 个不是应用。
+     * 直接平铺会让用户把 `https` 读成一个应用。
+     *
+     * 这里复用活动页的 `activityIsRealApplication()`（同一判据，不写第三份）：
+     * 真实应用优先排序，兜底条目降级到后面并如实标注，计数徽标给出识别口径。
+     * 覆盖率分母是全部条目、分子只算真实应用，与 APP 过滤页读数一致。
+     */
+    function applicationTopCard() {
+      const items = dedupeTopItems(topList(['top_all_traffic_by_application', 'top_applications', 'applications', 'apps']), 'application');
+      const applications = items.filter(activityIsRealApplication);
+      const services = items.filter((item) => !activityIsRealApplication(item));
+      // 真实应用排前面，兜底条目仍保留（隐藏会让用户以为流量消失了），只是降级。
+      const ordered = applications.concat(services);
+      // 计数徽标形如「7 应用 · 6 识别」：分母是全部条目，分子只算真实应用。
+      // 用户看到 6 < 7 就知道有条目没被识别，不必读文档。
+      const note = items.length ? `${formatInteger(applications.length)} 识别` : '';
+      return topCard('热门应用', '无受影响应用', ordered, 'application', note);
+    }
+
+    /*
+     * 地图上方是一条通栏控制台，四个模块共享同一张玻璃并用竖分割线分隔
+     * （用户给的 demo）。原来是四张各自加玻璃的卡片，等宽但高度各自为政
+     * （1440px 实测 190 / 190 / 174 / 174），且在两列断点下折成 2x2。
+     * 玻璃只加在外层容器一处，模块内部不再重复 `dwrt-glass-card`。
+     */
     function overviewMarkup() {
-      const destinationItems = geoDestinationItems();
       return `
-        <section class="insights-overview-row" aria-label="流量概览">
+        <section class="insights-overview-row insights-console dwrt-glass-card insights-stable-glass" aria-label="流量概览">
           ${summaryMarkup()}
-          ${topCard('热门目的地', '无目的地', destinationItems.length ? destinationItems : dedupeTopItems(topList(['top_all_count_by_destination', 'top_destinations', 'destinations']), 'destination'), 'destination')}
-          ${topCard('热门客户端', '无受影响客户端', dedupeTopItems(topList(['top_all_count_by_client', 'top_clients', 'clients']), 'client'), 'client')}
-          ${topCard('热门应用', '无受影响应用', dedupeTopItems(topList(['top_all_traffic_by_application', 'top_applications', 'applications', 'apps']), 'application'), 'application')}
+          ${topCard('热门目的地', '无目的地', destinationCardItems(), 'destination', destinationCardNote())}
+          ${topCard('热门客户端', '无受影响客户端', dedupeTopItems(topList(['top_all_count_by_client', 'clients']), 'client'), 'client')}
+          ${applicationTopCard()}
         </section>`;
     }
 
@@ -1233,6 +1841,7 @@
             ${mapRouteLayerMarkup(routes.slice(0, CYBER_ROUTE_LIMIT))}
             <div class="insights-map-point-layer">${points.slice(0, 32).map((point, index) => mapPointMarkup(point, index)).join('')}</div>
             ${state.mapScope === 'china' && !mapScopeSupported ? '<div class="insights-map-scope-empty">等待后端返回中国省市级地理流量</div>' : ''}
+            <div class="insights-map-status" data-insights-map-status role="status" aria-live="polite"${mapStatusText() ? '' : ' hidden'}>${html(mapStatusText())}</div>
             <div class="insights-map-controls" aria-label="地图控制">
               <button type="button" data-map-control="reset" title="重置视图">${targetSvg()}</button>
               <button type="button" data-map-control="zoom-in" title="放大">${zoomInSvg()}</button>
@@ -1271,6 +1880,58 @@
       return firstText(item.application_name, item.app_name, item.application, app.name, app.application, item.name, item.category, '--');
     }
 
+    /*
+     * 后端对每条用量都给了完整的识别标记，判据照抄插件页
+     * `plugins/native/app-filter.js` 的 `coverageFrom()`：三个标记同时成立才算
+     * 真实应用。DPI 特征库没命中时后端退化成「协议/端口」标识（`tcp/11881`、
+     * `https`、`dot`），这是如实兜底，不是应用名，因此不能和真实应用平铺在
+     * 同一个榜里。`identity_kind: "service"` 是后端给这类条目的分类。
+     */
+    function activityIsRealApplication(item) {
+      if (!item || typeof item !== 'object') return false;
+      return item.is_application === true
+        && item.app_identified === true
+        && item.application_name_is_fallback !== true;
+    }
+
+    /* 未识别原因是后端已返回但全仓库此前无人消费的字段。原样的
+       `no_dpi_signature_match_proto_port_used` 对用户没有意义，翻成人话放进
+       tooltip；出现未收录的取值时保留原文，不猜也不吞掉。 */
+    const ACTIVITY_IDENTITY_REASONS = {
+      no_dpi_signature_match_proto_port_used: '特征库未匹配，只能按协议/端口标识这段流量',
+      no_dpi_signature_match: '特征库未匹配到具体应用',
+      encrypted_no_sni: '流量加密且未暴露 SNI，无法归属到具体应用'
+    };
+
+    function activityIdentityHint(item) {
+      if (!item || typeof item !== 'object') return '';
+      const reason = firstText(item.identity_reason);
+      const source = firstText(item.identity_source);
+      const known = reason && ACTIVITY_IDENTITY_REASONS[reason];
+      const lines = ['未识别为具体应用'];
+      if (known) lines.push(known);
+      else if (reason) lines.push(`后端给出的原因：${reason}`);
+      if (source) lines.push(`标识来源：${source}`);
+      return lines.join('\n');
+    }
+
+    /* 把一份用量列表按识别结果分成两段，并给出覆盖率口径。分母是全部条目、
+       分子只算真实应用，与 app-filter.js 的覆盖率卡同一口径，两处读数才能对上。 */
+    function activityIdentityGroups() {
+      const rows = activityRows();
+      const applications = [];
+      const services = [];
+      rows.forEach((item) => (activityIsRealApplication(item) ? applications : services).push(item));
+      return {
+        rows,
+        applications,
+        services,
+        total: rows.length,
+        identified: applications.length,
+        percent: rows.length > 0 ? Math.round(applications.length / rows.length * 100) : 0
+      };
+    }
+
     function activityTopClient(item) {
       if (!item || typeof item !== 'object') return '--';
       const client = item.topClient || item.client || {};
@@ -1289,28 +1950,19 @@
     }
 
     function activityChartMarkup() {
-      const series = activityRateSeries();
-      const width = 1000;
-      const height = 310;
-      const pad = { left: 44, right: 16, top: 24, bottom: 36 };
-      const maxPoint = Math.max(0, ...series.map((item) => item.total || item.download || item.upload));
-      const max = maxPoint > 0 ? maxPoint : 500000;
-      const yTicks = [0.25, 0.5, 0.75, 1];
-      const x = (index) => pad.left + (series.length <= 1 ? 0 : index / (series.length - 1) * (width - pad.left - pad.right));
-      const y = (value) => pad.top + (1 - Math.min(1, Math.max(0, value / max))) * (height - pad.top - pad.bottom);
-      const line = (key) => series.map((item, index) => `${index ? 'L' : 'M'} ${x(index).toFixed(1)} ${y(item[key]).toFixed(1)}`).join(' ');
-      const labels = series.filter((_, index) => index === 0 || index === series.length - 1 || index % Math.max(1, Math.floor(series.length / 5)) === 0).slice(0, 7);
+      /* The chart was hand-drawn SVG scaled with preserveAspectRatio="none", so
+         the 1000x310 viewBox was stretched to whatever the card measured and every
+         glyph was scaled non-uniformly with it -- which is why the axis numbers
+         read as squashed/stretched rather than mis-sized. Text cannot be excluded
+         from a non-uniform viewBox scale, so there is no fix that keeps the raw
+         SVG. It renders through ECharts instead, matching the system health cards
+         (monitor/system-health), which also brings the hover tooltip the user
+         asked for. The container is empty markup on purpose: the chart is mounted
+         after layout so ECharts measures a real box. */
       return `
         <section class="insights-activity-chart dwrt-glass-card insights-stable-glass" aria-label="互联网活动趋势" data-insights-activity-card="chart">
           <div class="insights-card-content insights-activity-chart-content" data-insights-card-content>
-            <span class="activity-axis-unit">Mbps</span>
-            <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
-              ${yTicks.map((ratio) => `<path class="activity-grid-line" d="M ${pad.left} ${y(max * ratio).toFixed(1)} H ${width - pad.right}"/><text class="activity-y-label" x="${pad.left - 10}" y="${y(max * ratio).toFixed(1)}">${activityRateTick(max * ratio)}</text>`).join('')}
-              ${labels.map((item, idx) => `<text class="activity-x-label" x="${x(series.indexOf(item)).toFixed(1)}" y="${height - 10}" text-anchor="${idx === 0 ? 'start' : idx === labels.length - 1 ? 'end' : 'middle'}">${html(activityTimeLabel(item.timestamp))}</text>`).join('')}
-              <path class="activity-area-download" d="${line('download')} L ${x(series.length - 1).toFixed(1)} ${height - pad.bottom} L ${pad.left} ${height - pad.bottom} Z"/>
-              <path class="activity-line-download" d="${line('download')}"/>
-              <path class="activity-line-upload" d="${line('upload')}"/>
-            </svg>
+            <div class="insights-activity-chart-canvas" data-insights-activity-chart aria-hidden="true"></div>
           </div>
         </section>`;
     }
@@ -1322,6 +1974,138 @@
       return new Intl.DateTimeFormat('zh-CN', { hour: 'numeric', minute: '2-digit' }).format(date);
     }
 
+    /* Axis and tooltip styling is taken from systemHealthChartOption() in
+       menu-shell.js so the two pages read as one chart language: same axis
+       colours, same dashed split lines, same 45-degree x labels, same glass
+       tooltip. Values are bytes/sec on the wire and are shown as bit rates,
+       which is what the old "Mbps" caption claimed. */
+    function activityChartOption() {
+      const series = activityRateSeries();
+      const dark = document.documentElement.dataset.themeResolved === 'dark';
+      const axisColor = dark ? 'rgba(216,226,240,0.72)' : 'rgba(92,105,124,0.76)';
+      const splitColor = dark ? 'rgba(226,236,255,0.13)' : 'rgba(120,134,154,0.15)';
+      const tooltipBg = dark ? 'rgba(12, 18, 30, 0.88)' : 'rgba(255, 255, 255, 0.86)';
+      const tooltipBorder = dark ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.58)';
+      const rate = (bytesPerSecond) => formatRate(Math.max(0, Number(bytesPerSecond) || 0));
+      const line = (name, key, color) => ({
+        name,
+        type: 'line',
+        smooth: true,
+        symbol: series.length <= 2 ? 'circle' : 'none',
+        showSymbol: series.length <= 2,
+        symbolSize: 4,
+        lineStyle: { width: 1.45, color },
+        itemStyle: { color },
+        areaStyle: key === 'download' ? { color, opacity: 0.12 } : undefined,
+        data: series.map((item) => Math.max(0, Number(item[key]) || 0))
+      });
+      return {
+        animation: false,
+        color: ['#7d62ff', '#46c6ff'],
+        grid: { left: 64, right: 28, top: 18, bottom: 68 },
+        tooltip: {
+          trigger: 'axis',
+          confine: true,
+          appendToBody: true,
+          backgroundColor: tooltipBg,
+          borderColor: tooltipBorder,
+          borderWidth: 1,
+          textStyle: { color: dark ? 'rgba(248,251,255,0.94)' : 'rgba(24,31,42,0.92)', fontSize: 12 },
+          extraCssText: 'border-radius:10px;box-shadow:0 14px 34px rgba(0,0,0,.18);backdrop-filter:blur(12px) saturate(135%);-webkit-backdrop-filter:blur(12px) saturate(135%);',
+          formatter: (params) => {
+            const list = Array.isArray(params) ? params : [params];
+            if (!list.length) return '';
+            const head = html(String(list[0].axisValueLabel || list[0].axisValue || ''));
+            const rows = list.map((entry) => `<div style="display:flex;align-items:center;gap:8px"><span style="width:8px;height:8px;border-radius:50%;background:${entry.color}"></span><span style="flex:1 1 auto">${html(String(entry.seriesName))}</span><b>${html(rate(entry.value))}</b></div>`).join('');
+            return `<div style="display:grid;gap:4px;min-width:150px"><strong>${head}</strong>${rows}</div>`;
+          }
+        },
+        legend: {
+          show: true,
+          bottom: 0,
+          left: 'center',
+          icon: 'circle',
+          itemWidth: 8,
+          itemHeight: 8,
+          itemGap: 18,
+          textStyle: { color: axisColor, fontSize: 12, fontWeight: 500 }
+        },
+        xAxis: {
+          type: 'category',
+          boundaryGap: false,
+          data: series.map((item) => activityTimeLabel(item.timestamp)),
+          axisTick: { show: false },
+          axisLine: { lineStyle: { color: dark ? 'rgba(226,236,255,0.16)' : 'rgba(128,143,163,0.24)' } },
+          axisLabel: {
+            color: axisColor,
+            rotate: 45,
+            margin: 14,
+            fontSize: 12,
+            fontWeight: 520,
+            align: 'right',
+            verticalAlign: 'middle',
+            hideOverlap: true
+          }
+        },
+        yAxis: {
+          type: 'value',
+          min: 0,
+          splitLine: { lineStyle: { color: splitColor, type: 'dashed' } },
+          axisLabel: { color: axisColor, fontSize: 12, formatter: (value) => rate(value) }
+        },
+        series: [line('下载', 'download', '#7d62ff'), line('上传', 'upload', '#46c6ff')]
+      };
+    }
+
+    function disposeActivityChart(container) {
+      if (!container) return;
+      if (container.__dwrtActivityResizeObserver) {
+        try { container.__dwrtActivityResizeObserver.disconnect(); } catch (_) {}
+        container.__dwrtActivityResizeObserver = null;
+      }
+      if (container.__dwrtActivityChart) {
+        try { container.__dwrtActivityChart.dispose(); } catch (_) {}
+        container.__dwrtActivityChart = null;
+      }
+    }
+
+    /* Mounted after the markup is in the DOM: ECharts sizes itself from the
+       container, so initialising against a 0-height box paints nothing. A zero
+       box is retried on the next frame rather than failing silently. */
+    function renderActivityChart() {
+      if (!state.root || state.mode !== 'activity' || isAuditActivitySection() || !state.activityChartEnabled) return;
+      const container = state.root.querySelector('[data-insights-activity-chart]');
+      if (!container || !container.isConnected) return;
+      const rect = container.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) {
+        window.requestAnimationFrame(() => {
+          if (container.isConnected) renderActivityChart();
+        });
+        return;
+      }
+      loadECharts()
+        .then((echarts) => {
+          if (!state.root || state.mode !== 'activity' || !container.isConnected || !state.activityChartEnabled) return;
+          let chart = container.__dwrtActivityChart;
+          if (!chart) {
+            chart = echarts.init(container, null, { renderer: 'canvas' });
+            container.__dwrtActivityChart = chart;
+            if ('ResizeObserver' in window) {
+              container.__dwrtActivityResizeObserver = new ResizeObserver(() => {
+                if (!container.isConnected) return;
+                const box = container.getBoundingClientRect();
+                if (box.width < 2 || box.height < 2) return;
+                chart.resize();
+              });
+              container.__dwrtActivityResizeObserver.observe(container);
+            }
+          }
+          chart.setOption(activityChartOption(), true);
+          chart.resize();
+        })
+        .catch(() => {});
+    }
+
     function activityRateTick(bytesPerSecond) {
       const mbps = Math.max(0, Number(bytesPerSecond) || 0) * 8 / 1000000;
       if (mbps >= 10) return String(Math.round(mbps));
@@ -1329,49 +2113,94 @@
     }
 
     function activityTableMarkup() {
-      const rows = activityRows();
-      const total = Math.max(1, rows.reduce((sum, item) => sum + activityBytes(item), 0));
+      const groups = activityIdentityGroups();
+      const total = Math.max(1, groups.rows.reduce((sum, item) => sum + activityBytes(item), 0));
+      const row = (item) => {
+        const bytes = activityBytes(item);
+        const download = firstNumber(item.download, item.download_bytes, item.rx_bytes, item.rx_byte, item.topAppBytesReceived);
+        const upload = firstNumber(item.upload, item.upload_bytes, item.tx_bytes, item.tx_byte, item.topAppBytesTransmitted);
+        const pct = bytes > 0 ? Math.max(0.1, bytes / total * 100).toFixed(1) : '0.0';
+        const identified = activityIsRealApplication(item);
+        const hint = identified ? '' : activityIdentityHint(item);
+        const name = activityName(item);
+        /* 兜底条目的名字就是它的协议/端口标识，不改写成假的应用名；旁边挂一枚
+           「未识别」标记，并把后端给的原因放进 kit tooltip。 */
+        const nameCell = identified
+          ? `<span class="insights-activity-name">${html(name)}</span>`
+          : `<span class="insights-activity-name is-service"${hint ? ` data-dwrt-tooltip="${escapeAttr(hint)}" tabindex="0"` : ''}>`
+            + `<code>${html(name)}</code><em>未识别</em></span>`;
+        return `<tr class="${identified ? 'is-application' : 'is-service'}">
+          <td>${nameCell}</td>
+          <td>${html(formatBytes(bytes))} (${pct}%)</td>
+          <td class="traffic-down">${html(formatBytes(download))}</td>
+          <td class="traffic-up">${html(formatBytes(upload))}</td>
+          <td>${html(activityTopClient(item))}</td>
+          <td>${html(formatInteger(firstNumber(item.client_count, item.clients, item.clientCount, item.app_count, item.appCount)))}</td>
+        </tr>`;
+      };
+      const groupHead = (label, detail, count) => `
+        <tr class="insights-activity-group">
+          <th colspan="6" scope="colgroup">
+            <span class="insights-activity-group-label">${html(label)}</span>
+            <span class="insights-activity-group-count">${html(`${formatInteger(count)} 项`)}</span>
+            <span class="insights-activity-group-detail">${html(detail)}</span>
+          </th>
+        </tr>`;
+      const body = groups.rows.length
+        ? `${groups.applications.length ? `${groupHead('应用', 'DPI 特征库识别到具体应用', groups.applications.length)}${groups.applications.map(row).join('')}` : ''}`
+          + `${groups.services.length ? `${groupHead('未识别的协议 / 端口', '特征库未命中，只能按协议或端口标识，不代表某个应用', groups.services.length)}${groups.services.map(row).join('')}` : ''}`
+        : `
+          <tr>
+            <td colspan="6">
+              <div class="insights-activity-empty">
+                <span>${infoSvg()}</span>
+                <strong>此网络上没有流量。</strong>
+              </div>
+            </td>
+          </tr>`;
       return `
         <section class="insights-activity-table dwrt-glass-card insights-stable-glass" data-insights-activity-card="table">
-          <div class="insights-card-content insights-activity-table-scroll" data-insights-card-content>
-            <table>
-              <thead>
-                <tr>
-                  <th>应用程序</th>
-                  <th>总数据（流量 %）</th>
-                  <th>下载</th>
-                  <th>上传</th>
-                  <th>主要客户端</th>
-                  <th>客户端</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${rows.length ? rows.map((item) => {
-                  const bytes = activityBytes(item);
-                  const download = firstNumber(item.download, item.download_bytes, item.rx_bytes, item.rx_byte, item.topAppBytesReceived);
-                  const upload = firstNumber(item.upload, item.upload_bytes, item.tx_bytes, item.tx_byte, item.topAppBytesTransmitted);
-                  const pct = bytes > 0 ? Math.max(0.1, bytes / total * 100).toFixed(1) : '0.0';
-                  return `<tr>
-                    <td>${html(activityName(item))}</td>
-                    <td>${html(formatBytes(bytes))} (${pct}%)</td>
-                    <td class="traffic-down">${html(formatBytes(download))}</td>
-                    <td class="traffic-up">${html(formatBytes(upload))}</td>
-                    <td>${html(activityTopClient(item))}</td>
-                    <td>${html(formatInteger(firstNumber(item.client_count, item.clients, item.clientCount, item.app_count, item.appCount)))}</td>
-                  </tr>`;
-                }).join('') : `
+          <div class="insights-card-content insights-activity-table-content" data-insights-card-content>
+            ${activityCoverageMarkup(groups)}
+            <div class="insights-activity-table-scroll">
+              <table>
+                <thead>
                   <tr>
-                    <td colspan="6">
-                      <div class="insights-activity-empty">
-                        <span>${infoSvg()}</span>
-                        <strong>此网络上没有流量。</strong>
-                      </div>
-                    </td>
-                  </tr>`}
-              </tbody>
-            </table>
+                    <th>应用程序 / 协议</th>
+                    <th>总数据（流量 %）</th>
+                    <th>下载</th>
+                    <th>上传</th>
+                    <th>主要客户端</th>
+                    <th>客户端</th>
+                  </tr>
+                </thead>
+                <tbody>${body}</tbody>
+              </table>
+            </div>
           </div>
         </section>`;
+    }
+
+    /*
+     * 识别覆盖率如实呈现，口径与 APP 过滤页的覆盖率卡一致（分母为全部条目、
+     * 分子只算 `is_application`）。没有数据就不画这条，不用 0% 或 100% 假装
+     * 有结论。
+     */
+    function activityCoverageMarkup(groups) {
+      if (!groups.total) return '';
+      return `
+        <div class="insights-activity-coverage">
+          <div class="insights-activity-coverage-main">
+            <b>${html(`${groups.percent}%`)}</b>
+            <span>识别为应用</span>
+          </div>
+          <div class="insights-activity-coverage-split">
+            <span><i>${html(formatInteger(groups.identified))}</i>应用</span>
+            <span><i>${html(formatInteger(groups.services.length))}</i>仅协议/端口</span>
+            <span><i>${html(formatInteger(groups.total))}</i>条目合计</span>
+          </div>
+          <p>识别依赖 DPI 特征库。未命中的流量只能按协议或端口标识，它们不是应用。</p>
+        </div>`;
     }
 
     function flowCell(item, column) {
@@ -1629,7 +2458,121 @@
     }
 
     function auditMainCell(title, subtitle = '') {
-      return `<span class="insights-audit-main-cell"><strong>${html(title || '--')}</strong>${subtitle ? `<small>${html(subtitle)}</small>` : ''}</span>`;
+      /* Long values are truncated with an ellipsis and the full text is put on the
+         kit tooltip, so a URL or MAC+IP pair no longer runs into the next column.
+         The tooltip carries both lines because either one can be the clipped one. */
+      /* 副标题与主标题逐字相同时不渲染第二行：后端在 `category` / `type` 上经常给同一个
+         值（协议与应用页实测两列都是 `service`），重复一遍没有信息量，只是把行高撑高。 */
+      const mainText = firstText(title);
+      if (firstText(subtitle) === mainText) subtitle = '';
+      const full = [mainText, firstText(subtitle)].filter(Boolean).join('\n');
+      const tooltip = full ? ` data-dwrt-tooltip="${escapeAttr(full)}" tabindex="0"` : '';
+      return `<span class="insights-audit-main-cell"${tooltip}><strong>${html(title || '--')}</strong>${subtitle ? `<small>${html(subtitle)}</small>` : ''}</span>`;
+    }
+
+    /*
+     * `evidence` 只有在真的是证据（域名、命中规则）时才配当副标题。
+     *
+     * 后端目前把这一行的口径自述原样写进 `evidence`，取值与同行的 `semantic` 完全相同
+     * （30.1 实测 `/api/v1/audit/apps?limit=40` 四十行全部是
+     * `top_applications_from_audit_flow_event_lifecycle_bytes`）。那串东西说明的是这份
+     * 数据怎么聚合出来的，不是这一行的证据，每行还都一样，挂在应用名下面纯噪声。
+     *
+     * 判据用「与同行的口径字段逐字相等」，不用前缀黑名单：后端将来往 `evidence` 里写
+     * 真正的域名或命中规则时，等值判断不会误伤，而 `top_applications_from_` 这类前缀
+     * 匹配会把恰好同前缀的真实证据一起滤掉。
+     */
+    function auditEvidenceText(row) {
+      const evidence = firstText(row && row.evidence);
+      if (!evidence) return '';
+      const selfDescribing = [
+        row && row.semantic,
+        row && row.count_semantics,
+        row && row.ranking_basis,
+        row && row.accounting_source
+      ];
+      if (selfDescribing.some((value) => firstText(value) === evidence)) return '';
+      return evidence;
+    }
+
+    /*
+     * 审计各页的「这一行是不是真的识别出应用了」判据。活动页/概览卡用的
+     * `activityIsRealApplication()` 读 `is_application` / `app_identified`，但审计
+     * BFF（`/api/v1/audit/apps`、`/audit/protocols`、`/audit/urls`）的行上这两个布尔
+     * 并不总是存在——30.1 实测 `audit/protocols` 的行只有 `app_id` / `name_source` /
+     * `category` / `identity_kind`，`audit/urls` 走的是另一套 `app_unresolved` /
+     * `app_name_source`。所以这里按后端**实际给出的**标记逐层退让，不指定单一字段。
+     *
+     * 注意 `name_source` 的取值不是交接单里写的 `signature_app_id`：实测是
+     * `audit_flow.destination_app`（已识别）与 `audit_flow.service`（仅服务），
+     * URL 侧则是 `signature_host` / `signature_db` / `unresolved_app_id` /
+     * `audit_url_event`。按 `signature_app_id` 精确匹配会把所有行判成未识别。
+     */
+    function auditRowIsIdentifiedApp(row) {
+      if (!row || typeof row !== 'object') return false;
+      // 后端已经算好结论时直接采信，不再自行推断。
+      if (row.app_unresolved === true) return false;
+      if (row.application_name_is_fallback === true) return false;
+      if (row.is_application === true || row.app_identified === true) return true;
+      const kind = String(firstText(row.identity_kind)).toLowerCase();
+      if (kind) return kind === 'application';
+      // 其次看 app_id：> 0 表示命中了特征库里的具体应用。
+      const appId = firstNumber(row.app_id, row.appid, row.canonical_app_id);
+      if (appId > 0) return true;
+      const source = String(firstText(row.name_source, row.app_name_source)).toLowerCase();
+      if (/service|unresolved|audit_url_event/.test(source)) return false;
+      if (/app|signature/.test(source)) return true;
+      // 最后才看分类：后端在 app_id <= 0 时把 category 写成 service/network_service。
+      const category = String(firstText(row.category)).toLowerCase();
+      if (/^(service|network_service)$/.test(category)) return false;
+      return appId > 0;
+    }
+
+    /* 未识别行的说明文案。原始串（`no_dpi_signature_match_proto_port_used`、
+       `service_or_protocol_fallback_not_app_id`）对用户没有意义，翻成人话；
+       遇到未收录取值时保留原文，不猜也不吞掉。 */
+    const AUDIT_IDENTITY_REASONS = {
+      no_dpi_signature_match_proto_port_used: '特征库未匹配，只能按协议/端口标识这段流量',
+      no_dpi_signature_match_hostname_used: '特征库未匹配，只能按目的主机名标识这段流量',
+      no_dpi_signature_no_hostname: '特征库未匹配，且没有可用的主机名',
+      no_dpi_signature_match: '特征库未匹配到具体应用',
+      encrypted_no_sni: '流量加密且未暴露 SNI，无法归属到具体应用',
+      service_or_protocol_fallback_not_app_id: '这是协议/端口标识，不是应用名',
+      unresolved_app_id: '流量里带了应用编号，但特征库里查不到对应应用',
+      audit_url_event: '这条记录没有携带应用识别结果'
+    };
+
+    function auditIdentityHint(row) {
+      if (!row || typeof row !== 'object') return '';
+      const raw = firstText(row.identity_reason, row.application_identity_precision, row.app_name_source);
+      const known = raw && AUDIT_IDENTITY_REASONS[raw];
+      const lines = ['未识别为具体应用'];
+      if (known) lines.push(known);
+      else if (raw) lines.push(`后端给出的原因：${raw}`);
+      const label = firstText(row.service, row.app_proto, row.protocol, row.family);
+      if (label) lines.push(`实际标识：${label}`);
+      return lines.join('\n');
+    }
+
+    /*
+     * 应用列的渲染。识别出应用才把名字放在主位；否则主位写「未识别」，把后端给的
+     * 服务/端口标识降级到副标题，并把原因挂上 tooltip。这样信息一条都不丢，但
+     * `tcp/10195` 不再冒充应用名。
+     *
+     * 后端在 `app_id <= 0` 时既可能给服务标识（`dw_audit_apply_app_identity`），也
+     * 可能留空（URL 审计的 `unresolved_app_id` 分支把 `app_name` 清成 `""`），两种
+     * 都要能渲染，所以标识为空时只显示「未识别」而不留一个空副标题。
+     */
+    function auditAppCell(row, name) {
+      const text = firstText(name, row && row.app, row && row.app_name, row && row.application);
+      if (auditRowIsIdentifiedApp(row)) return auditMainCell(text || '--', '');
+      const fallback = firstText(text, row && row.service, row && row.app_proto, row && row.protocol);
+      const hint = auditIdentityHint(row);
+      const tooltip = hint ? ` data-dwrt-tooltip="${escapeAttr(hint)}" tabindex="0"` : '';
+      return `<span class="insights-audit-main-cell is-unidentified"${tooltip}>`
+        + `<strong>未识别</strong>`
+        + (fallback ? `<small>${html(fallback)}</small>` : '')
+        + `</span>`;
     }
 
     function auditMetric(label, value, hint = '') {
@@ -1791,11 +2734,28 @@
         app: firstText(row.app, row.application, row.app_name),
         category: firstText(row.category, row.type, row.class),
         action: firstText(row.action, row.verdict, row.policy_action),
+        /* 识别标记必须原样带下来，否则下游只剩一个 `app` 字符串，无法区分
+           「应用名」和「协议/端口兜底标识」。URL 审计路径给的是
+           `app_name_source` + `app_unresolved`（`jmx_dreamingwrt_api.c` 的
+           audit_urls 分支），app/protocol 路径给的是 `name_source` /
+           `identity_kind` / `app_id`，两套都收。 */
+        app_id: firstNumber(row.app_id, row.appid, row.canonical_app_id),
+        app_unresolved: row.app_unresolved === true,
+        app_name_source: firstText(row.app_name_source),
+        name_source: firstText(row.name_source),
+        identity_kind: firstText(row.identity_kind),
+        identity_reason: firstText(row.identity_reason),
+        is_application: row.is_application === true,
+        app_identified: row.app_identified === true,
+        application_name_is_fallback: row.application_name_is_fallback === true,
+        service: firstText(row.service),
+        app_proto: firstText(row.app_proto),
+        protocol: firstText(row.protocol),
         hits: firstNumber(row.hits, row.count, row.requests, 1),
         up_bytes: firstNumber(row.up_bytes, row.tx_bytes, row.upload_bytes),
         down_bytes: firstNumber(row.down_bytes, row.rx_bytes, row.download_bytes),
         wan: firstText(row.wan, row.ifname, row.interface),
-        evidence: firstText(row.evidence, row.reason, row.rule, row.source),
+        evidence: firstText(auditEvidenceText(row), row.reason, row.rule, row.source),
         method: firstText(row.method),
         status: firstText(row.status, row.status_code)
       }));
@@ -1811,6 +2771,19 @@
         host: firstText(row.host, row.domain, row.name),
         app: firstText(row.app, row.application, row.app_name),
         category: firstText(row.category, row.type),
+        /* 与记录视图同一套识别标记，聚合时一并带过来（见 deriveUrlDomains）。 */
+        app_id: firstNumber(row.app_id, row.appid, row.canonical_app_id),
+        app_unresolved: row.app_unresolved === true,
+        app_name_source: firstText(row.app_name_source),
+        name_source: firstText(row.name_source),
+        identity_kind: firstText(row.identity_kind),
+        identity_reason: firstText(row.identity_reason),
+        is_application: row.is_application === true,
+        app_identified: row.app_identified === true,
+        application_name_is_fallback: row.application_name_is_fallback === true,
+        service: firstText(row.service),
+        app_proto: firstText(row.app_proto),
+        protocol: firstText(row.protocol),
         clients: firstNumber(row.clients, row.client_count, row.devices),
         hits: firstNumber(row.hits, row.count, row.requests),
         up_bytes: firstNumber(row.up_bytes, row.tx_bytes, row.upload_bytes),
@@ -1825,14 +2798,35 @@
       const map = new Map();
       records.forEach((row) => {
         const host = row.host || row.url || '--';
-        const current = map.get(host) || { host, app: row.app, category: row.category, clientsSet: new Set(), hits: 0, up_bytes: 0, down_bytes: 0, first_seen: row.ts, last_seen: row.ts, action: row.action };
+        /* 聚合时把识别标记跟着第一条带过来。只留 `app` 字符串的话，域名视图会把
+           `tcp/10195` 这类兜底标识当应用名显示在副标题里。 */
+        const identity = {
+          app_id: row.app_id,
+          app_unresolved: row.app_unresolved,
+          app_name_source: row.app_name_source,
+          name_source: row.name_source,
+          identity_kind: row.identity_kind,
+          identity_reason: row.identity_reason,
+          is_application: row.is_application,
+          app_identified: row.app_identified,
+          application_name_is_fallback: row.application_name_is_fallback,
+          service: row.service,
+          app_proto: row.app_proto,
+          protocol: row.protocol
+        };
+        const current = map.get(host) || { host, app: row.app, category: row.category, ...identity, clientsSet: new Set(), hits: 0, up_bytes: 0, down_bytes: 0, first_seen: row.ts, last_seen: row.ts, action: row.action };
         if (row.mac || row.ip || row.client) current.clientsSet.add(row.mac || row.ip || row.client);
         current.hits += firstNumber(row.hits, 1);
         current.up_bytes += firstNumber(row.up_bytes);
         current.down_bytes += firstNumber(row.down_bytes);
         current.first_seen = Math.min(auditTimestamp(current.first_seen) || auditTimestamp(row.ts), auditTimestamp(row.ts) || auditTimestamp(current.first_seen));
         current.last_seen = Math.max(auditTimestamp(current.last_seen), auditTimestamp(row.ts));
-        if (!current.app) current.app = row.app;
+        /* 之前没有应用名、而这一条识别出了应用：整组识别标记一起换过来，
+           否则会出现「有应用名但标记仍说未识别」的自相矛盾状态。 */
+        if (!current.app && row.app) {
+          current.app = row.app;
+          Object.assign(current, identity);
+        }
         if (!current.category) current.category = row.category;
         map.set(host, current);
       });
@@ -1859,7 +2853,9 @@
       }
       if (section === 'protocol-app') {
         if (query.category) output = output.filter((row) => row.category === query.category || String(row.type || '').startsWith(query.category));
-        if (query.unknownFirst) output = output.slice().sort((a, b) => (/未知|unknown/i.test(`${b.name} ${b.type}`) ? 1 : 0) - (/未知|unknown/i.test(`${a.name} ${a.type}`) ? 1 : 0));
+        /* 「未知优先」与统计徽标必须用同一判据，否则按了按钮却什么都不动
+           （文本匹配对 `tcp/8889` 恒为 false，实测 20 条协议行排序前后完全一致）。 */
+        if (query.unknownFirst) output = output.slice().sort((a, b) => (auditEntityIsUnknown(b) ? 1 : 0) - (auditEntityIsUnknown(a) ? 1 : 0));
       }
       return output;
     }
@@ -1895,7 +2891,9 @@
       const blocked = records.filter((row) => auditTone(row.action) === 'bad' || auditTone(row.action) === 'warn').length;
       const uniqueHosts = new Set(records.map((row) => row.host).filter(Boolean)).size || domains.length;
       const columns = query.view === 'domains' ? [
-        { label: '域名', sort: 'host', render: (row) => auditMainCell(row.host, row.app || row.category || '') },
+        /* 副标题原来是 `row.app || row.category`，未识别时会把 `tcp/10195` 挂在域名
+           下面当应用名。识别出应用才写应用名，否则退回分类。 */
+        { label: '域名', sort: 'host', render: (row) => auditMainCell(row.host, (auditRowIsIdentifiedApp(row) && row.app) || row.category || '') },
         { label: '分类', sort: 'category', render: (row) => html(row.category || '--') },
         { label: '终端', sort: 'clients', className: 'num', render: (row) => html(formatInteger(row.clients)) },
         { label: '次数', sort: 'hits', className: 'num', render: (row) => html(formatInteger(row.hits)) },
@@ -1906,7 +2904,7 @@
         { label: '时间', sort: 'ts', render: (row) => html(auditTime(row.ts)) },
         { label: '终端', sort: 'client', render: (row) => auditMainCell(row.client || row.ip || '--', [row.ip, row.mac, row.account].filter(Boolean).join(' · ')) },
         { label: '域名 / URL', sort: 'host', render: (row) => auditMainCell(row.host || '--', row.path || row.url || '') },
-        { label: '应用', sort: 'app', render: (row) => html(row.app || '--') },
+        { label: '应用', sort: 'app', render: (row) => auditAppCell(row, row.app) },
         { label: '分类', sort: 'category', render: (row) => html(row.category || '--') },
         { label: '动作', sort: 'action', render: (row) => `<span class="insights-audit-pill ${auditTone(row.action)}">${html(auditActionLabel(row.action))}</span>` },
         { label: '次数', sort: 'hits', className: 'num', render: (row) => html(formatInteger(row.hits)) },
@@ -1914,10 +2912,10 @@
         { label: '证据', render: (row) => html(firstText(row.evidence, row.wan, row.method, row.status, '--')) }
       ];
       const stats = [
-        { label: 'URL 记录', value: formatInteger(records.length) },
-        { label: '独立域名', value: formatInteger(uniqueHosts) },
-        { label: '阻断/关注', value: formatInteger(blocked), tone: blocked ? 'warn' : '' },
-        { label: '关联流量', value: formatBytes(totalBytes) }
+        { label: 'URL 记录', value: formatInteger(records.length), icon: auditStatIcon('count') },
+        { label: '独立域名', value: formatInteger(uniqueHosts), icon: auditStatIcon('protocol') },
+        { label: '阻断/关注', value: formatInteger(blocked), tone: blocked ? 'warn' : '', icon: auditStatIcon('offline') },
+        { label: '关联流量', value: formatBytes(totalBytes), icon: auditStatIcon('traffic') }
       ];
       return auditWorkbenchMarkup(section, `
         ${auditOverviewCards(stats)}
@@ -1970,10 +2968,10 @@
         { label: '来源 / 原因', render: (row) => auditMainCell(row.source || '--', row.reason || row.connection || '') }
       ];
       const stats = [
-        { label: '事件数', value: formatInteger(rows.length) },
-        { label: '上线/续期', value: formatInteger(online), tone: online ? 'good' : '' },
-        { label: '离线', value: formatInteger(offline), tone: offline ? 'bad' : '' },
-        { label: '漫游', value: formatInteger(roam), tone: roam ? 'warn' : '' }
+        { label: '事件数', value: formatInteger(rows.length), icon: auditStatIcon('count') },
+        { label: '上线/续期', value: formatInteger(online), tone: online ? 'good' : '', icon: auditStatIcon('online') },
+        { label: '离线', value: formatInteger(offline), tone: offline ? 'bad' : '', icon: auditStatIcon('offline') },
+        { label: '漫游', value: formatInteger(roam), tone: roam ? 'warn' : '', icon: auditStatIcon('roam') }
       ];
       return auditWorkbenchMarkup(section, `
         ${auditOverviewCards(stats)}
@@ -1999,7 +2997,7 @@
         heartbeat_count: firstNumber(row.heartbeat_count, row.heartbeats, row.count),
         duration: firstNumber(row.duration, row.online_duration),
         last_domain: firstText(row.last_domain, row.domain, row.host),
-        evidence: firstText(row.evidence, row.reason, row.rule),
+        evidence: firstText(auditEvidenceText(row), row.reason, row.rule),
         risk: firstText(row.risk, row.severity)
       }));
       return auditClientFilterRows(rows, ['client', 'app', 'account', 'state', 'ip', 'mac', 'device_type', 'os', 'last_domain', 'evidence']);
@@ -2018,7 +3016,7 @@
       const accounts = new Set(rows.map((row) => `${row.app}:${row.account || row.client}`).filter(Boolean)).size;
       const columns = [
         { label: '最近在线', sort: 'ts', render: (row) => html(auditTime(row.ts)) },
-        { label: '应用', sort: 'app', render: (row) => auditMainCell(row.app || '--', row.last_domain || row.evidence || '') },
+        { label: '应用', sort: 'app', render: (row) => auditMainCell(row.app || '--', firstText(row.last_domain) || auditEvidenceText(row) || '') },
         { label: '账号 / 状态', sort: 'account', render: (row) => auditMainCell(row.account || '--', `<span>${row.state || '--'}</span>`.replace(/<[^>]+>/g, '')) },
         { label: '终端', sort: 'client', render: (row) => auditMainCell(row.client || '--', [row.device_type, row.os].filter(Boolean).join(' / ')) },
         { label: 'IP / MAC', sort: 'ip', render: (row) => auditMainCell(row.ip || '--', row.mac || '') },
@@ -2027,10 +3025,10 @@
         { label: '置信度', sort: 'confidence', className: 'num', render: (row) => html(row.confidence ? auditPercent(row.confidence, 0) : '--') }
       ];
       const stats = [
-        { label: '记录数', value: formatInteger(rows.length) },
-        { label: '在线状态', value: formatInteger(online), tone: online ? 'good' : '' },
-        { label: '后台/离开', value: formatInteger(away), tone: away ? 'warn' : '' },
-        { label: '账号数', value: formatInteger(accounts) }
+        { label: '记录数', value: formatInteger(rows.length), icon: auditStatIcon('count') },
+        { label: '在线状态', value: formatInteger(online), tone: online ? 'good' : '', icon: auditStatIcon('presence') },
+        { label: '后台/离开', value: formatInteger(away), tone: away ? 'warn' : '', icon: auditStatIcon('away') },
+        { label: '账号数', value: formatInteger(accounts), icon: auditStatIcon('accounts') }
       ];
       return auditWorkbenchMarkup(section, `
         ${auditOverviewCards(stats)}
@@ -2049,12 +3047,31 @@
           type,
           category: firstText(row.category, parts[0], type),
           subcategory: firstText(row.subcategory, parts.slice(1).join('/')),
+          /* 识别标记原样带下来。30.1 实测 `audit/protocols` 的行带
+             `app_id: 0` / `name_source: "audit_flow.service"` /
+             `identity_kind: "service"`，`audit/apps` 的行还额外带
+             `app_unresolved` 与 `application_identity_precision`。 */
+          app_id: firstNumber(row.app_id, row.appid, row.canonical_app_id),
+          app_unresolved: row.app_unresolved === true,
+          name_source: firstText(row.name_source),
+          identity_kind: firstText(row.identity_kind),
+          identity_reason: firstText(row.identity_reason),
+          application_identity_precision: firstText(row.application_identity_precision),
+          is_application: row.is_application === true,
+          app_identified: row.app_identified === true,
+          application_name_is_fallback: row.application_name_is_fallback === true,
+          service: firstText(row.service),
+          app_proto: firstText(row.app_proto),
+          protocol: firstText(row.protocol),
+          family: firstText(row.family),
           connections: firstNumber(row.connections, row.conn_count, row.connection_count),
           up_rate: firstNumber(row.up_rate, row.tx_rate, row.rate_up),
           down_rate: firstNumber(row.down_rate, row.rx_rate, row.rate_down),
           bytes: firstNumber(row.bytes, row.total_bytes, row.traffic_bytes),
           clients: firstNumber(row.clients, row.client_count, row.devices),
-          evidence: firstText(row.evidence, row.domain, row.host, row.rule),
+          /* 在归一化处就把口径自述滤掉：归一化后的行不再带 `semantic`，
+             等值判据只有在这里（还看得到原始行）才成立。 */
+          evidence: firstText(auditEvidenceText(row), row.domain, row.host, row.rule),
           wan: firstText(row.wan, row.ifname, row.interface),
           last_seen: firstNumber(row.last_seen, row.ts, row.time),
           confidence: firstNumber(row.confidence, row.score),
@@ -2063,6 +3080,33 @@
         };
       });
       return auditClientFilterRows(rows, ['name', 'type', 'category', 'subcategory', 'evidence', 'domains', 'ports', 'wan']);
+    }
+
+    /*
+     * 「未知项」的判据。原来是 `/未知|unknown/i.test(row.name + row.type)` 的文本匹配，
+     * 这个口径不成立：30.1 实测 20 条协议行里没有一条名字含「未知」，而其中 18 条是
+     * `tcp/8889` 这类纯端口兜底 —— 恰恰全是未识别项，却一条都统计不到，「未知项 0」
+     * 因此毫无意义。
+     *
+     * 两个 Tab 的口径必须分开，否则会反向做错：
+     * - 「应用」页的行若 `identity_kind !== "application"`，那它就是未识别（实测 40 条
+     *   里 26 条如此），这是这份交接单要修的主症状。
+     * - 「协议」页的行**全部**是 `identity_kind: "service"`，因为那一栏展示的本来就是
+     *   协议/服务。把它们一律算成未知会让「未知项」等于总数，同样读不出信息。这里只把
+     *   连协议都没识别出来的算未知：裸 `tcp/12345` 端口标识，或后端明说 `unknown`。
+     */
+    function auditEntityIsUnknown(row) {
+      if (!row || typeof row !== 'object') return false;
+      const kind = String(firstText(row.identity_kind)).toLowerCase();
+      if (kind === 'unknown') return true;
+      if (row.kind === 'apps') return !auditRowIsIdentifiedApp(row);
+      const name = String(firstText(row.name, row.service, row.app_proto));
+      if (/^(tcp|udp|sctp)[:/]\d+$/i.test(name)) return true;
+      if (!name) return true;
+      /* 不回退到文本匹配。后端已经用 `identity_kind` 明确表过态，而名字里是否含
+         「未知」二字与它是否被识别无关：实测 20 条协议行没有一条含这两个字。
+         剩下的情况（有名字、非裸端口、后端未说 unknown）按已识别处理。 */
+      return /^unknown$/i.test(name);
     }
 
     function protocolAppMarkup() {
@@ -2078,9 +3122,18 @@
         <button class="insights-audit-link ${query.unknownFirst ? 'is-active' : ''}" data-audit-unknown type="button">未知优先</button>`;
       const totalBytes = rows.reduce((sum, row) => sum + row.bytes, 0);
       const totalConnections = rows.reduce((sum, row) => sum + row.connections, 0);
-      const unknown = rows.filter((row) => /未知|unknown/i.test(`${row.name} ${row.type}`)).length;
+      const unknown = rows.filter(auditEntityIsUnknown).length;
       const columns = [
-        { label: '名称', sort: 'name', render: (row) => auditMainCell(row.name || '--', row.evidence || row.domains || '') },
+        /* 「应用」页的名称列必须区分应用名与协议/端口兜底标识：后端在
+           `app_id <= 0` 时把 `tcp/10195` 写进 `app_name`，直接渲染就等于把端口号
+           冒充成应用。「协议」页展示的本来就是协议名，照原样显示。 */
+        {
+          label: '名称',
+          sort: 'name',
+          render: (row) => (query.view === 'apps' && !auditRowIsIdentifiedApp(row)
+            ? auditAppCell(row, row.name)
+            : auditMainCell(row.name || '--', auditEvidenceText(row) || firstText(row.domains) || ''))
+        },
         { label: '分类', sort: 'category', render: (row) => auditMainCell(row.category || '--', row.subcategory || row.type || '') },
         { label: '连接数', sort: 'connections', className: 'num', render: (row) => html(formatInteger(row.connections)) },
         { label: '上行速率', sort: 'up_rate', className: 'num traffic-up', render: (row) => html(formatRate(row.up_rate)) },
@@ -2091,10 +3144,10 @@
       ];
       const title = query.view === 'apps' ? '应用审计' : '协议审计';
       const stats = [
-        { label: query.view === 'apps' ? '应用数' : '协议数', value: formatInteger(rows.length) },
-        { label: '连接数', value: formatInteger(totalConnections) },
-        { label: '累计流量', value: formatBytes(totalBytes) },
-        { label: '未知项', value: formatInteger(unknown), tone: unknown ? 'warn' : '' }
+        { label: query.view === 'apps' ? '应用数' : '协议数', value: formatInteger(rows.length), icon: auditStatIcon('protocol') },
+        { label: '连接数', value: formatInteger(totalConnections), icon: auditStatIcon('connections') },
+        { label: '累计流量', value: formatBytes(totalBytes), icon: auditStatIcon('traffic') },
+        { label: '未知项', value: formatInteger(unknown), tone: unknown ? 'warn' : '', icon: auditStatIcon('unknown') }
       ];
       return auditWorkbenchMarkup(section, `
         ${auditOverviewCards(stats)}
@@ -2113,10 +3166,10 @@
         { label: '值', render: (row) => `<span class="insights-audit-pill ${row.value === true ? 'good' : row.value === false ? 'bad' : 'neutral'}">${html(String(row.value))}</span>` }
       ];
       const stats = [
-        { label: '状态', value: status.enabled === false ? '未启用' : status.enabled === true ? '正在记录' : firstText(status.status, '--'), tone: status.enabled === false ? 'bad' : status.enabled === true ? 'good' : '' },
-        { label: '保留', value: `${firstText(status.retention_days, status.retention, '--')} 天` },
-        { label: '库体积', value: formatBytes(firstNumber(status.db_size_bytes, status.db_bytes)) },
-        { label: '丢弃事件', value: formatInteger(firstNumber(status.dropped_events, status.dropped)), tone: firstNumber(status.dropped_events, status.dropped) ? 'warn' : '' }
+        { label: '状态', value: status.enabled === false ? '未启用' : status.enabled === true ? '正在记录' : firstText(status.status, '--'), tone: status.enabled === false ? 'bad' : status.enabled === true ? 'good' : '', icon: auditStatIcon('status') },
+        { label: '保留', value: `${firstText(status.retention_days, status.retention, '--')} 天`, icon: auditStatIcon('retention') },
+        { label: '库体积', value: formatBytes(firstNumber(status.db_size_bytes, status.db_bytes)), icon: auditStatIcon('dbSize') },
+        { label: '丢弃事件', value: formatInteger(firstNumber(status.dropped_events, status.dropped)), tone: firstNumber(status.dropped_events, status.dropped) ? 'warn' : '', icon: auditStatIcon('dropped') }
       ];
       return auditWorkbenchMarkup(section, `
         ${auditOverviewCards(stats)}
@@ -2155,8 +3208,8 @@
         if (isAuditActivitySection()) return activityAuditMarkup();
         return `
           <main class="insights-main insights-main-activity" aria-label="活动内容">
-            <div class="insights-activity-board">
-              ${activityChartMarkup()}
+            <div class="insights-activity-board ${state.activityChartEnabled ? '' : 'is-chart-hidden'}">
+              ${state.activityChartEnabled ? activityChartMarkup() : ''}
               ${activityTableMarkup()}
             </div>
           </main>`;
@@ -2208,6 +3261,7 @@
       bindDom(preservedInput);
       restoreUiScrollState(scrollState);
       scheduleMapRender();
+      renderActivityChart();
     }
 
     function renderWithoutDisposingMaps() {
@@ -2229,11 +3283,13 @@
       bindDom(preservedInput);
       restoreUiScrollState(scrollState);
       scheduleMapRender();
+      renderActivityChart();
     }
 
     function disposeRenderedMaps(root) {
       if (!root) return;
       root.querySelectorAll('[data-insights-echarts-map]').forEach((container) => disposeCyberMap(container));
+      root.querySelectorAll('[data-insights-activity-chart]').forEach((container) => disposeActivityChart(container));
     }
 
     function replaceElementMarkup(target, markup) {
@@ -2253,6 +3309,17 @@
       const next = selector ? template.content.querySelector(selector) : template.content.firstElementChild;
       if (!next) return false;
       target.replaceChildren(...Array.from(next.childNodes));
+      /*
+       * 增量刷新换掉的是从 <template> 搬来的裸节点，没有经过 mountUiKit()，
+       * 所以 kit 的 tooltip / lucide 图标只在首帧活着，被第一次推送覆盖后就永久失效
+       * （实测 `.insights-console-rank-name` 的 `dwrt-kit-tooltip-trigger` 为 false，
+       * 悬浮弹不出玻璃 tooltip，而 design.md 洞察控制台第 7 条明文要求榜单名挂
+       * tooltip 给全貌）。这里对刚替换进来的子树补挂一次。
+       *
+       * 重复调用是安全的：kit 的 mountTooltip() 以 tooltipState（WeakMap）去重，
+       * 不会叠加监听；被替换掉的旧节点已从文档移除，WeakMap 会随节点一起回收。
+       */
+      mountUiKit?.(target);
       return true;
     }
 
@@ -2282,6 +3349,9 @@
           layer.innerHTML = state.mapEnabled ? points.slice(0, limit).map((point, index) => mapPointMarkup(point, index)).join('') : '';
         }
       });
+      /* render() rebuilds the shell from markup, so the pending/failed classes
+         have to be re-applied rather than assumed to have survived. */
+      updateMapStatusDom();
     }
 
     function updateFlowsRealtimeDom() {
@@ -2322,7 +3392,14 @@
       const tableScroll = table?.querySelector('.insights-activity-table-scroll');
       const scrollTop = tableScroll?.scrollTop || 0;
       const scrollLeft = tableScroll?.scrollLeft || 0;
-      const chartUpdated = patchStableCard(chart, activityChartMarkup(), '[data-insights-activity-card="chart"]');
+      /* The chart is a live ECharts instance, so it is updated in place with a new
+         option rather than having its markup replaced -- patching the container
+         would throw away the canvas and the tooltip state on every push. */
+      let chartUpdated = false;
+      if (state.activityChartEnabled && chart) {
+        renderActivityChart();
+        chartUpdated = true;
+      }
       const tableUpdated = patchStableCard(table, activityTableMarkup(), '[data-insights-activity-card="table"]');
       const nextTableScroll = table?.querySelector('.insights-activity-table-scroll');
       if (nextTableScroll) {
@@ -2414,19 +3491,34 @@
         state.activityStatMetric = button.dataset.activityStatMetric || 'total';
         render();
       }));
+      root.querySelector('[data-activity-chart-toggle]')?.addEventListener('change', (event) => {
+        state.activityChartEnabled = Boolean(event.target.checked);
+        render();
+      });
       root.querySelector('[data-map-toggle]')?.addEventListener('change', (event) => {
         state.mapEnabled = Boolean(event.target.checked);
-        state.geo = state.mapEnabled ? state.geo : null;
+        // Re-enabling the map reuses the cached snapshot for this scope so it
+        // paints immediately instead of waiting on the fetch.
+        state.geo = state.mapEnabled ? (state.geo || state.geoByScope[state.mapScope] || null) : null;
+        // Hiding the map must not leave a stale failure notice behind for the
+        // next time it is opened.
+        if (!state.mapEnabled) { state.mapFetch = 'idle'; state.mapFetchError = ''; }
         subscribeInsightsRealtime();
         render();
-        if (state.mapEnabled) refresh();
+        if (state.mapEnabled) refreshMapOnly();
       });
       root.querySelectorAll('[data-map-scope]').forEach((button) => button.addEventListener('click', () => {
         const next = button.dataset.mapScope === 'china' ? 'china' : 'world';
         if (next === state.mapScope) return;
         state.mapScope = next;
-        state.geo = null;
-        refresh();
+        /* Switching scope used to drop state.geo and run the full refresh, so a
+           map-only change waited on insights_summary and network_wans. The
+           highlight is painted first from cache, then only the geo endpoint is
+           re-fetched. */
+        state.geo = state.geoByScope[next] || null;
+        render();
+        scheduleMapRender();
+        refreshMapOnly();
       }));
       root.querySelectorAll('[data-map-control]').forEach((button) => button.addEventListener('click', () => {
         const container = state.root && state.root.querySelector('[data-map-role="main"]');
@@ -2621,7 +3713,27 @@
 
     function scheduleMapRender() {
       if (state.mode !== 'flows' || !state.root) return;
-      window.requestAnimationFrame(() => renderVectorMap());
+      /* Realtime pushes arrive as often as every 250ms while the update animation
+         runs 420ms, so a bare rAF per message stacked several unfinished
+         animations of the same arc on screen: the arcs read as duplicated copies
+         fanning out. Renders are coalesced to one per frame, and pushes are
+         additionally throttled so an animation can finish before the next one
+         starts. The trailing call is always kept, so the final state still lands. */
+      if (mapRender.frame) return;
+      const wait = Math.max(0, MAP_RENDER_MIN_INTERVAL - (Date.now() - mapRender.lastAt));
+      if (wait > 0) {
+        if (mapRender.timer) return;
+        mapRender.timer = window.setTimeout(() => {
+          mapRender.timer = 0;
+          scheduleMapRender();
+        }, wait);
+        return;
+      }
+      mapRender.frame = window.requestAnimationFrame(() => {
+        mapRender.frame = 0;
+        mapRender.lastAt = Date.now();
+        renderVectorMap();
+      });
     }
 
     function renderVectorMap() {
@@ -2737,7 +3849,19 @@
           container.__dwrtCyberKey = nextKey;
           const mapView = storedCyberMapView(scope, role);
           container.__dwrtCyberZoom = mapView.zoom;
-          chart.setOption(cyberMapOption(mapName, scope, role, mapView), replace ? true : { notMerge: false, lazyUpdate: true });
+          /* Most pushes do not change the map topology. Re-running setOption for
+             them replays the entrance animation for no reason, which is what made
+             the arcs bloom, so an unchanged signature skips the update entirely. */
+          const option = cyberMapOption(mapName, scope, role, mapView, { animateEntrance: replace });
+          const signature = cyberMapSignature(scope, role, option);
+          if (!replace && container.__dwrtCyberSignature === signature) {
+            shell?.classList.remove('is-map-loading');
+            shell?.classList.add('has-vector-map', 'has-local-cyber-map');
+            if (fallback) fallback.hidden = true;
+            return;
+          }
+          container.__dwrtCyberSignature = signature;
+          chart.setOption(option, replace ? true : { notMerge: false, lazyUpdate: true });
           const currentRect = container.getBoundingClientRect();
           if (currentRect.width >= 2 && currentRect.height >= 2) chart.resize();
           shell?.classList.remove('is-map-loading');
@@ -2821,7 +3945,25 @@
       chart.setOption({ geo: { zoom: next } });
     }
 
-    function cyberMapOption(mapName, scope, role, mapView) {
+    /* Signature over what the map actually draws: arc endpoints, direction and
+       weight, plus the point set. Animation flags and the stored view are left
+       out on purpose, so panning does not count as a data change. */
+    function cyberMapSignature(scope, role, option) {
+      const series = Array.isArray(option.series) ? option.series : [];
+      const parts = series.map((entry) => {
+        const data = Array.isArray(entry.data) ? entry.data : [];
+        return `${entry.name || ''}:${data.map((item) => {
+          const coords = Array.isArray(item.coords)
+            ? item.coords.map((pair) => (Array.isArray(pair) ? pair.map((value) => Number(value).toFixed(2)).join(',') : '')).join('>')
+            : Array.isArray(item.value) ? item.value.slice(0, 2).map((value) => Number(value).toFixed(2)).join(',') : '';
+          const weight = Array.isArray(item.value) ? item.value[2] : item.value;
+          return `${item.name || ''}@${coords}#${Number(weight) || 0}`;
+        }).join('|')}`;
+      });
+      return `${scope}|${role}|${parts.join(';')}`;
+    }
+
+    function cyberMapOption(mapName, scope, role, mapView, options = {}) {
       const routes = cyberMapRoutes(role);
       const points = cyberMapPoints(routes);
       const maxPoint = Math.max(1, ...points.map((point) => point.metric));
@@ -2830,11 +3972,15 @@
       const localPoints = points.filter((point) => point.local);
       const remotePoints = points.filter((point) => !point.local);
       const routeData = routes.map((route, index) => cyberRouteSeriesItem(route, index, maxRoute));
+      /* The 620ms entrance is for first paint and scope switches. On a realtime
+         update it must not replay, or a redraw arriving before the previous
+         animation ends leaves both on screen at once. */
+      const animateEntrance = options.animateEntrance !== false;
       return {
         backgroundColor: 'transparent',
-        animation: true,
-        animationDuration: 620,
-        animationDurationUpdate: 420,
+        animation: animateEntrance,
+        animationDuration: animateEntrance ? 620 : 0,
+        animationDurationUpdate: 0,
         animationEasingUpdate: 'cubicOut',
         tooltip: {
           trigger: 'item',
@@ -2885,7 +4031,7 @@
             silent: true,
             large: true,
             blendMode: 'lighter',
-            lineStyle: { opacity: 0.15, width: 5.5, curveness: 0.28, color: 'rgba(55, 211, 255, 0.50)' },
+            lineStyle: { opacity: 0.15, width: 5.5, color: 'rgba(55, 211, 255, 0.50)' },
             data: routeData.map((item) => ({ ...item, lineStyle: { ...item.lineStyle, opacity: 0.13, width: item.lineStyle.width + 4.2 } }))
           },
           {
@@ -2897,7 +4043,7 @@
             silent: false,
             blendMode: 'lighter',
             effect: { show: false },
-            lineStyle: { opacity: 0.46, width: 1.6, curveness: 0.28, type: 'solid' },
+            lineStyle: { opacity: 0.46, width: 1.6, type: 'solid' },
             data: routeData
           },
           {
@@ -2907,23 +4053,32 @@
             coordinateSystem: 'geo',
             zlevel: 4,
             silent: false,
-            blendMode: 'lighter',
             effect: {
               show: true,
               constantSpeed: role === 'overview' ? 42 : 58,
-              trailLength: 0.36,
+              /*
+               * trailLength 必须是 0。任何 > 0 的值都会让 ZRender 把这一层切成
+               * motionBlur 层（`lastFrameAlpha: 0.7`）——每帧保留上一帧的 70% 而不是清屏。
+               * 再叠上 blendMode: 'lighter'（加色），保留的残影只会越叠越亮、永不衰减，
+               * 于是一条弧上移动的光点把自己拖成一排等间距、形状完全相同的副本。
+               * 这就是用户反复打回的「一条线被平移复制多次」的真因，
+               * 与路由聚合、坐标去重、后端是否聚合都无关。
+               *
+               * 同理这一层不能用 blendMode: 'lighter'：加色混合在残影层上会累积到饱和。
+               */
+              trailLength: 0,
               symbol: 'circle',
               symbolSize: 5.2,
               color: '#effbff'
             },
-            lineStyle: { opacity: 0.26, width: 1.1, curveness: 0.28, color: 'rgba(90,220,255,0.52)' },
+            lineStyle: { opacity: 0.26, width: 1.1, color: 'rgba(90,220,255,0.52)' },
             data: routeData.map((item, index) => ({
               ...item,
               effect: {
                 show: true,
                 period: Math.max(2.2, 4.8 - Math.min(2.1, item.dataInfo.metric / maxRoute * 2.1)),
                 delay: (index % 5) * 0.22,
-                trailLength: 0.38,
+                trailLength: 0,
                 symbol: 'circle',
                 symbolSize: item.dataInfo.direction === 'inbound' ? 5.6 : 4.8,
                 color: item.dataInfo.packetColor
@@ -3019,10 +4174,15 @@
       const limit = role === 'overview' ? 8 : CYBER_ROUTE_LIMIT;
       const normalized = mapRouteItems()
         .map((route) => {
-          const from = mapCoordinates(route.from);
-          const to = mapCoordinates(route.to);
+          // mapRouteItems() 已按国家 / 省份聚合过，落点取该行政区划的标准坐标，
+          // 城市级抖动不再影响弧的端点，否则合并后的弧会指向"先到的那座城市"
+          const merged = Number(route.mergedCount || 1) > 1;
+          const from = (merged ? aggregatedEndpoint(route.from) : null) || mapCoordinates(route.from);
+          const to = (merged ? aggregatedEndpoint(route.to) : null) || mapCoordinates(route.to);
           if (!from || !to || coordinatesEqual(from, to)) return null;
-          const metric = Math.max(1, firstNumber(route.bytes, route.total_bytes, route.count, route.flow_count, route.value, 1));
+          /* 权重用流数而非 bytes：实测 25/30 条 geo 路由的 bytes 为 0（采样所致），
+             按 bytes 归一化会让绝大多数弧一起压到最细，粗细失去表达力。 */
+          const metric = routeWeight(route);
           const direction = String(route.direction || '').toLowerCase() === 'inbound' ? 'inbound' : 'outbound';
           return {
             route,
@@ -3030,27 +4190,75 @@
             to,
             metric,
             direction,
-            label: firstText(route.label, mapPointTitle(route.to), mapPointTitle(route.from), '流量路径')
+            /* 未合并的单条弧同样要以远端命名，否则 inbound 会全部叫"本机 <公网 IP>"。 */
+            label: firstText(route.label, mapPointTitle(remoteEndpointOf(route)), mapPointTitle(route.to), mapPointTitle(route.from), '流量路径')
           };
         })
         .filter(Boolean);
       const grouped = new Map();
       normalized.forEach((route) => {
-        const key = `${route.direction}|${route.from.map((value) => Number(value).toFixed(3)).join(',')}|${route.to.map((value) => Number(value).toFixed(3)).join(',')}`;
+        const key = `${route.direction}|${route.from.map((value) => Number(value).toFixed(2)).join(',')}|${route.to.map((value) => Number(value).toFixed(2)).join(',')}`;
         const existing = grouped.get(key);
         if (!existing) {
-          grouped.set(key, { ...route, route: { ...route.route } });
+          grouped.set(key, { ...route, route: { ...route.route }, coincident: [route] });
           return;
         }
+        /*
+         * 后端已聚合时，落到同一坐标的两条路由是**不同的目的地**（GeoIP 把不同 IP
+         * 解析到同一个省级中心点），不能再合并计数 —— 那会把「访问了 5 个不同服务」
+         * 报成 1 个。这里只登记为同坐标同伴，由 curveness 错开，计数保持各自独立。
+         */
+        if (routeAggregationSupported(state.geo)) {
+          existing.coincident.push(route);
+          return;
+        }
+        // 未聚合时才按最终坐标再收一次（国家级估算与城市级并存的情况）
         existing.metric += route.metric;
         existing.route.bytes = firstNumber(existing.route.bytes) + firstNumber(route.route.bytes);
         existing.route.total_bytes = firstNumber(existing.route.total_bytes) + firstNumber(route.route.total_bytes);
         existing.route.count = firstNumber(existing.route.count, existing.route.flow_count, 1) + firstNumber(route.route.count, route.route.flow_count, 1);
         existing.route.flow_count = existing.route.count;
+        existing.coincident.push(route);
       });
-      return Array.from(grouped.values())
+      /* 同坐标的多条弧展开成独立弧线，各自带 fanIndex/fanTotal 供曲率错开。
+         排序按权重，但同坐标组内保持相邻，避免 slice 把一组截成半组。 */
+      const out = [];
+      Array.from(grouped.values())
         .sort((a, b) => b.metric - a.metric)
-        .slice(0, limit);
+        .forEach((entry) => {
+          const fan = Array.isArray(entry.coincident) && entry.coincident.length > 1
+            ? entry.coincident.slice().sort((a, b) => b.metric - a.metric)
+            : [entry];
+          const total = fan.length;
+          fan.forEach((item, index) => {
+            out.push({
+              ...item,
+              from: entry.from,
+              to: entry.to,
+              route: total > 1 ? item.route : entry.route,
+              metric: total > 1 ? item.metric : entry.metric,
+              fanIndex: index,
+              fanTotal: total,
+              fanPeers: total > 1 ? fan.map((peer) => routeDestinationLabel(peer.route)).filter(Boolean) : []
+            });
+          });
+        });
+      return out.slice(0, limit);
+    }
+
+    function aggregatedEndpoint(point) {
+      if (!point || typeof point !== 'object') return null;
+      /* 本机端点绝不吸附到行政区划中心。本机与国内目的地同属 CN，一起吸到中国中心点
+         会让弧的两端重合、被 coordinatesEqual() 整条丢掉，国内流量就从图上消失了。
+         本机始终用它自己的坐标。 */
+      if (point.is_local || point.local || point.role === 'local') return null;
+      if (state.mapScope === 'china') {
+        const province = provinceCodeOf(point);
+        if (province && CHINA_PROVINCE_COORDINATES[province]) return CHINA_PROVINCE_COORDINATES[province];
+      }
+      const code = countryCodeOf(point);
+      if (code && COUNTRY_COORDINATES[code]) return COUNTRY_COORDINATES[code];
+      return null;
     }
 
     function cyberPointSeriesItem(point, maxPoint) {
@@ -3085,6 +4293,20 @@
       const color = inbound ? '#ffb25f' : '#38d8ff';
       const packetColor = inbound ? '#ffd49b' : '#eefbff';
       const ratio = Math.max(0.08, Math.min(1, route.metric / maxRoute));
+      /*
+       * 同坐标的多条弧靠曲率错开，而不是合并掉。基础曲率 ±0.31 保持不变（单条弧
+       * 的观感不受影响）。同组内的弧在 base 两侧的一段窄带内均匀分布：
+       * 交替加减会在组内条数多时把偏移量累加到越过 0，使 outbound 的弧朝反方向
+       * 弯（实测 10 条一组时出现 -0.115），看起来像入站。这里改为固定带宽内插值，
+       * 保证同组每条弧的曲率互不相同、且符号与方向一致。
+       */
+      const fanTotal = Math.max(1, Number(route.fanTotal) || 1);
+      const fanIndex = Math.min(Math.max(0, Number(route.fanIndex) || 0), fanTotal - 1);
+      const base = inbound ? -0.31 : 0.31;
+      /* 带宽 0.34：base 0.31 时曲率落在 0.14 ~ 0.48，始终同号，不会翻向。 */
+      const band = 0.34;
+      const offset = fanTotal > 1 ? (fanIndex / (fanTotal - 1) - 0.5) * band : 0;
+      const curveness = base + (inbound ? -offset : offset);
       return {
         name: route.label,
         coords: [route.from, route.to],
@@ -3093,7 +4315,7 @@
           color,
           opacity: 0.38 + ratio * 0.30,
           width: 1.0 + ratio * 2.2,
-          curveness: inbound ? -0.31 : 0.31
+          curveness
         },
         dataInfo: {
           type: 'route',
@@ -3101,6 +4323,18 @@
           metric: route.metric,
           bytes: firstNumber(route.route.bytes, route.route.total_bytes),
           count: firstNumber(route.route.count, route.route.flow_count),
+          /* 聚合自述：tooltip 要能说清这条弧代表多少条连接、源端口为何不显示。 */
+          aggregated: route.route.aggregated === true || firstPositive(route.route.aggregate_count) > 1,
+          aggregateCount: firstPositive(route.route.aggregate_count, route.route.mergedCount),
+          sourcePort: route.route.source_port,
+          sourcePortSupported: route.route.source_port_supported,
+          sourcePortReason: route.route.source_port_reason,
+          service: route.route.service,
+          protocol: route.route.protocol,
+          dstPort: firstPositive(route.route.dst_port),
+          /* 同坐标不同目的地的展开清单 */
+          fanTotal: Math.max(1, Number(route.fanTotal) || 1),
+          fanPeers: Array.isArray(route.fanPeers) ? route.fanPeers : [],
           direction: route.direction,
           packetColor,
           index
@@ -3109,8 +4343,13 @@
     }
 
     function cyberPointSize(value, maxPoint, local) {
+      /*
+       * 用户 2026-08-04：「流量地图里的点小一点，太大了目前」。
+       * 本机点 11-20px → 7-12px，远端点 6-18px → 4-10px；仍按 sqrt 归一化，
+       * 保留大小差异，只是整体收一档，密集区域不再糊成一片。
+       */
       const ratio = Math.sqrt(Math.max(1, Number(value) || 1) / Math.max(1, Number(maxPoint) || 1));
-      return Math.max(local ? 11 : 6, Math.min(local ? 20 : 18, (local ? 11 : 6) + ratio * (local ? 9 : 12)));
+      return Math.max(local ? 7 : 4, Math.min(local ? 12 : 10, (local ? 7 : 4) + ratio * (local ? 5 : 6)));
     }
 
     function cyberMetricColor(value, maxValue, mode) {
@@ -3125,11 +4364,70 @@
       const info = params && params.data && params.data.dataInfo;
       if (!info) return '';
       if (info.type === 'route') {
-        const metric = info.bytes ? formatBytes(info.bytes) : `${formatInteger(info.count || info.metric)} 条`;
-        return `<div class="insights-cyber-tip"><strong>${html(info.direction === 'inbound' ? '入站路径' : '出站路径')}</strong><span>${html(info.label)}</span><b>${html(metric)}</b></div>`;
+        return cyberRouteTooltip(info);
       }
       const metric = info.bytes ? formatBytes(info.bytes) : `${formatInteger(info.count || info.metric)} 条`;
       return `<div class="insights-cyber-tip"><strong>${html(info.local ? '本机出口' : info.label)}</strong>${info.ip ? `<span>${html(info.ip)}</span>` : ''}<b>${html(metric)}</b>${info.approximate ? '<em>国家/省级坐标，等待 City GeoIP</em>' : ''}</div>`;
+    }
+
+    /*
+     * 弧的 tooltip。三件事必须如实说：
+     * 1. 流数与字节分开报。geo 的 bytes 是采样值且常为 0，把 0 说成"0 B 流量"会
+     *    让用户以为没有流量，实际是没采到样本，所以 bytes 为 0 时不报字节。
+     * 2. 聚合条目的源端口是 null，写"源端口 0"等于造出一条不存在的连接。
+     *    未聚合条目上后端不下发 source_port_supported，故按缺键=支持处理。
+     * 3. 同坐标的多个目的地在这里展开 —— 它们没有被合并，用户需要看到是哪几个。
+     */
+    function cyberRouteTooltip(info) {
+      const title = info.direction === 'inbound' ? '入站路径' : '出站路径';
+      const rows = [];
+      const flows = firstPositive(info.count, info.metric);
+      if (flows) rows.push(`${formatInteger(flows)} 条连接`);
+      if (firstPositive(info.bytes)) rows.push(formatBytes(info.bytes));
+      const service = firstText(info.service, '');
+      const dstPort = firstPositive(info.dstPort);
+      const serviceLine = [service, dstPort ? `:${dstPort}` : ''].filter(Boolean).join('');
+      /*
+       * 源端口有三种「没有值」的情形，都不能显示成 0：
+       * - 聚合条目：后端给 null（多条连接的源端口本就不同，挑一个是假信息）
+       * - ICMP / ICMPv6：协议本身没有端口概念，实测 30.1 的 30 条路由里有 14 条
+       *   `source_port: 0` 全是 icmp/icmpv6。写「源端口：0」等于凭空造出一个端口。
+       * - 缺键：未聚合条目上后端不下发 source_port_supported，按「支持」处理，
+       *   所以判断不能写成 `=== false`。
+       */
+      const portless = /^icmp/i.test(String(info.protocol || ''));
+      const portMissing = info.sourcePortSupported === false
+        || info.sourcePort === null
+        || info.sourcePort === undefined
+        || Number(info.sourcePort) === 0;
+      let portLine = '';
+      /* 端口号不是数量，不能过千分位：formatInteger(4018) 输出 "4,018"，
+         读起来像一个不存在的端口。实测浏览器里就是这样显示的，故直接取整。 */
+      if (!portMissing) portLine = `源端口：${Math.trunc(Number(info.sourcePort))}`;
+      else if (info.aggregated) portLine = '源端口：多条连接各不相同';
+      else if (portless) portLine = `${String(info.protocol).toUpperCase()}：无端口`;
+      const aggregateLine = info.aggregated && firstPositive(info.aggregateCount) > 1
+        ? `已按目的地聚合 ${formatInteger(info.aggregateCount)} 条`
+        : '';
+      const peers = Array.isArray(info.fanPeers) ? info.fanPeers.filter(Boolean) : [];
+      /* 同一坐标下的多个真实目的地。GeoIP 把不同 IP 落到同一个省级中心点，
+         这些弧不合并，此处列出前几个，让用户知道这个点位后面不止一个目的地。
+
+         必须去重：同一「目的地 IP + 服务」会因源端口不同在 routes[] 里出现多条，
+         照原样列出会显示成「同坐标 2 个目的地：X、X」——实测浏览器里就是这样，
+         看着像重复的脏数据，而它其实是两条不同连接打到同一个目的地。 */
+      const uniquePeers = Array.from(new Set(peers));
+      const coincidentLine = uniquePeers.length > 1
+        ? `同坐标 ${uniquePeers.length} 个目的地：${uniquePeers.slice(0, 4).join('、')}${uniquePeers.length > 4 ? ` 等 ${uniquePeers.length} 个` : ''}`
+        : '';
+      return `<div class="insights-cyber-tip"><strong>${html(title)}</strong>`
+        + `<span>${html(info.label)}</span>`
+        + (serviceLine ? `<span>${html(serviceLine)}</span>` : '')
+        + (rows.length ? `<b>${html(rows.join(' · '))}</b>` : '')
+        + (aggregateLine ? `<em>${html(aggregateLine)}</em>` : '')
+        + (portLine ? `<em>${html(portLine)}</em>` : '')
+        + (coincidentLine ? `<em>${html(coincidentLine)}</em>` : '')
+        + '</div>';
     }
 
     function disposeCyberMap(container) {
@@ -3202,6 +4500,7 @@
       state.mounted = false;
       if (state.root) {
         state.root.querySelectorAll('[data-insights-echarts-map]').forEach((container) => disposeCyberMap(container));
+        state.root.querySelectorAll('[data-insights-activity-chart]').forEach((container) => disposeActivityChart(container));
         state.root.classList.remove('route-insights-host');
         state.root = null;
       }
@@ -3233,6 +4532,149 @@
     return `<svg class="insights-map-route-layer" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">${mapRouteLayerInnerMarkup(routes)}</svg>`;
   }
 
+  /*
+   * 弧的聚合粒度（SVG 兜底层与 ECharts 矢量层共用）。
+   *
+   * 后端在 GeoIP City 库命中时给出**城市级** `lat` / `lon`（`geo_precision: "city"`，
+   * 见 `webd_insights_add_geo_city_json()`），同一国家的多座城市各自成为一条路由。
+   * 这些路由共用同一个起点、弯曲度又是固定的 ±0.31，在世界地图缩放下终点彼此只差
+   * 几像素——实测大阪与名古屋 6px、东京与名古屋 11px。于是五条同形状的弧叠成一把
+   * 扇子，表现为「同一条抛物线在上方平移出很多条」。
+   *
+   * 这里按地图真正能分辨的粒度合并：世界视图同一国家一条弧，中国视图同一省份一条。
+   * 城市级细节留给列表与 tooltip，地图不承担它分辨不了的精度。
+   *
+   * 国家码缺失时只能退回坐标分桶，桶宽见 COORD_BUCKET_*。之所以不能只靠分桶：
+   * 桶边界两侧的两座城市仍可能落在相邻桶里、屏幕上却几乎重合，所以合并之后还要
+   * 再按屏幕角距做一次去重（mergeAdjacentRoutes）。
+   */
+  /* 坐标退路的分桶角度。世界视图整张图约 360 度宽，12 度差不多是能看清的最小间隔；
+     中国视图跨度小得多，用 4 度。 */
+  const COORD_BUCKET_WORLD = 12;
+  const COORD_BUCKET_CHINA = 4;
+  /* 合并后仍然过近的弧按角距再收一次。世界视图 10 度、中国视图 3.5 度以内视为同一条。 */
+  const ARC_MIN_SEPARATION_WORLD = 10;
+  const ARC_MIN_SEPARATION_CHINA = 3.5;
+
+  function aggregateMapRoutes(routes, scope, options) {
+    if (!Array.isArray(routes) || !routes.length) return Array.isArray(routes) ? routes : [];
+    /*
+     * 后端已按语义键（`route_aggregation_key`）聚合过时，前端那套「同键合并」
+     * 必须让位：两套合并叠在一起会二次合并 —— 后端按语义合过的条目再被按屏幕
+     * 像素距离合一次，用户看到的弧线条数与 `aggregate_count` 对不上，且合并依据
+     * 是像素而非语义。此时只标注同坐标关系，交给渲染层错开曲率。
+     */
+    if (options && options.backendAggregated) {
+      return annotateCoincidentRoutes(routes.slice(), scope);
+    }
+    if (routes.length < 2) return annotateCoincidentRoutes(routes.slice(), scope);
+    const grouped = new Map();
+    routes.forEach((route) => {
+      const key = `${String(route.direction || '').toLowerCase()}|${routeScopeKey(route.from, scope)}|${routeScopeKey(route.to, scope)}`;
+      const existing = grouped.get(key);
+      if (!existing) {
+        grouped.set(key, { ...route, mergedCount: 1 });
+        return;
+      }
+      existing.mergedCount += 1;
+      existing.count = numberOr(existing.count) + numberOr(route.count);
+      existing.bytes = numberOr(existing.bytes) + numberOr(route.bytes);
+      existing.label = aggregatedRouteLabel(remoteEndpointOf(existing), existing.label, existing.mergedCount, scope);
+    });
+    return annotateCoincidentRoutes(mergeAdjacentRoutes(Array.from(grouped.values()), scope), scope);
+  }
+
+  /* 弧的名字要说远端是谁。inbound 的远端在 `from`（`to` 是本机 WAN），
+     照搬 `to` 会把境外来源全部标成"本机 <公网 IP>"——实测 30.1 的 9 条 inbound
+     就是这样被标成本机的。 */
+  function remoteEndpointOf(route) {
+    if (!route || typeof route !== 'object') return null;
+    const from = route.from;
+    const to = route.to;
+    const isLocal = (point) => Boolean(point && typeof point === 'object'
+      && (point.is_local || point.local || point.role === 'local'));
+    if (isLocal(to) && !isLocal(from)) return from;
+    return to;
+  }
+
+  /* 分桶只看绝对坐标，桶边界两侧的两点仍可能在屏幕上重合，而重合的弧因为曲率相同
+     会呈现为"同一条线被平移复制"。这里按同向、同起点、终点角距过近再合并一次，
+     所以无论后端给不给国家码，都不会画出两条肉眼分不开的弧。 */
+  function mergeAdjacentRoutes(routes, scope) {
+    if (!Array.isArray(routes) || routes.length < 2) return Array.isArray(routes) ? routes : [];
+    const limit = scope === 'china' ? ARC_MIN_SEPARATION_CHINA : ARC_MIN_SEPARATION_WORLD;
+    // 权重大的留作代表，合并进来的流量并入它，避免代表弧是条极小的流量
+    const sorted = routes.slice().sort((a, b) => numberOr(b.bytes) + numberOr(b.count) - (numberOr(a.bytes) + numberOr(a.count)));
+    const kept = [];
+    sorted.forEach((route) => {
+      const from = mapCoordinates(route.from);
+      const to = mapCoordinates(route.to);
+      const direction = String(route.direction || '').toLowerCase();
+      const near = from && to ? kept.find((candidate) => {
+        if (String(candidate.direction || '').toLowerCase() !== direction) return false;
+        const candidateFrom = mapCoordinates(candidate.from);
+        const candidateTo = mapCoordinates(candidate.to);
+        if (!candidateFrom || !candidateTo) return false;
+        return angularGap(candidateFrom, from) <= limit && angularGap(candidateTo, to) <= limit;
+      }) : null;
+      if (!near) {
+        kept.push(route);
+        return;
+      }
+      near.mergedCount = numberOr(near.mergedCount || 1) + numberOr(route.mergedCount || 1);
+      near.count = numberOr(near.count) + numberOr(route.count);
+      near.bytes = numberOr(near.bytes) + numberOr(route.bytes);
+      // 同上：inbound 的远端在 from，用 to 会把境外来源标成本机所在国。
+      near.label = aggregatedRouteLabel(remoteEndpointOf(near), near.label, near.mergedCount, scope);
+    });
+    return kept;
+  }
+
+  function angularGap(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return Infinity;
+    // 经度跨 ±180 时取较短的一侧，否则太平洋两岸会被误判成相距 350 度
+    let lonGap = Math.abs(Number(a[0]) - Number(b[0])) % 360;
+    if (lonGap > 180) lonGap = 360 - lonGap;
+    return Math.hypot(lonGap, Number(a[1]) - Number(b[1]));
+  }
+
+  function numberOr(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function routeScopeKey(point, scope) {
+    if (!point || typeof point !== 'object') return 'unknown';
+    if (point.is_local || point.local || point.role === 'local') return 'local';
+    if (scope === 'china') {
+      const province = provinceCodeOf(point);
+      if (province) return `cn:${province}`;
+    }
+    const code = countryCodeOf(point);
+    if (code) return `country:${String(code).toLowerCase()}`;
+    const coords = explicitCoordinates(point);
+    /* 没有行政区划标识时只能退回坐标。1 度在世界视图下仍只有几个像素，24 条相邻城市
+       路由会留下 9 条几乎重合、等间距的弧——正是"一条线被平移复制多次"的来源。
+       这里按世界/中国视图各自能分辨的角度分桶（世界 12 度、中国 4 度），
+       桶宽与下面的像素级去重互为兜底。 */
+    if (!coords) return 'unknown';
+    const bucket = scope === 'china' ? COORD_BUCKET_CHINA : COORD_BUCKET_WORLD;
+    return coords.map((value) => Math.round(Number(value) / bucket)).join(',');
+  }
+
+  function aggregatedRouteLabel(point, fallback, mergedCount, scope) {
+    if (!(mergedCount > 1) || !point || typeof point !== 'object') return fallback;
+    const scoped = String(
+      (scope === 'china' ? point.region_name : '')
+      || point.country_name || point.country || point.country_code || ''
+    ).trim();
+    if (scoped) return `${scoped} · ${mergedCount} 个地点`;
+    /* 没有行政区划名时（坐标退路）也不能只挂第一座城市的名字，那会把多地流量
+       说成发生在一个点。退成"附近 N 个地点"，至少不误报。 */
+    const base = String(fallback || '').trim();
+    return base ? `${base} 附近 · ${mergedCount} 个地点` : `${mergedCount} 个地点`;
+  }
+
   function mapRouteLayerInnerMarkup(routes) {
     if (!Array.isArray(routes) || !routes.length) return '';
     return routes.map((route, index) => mapRouteMarkup(route, index)).join('');
@@ -3249,11 +4691,19 @@
     const bend = Math.max(7, Math.min(23, distance * 0.26));
     const inbound = route.direction === 'inbound';
     const sign = inbound ? 1 : -1;
+    /* 同坐标的多条弧（GeoIP 同点位、不同目的地）在兜底层也要错开，否则会叠成一条。
+       与 ECharts 层同源：按 fanIndex 交替正负偏移控制点。 */
+    const fanTotal = Math.max(1, Number(route.fanTotal || route.coincidentTotal) || 1);
+    const fanIndex = Math.max(0, Number(route.fanIndex ?? route.coincidentIndex) || 0);
+    const fanOffset = fanTotal > 1
+      ? (fanIndex % 2 === 0 ? 1 : -1) * Math.ceil(fanIndex / 2) * Math.min(6, bend * 0.34)
+      : 0;
     const cx = clampPercent((from.x + to.x) / 2 + Math.sign(dx || 1) * Math.min(4, distance * 0.035));
-    const cy = clampPercent((from.y + to.y) / 2 - bend * sign);
+    const cy = clampPercent((from.y + to.y) / 2 - (bend + fanOffset) * sign);
     const path = `M ${from.x.toFixed(2)} ${from.y.toFixed(2)} Q ${cx.toFixed(2)} ${cy.toFixed(2)} ${to.x.toFixed(2)} ${to.y.toFixed(2)}`;
     const delay = ((index % 7) * 0.24).toFixed(2);
-    const metric = Math.max(1, Number(route.count || route.flow_count || route.bytes || 1));
+    /* 与 ECharts 层同一口径：用流数，不让 bytes（25/30 条为 0）决定粗细。 */
+    const metric = routeWeight(route);
     const width = Math.max(1.15, Math.min(3.2, 1.15 + Math.log10(metric) * 0.42));
     const duration = Math.max(2.4, Math.min(4.8, 4.8 - Math.log10(metric) * 0.34)).toFixed(2);
     const color = inbound ? '#ffb25f' : '#38d8ff';
@@ -3710,14 +5160,133 @@
     const from = route.from || route.source || route.src || route.origin || route.local || route.a;
     const to = route.to || route.destination || route.dst || route.target || route.remote || route.b;
     if (!from || !to) return null;
+    /* `count` 以前写作 `route.count || route.flow_count || route.bytes || 1`，
+       bytes 会在流数缺失时冒充流数（单位不同的两个量），所以这里分开取。 */
+    const aggregateCount = firstPositive(route.aggregate_count, route.aggregated_count);
+    const flowCount = firstPositive(route.flow_count, route.count);
     return {
       from,
       to,
       direction: String(route.direction || route.flow_direction || '').toLowerCase(),
-      count: route.count || route.flow_count || route.bytes || 1,
+      count: flowCount || aggregateCount || 1,
       bytes: route.bytes || route.total_bytes || 0,
-      label: route.label || route.name || ''
+      label: route.label || route.name || '',
+      /* 后端权威聚合字段。`route_key` 是判定「两条弧是否真的同一条」的唯一依据，
+         比屏幕角距可靠，因此一路带到渲染层。 */
+      route_key: firstFilled(route.route_key),
+      aggregated: route.aggregated === true || aggregateCount > 1,
+      aggregate_count: aggregateCount || 1,
+      /* 聚合条目的源端口是 null（多条连接的源端口本就不同，挑一个是假信息）。
+         这里保留 null/undefined 原样，绝不折成 0 —— 0 是一个合法端口号，
+         显示成 0 等于凭空造出一条「从 0 端口发出」的连接。 */
+      source_port: route.source_port,
+      /* 未聚合条目上后端不下发这两个键（实测 30 条里只有 5 条聚合行带），
+         所以缺键必须按「支持」处理，不能写 `=== false` 那种判断。 */
+      source_port_supported: route.source_port_supported,
+      source_port_reason: firstFilled(route.source_port_reason),
+      service: firstFilled(route.service),
+      protocol: firstFilled(route.protocol),
+      dst_port: firstPositive(route.dst_port, route.destination_port, route.remote_port),
+      /* 实测 routes[] 不含 remote_ip；保留读取只为兼容将来补上该键的情况，
+         真正的远端地址来自 from/to 端点对象。 */
+      remote_ip: firstFilled(route.remote_ip),
+      client_ip: firstFilled(route.client_ip)
     };
+  }
+
+  /* `firstText()` 只存在于 create() 的参数默认值里，模块级取不到它。
+     这些工具函数是模块级的，所以用本地实现，避免运行期 ReferenceError。 */
+  function firstFilled(...values) {
+    for (const value of values) {
+      if (value === undefined || value === null) continue;
+      const text = String(value);
+      if (text !== '') return text;
+    }
+    return '';
+  }
+
+  /* firstNumber() 返回第一个「有限」值，而 0 是有限的，所以它取不到
+     「第一个有意义的正数」。弧的权重与端口号都需要后者。 */
+  function firstPositive(...values) {
+    for (const value of values) {
+      const number = Number(value);
+      if (Number.isFinite(number) && number > 0) return number;
+    }
+    return 0;
+  }
+
+  /* 弧的粗细权重。
+   *
+   * 实测 30.1 的 `flows/geo`：30 条路由里 25 条 `bytes` 为 0（geo 的字节来自
+   * `nf_conntrack_polling_sample` 采样，短连接常常一个字节都没采到），只有 5 条非零。
+   * 若按 bytes 定粗细，五分之四的弧会一起压到最细，地图上看不出任何差别。
+   *
+   * 所以权重用流数（`flow_count`，聚合后等于 `aggregate_count`）：它恒 ≥ 1、
+   * 单位统一、且正是后端建议的两个表达量之一。bytes 不参与粗细，改在 tooltip 里
+   * 如实报出（含 0），避免把两种单位混进同一个归一化尺度。 */
+  function routeWeight(route) {
+    if (!route || typeof route !== 'object') return 1;
+    return Math.max(1, firstPositive(route.flow_count, route.count, route.aggregate_count, route.mergedCount));
+  }
+
+  /* 后端是否已按语义键聚合过。为真时前端不再用屏幕角距去猜聚合关系。 */
+  function routeAggregationSupported(geo) {
+    const caps = (geo && typeof geo === 'object' && geo.capabilities) || {};
+    return caps.route_aggregation_supported === true;
+  }
+
+  /* 同一坐标对下的多条弧：不合并，给序号让渲染层错开曲率。
+   *
+   * GeoIP 城市库会把不同 IP 解析到同一个省级中心点，这类重合是真实的 ——
+   * 按坐标合并会把「访问了 5 个不同服务」显示成「1 个」，是拿数据真实性换视觉整洁。
+   * 正确做法是让它们视觉上可区分，所以这里只标注 `coincidentIndex` /
+   * `coincidentTotal`，并把同点位的目的地清单挂上去供 tooltip 展开。 */
+  function annotateCoincidentRoutes(routes, scope) {
+    if (!Array.isArray(routes) || !routes.length) return Array.isArray(routes) ? routes : [];
+    const groups = new Map();
+    routes.forEach((route) => {
+      const key = `${String(route.direction || '').toLowerCase()}|${routeScopeKey(route.from, scope)}|${routeScopeKey(route.to, scope)}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(route);
+    });
+    groups.forEach((group) => {
+      const total = group.length;
+      const peers = total > 1
+        ? group.map((peer) => routeDestinationLabel(peer)).filter(Boolean)
+        : [];
+      group.forEach((route, index) => {
+        route.coincidentIndex = index;
+        route.coincidentTotal = total;
+        route.coincidentPeers = peers;
+      });
+    });
+    return routes;
+  }
+
+  /* 同点位展开清单里的一行：目的地 + 服务/端口，足以区分「同坐标不同目的」。 */
+  function routeDestinationLabel(route) {
+    if (!route || typeof route !== 'object') return '';
+    const remote = remoteEndpointOf(route);
+    /*
+     * 远端标识取自端点对象，不要用 `route.remote_ip` —— 实测 `flows/geo` 的
+     * routes[] **没有** 这个键（`'remote_ip' in row` 为 false），一律取到
+     * undefined 后落到 `route.label`，于是同坐标的多个不同目的地会被显示成
+     * 同一个名字（浏览器实测出现「同坐标 2 个目的地：X、X」）。
+     * 真实的 IP 在 `to.ip` / `from.ip`（见 remoteEndpointOf），域名在 `.domain`。
+     * 域名优先于 IP：它才是用户认得出的那一项；两者都给出时附上 IP 以便区分
+     * 同域名的多个后端地址。
+     */
+    const ip = firstFilled(remote && (remote.ip || remote.public_ip || remote.address), route.remote_ip);
+    const domain = firstFilled(remote && (remote.domain || remote.host));
+    const place = firstFilled(remote && (remote.name || remote.label), route.label);
+    const host = domain
+      ? (ip && ip !== domain ? `${domain}（${ip}）` : domain)
+      : firstFilled(ip, place);
+    const service = firstFilled(route.service, route.protocol);
+    const port = firstPositive(route.dst_port);
+    const suffix = [service, port ? String(port) : ''].filter(Boolean).join(' ');
+    if (!host) return suffix;
+    return suffix ? `${host} · ${suffix}` : String(host);
   }
 
   function arcCoordinates(from, to, direction) {
@@ -3944,6 +5513,35 @@
       }
     ])
   );
+
+  /* The audit overview cards pass `icon` straight through to the kit, which renders
+     whatever markup it is handed, so every stats array that omitted one left an
+     empty icon slot on the page: 16 of them across the four activity sub-pages.
+     Stroke icons keyed by role, on the same 24-box the kit normalises to. */
+  const AUDIT_STAT_ICONS = {
+    count: '<path d="M4 19V9M10 19V5M16 19v-7M22 19V3"></path>',
+    online: '<path d="M5 12.5 9.5 17 19 7.5"></path>',
+    offline: '<path d="M6 6l12 12M18 6 6 18"></path>',
+    roam: '<path d="M4 12h10m0 0-3.5-3.5M14 12l-3.5 3.5"></path><circle cx="19" cy="12" r="2"></circle>',
+    presence: '<circle cx="12" cy="8" r="3.4"></circle><path d="M5.5 20c0-3.6 2.9-6.5 6.5-6.5s6.5 2.9 6.5 6.5"></path>',
+    away: '<circle cx="12" cy="12" r="8.5"></circle><path d="M12 7.5V12l3 2"></path>',
+    accounts: '<circle cx="9" cy="8" r="3.2"></circle><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M16 6.2a3.2 3.2 0 0 1 0 6.1M18 20c0-2.2-.9-4.2-2.4-5.6"></path>',
+    protocol: '<path d="M4 7h13m0 0-4-4m4 4-4 4M20 17H7m0 0 4 4m-4-4 4-4"></path>',
+    connections: '<circle cx="6" cy="6" r="2.4"></circle><circle cx="18" cy="18" r="2.4"></circle><path d="M8 7.6 16 16.4"></path>',
+    traffic: '<path d="M3 17.5 8.5 11l4 3.5L21 5"></path><path d="M21 10V5h-5"></path>',
+    unknown: '<circle cx="12" cy="12" r="8.5"></circle><path d="M9.6 9.4a2.5 2.5 0 1 1 3.4 2.3c-.6.3-1 .8-1 1.5v.4"></path><path d="M12 17h.01"></path>',
+    status: '<circle cx="12" cy="12" r="8.5"></circle><path d="M12 8v4.2l2.8 1.6"></path>',
+    retention: '<path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3Z"></path><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"></path><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"></path>',
+    dbSize: '<path d="M5 5h14v14H5z"></path><path d="M5 10h14M10 5v14"></path>',
+    dropped: '<path d="M12 4v9"></path><path d="M8.5 9.5 12 13l3.5-3.5"></path><path d="M5 18h14"></path>'
+  };
+
+  function auditStatIcon(name) {
+    const body = AUDIT_STAT_ICONS[name];
+    if (!body) return '';
+    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
+  }
+
 
   function chevronSvg() {
     return '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 5 5 5-5"/></svg>';

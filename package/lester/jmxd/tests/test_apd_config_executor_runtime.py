@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 
+import apd_test_deps
+
 
 ROOT = Path(__file__).resolve().parents[1]
 EXECUTOR = ROOT / "src/apd/apd_config_executor.c"
@@ -62,17 +64,15 @@ def static_contract() -> None:
 
 
 def compile_fixture(output: Path) -> None:
-    prefix = os.environ.get("APD_TEST_PREFIX", "")
-    json_prefix = Path(prefix) if prefix else Path(
-        "/opt/homebrew/var/homebrew/tmp/.cellar/json-c/0.19")
-    openssl_prefix_raw = os.environ.get("APD_TEST_OPENSSL_PREFIX", "")
-    openssl_prefix = (Path(openssl_prefix_raw) if openssl_prefix_raw else
-                      (json_prefix if prefix else
-                       Path("/opt/homebrew/opt/openssl@3")))
+    json_prefix, json_shared = apd_test_deps.resolve_json_prefix()
+    openssl_prefix, _ = apd_test_deps.resolve_openssl_prefix()
+    # Prefer the .so: preferring the archive picks up the staging_dir LTO
+    # archive on the build host, which the host linker cannot consume.
     static_lib = json_prefix / "lib/libjson-c.a"
-    json_link = ([str(static_lib)] if static_lib.is_file() else
-                 [f"-L{json_prefix / 'lib'}",
-                  f"-Wl,-rpath,{json_prefix / 'lib'}", "-ljson-c"])
+    json_link = ([f"-L{json_prefix / 'lib'}",
+                  f"-Wl,-rpath,{json_prefix / 'lib'}", "-ljson-c"]
+                 if json_shared or not static_lib.is_file()
+                 else [str(static_lib)])
     command = [
         os.environ.get("CC", "cc"), "-std=c11",
         "-D_DARWIN_C_SOURCE" if sys.platform == "darwin" else "-D_GNU_SOURCE",

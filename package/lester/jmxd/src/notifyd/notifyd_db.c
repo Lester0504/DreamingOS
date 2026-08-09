@@ -97,48 +97,55 @@ struct notifyd_event_definition {
     const char *label;
     const char *producer;
     const char *recovery_event;
+    /*
+     * Non-empty only on the half of a pair that clears the other. recovery_event
+     * is symmetric (both halves point at each other), so it cannot answer "is
+     * this the recovery?" -- the question min_severity handling depends on.
+     * Mirrors logd_notify_event_contract.recovers_event (logd_event.c).
+     */
+    const char *recovers_event;
     const char *reason;
     const char *default_severity;
     int available;
 };
 
 static const struct notifyd_event_definition notifyd_event_definitions[] = {
-    { "SYSTEM_RESOURCE_THRESHOLD", "SYSTEM", "System Resource Threshold", "dreamingwrt.logd.collector.resource", "", "", "warning", 1 },
-    { "SYSTEM_LOG", "SYSTEM", "System Log", "dreamingwrt.logd", "", "", "notice", 1 },
-    { "CALLBACKS_SUPPRESSED", "SYSTEM", "Callbacks Suppressed", "dreamingwrt.logd", "", "", "warning", 1 },
-    { "PACKET_CAPTURE_STARTED", "SYSTEM", "Packet Capture Started", "dreamingwrt.logd", "", "", "notice", 1 },
-    { "PACKET_CAPTURE_STOPPED", "SYSTEM", "Packet Capture Stopped", "dreamingwrt.logd", "", "", "notice", 1 },
-    { "PACKET_CAPTURE_FINISHED", "SYSTEM", "Packet Capture Finished", "dreamingwrt.logd", "", "", "notice", 1 },
-    { "PACKET_CAPTURE_DELETED", "SYSTEM", "Packet Capture Deleted", "dreamingwrt.logd", "", "", "notice", 1 },
-    { "WAN_EVENT", "INTERNET_AND_WAN", "WAN Event", "dreamingwrt.logd.collector.system_log", "", "", "notice", 1 },
-    { "PPPOE_EVENT", "INTERNET_AND_WAN", "PPPoE Event", "dreamingwrt.logd.collector.system_log", "", "", "notice", 1 },
-    { "PORT_LINK_DOWN", "INTERNET_AND_WAN", "Port Link Down", "dreamingwrt.logd.collector.port", "PORT_LINK_UP", "", "warning", 1 },
-    { "PORT_LINK_UP", "INTERNET_AND_WAN", "Port Link Up", "dreamingwrt.logd.collector.port", "PORT_LINK_DOWN", "", "notice", 1 },
-    { "PORT_EVENT", "INTERNET_AND_WAN", "Port Event", "dreamingwrt.logd.collector.port", "", "", "notice", 1 },
-    { "CLIENT_CONNECTED_WIRED", "CLIENT_DEVICES", "Wired Client Connected", "dreamingwrt.logd.collector.dhcp_lease", "CLIENT_DISCONNECTED", "", "notice", 1 },
-    { "CLIENT_DISCONNECTED", "CLIENT_DEVICES", "Client Disconnected", "dreamingwrt.logd.collector.dhcp_lease", "CLIENT_CONNECTED_WIRED", "", "notice", 1 },
-    { "DHCP_EVENT", "CLIENT_DEVICES", "DHCP Event", "dreamingwrt.logd.collector.dhcp_lease", "", "", "notice", 1 },
-    { "ADMIN_AUTH_EVENT", "ADMIN", "Admin Authentication Event", "dreamingwrt.logd.collector.system_log", "", "", "warning", 1 },
+    { "SYSTEM_RESOURCE_THRESHOLD", "SYSTEM", "System Resource Threshold", "dreamingwrt.logd.collector.resource", "", "", "", "warning", 1 },
+    { "SYSTEM_LOG", "SYSTEM", "System Log", "dreamingwrt.logd", "", "", "", "notice", 1 },
+    { "CALLBACKS_SUPPRESSED", "SYSTEM", "Callbacks Suppressed", "dreamingwrt.logd", "", "", "", "warning", 1 },
+    { "PACKET_CAPTURE_STARTED", "SYSTEM", "Packet Capture Started", "dreamingwrt.logd", "", "", "", "notice", 1 },
+    { "PACKET_CAPTURE_STOPPED", "SYSTEM", "Packet Capture Stopped", "dreamingwrt.logd", "", "", "", "notice", 1 },
+    { "PACKET_CAPTURE_FINISHED", "SYSTEM", "Packet Capture Finished", "dreamingwrt.logd", "", "", "", "notice", 1 },
+    { "PACKET_CAPTURE_DELETED", "SYSTEM", "Packet Capture Deleted", "dreamingwrt.logd", "", "", "", "notice", 1 },
+    { "WAN_EVENT", "INTERNET_AND_WAN", "WAN Event", "dreamingwrt.logd.collector.system_log", "", "", "", "notice", 1 },
+    { "PPPOE_EVENT", "INTERNET_AND_WAN", "PPPoE Event", "dreamingwrt.logd.collector.system_log", "", "", "", "notice", 1 },
+    { "PORT_LINK_DOWN", "INTERNET_AND_WAN", "Port Link Down", "dreamingwrt.logd.collector.port", "PORT_LINK_UP", "", "", "warning", 1 },
+    { "PORT_LINK_UP", "INTERNET_AND_WAN", "Port Link Up", "dreamingwrt.logd.collector.port", "PORT_LINK_DOWN", "PORT_LINK_DOWN", "", "notice", 1 },
+    { "PORT_EVENT", "INTERNET_AND_WAN", "Port Event", "dreamingwrt.logd.collector.port", "", "", "", "notice", 1 },
+    { "CLIENT_CONNECTED_WIRED", "CLIENT_DEVICES", "Wired Client Connected", "dreamingwrt.logd.collector.dhcp_lease", "CLIENT_DISCONNECTED", "", "", "notice", 1 },
+    { "CLIENT_DISCONNECTED", "CLIENT_DEVICES", "Client Disconnected", "dreamingwrt.logd.collector.dhcp_lease", "CLIENT_CONNECTED_WIRED", "CLIENT_CONNECTED_WIRED", "", "notice", 1 },
+    { "DHCP_EVENT", "CLIENT_DEVICES", "DHCP Event", "dreamingwrt.logd.collector.dhcp_lease", "", "", "", "notice", 1 },
+    { "ADMIN_AUTH_EVENT", "ADMIN", "Admin Authentication Event", "dreamingwrt.logd.collector.system_log", "", "", "", "warning", 1 },
 
-    { "WAN_DOWN", "INTERNET_AND_WAN", "Internet Down", "dreamingwrt-core", "WAN_RESTORED", "", "warning", 1 },
-    { "WAN_RESTORED", "INTERNET_AND_WAN", "Internet Restored", "dreamingwrt-core", "WAN_DOWN", "", "notice", 1 },
-    { "WAN_FAILOVER_ACTIVE", "INTERNET_AND_WAN", "WAN Failover Active", "dreamingwrt.routed.health", "WAN_FAILBACK", "", "warning", 1 },
-    { "WAN_FAILBACK", "INTERNET_AND_WAN", "WAN Failback", "dreamingwrt.routed.health", "WAN_FAILOVER_ACTIVE", "", "notice", 1 },
-    { "WAN_FLAPPING", "INTERNET_AND_WAN", "WAN Flapping", "dreamingwrt-core", "", "", "warning", 1 },
-    { "ISP_PACKET_LOSS", "INTERNET_AND_WAN", "ISP Packet Loss", "", "", "wan_sla_event_producer_pending", "warning", 0 },
-    { "ISP_HIGH_LATENCY", "INTERNET_AND_WAN", "ISP High Latency", "", "", "wan_sla_event_producer_pending", "warning", 0 },
-    { "DEVICE_OFFLINE", "DEVICES", "Infrastructure Device Offline", "", "DEVICE_RESTORED", "topology_history_not_connected_to_logd_notifyd", "warning", 0 },
-    { "DEVICE_RESTORED", "DEVICES", "Infrastructure Device Restored", "", "DEVICE_OFFLINE", "topology_history_not_connected_to_logd_notifyd", "notice", 0 },
-    { "PORT_TX_RX_ERRORS", "INTERNET_AND_WAN", "Port TX/RX Errors", "", "", "port_counter_delta_producer_pending", "warning", 0 },
-    { "PORT_DROPPED_TRAFFIC", "INTERNET_AND_WAN", "Port Dropped Traffic", "", "", "port_counter_delta_producer_pending", "warning", 0 },
-    { "DHCP_POOL_EXHAUSTED", "CLIENT_DEVICES", "DHCP Pool Exhausted", "dreamingwrt-core", "", "", "critical", 1 },
-    { "CLIENT_IP_CONFLICT", "CLIENT_DEVICES", "Client IP Conflict", "", "", "ip_conflict_producer_pending", "warning", 0 },
-    { "VPN_SITE_TO_SITE_DISCONNECTED", "VPN", "Site-to-Site VPN Disconnected", "", "VPN_SITE_TO_SITE_RESTORED", "vpn_state_producer_pending", "warning", 0 },
-    { "VPN_SITE_TO_SITE_RESTORED", "VPN", "Site-to-Site VPN Restored", "", "VPN_SITE_TO_SITE_DISCONNECTED", "vpn_state_producer_pending", "notice", 0 },
-    { "SECURITY_DETECTION", "SECURITY", "Security Detection", "", "", "aegis_suricata_event_bridge_pending", "warning", 0 },
-    { "CONFIG_COMMIT_FAILED", "ADMIN", "Configuration Commit Failed", "", "", "config_transaction_event_producer_pending", "error", 0 },
-    { "APPLICATION_UPDATE_FAILED", "SYSTEM", "Application Update Failed", "", "", "otad_failure_event_producer_pending", "error", 0 },
-    { "IMPROPER_SHUTDOWN", "SYSTEM", "Improper Shutdown", "", "", "boot_marker_event_producer_pending", "warning", 0 },
+    { "WAN_DOWN", "INTERNET_AND_WAN", "Internet Down", "dreamingwrt-core", "WAN_RESTORED", "", "", "warning", 1 },
+    { "WAN_RESTORED", "INTERNET_AND_WAN", "Internet Restored", "dreamingwrt-core", "WAN_DOWN", "WAN_DOWN", "", "notice", 1 },
+    { "WAN_FAILOVER_ACTIVE", "INTERNET_AND_WAN", "WAN Failover Active", "dreamingwrt.routed.health", "WAN_FAILBACK", "", "", "warning", 1 },
+    { "WAN_FAILBACK", "INTERNET_AND_WAN", "WAN Failback", "dreamingwrt.routed.health", "WAN_FAILOVER_ACTIVE", "WAN_FAILOVER_ACTIVE", "", "notice", 1 },
+    { "WAN_FLAPPING", "INTERNET_AND_WAN", "WAN Flapping", "dreamingwrt-core", "", "", "", "warning", 1 },
+    { "ISP_PACKET_LOSS", "INTERNET_AND_WAN", "ISP Packet Loss", "", "", "", "wan_sla_event_producer_pending", "warning", 0 },
+    { "ISP_HIGH_LATENCY", "INTERNET_AND_WAN", "ISP High Latency", "", "", "", "wan_sla_event_producer_pending", "warning", 0 },
+    { "DEVICE_OFFLINE", "DEVICES", "Infrastructure Device Offline", "", "DEVICE_RESTORED", "", "topology_history_not_connected_to_logd_notifyd", "warning", 0 },
+    { "DEVICE_RESTORED", "DEVICES", "Infrastructure Device Restored", "", "DEVICE_OFFLINE", "DEVICE_OFFLINE", "topology_history_not_connected_to_logd_notifyd", "notice", 0 },
+    { "PORT_TX_RX_ERRORS", "INTERNET_AND_WAN", "Port TX/RX Errors", "", "", "", "port_counter_delta_producer_pending", "warning", 0 },
+    { "PORT_DROPPED_TRAFFIC", "INTERNET_AND_WAN", "Port Dropped Traffic", "", "", "", "port_counter_delta_producer_pending", "warning", 0 },
+    { "DHCP_POOL_EXHAUSTED", "CLIENT_DEVICES", "DHCP Pool Exhausted", "dreamingwrt-core", "", "", "", "critical", 1 },
+    { "CLIENT_IP_CONFLICT", "CLIENT_DEVICES", "Client IP Conflict", "", "", "", "ip_conflict_producer_pending", "warning", 0 },
+    { "VPN_SITE_TO_SITE_DISCONNECTED", "VPN", "Site-to-Site VPN Disconnected", "", "VPN_SITE_TO_SITE_RESTORED", "", "vpn_state_producer_pending", "warning", 0 },
+    { "VPN_SITE_TO_SITE_RESTORED", "VPN", "Site-to-Site VPN Restored", "", "VPN_SITE_TO_SITE_DISCONNECTED", "VPN_SITE_TO_SITE_DISCONNECTED", "vpn_state_producer_pending", "notice", 0 },
+    { "SECURITY_DETECTION", "SECURITY", "Security Detection", "", "", "", "aegis_suricata_event_bridge_pending", "warning", 0 },
+    { "CONFIG_COMMIT_FAILED", "ADMIN", "Configuration Commit Failed", "", "", "", "config_transaction_event_producer_pending", "error", 0 },
+    { "APPLICATION_UPDATE_FAILED", "SYSTEM", "Application Update Failed", "", "", "", "otad_failure_event_producer_pending", "error", 0 },
+    { "IMPROPER_SHUTDOWN", "SYSTEM", "Improper Shutdown", "", "", "", "boot_marker_event_producer_pending", "warning", 0 },
 
     /*
      * dreamingproxy is an out-of-tree Go plugin that enqueues with category
@@ -150,30 +157,30 @@ static const struct notifyd_event_definition notifyd_event_definitions[] = {
      * notifications.go and egress_drift.go); recovery events are info because
      * notify/manager.go hardcodes "info" when it resolves an active state.
      */
-    { "PROXY_NODE_MASS_FAILURE", "PROXY", "Proxy Nodes Mass Failure", "dreamingproxy", "PROXY_NODE_MASS_RECOVERED", "", "warning", 1 },
-    { "PROXY_NODE_MASS_RECOVERED", "PROXY", "Proxy Nodes Recovered", "dreamingproxy", "PROXY_NODE_MASS_FAILURE", "", "info", 1 },
-    { "PROXY_CAPABILITY_EMPTY", "PROXY", "Policy Group Candidates Empty", "dreamingproxy", "PROXY_CAPABILITY_RECOVERED", "", "error", 1 },
-    { "PROXY_CAPABILITY_RECOVERED", "PROXY", "Policy Group Candidates Recovered", "dreamingproxy", "PROXY_CAPABILITY_EMPTY", "", "info", 1 },
-    { "PROXY_BINDING_OFFLINE", "PROXY", "Client Binding Offline", "dreamingproxy", "PROXY_BINDING_RESTORED", "", "critical", 1 },
-    { "PROXY_BINDING_RESTORED", "PROXY", "Client Binding Restored", "dreamingproxy", "PROXY_BINDING_OFFLINE", "", "info", 1 },
-    { "PROXY_ALL_WANS_DEGRADED", "PROXY", "All WAN Paths Degraded", "dreamingproxy", "PROXY_WAN_PATH_RECOVERED", "", "error", 1 },
-    { "PROXY_WAN_PATH_RECOVERED", "PROXY", "WAN Path Recovered", "dreamingproxy", "PROXY_ALL_WANS_DEGRADED", "", "info", 1 },
-    { "PROXY_WAN_PATH_FLAPPING", "PROXY", "WAN Path Flapping", "dreamingproxy", "", "", "warning", 1 },
-    { "PROXY_CONFIG_APPLY_FAILED", "PROXY", "Proxy Config Apply Failed", "dreamingproxy", "", "", "error", 1 },
-    { "PROXY_CONFIG_ROLLED_BACK", "PROXY", "Proxy Config Rolled Back", "dreamingproxy", "", "", "warning", 1 },
-    { "PROXY_SUBSCRIPTION_UPDATE_FAILED", "PROXY", "Subscription Update Failed", "dreamingproxy", "PROXY_SUBSCRIPTION_UPDATE_RECOVERED", "", "warning", 1 },
-    { "PROXY_SUBSCRIPTION_UPDATE_RECOVERED", "PROXY", "Subscription Update Recovered", "dreamingproxy", "PROXY_SUBSCRIPTION_UPDATE_FAILED", "", "info", 1 },
-    { "PROXY_RULESET_UPDATE_FAILED", "PROXY", "Ruleset Update Failed", "dreamingproxy", "PROXY_RULESET_UPDATE_RECOVERED", "", "warning", 1 },
-    { "PROXY_RULESET_UPDATE_RECOVERED", "PROXY", "Ruleset Update Recovered", "dreamingproxy", "PROXY_RULESET_UPDATE_FAILED", "", "info", 1 },
-    { "PROXY_CORE_UNAVAILABLE", "PROXY", "Proxy Core Unavailable", "dreamingproxy", "PROXY_CORE_RECOVERED", "", "error", 1 },
-    { "PROXY_CORE_RECOVERED", "PROXY", "Proxy Core Recovered", "dreamingproxy", "PROXY_CORE_UNAVAILABLE", "", "info", 1 },
+    { "PROXY_NODE_MASS_FAILURE", "PROXY", "Proxy Nodes Mass Failure", "dreamingproxy", "PROXY_NODE_MASS_RECOVERED", "", "", "warning", 1 },
+    { "PROXY_NODE_MASS_RECOVERED", "PROXY", "Proxy Nodes Recovered", "dreamingproxy", "PROXY_NODE_MASS_FAILURE", "PROXY_NODE_MASS_FAILURE", "", "info", 1 },
+    { "PROXY_CAPABILITY_EMPTY", "PROXY", "Policy Group Candidates Empty", "dreamingproxy", "PROXY_CAPABILITY_RECOVERED", "", "", "error", 1 },
+    { "PROXY_CAPABILITY_RECOVERED", "PROXY", "Policy Group Candidates Recovered", "dreamingproxy", "PROXY_CAPABILITY_EMPTY", "PROXY_CAPABILITY_EMPTY", "", "info", 1 },
+    { "PROXY_BINDING_OFFLINE", "PROXY", "Client Binding Offline", "dreamingproxy", "PROXY_BINDING_RESTORED", "", "", "critical", 1 },
+    { "PROXY_BINDING_RESTORED", "PROXY", "Client Binding Restored", "dreamingproxy", "PROXY_BINDING_OFFLINE", "PROXY_BINDING_OFFLINE", "", "info", 1 },
+    { "PROXY_ALL_WANS_DEGRADED", "PROXY", "All WAN Paths Degraded", "dreamingproxy", "PROXY_WAN_PATH_RECOVERED", "", "", "error", 1 },
+    { "PROXY_WAN_PATH_RECOVERED", "PROXY", "WAN Path Recovered", "dreamingproxy", "PROXY_ALL_WANS_DEGRADED", "PROXY_ALL_WANS_DEGRADED", "", "info", 1 },
+    { "PROXY_WAN_PATH_FLAPPING", "PROXY", "WAN Path Flapping", "dreamingproxy", "", "", "", "warning", 1 },
+    { "PROXY_CONFIG_APPLY_FAILED", "PROXY", "Proxy Config Apply Failed", "dreamingproxy", "", "", "", "error", 1 },
+    { "PROXY_CONFIG_ROLLED_BACK", "PROXY", "Proxy Config Rolled Back", "dreamingproxy", "", "", "", "warning", 1 },
+    { "PROXY_SUBSCRIPTION_UPDATE_FAILED", "PROXY", "Subscription Update Failed", "dreamingproxy", "PROXY_SUBSCRIPTION_UPDATE_RECOVERED", "", "", "warning", 1 },
+    { "PROXY_SUBSCRIPTION_UPDATE_RECOVERED", "PROXY", "Subscription Update Recovered", "dreamingproxy", "PROXY_SUBSCRIPTION_UPDATE_FAILED", "PROXY_SUBSCRIPTION_UPDATE_FAILED", "", "info", 1 },
+    { "PROXY_RULESET_UPDATE_FAILED", "PROXY", "Ruleset Update Failed", "dreamingproxy", "PROXY_RULESET_UPDATE_RECOVERED", "", "", "warning", 1 },
+    { "PROXY_RULESET_UPDATE_RECOVERED", "PROXY", "Ruleset Update Recovered", "dreamingproxy", "PROXY_RULESET_UPDATE_FAILED", "PROXY_RULESET_UPDATE_FAILED", "", "info", 1 },
+    { "PROXY_CORE_UNAVAILABLE", "PROXY", "Proxy Core Unavailable", "dreamingproxy", "PROXY_CORE_RECOVERED", "", "", "error", 1 },
+    { "PROXY_CORE_RECOVERED", "PROXY", "Proxy Core Recovered", "dreamingproxy", "PROXY_CORE_UNAVAILABLE", "PROXY_CORE_UNAVAILABLE", "", "info", 1 },
     /*
      * No recovery event by design: egress drift is a completed discrete change,
      * so "recovered" would wrongly claim the previous exit came back. Severity
      * is warning for operator_changed and info for unknown attribution, so the
      * default here is the more common warning form.
      */
-    { "PROXY_EGRESS_DRIFT", "PROXY", "Proxy Egress Address Drift", "dreamingproxy", "", "", "warning", 1 },
+    { "PROXY_EGRESS_DRIFT", "PROXY", "Proxy Egress Address Drift", "dreamingproxy", "", "", "", "warning", 1 },
 };
 
 static void notifyd_event_ids_json(struct json_object *cap)
@@ -248,6 +255,8 @@ struct json_object *notifyd_event_catalog_json(void)
         json_object_object_add(event, "available", json_object_new_boolean(def->available));
         json_object_object_add(event, "producer", json_object_new_string(def->producer));
         json_object_object_add(event, "recovery_event", json_object_new_string(def->recovery_event));
+        json_object_object_add(event, "recovers_event", json_object_new_string(def->recovers_event));
+        json_object_object_add(event, "severity_exempt", json_object_new_boolean(def->recovers_event[0] != 0));
         json_object_object_add(event, "default_severity", json_object_new_string(def->default_severity));
         if (def->reason[0])
             json_object_object_add(event, "reason", json_object_new_string(def->reason));
@@ -1357,6 +1366,30 @@ int notifyd_channel_get(const char *id, struct notifyd_channel *out)
     return found;
 }
 
+/*
+ * A recovery event is exempt from min_severity, because the pair is asymmetric
+ * in severity but symmetric in usefulness: WAN_DOWN is warning and passes, its
+ * clearing event WAN_RESTORED is notice and did not, so the only live route
+ * (default-warning) delivered "internet is down" and never "it came back".
+ * The user was left holding an alarm nothing could clear.
+ *
+ * Exemption is deliberately narrow. It keys off recovers_event, so it covers
+ * only the half of a pair that clears a prior alarm, and it never lowers the
+ * threshold for ordinary low-severity chatter (SYSTEM_LOG, DHCP_EVENT and the
+ * other notice/info events stay filtered). category/event/source selectors are
+ * still applied, so an operator scoping a route to one category keeps that
+ * scope. The catalog reports this per event as severity_exempt.
+ */
+static int notifyd_event_is_recovery(const char *event_id)
+{
+    const struct notifyd_event_definition *def;
+
+    if (!event_id || !event_id[0])
+        return 0;
+    def = notifyd_event_definition_find(event_id);
+    return def && def->recovers_event[0] ? 1 : 0;
+}
+
 static int notifyd_route_matches(sqlite3_stmt *st, struct json_object *body)
 {
     const char *min_sev = (const char *)sqlite3_column_text(st, 4);
@@ -1368,7 +1401,8 @@ static int notifyd_route_matches(sqlite3_stmt *st, struct json_object *body)
     const char *ev_event = notifyd_json_str(body, "event", "");
     const char *ev_source = notifyd_json_str(body, "source", "");
 
-    if (notifyd_severity_rank(ev_sev) < notifyd_severity_rank(min_sev))
+    if (notifyd_severity_rank(ev_sev) < notifyd_severity_rank(min_sev) &&
+        !notifyd_event_is_recovery(ev_event))
         return 0;
     if (category && category[0] && strcmp(category, ev_category))
         return 0;
@@ -1619,8 +1653,14 @@ struct json_object *notifyd_enqueue_event(struct json_object *body)
         json_object_object_add(resp, "error", json_object_new_string("routes_query_failed"));
         return resp;
     }
+    /*
+     * Same recovery exemption as notifyd_route_matches(). Without it the
+     * fallback reintroduces the drop whenever no route matched at all, e.g.
+     * every route disabled or scoped elsewhere.
+     */
     if (!matched && s.default_channel_id[0] &&
-        notifyd_severity_rank(notifyd_json_str(body, "severity", "info")) >= notifyd_severity_rank("warning")) {
+        (notifyd_severity_rank(notifyd_json_str(body, "severity", "info")) >= notifyd_severity_rank("warning") ||
+         notifyd_event_is_recovery(notifyd_json_str(body, "event", "")))) {
         matched = 1;
         if (notifyd_insert_outbox(s.default_channel_id, "default", body, s.max_attempts, NULL, 0))
             enqueued = 1;

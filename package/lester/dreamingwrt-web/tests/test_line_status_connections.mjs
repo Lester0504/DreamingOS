@@ -18,7 +18,15 @@ const context = {
       if (Number.isFinite(number)) return number;
     }
     return 0;
-  }
+  },
+  /*
+   * connectionCountOf now delegates the field set to the shared normalizer, so
+   * the harness supplies the real module rather than a paraphrase. Passing the
+   * genuine implementation is the point: a divergence between this test's idea
+   * of the field list and the shipped one is exactly what it must catch.
+   */
+  connTruth: (await import('../files/www/dreamingwrt/static/js/dwrt-conn-truth.js')).default
+    || globalThis.DWRTConnTruth
 };
 vm.createContext(context);
 vm.runInContext([

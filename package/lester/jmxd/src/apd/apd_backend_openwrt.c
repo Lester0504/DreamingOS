@@ -170,6 +170,33 @@ static int apd_hostapd_control_dir_available(void);
     defined(APD_SURVEY_STANDALONE_TEST) || \
     defined(APD_NEIGHBOR_SCAN_STANDALONE_TEST)
 #define APD_SURVEY_REASON_LEN 63U
+/*
+ * Locating the `iw` binary is an access() probe with nothing hostapd-specific in
+ * it, so it lives under the widest guard that any of its callers use. It used to
+ * sit inside "#ifndef APD_HOSTAPD_STANDALONE_TEST" while its callers are in the
+ * neighbor-scan/survey vendor-fallback block that IS compiled in for those
+ * fixtures, so both standalone builds saw a call with no declaration:
+ * "call to undeclared function 'apd_find_iw'". Note the guard below admits the
+ * survey fixture too, which defines APD_SURVEY_STANDALONE_TEST but not
+ * APD_NEIGHBOR_SCAN_STANDALONE_TEST -- placing this any deeper fixes only the
+ * neighbor-scan build and leaves the survey build broken.
+ */
+static const char *apd_find_iw(void)
+{
+    static const char *const paths[] = {
+        "/usr/sbin/iw", "/usr/bin/iw", "/sbin/iw", NULL
+    };
+    size_t i;
+
+    if (APD_IW_PATH[0] && access(APD_IW_PATH, X_OK) == 0)
+        return APD_IW_PATH;
+    for (i = 0; paths[i]; i++) {
+        if (access(paths[i], X_OK) == 0)
+            return paths[i];
+    }
+    return NULL;
+}
+
 
 struct apd_survey_sample {
     int has_frequency;
@@ -2585,22 +2612,6 @@ static int apd_openwrt_phy_count(int *inventory_available)
     return count;
 }
 
-static const char *apd_find_iw(void)
-{
-    static const char *const paths[] = {
-        "/usr/sbin/iw", "/usr/bin/iw", "/sbin/iw", NULL
-    };
-    size_t i;
-
-    if (APD_IW_PATH[0] && access(APD_IW_PATH, X_OK) == 0)
-        return APD_IW_PATH;
-    for (i = 0; paths[i]; i++) {
-        if (access(paths[i], X_OK) == 0)
-            return paths[i];
-    }
-    return NULL;
-}
-
 static const char *apd_uci_string(struct uci_context *ctx,
                                   struct uci_section *section,
                                   const char *name)
@@ -4763,12 +4774,21 @@ static void apd_collect_radio_surveys(const char *path,
 
 #endif /* APD_HOSTAPD_STANDALONE_TEST */
 
-/* Compiled for production and for the neighbor/survey standalone
- * fixtures (which link json-c); the hostapd-only fixture builds without
- * json-c and must not see this block. */
+/* Compiled for production and for the neighbor-scan standalone fixture (which
+ * links json-c); the hostapd-only fixture builds without json-c and must not
+ * see this block.
+ *
+ * Deliberately NOT compiled for a survey-only fixture. This block calls the
+ * neighbor-scan helpers (apd_neighbor_target_from_iw(), apd_find_wlanconfig(),
+ * struct apd_neighbor_target, APD_NEIGHBOR_REASON_LEN), which are declared under
+ * a guard requiring APD_NEIGHBOR_SCAN_STANDALONE_TEST. Admitting
+ * APD_SURVEY_STANDALONE_TEST here pulled these callers in without their
+ * dependencies, so tests/apd_survey_runtime_fixture.c failed to compile on
+ * symbols it never uses: it needs only apd_survey_utilization() and
+ * apd_survey_collect_raw(), both defined far above this point.
+ */
 #if !defined(APD_HOSTAPD_STANDALONE_TEST) || \
-    defined(APD_NEIGHBOR_SCAN_STANDALONE_TEST) || \
-    defined(APD_SURVEY_STANDALONE_TEST)
+    defined(APD_NEIGHBOR_SCAN_STANDALONE_TEST)
 
 /* ── Authoritative channel catalog from `iw phy` ─────────────────────────
  * Channels, disabled/no-IR/radar flags and DFS state come only from the

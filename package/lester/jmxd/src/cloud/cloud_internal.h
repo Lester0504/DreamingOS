@@ -92,6 +92,14 @@
 #define CLOUD_SIGNING_KEY_PATH CLOUD_STATE_DIR "/identity.ed25519"
 #define CLOUD_TUNNEL_TOKEN_PATH CLOUD_STATE_DIR "/tunnel_token"
 #define CLOUD_ROUTER_ID_PATH CLOUD_STATE_DIR "/router_id"
+/*
+ * The id used on the wire with the relay. Always the key fingerprint, which is
+ * not necessarily what CLOUD_ROUTER_ID_PATH holds: a legacy router keeps its
+ * UUID there because paired Apps pinned it. Persisted separately so other
+ * components (notifyd's relay ingest) can address the relay without having to
+ * re-derive it from the private key material, which they cannot read.
+ */
+#define CLOUD_RELAY_ROUTER_ID_PATH CLOUD_STATE_DIR "/relay_router_id"
 /* Must stay identical to webd's APP_API_DB_PATH (jmx_app_api.c). webd owns the
  * pairing rows; this daemon only reads them. Verified against 30.1, where the
  * file on disk is apid.db. */

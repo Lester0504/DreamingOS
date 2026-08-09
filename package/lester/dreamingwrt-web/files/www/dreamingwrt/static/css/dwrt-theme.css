@@ -52,6 +52,16 @@
   --color-danger: var(--app-danger, #ff6b8a);
   --color-info: #20bde8;
 
+  /* 策略引擎提示条（.policy-entity-alert）的底墨配对。
+     底色与墨色必须成对使用：alert 自带接近不透明的纸面，墨色不能再跟随随壁纸
+     翻转的自适应前景，否则会出现浅字压浅底。两者方向相反，light / dark 各自
+     都留出对比余量（最坏壁纸下实测 14.6:1）。
+     定义在主题层而不是 policy-entities.css：那份样式受契约约束，不得出现字面
+     色值，色值一律由这里提供。原先它引用的 --color-surface-subtle 全站从未
+     定义，于是一路 fallback 到 transparent，alert 因此没有纸面。 */
+  --color-surface-alert-paper: rgba(233, 236, 241, 0.96);
+  --color-surface-alert-ink: rgba(8, 13, 21, 0.98);
+
   --setup-text: var(--dwrt-ink);
   --setup-text-secondary: var(--dwrt-text);
   --setup-text-muted: var(--dwrt-muted);
@@ -136,6 +146,9 @@ html[data-theme-resolved="dark"] {
   --color-on-accent: #07101c;
   --color-surface-dense: rgb(10 16 25 / 0.78);
   --color-surface-solid: rgb(18 27 40);
+  /* 提示条纸面在 dark 主题下翻向深色，墨色随之翻向浅色，成对使用。 */
+  --color-surface-alert-paper: rgba(9, 13, 22, 0.96);
+  --color-surface-alert-ink: rgba(240, 246, 255, 0.96);
 }
 
 html[data-adaptive-foreground="dark"] {
