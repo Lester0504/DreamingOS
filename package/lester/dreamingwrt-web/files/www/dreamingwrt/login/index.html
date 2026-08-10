@@ -6,10 +6,10 @@
     <meta name="robots" content="noindex,nofollow">
     <title>Dreaming OS 登录</title>
     <link rel="icon" href="/static/images/logo-64.png">
-    <link rel="stylesheet" href="/login/login.css?v=20260725-corner-clip-01">
+    <link rel="stylesheet" href="/login/login.css?v=20260809-password-rotate-01">
     <link rel="stylesheet" href="/static/css/notifications.css?v=20260712-10">
     <link rel="stylesheet" href="/static/css/dwrt-theme.css?v=20260722-03">
-    <link rel="stylesheet" href="/static/ui-kit/dwrt-sampled-liquid-glass.css?v=20260730-safari-glass-lite-06">
+    <link rel="stylesheet" href="/static/ui-kit/dwrt-sampled-liquid-glass.css?v=20260808-glass-unified-no-safari-branch-01">
   </head>
   <body>
     <main class="dwrt-login-page" id="loginPage">
@@ -61,6 +61,20 @@
                 </button>
               </label>
 
+              <!--
+                周期性改密（rotate 模式）专用的「新密码」框。setup 模式沿用 password
+                作为新密码，所以只有 rotate 需要三个框：旧密码（password）、新密码、
+                确认密码（confirmPassword）。默认 hidden，只有后端在登录响应里明确
+                要求改密时才显示 —— 未接入该合同的固件上这一段不会出现。
+              -->
+              <label class="field password-field rotate-only" id="newPasswordField" hidden>
+                <span class="visually-hidden">新密码</span>
+                <input id="newPassword" name="new_password" type="password" placeholder="新密码" autocomplete="new-password">
+                <span class="field-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24"><path d="M17 9V7a5 5 0 0 0-10 0v2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1Zm-8 0V7a3 3 0 1 1 6 0v2H9Zm3 4a1.7 1.7 0 0 1 .85 3.17V18h-1.7v-1.83A1.7 1.7 0 0 1 12 13Z"></path></svg>
+                </span>
+              </label>
+
               <label class="field password-field setup-only" id="confirmPasswordField" hidden>
                 <span class="visually-hidden">确认密码</span>
                 <input id="confirmPassword" name="confirm_password" type="password" placeholder="确认密码" autocomplete="new-password">
@@ -88,8 +102,8 @@
     </main>
 
     <script src="/static/js/notifications.js?v=20260622-1"></script>
-    <script src="/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260730-safari-glass-lite-06"></script>
-    <script src="/static/js/shell-prewarm.js?v=20260730-session-recovery-clip-06"></script>
+    <script src="/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260808-glass-unified-no-safari-branch-01"></script>
+    <script src="/static/js/shell-prewarm.js?v=20260809-advanced-capability-truth-01"></script>
     <script>
       const LIQUID_GLASS = {
         cornerRadius: 25,
@@ -115,6 +129,8 @@
       const password = document.getElementById('password');
       const confirmPassword = document.getElementById('confirmPassword');
       const confirmPasswordField = document.getElementById('confirmPasswordField');
+      const newPassword = document.getElementById('newPassword');
+      const newPasswordField = document.getElementById('newPasswordField');
       const togglePassword = document.getElementById('togglePassword');
       const form = document.getElementById('loginForm');
       const button = document.getElementById('loginButton');
@@ -156,15 +172,25 @@
         formMode = mode;
         setupToken = options.setupToken || setupToken || '';
         const isSetup = mode === 'setup';
-        shell.classList.toggle('is-first-run', isSetup);
-        confirmPasswordField.hidden = !isSetup;
-        username.autocomplete = isSetup ? 'username' : 'username';
+        /*
+         * rotate = 周期性改密到期后的强制改密。它与 setup 的差别只有一处：
+         * setup 用 password 当新密码，rotate 要先验旧密码，所以多一个「新密码」框。
+         * 确认框两种模式共用。
+         */
+        const isRotate = mode === 'rotate';
+        shell.classList.toggle('is-first-run', isSetup || isRotate);
+        confirmPasswordField.hidden = !(isSetup || isRotate);
+        newPasswordField.hidden = !isRotate;
         password.autocomplete = isSetup ? 'new-password' : 'current-password';
-        password.placeholder = isSetup ? '新密码' : '密码';
-        confirmPassword.required = isSetup;
-        formTitle.textContent = isSetup ? 'Create Admin' : 'Welcome Back';
-        formSubtitle.innerHTML = isSetup ? 'Set your <span>Dreaming OS</span> account' : 'Enter your <span>Dreaming OS</span>';
-        button.querySelector('span').textContent = isSetup ? '创建管理员' : '登录';
+        password.placeholder = isSetup ? '新密码' : (isRotate ? '当前密码' : '密码');
+        confirmPassword.required = isSetup || isRotate;
+        newPassword.required = isRotate;
+        username.readOnly = isRotate;
+        formTitle.textContent = isSetup ? 'Create Admin' : (isRotate ? 'Update Password' : 'Welcome Back');
+        formSubtitle.innerHTML = isSetup
+          ? 'Set your <span>Dreaming OS</span> account'
+          : (isRotate ? 'Rotate your <span>Dreaming OS</span> password' : 'Enter your <span>Dreaming OS</span>');
+        button.querySelector('span').textContent = isSetup ? '创建管理员' : (isRotate ? '修改密码并登录' : '登录');
         if (isSetup) {
           username.value = options.username || '';
           password.value = '';
@@ -172,6 +198,40 @@
           setMessage('默认账号已验证，请创建新的管理账号。', 'info');
           setTimeout(() => username.focus(), 80);
         }
+        if (isRotate) {
+          if (options.username) username.value = options.username;
+          /*
+           * 旧密码保留在框里：用户刚刚输过一次且已被后端验证通过，再让他重敲
+           * 一遍没有安全收益，只会增加输错的机会。新密码两个框清空。
+           */
+          newPassword.value = '';
+          confirmPassword.value = '';
+          setMessage(options.message || '当前密码已到达设定的使用周期，请设置新密码后继续。', 'info');
+          setTimeout(() => newPassword.focus(), 80);
+        }
+      }
+
+      /*
+       * 后端是否要求先改密码。
+       *
+       * 已经在 rotate 模式里就不再重入，否则改密失败（例如新密码太弱）时会
+       * 反复重置表单、清掉刚输的内容。
+       *
+       * 判据只认后端的显式信号，且**不看 HTTP 状态码**：这个合同还没落地，
+       * 后端可能用 200 + 标志位，也可能用 4xx + error.code 表达同一件事
+       * （design.md Capability truth 第 3 条：同一后端不同构建会用不同状态码
+       * 表达同一件事，两条判据都要覆盖）。因此这里既读标志位也读 error.code，
+       * 但绝不把「登录失败」泛化成「要改密码」—— 只有明确的键名才算。
+       */
+      function passwordRotationRequired(res, body, data) {
+        if (formMode === 'rotate') return false;
+        const flag = data && (data.password_change_required
+          || data.requires_password_change
+          || data.must_change_password
+          || data.password_expired);
+        if (flag === true) return true;
+        const code = String((body && body.error && body.error.code) || (body && body.code) || '');
+        return /^(password_change_required|password_expired|password_rotation_required)$/.test(code);
       }
 
       function responseMessage(body, fallback) {
@@ -235,7 +295,8 @@
         avatar.style.transform = '';
       });
       password.addEventListener('blur', () => setTimeout(() => {
-        if (document.activeElement !== username && document.activeElement !== confirmPassword) shell.classList.remove('is-password');
+        if (document.activeElement !== username && document.activeElement !== confirmPassword
+          && document.activeElement !== newPassword) shell.classList.remove('is-password');
       }, 0));
 
       confirmPassword.addEventListener('focus', () => {
@@ -244,13 +305,26 @@
         avatar.style.transform = '';
       });
       confirmPassword.addEventListener('blur', () => setTimeout(() => {
-        if (document.activeElement !== username && document.activeElement !== password) shell.classList.remove('is-password');
+        if (document.activeElement !== username && document.activeElement !== password
+          && document.activeElement !== newPassword) shell.classList.remove('is-password');
+      }, 0));
+
+      /* 新密码框与另外两个密码框共享同一套聚焦态，否则 rotate 模式下卡片会跳。 */
+      newPassword.addEventListener('focus', () => {
+        shell.classList.add('is-password');
+        shell.classList.remove('is-user', 'has-error');
+        avatar.style.transform = '';
+      });
+      newPassword.addEventListener('blur', () => setTimeout(() => {
+        if (document.activeElement !== username && document.activeElement !== password
+          && document.activeElement !== confirmPassword) shell.classList.remove('is-password');
       }, 0));
 
       togglePassword.addEventListener('click', () => {
         const showing = password.type === 'text';
         password.type = showing ? 'password' : 'text';
         confirmPassword.type = showing ? 'password' : 'text';
+        newPassword.type = showing ? 'password' : 'text';
         togglePassword.setAttribute('aria-label', showing ? '显示密码' : '隐藏密码');
         password.focus();
       });
@@ -576,18 +650,53 @@
             return;
           }
         }
+        if (formMode === 'rotate') {
+          if (!newPassword.value || !confirmPassword.value) {
+            setMessage('请输入新密码并再次确认。', 'error');
+            return;
+          }
+          if (newPassword.value !== confirmPassword.value) {
+            setMessage('两次输入的新密码不一致。', 'error');
+            return;
+          }
+          if (newPassword.value.length < 8) {
+            setMessage('新密码至少需要 8 个字符。', 'error');
+            return;
+          }
+          /* 后端也会拒同密码复用，这里先在本地挡掉，省一次必然失败的往返。 */
+          if (newPassword.value === password.value) {
+            setMessage('新密码不能与当前密码相同。', 'error');
+            return;
+          }
+        }
         shell.classList.add('is-submitting');
         button.disabled = true;
         try {
+          /*
+           * rotate 走同一个 login 端点，额外带 new_password / confirm_password：
+           * 强制改密发生在会话建立之前，此时还没有 access_token，用不了任何
+           * 需要鉴权的改密接口。键名与 setup 保持一致，减少后端两套解析。
+           */
           const payload = formMode === 'setup'
             ? { username: username.value.trim(), password: password.value, confirm_password: confirmPassword.value, setup_token: setupToken }
-            : { username: username.value.trim(), password: password.value };
+            : (formMode === 'rotate'
+              ? { username: username.value.trim(), password: password.value, new_password: newPassword.value, confirm_password: confirmPassword.value }
+              : { username: username.value.trim(), password: password.value });
           const endpoint = formMode === 'setup' ? '/api/v1/session/init' : '/api/v1/session/login';
           const { res, body } = await postApiJson(endpoint, payload);
           const data = sessionData(body);
           if (res.ok && data && data.access_token) saveSession(data);
           if (res.ok && data && data.requires_initial_setup) {
             setFormMode('setup', { username: '', setupToken: data.setup_token || '' });
+          } else if (passwordRotationRequired(res, body, data)) {
+            /*
+             * 后端要求先改密码。这一分支只在后端真的这么答时才走到，
+             * 未实现该合同的固件永远不会命中，页面行为与现在完全一致。
+             */
+            setFormMode('rotate', {
+              username: username.value.trim(),
+              message: responseMessage(body, '当前密码已到达设定的使用周期，请设置新密码后继续。')
+            });
           } else if (res.ok && formMode === 'setup' && data && data.initialized) {
             setMessage('管理账号已创建，下一步进入初始化配网。', 'success');
             setupToken = '';

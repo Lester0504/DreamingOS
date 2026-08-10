@@ -313,6 +313,21 @@ int aegisxd_db_init(void)
         " suricata_interface TEXT NOT NULL DEFAULT '',"
         " suricata_queue_num INTEGER NOT NULL DEFAULT 0,"
         " suricata_fail_open INTEGER NOT NULL DEFAULT 1,"
+        /*
+         * Traffic-log collection scope. 'all' keeps every security event,
+         * 'blocked' keeps only the ones that were actually stopped. This is a
+         * filter over security events (policy / DNS / reputation hits), not
+         * over forwarded traffic, so its volume is hit count and not throughput.
+         *
+         * The three source toggles decide whether a class of event joins the
+         * log at all; they carry no scope of their own, because the scope is a
+         * single global choice over the combined set.
+         */
+        " traffic_log_scope TEXT NOT NULL DEFAULT 'all'"
+        "   CHECK(traffic_log_scope IN ('all','blocked')),"
+        " traffic_log_gateway_dns INTEGER NOT NULL DEFAULT 1,"
+        " traffic_log_aegisx_service INTEGER NOT NULL DEFAULT 1,"
+        " traffic_log_device_admin INTEGER NOT NULL DEFAULT 0,"
         " updated_at INTEGER NOT NULL DEFAULT 0)") != 0)
         return aegisxd_db_init_fail();
     if (aegisxd_add_column_if_missing(g_aegisxd_config_db, "aegis_settings",
@@ -324,6 +339,25 @@ int aegisxd_db_init(void)
         aegisxd_add_column_if_missing(g_aegisxd_config_db, "aegis_settings",
         "suricata_fail_open",
         "ALTER TABLE aegis_settings ADD COLUMN suricata_fail_open INTEGER NOT NULL DEFAULT 1") != 0)
+        return aegisxd_db_init_fail();
+    /*
+     * Existing installs already have the table, so the columns above only
+     * reach them through these migrations. ALTER TABLE ADD COLUMN cannot carry
+     * the CHECK constraint, so the write path validates the value instead;
+     * a fresh install gets both, an upgraded one gets the validation.
+     */
+    if (aegisxd_add_column_if_missing(g_aegisxd_config_db, "aegis_settings",
+        "traffic_log_scope",
+        "ALTER TABLE aegis_settings ADD COLUMN traffic_log_scope TEXT NOT NULL DEFAULT 'all'") != 0 ||
+        aegisxd_add_column_if_missing(g_aegisxd_config_db, "aegis_settings",
+        "traffic_log_gateway_dns",
+        "ALTER TABLE aegis_settings ADD COLUMN traffic_log_gateway_dns INTEGER NOT NULL DEFAULT 1") != 0 ||
+        aegisxd_add_column_if_missing(g_aegisxd_config_db, "aegis_settings",
+        "traffic_log_aegisx_service",
+        "ALTER TABLE aegis_settings ADD COLUMN traffic_log_aegisx_service INTEGER NOT NULL DEFAULT 1") != 0 ||
+        aegisxd_add_column_if_missing(g_aegisxd_config_db, "aegis_settings",
+        "traffic_log_device_admin",
+        "ALTER TABLE aegis_settings ADD COLUMN traffic_log_device_admin INTEGER NOT NULL DEFAULT 0") != 0)
         return aegisxd_db_init_fail();
     if (aegisxd_exec(g_aegisxd_config_db,
         "CREATE TABLE IF NOT EXISTS aegis_honeypots ("
@@ -697,10 +731,16 @@ int aegisxd_settings_load(struct aegisxd_settings *out)
     out->suricata_interface[0] = '\0';
     out->suricata_queue_num = 0;
     out->suricata_fail_open = 1;
+    snprintf(out->traffic_log_scope, sizeof(out->traffic_log_scope), "%s", "all");
+    out->traffic_log_gateway_dns = 1;
+    out->traffic_log_aegisx_service = 1;
+    out->traffic_log_device_admin = 0;
 
     st = aegisxd_config_prepare(
         "SELECT enabled,mode,source_level,suricata_version,default_action,logging_enabled,"
-        "suricata_interface,suricata_queue_num,suricata_fail_open "
+        "suricata_interface,suricata_queue_num,suricata_fail_open,"
+        "traffic_log_scope,traffic_log_gateway_dns,traffic_log_aegisx_service,"
+        "traffic_log_device_admin "
         "FROM aegis_settings WHERE id=1");
     if (!st)
         return -1;
@@ -719,7 +759,63 @@ int aegisxd_settings_load(struct aegisxd_settings *out)
                  aegisxd_sqlite_text(st, 6, ""));
         out->suricata_queue_num = sqlite3_column_int(st, 7);
         out->suricata_fail_open = sqlite3_column_int(st, 8) ? 1 : 0;
+        snprintf(out->traffic_log_scope, sizeof(out->traffic_log_scope), "%s",
+                 aegisxd_sqlite_text(st, 9, "all"));
+        out->traffic_log_gateway_dns = sqlite3_column_int(st, 10) ? 1 : 0;
+        out->traffic_log_aegisx_service = sqlite3_column_int(st, 11) ? 1 : 0;
+        out->traffic_log_device_admin = sqlite3_column_int(st, 12) ? 1 : 0;
+        /* A row written before the CHECK existed, or by hand, must not be
+         * handed onward as a third value the rest of the code cannot read. */
+        if (strcmp(out->traffic_log_scope, "all") &&
+            strcmp(out->traffic_log_scope, "blocked"))
+            snprintf(out->traffic_log_scope, sizeof(out->traffic_log_scope),
+                     "%s", "all");
     }
     sqlite3_finalize(st);
     return rc == SQLITE_ROW || rc == SQLITE_DONE ? 0 : -1;
+}
+
+int aegisxd_traffic_log_scope_valid(const char *scope)
+{
+    return scope && (!strcmp(scope, "all") || !strcmp(scope, "blocked"));
+}
+
+/*
+ * Persist the traffic-log settings.
+ *
+ * Every field is optional: NULL scope or a negative flag means "leave this one
+ * alone", so a caller that only wants to flip one toggle does not have to
+ * resend the rest and cannot blank a value by omitting it. Returns 0 on
+ * success, -1 on a storage failure and -2 on an invalid scope.
+ */
+int aegisxd_traffic_log_settings_save(const char *scope, int gateway_dns,
+                                      int aegisx_service, int device_admin)
+{
+    sqlite3_stmt *st;
+    int rc;
+
+    if (scope && !aegisxd_traffic_log_scope_valid(scope))
+        return -2;
+    if (!g_aegisxd_config_db)
+        return -1;
+    st = aegisxd_config_prepare(
+        "UPDATE aegis_settings SET "
+        "traffic_log_scope=COALESCE(?1,traffic_log_scope),"
+        "traffic_log_gateway_dns=CASE WHEN ?2<0 THEN traffic_log_gateway_dns ELSE ?2 END,"
+        "traffic_log_aegisx_service=CASE WHEN ?3<0 THEN traffic_log_aegisx_service ELSE ?3 END,"
+        "traffic_log_device_admin=CASE WHEN ?4<0 THEN traffic_log_device_admin ELSE ?4 END,"
+        "updated_at=?5 WHERE id=1");
+    if (!st)
+        return -1;
+    if (scope)
+        sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(st, 1);
+    sqlite3_bind_int(st, 2, gateway_dns);
+    sqlite3_bind_int(st, 3, aegisx_service);
+    sqlite3_bind_int(st, 4, device_admin);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)time(NULL));
+    rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 0 : -1;
 }

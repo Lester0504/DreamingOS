@@ -5,9 +5,13 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,14 +27,13 @@ class SelectedCountryBehaviorTests(unittest.TestCase):
         if configured:
             cls.exporter = Path(configured)
             return
-        if not shutil.which("cc") or subprocess.run(
-            ["pkg-config", "--exists", "libmaxminddb"], check=False
-        ).returncode:
+        # 31.6 ships libmaxminddb in the staging_dir but with no .pc file, so
+        # the pkg-config probe skipped this suite on the very host where it
+        # matters. Ask the shared resolver whether the dependency is reachable.
+        if not shutil.which("cc") or not apd_test_deps.have_package("libmaxminddb"):
             raise unittest.SkipTest("libmaxminddb development files are unavailable")
         cls.exporter = Path(cls._build_dir.name) / "geo-export"
-        flags = subprocess.check_output(
-            ["pkg-config", "--cflags", "--libs", "libmaxminddb"], text=True
-        ).split()
+        flags = apd_test_deps.package_flags("libmaxminddb")
         subprocess.run(
             [
                 "cc", "-std=c11", "-Wall", "-Wextra", "-Werror",

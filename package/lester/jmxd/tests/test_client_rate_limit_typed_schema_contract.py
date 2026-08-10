@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,17 +106,12 @@ def test_runtime_failure_has_stable_reason_and_field() -> None:
 
 def test_json_type_rejection_precedes_mutation_in_host_fixture() -> None:
     cc = shutil.which("cc") or shutil.which("clang")
-    pkg_config = shutil.which("pkg-config")
-    if not cc or not pkg_config:
+    # Keyed on whether json-c can actually be resolved. The old guard keyed on
+    # `pkg-config --libs json-c` succeeding, which is false on 31.6, so this
+    # fixture returned early there and silently tested nothing.
+    if not cc or not apd_test_deps.have_package("json-c"):
         return
-    flags = subprocess.run(
-        [pkg_config, "--cflags", "--libs", "json-c"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if flags.returncode != 0:
-        return
+    json_c_flags = apd_test_deps.package_flags("json-c")
 
     helpers = body(CORE, "static int nc_rate_limit_json_string", "static void nc_rate_limit_emit_filter")
     setters = body(CORE, "int nc_client_rate_limit_set_json", "/* ═══ Client Control Rule Schedule Runtime")
@@ -184,7 +183,7 @@ int main(void) {{
         binary = Path(tmp) / "rate_limit_schema_fixture"
         src.write_text(source, encoding="utf-8")
         subprocess.run(
-            [cc, "-std=c11", "-Wall", "-Wextra", "-Werror", str(src), "-o", str(binary), *flags.stdout.split()],
+            [cc, "-std=c11", "-Wall", "-Wextra", "-Werror", str(src), "-o", str(binary), *json_c_flags],
             check=True,
         )
         subprocess.run([str(binary)], check=True)

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import os
-import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,13 +18,9 @@ MAKEFILE = ROOT / "src/Makefile"
 
 
 def sqlite_flags() -> list[str]:
-    result = subprocess.run(
-        ["pkg-config", "--cflags", "--libs", "sqlite3"],
-        text=True,
-        capture_output=True,
-    )
-    assert result.returncode == 0, "sqlite3 development files are required"
-    return shlex.split(result.stdout)
+    # Resolved rather than probed: a host with no sqlite3.pc still has a usable
+    # prefix, and the assertion below now reflects the library, not the metadata.
+    return apd_test_deps.package_flags("sqlite3")
 
 
 def test_module_contract_markers() -> None:

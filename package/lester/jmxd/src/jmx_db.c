@@ -39,7 +39,7 @@ static int g_fingerprint_catalog_changed = 0;
 #define FINGERPRINT_CATALOG_VERSION 4
 #define FINGERPRINT_DB_APPLICATION_ID 1146570320
 #define FINGERPRINT_DB_SCHEMA_VERSION 1
-#define JMX_DB_SCHEMA_VERSION 8
+#define JMX_DB_SCHEMA_VERSION 9
 
 static int db_signature_db_path(char *path, size_t path_len)
 {
@@ -3052,7 +3052,13 @@ int jmx_db_init(void)
                             " latency_max REAL NOT NULL DEFAULT 0,"
                             " PRIMARY KEY(ts, wan_id));") != 0 ||
                     db_exec("CREATE INDEX IF NOT EXISTS idx_dashboard_activity_sample_ts "
-                            "ON dashboard_activity_sample(ts);") != 0)
+                            "ON dashboard_activity_sample(ts);") != 0 ||
+                    /* Per-WAN readers filter wan_id=? over a time window; see
+                     * the schema v9 step for why a ts-only index makes each of
+                     * those scan the whole window. */
+                    db_exec("CREATE INDEX IF NOT EXISTS "
+                            "idx_dashboard_activity_sample_wan_ts "
+                            "ON dashboard_activity_sample(wan_id, ts);") != 0)
                     goto migration_failed;
             }
             if (db_exec("CREATE TABLE IF NOT EXISTS dashboard_daily_usage_counter ("
@@ -3213,6 +3219,30 @@ int jmx_db_init(void)
             }
             if (db_exec("CREATE INDEX IF NOT EXISTS idx_client_overrides_mac "
                         "ON client_overrides(mac);") != 0)
+                goto migration_failed;
+        }
+        /*
+         * Schema v9: index dashboard_activity_sample by (wan_id, ts).
+         *
+         * The table is keyed PRIMARY KEY(ts, wan_id) and carried only a ts
+         * index, but every per-WAN reader filters wan_id=? over a time window
+         * (jmx_db_usage_integrate_window(), used by the monthly usage contract
+         * on each WAN). With a ts-leading index only, that query walks every
+         * row in the window and discards the WANs it did not ask for, so the
+         * cost per WAN is the size of the whole window rather than of that
+         * WAN's slice. Measured on 30.1: 655026 rows in the 30-day window
+         * across 4 live WANs, ~70 ms per WAN, which is what pushed
+         * dw_refresh_wan_state() to 236-254 ms against a 200 ms tick budget.
+         *
+         * A wan_id-leading index turns each of those scans into a range seek
+         * over just that WAN's rows and also satisfies the ORDER BY ts, so no
+         * sort is added. The ts-only index is left in place: the whole-window
+         * readers (activity charts, pruning) still use it.
+         */
+        if (version < 9) {
+            if (db_exec("CREATE INDEX IF NOT EXISTS "
+                        "idx_dashboard_activity_sample_wan_ts "
+                        "ON dashboard_activity_sample(wan_id, ts);") != 0)
                 goto migration_failed;
         }
         if (db_set_schema_version(JMX_DB_SCHEMA_VERSION) != 0 || db_commit() != 0)
@@ -6467,10 +6497,23 @@ void jmx_db_add_wan_loss_contract(struct json_object *obj,
         sqlite3_finalize(st);
     }
 
-    json_object_object_add(obj, "up_loss_24h", json_object_new_double(up));
-    json_object_object_add(obj, "down_loss_24h", json_object_new_double(down));
-    json_object_object_add(obj, "loss_up_24h", json_object_new_double(up));
-    json_object_object_add(obj, "loss_down_24h", json_object_new_double(down));
+    /*
+     * No samples in the window means no measurement, so these are null rather
+     * than 0.0. A rendered "0%" for an unmeasured line reads as a perfect line.
+     */
+    if (samples > 0) {
+        json_object_object_add(obj, "up_loss_24h", json_object_new_double(up));
+        json_object_object_add(obj, "down_loss_24h", json_object_new_double(down));
+        json_object_object_add(obj, "loss_up_24h", json_object_new_double(up));
+        json_object_object_add(obj, "loss_down_24h", json_object_new_double(down));
+    } else {
+        json_object_object_add(obj, "up_loss_24h", json_object_new_null());
+        json_object_object_add(obj, "down_loss_24h", json_object_new_null());
+        json_object_object_add(obj, "loss_up_24h", json_object_new_null());
+        json_object_object_add(obj, "loss_down_24h", json_object_new_null());
+        json_object_object_add(obj, "loss_reason",
+                               json_object_new_string("no_samples_in_window"));
+    }
     json_object_object_add(obj, "loss_window_sec", json_object_new_int(86400));
     json_object_object_add(obj, "loss_window_label", json_object_new_string("24h"));
     json_object_object_add(obj, "loss_source", json_object_new_string("wan_health_bucket"));

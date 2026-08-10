@@ -643,6 +643,69 @@ static struct json_object *authd_delegated_array(int limit, int offset)
     return items;
 }
 
+/*
+ * Enumerate the WANs a delegated service may dial over.
+ *
+ * The write path only accepts a value matching wan.id / ifname / device of an
+ * enabled line, so the UI needs the same list to build a picker instead of a
+ * free-text box. Ordering matches route preference (metric, then priority),
+ * which makes the first entry the sensible default.
+ */
+struct json_object *authd_delegated_interface_options(void)
+{
+    struct json_object *items = json_object_new_array();
+    sqlite3_stmt *st = authd_prepare(
+        "SELECT id,name,ifname,device,metric,priority,role FROM wan WHERE enabled=1 "
+        "ORDER BY metric, priority, id");
+
+    while (st && sqlite3_step(st) == SQLITE_ROW) {
+        struct json_object *item = json_object_new_object();
+        const char *id = authd_sqlite_text(st, 0, "");
+        const char *name = authd_sqlite_text(st, 1, "");
+        const char *ifname = authd_sqlite_text(st, 2, "");
+
+        json_object_object_add(item, "value", json_object_new_string(id));
+        json_object_object_add(item, "label",
+                               json_object_new_string(name[0] ? name : id));
+        json_object_object_add(item, "ifname", json_object_new_string(ifname));
+        json_object_object_add(item, "device", json_object_new_string(authd_sqlite_text(st, 3, "")));
+        json_object_object_add(item, "metric", json_object_new_int(sqlite3_column_int(st, 4)));
+        json_object_object_add(item, "priority", json_object_new_int(sqlite3_column_int(st, 5)));
+        json_object_object_add(item, "role", json_object_new_string(authd_sqlite_text(st, 6, "")));
+        json_object_array_add(items, item);
+    }
+    sqlite3_finalize(st);
+    return items;
+}
+
+/*
+ * Resolve the interface a delegated service gets when the caller leaves the
+ * field empty: the most preferred enabled WAN. Returns 1 when one was written
+ * to out, 0 when no enabled WAN exists, -1 when the table is unreadable.
+ */
+int authd_delegated_interface_default(char *out, size_t out_len)
+{
+    sqlite3_stmt *st;
+    int found = 0;
+
+    if (!out || !out_len)
+        return -1;
+    out[0] = '\0';
+    if (!g_authd_db)
+        return -1;
+    if (sqlite3_prepare_v2(g_authd_db,
+                           "SELECT id FROM wan WHERE enabled=1 "
+                           "ORDER BY metric, priority, id LIMIT 1",
+                           -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        snprintf(out, out_len, "%s", authd_sqlite_text(st, 0, ""));
+        found = out[0] ? 1 : 0;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
 static struct json_object *authd_notifications_data(void)
 {
     struct json_object *data = json_object_new_object();
@@ -812,8 +875,11 @@ struct json_object *authd_delegated_json(struct json_object *query)
     root = authd_page(authd_delegated_array(limit, offset),
                       authd_query_int("SELECT COUNT(*) FROM authentication_delegated_services"),
                       limit, offset);
-    if (json_object_object_get_ex(root, "data", &data))
+    if (json_object_object_get_ex(root, "data", &data)) {
         json_object_object_add(data, "online", json_object_new_array());
+        json_object_object_add(data, "interface_options",
+                               authd_delegated_interface_options());
+    }
     return root;
 }
 
@@ -847,6 +913,8 @@ struct json_object *authd_aggregate_json(void)
     json_object_object_add(data, "account_management", accounts);
     json_object_object_add(delegated, "services", authd_delegated_array(AUTHD_MAX_LIMIT, 0));
     json_object_object_add(delegated, "online", json_object_new_array());
+    json_object_object_add(delegated, "interface_options",
+                           authd_delegated_interface_options());
     json_object_object_add(data, "delegated", delegated);
     json_object_object_add(data, "notifications", authd_notifications_data());
     json_object_object_add(data, "aggregate_limit", json_object_new_int(AUTHD_MAX_LIMIT));

@@ -598,6 +598,13 @@
 .user-auth-import-preview small { color: var(--app-text-muted); font-size: 11px; }
 .user-auth-import-errors span { padding: 8px 10px; border-radius: var(--app-radius-compact); color: #ff949d; background: rgba(211,51,72,.09); font-size: 11px; }
 
+/* 上网码列的脱敏说明，以及创建后一次性明文列表。 */
+.user-auth-voucher-note { display: block; margin-top: 2px; color: var(--app-text-muted); font-size: 11px; }
+.user-auth-voucher-reveal { max-height: 46dvh; overflow: auto; }
+.user-auth-voucher-reveal > div { grid-template-columns: minmax(0,1fr) auto; align-items: center; }
+.user-auth-voucher-reveal strong { font: 700 15px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 1.5px; user-select: all; }
+.user-auth-voucher-reveal span { justify-self: end; color: var(--app-text-muted); font-size: 11px; }
+
 .user-auth-preview-overlay { position: fixed; z-index: 84; inset: 0; border: 0; background: rgba(3,8,16,.46); backdrop-filter: blur(3px); }
 .user-auth-preview-dialog { position: fixed; z-index: 85; inset: 50% auto auto 50%; width: min(92vw, 760px); max-height: min(88dvh, 760px); display: grid; grid-template-rows: auto minmax(0,1fr); overflow: hidden; transform: translate(-50%,-50%); }
 .user-auth-preview-dialog > header { min-height: 58px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; border-bottom: 1px solid rgba(255,255,255,.10); }
@@ -800,6 +807,14 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
 .cnc-status.is-success { color: #5ee59b; background: rgba(38,174,99,.12); }
 .cnc-status.is-warning { color: #f2c66d; background: rgba(211,150,42,.12); }
 .cnc-status.is-error { color: #ff8a94; background: rgba(211,51,72,.12); }
+/*
+ * 「拦不到任何设备」和「你正在使用的设备」都是必须读到的警示，不能被上面那条
+ * `.cnc-table td small` 的 nowrap + ellipsis 截断，所以在这里显式放开换行。
+ */
+.cnc-table td small.cnc-group-warning,
+.cnc-table td small.cnc-self-device { white-space: normal; overflow: visible; font-weight: 700; line-height: 1.45; }
+.cnc-table td small.cnc-group-warning { color: #f2c66d; }
+.cnc-table td small.cnc-self-device { color: #ff8a94; }
 .cnc-capability-card { min-height: 0; display: grid; gap: 6px; padding: 12px 16px; }
 .cnc-capability-card strong { font-size: 12px; font-weight: 740; }
 .cnc-capability-card ul { margin: 0; padding-left: 16px; display: grid; gap: 3px; }
@@ -808,6 +823,26 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
 .cnc-source-switch { display: grid; gap: 5px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .cnc-source-switch button { min-width: 0; height: 32px; padding: 0 10px; border: 0; border-radius: var(--app-radius-control); color: var(--app-text-muted); background: var(--dwrt-control-material, rgba(255,255,255,.07)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.1); font-size: 11px; font-weight: 700; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cnc-source-switch button.is-active { color: #fff; background: rgba(47,126,234,.78); }
+
+/* 生效时段：模式切换沿用来源切换的两列几何，星期沿用限速页的七列，保持同一视觉语汇。 */
+.cnc-schedule-section { display: grid; gap: 10px; min-width: 0; }
+.cnc-schedule-switch { display: grid; gap: 5px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cnc-schedule-switch button { min-width: 0; height: 32px; padding: 0 10px; border: 0; border-radius: var(--app-radius-control); color: var(--app-text-muted); background: var(--dwrt-control-material, rgba(255,255,255,.07)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.1); font-size: 11px; font-weight: 700; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cnc-schedule-switch button.is-active { color: #fff; background: rgba(47,126,234,.78); }
+.cnc-weekdays { display: grid; gap: 8px; min-width: 0; }
+.cnc-weekdays > span { color: var(--app-text-secondary); font-size: 12px; font-weight: 700; }
+.cnc-weekdays > div { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 5px; }
+.cnc-weekdays label { position: relative; height: 34px; display: grid; place-items: center; border-radius: var(--app-radius-compact); color: var(--app-text-muted); background: var(--dwrt-control-material, rgba(255,255,255,.07)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.1); font-size: 11px; cursor: pointer; }
+.cnc-weekdays label.is-active { color: #fff; background: rgba(47,126,234,.78); }
+.cnc-weekdays input { position: absolute; opacity: 0; pointer-events: none; }
+.cnc-weekdays > small,
+.cnc-schedule-hint { color: var(--app-text-muted); font-size: 11px; line-height: 1.5; }
+/* 到期时刻已过去的即时提示：与列表里的失效警示同色，说明这是"存得下但不生效"。 */
+.cnc-expires-warning { color: #f2c66d; font-size: 11px; font-weight: 700; line-height: 1.5; }
+/* 日期时间控件的原生日历/滚轮由 UA 绘制，深色面板上不声明配色会得到白底白字。 */
+.user-auth-field input[type="datetime-local"] { color-scheme: light dark; }
+/* 时段列按内容宽度收窄，避免挤掉终端列的 MAC 与定位信息。 */
+.cnc-table .cnc-schedule { white-space: nowrap; }
 
 @media (max-width: 700px) {
   .cnc-mode-options { grid-template-columns: minmax(0, 1fr); }
@@ -818,6 +853,8 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
    */
   .cnc-table-controls { justify-content: space-between; }
   .cnc-table-controls .policy-search-main { width: 100%; }
+  /* 七列星期在 390px 下每格只剩 40px，换成四列两行，文字不会被压出格子。 */
+  .cnc-weekdays > div { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 
 /* APP filter page: same workbench, table, Sheet and sampled material as authentication. */

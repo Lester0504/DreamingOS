@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -12,11 +13,44 @@ RULESD = (ROOT / "files/rule_manager.lua").read_text(encoding="utf-8")
 JMX_ROOT = ROOT.parent / "jmx" / "src"
 KERNEL_FILTER = (JMX_ROOT / "jmx_app_filter.c").read_text(encoding="utf-8")
 KERNEL_MAIN = (JMX_ROOT / "jmx_main.c").read_text(encoding="utf-8")
+KERNEL_FILTER_H = (JMX_ROOT / "jmx_app_filter.h").read_text(encoding="utf-8")
+
+
+def _defined_int(source: str, name: str) -> int:
+    match = re.search(rf"^#define\s+{name}\s+(\d+)\s*$", source, re.MULTILINE)
+    assert match, f"{name} not found"
+    return int(match.group(1))
+
+
+# 从真实源码读取上限，避免测试里写死数字后与实现脱节。
+MAX_RULES = _defined_int(DB, "NC_AEGIS_APPFILTER_MAX_RULES")
+KERNEL_MAX_RULES = _defined_int(KERNEL_FILTER_H, "MAX_APP_FILTER_RULE_NUM")
+
+
+def test_userspace_and_kernel_rule_caps_agree() -> None:
+    """
+    webd 与 kmod 的上限必须一致，否则 webd 会接受内核拒收的规则，
+    表现为 applied_rule_count 少于配置条数(静默不生效)。
+    """
+    assert MAX_RULES == KERNEL_MAX_RULES
 
 
 def between(source: str, start: str, end: str) -> str:
     offset = source.index(start)
     return source[offset:source.index(end, offset)]
+
+
+def strip_comments(source: str) -> str:
+    """Drop /* */ and // comments so prose cannot trip a code assertion.
+
+    The "no nft" check below matches substrings across a 1600-line span that
+    happens to hold several unrelated features. A MAC ACL comment reading
+    "how many nft rules a bound rule expands to" was enough to fail it, which
+    says nothing about whether app filtering calls nft. Comparing code only
+    keeps the assertion pointed at behavior.
+    """
+    source = re.sub(r"/\*.*?\*/", " ", source, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", " ", source)
 
 
 def test_ubus_surface_and_authority_are_explicit() -> None:
@@ -33,8 +67,12 @@ def test_ubus_surface_and_authority_are_explicit() -> None:
     assert "network_control_rule" in control
     assert "network_control_app_rule" in control
     assert "config.db:network_control_rule+network_control_app_rule" in control
-    assert "nft " not in control
-    assert "flowd" not in control
+    # The intent is that app-filter delivery goes through rulesd + /dev/jmx and
+    # never shells out to nft, so only executable text is examined. The string
+    # literals that reach a shell still count, so a real regression is caught.
+    control_code = strip_comments(control)
+    assert "nft " not in control_code
+    assert "flowd" not in control_code
 
 
 def test_validation_is_strict_and_limited_to_rulesd_semantics() -> None:
@@ -125,7 +163,7 @@ def test_existing_rulesd_and_kernel_dataplane_are_the_only_apply_path() -> None:
     assert "set_appfilter_rule_mac_list" in RULESD
     assert "set_appfilter_rule_app_id_list" in RULESD
     assert '"filter_quic_supported", json_object_new_boolean(0)' in DB
-    assert "NC_AEGIS_APPFILTER_MAX_RULES 64" in DB
+    assert f"NC_AEGIS_APPFILTER_MAX_RULES {MAX_RULES}" in DB
     assert "NC_AEGIS_APPFILTER_MAX_APP_IDS 1024" in DB
     assert "nc_aegis_app_block_runtime_id" in DB
     assert "nc_rulesd_repair_app_runtime_ids" in DB
@@ -182,10 +220,10 @@ def _upsert(db: sqlite3.Connection, revision: int, rule: dict) -> int:
             row[0] for row in db.execute(
                 "SELECT runtime_rule_id FROM network_control_rule WHERE type='app' AND id<>?",
                 (rule["id"],),
-            ).fetchall() if 0 < row[0] <= 64
+            ).fetchall() if 0 < row[0] <= MAX_RULES
         }
         if current_runtime_id <= 0 or current_runtime_id in used_runtime_ids:
-            current_runtime_id = next(candidate for candidate in range(1, 65)
+            current_runtime_id = next(candidate for candidate in range(1, MAX_RULES + 1)
                                       if candidate not in used_runtime_ids)
         changed = db.execute(
             "UPDATE network_control_global SET revision=revision+1 WHERE id=1 AND revision=?",
@@ -239,12 +277,12 @@ def _repair_runtime_ids(db: sqlite3.Connection) -> None:
     rows = db.execute(
         "SELECT id,runtime_rule_id FROM network_control_rule WHERE type='app' ORDER BY id"
     ).fetchall()
-    if len(rows) > 64:
+    if len(rows) > MAX_RULES:
         raise ValueError("runtime_rule_id_unavailable")
     used: set[int] = set()
     repaired: list[tuple[str, int]] = []
     for rule_id, runtime_id in rows:
-        if 0 < runtime_id <= 64 and runtime_id not in used:
+        if 0 < runtime_id <= MAX_RULES and runtime_id not in used:
             used.add(runtime_id)
             repaired.append((rule_id, runtime_id))
         else:
@@ -254,7 +292,8 @@ def _repair_runtime_ids(db: sqlite3.Connection) -> None:
         for rule_id, runtime_id in repaired:
             if runtime_id:
                 continue
-            candidate = next(value for value in range(1, 65) if value not in used)
+            candidate = next(value for value in range(1, MAX_RULES + 1)
+                             if value not in used)
             db.execute(
                 "UPDATE network_control_rule SET runtime_rule_id=? WHERE id=? AND type='app'",
                 (candidate, rule_id),
@@ -288,7 +327,7 @@ def test_legacy_zero_duplicate_and_out_of_range_runtime_ids_are_repaired() -> No
     repaired = db.execute(
         "SELECT runtime_rule_id FROM network_control_rule WHERE type='app' ORDER BY id"
     ).fetchall()
-    assert all(0 < row[0] <= 64 for row in repaired)
+    assert all(0 < row[0] <= MAX_RULES for row in repaired)
     assert len({row[0] for row in repaired}) == len(repaired)
     assert db.execute(
         "SELECT runtime_rule_id FROM network_control_rule WHERE id='app-b'"

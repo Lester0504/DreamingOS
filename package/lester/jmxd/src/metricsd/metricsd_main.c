@@ -32,6 +32,44 @@ static unsigned int metrics_consecutive_failures;
 static unsigned int metrics_slow_consecutive_failures;
 static time_t metrics_slow_retry_after;
 static const char *metrics_last_failure_msg;
+static time_t metrics_last_tick_at;
+static time_t metrics_started_at;
+static time_t metrics_last_stall_warn;
+
+/*
+ * Stall self-check. A collector that stops ticking used to surface only as blank
+ * pages in the UI, 23 hours after the fact, because a live process sitting in
+ * epoll_wait with an open ubus socket looks healthy from the outside. The tick
+ * stamps metrics_last_tick_at; this timer runs on its own uloop timeout, so it
+ * still fires if the tick timer is the thing that died, and reports the gap.
+ */
+#define METRICSD_STALL_CHECK_MS 30000
+#define METRICSD_STALL_AFTER_TICKS 5
+
+static struct uloop_timeout metrics_stall_timer;
+
+static void metrics_stall_check_cb(struct uloop_timeout *t)
+{
+    time_t now = time(NULL);
+    time_t reference;
+    long gap;
+    long threshold = (long)((METRICSD_INTERVAL_MS / 1000) * METRICSD_STALL_AFTER_TICKS);
+
+    uloop_timeout_set(t, METRICSD_STALL_CHECK_MS);
+
+    reference = metrics_last_tick_at ? metrics_last_tick_at : metrics_started_at;
+    if (!reference)
+        return;
+    gap = (long)(now - reference);
+    if (gap < threshold)
+        return;
+    if (now - metrics_last_stall_warn < 300)
+        return;
+    metrics_last_stall_warn = now;
+    fprintf(stderr,
+            "[dreamingwrt-metricsd] tick stalled: no tick for %lds (threshold %lds, ticks=%u)\n",
+            gap, threshold, metrics_tick_count);
+}
 
 static void metrics_warn_throttled_at(const char *msg, int rc, unsigned int failures,
                                       int next_delay_ms, time_t *last_warn)
@@ -152,6 +190,14 @@ static int metrics_next_delay_ms(int rc)
     delay = METRICSD_INTERVAL_MS * (int)(metrics_consecutive_failures + 1);
     if (delay > METRICSD_BACKOFF_MAX_MS)
         delay = METRICSD_BACKOFF_MAX_MS;
+    /*
+     * Clamp both ends. A delay of 0 would spin the loop, and a negative one --
+     * reachable if metrics_consecutive_failures ever grew enough to overflow the
+     * int multiply above -- is passed to uloop as a timeout it can never fire,
+     * which is indistinguishable from a dead scheduler.
+     */
+    if (delay < METRICSD_INTERVAL_MS)
+        delay = METRICSD_BACKOFF_MAX_MS;
     metrics_warn_throttled(metrics_last_failure_msg ? metrics_last_failure_msg : "_metrics_tick invoke failed",
                            rc, delay);
     return delay;
@@ -170,6 +216,19 @@ static void metrics_tick_cb(struct uloop_timeout *t)
     int slow_rc;
     int next_delay_ms;
     time_t now;
+
+    /*
+     * Re-arm first, unconditionally. Everything below this point can fail, and
+     * the old ordering put the only uloop_timeout_set() call at the very end of
+     * the function, so any future early return silently retired the collector
+     * for the lifetime of the process -- with no log line and no ubus symptom,
+     * because the socket stays connected and the process stays in epoll_wait.
+     * Arming up front costs a fixed cadence during backoff (the delay computed
+     * at the end still applies from the next tick onward) and removes the class
+     * of bug entirely.
+     */
+    uloop_timeout_set(t, METRICSD_INTERVAL_MS);
+    metrics_last_tick_at = time(NULL);
 
     metrics_tick_count++;
     wan_health = (metrics_tick_count % METRICSD_HEALTH_TICKS) == 0;
@@ -232,11 +291,15 @@ int main(int argc, char **argv)
     signal(SIGTERM, metrics_handle_signal);
 
     uloop_init();
+    metrics_started_at = time(NULL);
     metrics_timer.cb = metrics_tick_cb;
     uloop_timeout_set(&metrics_timer, 1000);
+    metrics_stall_timer.cb = metrics_stall_check_cb;
+    uloop_timeout_set(&metrics_stall_timer, METRICSD_STALL_CHECK_MS);
     uloop_run();
 
     uloop_timeout_cancel(&metrics_timer);
+    uloop_timeout_cancel(&metrics_stall_timer);
     metrics_ubus_close();
     uloop_done();
     return 0;

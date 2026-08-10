@@ -99,9 +99,21 @@ dry = branch[branch.index("dry_run"):]
 check('"dry_run"' in dry, "dry_run must still be reported as dry_run")
 
 # The audit trail should record which effect was actually attempted.
-check(re.search(r'jmx_app_audit_log\("app", "", "client\.kick", "medium", mac_buf,\s*\n?\s*wireless \?', branch)
-      is not None,
-      "the audit entry must record the effect, not a bare success")
+# The call was renamed jmx_app_audit_log -> jmx_app_audit_log_full (the latter
+# adds source_ip/result/failure_reason on top of the same leading arguments), so
+# the old name-pinned regex could no longer match and this read as a regression.
+# What the contract actually cares about is unchanged: the effect must be
+# recorded, not a bare success. Accept either name and keep asserting that the
+# effect argument is the wireless-dependent one.
+check(re.search(
+    r'jmx_app_audit_log(?:_full)?\("app", "", "client\.kick", "medium", mac_buf,\s*\n?\s*wireless \?',
+    branch) is not None,
+    "the audit entry must record the effect, not a bare success")
+check(re.search(r'wireless \?\s*\n?\s*"conntrack_only" : "conntrack_flush"', branch) is not None,
+      "the audited effect must distinguish conntrack_only from conntrack_flush")
+# A preflight must not be audited as a real disconnect.
+check(re.search(r'dry_run \? "dry_run" : "applied"', branch) is not None,
+      "the audit result must mark dry runs so they cannot be read as real disconnects")
 
 if failures:
     print("FAIL")

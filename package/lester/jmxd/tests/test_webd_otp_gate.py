@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Contract tests for the TOTP gate on irreversible operations."""
 import os
-import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,14 +17,12 @@ HARNESS = ROOT / "tests/webd_otp_gate_fixture.c"
 
 
 def _flags() -> list[str]:
-    result = subprocess.run(
-        ["pkg-config", "--cflags", "--libs", "sqlite3", "openssl"],
-        text=True,
-        capture_output=True,
-    )
-    if result.returncode != 0:
+    # Resolved rather than probed, so a host without .pc files still links
+    # against a real prefix instead of a bare -lsqlite3 -lcrypto guess.
+    try:
+        return apd_test_deps.package_flags("sqlite3", "openssl")
+    except AssertionError:
         return ["-lsqlite3", "-lcrypto"]
-    return shlex.split(result.stdout)
 
 
 def test_factory_reset_is_gated_and_audited_before_execution() -> None:

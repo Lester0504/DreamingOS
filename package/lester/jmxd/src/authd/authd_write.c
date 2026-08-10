@@ -1361,11 +1361,55 @@ struct json_object *authd_access_rule_delete(struct json_object *request)
     return authd_write_success(id, "deleted");
 }
 
-static int authd_delegated_wan_normalize(const char *input, char *out, size_t out_len)
+/*
+ * Attach the machine-readable hints the UI needs to point at the offending
+ * field instead of showing a generic "save failed".
+ */
+static struct json_object *authd_field_error(const char *error, const char *message,
+                                             const char *field,
+                                             struct json_object *options)
+{
+    struct json_object *root = authd_error(error, message);
+    struct json_object *data = NULL;
+
+    if (json_object_object_get_ex(root, "data", &data) && data) {
+        if (field && field[0])
+            json_object_object_add(data, "field", json_object_new_string(field));
+        if (options)
+            json_object_object_add(data, "options", options);
+    } else if (options) {
+        json_object_put(options);
+    }
+    return root;
+}
+
+/*
+ * Resolve the caller's delegated interface to a wan.id.
+ *
+ * An empty value is legal and means "use the preferred enabled WAN": the field
+ * is optional in the UI, and rejecting empty input made every default-shaped
+ * create fail with delegated_interface_not_found. A non-empty value still has
+ * to match an enabled line by id / ifname / device.
+ *
+ * Returns 1 on success, 0 when nothing matched, -1 on storage failure, and
+ * writes to *fell_back when the value came from the default rather than input.
+ */
+static int authd_delegated_wan_normalize(const char *input, char *out, size_t out_len,
+                                         int *fell_back)
 {
     sqlite3_stmt *st;
     int found = 0;
-    if (!input || !input[0] || !authd_text_ok(input, 128, 1))
+
+    if (fell_back)
+        *fell_back = 0;
+    if (!input || !input[0]) {
+        int rc = authd_delegated_interface_default(out, out_len);
+
+        if (rc == 1 && fell_back)
+            *fell_back = 1;
+        return rc;
+    }
+    if (!authd_text_ok(input, 128, 1))
         return 0;
     st = authd_write_prepare(
         "SELECT id FROM wan WHERE enabled=1 AND (id=?1 OR ifname=?1 OR device=?1) "
@@ -1425,7 +1469,8 @@ struct json_object *authd_delegated_upsert(struct json_object *request)
     int update = authd_req_bool(request, "_update", 0);
     char id[96], interface_id[96], password_cipher[1400] = "", old_cipher[1400] = "";
     sqlite3_stmt *st;
-    int exists, wan_found, account_found, conflict, rc;
+    struct json_object *response, *success_data = NULL;
+    int exists, wan_found, account_found, conflict, rc, wan_fell_back = 0;
 
     snprintf(id, sizeof(id), "%s", id_in);
     if (!id[0] && authd_random_id("dlg-", id, sizeof(id)) != 0)
@@ -1439,16 +1484,32 @@ struct json_object *authd_delegated_upsert(struct json_object *request)
         return authd_error("delegated_service_not_found", "delegated service does not exist");
     if (!update && exists)
         return authd_error("delegated_service_exists", "delegated service id already exists");
-    wan_found = authd_delegated_wan_normalize(interface_in, interface_id, sizeof(interface_id));
+    wan_found = authd_delegated_wan_normalize(interface_in, interface_id,
+                                              sizeof(interface_id), &wan_fell_back);
     if (wan_found < 0)
         return authd_error("storage_error", "WAN configuration storage unavailable");
-    if (!wan_found)
-        return authd_error("delegated_interface_not_found", "delegated interface is not an enabled WAN");
+    if (!wan_found) {
+        /*
+         * Separate the two reasons: the caller named a line that is not an
+         * enabled WAN, or there is no enabled WAN to fall back to at all. The
+         * first is a fixable form error, the second is a network config
+         * problem the user has to solve elsewhere.
+         */
+        if (!interface_in[0])
+            return authd_field_error("delegated_interface_unavailable",
+                                     "no enabled WAN is available for delegated dialing",
+                                     "interface", NULL);
+        return authd_field_error("delegated_interface_not_found",
+                                 "delegated interface is not an enabled WAN",
+                                 "interface", authd_delegated_interface_options());
+    }
     account_found = authd_delegated_account_exists(delegated_account);
     if (account_found < 0)
         return authd_error("storage_error", "account storage unavailable");
     if (!account_found)
-        return authd_error("delegated_account_not_found", "delegated account does not exist");
+        return authd_field_error("delegated_account_not_found",
+                                 "delegated account does not exist",
+                                 "delegated_account", NULL);
     conflict = authd_delegated_username_conflict(username, id);
     if (conflict < 0)
         return authd_error("storage_error", "delegated service storage unavailable");
@@ -1469,7 +1530,9 @@ struct json_object *authd_delegated_upsert(struct json_object *request)
     } else if (update && old_cipher[0]) {
         snprintf(password_cipher, sizeof(password_cipher), "%s", old_cipher);
     } else {
-        return authd_error("password_required", "new delegated service requires a password");
+        return authd_field_error("password_required",
+                                 "new delegated service requires a password",
+                                 "password", NULL);
     }
     st = authd_write_prepare(
         "INSERT INTO authentication_delegated_services(id,line_name,username,password_cipher,interface,"
@@ -1498,7 +1561,18 @@ struct json_object *authd_delegated_upsert(struct json_object *request)
     OPENSSL_cleanse(old_cipher, sizeof(old_cipher));
     if (rc != SQLITE_DONE)
         return authd_error("delegated_service_save_failed", "delegated service could not be saved");
-    return authd_write_success(id, exists ? "updated" : "created");
+    response = authd_write_success(id, exists ? "updated" : "created");
+    /*
+     * Report the line that actually took effect. When the interface was left
+     * empty we picked one, and the caller must be able to show which without
+     * a second round trip.
+     */
+    if (json_object_object_get_ex(response, "data", &success_data) && success_data) {
+        json_object_object_add(success_data, "interface", json_object_new_string(interface_id));
+        json_object_object_add(success_data, "interface_defaulted",
+                               json_object_new_boolean(wan_fell_back));
+    }
+    return response;
 }
 
 struct json_object *authd_delegated_delete(struct json_object *request)

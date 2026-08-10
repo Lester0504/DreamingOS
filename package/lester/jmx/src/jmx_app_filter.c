@@ -53,6 +53,25 @@ static u64 jmx_app_filter_mac_value(const unsigned char *mac)
     return value;
 }
 
+/*
+ * 重算 rule->mac_count。mac_config_t 由 jmx_mac.c 维护、且与 mac filter 模块
+ * 共用，不便在那里加计数字段，所以只在本模块的写路径(增/删/清空 MAC 后)重算。
+ * 调用者必须已持 write lock。
+ */
+static void jmx_app_filter_refresh_mac_count(app_filter_rule_t *rule)
+{
+    struct mac_node *mac_node;
+    int count = 0;
+    int i;
+
+    if (!rule)
+        return;
+    for (i = 0; i < MAC_HASH_SIZE; i++)
+        hlist_for_each_entry(mac_node, &rule->mac_list.hash_table[i], hlist)
+            count++;
+    rule->mac_count = count;
+}
+
 
 static void app_id_config_init(app_id_config_t *config) {
     int i;
@@ -257,6 +276,7 @@ static int jmx_add_app_filter_rule(int rule_id) {
     
     rule->rule_id = rule_id;
     rule->enable = 1;
+    rule->mac_count = 0;
     atomic64_set(&rule->hit_count, 0);
     atomic64_set(&rule->last_hit_s, 0);
     jmx_mac_config_init(&rule->mac_list);
@@ -324,28 +344,22 @@ int jmx_match_app_filter_rule_record(int app_id, const unsigned char *mac,
 {
     app_filter_rule_t *rule;
     app_id_node_t *node;
-    struct mac_node *mac_node;
-    int i;
-    int mac_list_empty;
 
     app_filter_read_lock();
     list_for_each_entry(rule, &app_filter_rule_list, list) {
         if (!rule->enable)
             continue;
-        mac_node = jmx_find_mac_node(&rule->mac_list, mac);
-        if (!mac_node) {
-            mac_list_empty = 1;
-            for (i = 0; i < MAC_HASH_SIZE; i++) {
-                if (!hlist_empty(&rule->mac_list.hash_table[i])) {
-                    mac_list_empty = 0;
-                    break;
-                }
-            }
-            if (!mac_list_empty)
-                continue;
-        }
+        /*
+         * 先查 app_id(单桶 hash，O(1))再查 MAC：两个条件是 AND 且都无副作用，
+         * 顺序不影响结果，但绝大多数规则会在 app_id 这一步就被排除，不必再碰
+         * MAC 表。规则上限提到 512 后这个顺序决定了单包最坏开销。
+         */
         node = find_app_id_node(&rule->app_id_list, app_id);
         if (!node)
+            continue;
+        /* mac_count == 0 表示不限定终端，对所有 MAC 生效。 */
+        if (rule->mac_count > 0 &&
+            !jmx_find_mac_node(&rule->mac_list, mac))
             continue;
         atomic64_inc(&rule->hit_count);
         atomic64_set(&rule->last_hit_s, (s64)ktime_get_real_seconds());
@@ -420,13 +434,14 @@ int jmx_api_mod_app_filter_rule(cJSON *data_obj) {
                 if (mac_action_obj->valueint == 1) {  // flush old
                     jmx_flush_mac_list(&rule->mac_list);
                 }
-                for (i = 0; i < cJSON_GetArraySize(mac_array); i++) {
+                    for (i = 0; i < cJSON_GetArraySize(mac_array); i++) {
                     cJSON *mac_obj = cJSON_GetArrayItem(mac_array, i);
                     u8 mac_bin[ETH_ALEN] = {0};
                     if (mac_obj && mac_str_to_bin(mac_obj->valuestring, mac_bin)) {
                         jmx_add_mac_node(&rule->mac_list, mac_bin);
                     }
                 }
+                jmx_app_filter_refresh_mac_count(rule);
                 app_filter_write_unlock();
             }
         } else if (mac_action_obj->valueint == 3) {
@@ -437,12 +452,14 @@ int jmx_api_mod_app_filter_rule(cJSON *data_obj) {
                 if (mac_str_to_bin(mac_obj->valuestring, mac_bin)) {
                     jmx_add_mac_node(&rule->mac_list, mac_bin);
                 }
+                jmx_app_filter_refresh_mac_count(rule);
                 app_filter_write_unlock();
             }
         } else {
 
             app_filter_write_lock();
             jmx_flush_mac_list(&rule->mac_list);
+            jmx_app_filter_refresh_mac_count(rule);
             app_filter_write_unlock();
         }
     }

@@ -1,9 +1,12 @@
 import os
 import pathlib
-import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -252,31 +255,10 @@ int main(void)
 
 
 def json_c_flags() -> tuple[list[str], dict[str, str]]:
-    env = os.environ.copy()
-    candidates = []
-    try:
-        prefix = pathlib.Path(
-            subprocess.check_output(["brew", "--prefix", "json-c"], text=True).strip()
-        )
-        candidates.append(prefix)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
-    candidates.extend(
-        pathlib.Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c").glob("*")
-    )
-    for prefix in candidates:
-        header = prefix / "include" / "json-c" / "json.h"
-        library = prefix / "lib" / "libjson-c.a"
-        if header.is_file() and library.is_file():
-            return [f"-I{prefix / 'include'}", str(library)], env
-
-    try:
-        output = subprocess.check_output(
-            ["pkg-config", "--cflags", "--libs", "json-c"], text=True, env=env
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError) as error:
-        raise RuntimeError("json-c development files are required") from error
-    return shlex.split(output), env
+    # The Homebrew-first search resolved on 31.6 to an LTO archive the host
+    # linker rejects, so the harness failed to build for a reason that had
+    # nothing to do with the AI config contract under test.
+    return apd_test_deps.package_flags("json-c"), os.environ.copy()
 
 
 class AiConfigDefaultContract(unittest.TestCase):

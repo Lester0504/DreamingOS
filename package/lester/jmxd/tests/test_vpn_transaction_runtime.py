@@ -3,7 +3,11 @@ from pathlib import Path
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,10 +23,9 @@ def main() -> None:
         flags = ["-I", str(prefix / "include"), "-L", str(prefix / "lib"),
                  "-ljson-c", f"-Wl,-rpath,{prefix / 'lib'}"]
     else:
-        flags = subprocess.run(
-            ["pkg-config", "--cflags", "--libs", "json-c"],
-            text=True, capture_output=True, check=True,
-        ).stdout.split()
+        # pkg-config knows nothing about json-c on 31.6, so resolve the prefix
+        # instead of failing the whole fixture on a missing .pc file.
+        flags = apd_test_deps.package_flags("json-c")
     with tempfile.TemporaryDirectory(prefix="vpn-transaction-") as raw:
         binary = Path(raw) / "vpn-transaction"
         subprocess.run([

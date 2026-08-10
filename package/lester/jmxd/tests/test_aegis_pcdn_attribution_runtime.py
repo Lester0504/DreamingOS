@@ -7,8 +7,12 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import textwrap
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,11 +20,10 @@ AEGIS = ROOT / "src" / "aegisxd"
 
 
 def _pkg_config(*packages: str) -> list[str]:
-    output = subprocess.check_output(
-        [os.environ.get("PKG_CONFIG", "pkg-config"), "--cflags", "--libs", *packages],
-        text=True,
-    )
-    return shlex.split(output)
+    # PKG_CONFIG is still honoured inside the resolver; the difference is that a
+    # package with no .pc file (json-c on 31.6) now falls back to a prefix
+    # search instead of aborting the fixture.
+    return apd_test_deps.package_flags(*packages)
 
 
 def _stub_headers(root: Path) -> None:

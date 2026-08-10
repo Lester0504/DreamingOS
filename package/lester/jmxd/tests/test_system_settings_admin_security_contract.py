@@ -35,21 +35,37 @@ assert "jmx_admin_password_set_ex(admin, out, 1)" in SETUP
 rename = between(
     WEB,
     "static int webd_web_user_rename_local",
-    "static int webd_system_settings_apply_admin_ops",
+    "static int webd_admin_avatar_persist_from_response",
 )
 assert 'UPDATE web_sessions SET username' not in rename
 assert 'UPDATE web_user_group_members SET username' in rename
 assert "webd_directory_revoke_sessions(old_username)" in rename
 
-admin_ops = between(
+# The bulk webd_system_settings_apply_admin_ops() writer was removed as
+# refactor residue; its work is now split across two transactional callbacks.
+# Re-anchor the same guarantees onto those, so this stays a real check rather
+# than a check of a function nobody calls.
+identity_apply = between(
     WEB,
-    "static int webd_system_settings_apply_admin_ops",
-    "static int webd_system_settings_has_admin_write",
+    "static int webd_admin_identity_apply_cb",
+    "static struct json_object *webd_system_settings_save_response",
 )
-assert "if (admin && new_password[0] && all_ok)" in admin_ops
-assert "if (admin && avatar_data[0] && all_ok)" in admin_ops
-assert '"reauth_required"' in admin_ops
-assert "webd_directory_revoke_sessions" in admin_ops
+# Password change must revoke sessions and demand re-authentication, and it
+# must be able to roll back rather than leave a half-applied identity.
+assert '"reauth_required"' in identity_apply
+# This path revokes inline rather than through webd_directory_revoke_sessions(),
+# so assert the actual SQL: the helper name would pass while the write changed.
+assert "UPDATE web_sessions SET revoked=1" in identity_apply
+assert "identity_session_revoke_failed" in identity_apply
+assert "admin_password_ok" in identity_apply
+assert "ROLLBACK" in identity_apply
+
+avatar_apply = between(
+    WEB,
+    "static int webd_admin_avatar_apply_cb",
+    "static int webd_admin_identity_apply_cb",
+)
+assert "admin_avatar_ok" in avatar_apply
 
 save = between(
     WEB,

@@ -143,6 +143,11 @@
 .routing-resource-table td:last-child { overflow: visible; text-align: center; }
 .routing-resource-table .routing-row-action { width: 32px; height: 32px; }
 .routing-cell-ellipsis { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/*
+ * 「未提供 / 设备路由」这类语义化空值：比正文弱一档但仍可读，不用 -- 占位。
+ * 只改颜色与字号，不动几何，避免影响表格列宽。
+ */
+.routing-cell-muted { color: var(--app-text-muted); font-size: var(--dwrt-type-meta, 12px); cursor: help; }
 
 .routing-kind,
 .routing-table-pill,

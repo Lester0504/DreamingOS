@@ -1,5 +1,22 @@
 @import url('/static/css/policy-entities.css?v=20260730-policy-workbench-unify-14');
 
+/* 内联 chip（code / 算法取值）的底墨配对。
+   这两个变量必须成对使用：chip 自带不透明底，墨色不能再跟随随壁纸翻转的
+   自适应前景，否则会出现浅字压浅底（实测 2.2:1）。底色跟主题走，墨色也跟
+   主题走，两者方向相反，因此 light / dark 各自都有余量。 */
+/* alpha 必须足够高：半透明底会把明亮壁纸透上来，dark 主题下实测底色被抬到
+   0.563，浅色墨压在上面只有 1.58:1。chip 很小，用接近不透明的底自建纸面，
+   代价只是这一小块不透玻璃，换来的是墨色可以确定。 */
+.flow-engine-page {
+  --flow-chip-bg: rgba(233, 236, 241, 0.96);
+  --flow-chip-ink: rgba(8, 13, 21, 0.98);
+}
+
+html[data-theme-resolved="dark"] .flow-engine-page {
+  --flow-chip-bg: rgba(9, 13, 22, 0.96);
+  --flow-chip-ink: rgba(240, 246, 255, 0.96);
+}
+
 .console-stage.is-flow-engine {
   grid-template-rows: minmax(0, 1fr);
   align-items: start;
@@ -107,6 +124,19 @@
   align-items: start;
 }
 
+/* 分区页头此前是裸网格，文字直接压在壁纸上：共享采样层按挖空卡片的形状取蒙版，
+   没有玻璃面的元素拿不到任何材质，实测最坏对比度 1.02:1，且加大吸收密度对这些
+   像素完全无效。改为 kit 玻璃面之后由共享层统一供材质，这里只补它需要的内边距，
+   不另画中心。 */
+.flow-engine-page .policy-entity-section > header.dwrt-kit-glass-surface {
+  /* 共享采样层只接纳 >= 54px 高的候选（menu-shell.js visiblePageGlassCandidates）。
+     页头原本正好 50px，会被这道门槛挡掉，于是只剩 kit 静态兜底、拿不到共享材质。
+     这里把最小高度抬过门槛，让它真正被挖空并获得中心材质。 */
+  min-height: 58px;
+  padding: 12px 14px;
+  border-radius: var(--app-radius-control, 12px);
+}
+
 .flow-engine-workbench > .policy-entity-alert strong,
 .flow-engine-workbench > .policy-entity-alert span {
   display: block;
@@ -195,7 +225,13 @@
 .flow-engine-page code {
   padding: 1px 5px;
   border-radius: var(--app-radius-chip, 7px);
-  background: color-mix(in srgb, var(--app-text) 6%, transparent);
+  /* 原来底色取 color-mix(var(--app-text) 6%)：自适应前景翻转时底色跟着字色
+     同向移动，实测只剩 3.54:1。
+     chip 自带一层足够不透明的底，所以底色与墨色必须成对钉在主题上，
+     不参与随壁纸翻转的自适应前景 —— 否则会出现浅字压浅底。
+     这是 design.md 允许的 material-local 配对：底与墨一起定义。 */
+  background: var(--flow-chip-bg);
+  color: var(--flow-chip-ink);
   font-size: 11px;
   font-family: var(--app-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
 }
@@ -228,7 +264,10 @@
    所以选中态只能走边框、字重与徽章这些不被挖空覆盖的通道。 */
 .flow-balance-algorithm.is-active > .flow-balance-algorithm-head > strong { font-weight: 800; }
 .flow-balance-algorithm.is-active > .flow-balance-algorithm-value {
-  color: var(--app-text);
+  /* 选中态不能把 chip 墨色交回 --app-text：卡片被判为 light 区域时
+     --app-text 是近白色，压在 chip 自带的浅底上只有 1.15:1。
+     chip 的底墨是成对的，这里跟着 chip 的墨色走。 */
+  color: var(--flow-chip-ink);
   border-color: color-mix(in srgb, var(--app-accent) 45%, transparent);
 }
 /* 运行中但草稿已改到别处：保留一条细边，说明「真正在跑的是这张」。 */
@@ -247,8 +286,10 @@
   justify-self: start;
   border-radius: var(--app-radius-compact, 8px);
   padding: 2px 7px;
-  color: var(--app-text-muted);
-  background: color-mix(in srgb, var(--app-text) 6%, transparent);
+  /* 与 code 用同一对底墨变量：11px 上原先是 muted 墨色配自适应底，实测 2.2:1。
+     弱化改由字号与留白承担，不再靠降低墨色对比。 */
+  background: var(--flow-chip-bg);
+  color: var(--flow-chip-ink);
   font-family: var(--app-font-mono, ui-monospace, monospace); font-size: 11px;
 }
 /* demo 是固定 2 列；auto-fit 会把 4 条线路挤成一行，指标没有空间显示。 */
@@ -341,6 +382,112 @@
   padding-block-end: 84px;
 }
 
+/* GeoIP 数据源：源数量少（当前 3 个），用双列卡片而不是表格，
+   因为每张卡片都带自己的开关、频率与时间窗表单。 */
+.flow-geoip-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-block-start: 12px;
+  /* 本地文件源没有表单，比远端源短很多；等高拉伸会在它下面留一大片空白。 */
+  align-items: start;
+}
+
+/*
+ * 线路场景那一列的「档位 + 来源」两段文字。
+ *
+ * `policy-entities.css:548` 只把 `td:first-child` 里的 strong/small 设成 block，
+ * 其他列仍是 inline，于是「自定义」和「沿用全局模式」实测挤在同一行、连成
+ * 「自定义沿用全局模式」。这里只给这一列补上块级排布，不去改共享表格规则。
+ */
+.flow-engine-page .policy-entity-table td.flow-smart-mode-cell > strong,
+.flow-engine-page .policy-entity-table td.flow-smart-mode-cell > small {
+  display: block;
+}
+.flow-engine-page .policy-entity-table td.flow-smart-mode-cell > small {
+  margin-top: 3px;
+  opacity: 0.72;
+}
+.flow-geoip-source {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+  align-content: start;
+  border-radius: var(--app-radius-control, 12px);
+  padding: 16px 18px;
+}
+.flow-geoip-source-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  min-width: 0;
+}
+.flow-geoip-source-head > div { min-width: 0; display: grid; gap: 2px; }
+.flow-geoip-source-head h3 {
+  margin: 0; min-width: 0;
+  color: var(--app-text); font-size: 14px; font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.flow-geoip-source-head p { margin: 0; color: var(--app-text-muted); font-size: 11px; overflow-wrap: anywhere; }
+
+.flow-geoip-facts { margin: 0; display: grid; gap: 6px; }
+.flow-geoip-facts > div {
+  min-width: 0;
+  display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 10px; align-items: baseline;
+}
+.flow-geoip-facts dt { color: var(--app-text-muted); font-size: 11px; }
+.flow-geoip-facts dd {
+  margin: 0; min-width: 0;
+  color: var(--app-text); font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.flow-geoip-controls { display: grid; gap: 12px; }
+.flow-geoip-switch-row {
+  min-width: 0;
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  cursor: pointer;
+}
+.flow-geoip-switch-row > span:first-child { min-width: 0; display: grid; gap: 2px; }
+.flow-geoip-switch-row strong { color: var(--app-text); font-size: 13px; font-weight: 700; }
+.flow-geoip-switch-row small { color: var(--app-text-muted); font-size: 11px; overflow-wrap: anywhere; }
+
+.flow-geoip-form-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.flow-geoip-form-grid > label { min-width: 0; }
+.flow-geoip-form-grid .dwrt-kit-select { width: 100%; min-width: 0; }
+/* 关闭自动更新时下拉是 disabled，默认灰度会让「每周」看起来像没有值，
+   这里保留可读的文字颜色，只用整体透明度表达不可编辑。 */
+.flow-geoip-form-grid .dwrt-kit-select:disabled {
+  color: var(--app-text);
+  opacity: .72;
+}
+
+.flow-geoip-note { margin: 0; color: var(--app-text-muted); font-size: 11px; overflow-wrap: anywhere; }
+
+.flow-geoip-source-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  min-width: 0;
+}
+.flow-geoip-foot-hint {
+  min-width: 0;
+  color: var(--app-text-muted); font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.flow-geoip-foot-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* 三列表单在中等宽度会把「时间窗开始」压成竖排，早于卡片单列化先退到两列。 */
+@media (max-width: 1180px) {
+  .flow-geoip-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 620px) {
+  .flow-geoip-form-grid { grid-template-columns: minmax(0, 1fr); }
+  .flow-geoip-facts > div { grid-template-columns: minmax(0, 1fr); gap: 0; }
+}
+
 
 @media (max-width: 760px) {
   .console-stage.is-flow-engine { padding: 10px; }
@@ -351,12 +498,20 @@
   }
 
   .flow-engine-page-toolbar { gap: 6px; }
-  .flow-engine-tabs { width: auto; flex: 1 1 0; }
+  /*
+   * 移动端 tab 不再等分压缩，改回 kit 的横向滚动。
+   *
+   * 原先是 `flex: 1 1 0` + `min-width: 0`：390px 视口下 6 个 tab 各得 51px，
+   * 「容量与健康」「GeoIP 数据源」实测 scrollWidth > clientWidth，文字被裁掉。
+   * `.dwrt-kit-tabs.dwrt-kit-page-tabs` 本身是 `overflow-x: auto`，让每个 tab
+   * 保持自身文字宽度、由导航条自己滚动，才不会出现半截标签。
+   */
+  .flow-engine-tabs { width: auto; flex: 1 1 0; min-width: 0; }
   .flow-engine-tabs .dwrt-kit-tab {
+    flex: 0 0 auto;
     min-width: 0;
-    flex: 1 1 0;
-    padding-inline: 6px;
-    font-size: 12px;
+    padding-inline: 12px;
+    font-size: 13px;
   }
   .flow-engine-toolbar-actions .dwrt-kit-status-badge { display: none; }
   .flow-engine-toolbar-actions [data-flow-refresh] { width: 40px; padding: 0; }
@@ -374,6 +529,9 @@
   .flow-balance-member-grid { grid-template-columns: minmax(0, 1fr); }
   .flow-balance-actionbar { align-items: stretch; flex-direction: column; }
   .flow-balance-actionbar [data-flow-balance-save] { width: 100%; }
+
+  .flow-geoip-source-foot { align-items: stretch; flex-direction: column; }
+  .flow-geoip-foot-actions > button { flex: 1 1 0; min-width: 0; justify-content: center; }
 
   .flow-engine-overview-fallback { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .flow-engine-overview-fallback > div:nth-child(3n) { border-inline-end: 1px solid var(--color-border-subtle, var(--dwrt-glass-edge)); }

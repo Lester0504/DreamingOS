@@ -3,10 +3,13 @@
 
 from pathlib import Path
 import os
-import shlex
 import subprocess
+import sys
 import tempfile
 import textwrap
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -241,13 +244,12 @@ def test_apply_readback_and_rollback_behavior() -> None:
             return 0;
         }
     ''')
-    pkg = subprocess.run(
-        ["pkg-config", "--cflags", "--libs", "json-c"],
-        check=False, capture_output=True, text=True,
-    )
-    if pkg.returncode != 0:
+    # Keyed on real resolvability: pkg-config has no json-c entry on 31.6, so
+    # the old probe printed "skip" there and the contract went unexercised.
+    if not apd_test_deps.have_package("json-c"):
         print("skip: executable nft contract fixture requires host json-c development metadata")
         return
+    json_c_flags = apd_test_deps.package_flags("json-c")
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         fake = tmp / "fake-nft"
@@ -259,7 +261,7 @@ def test_apply_readback_and_rollback_behavior() -> None:
         fake.write_text(_fake_nft(), encoding="utf-8")
         fake.chmod(0o755)
         source.write_text(harness, encoding="utf-8")
-        flags = shlex.split(pkg.stdout)
+        flags = json_c_flags
         subprocess.run([
             "cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
             "-I", str(FLOWD), str(source), *flags, "-o", str(binary),
@@ -331,13 +333,11 @@ def test_runner_timeout_output_limit_and_wait_failure() -> None:
             return 0;
         }
     ''')
-    pkg = subprocess.run(
-        ["pkg-config", "--cflags", "--libs", "json-c"],
-        check=False, capture_output=True, text=True,
-    )
-    if pkg.returncode != 0:
+    # Same reasoning as above: resolve json-c rather than trusting pkg-config.
+    if not apd_test_deps.have_package("json-c"):
         print("skip: executable nft runner fixture requires host json-c development metadata")
         return
+    json_c_flags = apd_test_deps.package_flags("json-c")
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         fake = tmp / "fake-nft"
@@ -346,7 +346,7 @@ def test_runner_timeout_output_limit_and_wait_failure() -> None:
         fake.write_text(_fake_nft(), encoding="utf-8")
         fake.chmod(0o755)
         source.write_text(harness, encoding="utf-8")
-        flags = shlex.split(pkg.stdout)
+        flags = json_c_flags
         subprocess.run([
             "cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
             "-I", str(FLOWD), str(source), *flags, "-o", str(binary),

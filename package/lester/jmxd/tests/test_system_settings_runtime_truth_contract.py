@@ -51,12 +51,53 @@ for field in ("zram_size_mb", "packet_steering", "irq_balance", "flow_offloading
 assert "nc_sys_projected_value_equal" in preflight
 assert "accepted_sections" in preflight
 assert '"system_settings_section_write"' in preflight
+assert '!strncmp(field, "zram_", 5)' in preflight
+
+# A gated field must be recorded and skipped, not abort the whole request. The
+# old builder returned -1 on the first non-writable field, which made a closed
+# capability (a log level, a timezone) take the writable hostname down with it.
+changed_fields = between(
+    CORE,
+    "static int nc_sys_add_changed_fields",
+    "static struct json_object *nc_sys_build_settings_delta",
+)
+assert "nc_sys_denied_field_result" in changed_fields
+assert "return -1" not in changed_fields
+assert changed_fields.count("continue;") >= 3
+
+# Fields GET reports but no writer accepts are skipped silently; fields with a
+# real writer that is gated stay visible as rejections.
+delta = between(
+    CORE,
+    "static struct json_object *nc_sys_build_settings_delta",
+    "static struct json_object *nc_sys_settings_snapshot",
+)
+for derived in ("version_source", "version_error", "interrupt_runtime_source",
+                "key_management", "disabled_func_path"):
+    assert f'"{derived}"' in delta, derived
+# `disabled_functions` is deliberately left out of this check: it is classified
+# by the advanced-page owner, who lists it as observed state.
+for gated in ("led_policy", "update_channel"):
+    assert f'"{gated}"' not in delta, gated
+
+# Error responses carry a human readable message, not just a machine token.
+assert "nc_sys_settings_reason_message" in CORE
+assert '"message"' in CORE
+assert "static char message[320]" not in CORE  # reentrancy: core spawns threads
+assert '"allocation_failed"' in CORE
+assert "if (!denied)" in CORE
 
 transaction = between(
     CORE,
     "struct json_object *jmx_system_settings_save_apply_result",
     "/* ── system_settings_draft_apply",
 )
+
+# Rejections reach the client, and an all-gated request is an honest failure
+# rather than a silent "nothing changed".
+assert "nc_sys_merge_field_results" in transaction
+assert '"no_writable_fields"' in transaction
+assert '"rejected_fields"' in transaction
 assert transaction.index("nc_sys_build_settings_delta") < transaction.index(
     "jmx_system_settings_set(delta)"
 )
@@ -122,6 +163,10 @@ assert 'app_ubus_or_error("dreamingwrt_system_settings_set", payload)' in web_sa
 assert 'app_ubus_invoke_timeout("dreamingwrt_system_settings_apply"' not in web_save
 assert '"jmxd.dreamingwrt_system_settings_transaction"' in web_save
 assert "webd_json_clone(data)" in web_save
+assert 'app_nc_json_str(resp, "message"' in web_save
+assert web_save.index('app_nc_json_str(resp, "message"') < web_save.index(
+    'app_nc_json_str(resp, "reason"'
+)
 
 setup_apply = between(SETUP, "if (has_device) {", "if (ok && has_wan)")
 assert "jmx_system_settings_save_apply_result(settings_payload)" in setup_apply

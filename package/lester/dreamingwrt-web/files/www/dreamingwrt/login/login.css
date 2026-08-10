@@ -291,7 +291,13 @@ h1 {
 
 form { display: grid; gap: 18px; }
 
-.setup-only[hidden] { display: none; }
+/*
+ * `display: grid` 的子项会忽略 `hidden` 属性（grid item 的 display 被容器重置），
+ * 所以这两个条件字段必须显式声明 `[hidden] { display: none }`。少写 rotate-only
+ * 那一行，周期性改密的「新密码」框在普通登录时也会露出来。
+ */
+.setup-only[hidden],
+.rotate-only[hidden] { display: none; }
 
 .is-first-run .avatar-check {
   opacity: 1;

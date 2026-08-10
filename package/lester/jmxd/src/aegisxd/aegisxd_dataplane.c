@@ -343,6 +343,106 @@ struct json_object *aegisxd_set_profile(struct json_object *body)
     return resp;
 }
 
+/*
+ * Traffic-log collection scope and the three source toggles.
+ *
+ * Every field is optional and an omitted one stays unchanged, so the UI can
+ * save a single control without resending the rest. An unknown scope is a hard
+ * error rather than a silent fallback to "all": quietly widening collection
+ * after the user asked for "blocked" would be the worse failure.
+ */
+struct json_object *aegisxd_set_traffic_log(struct json_object *body)
+{
+    struct json_object *resp = json_object_new_object();
+    struct json_object *sources = NULL, *tmp = NULL;
+    const char *scope = aegisxd_json_str(body, "traffic_log_scope", NULL);
+    int gateway_dns = -1, aegisx_service = -1, device_admin = -1;
+    int rc;
+
+    if (!scope)
+        scope = aegisxd_json_str(body, "scope", NULL);
+    /* Accept the toggles flat or nested, since the read side reports both. */
+    if (body && json_object_object_get_ex(body, "traffic_log", &tmp) && tmp) {
+        if (!scope)
+            scope = aegisxd_json_str(tmp, "scope", NULL);
+        json_object_object_get_ex(tmp, "sources", &sources);
+    }
+    if (!sources && body)
+        json_object_object_get_ex(body, "traffic_log_sources", &sources);
+
+    if (scope && !aegisxd_traffic_log_scope_valid(scope)) {
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        json_object_object_add(resp, "changed", json_object_new_boolean(0));
+        aegisxd_json_add_string(resp, "operation", "set_traffic_log");
+        aegisxd_json_add_string(resp, "error", "invalid_traffic_log_scope");
+        aegisxd_json_add_string(resp, "expected", "all|blocked");
+        return resp;
+    }
+
+    if (sources && json_object_is_type(sources, json_type_object)) {
+        if (json_object_object_get_ex(sources, "gateway_dns", &tmp))
+            gateway_dns = json_object_get_boolean(tmp) ? 1 : 0;
+        if (json_object_object_get_ex(sources, "aegisx_service", &tmp))
+            aegisx_service = json_object_get_boolean(tmp) ? 1 : 0;
+        if (json_object_object_get_ex(sources, "device_admin", &tmp))
+            device_admin = json_object_get_boolean(tmp) ? 1 : 0;
+    }
+    if (body) {
+        if (json_object_object_get_ex(body, "traffic_log_gateway_dns", &tmp))
+            gateway_dns = json_object_get_boolean(tmp) ? 1 : 0;
+        if (json_object_object_get_ex(body, "traffic_log_aegisx_service", &tmp))
+            aegisx_service = json_object_get_boolean(tmp) ? 1 : 0;
+        if (json_object_object_get_ex(body, "traffic_log_device_admin", &tmp))
+            device_admin = json_object_get_boolean(tmp) ? 1 : 0;
+    }
+
+    if (!scope && gateway_dns < 0 && aegisx_service < 0 && device_admin < 0) {
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        json_object_object_add(resp, "changed", json_object_new_boolean(0));
+        aegisxd_json_add_string(resp, "operation", "set_traffic_log");
+        aegisxd_json_add_string(resp, "error", "no_traffic_log_fields");
+        return resp;
+    }
+
+    rc = aegisxd_traffic_log_settings_save(scope, gateway_dns, aegisx_service,
+                                           device_admin);
+    json_object_object_add(resp, "ok", json_object_new_boolean(rc == 0));
+    json_object_object_add(resp, "changed", json_object_new_boolean(rc == 0));
+    /* Nothing here touches nftables or dnsmasq: it selects what the hit
+     * producers persist, so the dataplane ruleset is untouched. */
+    json_object_object_add(resp, "dataplane_changed", json_object_new_boolean(0));
+    aegisxd_json_add_string(resp, "operation", "set_traffic_log");
+    if (rc == 0) {
+        struct aegisxd_settings settings;
+
+        /* Echo the stored state so the caller does not have to re-read status
+         * to learn what the omitted fields ended up as. */
+        if (aegisxd_settings_load(&settings) == 0) {
+            struct json_object *stored = json_object_new_object();
+            struct json_object *out = json_object_new_object();
+
+            aegisxd_json_add_string(stored, "scope", settings.traffic_log_scope);
+            json_object_object_add(out, "gateway_dns",
+                                   json_object_new_boolean(settings.traffic_log_gateway_dns));
+            json_object_object_add(out, "aegisx_service",
+                                   json_object_new_boolean(settings.traffic_log_aegisx_service));
+            json_object_object_add(out, "device_admin",
+                                   json_object_new_boolean(settings.traffic_log_device_admin));
+            json_object_object_add(stored, "sources", out);
+            json_object_object_add(resp, "traffic_log", stored);
+        }
+        /* Existing rows are left alone; only later writes are filtered. */
+        aegisxd_json_add_string(resp, "applies_to", "future_writes_only");
+        json_object_object_add(resp, "history_rewritten",
+                               json_object_new_boolean(0));
+    } else {
+        aegisxd_json_add_string(resp, "error",
+                                rc == -2 ? "invalid_traffic_log_scope" :
+                                           "settings_update_failed");
+    }
+    return resp;
+}
+
 static int aegisxd_plan_count_where(const char *table, const char *where)
 {
     char sql[256];
@@ -927,6 +1027,21 @@ static int aegisxd_plan_write_dnsmasq(const char *path, const char *job_id)
         goto out;
     }
     written += explicit_written;
+    {
+        /*
+         * Device- and time-scoped policies cannot be expressed as address=
+         * rewrites, which apply to every client. They are emitted as nftset=
+         * directives so dnsmasq records resolved addresses into per-policy sets
+         * that the companion nft ruleset matches against the scoped MACs.
+         */
+        int scoped_written = aegisxd_content_filter_write_scoped_dnsmasq(filter, fp);
+
+        if (scoped_written < 0) {
+            ok = 0;
+            goto out;
+        }
+        written += scoped_written;
+    }
 out:
     if (st)
         sqlite3_finalize(st);
@@ -934,6 +1049,40 @@ out:
     if (aegisxd_plan_writer_finish(path, tmp, fp, ok) != 0)
         return -1;
     return written;
+}
+
+/*
+ * Companion artifact to the dnsmasq nftset= directives: the sets the resolver
+ * fills, plus one reject rule per scoped policy and family. Returns the number
+ * of rules written, or 0 when no policy is scoped (in which case no table is
+ * emitted and apply tears down any stale one).
+ */
+static int aegisxd_plan_write_content_scope_nft(const char *path, const char *job_id)
+{
+    FILE *fp = NULL;
+    char tmp[AEGISXD_MAX_PATH + 8];
+    void *filter = NULL;
+    int rules = 0;
+    int ok = 1;
+
+    if (aegisxd_plan_writer_open(path, tmp, sizeof(tmp), &fp) != 0)
+        return -1;
+    fprintf(fp, "# Generated by dreamingwrt-aegisxd compile plan\n");
+    fprintf(fp, "# job_id=%s\n", job_id ? job_id : "");
+    fprintf(fp, "# Device- and schedule-scoped content policies.\n");
+    fprintf(fp, "# This artifact is not active until guarded apply loads it.\n");
+    filter = aegisxd_content_filter_load();
+    if (!filter)
+        ok = 0;
+    else {
+        rules = aegisxd_content_filter_write_scoped_nft(filter, fp);
+        if (rules < 0)
+            ok = 0;
+    }
+    aegisxd_content_filter_free(filter);
+    if (aegisxd_plan_writer_finish(path, tmp, fp, ok) != 0)
+        return -1;
+    return rules;
 }
 
 static int aegisxd_plan_write_domain_index(const char *path, const char *job_id)
@@ -1323,12 +1472,14 @@ struct json_object *aegisxd_compile_plan(struct json_object *body)
     int retention_keep;
     int dns_written = -1;
     int nft_written = -1;
+    int content_scope_written = -1;
     int domain_index_written = -1;
     int suricata_written = -1;
     char job_id[96];
     char plan_path[AEGISXD_MAX_PATH];
     char dns_path[AEGISXD_MAX_PATH];
     char nft_path[AEGISXD_MAX_PATH];
+    char content_scope_path[AEGISXD_MAX_PATH];
     int64_t now = aegisxd_now_s();
 
     if (!body || !json_object_is_type(body, json_type_object))
@@ -1349,6 +1500,8 @@ struct json_object *aegisxd_compile_plan(struct json_object *body)
     snprintf(plan_path, sizeof(plan_path), "%s/%s.json", AEGISXD_RUNTIME_DIR, job_id);
     snprintf(dns_path, sizeof(dns_path), "%s/%s.dnsmasq.conf", AEGISXD_RUNTIME_DIR, job_id);
     snprintf(nft_path, sizeof(nft_path), "%s/%s.nft", AEGISXD_RUNTIME_DIR, job_id);
+    snprintf(content_scope_path, sizeof(content_scope_path),
+             "%s/%s.content-scope.nft", AEGISXD_RUNTIME_DIR, job_id);
     char domain_index_path[AEGISXD_MAX_PATH];
     char suricata_path[AEGISXD_MAX_PATH];
 
@@ -1443,6 +1596,8 @@ struct json_object *aegisxd_compile_plan(struct json_object *body)
                                (blocklist_domains < 0 ? 0 : blocklist_domains) +
                                (safe_search_rules < 0 ? 0 : safe_search_rules),
                                "dnsmasq", 1);
+    aegisxd_plan_artifact_json(artifacts, "nft_content_scope_rules", "dns_filter",
+                               content_scope_path, 0, "nftables", 1);
     aegisxd_plan_artifact_json(artifacts, "nft_ip_reputation_sets", "reputation_ip", nft_path,
                                reputation_ips, "nftables", 1);
     aegisxd_plan_artifact_json(artifacts, "domain_reputation_index", "reputation_domain",
@@ -1572,6 +1727,14 @@ struct json_object *aegisxd_compile_plan(struct json_object *body)
         } else {
             if (write_dns)
                 dns_written = aegisxd_plan_write_dnsmasq(dns_path, job_id);
+            /*
+             * Scoped rules ride with the dns_filter scope: the nft sets are
+             * useless without the nftset= directives that fill them, so the two
+             * artifacts are always produced together.
+             */
+            if (write_dns)
+                content_scope_written =
+                    aegisxd_plan_write_content_scope_nft(content_scope_path, job_id);
             if (write_nft)
                 nft_written = aegisxd_plan_write_nft(nft_path, job_id);
             if (write_domain_index)
@@ -1579,6 +1742,7 @@ struct json_object *aegisxd_compile_plan(struct json_object *body)
             if (write_suricata)
                 suricata_written = aegisxd_plan_write_suricata(suricata_path, job_id);
             if ((write_dns && dns_written < 0) ||
+                (write_dns && content_scope_written < 0) ||
                 (write_nft && nft_written < 0) ||
                 (write_domain_index && domain_index_written < 0) ||
                 (write_suricata && suricata_written < 0)) {
@@ -1587,6 +1751,8 @@ struct json_object *aegisxd_compile_plan(struct json_object *body)
             }
         }
         aegisxd_plan_artifact_mark_written(artifacts, "dnsmasq_domain_blocklist", write_dns, dns_written);
+        aegisxd_plan_artifact_mark_written(artifacts, "nft_content_scope_rules", write_dns,
+                                           content_scope_written);
         aegisxd_plan_artifact_mark_written(artifacts, "nft_ip_reputation_sets", write_nft, nft_written);
         aegisxd_plan_artifact_mark_written(artifacts, "domain_reputation_index", write_domain_index, domain_index_written);
         aegisxd_plan_artifact_mark_written(artifacts, "suricata_ruleset", write_suricata, suricata_written);
@@ -1600,6 +1766,7 @@ struct json_object *aegisxd_compile_plan(struct json_object *body)
         }
     } else {
         aegisxd_plan_artifact_mark_written(artifacts, "dnsmasq_domain_blocklist", 0, -1);
+        aegisxd_plan_artifact_mark_written(artifacts, "nft_content_scope_rules", 0, -1);
         aegisxd_plan_artifact_mark_written(artifacts, "nft_ip_reputation_sets", 0, -1);
         aegisxd_plan_artifact_mark_written(artifacts, "domain_reputation_index", 0, -1);
         aegisxd_plan_artifact_mark_written(artifacts, "suricata_ruleset", 0, -1);
@@ -1787,6 +1954,13 @@ static int aegisxd_nft_delete_table(void)
 {
     return aegisxd_dataplane_run_quiet_log(
         "nft delete table inet " AEGISXD_NFT_TABLE " >/dev/null 2>&1 || true",
+        AEGISXD_NFT_LOG);
+}
+
+static int aegisxd_nft_delete_content_scope_table(void)
+{
+    return aegisxd_dataplane_run_quiet_log(
+        "nft delete table inet " AEGISXD_CONTENT_NFT_TABLE " >/dev/null 2>&1 || true",
         AEGISXD_NFT_LOG);
 }
 
@@ -3121,11 +3295,13 @@ struct json_object *aegisxd_apply(struct json_object *body)
     struct json_object *plan = NULL;
     struct json_object *artifacts = NULL;
     struct json_object *dns_art = NULL;
+    struct json_object *scope_art = NULL;
     struct json_object *blockers = json_object_new_array();
     struct aegisxd_settings s;
     const char *operation = aegisxd_json_str(body, "operation", "apply");
     const char *scope = aegisxd_json_str(body, "scope", "dns_filter");
     const char *dns_src = "";
+    const char *scope_src = "";
     const char *job_id = "";
     char dns_dir[AEGISXD_MAX_PATH] = "";
     char dns_file[AEGISXD_MAX_PATH] = "";
@@ -3133,6 +3309,7 @@ struct json_object *aegisxd_apply(struct json_object *body)
     int confirm = aegisxd_json_bool(body, "confirm", 0);
     int force = aegisxd_json_bool(body, "force", 0);
     int rules = 0;
+    int scope_rules = 0;
     int ok = 1;
     int reload_rc = 0;
     int previous_saved = 0;
@@ -3217,6 +3394,24 @@ struct json_object *aegisxd_apply(struct json_object *body)
         dns_src = aegisxd_json_str(dns_art, "path", "");
         rules = aegisxd_plan_json_int(dns_art, "written_items", 0);
     }
+    if (artifacts &&
+        json_object_object_get_ex(artifacts, "nft_content_scope_rules", &scope_art) &&
+        scope_art) {
+        scope_src = aegisxd_json_str(scope_art, "path", "");
+        scope_rules = aegisxd_plan_json_int(scope_art, "written_items", 0);
+    }
+    /*
+     * Reject a scoped ruleset that nft will not parse before anything is
+     * installed. Without this the dnsmasq half could go live while the nft half
+     * failed, leaving the nftset= directives filling sets that no rule reads —
+     * a policy that looks applied and blocks nothing.
+     */
+    if (scope_rules > 0 &&
+        (!scope_src[0] || access(scope_src, R_OK) != 0 ||
+         aegisxd_nft_check_file(scope_src) != 0)) {
+        ok = 0;
+        aegisxd_apply_add_blocker(blockers, "content_scope_ruleset_invalid");
+    }
     if (!dns_src || !dns_src[0] || access(dns_src, R_OK) != 0) {
         ok = 0;
         aegisxd_apply_add_blocker(blockers, "dnsmasq_artifact_unavailable");
@@ -3244,6 +3439,10 @@ struct json_object *aegisxd_apply(struct json_object *body)
     aegisxd_json_add_string(resp, "dnsmasq_conf_dir", dns_dir);
     aegisxd_json_add_string(resp, "dnsmasq_conf_file", dns_file);
     aegisxd_json_add_string(resp, "dnsmasq_artifact", dns_src);
+    json_object_object_add(resp, "content_scope_rules", json_object_new_int(scope_rules));
+    aegisxd_json_add_string(resp, "content_scope_artifact", scope_src);
+    aegisxd_json_add_string(resp, "content_scope_nft_table",
+                            scope_rules > 0 ? AEGISXD_CONTENT_NFT_TABLE : "");
     aegisxd_json_add_string(resp, "job_id", job_id);
     json_object_object_add(resp, "blockers", blockers);
     aegisxd_apply_add_capabilities(resp);
@@ -3281,11 +3480,41 @@ struct json_object *aegisxd_apply(struct json_object *body)
         json_object_put(compile_req);
         return resp;
     }
+    /*
+     * Load the scoped table before reloading dnsmasq: the resolver starts
+     * filling the sets as soon as it reads nftset=, and a set that does not
+     * exist yet makes it log an error per query. Replaced wholesale rather than
+     * merged so a policy the user deleted cannot leave a rule behind.
+     */
+    if (scope_rules > 0) {
+        (void)aegisxd_nft_delete_content_scope_table();
+        if (aegisxd_nft_apply_file(scope_src) != 0) {
+            if (previous_saved) {
+                (void)aegisxd_file_copy_atomic(dns_previous, dns_file);
+                unlink(dns_previous);
+            } else
+                unlink(dns_file);
+            (void)aegisxd_dataplane_run_quiet(AEGISXD_DNSMASQ_RELOAD_CMD);
+            aegisxd_json_add_string(resp, "state", "rolled_back");
+            aegisxd_json_add_string(resp, "error", "content_scope_apply_failed");
+            aegisxd_json_add_string(resp, "nft_log", AEGISXD_NFT_LOG);
+            json_object_object_add(resp, "ok", json_object_new_boolean(0));
+            json_object_put(compile_req);
+            return resp;
+        }
+    } else
+        /* No scoped policy left; drop a table from an earlier apply. */
+        (void)aegisxd_nft_delete_content_scope_table();
     reload_rc = aegisxd_dataplane_run_quiet(AEGISXD_DNSMASQ_RELOAD_CMD);
     if (reload_rc != 0) {
         int rollback_rc;
         int rollback_restored;
 
+        /*
+         * The resolver never came back with the new config, so the sets will not
+         * be populated; leaving the table would keep rules matching a stale set.
+         */
+        (void)aegisxd_nft_delete_content_scope_table();
         if (previous_saved)
             rollback_restored = aegisxd_file_copy_atomic(dns_previous, dns_file) == 0;
         else {

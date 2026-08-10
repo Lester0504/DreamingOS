@@ -1,10 +1,13 @@
 import json
 import os
 import pathlib
-import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -120,42 +123,23 @@ def json_c_flags() -> tuple[list[str], dict[str, str]]:
     configured_prefix = env.get("JSON_C_PREFIX")
     if configured_prefix:
         candidates.append(pathlib.Path(configured_prefix))
-
-    try:
-        candidates.append(
-            pathlib.Path(
-                subprocess.check_output(
-                    ["brew", "--prefix", "json-c"], text=True, stderr=subprocess.DEVNULL
-                ).strip()
-            )
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
-
-    candidates.extend(
-        pathlib.Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c").glob("*")
-    )
-    for ancestor in (ROOT, *ROOT.parents):
-        candidates.append(ancestor / "staging_dir" / "host")
-
+    # An explicit JSON_C_PREFIX still wins, and it may legitimately point at a
+    # static-only prefix.
     for prefix in candidates:
         header = prefix / "include" / "json-c" / "json.h"
         libraries = (
-            prefix / "lib" / "libjson-c.a",
-            prefix / "lib" / "libjson-c.dylib",
             prefix / "lib" / "libjson-c.so",
+            prefix / "lib" / "libjson-c.dylib",
+            prefix / "lib" / "libjson-c.a",
         )
         library = next((candidate for candidate in libraries if candidate.is_file()), None)
         if header.is_file() and library:
             return [f"-I{prefix / 'include'}", str(library)], env
 
-    try:
-        output = subprocess.check_output(
-            ["pkg-config", "--cflags", "--libs", "json-c"], text=True, env=env
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError) as error:
-        raise RuntimeError("json-c development files are required") from error
-    return shlex.split(output), env
+    # Otherwise defer to the shared resolver. The former Homebrew-first search
+    # picked an LTO archive on 31.6 that the host linker cannot consume, which
+    # failed the harness build for reasons unrelated to this contract.
+    return apd_test_deps.package_flags("json-c"), env
 
 
 class AiModelCapabilitiesContract(unittest.TestCase):

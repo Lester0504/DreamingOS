@@ -103,7 +103,11 @@
 /* Must stay identical to webd's APP_API_DB_PATH (jmx_app_api.c). webd owns the
  * pairing rows; this daemon only reads them. Verified against 30.1, where the
  * file on disk is apid.db. */
+/* Overridable at compile time on the same terms as CLOUD_STATE_DIR, so tests can
+ * exercise the real queries against a temporary database. */
+#ifndef CLOUD_APP_DB_PATH
 #define CLOUD_APP_DB_PATH "/etc/dreamingwrt/apid.db"
+#endif
 
 /* Local webd. The inner request is replayed here as ordinary HTTP. */
 #define CLOUD_LOCAL_HOST "127.0.0.1"

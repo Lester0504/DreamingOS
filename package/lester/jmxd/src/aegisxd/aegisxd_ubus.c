@@ -395,6 +395,21 @@ static int aegisxd_handle_set_profile(struct ubus_context *ctx, struct ubus_obje
     return UBUS_STATUS_OK;
 }
 
+static int aegisxd_handle_set_traffic_log(struct ubus_context *ctx, struct ubus_object *obj,
+                                          struct ubus_request_data *req, const char *method,
+                                          struct blob_attr *msg)
+{
+    struct json_object *body = aegisxd_json_from_blob(msg);
+    struct json_object *resp;
+    (void)obj; (void)method;
+
+    resp = aegisxd_set_traffic_log(aegisxd_payload_or_self(body));
+    aegisxd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    json_object_put(body);
+    return UBUS_STATUS_OK;
+}
+
 static int aegisxd_handle_compile(struct ubus_context *ctx, struct ubus_object *obj,
                                   struct ubus_request_data *req, const char *method,
                                   struct blob_attr *msg)
@@ -703,6 +718,7 @@ static const struct ubus_method aegisxd_methods[] = {
     UBUS_METHOD("set_enabled", aegisxd_handle_set_enabled, aegisxd_any_policy),
     UBUS_METHOD("set_mode", aegisxd_handle_set_mode, aegisxd_any_policy),
     UBUS_METHOD("set_profile", aegisxd_handle_set_profile, aegisxd_any_policy),
+    UBUS_METHOD("set_traffic_log", aegisxd_handle_set_traffic_log, aegisxd_any_policy),
     UBUS_METHOD("honeypot_get", aegisxd_handle_honeypot_get, aegisxd_any_policy),
     UBUS_METHOD("honeypot_validate", aegisxd_handle_honeypot_validate, aegisxd_any_policy),
     UBUS_METHOD("honeypot_set", aegisxd_handle_honeypot_set, aegisxd_any_policy),

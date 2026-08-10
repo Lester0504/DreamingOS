@@ -60,6 +60,14 @@
 #ifndef AEGISXD_DNSMASQ_LOG_PATH
 #define AEGISXD_DNSMASQ_LOG_PATH "/var/run/dnsmasq/dreamingwrt-aegis.log"
 #endif
+/*
+ * Scoped content policies live in their own table so a failed scoped apply can
+ * be torn down without touching the reputation table in dreamingwrt_aegis.
+ */
+#ifndef AEGISXD_CONTENT_NFT_TABLE
+#define AEGISXD_CONTENT_NFT_TABLE "dreamingwrt_aegis_content"
+#endif
+#define AEGISXD_CONTENT_NFT_PATH AEGISXD_RUNTIME_DIR "/content-scope.nft"
 #define AEGISXD_SURICATA_ACTIVE_PATH AEGISXD_RUNTIME_DIR "/suricata-active.json"
 #define AEGISXD_SURICATA_EVE_PATH AEGISXD_WORK_DIR "/suricata/eve.json"
 #define AEGISXD_SURICATA_LOG_DIR AEGISXD_WORK_DIR "/suricata"
@@ -86,6 +94,16 @@ struct aegisxd_settings {
     char suricata_interface[IFNAMSIZ];
     int suricata_queue_num;
     int suricata_fail_open;
+    /*
+     * Traffic-log collection scope: "all" or "blocked". Filters security
+     * events, not forwarded traffic. The three source flags decide whether a
+     * class of event is logged at all and deliberately carry no scope of their
+     * own; scope is one global choice over the combined set.
+     */
+    char traffic_log_scope[16];
+    int traffic_log_gateway_dns;
+    int traffic_log_aegisx_service;
+    int traffic_log_device_admin;
 };
 
 struct aegisxd_feed_manifest {
@@ -121,6 +139,10 @@ sqlite3_stmt *aegisxd_prepare(const char *sql);
 int aegisxd_db_init(void);
 void aegisxd_db_close(void);
 int aegisxd_settings_load(struct aegisxd_settings *out);
+int aegisxd_traffic_log_scope_valid(const char *scope);
+/* NULL scope / negative flag means "unchanged"; -2 signals an invalid scope. */
+int aegisxd_traffic_log_settings_save(const char *scope, int gateway_dns,
+                                      int aegisx_service, int device_admin);
 int aegisxd_seed_builtin_feeds(void);
 int aegisxd_certificate_schema_init(void);
 
@@ -151,6 +173,8 @@ struct json_object *aegisxd_apply(struct json_object *body);
 struct json_object *aegisxd_set_enabled(struct json_object *body);
 struct json_object *aegisxd_set_mode(struct json_object *body);
 struct json_object *aegisxd_set_profile(struct json_object *body);
+/* Traffic-log scope + source toggles; omitted fields stay unchanged. */
+struct json_object *aegisxd_set_traffic_log(struct json_object *body);
 
 struct json_object *aegisxd_certificate_status_json(void);
 struct json_object *aegisxd_certificate_generate_json(struct json_object *body);
@@ -179,6 +203,9 @@ int aegisxd_content_filter_domain_explicitly_blocked(void *filter,
 int aegisxd_content_filter_mark_category_emitted(void *filter,
                                                   const char *domain);
 int aegisxd_content_filter_write_explicit_blocks(void *filter, FILE *fp);
+int aegisxd_content_filter_scoped_count(void *filter);
+int aegisxd_content_filter_write_scoped_dnsmasq(void *filter, FILE *fp);
+int aegisxd_content_filter_write_scoped_nft(void *filter, FILE *fp);
 int aegisxd_content_revision_get(void);
 int aegisxd_content_installed_dns_rule_match(const char *domain,
                                              char kind[32], char source_id[64],

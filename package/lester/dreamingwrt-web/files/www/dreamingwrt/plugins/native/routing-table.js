@@ -10,7 +10,7 @@ export function mount(context = {}) {
     return { name, ok: response.ok && json?.ok !== false, data: json?.data ?? json, raw: json };
   });
 
-  const VERSION = '20260805-page-tabs-tier-02';
+  const VERSION = '20260809-routing-empty-cell-semantics-01';
   const POLICY_ENDPOINT = '/api/v1/policy-engine/policy-table';
   const ROUTING_ENDPOINT = '/api/v1/routing';
   const RESOURCE_ENDPOINTS = {
@@ -64,6 +64,25 @@ export function mount(context = {}) {
       if (Number.isFinite(number)) return number;
     }
     return 0;
+  }
+  /*
+   * 与 firstNumber 的区别只有一处，但语义上是关键的：**取不到时返回 null，而不是 0**。
+   *
+   * firstNumber 的 0 兜底会把「后端没送这个字段」和「字段真的是 0」压成同一个值，
+   * 随后 `value || '--'` 又把真实的 0 判为 falsy 印成 `--`。于是页面把
+   * 「metric 0」「优先级 0」「引用 0」这三个**真实值**一律显示成"没有值"。
+   * 判空一律用 `== null`，不要用 `||`。
+   *
+   * 注意也要跳过空串：`Number('')` 是 0，直接 Number() 会把空串当成 0 混进来。
+   */
+  function nullableNumber(...values) {
+    for (const value of values) {
+      if (value === undefined || value === null) continue;
+      if (typeof value === 'string' && value.trim() === '') continue;
+      const number = Number(value);
+      if (Number.isFinite(number)) return number;
+    }
+    return null;
   }
   function asArray(value, keys = ['items', 'rows', 'data']) {
     if (Array.isArray(value)) return value;
@@ -155,15 +174,32 @@ export function mount(context = {}) {
       source, destination, target,
       interface: firstText(row.interface, raw.interface, raw.iface, raw.network, '--'),
       table: firstText(raw.route_table, raw.table, raw.routing_table, type === 'static_route' ? 'main' : target, '--'),
-      priority: firstNumber(raw.priority, raw.metric, row.priority, row.metric),
+      priority: nullableNumber(raw.priority, raw.metric, row.priority, row.metric),
+      /*
+       * 静态路由的 metric 语义：UCI section 不写 metric 时，内核按 metric 0 选路 ——
+       * 这是一个**真实值**，不是"后端没给数据"。30.1 实测该 section 的 options 只有
+       * interface/target/gateway，`metric` 键在 row / raw / options 三处都不存在，
+       * 所以 priority 会是 null；此时对静态路由要显示 0（并说明由来），
+       * 不能显示"未提供"，那会把一个确定的内核行为说成缺数据。
+       *
+       * PBR 不同：它的优先级由 ip rule 决定，后端没送就是真的不知道，保持"未提供"。
+       * 判据只看类型，不用 hasOwnProperty —— 后端根本没有这个键，探测它恒为 false，
+       * 区分不出"未设置(=0)"和"未提供"，这是我第一版写错的地方。
+       */
+      priorityImpliedZero: type === 'static_route',
       hits: firstNumber(raw.hit_count, raw.hits, row.hit_count, row.hits),
       lastHit: firstNumber(raw.last_hit, raw.last_hit_at, row.last_hit),
       enabled: row.enabled !== false && raw.enabled !== false && raw.disabled !== '1',
       comment: firstText(raw.comment, raw.remark, row.description), raw: { ...raw, ...row }
     };
   }
+  /*
+   * metric 与 ref_count 用 nullableNumber：这两列在 30.1 上真实为 0，
+   * 用 firstNumber 的 0 兜底会让"缺字段"和"真的是 0"无法区分（见 nullableNumber 注释）。
+   * table_id 保留 firstNumber —— 它是主键，缺失时没有可展示的语义。
+   */
   function normalizeTable(item = {}) {
-    return { ...item, id: firstText(item.id), name: firstText(item.name, item.id), table_id: firstNumber(item.table_id), metric: firstNumber(item.metric), enabled: item.enabled === true, references: asArray(item.references), ref_count: firstNumber(item.ref_count) };
+    return { ...item, id: firstText(item.id), name: firstText(item.name, item.id), table_id: firstNumber(item.table_id), metric: nullableNumber(item.metric), enabled: item.enabled === true, references: asArray(item.references), ref_count: nullableNumber(item.ref_count) };
   }
   function normalizeObject(item = {}) {
     return { ...item, id: firstText(item.id), name: firstText(item.name, item.id), type: firstText(item.type, item.object_type, 'ip_group'), family: firstText(item.family, 'mixed'), enabled: item.enabled === true, members: asArray(item.members), references: asArray(item.references), ref_count: firstNumber(item.ref_count) };
@@ -262,14 +298,61 @@ export function mount(context = {}) {
   function actionButton(kind, item, readOnly = false) {
     return `<button class="routing-row-action" type="button" data-routing-open="${escapeHtml(kind)}" data-routing-id="${escapeHtml(item.id)}" aria-label="${readOnly ? '查看' : '编辑'} ${escapeHtml(item.name)}">${icon(readOnly ? 'eye' : 'edit')}</button>`;
   }
+  /*
+   * 跃点 / 优先级单元格。三种状态必须分开，因为排查方向不同：
+   *   有明确值           照实显示
+   *   静态路由未设 metric 显示 0，并说明"UCI 未设置，内核按 0 处理"（真实值，不是缺数据）
+   *   后端确实没送字段   显示"未提供"，指向后端而不是配置
+   */
+  function priorityCell(item) {
+    if (item.priority == null) {
+      if (item.priorityImpliedZero) {
+        return '<span title="UCI 未设置 metric，内核按 metric 0 选路；这是真实值，不是缺少数据">0</span>';
+      }
+      return '<span class="routing-cell-muted" title="后端未在该行提供 priority 字段">未提供</span>';
+    }
+    if (item.priority === 0) {
+      return '<span title="优先级 0 是合法值">0</span>';
+    }
+    return String(item.priority);
+  }
+  /*
+   * 路由表的网关列。空网关不等于"没配好"：PPPoE 这类点对点链路走 `dev` 而没有 `via`，
+   * 30.1 实测 `ip route show table 101` 是 `default dev pppoe-wan scope link`，
+   * **空网关就是正确答案**。原先渲染成裸 `--`，与"后端没送数据"无法区分。
+   *
+   * 出口设备名后端当前未在 `routing/tables` 里下发（已由 Acceptance 说明需另开单），
+   * 所以这里只表达"这是设备路由"，不猜设备名。
+   */
+  function gatewayCell(item) {
+    const gateway = firstText(item.gateway);
+    if (gateway) return escapeHtml(gateway);
+    return '<span class="routing-cell-muted" title="点对点链路（如 PPPoE）经出口设备直连，没有下一跳地址；这是正常状态，不是缺少配置">设备路由</span>';
+  }
+  /* 引用数 0 是真实值（设备上没有 PBR 规则引用该表），不能退化成 --。 */
+  function countCell(value) {
+    const number = nullableNumber(value);
+    if (number == null) return '<span class="routing-cell-muted" title="后端未提供该计数">未提供</span>';
+    return String(number);
+  }
+  /*
+   * 路由表的 Metric。30.1 上四条 wan 表的 metric 都是真实的 0，
+   * 读起来像"未配置"，所以给 0 补一句说明；字段缺失才说未提供。
+   */
+  function metricCell(item) {
+    const number = nullableNumber(item.metric);
+    if (number == null) return '<span class="routing-cell-muted" title="后端未提供 metric 字段">未提供</span>';
+    if (number === 0) return '<span title="metric 0：默认优先级，内核按最长前缀与路由表顺序选路">0</span>';
+    return String(number);
+  }
   function policiesMarkup() {
-    const rows = state.policies.filter((item) => matchesQuery([item.name, item.typeLabel, item.source, item.destination, item.target, item.interface, item.table])).map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><span class="routing-kind is-${item.type}">${escapeHtml(item.typeLabel)}</span></td><td><strong>${escapeHtml(item.name)}</strong>${item.comment ? `<small>${escapeHtml(item.comment)}</small>` : ''}</td><td>${escapeHtml(item.source)}</td><td>${escapeHtml(item.destination)}</td><td>${escapeHtml(item.target)}</td><td>${escapeHtml(item.interface)}</td><td><span class="routing-table-pill">${escapeHtml(item.table)}</span></td><td>${item.priority || '--'}</td><td>${item.type === 'pbr' ? item.hits : '--'}</td><td>${item.type === 'pbr' ? escapeHtml(formatTime(item.lastHit)) : '--'}</td><td>${actionButton('policy', item, true)}</td></tr>`);
+    const rows = state.policies.filter((item) => matchesQuery([item.name, item.typeLabel, item.source, item.destination, item.target, item.interface, item.table])).map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><span class="routing-kind is-${item.type}">${escapeHtml(item.typeLabel)}</span></td><td><strong>${escapeHtml(item.name)}</strong>${item.comment ? `<small>${escapeHtml(item.comment)}</small>` : ''}</td><td>${escapeHtml(item.source)}</td><td>${escapeHtml(item.destination)}</td><td>${escapeHtml(item.target)}</td><td>${escapeHtml(item.interface)}</td><td><span class="routing-table-pill">${escapeHtml(item.table)}</span></td><td>${priorityCell(item)}</td><td>${item.type === 'pbr' ? item.hits : '--'}</td><td>${item.type === 'pbr' ? escapeHtml(formatTime(item.lastHit)) : '--'}</td><td>${actionButton('policy', item, true)}</td></tr>`);
     return `${capabilityBanner('静态路由与 PBR 在此仅作统一索引；创建、修改和删除继续由“策略表”作为唯一写入口。', 'info')}${state.errors.policies ? capabilityBanner(`路由策略读取失败：${state.errors.policies}`, 'danger') : ''}${tableShell('路由策略', `${rows.length} 条 · 只读索引`, ['状态', '类型', '名称', '源', '目标网络', '下一跳 / 目标', '接口', '路由表', '跃点 / 优先级', '命中', '最后命中', '详情'], rows, state.errors.policies || '没有路由策略', 'is-policy-table', tableControlsMarkup())}`;
   }
   function tablesMarkup() {
     const writable = cap('table_crud');
     const items = state.tables.filter((item) => matchesQuery([item.id, item.name, item.role, item.gateway, item.table_id]));
-    const rows = items.map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></td><td>${item.table_id}</td><td>${escapeHtml(item.role || '--')}</td><td>${escapeHtml(item.gateway || '--')}</td><td>${item.metric}</td><td>${item.ref_count}</td><td>${actionButton('table', item, !writable)}</td></tr>`);
+    const rows = items.map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></td><td>${item.table_id}</td><td>${escapeHtml(item.role || '--')}</td><td>${gatewayCell(item)}</td><td>${metricCell(item)}</td><td>${countCell(item.ref_count)}</td><td>${actionButton('table', item, !writable)}</td></tr>`);
     return `${!writable ? capabilityBanner('后端未明确声明 table_crud，路由表保持只读。', 'danger') : ''}${state.errors.tables ? capabilityBanner(`路由表读取失败：${state.errors.tables}`, 'danger') : ''}${tableShell('自定义路由表', `${items.length} 个 · ${writable ? '真实 CRUD' : '只读'}`, ['状态', '名称 / ID', 'Table ID', '角色', '网关', 'Metric', '引用', '操作'], rows, state.errors.tables || '没有自定义路由表', '', tableControlsMarkup())}`;
   }
   function objectsMarkup() {

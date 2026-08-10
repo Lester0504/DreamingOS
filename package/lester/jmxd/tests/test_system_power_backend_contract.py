@@ -10,8 +10,12 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import textwrap
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +25,6 @@ MAKEFILE = ROOT / "src/Makefile"
 CORE_API = ROOT / "src/jmx_dreamingwrt_api.c"
 WEBD_API = ROOT / "src/webd/jmx_app_api.c"
 WEBD_PERMS = ROOT / "src/webd/jmx_app_perms.c"
-CORE_PERMS = ROOT / "src/jmx_app_perms.c"
 MAINTENANCED = ROOT / "src/maintenanced/maintenanced_main.c"
 
 
@@ -33,7 +36,7 @@ def read(path: Path) -> str:
 C = read(SOURCE)
 H = read(HEADER)
 WIRING = "\n".join(read(path) for path in (
-    MAKEFILE, CORE_API, WEBD_API, WEBD_PERMS, CORE_PERMS, MAINTENANCED,
+    MAKEFILE, CORE_API, WEBD_API, WEBD_PERMS, MAINTENANCED,
 ))
 
 
@@ -139,13 +142,18 @@ def test_core_webd_and_maintenance_wiring() -> None:
         "jmx_app_audit_log_ex",
         '"source_ip"',
         '"failure_reason"',
-        '"source_ip,result,failure_reason) VALUES',
+        '"source_ip,result,failure_reason) "',
         "MAINTENANCED_POWER_TICKS 5",
         'blobmsg_add_u32(&maintenance_blob, "power_schedule"',
     ), "core/webd/maintenanced wiring")
+    # Exactly one risk-table row, in webd/jmx_app_perms.c.  This asserted 2
+    # while src/jmx_app_perms.c held a second, independent copy of the table;
+    # that copy was collapsed into a forwarding header (see
+    # src/jmx_app_perms.h) precisely so a second definition cannot drift, so
+    # a count of 2 would now mean the duplicate came back.
     assert WIRING.count(
         '{ "/api/v1/system/shutdown",  "POST", JMX_RISK_HIGH }'
-    ) == 2
+    ) == 1
     assert 'json_object_object_add(params, "execute", json_object_new_boolean(1))' in WIRING
 
 
@@ -175,13 +183,12 @@ def pkg_config_flags() -> list[str]:
     explicit = os.environ.get("SYSTEM_POWER_TEST_FLAGS", "").strip()
     if explicit:
         return shlex.split(explicit)
-    proc = subprocess.run(
-        ["pkg-config", "--cflags", "--libs", "json-c", "sqlite3"],
-        text=True, capture_output=True,
-    )
-    if proc.returncode != 0:
+    # Returning [] on a pkg-config miss turned into a silent skip on 31.6, where
+    # json-c has no .pc file. Resolve it instead so the fixture actually runs.
+    try:
+        return apd_test_deps.package_flags("json-c", "sqlite3")
+    except AssertionError:
         return []
-    return shlex.split(proc.stdout)
 
 
 def test_executable_contract_when_native_dependencies_exist() -> None:
@@ -189,6 +196,13 @@ def test_executable_contract_when_native_dependencies_exist() -> None:
     flags = pkg_config_flags()
     if not compiler or not flags:
         print("skip: native json-c/sqlite3 development dependencies unavailable")
+        return
+    # power.c reaches the OS through pipe2()/SOCK_CLOEXEC, which are Linux-only
+    # and absent from the macOS SDK under every feature macro.  The target is
+    # Linux, so this is a host limitation rather than a defect in power.c; the
+    # static contracts above still run everywhere.
+    if sys.platform == "darwin":
+        print("skip: pipe2()/SOCK_CLOEXEC are Linux-only; run this on the target host")
         return
     with tempfile.TemporaryDirectory(prefix="system-power-contract-") as temp_name:
         temp = Path(temp_name)

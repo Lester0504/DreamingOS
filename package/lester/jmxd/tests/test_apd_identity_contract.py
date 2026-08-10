@@ -70,9 +70,20 @@ def test_ubus_surface_is_read_only_and_secret_free() -> None:
         '"enroll"',
     ):
         assert forbidden_method not in ubus
-    for forbidden in ("private_key", "challenge_hash", "pairing_token", "secret"):
+    # Match the published JSON field name, not a bare substring. The read-only
+    # surface exposes "pairing_token_expired", a boolean that reports whether a
+    # fresh pairing code is needed and carries no token value, which a substring
+    # rule flags as a leak. Quoting the field name keeps a real
+    # "pairing_token" field failing while letting the boolean through.
+    for forbidden in ('"private_key"', '"challenge_hash"', '"pairing_token"',
+                      '"secret"'):
         assert forbidden not in protocol
         assert forbidden not in ubus
+    # The bare names must still not appear as C identifiers being serialised;
+    # anything holding actual key material would show up here.
+    for leaked in ("private_key", "challenge_hash", "secret"):
+        assert leaked not in protocol
+        assert leaked not in ubus
     assert '"public_key"' in protocol
     assert '"key_exportable"' in protocol
     assert '"mtls_ready"' in protocol
@@ -90,8 +101,8 @@ def test_pairing_state_machine_cannot_claim_remote_pairing() -> None:
     assert "attempts+1>=5" in db
     assert "paired" not in re.sub(r"unpaired", "", db)
     assert "adopted" not in db
-    assert 'apd_capability(cap, reasons, "pairing", 0' in protocol
-    assert '"pairing_transport_and_mtls_not_implemented"' in protocol
+    assert 'apd_capability(cap, reasons, "pairing", APD_NODE_TRANSPORT_ENABLED' in protocol
+    assert "apd_transport_reason()" in protocol
 
 
 if __name__ == "__main__":

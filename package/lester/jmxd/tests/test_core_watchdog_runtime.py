@@ -5,7 +5,11 @@ from pathlib import Path
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,19 +19,10 @@ def json_c_flags() -> list[str]:
     explicit = os.environ.get("CORE_WATCHDOG_TEST_FLAGS", "").strip()
     if explicit:
         return shlex.split(explicit)
-    candidates = [Path("/opt/homebrew/opt/json-c")]
-    candidates.extend(Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c").glob("*"))
-    for prefix in candidates:
-        header = prefix / "include/json-c/json.h"
-        static = prefix / "lib/libjson-c.a"
-        dynamic = prefix / "lib/libjson-c.dylib"
-        if header.is_file() and static.is_file():
-            return [f"-I{prefix / 'include'}", str(static)]
-        if header.is_file() and dynamic.is_file():
-            return [f"-I{prefix / 'include'}", f"-L{prefix / 'lib'}", "-ljson-c"]
-    return shlex.split(subprocess.check_output(
-        ["pkg-config", "--cflags", "--libs", "json-c"], text=True
-    ))
+    # Searching Homebrew first picked the static archive even on 31.6, where it
+    # is an LTO archive from a different compiler and the link fails. The
+    # shared resolver prefers a real shared library wherever it lives.
+    return apd_test_deps.package_flags("json-c")
 
 
 def main() -> None:

@@ -5,6 +5,18 @@
 #define CONTENT_MAX_LIST 128
 #define CONTENT_MAX_DOMAIN 253
 #define CONTENT_PROVENANCE_MAX_RULES 60000
+/*
+ * Devices per policy. Each scoped device becomes one element in an nft
+ * ether_addr set, so this is a policy-authoring limit rather than a dataplane
+ * one; it exists so a pasted list cannot blow up the ruleset unnoticed.
+ */
+#define CONTENT_MAX_SCOPE_DEVICES 64
+/*
+ * Lifetime of an address learned from dnsmasq. Long enough to outlive normal
+ * DNS TTLs so a re-resolve does not open a gap mid-session, short enough that a
+ * recycled address stops being blocked on its own.
+ */
+#define CONTENT_SCOPE_SET_TIMEOUT_MIN 120
 
 struct content_provenance_rule {
     char domain[254];
@@ -36,6 +48,28 @@ struct content_safe_search {
     int youtube;
 };
 
+/*
+ * A policy limited to specific devices and/or a time window. These cannot be
+ * expressed as dnsmasq address= rewrites, which apply to every client, so they
+ * are rendered as an nftables rule matching `ether saddr` against a per-policy
+ * device set, with the domains carried in an ipv4/ipv6 set that dnsmasq fills
+ * through nftset= as answers are resolved.
+ */
+struct content_scoped_policy {
+    char id[96];
+    char set_key[80];
+    int enhanced;
+    int ad_block;
+    int schedule_always;
+    char start_time[8];
+    char end_time[8];
+    int weekdays;                       /* bitmask, bit0 = Sunday */
+    struct content_string_list devices; /* normalized lower-case MACs */
+    struct content_string_list categories;
+    struct content_string_list blocks;  /* per-policy domain overrides */
+    struct content_string_list allows;
+};
+
 struct content_filter {
     int managed;
     int policy_count;
@@ -47,6 +81,8 @@ struct content_filter {
     struct content_string_list blocks;
     struct content_string_list emitted_blocks;
     struct content_string_list emitted_categories;
+    struct content_scoped_policy *scoped;
+    size_t scoped_count;
 };
 
 struct content_safe_search_host {
@@ -191,6 +227,227 @@ static int content_domain_list_matches(const struct content_string_list *list,
     if (!list || !domain) return 0;
     for (size_t i = 0; i < list->count; i++)
         if (content_domain_matches(domain, list->items[i])) return 1;
+    return 0;
+}
+
+static int content_json_empty_array(struct json_object *o, const char *key)
+{
+    struct json_object *v = NULL;
+    return !o || !json_object_object_get_ex(o, key, &v) ||
+        (json_object_is_type(v, json_type_array) && json_object_array_length(v) == 0);
+}
+
+/*
+ * Normalize a MAC into lower-case colon form. Deliberately the same acceptance
+ * rule as the MAC ACL (nc_netctl_mac_ok) so a device the user already blocked
+ * there can be pasted into a content policy without being re-typed: six hex
+ * octets, ':' or '-' separated. Returns 0 and fills out[18] on success.
+ */
+static int content_mac_normalize(const char *raw, char out[18])
+{
+    unsigned int byte[6];
+    int consumed = 0;
+
+    if (!raw || !out)
+        return -1;
+    if (sscanf(raw, "%2x:%2x:%2x:%2x:%2x:%2x%n", &byte[0], &byte[1], &byte[2],
+               &byte[3], &byte[4], &byte[5], &consumed) != 6 || raw[consumed] ||
+        consumed != 17) {
+        consumed = 0;
+        if (sscanf(raw, "%2x-%2x-%2x-%2x-%2x-%2x%n", &byte[0], &byte[1],
+                   &byte[2], &byte[3], &byte[4], &byte[5], &consumed) != 6 ||
+            raw[consumed] || consumed != 17)
+            return -1;
+    }
+    for (int i = 0; i < 6; i++)
+        if (byte[i] > 0xff)
+            return -1;
+    /*
+     * A multicast or all-zero source address never identifies a real client, so
+     * accepting it would create a rule that silently matches nothing.
+     */
+    if (byte[0] & 0x01)
+        return -1;
+    if (!(byte[0] | byte[1] | byte[2] | byte[3] | byte[4] | byte[5]))
+        return -1;
+    snprintf(out, 18, "%02x:%02x:%02x:%02x:%02x:%02x", byte[0], byte[1],
+             byte[2], byte[3], byte[4], byte[5]);
+    return 0;
+}
+
+static int content_hhmm_ok(const char *s)
+{
+    int h, m;
+
+    if (!s || strlen(s) != 5 || s[2] != ':')
+        return 0;
+    if (!isdigit((unsigned char)s[0]) || !isdigit((unsigned char)s[1]) ||
+        !isdigit((unsigned char)s[3]) || !isdigit((unsigned char)s[4]))
+        return 0;
+    h = (s[0] - '0') * 10 + (s[1] - '0');
+    m = (s[3] - '0') * 10 + (s[4] - '0');
+    return h <= 24 && m <= 59 && !(h == 24 && m);
+}
+
+static int content_scope_is_global(struct json_object *scope)
+{
+    return scope && json_object_is_type(scope, json_type_object) &&
+        !strcmp(aegisxd_json_str(scope, "type", "all"), "all") &&
+        content_json_empty_array(scope, "devices") &&
+        content_json_empty_array(scope, "networks");
+}
+
+static int content_scope_is_devices(struct json_object *scope)
+{
+    struct json_object *devices = NULL;
+
+    return scope && json_object_is_type(scope, json_type_object) &&
+        !strcmp(aegisxd_json_str(scope, "type", "devices"), "devices") &&
+        content_json_empty_array(scope, "networks") &&
+        json_object_object_get_ex(scope, "devices", &devices) && devices &&
+        json_object_is_type(devices, json_type_array) &&
+        json_object_array_length(devices) > 0;
+}
+
+static int content_schedule_is_always(struct json_object *schedule)
+{
+    return schedule && json_object_is_type(schedule, json_type_object) &&
+        !strcmp(aegisxd_json_str(schedule, "type", "always"), "always");
+}
+
+static int content_schedule_is_window(struct json_object *schedule)
+{
+    struct json_object *windows = NULL;
+
+    return schedule && json_object_is_type(schedule, json_type_object) &&
+        !strcmp(aegisxd_json_str(schedule, "type", "window"), "window") &&
+        json_object_object_get_ex(schedule, "windows", &windows) && windows &&
+        json_object_is_type(windows, json_type_array) &&
+        json_object_array_length(windows) == 1;
+}
+
+static struct content_scoped_policy *content_filter_find_scoped(struct content_filter *f,
+                                                                 const char *policy_id)
+{
+    if (!f || !policy_id || !policy_id[0])
+        return NULL;
+    for (size_t i = 0; i < f->scoped_count; i++)
+        if (!strcmp(f->scoped[i].id, policy_id))
+            return &f->scoped[i];
+    return NULL;
+}
+
+/*
+ * Build the nft set suffix for a policy. Set names allow a narrower alphabet
+ * than policy ids, so anything outside [A-Za-z0-9_] becomes '_'. Ids are unique
+ * and length-capped upstream, but two ids differing only in a substituted
+ * character would collide, so the caller checks for a duplicate key.
+ */
+static void content_scoped_set_key(const char *policy_id, char *out, size_t out_len)
+{
+    size_t j = 0;
+
+    for (size_t i = 0; policy_id && policy_id[i] && j + 1 < out_len; i++) {
+        unsigned char c = (unsigned char)policy_id[i];
+
+        out[j++] = isalnum(c) ? (char)tolower(c) : '_';
+    }
+    out[j] = '\0';
+}
+
+static int content_filter_add_scoped(struct content_filter *f, const char *policy_id,
+                                      const char *mode, int ad_block,
+                                      struct json_object *categories,
+                                      struct json_object *scope,
+                                      struct json_object *schedule)
+{
+    struct content_scoped_policy *next, *sp;
+    struct json_object *devices = NULL;
+
+    if (!f || !policy_id || !policy_id[0] ||
+        strlen(policy_id) >= sizeof(sp->id))
+        return -1;
+    if (content_filter_find_scoped(f, policy_id))
+        return -1;
+    next = realloc(f->scoped, (f->scoped_count + 1) * sizeof(*next));
+    if (!next)
+        return -1;
+    f->scoped = next;
+    sp = &f->scoped[f->scoped_count];
+    memset(sp, 0, sizeof(*sp));
+    snprintf(sp->id, sizeof(sp->id), "%s", policy_id);
+    content_scoped_set_key(policy_id, sp->set_key, sizeof(sp->set_key));
+    if (!sp->set_key[0])
+        return -1;
+    for (size_t i = 0; i < f->scoped_count; i++)
+        if (!strcmp(f->scoped[i].set_key, sp->set_key))
+            return -1;
+    sp->enhanced = mode && !strcmp(mode, "enhanced");
+    sp->ad_block = ad_block ? 1 : 0;
+    if (categories && json_object_is_type(categories, json_type_array))
+        for (size_t i = 0; i < json_object_array_length(categories); i++) {
+            struct json_object *v = json_object_array_get_idx(categories, i);
+
+            if (v && json_object_is_type(v, json_type_string) &&
+                content_list_add(&sp->categories, json_object_get_string(v)) != 0)
+                return -1;
+        }
+    /*
+     * scope=all with a window is legitimate: "block these categories for
+     * everyone, but only in the evening". Such a policy has no device list and
+     * is rendered without an ether saddr match.
+     */
+    if (content_scope_is_devices(scope) &&
+        json_object_object_get_ex(scope, "devices", &devices) && devices)
+        for (size_t i = 0; i < json_object_array_length(devices); i++) {
+            struct json_object *v = json_object_array_get_idx(devices, i);
+            char mac[18];
+
+            if (!v || !json_object_is_type(v, json_type_string) ||
+                content_mac_normalize(json_object_get_string(v), mac) != 0 ||
+                content_list_add(&sp->devices, mac) != 0)
+                return -1;
+        }
+    sp->schedule_always = 1;
+    if (content_schedule_is_window(schedule)) {
+        struct json_object *windows = NULL, *entry, *days = NULL, *v;
+        const char *start, *end;
+
+        if (!json_object_object_get_ex(schedule, "windows", &windows) || !windows)
+            return -1;
+        entry = json_object_array_get_idx(windows, 0);
+        if (!entry || !json_object_is_type(entry, json_type_object))
+            return -1;
+        start = json_object_object_get_ex(entry, "start_time", &v) && v &&
+            json_object_is_type(v, json_type_string) ?
+            json_object_get_string(v) : NULL;
+        end = json_object_object_get_ex(entry, "end_time", &v) && v &&
+            json_object_is_type(v, json_type_string) ?
+            json_object_get_string(v) : NULL;
+        if (!content_hhmm_ok(start) || !content_hhmm_ok(end) || !strcmp(start, end))
+            return -1;
+        snprintf(sp->start_time, sizeof(sp->start_time), "%s", start);
+        snprintf(sp->end_time, sizeof(sp->end_time), "%s", end);
+        if (json_object_object_get_ex(entry, "weekdays", &days) && days &&
+            json_object_is_type(days, json_type_array))
+            for (size_t i = 0; i < json_object_array_length(days); i++) {
+                struct json_object *d = json_object_array_get_idx(days, i);
+                int n;
+
+                if (!d || !json_object_is_type(d, json_type_int) ||
+                    (n = json_object_get_int(d)) < 0 || n > 6)
+                    return -1;
+                sp->weekdays |= 1 << n;
+            }
+        if (!sp->weekdays)
+            sp->weekdays = 0x7f;
+        sp->schedule_always = 0;
+    }
+    /* A scoped policy that matches no device and no window is really global;
+     * refuse rather than emit a rule that quietly applies to everyone. */
+    if (sp->schedule_always && !sp->devices.count)
+        return -1;
+    f->scoped_count++;
     return 0;
 }
 
@@ -414,11 +671,172 @@ int aegisxd_content_installed_dns_rule_match(const char *domain,
     return 0;
 }
 
-static int content_json_empty_array(struct json_object *o, const char *key)
+/*
+ * Canonicalize scope into {"type":...,"devices":[...],"networks":[]}.
+ *
+ * type=all keeps the historical global behavior. type=devices requires at
+ * least one MAC: an empty device list would otherwise read as "every device"
+ * and turn a targeted rule into a global one. Network scope is still refused
+ * because nothing renders it (see content_capabilities).
+ */
+static struct json_object *content_scope_canonical(struct json_object *scope,
+                                                    const char **error)
 {
-    struct json_object *v = NULL;
-    return !o || !json_object_object_get_ex(o, key, &v) ||
-        (json_object_is_type(v, json_type_array) && json_object_array_length(v) == 0);
+    struct json_object *out, *devices, *raw = NULL;
+    struct content_string_list seen = { 0 };
+    const char *type;
+
+    if (scope && !json_object_is_type(scope, json_type_object)) {
+        *error = "invalid_content_policy_scope";
+        return NULL;
+    }
+    type = scope ? aegisxd_json_str(scope, "type", "all") : "all";
+    if (!scope || !strcmp(type, "all")) {
+        if (!content_json_empty_array(scope, "devices") ||
+            !content_json_empty_array(scope, "networks")) {
+            *error = "invalid_content_policy_scope";
+            return NULL;
+        }
+        return json_tokener_parse("{\"type\":\"all\",\"devices\":[],\"networks\":[]}");
+    }
+    if (strcmp(type, "devices")) {
+        *error = "content_scope_not_supported";
+        return NULL;
+    }
+    if (!content_json_empty_array(scope, "networks")) {
+        *error = "content_network_scope_not_supported";
+        return NULL;
+    }
+    if (!json_object_object_get_ex(scope, "devices", &raw) ||
+        !json_object_is_type(raw, json_type_array) ||
+        !json_object_array_length(raw)) {
+        *error = "content_scope_devices_required";
+        return NULL;
+    }
+    if (json_object_array_length(raw) > CONTENT_MAX_SCOPE_DEVICES) {
+        *error = "content_scope_devices_too_many";
+        return NULL;
+    }
+    devices = json_object_new_array();
+    for (size_t i = 0; i < json_object_array_length(raw); i++) {
+        struct json_object *v = json_object_array_get_idx(raw, i);
+        char mac[18];
+
+        if (!v || !json_object_is_type(v, json_type_string) ||
+            content_mac_normalize(json_object_get_string(v), mac) != 0) {
+            json_object_put(devices);
+            content_list_free(&seen);
+            *error = "invalid_content_scope_device";
+            return NULL;
+        }
+        if (content_list_has(&seen, mac))
+            continue;
+        if (content_list_add(&seen, mac) != 0) {
+            json_object_put(devices);
+            content_list_free(&seen);
+            *error = "content_scope_devices_too_many";
+            return NULL;
+        }
+        json_object_array_add(devices, json_object_new_string(mac));
+    }
+    content_list_free(&seen);
+    out = json_object_new_object();
+    json_object_object_add(out, "type", json_object_new_string("devices"));
+    json_object_object_add(out, "devices", devices);
+    json_object_object_add(out, "networks", json_object_new_array());
+    return out;
+}
+
+/*
+ * Canonicalize schedule into {"type":"always"} or
+ * {"type":"window","windows":[{weekdays,start_time,end_time}]}.
+ *
+ * One window per policy, matching acl_schedule_max_windows: nft evaluates a
+ * single time expression per rule, so disjoint windows need separate rules.
+ * Times are device-local, same basis as acl_schedule_time_basis.
+ */
+static struct json_object *content_schedule_canonical(struct json_object *schedule,
+                                                       const char **error)
+{
+    struct json_object *out, *windows, *raw = NULL, *entry, *days = NULL, *v;
+    struct json_object *clean, *clean_days;
+    const char *type, *start, *end;
+    int seen[7] = { 0 };
+
+    if (schedule && !json_object_is_type(schedule, json_type_object)) {
+        *error = "invalid_content_schedule";
+        return NULL;
+    }
+    type = schedule ? aegisxd_json_str(schedule, "type", "always") : "always";
+    if (!schedule || !strcmp(type, "always"))
+        return json_tokener_parse("{\"type\":\"always\"}");
+    if (strcmp(type, "window")) {
+        *error = "content_schedule_not_supported";
+        return NULL;
+    }
+    if (!json_object_object_get_ex(schedule, "windows", &raw) ||
+        !json_object_is_type(raw, json_type_array) ||
+        json_object_array_length(raw) != 1) {
+        *error = "content_schedule_single_window_required";
+        return NULL;
+    }
+    entry = json_object_array_get_idx(raw, 0);
+    if (!entry || !json_object_is_type(entry, json_type_object)) {
+        *error = "invalid_content_schedule_window";
+        return NULL;
+    }
+    start = json_object_object_get_ex(entry, "start_time", &v) && v &&
+        json_object_is_type(v, json_type_string) ? json_object_get_string(v) : NULL;
+    end = json_object_object_get_ex(entry, "end_time", &v) && v &&
+        json_object_is_type(v, json_type_string) ? json_object_get_string(v) : NULL;
+    if (!content_hhmm_ok(start) || !content_hhmm_ok(end)) {
+        *error = "invalid_content_schedule_time";
+        return NULL;
+    }
+    /* An empty window would never match, which is not what the user asked for. */
+    if (!strcmp(start, end)) {
+        *error = "invalid_content_schedule_window";
+        return NULL;
+    }
+    clean_days = json_object_new_array();
+    if (json_object_object_get_ex(entry, "weekdays", &days) && days) {
+        if (!json_object_is_type(days, json_type_array) ||
+            json_object_array_length(days) > 7) {
+            json_object_put(clean_days);
+            *error = "invalid_content_schedule_weekdays";
+            return NULL;
+        }
+        for (size_t i = 0; i < json_object_array_length(days); i++) {
+            struct json_object *d = json_object_array_get_idx(days, i);
+            int n;
+
+            if (!d || !json_object_is_type(d, json_type_int) ||
+                (n = json_object_get_int(d)) < 0 || n > 6) {
+                json_object_put(clean_days);
+                *error = "invalid_content_schedule_weekdays";
+                return NULL;
+            }
+            if (!seen[n]) {
+                seen[n] = 1;
+                json_object_array_add(clean_days, json_object_new_int(n));
+            }
+        }
+    }
+    /* No weekdays given means every day; store it explicitly so the renderer
+     * never has to guess what an absent field meant. */
+    if (!json_object_array_length(clean_days))
+        for (int i = 0; i < 7; i++)
+            json_object_array_add(clean_days, json_object_new_int(i));
+    clean = json_object_new_object();
+    json_object_object_add(clean, "weekdays", clean_days);
+    json_object_object_add(clean, "start_time", json_object_new_string(start));
+    json_object_object_add(clean, "end_time", json_object_new_string(end));
+    windows = json_object_new_array();
+    json_object_array_add(windows, clean);
+    out = json_object_new_object();
+    json_object_object_add(out, "type", json_object_new_string("window"));
+    json_object_object_add(out, "windows", windows);
+    return out;
 }
 
 static int content_safe_search_provider_enabled(const struct content_safe_search *safe,
@@ -542,15 +960,13 @@ static int content_safe_search_effective(struct content_safe_search *safe,
             aegisxd_sqlite_text(st, 1, "{}"));
         struct json_object *schedule = json_tokener_parse(
             aegisxd_sqlite_text(st, 2, "{}"));
-        int global = scope && json_object_is_type(scope, json_type_object) &&
-            !strcmp(aegisxd_json_str(scope, "type", "all"), "all") &&
-            content_json_empty_array(scope, "devices") &&
-            content_json_empty_array(scope, "networks");
-        int always = schedule && json_object_is_type(schedule, json_type_object) &&
-            !strcmp(aegisxd_json_str(schedule, "type", "always"), "always");
+        int global = content_scope_is_global(scope);
+        int always = content_schedule_is_always(schedule);
+        int recognized = (global || content_scope_is_devices(scope)) &&
+            (always || content_schedule_is_window(schedule));
 
         count++;
-        if (!value || !global || !always ||
+        if (!value || !recognized ||
             content_safe_search_parse(value, &parsed, NULL) != 0) {
             if (value)
                 json_object_put(value);
@@ -561,7 +977,13 @@ static int content_safe_search_effective(struct content_safe_search *safe,
             sqlite3_finalize(st);
             return -1;
         }
-        if (safe) {
+        /*
+         * Safe-search is enforced by rewriting the provider hostnames for every
+         * client, so only a global always-on policy can contribute. A scoped
+         * policy is valid configuration but must not raise the global state, or
+         * one child's evening rule would force safe-search on the whole house.
+         */
+        if (safe && global && always) {
             safe->google |= parsed.google;
             safe->bing |= parsed.bing;
             safe->youtube |= parsed.youtube;
@@ -620,12 +1042,12 @@ static struct json_object *content_canonical_object(struct json_object *body,
 {
     struct json_object *out = json_object_new_object();
     struct json_object *scope = NULL, *safe = NULL, *schedule = NULL, *categories = NULL;
+    struct json_object *scope_canonical = NULL, *schedule_canonical = NULL;
     struct json_object *copy;
     struct content_safe_search safe_values = { 0 };
     const char *id = aegisxd_json_str(body, "id", "");
     const char *name = aegisxd_json_str(body, "name", "");
     const char *mode = aegisxd_json_str(body, "mode", "basic");
-    const char *scope_type = "all", *schedule_type = "always";
     int enabled = aegisxd_json_bool(body, "enabled", 1);
     int ad_block = aegisxd_json_bool(body, "ad_block", 0);
 
@@ -634,17 +1056,14 @@ static struct json_object *content_canonical_object(struct json_object *body,
     else if (!content_text_ok(name, 128, 1)) *error = "invalid_content_policy_name";
     else if (!content_mode_ok(mode)) *error = "invalid_content_policy_mode";
     if (body) json_object_object_get_ex(body, "scope", &scope);
-    if (scope && !json_object_is_type(scope, json_type_object)) *error = "invalid_content_policy_scope";
-    if (scope) scope_type = aegisxd_json_str(scope, "type", "all");
-    if (!*error && (strcmp(scope_type, "all") || !content_json_empty_array(scope, "devices") ||
-        !content_json_empty_array(scope, "networks"))) *error = "content_scope_not_supported";
+    if (!*error)
+        scope_canonical = content_scope_canonical(scope, error);
     if (body) json_object_object_get_ex(body, "safe_search", &safe);
     if (!*error)
         (void)content_safe_search_parse(safe, &safe_values, error);
     if (body) json_object_object_get_ex(body, "schedule", &schedule);
-    if (!*error && schedule && !json_object_is_type(schedule, json_type_object)) *error = "invalid_content_schedule";
-    if (schedule) schedule_type = aegisxd_json_str(schedule, "type", "always");
-    if (!*error && strcmp(schedule_type, "always")) *error = "content_schedule_not_supported";
+    if (!*error)
+        schedule_canonical = content_schedule_canonical(schedule, error);
     if (body) json_object_object_get_ex(body, "categories", &categories);
     if (!*error && categories && (!json_object_is_type(categories, json_type_array) ||
         json_object_array_length(categories) > 64)) *error = "invalid_content_categories";
@@ -658,7 +1077,14 @@ static struct json_object *content_canonical_object(struct json_object *body,
     json_object_object_add(out, "name", json_object_new_string(name));
     json_object_object_add(out, "enabled", json_object_new_boolean(enabled));
     json_object_object_add(out, "mode", json_object_new_string(mode));
-    copy = scope ? json_object_get(scope) : json_tokener_parse("{\"type\":\"all\",\"devices\":[],\"networks\":[]}");
+    /*
+     * Echo the canonical form, not the caller's raw object: the stored row and
+     * the renderer both read this, so normalized MACs must be what round-trips.
+     * On a validation error fall back to the global default so the response
+     * still carries a well-formed shape alongside the error code.
+     */
+    copy = scope_canonical ? scope_canonical :
+        json_tokener_parse("{\"type\":\"all\",\"devices\":[],\"networks\":[]}");
     json_object_object_add(out, "scope", copy);
     json_object_object_add(out, "ad_block", json_object_new_boolean(ad_block));
     copy = json_object_new_object();
@@ -668,7 +1094,8 @@ static struct json_object *content_canonical_object(struct json_object *body,
     json_object_object_add(out, "safe_search", copy);
     copy = categories ? json_object_get(categories) : json_object_new_array();
     json_object_object_add(out, "categories", copy);
-    copy = schedule ? json_object_get(schedule) : json_tokener_parse("{\"type\":\"always\"}");
+    copy = schedule_canonical ? schedule_canonical :
+        json_tokener_parse("{\"type\":\"always\"}");
     json_object_object_add(out, "schedule", copy);
     return out;
 }
@@ -682,9 +1109,32 @@ static struct json_object *content_capabilities(void)
     json_object_object_add(cap, "safe_search_supported", json_object_new_boolean(1));
     aegisxd_json_add_string(cap, "safe_search_providers", "google,bing,youtube");
     aegisxd_json_add_string(cap, "safe_search_merge", "logical_or");
-    json_object_object_add(cap, "schedule_supported", json_object_new_boolean(0));
+    json_object_object_add(cap, "schedule_supported", json_object_new_boolean(1));
+    /*
+     * Same expressiveness and the same wire shape as the MAC ACL schedule, so a
+     * single frontend control can drive both.
+     */
+    aegisxd_json_add_string(cap, "schedule_mode", "always_or_single_window");
+    json_object_object_add(cap, "schedule_max_windows", json_object_new_int(1));
+    json_object_object_add(cap, "schedule_weekdays_supported", json_object_new_boolean(1));
+    aegisxd_json_add_string(cap, "schedule_time_basis", "device_local_time");
+    aegisxd_json_add_string(cap, "schedule_runtime", "nft_meta_hour_and_meta_day");
     json_object_object_add(cap, "all_scope_supported", json_object_new_boolean(1));
-    json_object_object_add(cap, "device_scope_supported", json_object_new_boolean(0));
+    json_object_object_add(cap, "device_scope_supported", json_object_new_boolean(1));
+    aegisxd_json_add_string(cap, "device_scope_match", "mac");
+    json_object_object_add(cap, "device_scope_max_devices",
+                           json_object_new_int(CONTENT_MAX_SCOPE_DEVICES));
+    /*
+     * Scoped rules match the resolved address, not the DNS answer, so the
+     * enforcement point differs from the global path. Reported so the UI can
+     * explain why a scoped block behaves differently from a global one.
+     */
+    aegisxd_json_add_string(cap, "device_scope_runtime",
+                            "dnsmasq_nftset+nft_ether_saddr");
+    aegisxd_json_add_string(cap, "scoped_domain_limit_reason",
+                            "per_policy_domain_set_capped");
+    json_object_object_add(cap, "scoped_domain_max",
+                           json_object_new_int(CONTENT_MAX_LIST));
     json_object_object_add(cap, "network_scope_supported", json_object_new_boolean(0));
     json_object_object_add(cap, "dataplane_apply_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "rollback_supported", json_object_new_boolean(1));
@@ -1134,14 +1584,99 @@ rollback:sqlite3_exec(g_aegisxd_config_db,"ROLLBACK",NULL,NULL,NULL);if(do_apply
 void *aegisxd_content_filter_load(void)
 {
     struct content_filter *f=calloc(1,sizeof(*f));sqlite3_stmt *st;if(!f)return NULL;st=aegisxd_config_prepare("SELECT managed FROM aegis_content_meta WHERE id=1");if(st&&sqlite3_step(st)==SQLITE_ROW)f->managed=sqlite3_column_int(st,0);if(st)sqlite3_finalize(st);if(!f->managed)return f;
-    st=aegisxd_config_prepare("SELECT mode,ad_block,categories_json,safe_search_json,scope_json,schedule_json FROM aegis_content_policies WHERE enabled=1 AND mode<>'off' ORDER BY id");if(!st){free(f);return NULL;}while(sqlite3_step(st)==SQLITE_ROW){const char *mode=aegisxd_sqlite_text(st,0,"");struct json_object *arr=json_tokener_parse(aegisxd_sqlite_text(st,2,"[]"));struct json_object *safe=json_tokener_parse(aegisxd_sqlite_text(st,3,"{}"));struct json_object *scope=json_tokener_parse(aegisxd_sqlite_text(st,4,"{}"));struct json_object *schedule=json_tokener_parse(aegisxd_sqlite_text(st,5,"{}"));struct content_safe_search parsed;int global=scope&&json_object_is_type(scope,json_type_object)&&!strcmp(aegisxd_json_str(scope,"type","all"),"all")&&content_json_empty_array(scope,"devices")&&content_json_empty_array(scope,"networks");int always=schedule&&json_object_is_type(schedule,json_type_object)&&!strcmp(aegisxd_json_str(schedule,"type","always"),"always");if(!safe||!global||!always||content_safe_search_parse(safe,&parsed,NULL)!=0){if(arr)json_object_put(arr);if(safe)json_object_put(safe);if(scope)json_object_put(scope);if(schedule)json_object_put(schedule);sqlite3_finalize(st);aegisxd_content_filter_free(f);return NULL;}f->policy_count++;f->safe_search.google|=parsed.google;f->safe_search.bing|=parsed.bing;f->safe_search.youtube|=parsed.youtube;if(!strcmp(mode,"enhanced"))f->enhanced=1;if(sqlite3_column_int(st,1))f->ad_block=1;if(arr&&json_object_is_type(arr,json_type_array))for(size_t i=0;i<json_object_array_length(arr);i++){struct json_object *v=json_object_array_get_idx(arr,i);if(v&&json_object_is_type(v,json_type_string))content_list_add(&f->categories,json_object_get_string(v));}if(arr)json_object_put(arr);json_object_put(safe);json_object_put(scope);json_object_put(schedule);}sqlite3_finalize(st);
-    st=aegisxd_config_prepare("SELECT domain,action FROM aegis_domain_overrides WHERE enabled=1 ORDER BY domain");while(st&&sqlite3_step(st)==SQLITE_ROW){const char *d=aegisxd_sqlite_text(st,0,"");const char *a=aegisxd_sqlite_text(st,1,"");if(!strcmp(a,"allow"))content_list_add(&f->allows,d);else if(!strcmp(a,"block"))content_list_add(&f->blocks,d);}if(st)sqlite3_finalize(st);
+    st=aegisxd_config_prepare("SELECT mode,ad_block,categories_json,safe_search_json,scope_json,schedule_json,id FROM aegis_content_policies WHERE enabled=1 AND mode<>'off' ORDER BY id");
+    if (!st) { free(f); return NULL; }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *mode = aegisxd_sqlite_text(st, 0, "");
+        const char *policy_id = aegisxd_sqlite_text(st, 6, "");
+        struct json_object *arr = json_tokener_parse(aegisxd_sqlite_text(st, 2, "[]"));
+        struct json_object *safe = json_tokener_parse(aegisxd_sqlite_text(st, 3, "{}"));
+        struct json_object *scope = json_tokener_parse(aegisxd_sqlite_text(st, 4, "{}"));
+        struct json_object *schedule = json_tokener_parse(aegisxd_sqlite_text(st, 5, "{}"));
+        struct content_safe_search parsed;
+        int global, always, bad;
+
+        global = content_scope_is_global(scope);
+        always = content_schedule_is_always(schedule);
+        /*
+         * A row that parses but is neither global nor a recognized scoped form
+         * is corrupt, and guessing which devices it meant would be worse than
+         * refusing, so the whole load still fails closed.
+         */
+        bad = !safe || content_safe_search_parse(safe, &parsed, NULL) != 0 ||
+            (!global && !content_scope_is_devices(scope)) ||
+            (!always && !content_schedule_is_window(schedule));
+        if (bad) {
+            if (arr) json_object_put(arr);
+            if (safe) json_object_put(safe);
+            if (scope) json_object_put(scope);
+            if (schedule) json_object_put(schedule);
+            sqlite3_finalize(st);
+            aegisxd_content_filter_free(f);
+            return NULL;
+        }
+        if (global && always) {
+            f->policy_count++;
+            f->safe_search.google |= parsed.google;
+            f->safe_search.bing |= parsed.bing;
+            f->safe_search.youtube |= parsed.youtube;
+            if (!strcmp(mode, "enhanced")) f->enhanced = 1;
+            if (sqlite3_column_int(st, 1)) f->ad_block = 1;
+            if (arr && json_object_is_type(arr, json_type_array))
+                for (size_t i = 0; i < json_object_array_length(arr); i++) {
+                    struct json_object *v = json_object_array_get_idx(arr, i);
+                    if (v && json_object_is_type(v, json_type_string))
+                        content_list_add(&f->categories, json_object_get_string(v));
+                }
+        } else if (content_filter_add_scoped(f, policy_id, mode,
+                                             sqlite3_column_int(st, 1), arr,
+                                             scope, schedule) != 0) {
+            if (arr) json_object_put(arr);
+            json_object_put(safe);
+            if (scope) json_object_put(scope);
+            if (schedule) json_object_put(schedule);
+            sqlite3_finalize(st);
+            aegisxd_content_filter_free(f);
+            return NULL;
+        }
+        if (arr) json_object_put(arr);
+        json_object_put(safe);
+        if (scope) json_object_put(scope);
+        if (schedule) json_object_put(schedule);
+    }
+    sqlite3_finalize(st);
+    /*
+     * policy_id='' overrides stay global; a scoped policy's own overrides are
+     * attached to that policy so they are not applied to every client.
+     */
+    st=aegisxd_config_prepare("SELECT domain,action,policy_id FROM aegis_domain_overrides WHERE enabled=1 ORDER BY domain");
+    while (st && sqlite3_step(st) == SQLITE_ROW) {
+        const char *d = aegisxd_sqlite_text(st, 0, "");
+        const char *a = aegisxd_sqlite_text(st, 1, "");
+        const char *pid = aegisxd_sqlite_text(st, 2, "");
+        struct content_scoped_policy *sp = pid[0] ?
+            content_filter_find_scoped(f, pid) : NULL;
+        struct content_string_list *allows = sp ? &sp->allows : &f->allows;
+        struct content_string_list *blocks = sp ? &sp->blocks : &f->blocks;
+
+        if (!strcmp(a, "allow")) content_list_add(allows, d);
+        else if (!strcmp(a, "block")) content_list_add(blocks, d);
+    }
+    if (st) sqlite3_finalize(st);
     return f;
 }
 
 void aegisxd_content_filter_free(void *opaque)
 {
-    struct content_filter *f=opaque;if(!f)return;content_list_free(&f->categories);content_list_free(&f->allows);content_list_free(&f->blocks);content_list_free(&f->emitted_blocks);content_list_free(&f->emitted_categories);free(f);
+    struct content_filter *f=opaque;if(!f)return;content_list_free(&f->categories);content_list_free(&f->allows);content_list_free(&f->blocks);content_list_free(&f->emitted_blocks);content_list_free(&f->emitted_categories);
+    for (size_t i = 0; i < f->scoped_count; i++) {
+        content_list_free(&f->scoped[i].devices);
+        content_list_free(&f->scoped[i].categories);
+        content_list_free(&f->scoped[i].blocks);
+        content_list_free(&f->scoped[i].allows);
+    }
+    free(f->scoped);
+    free(f);
 }
 
 int aegisxd_content_filter_domain_blocked(void *opaque,const char *domain,const char *category,int reputation)
@@ -1217,4 +1752,181 @@ int aegisxd_content_filter_write_explicit_blocks(void *opaque, FILE *fp)
         written++;
     }
     return written;
+}
+
+int aegisxd_content_filter_scoped_count(void *opaque)
+{
+    struct content_filter *f = opaque;
+
+    return f ? (int)f->scoped_count : 0;
+}
+
+/*
+ * Collect the domains a scoped policy blocks.
+ *
+ * A device-scoped rule cannot use `address=`, which rewrites the answer for
+ * every client. Instead dnsmasq is told to record the resolved addresses of
+ * these domains into a per-policy nft set, and an nft rule drops traffic from
+ * the scoped devices to those addresses. This is why the domain must be known
+ * by name here but enforced by address later.
+ *
+ * Domains come from the policy's own overrides plus the category index, the
+ * same sources the global path uses.
+ */
+static int content_scoped_domains(struct content_filter *f,
+                                   struct content_scoped_policy *sp,
+                                   struct content_string_list *out)
+{
+    sqlite3_stmt *st;
+
+    for (size_t i = 0; i < sp->blocks.count; i++) {
+        if (content_domain_list_matches(&sp->allows, sp->blocks.items[i]))
+            continue;
+        if (content_list_add(out, sp->blocks.items[i]) != 0)
+            return -1;
+    }
+    if (!sp->enhanced && !sp->categories.count && !sp->ad_block)
+        return 0;
+    st = aegisxd_prepare(
+        "SELECT domain,category FROM aegis_domain_categories WHERE domain<>'' "
+        "ORDER BY domain");
+    while (st && sqlite3_step(st) == SQLITE_ROW) {
+        const char *domain = aegisxd_sqlite_text(st, 0, "");
+        const char *category = aegisxd_sqlite_text(st, 1, "");
+        int want = sp->enhanced || content_list_has(&sp->categories, category) ||
+            (sp->ad_block && category &&
+             (strstr(category, "ads") || strstr(category, "track")));
+
+        if (!want || !content_domain_ok(domain) ||
+            content_domain_list_matches(&sp->allows, domain) ||
+            content_list_has(out, domain))
+            continue;
+        /*
+         * The set is bounded; stop adding rather than fail the whole policy, and
+         * report the truncation so the caller can surface it instead of silently
+         * enforcing a partial list.
+         */
+        if (out->count >= CONTENT_MAX_LIST)
+            break;
+        if (content_list_add(out, domain) != 0) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+    }
+    if (st)
+        sqlite3_finalize(st);
+    (void)f;
+    return 0;
+}
+
+int aegisxd_content_filter_write_scoped_dnsmasq(void *opaque, FILE *fp)
+{
+    struct content_filter *f = opaque;
+    int written = 0;
+
+    if (!f || !fp || !f->managed)
+        return 0;
+    for (size_t i = 0; i < f->scoped_count; i++) {
+        struct content_scoped_policy *sp = &f->scoped[i];
+        struct content_string_list domains = { 0 };
+
+        if (content_scoped_domains(f, sp, &domains) != 0) {
+            content_list_free(&domains);
+            return -1;
+        }
+        for (size_t j = 0; j < domains.count; j++) {
+            fprintf(fp, "# aegis provenance=scoped_block policy=%s domain=%s\n",
+                    sp->id, domains.items[j]);
+            /*
+             * Populate both families; a domain resolving only to AAAA would
+             * otherwise escape a v4-only set.
+             */
+            fprintf(fp, "nftset=/%s/4#inet#" AEGISXD_CONTENT_NFT_TABLE "#scope_%s_v4\n",
+                    domains.items[j], sp->set_key);
+            fprintf(fp, "nftset=/%s/6#inet#" AEGISXD_CONTENT_NFT_TABLE "#scope_%s_v6\n",
+                    domains.items[j], sp->set_key);
+            written++;
+        }
+        content_list_free(&domains);
+    }
+    return written;
+}
+
+int aegisxd_content_filter_write_scoped_nft(void *opaque, FILE *fp)
+{
+    struct content_filter *f = opaque;
+    static const char *const day_names[7] = {
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+        "Saturday"
+    };
+    int rules = 0;
+
+    if (!f || !fp || !f->managed)
+        return 0;
+    if (!f->scoped_count)
+        return 0;
+    fprintf(fp, "table inet " AEGISXD_CONTENT_NFT_TABLE " {\n");
+    for (size_t i = 0; i < f->scoped_count; i++) {
+        struct content_scoped_policy *sp = &f->scoped[i];
+
+        /*
+         * Entries arrive from dnsmasq as domains resolve, so they must expire:
+         * addresses get recycled between hosts, and without a timeout a CDN
+         * address once used by a blocked domain would stay blocked forever.
+         */
+        fprintf(fp, "  set scope_%s_v4 {\n    type ipv4_addr\n    flags timeout\n"
+                    "    timeout %dm\n  }\n", sp->set_key, CONTENT_SCOPE_SET_TIMEOUT_MIN);
+        fprintf(fp, "  set scope_%s_v6 {\n    type ipv6_addr\n    flags timeout\n"
+                    "    timeout %dm\n  }\n", sp->set_key, CONTENT_SCOPE_SET_TIMEOUT_MIN);
+        if (sp->devices.count) {
+            fprintf(fp, "  set scope_%s_dev {\n    type ether_addr\n    elements = { ",
+                    sp->set_key);
+            for (size_t j = 0; j < sp->devices.count; j++)
+                fprintf(fp, "%s%s", j ? ", " : "", sp->devices.items[j]);
+            fprintf(fp, " }\n  }\n");
+        }
+    }
+    fprintf(fp, "  chain forward {\n");
+    fprintf(fp, "    type filter hook forward priority -150; policy accept;\n");
+    for (size_t i = 0; i < f->scoped_count; i++) {
+        struct content_scoped_policy *sp = &f->scoped[i];
+
+        for (int family = 0; family < 2; family++) {
+            const char *proto = family ? "ip6" : "ip";
+            const char *suffix = family ? "v6" : "v4";
+
+            fprintf(fp, "    ");
+            if (sp->devices.count)
+                fprintf(fp, "ether saddr @scope_%s_dev ", sp->set_key);
+            fprintf(fp, "%s daddr @scope_%s_%s", proto, sp->set_key, suffix);
+            if (!sp->schedule_always) {
+                /*
+                 * Local time on purpose: nft converts the literal using the
+                 * timezone of the parsing process, matching the MAC ACL, so the
+                 * window means what the user typed on the device.
+                 */
+                if (!(!strcmp(sp->start_time, "00:00") &&
+                      (!strcmp(sp->end_time, "23:59") ||
+                       !strcmp(sp->end_time, "24:00"))))
+                    fprintf(fp, " meta hour \"%s\"-\"%s\"", sp->start_time,
+                            sp->end_time);
+                if (sp->weekdays != 0x7f) {
+                    int emitted = 0;
+
+                    fprintf(fp, " meta day { ");
+                    for (int d = 0; d < 7; d++)
+                        if (sp->weekdays & (1 << d))
+                            fprintf(fp, "%s\"%s\"", emitted++ ? ", " : "",
+                                    day_names[d]);
+                    fprintf(fp, " }");
+                }
+            }
+            fprintf(fp, " counter reject with icmp%s type admin-prohibited",
+                    family ? "v6" : "");
+            fprintf(fp, " comment \"aegis scoped policy=%s\"\n", sp->id);
+            rules++;
+        }
+    }
+    fprintf(fp, "  }\n}\n");
+    return rules;
 }

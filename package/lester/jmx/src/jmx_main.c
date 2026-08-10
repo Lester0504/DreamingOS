@@ -13,8 +13,11 @@
 #include <linux/netfilter.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_acct.h>
+#include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_ecache.h>
 #include <linux/notifier.h>
+#include <linux/workqueue.h>
+#include <linux/slab.h>
 #include <linux/skbuff.h>
 #include <net/ip.h>
 #include <uapi/linux/ipv6.h>
@@ -50,6 +53,7 @@
 #include "jmx_config.h"
 #include "jmx_mac_filter.h"
 #include "jmx_app_filter.h"
+#include "jmx_stats.h"
 #include <linux/version.h>
 #include <linux/timer.h>
 
@@ -2430,7 +2434,76 @@ static bool jmx_route_prepare_lifecycle(struct nf_conn *ct)
 	ecache->ctmask |= BIT(IPCT_DESTROY);
 	return true;
 }
+
+/*
+ * Will this conntrack entry actually deliver the DESTROY that releases the
+ * active_conn credit we are about to take?
+ *
+ * An ecache extension can only be attached before the entry is confirmed
+ * (nf_ct_ext_add() refuses a confirmed ct).  jmx_route_prepare_lifecycle()
+ * therefore returns true in two very different situations:
+ *
+ *   - unconfirmed ct, extension freshly attached  -> DESTROY will be delivered
+ *   - already-confirmed ct that happens to have an ecache from some other
+ *     subscriber -> DESTROY delivery depends on that subscriber's lifetime
+ *
+ * and, critically, a confirmed ct with no ecache gets no extension at all. The
+ * old code took the increment whenever prepare_lifecycle() reported success and
+ * had no way to notice the flows that could never report back. Every such flow
+ * leaked one count permanently, which is why per-WAN active_conn totalled ~27x
+ * the global conntrack table after 43 hours of uptime while still visibly
+ * fluctuating: the DESTROY path works, it just never covered every acquire.
+ *
+ * Requiring an unconfirmed entry makes acquire and release symmetric by
+ * construction: we only count a flow whose ecache we attached ourselves, on an
+ * entry that has not yet been committed, so IPCT_DESTROY is guaranteed for
+ * exactly the flows we counted.
+ *
+ * Byte/packet accounting is deliberately left alone. It keys off route_mark and
+ * route_wan_generation, not off this decision, so unconfirmed-only acquisition
+ * does not reduce traffic accounting coverage. Only the connection gauge
+ * narrows, and it narrows to the set it can actually decrement.
+ */
+static bool jmx_route_lifecycle_release_guaranteed(struct nf_conn *ct)
+{
+	if (!ct || nf_ct_is_confirmed(ct))
+		return false;
+	return jmx_route_prepare_lifecycle(ct);
+}
 #endif
+
+/*
+ * Per-flow category attribution packed into route_counted.
+ *
+ * The conntrack layout lives in a kernel hack patch
+ * (target/linux/generic/hack-*_/980-nf-contrack-support-jmx-data.patch);
+ * adding a field there changes struct nf_conn and forces a full conntrack
+ * rebuild, which an active vermagic freeze does not allow.  route_counted is a
+ * jmx owned byte that previously held only 0/1, so the category rides in it:
+ *
+ *   0              flow was never counted (no active_conn acquired)
+ *   bits 0..5      attributed category slot + 1  (1..JMX_APP_CAT_SLOTS)
+ *   bit 6 (0x40)   slot was resolved from a real appid
+ *
+ * Existing truth tests (`if (route_counted)`, `xchg(..., 0)`) keep working
+ * because any counted flow stores a non-zero value.
+ */
+#define JMX_RC_CAT_MASK     0x3F
+#define JMX_RC_CAT_RESOLVED 0x40
+
+static inline u8 jmx_rc_encode(u8 cat_slot, bool resolved)
+{
+	if (cat_slot >= JMX_APP_CAT_SLOTS)
+		cat_slot = JMX_APP_CAT_UNKNOWN;
+	return (u8)((cat_slot + 1) | (resolved ? JMX_RC_CAT_RESOLVED : 0));
+}
+
+static inline u8 jmx_rc_cat(u8 rc)
+{
+	u8 slot = (u8)((rc & JMX_RC_CAT_MASK) - 1);
+
+	return slot < JMX_APP_CAT_SLOTS ? slot : JMX_APP_CAT_UNKNOWN;
+}
 
 static bool jmx_route_maybe_bind(struct nf_conn *ct, const flow_info_t *flow)
 {
@@ -2458,7 +2531,11 @@ static bool jmx_route_maybe_bind(struct nf_conn *ct, const flow_info_t *flow)
 	if (ct->jmx_data.route_mark)
 		goto out_unlock;
 #if IS_ENABLED(CONFIG_NF_CONNTRACK_CHAIN_EVENTS)
-	track_lifecycle = jmx_route_prepare_lifecycle(ct);
+	/*
+	 * Only acquire an active_conn credit for a flow whose DESTROY we are
+	 * guaranteed to see; see jmx_route_lifecycle_release_guaranteed().
+	 */
+	track_lifecycle = jmx_route_lifecycle_release_guaranteed(ct);
 	if (flow->src6 && flow->dst6) {
 		if (track_lifecycle)
 			select_rc = jmx_route_select_wan6_acquire(
@@ -2494,12 +2571,19 @@ static bool jmx_route_maybe_bind(struct nf_conn *ct, const flow_info_t *flow)
 			&route_source, &rule_prio);
 #endif
 	if (select_rc == 0 && fwmark) {
+		u8 cat_slot = jmx_app_cat_slot(flow->app_id);
+		bool cat_resolved = flow->app_id != 0;
+
 		ct->jmx_data.route_mark = fwmark;
 		ct->jmx_data.route_wan_id = wan_id;
 		ct->jmx_data.route_source = route_source;
 		ct->jmx_data.route_wan_generation = wan_generation;
 		smp_store_release(&ct->jmx_data.route_counted,
-				  wan_generation ? 1 : 0);
+				  wan_generation ?
+					jmx_rc_encode(cat_slot, cat_resolved) : 0);
+		if (wan_generation)
+			jmx_wan_flow_cat_acquire(wan_id, wan_generation,
+						 cat_slot);
 #if defined(CONFIG_NF_CONNTRACK_MARK)
 		/* Export per-flow PBR attribution to ctnetlink. Encoding:
 		 * bits 31..16 = route rule priority, bits 15..0 = selected WAN id.
@@ -2518,22 +2602,62 @@ out_unlock:
 	return bound;
 }
 
-static void jmx_route_account_rx(struct nf_conn *ct,
-				 enum ip_conntrack_info ctinfo, unsigned int bytes)
+/*
+ * Move the per-category active_conn credit once DPI has identified the flow.
+ * A flow binds on its first packet, when app_id is usually still 0, so its
+ * connection is initially credited to Unknown.  This runs at most once per
+ * flow: the resolved bit makes every later packet skip the map lookup, which
+ * keeps the forwarding path free of a per-packet hash walk.
+ */
+static u8 jmx_route_resolve_cat(struct nf_conn *ct, u8 wan_id, u32 generation)
+{
+	u8 rc = smp_load_acquire(&ct->jmx_data.route_counted);
+	u8 old_slot, new_slot, desired;
+	u32 app_id;
+
+	if (!rc)
+		return JMX_APP_CAT_UNKNOWN;
+	old_slot = jmx_rc_cat(rc);
+	if (rc & JMX_RC_CAT_RESOLVED)
+		return old_slot;
+
+	app_id = READ_ONCE(ct->jmx_data.app_id);
+	if (!app_id)
+		return old_slot;
+
+	new_slot = jmx_app_cat_slot(app_id);
+	desired = jmx_rc_encode(new_slot, true);
+	if (cmpxchg(&ct->jmx_data.route_counted, rc, desired) != rc)
+		return jmx_rc_cat(smp_load_acquire(&ct->jmx_data.route_counted));
+
+	if (new_slot != old_slot) {
+		jmx_wan_flow_cat_release(wan_id, generation, old_slot);
+		jmx_wan_flow_cat_acquire(wan_id, generation, new_slot);
+	}
+	return new_slot;
+}
+
+static void jmx_route_account(struct nf_conn *ct,
+			      enum ip_conntrack_info ctinfo, unsigned int bytes)
 {
 	u32 generation = 0;
 	u8 wan_id = 0;
+	u8 cat_slot;
+	bool is_reply;
 
-	if (!ct || !bytes || CTINFO2DIR(ctinfo) != IP_CT_DIR_REPLY)
+	if (!ct || !bytes)
 		return;
 
 	if (smp_load_acquire(&ct->jmx_data.route_counted)) {
 		wan_id = READ_ONCE(ct->jmx_data.route_wan_id);
 		generation = READ_ONCE(ct->jmx_data.route_wan_generation);
 	}
+	if (!wan_id || !generation)
+		return;
 
-	if (wan_id && generation)
-		jmx_wan_flow_account_rx(wan_id, generation, bytes);
+	cat_slot = jmx_route_resolve_cat(ct, wan_id, generation);
+	is_reply = CTINFO2DIR(ctinfo) == IP_CT_DIR_REPLY;
+	jmx_wan_flow_account(wan_id, generation, cat_slot, bytes, is_reply);
 }
 
 static u_int32_t jmx_hook_gateway_handle(struct sk_buff *skb,
@@ -2575,7 +2699,7 @@ static u_int32_t jmx_hook_gateway_handle(struct sk_buff *skb,
 	 * the flow because appid=0 will not match app-specific rules here.
 	 */
 	jmx_route_maybe_bind(ct, &flow);
-	jmx_route_account_rx(ct, ctinfo, skb->len);
+	jmx_route_account(ct, ctinfo, skb->len);
 	if (ct->jmx_data.route_mark)
 		skb->mark = ct->jmx_data.route_mark;
 
@@ -2614,8 +2738,18 @@ if (!client && flow.dst6)
 if (client)
 	client->update_jiffies = jiffies;
 
+/*
+ * Tier accounting for cache_stats.  One lookup is counted per packet that
+ * reaches app-id resolution, and exactly one tier is credited when it
+ * resolves, so hit_conn_cached + hit_feature + hit_v2_ac + hit_v3_ac equals
+ * the number of resolved lookups.  The counters are per-CPU and lock-free.
+ */
+jmx_stats_lookup();
+
 if (ct->jmx_data.app_id != 0)
 {
+	/* Already classified on an earlier packet of this flow. */
+	jmx_stats_tier_hit(JMX_TIER_CONN_CACHED);
 	app_id = ct->jmx_data.app_id;
 	u_int32_t orig_action = ct->jmx_data.action;
 	int ct_action = ct->jmx_data.action;
@@ -2768,6 +2902,8 @@ if (ct->jmx_data.app_id == 0 && match_feature(&flow)) {
 		ct->jmx_data.app_id = flow.app_id;
 		ct->jmx_data.match_status |= JMX_MATCH_STATUS_RELIABLE;
 		flow.app_id = ct->jmx_data.app_id;
+		/* Resolved by the legacy feature list on this packet. */
+		jmx_stats_tier_hit(JMX_TIER_FEATURE);
 
 		if (flow.feature && flow.feature->ignore) {
 			ct->jmx_data.match_status |= JMX_MATCH_STATUS_IGNORE;
@@ -2842,6 +2978,12 @@ if (ct->jmx_data.app_id == 0 && flow.l4_data && flow.l4_len > 0) {
 	if (v3_appid > 0 && v3_mode == JMX_V3_MODE_SHADOW) {
 		/* Shadow is observability-only: do not write app_id, reliable bits,
 		 * policy state, or active-app accounting. */
+		/*
+		 * Counted apart from the tiers on purpose: a shadow match never
+		 * classifies anything, so folding it into hit_* would break the
+		 * tier-sum invariant.
+		 */
+		jmx_stats_shadow_hit();
 		JMX_DEBUG_RATELIMITED(2, "jmx_v3_SHADOW: appid=%u pri=%u %pI4:%u -> %pI4:%u proto=%u len=%u\n",
 			v3_appid, v3_priority, &flow.src, flow.sport,
 			&flow.dst, flow.dport, v2_proto, flow.l4_len);
@@ -2861,6 +3003,7 @@ if (ct->jmx_data.app_id == 0 && flow.l4_data && flow.l4_len > 0) {
 		ct->jmx_data.match_status |= JMX_MATCH_STATUS_RELIABLE;
 		flow.app_id = v2_appid;
 		v2_matched = 1;
+		jmx_stats_tier_hit(JMX_TIER_V2_AC);
 		JMX_DEBUG_RATELIMITED(2, "jmx_v2_MATCH: appid=%u pri=%u %pI4:%u -> %pI4:%u proto=%u seq=%u len=%u\n",
 			v2_appid, v2_priority, &flow.src, flow.sport,
 			&flow.dst, flow.dport, v2_proto, v2_pkt_seq, flow.l4_len);
@@ -2871,6 +3014,7 @@ if (ct->jmx_data.app_id == 0 && flow.l4_data && flow.l4_len > 0) {
 		ct->jmx_data.match_status |= JMX_MATCH_STATUS_RELIABLE;
 		flow.app_id = v3_active_appid;
 		v2_matched = 1;
+		jmx_stats_tier_hit(JMX_TIER_V3_AC);
 		JMX_DEBUG_RATELIMITED(2, "jmx_v3_MATCH: appid=%u pri=%u %pI4:%u -> %pI4:%u proto=%u len=%u\n",
 			v3_active_appid, v3_priority, &flow.src, flow.sport,
 			&flow.dst, flow.dport, v2_proto, flow.l4_len);
@@ -2907,7 +3051,7 @@ if (ret != NF_DROP && client){
 	}
 
 if (jmx_route_maybe_bind(ct, &flow))
-	jmx_route_account_rx(ct, ctinfo, skb->len);
+	jmx_route_account(ct, ctinfo, skb->len);
 if (ct->jmx_data.route_mark)
 	skb->mark = ct->jmx_data.route_mark;
 
@@ -2935,6 +3079,15 @@ if (g_record_enable && client){
 }
 	
 	gateway_out:
+		/*
+		 * Every path out of the resolution logic passes through here,
+		 * including the early drop gotos.  A flow that still has no
+		 * app_id was not resolved by any tier, so it is the miss.
+		 * Counting it here rather than at each dead end keeps
+		 * hit_total + miss == lookup without a counter at every exit.
+		 */
+		if (ct && ct->jmx_data.app_id == 0)
+			jmx_stats_miss();
 		if (malloc_data)
 	{
 		if (flow.l4_data)
@@ -3222,26 +3375,172 @@ static int jmx_route_conntrack_event(struct notifier_block *this,
 	struct nf_conn *ct;
 	u32 generation = 0;
 	u8 wan_id = 0;
+	u8 rc = 0;
 
 	(void)this;
 	if (!(events & (1UL << IPCT_DESTROY)) || !item || !item->ct)
 		return NOTIFY_DONE;
 
 	ct = item->ct;
-	if (xchg(&ct->jmx_data.route_counted, 0)) {
+	rc = xchg(&ct->jmx_data.route_counted, 0);
+	if (rc) {
 		wan_id = READ_ONCE(ct->jmx_data.route_wan_id);
 		generation = READ_ONCE(ct->jmx_data.route_wan_generation);
 		WRITE_ONCE(ct->jmx_data.route_wan_generation, 0);
 	}
 
-	if (wan_id && generation)
+	if (wan_id && generation) {
 		jmx_wan_flow_release(wan_id, generation);
+		jmx_wan_flow_cat_release(wan_id, generation, jmx_rc_cat(rc));
+	}
 	return NOTIFY_DONE;
 }
 
 static struct notifier_block jmx_route_ct_notifier = {
 	.notifier_call = jmx_route_conntrack_event,
 };
+
+/*
+ * Periodic active_conn reconciliation.
+ *
+ * jmx_route_lifecycle_release_guaranteed() makes acquire and release symmetric
+ * for every flow we newly count, which stops the leak at its source. It cannot
+ * repair a counter that already drifted, and one asymmetry survives it by
+ * design: jmx_wan_flow_release() only decrements while wan->generation still
+ * matches the value the flow was bound under, and jmx_wan_register() issues a
+ * new generation whenever a WAN's name, fwmark or table changes. Every pppoe
+ * redial therefore abandons the decrements of all flows still in flight on that
+ * line -- and all four WANs on the reference unit are pppoe.
+ *
+ * Re-measuring is the only way to close that: walk conntrack, count the flows
+ * that actually hold a credit right now, and assign. This is the real-time
+ * reconciliation the user chose over relabelling the counter as a monotonic
+ * total.
+ *
+ * What is counted here must match exactly what acquire counted: route_counted
+ * non-zero (it carries the category slot, so non-zero means "a credit was
+ * taken") and a route_wan_generation matching the generation this pass
+ * snapshotted. The category slot is decoded with the same jmx_rc_cat() the
+ * DESTROY path uses, so the per-category gauges are rebuilt from the same
+ * source as the per-WAN totals and sum to them by construction.
+ */
+#define JMX_ACTIVE_CONN_RECONCILE_SEC 30
+
+struct jmx_active_conn_recount {
+	u64 wan[JMX_MAX_WAN_IFACES];
+	u64 cat[JMX_MAX_WAN_IFACES * JMX_APP_CAT_SLOTS];
+	u32 generations[JMX_MAX_WAN_IFACES];
+	u64 scanned;
+	u64 counted;
+	u64 generation_mismatch;
+};
+
+static struct delayed_work jmx_active_conn_work;
+static bool jmx_active_conn_work_running;
+
+/*
+ * Iterator body. Runs under a conntrack bucket lock, so it must not sleep, and
+ * it returns 0 unconditionally: a true return would make
+ * nf_ct_iterate_cleanup_net() kill the entry. This is a read-only walk that
+ * borrows the cleanup iterator purely for its safe traversal.
+ */
+static int jmx_active_conn_recount_one(struct nf_conn *ct, void *data)
+{
+	struct jmx_active_conn_recount *acc = data;
+	u32 generation;
+	u8 wan_id;
+	u8 rc;
+
+	if (!ct || !acc)
+		return 0;
+	acc->scanned++;
+
+	rc = smp_load_acquire(&ct->jmx_data.route_counted);
+	if (!rc)
+		return 0;
+	wan_id = READ_ONCE(ct->jmx_data.route_wan_id);
+	generation = READ_ONCE(ct->jmx_data.route_wan_generation);
+	if (!wan_id || wan_id > JMX_MAX_WAN_IFACES || !generation)
+		return 0;
+	/*
+	 * A flow bound under a superseded generation is genuinely uncounted:
+	 * its release would be dropped by jmx_wan_flow_release() as well, so
+	 * excluding it here is what makes the gauge and the release path agree.
+	 */
+	if (generation != acc->generations[wan_id - 1]) {
+		acc->generation_mismatch++;
+		return 0;
+	}
+	acc->wan[wan_id - 1]++;
+	acc->cat[(wan_id - 1) * JMX_APP_CAT_SLOTS + jmx_rc_cat(rc)]++;
+	acc->counted++;
+	return 0;
+}
+
+static void jmx_active_conn_reconcile_work(struct work_struct *work)
+{
+	struct jmx_active_conn_recount *acc;
+	u8 wan_high;
+
+	(void)work;
+	if (!jmx_active_conn_work_running)
+		return;
+
+	/* ~1.3 KiB: too large for the stack, and this is process context. */
+	acc = kzalloc(sizeof(*acc), GFP_KERNEL);
+	if (!acc)
+		goto again;
+
+	wan_high = jmx_wan_generation_snapshot(acc->generations,
+					       JMX_MAX_WAN_IFACES);
+	if (!wan_high) {
+		kfree(acc);
+		goto again;
+	}
+
+	{
+		/*
+		 * nf_ct_iterate_cleanup_net() takes its net and callback data
+		 * through nf_ct_iter_data since 6.1; the jmx_data conntrack hack
+		 * patch only exists for hack-6.18 and newer, so every kernel
+		 * this module can build against has the struct form. Zeroed in
+		 * full because portid/report are only meaningful when the
+		 * iterator kills entries, and this one never does.
+		 */
+		struct nf_ct_iter_data iter_data = {
+			.net = &init_net,
+			.data = acc,
+		};
+
+		nf_ct_iterate_cleanup_net(jmx_active_conn_recount_one, &iter_data);
+	}
+	jmx_wan_active_conn_reconcile(acc->wan, acc->cat, acc->generations,
+				      wan_high);
+
+	JMX_DEBUG_RATELIMITED(2,
+		"jmx_route: active_conn reconciled scanned=%llu counted=%llu stale_generation=%llu\n",
+		acc->scanned, acc->counted, acc->generation_mismatch);
+	kfree(acc);
+
+again:
+	if (jmx_active_conn_work_running)
+		mod_delayed_work(system_wq, &jmx_active_conn_work,
+				 JMX_ACTIVE_CONN_RECONCILE_SEC * HZ);
+}
+
+static void jmx_active_conn_reconcile_init(void)
+{
+	jmx_active_conn_work_running = true;
+	INIT_DELAYED_WORK(&jmx_active_conn_work, jmx_active_conn_reconcile_work);
+	mod_delayed_work(system_wq, &jmx_active_conn_work,
+			 JMX_ACTIVE_CONN_RECONCILE_SEC * HZ);
+}
+
+static void jmx_active_conn_reconcile_exit(void)
+{
+	jmx_active_conn_work_running = false;
+	cancel_delayed_work_sync(&jmx_active_conn_work);
+}
 #endif
 
 enum jmx_init_stage {
@@ -3263,6 +3562,9 @@ enum jmx_init_stage {
 	JMX_INIT_FILTER_HOOKS    = BIT(15),
 	JMX_INIT_TIMER           = BIT(16),
 	JMX_INIT_ROUTE_CT_EVENTS = BIT(17),
+	JMX_INIT_FEATURES_PROC   = BIT(18),
+	JMX_INIT_STATS_PROC      = BIT(19),
+	JMX_INIT_ACTIVE_CONN_RECONCILE = BIT(20),
 };
 
 static int jmx_v3_reply_to_portid(u32 portid, u32 nlmsg_seq,
@@ -3442,6 +3744,8 @@ static int af_active_app_init_procfs(void);
 static void af_active_app_clean_procfs(void);
 static int af_active_host_init_procfs(void);
 static void af_active_host_clean_procfs(void);
+static int jmx_features_status_init_procfs(void);
+static void jmx_features_status_clean_procfs(void);
 
 static void jmx_cleanup(void)
 {
@@ -3449,6 +3753,12 @@ static void jmx_cleanup(void)
 
 	/* Stop control-plane and packet ingress before releasing shared state. */
 	jmx_init_state = 0;
+	/*
+	 * Remove the stats proc entries first: they read the conn, client and
+	 * rule caches, so they must be unreachable before those are torn down.
+	 */
+	if (state & JMX_INIT_STATS_PROC)
+		jmx_stats_exit();
 	if (state & JMX_INIT_FILTER_HOOKS) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
 		nf_unregister_net_hooks(&init_net, jmx_ops, ARRAY_SIZE(jmx_ops));
@@ -3464,6 +3774,9 @@ static void jmx_cleanup(void)
 		netlink_jmx_exit();
 
 #if IS_ENABLED(CONFIG_NF_CONNTRACK_CHAIN_EVENTS)
+	/* Stop the walker before the WAN table it reconciles can go away. */
+	if (state & JMX_INIT_ACTIVE_CONN_RECONCILE)
+		jmx_active_conn_reconcile_exit();
 	if (state & JMX_INIT_ROUTE_CT_EVENTS)
 		nf_conntrack_unregister_notifier(&init_net, &jmx_route_ct_notifier);
 #endif
@@ -3487,6 +3800,8 @@ static void jmx_cleanup(void)
 		af_active_host_clean_procfs();
 	if (state & JMX_INIT_ACTIVE_APP_PROC)
 		af_active_app_clean_procfs();
+	if (state & JMX_INIT_FEATURES_PROC)
+		jmx_features_status_clean_procfs();
 	if (state & JMX_INIT_CLIENT_PROC)
 		finit_af_client_procfs();
 	af_clean_feature_list();
@@ -3586,6 +3901,10 @@ static int __init jmx_init(void)
 	if (err)
 		goto fail;
 	jmx_init_state |= JMX_INIT_ROUTE_CT_EVENTS;
+	/* Started after the notifier so the first pass cannot race a WAN set
+	 * that is still being registered. */
+	jmx_active_conn_reconcile_init();
+	jmx_init_state |= JMX_INIT_ACTIVE_CONN_RECONCILE;
 #else
 	AF_WARN("jmx_route: conn_cnt accounting disabled without NF_CONNTRACK_CHAIN_EVENTS\n");
 #endif
@@ -3603,6 +3922,17 @@ static int __init jmx_init(void)
 	jmx_init_state |= JMX_INIT_FILTER_HOOKS;
 	init_jmx_timer();
 	jmx_init_state |= JMX_INIT_TIMER;
+	/* Registered last so the first read already reflects every subsystem's
+	 * real init outcome rather than a partially populated jmx_init_state.
+	 */
+	err = jmx_features_status_init_procfs();
+	if (err)
+		goto fail;
+	jmx_init_state |= JMX_INIT_FEATURES_PROC;
+	err = jmx_stats_init();
+	if (err)
+		goto fail;
+	jmx_init_state |= JMX_INIT_STATS_PROC;
 	printk("jmx: Driver ver. %s - Copyright(c) 2026, DreamingWrt, <www.LesterWrt.com>\n", AF_VERSION);
 	printk("jmx: init ok\n");
 	return 0;
@@ -3617,6 +3947,225 @@ static void jmx_fini(void)
 {
 	AF_INFO("jmx module exit\n");
 	jmx_cleanup();
+}
+
+/*
+ * /proc/dreamingwrt/jmx/features_status
+ *
+ * Kernel self-report for the webd capabilities aggregator. Three states, so a
+ * consumer can tell "compiled in but switched off" from "not in this build":
+ *
+ *   enabled      compiled in, and currently on
+ *   disabled     compiled in, currently off
+ *   unsupported  not compiled in, or its subsystem failed to initialise
+ *
+ * Every line must resolve to a real compile guard or runtime variable. A bit
+ * that would always print "enabled" does not belong here: a constant true is
+ * exactly the derived-capability guesswork this node exists to replace.
+ *
+ * The feature names are a published contract consumed by webd and the web UI.
+ * Renaming a key breaks them, so add new keys rather than repurposing old ones.
+ */
+#define JMX_FEATURES_PROC_STR "features_status"
+
+/* Schema version, bumped when keys are added or their meaning changes. */
+#define JMX_FEATURES_SCHEMA_VERSION 1
+
+enum jmx_feature_state {
+	JMX_FEATURE_UNSUPPORTED = 0,
+	JMX_FEATURE_DISABLED,
+	JMX_FEATURE_ENABLED,
+};
+
+static const char *jmx_feature_state_str(enum jmx_feature_state st)
+{
+	switch (st) {
+	case JMX_FEATURE_ENABLED:
+		return "enabled";
+	case JMX_FEATURE_DISABLED:
+		return "disabled";
+	default:
+		return "unsupported";
+	}
+}
+
+/* Present at build time but gated on its subsystem having initialised. */
+static enum jmx_feature_state jmx_feature_runtime(unsigned long init_bit,
+						  int on)
+{
+	if (!(jmx_init_state & init_bit))
+		return JMX_FEATURE_UNSUPPORTED;
+	return on ? JMX_FEATURE_ENABLED : JMX_FEATURE_DISABLED;
+}
+
+/* Compiled in unconditionally; only its init outcome varies. */
+static enum jmx_feature_state jmx_feature_present(unsigned long init_bit)
+{
+	return (jmx_init_state & init_bit) ? JMX_FEATURE_ENABLED
+					   : JMX_FEATURE_UNSUPPORTED;
+}
+
+static void jmx_feature_emit(struct seq_file *s, const char *name,
+			     enum jmx_feature_state st, const char *source)
+{
+	seq_printf(s, "%-24s : %-12s %s\n", name, jmx_feature_state_str(st),
+		   source);
+}
+
+static int jmx_features_status_show(struct seq_file *s, void *v)
+{
+	(void)v;
+
+	seq_printf(s, "schema_version : %d\n", JMX_FEATURES_SCHEMA_VERSION);
+	seq_printf(s, "module_version : %s\n", AF_VERSION);
+	seq_puts(s, "# <feature> : <enabled|disabled|unsupported> <source>\n");
+
+	/* DPI / application identification. */
+	jmx_feature_emit(s, "app_filter",
+			 jmx_feature_runtime(JMX_INIT_APP_FILTER,
+					     g_appfilter_enable),
+			 "sysctl:appfilter_enable");
+	jmx_feature_emit(s, "mac_filter",
+			 jmx_feature_runtime(JMX_INIT_MAC_FILTER,
+					     g_mac_filter_enable),
+			 "sysctl:macfilter_enable");
+	jmx_feature_emit(s, "flow_record",
+			 jmx_feature_runtime(JMX_INIT_LOG, g_record_enable),
+			 "sysctl:record_enable");
+	jmx_feature_emit(s, "tcp_rst_block",
+			 jmx_feature_runtime(JMX_INIT_FILTER_HOOKS, g_tcp_rst),
+			 "sysctl:tcp_rst");
+	jmx_feature_emit(s, "bypass_offload",
+			 jmx_feature_runtime(JMX_INIT_FILTER_HOOKS,
+					     g_by_pass_accl),
+			 "sysctl:by_pass_accl");
+	jmx_feature_emit(s, "user_mode",
+			 jmx_feature_runtime(JMX_INIT_LOG, g_user_mode),
+			 "sysctl:user_mode");
+	jmx_feature_emit(s, "test_mode",
+			 jmx_feature_runtime(JMX_INIT_LOG, jmx_test_mode),
+			 "sysctl:test_mode");
+
+	/* Rule engines. v3 runs alongside v2; both report their own init. */
+	jmx_feature_emit(s, "rules_v2", jmx_feature_present(JMX_INIT_V2_RULES),
+			 "init:jmx_v2_rules_init");
+	jmx_feature_emit(s, "rules_v2_regex",
+			 jmx_feature_runtime(JMX_INIT_V2_RULES,
+					     jmx_v2_has_regex_rules()),
+			 "runtime:jmx_v2_has_regex_rules");
+	jmx_feature_emit(s, "rules_v3", jmx_feature_present(JMX_INIT_V3_RULES),
+			 "init:jmx_v3_rules_init");
+
+	/* Policy based routing. */
+	jmx_feature_emit(s, "policy_route", jmx_feature_present(JMX_INIT_ROUTE),
+			 "init:jmx_route_init");
+	jmx_feature_emit(s, "policy_route_proc",
+			 jmx_feature_present(JMX_INIT_ROUTE_PROC),
+			 "init:jmx_route_init_procfs");
+
+	/* conn_cnt attribution needs conntrack chain events at build time. */
+#if IS_ENABLED(CONFIG_NF_CONNTRACK_CHAIN_EVENTS)
+	jmx_feature_emit(s, "route_conn_accounting",
+			 jmx_feature_present(JMX_INIT_ROUTE_CT_EVENTS),
+			 "init:nf_conntrack_register_notifier");
+	/* Present means active_conn is periodically re-measured from conntrack
+	 * rather than left to the incremental gauge alone. */
+	jmx_feature_emit(s, "route_conn_reconcile",
+			 jmx_feature_present(JMX_INIT_ACTIVE_CONN_RECONCILE),
+			 "init:nf_ct_iterate_cleanup_net@30s");
+#else
+	jmx_feature_emit(s, "route_conn_accounting", JMX_FEATURE_UNSUPPORTED,
+			 "build:CONFIG_NF_CONNTRACK_CHAIN_EVENTS=n");
+	jmx_feature_emit(s, "route_conn_reconcile", JMX_FEATURE_UNSUPPORTED,
+			 "build:CONFIG_NF_CONNTRACK_CHAIN_EVENTS=n");
+#endif
+
+	/* Per-flow PBR attribution exported through ctnetlink ct->mark. */
+#if defined(CONFIG_NF_CONNTRACK_MARK)
+	jmx_feature_emit(s, "route_ctmark_export",
+			 jmx_feature_present(JMX_INIT_ROUTE),
+			 "build:CONFIG_NF_CONNTRACK_MARK=y");
+#else
+	jmx_feature_emit(s, "route_ctmark_export", JMX_FEATURE_UNSUPPORTED,
+			 "build:CONFIG_NF_CONNTRACK_MARK=n");
+#endif
+
+	/* Client tracking and observability surfaces. */
+	jmx_feature_emit(s, "client_tracking",
+			 jmx_feature_present(JMX_INIT_CLIENT_HOOKS),
+			 "init:af_client_init");
+	jmx_feature_emit(s, "active_app_proc",
+			 jmx_feature_present(JMX_INIT_ACTIVE_APP_PROC),
+			 "init:af_active_app_init_procfs");
+	jmx_feature_emit(s, "active_host_proc",
+			 jmx_feature_present(JMX_INIT_ACTIVE_HOST_PROC),
+			 "init:af_active_host_init_procfs");
+	jmx_feature_emit(s, "conntrack_hooks",
+			 jmx_feature_present(JMX_INIT_CONN),
+			 "init:af_conn_init");
+	jmx_feature_emit(s, "netlink_channel",
+			 jmx_feature_present(JMX_INIT_NETLINK),
+			 "init:netlink_jmx_init");
+	jmx_feature_emit(s, "char_device",
+			 jmx_feature_present(JMX_INIT_CHARDEV),
+			 "init:jmx_register_dev");
+	jmx_feature_emit(s, "netfilter_hooks",
+			 jmx_feature_present(JMX_INIT_FILTER_HOOKS),
+			 "init:nf_register_net_hooks");
+
+	/* IPv6 inspection follows the kernel's own IPv6 support. */
+#if IS_ENABLED(CONFIG_IPV6)
+	jmx_feature_emit(s, "ipv6_inspect",
+			 jmx_feature_present(JMX_INIT_FILTER_HOOKS),
+			 "build:CONFIG_IPV6=y");
+#else
+	jmx_feature_emit(s, "ipv6_inspect", JMX_FEATURE_UNSUPPORTED,
+			 "build:CONFIG_IPV6=n");
+#endif
+
+	return 0;
+}
+
+static int jmx_features_status_open(struct inode *inode, struct file *file)
+{
+	(void)inode;
+	return single_open(file, jmx_features_status_show, NULL);
+}
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(5, 5, 0)
+static const struct file_operations jmx_features_status_fops = {
+	.owner = THIS_MODULE,
+	.open = jmx_features_status_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+#else
+static const struct proc_ops jmx_features_status_fops = {
+	.proc_flags = PROC_ENTRY_PERMANENT,
+	.proc_open = jmx_features_status_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+#endif
+
+static int jmx_features_status_init_procfs(void)
+{
+	struct proc_dir_entry *pde;
+
+	pde = proc_create(JMX_FEATURES_PROC_STR, 0444, jmx_proc_root,
+			  &jmx_features_status_fops);
+	if (!pde) {
+		AF_ERROR("features_status proc file create failed\n");
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+static void jmx_features_status_clean_procfs(void)
+{
+	remove_proc_entry(JMX_FEATURES_PROC_STR, jmx_proc_root);
 }
 
 

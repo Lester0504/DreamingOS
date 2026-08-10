@@ -43,7 +43,7 @@ db_init = between(
     "int jmx_db_init(void)",
     "void jmx_db_close(void)",
 )
-assert "JMX_DB_SCHEMA_VERSION 8" in DB
+assert "JMX_DB_SCHEMA_VERSION 9" in DB
 assert 'db_exec("PRAGMA journal_mode=WAL;")' in db_init
 version_gate = db_init.index("if (version < JMX_DB_SCHEMA_VERSION)")
 begin = db_init.index("if (db_begin() != 0)")
@@ -55,9 +55,11 @@ schema_v5 = db_init.index("if (version < 5)")
 schema_v6 = db_init.index("if (version < 6)")
 schema_v7 = db_init.index("if (version < 7)")
 schema_v8 = db_init.index("if (version < 8)")
+schema_v9 = db_init.index("if (version < 9)")
 set_version = db_init.index("db_set_schema_version(JMX_DB_SCHEMA_VERSION)")
 assert version_gate < begin < schema_v1 < schema_v2 < schema_v3 < schema_v4
-assert schema_v4 < schema_v5 < schema_v6 < schema_v7 < schema_v8 < set_version
+assert schema_v4 < schema_v5 < schema_v6 < schema_v7 < schema_v8 < schema_v9
+assert schema_v9 < set_version
 # The v7 migration must create the lifetime WAN counter table inside the same
 # transaction as every other migration step, so a failure cannot leave the DB
 # claiming v7 without the table.
@@ -67,6 +69,10 @@ assert "wan_lifetime_usage" in db_init
 # user overrides are still cascade-deletable.
 assert "client_overrides_old" in db_init
 assert "idx_client_overrides_mac" in db_init
+# The v9 migration adds the (wan_id, ts) index that per-WAN activity reads need,
+# inside the same transaction, so a partial run cannot leave the DB claiming v9
+# while every per-WAN read still scans the whole retention window.
+assert "idx_dashboard_activity_sample_wan_ts" in db_init
 # The shipped v1 DDL must not reintroduce the foreign key: custom_name and
 # custom_icon are user intent and must outlive the clients row.
 assert "REFERENCES clients(client_id) ON DELETE CASCADE);\"\n" not in DB.split(

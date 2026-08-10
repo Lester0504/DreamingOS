@@ -11,7 +11,7 @@
 #include <linux/list.h>
 #include <linux/types.h>
 
-#define MAX_APP_FILTER_RULE_NUM 64
+#define MAX_APP_FILTER_RULE_NUM 512
 #define MAX_APP_ID_PER_RULE 1024
 
 extern u_int32_t g_appfilter_update_jiffies;
@@ -32,6 +32,12 @@ typedef struct app_filter_rule {
     int rule_id;                
     int enable;                 
     mac_config_t mac_list;      
+    /*
+     * mac_list 的节点数缓存。匹配路径每包都会走，若在那里用"扫 128 个 hash
+     * 桶判空"来区分"无 MAC 限制(对所有终端生效)"和"限定 MAC"，规则数放大到
+     * 512 后单包最坏要跑 512*128 次桶检查。这里在写路径维护计数，读路径 O(1)。
+     */
+    int mac_count;
     app_id_config_t app_id_list; 
     atomic64_t hit_count;
     atomic64_t last_hit_s;

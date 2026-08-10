@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '20260808-audit-evidence-semantic-01';
+  const VERSION = '20260809-audit-icon-cells-sticky-head-02';
   const PERIODS = {
     hour: { label: '1 小时', api: 'hour', ms: 3600000 },
     day: { label: '1 天', api: 'day', ms: 86400000 },
@@ -76,6 +76,73 @@
   };
   const LOCAL_MAP_VERSION = 'fastmonitor-apache2-20260709';
   const CYBER_ROUTE_LIMIT = 18;
+  /*
+   * 地图的两个视觉通道必须各用一族颜色，绝不共用琥珀/红。
+   *
+   * 用户 2026-08-09：地图里的黄色被读成上方摘要的「可疑」，而地图的黄色其实是
+   * 「入站」。同一屏用同一族颜色表达两套语义就必然被误读，所以这里把职责拆开：
+   *   风险 → 颜色（未评级中性青 / 低绿 / 可疑琥珀 / 令人担忧红），与摘要三档同源
+   *   方向 → 形状（弧的弯向 + 箭头符号 + 光点方向），不占用颜色
+   *   流量 → 亮度/粗细/点径（同一色相的深浅），不借用风险语义色
+   * 风险色刻意与 `.insights-console-dot` 的 `--dwrt-ok/warn/bad` 对齐，
+   * 保证「地图上这一档的颜色」和「摘要里这一档的颜色」指的是同一件事。
+   */
+  const MAP_RISK_COLORS = {
+    unknown: { line: '#39d9ff', packet: '#effbff', label: '未评级' },
+    low: { line: '#30d158', packet: '#c9ffd9', label: '低' },
+    suspicious: { line: '#ff9f0a', packet: '#ffe0ad', label: '可疑' },
+    concern: { line: '#ff453a', packet: '#ffc9c5', label: '令人担忧' }
+  };
+  /* 本机出口不是一个「风险等级」，它是拓扑里的自己，用独立的青绿标识。 */
+  const MAP_LOCAL_COLOR = '#27f0a8';
+
+  /* 弧/点的风险档。后端 `flows/geo` 的每条 route 与每个 region 都带 `risk_level`
+     与 `risk`（实测 30/30 条 `risk_supported: true`）。缺字段或 unknown 一律落到
+     未评级——`risk_unknown_meaning` 自述为「目的地不在已加载情报源中，并非判定为
+     安全」，所以未评级绝不能画成「低」。 */
+  function mapRiskBucket(source) {
+    if (!source || typeof source !== 'object') return 'unknown';
+    const raw = source.risk_level !== undefined && source.risk_level !== null && source.risk_level !== ''
+      ? source.risk_level
+      : source.risk;
+    const text = String(raw === undefined || raw === null ? '' : raw).toLowerCase();
+    if (!text || text === 'unknown' || text === 'unrated' || text === 'none') return 'unknown';
+    if (/concern|high|very|critical|severe|严重|高|令人/.test(text)) return 'concern';
+    if (/suspicious|medium|moderate|可疑|中/.test(text)) return 'suspicious';
+    if (/low|safe|clean|低/.test(text)) return 'low';
+    return 'unknown';
+  }
+
+  function mapRiskPalette(bucket) {
+    return MAP_RISK_COLORS[bucket] || MAP_RISK_COLORS.unknown;
+  }
+
+  /*
+   * 合并后的弧只有一个颜色，取值必须保守：
+   *   有任一条评到 concern/suspicious 就按最坏档画，否则一条高风险目的地会被
+   *   一堆同坐标的普通流量「洗白」；
+   *   「低 + 未评级」合成未评级而不是低 —— 未评级的含义是没查过，把它算进低
+   *   等于替情报源下结论。
+   */
+  const MAP_RISK_ORDER = { unknown: 0, low: 1, suspicious: 2, concern: 3 };
+
+  /* 发光色跟随点位色。写死一个青色阴影会让绿点/红点都带青边，档位之间反而更难分。 */
+  function hexToRgba(hex, alpha) {
+    const text = String(hex || '').trim().replace('#', '');
+    const full = text.length === 3 ? text.split('').map((ch) => ch + ch).join('') : text;
+    if (!/^[0-9a-fA-F]{6}$/.test(full)) return `rgba(57, 217, 255, ${alpha})`;
+    const value = parseInt(full, 16);
+    return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${alpha})`;
+  }
+
+  function mergeRiskBuckets(a, b) {
+    const left = MAP_RISK_COLORS[a] ? a : 'unknown';
+    const right = MAP_RISK_COLORS[b] ? b : 'unknown';
+    if (left === right) return left;
+    const worst = MAP_RISK_ORDER[left] >= MAP_RISK_ORDER[right] ? left : right;
+    if (worst === 'low') return 'unknown';
+    return worst;
+  }
   /* The map does not need a 250ms refresh rate. Kept clear of the 420ms update
      animation so one animation finishes before the next render starts. */
   const MAP_RENDER_MIN_INTERVAL = 1000;
@@ -1842,6 +1909,7 @@
             <div class="insights-map-point-layer">${points.slice(0, 32).map((point, index) => mapPointMarkup(point, index)).join('')}</div>
             ${state.mapScope === 'china' && !mapScopeSupported ? '<div class="insights-map-scope-empty">等待后端返回中国省市级地理流量</div>' : ''}
             <div class="insights-map-status" data-insights-map-status role="status" aria-live="polite"${mapStatusText() ? '' : ' hidden'}>${html(mapStatusText())}</div>
+            ${mapLegendMarkup()}
             <div class="insights-map-controls" aria-label="地图控制">
               <button type="button" data-map-control="reset" title="重置视图">${targetSvg()}</button>
               <button type="button" data-map-control="zoom-in" title="放大">${zoomInSvg()}</button>
@@ -1849,6 +1917,57 @@
             </div>
           </div>
         </section>`;
+    }
+
+    /*
+     * 地图图例。用户 2026-08-09 提出「地图里不同颜色代表什么」——此前地图一条图例
+     * 都没有，唯一的琥珀图例在上方摘要里写着「可疑」，于是地图的琥珀（当时表示
+     * 入站）被读成风险。图例是这次修复的主体，不是装饰。
+     *
+     * 三条口径：
+     *   1. 只列这一屏真的画出来的档位。图例里出现图上没有的颜色，等于换一种方式
+     *      让人猜。
+     *   2. 「未评级」必须与「低」分开写明，并说清它不等于安全 —— 后端自述
+     *      `risk_unknown_meaning` 是「目的地不在已加载情报源中，并非判定为安全」，
+     *      实测 30/30 条路由都是 unknown，这一档是常态而不是边角情况。
+     *   3. 方向与流量各自单独一行，明确它们由形状/粗细表达，不占用颜色。
+     */
+    /* 外壳常驻 DOM，内容由 updateMapDom() 重算：首次渲染时 geo 还没到，
+       若外壳也按数据条件生成，后续增量更新就找不到挂载点。 */
+    function mapLegendMarkup() {
+      const inner = mapLegendInnerMarkup();
+      return `<div class="insights-map-legend" data-insights-map-legend role="note" aria-label="地图图例"${inner ? '' : ' hidden'}>${inner}</div>`;
+    }
+
+    function mapLegendInnerMarkup() {
+      const routes = mapRouteItems();
+      const points = mapDisplayPoints();
+      if (!routes.length && !points.length) return '';
+      const buckets = new Set();
+      routes.forEach((route) => buckets.add(mapRiskBucket(route)));
+      points.forEach((point) => {
+        if (point.is_local || point.local || point.role === 'local') return;
+        buckets.add(mapRiskBucket(point));
+      });
+      const order = ['unknown', 'low', 'suspicious', 'concern'];
+      const riskItems = order.filter((bucket) => buckets.has(bucket)).map((bucket) => {
+        const palette = mapRiskPalette(bucket);
+        const note = bucket === 'unknown' ? ' data-dwrt-tooltip="目的地不在已加载的情报源中，未做评级；这不等于判定为安全"' : '';
+        return `<span class="insights-map-legend-item"${note}>`
+          + `<i class="insights-map-legend-swatch" style="--legend-color:${palette.line}"></i>`
+          + `${html(palette.label)}</span>`;
+      }).join('');
+      const hasLocal = points.some((point) => point.is_local || point.local || point.role === 'local');
+      const directions = new Set(routes.map((route) => String(route.direction || '').toLowerCase() === 'inbound' ? 'inbound' : 'outbound'));
+      const directionItems = [
+        directions.has('outbound') ? `<span class="insights-map-legend-item"><i class="insights-map-legend-line is-outbound" aria-hidden="true"></i>出站</span>` : '',
+        directions.has('inbound') ? `<span class="insights-map-legend-item"><i class="insights-map-legend-line is-inbound" aria-hidden="true"></i>入站</span>` : '',
+        hasLocal ? `<span class="insights-map-legend-item"><i class="insights-map-legend-swatch is-local" style="--legend-color:${MAP_LOCAL_COLOR}"></i>本机出口</span>` : ''
+      ].filter(Boolean).join('');
+      return `
+        ${riskItems ? `<div class="insights-map-legend-group"><span class="insights-map-legend-title">颜色 · 风险</span>${riskItems}</div>` : ''}
+        ${directionItems ? `<div class="insights-map-legend-group"><span class="insights-map-legend-title">线型 · 方向</span>${directionItems}</div>` : ''}
+        <div class="insights-map-legend-group"><span class="insights-map-legend-title">粗细 / 点径 · 流量</span><span class="insights-map-legend-item"><i class="insights-map-legend-scale" aria-hidden="true"></i><span class="insights-map-legend-scale-text">越粗越大代表流量越多</span><span class="insights-map-legend-scale-short" aria-hidden="true">流量</span></span></div>`;
     }
 
     function activityRows() {
@@ -2125,9 +2244,15 @@
         const name = activityName(item);
         /* 兜底条目的名字就是它的协议/端口标识，不改写成假的应用名；旁边挂一枚
            「未识别」标记，并把后端给的原因放进 kit tooltip。 */
+        /* 图标在前、名字在后（用户 2026-08-09 的要求）。图标用后端在这份用量里
+           给的 `icon_url` / `icon_file` / `icon_key`（30.1 实测同一批字段各 19 处），
+           服务条目没有品牌图标，出首字母字形，两组行的文字仍然对齐。 */
         const nameCell = identified
-          ? `<span class="insights-activity-name">${html(name)}</span>`
+          ? `<span class="insights-activity-name">`
+            + auditIconMarkup(auditAppIconSrc(item), name)
+            + `<b>${html(name)}</b></span>`
           : `<span class="insights-activity-name is-service"${hint ? ` data-dwrt-tooltip="${escapeAttr(hint)}" tabindex="0"` : ''}>`
+            + auditIconMarkup('', name)
             + `<code>${html(name)}</code><em>未识别</em></span>`;
         return `<tr class="${identified ? 'is-application' : 'is-service'}">
           <td>${nameCell}</td>
@@ -2138,17 +2263,16 @@
           <td>${html(formatInteger(firstNumber(item.client_count, item.clients, item.clientCount, item.app_count, item.appCount)))}</td>
         </tr>`;
       };
-      const groupHead = (label, detail, count) => `
+      const groupHead = (label, count) => `
         <tr class="insights-activity-group">
           <th colspan="6" scope="colgroup">
             <span class="insights-activity-group-label">${html(label)}</span>
             <span class="insights-activity-group-count">${html(`${formatInteger(count)} 项`)}</span>
-            <span class="insights-activity-group-detail">${html(detail)}</span>
           </th>
         </tr>`;
       const body = groups.rows.length
-        ? `${groups.applications.length ? `${groupHead('应用', 'DPI 特征库识别到具体应用', groups.applications.length)}${groups.applications.map(row).join('')}` : ''}`
-          + `${groups.services.length ? `${groupHead('未识别的协议 / 端口', '特征库未命中，只能按协议或端口标识，不代表某个应用', groups.services.length)}${groups.services.map(row).join('')}` : ''}`
+        ? `${groups.applications.length ? `${groupHead('应用', groups.applications.length)}${groups.applications.map(row).join('')}` : ''}`
+          + `${groups.services.length ? `${groupHead('未识别的协议 / 端口', groups.services.length)}${groups.services.map(row).join('')}` : ''}`
         : `
           <tr>
             <td colspan="6">
@@ -2185,6 +2309,10 @@
      * 识别覆盖率如实呈现，口径与 APP 过滤页的覆盖率卡一致（分母为全部条目、
      * 分子只算 `is_application`）。没有数据就不画这条，不用 0% 或 100% 假装
      * 有结论。
+     *
+     * 三档数字自己就说清了口径（14 应用 / 466 仅协议/端口 / 480 合计），
+     * 用户 2026-08-09 要求删掉底下那句解释性长句；未识别行仍在表内带
+     * 「未识别」标记与原因 tooltip，信息没有丢。
      */
     function activityCoverageMarkup(groups) {
       if (!groups.total) return '';
@@ -2199,7 +2327,6 @@
             <span><i>${html(formatInteger(groups.services.length))}</i>仅协议/端口</span>
             <span><i>${html(formatInteger(groups.total))}</i>条目合计</span>
           </div>
-          <p>识别依赖 DPI 特征库。未命中的流量只能按协议或端口标识，它们不是应用。</p>
         </div>`;
     }
 
@@ -2471,6 +2598,57 @@
     }
 
     /*
+     * 审计表格里的「图标在前、名字在后」两件事共用一套渲染。
+     *
+     * 图标来源都是后端已经给出的真实字段，不是前端猜的：
+     *   应用  `/api/v1/audit/apps`、`/audit/urls`、`/audit/protocols` 的行上带
+     *         `icon_url` / `icon_file` / `icon_key`（30.1 实测 `IOS更新` →
+     *         `/static/images/logo/ios.svg`，`谷歌通用协议` → `google.svg`）。
+     *         固件里 4694 张图标。
+     *   设备  走全局 `DWRT_DEVICE_IMAGES.resolve()`，与仪表盘/终端列表同一套
+     *         优先级（自定义 > 指纹 > 品牌 logo）。在线记录行带 `vendor`
+     *         (`Synology`) / `model` (`Lester-Synology SA6400`) / `mac`，够它出图。
+     *
+     * 取不到图就退回首字母字形，不硬塞一张不相干的图；`onerror` 时隐藏 img 并
+     * 让父元素切到字形，一个 404 不会在列里留下破图占位。
+     */
+    function auditIconMarkup(src, fallbackText, extraClass = '') {
+      const fallback = html(String(firstText(fallbackText) || '').trim().slice(0, 1).toUpperCase() || '·');
+      const cls = `insights-audit-cell-icon${extraClass ? ` ${extraClass}` : ''}`;
+      if (!src) return `<span class="${cls} is-glyph" aria-hidden="true"><i>${fallback}</i></span>`;
+      return `<span class="${cls}" aria-hidden="true">`
+        + `<img src="${html(src)}" alt="" loading="lazy" decoding="async"`
+        + ` onerror="this.hidden=true;this.parentElement.classList.add('is-glyph')">`
+        + `<i>${fallback}</i></span>`;
+    }
+
+    /* 应用图标的真实来源。服务类条目（https、tcp/30164）不是应用，没有品牌图标，
+       后端也不给 icon 字段，这时不出图，交给字形兜底。 */
+    function auditAppIconSrc(row) {
+      if (!row || typeof row !== 'object') return '';
+      const direct = firstText(row.icon_url, row.icon, row.logo_url, row.logo);
+      if (direct) return normalizeIconUrl(direct);
+      const file = firstText(row.icon_file, row.icon_key && `${row.icon_key}.svg`);
+      return file ? `/static/images/logo/${encodeURIComponent(file)}` : '';
+    }
+
+    function auditDeviceIconSrc(row) {
+      if (!row || typeof row !== 'object') return '';
+      const images = globalThis.DWRT_DEVICE_IMAGES;
+      if (images && typeof images.resolve === 'function') {
+        const resolved = images.resolve(row);
+        if (resolved && resolved.src) return resolved.src;
+      }
+      return normalizeIconUrl(firstText(row.icon_url, row.icon, row.image, row.image_url));
+    }
+
+    /* 图标 + 主/副标题。图标在前、文字在后（用户 2026-08-09 的要求），
+       tooltip 与纯文字版本保持一致，所以直接复用 auditMainCell 的输出。 */
+    function auditIconCell(iconMarkup, body) {
+      return `<span class="insights-audit-icon-cell">${iconMarkup}${body}</span>`;
+    }
+
+    /*
      * `evidence` 只有在真的是证据（域名、命中规则）时才配当副标题。
      *
      * 后端目前把这一行的口径自述原样写进 `evidence`，取值与同行的 `semantic` 完全相同
@@ -2562,17 +2740,28 @@
      * 后端在 `app_id <= 0` 时既可能给服务标识（`dw_audit_apply_app_identity`），也
      * 可能留空（URL 审计的 `unresolved_app_id` 分支把 `app_name` 清成 `""`），两种
      * 都要能渲染，所以标识为空时只显示「未识别」而不留一个空副标题。
+     *
+     * 识别出应用时图标在前、名字在后；未识别的条目没有品牌图标可用，出字形占位，
+     * 这样两组行的文字仍然左对齐，不会因为有没有图而错开一列。
      */
     function auditAppCell(row, name) {
       const text = firstText(name, row && row.app, row && row.app_name, row && row.application);
-      if (auditRowIsIdentifiedApp(row)) return auditMainCell(text || '--', '');
+      if (auditRowIsIdentifiedApp(row)) {
+        return auditIconCell(
+          auditIconMarkup(auditAppIconSrc(row), text),
+          auditMainCell(text || '--', '')
+        );
+      }
       const fallback = firstText(text, row && row.service, row && row.app_proto, row && row.protocol);
       const hint = auditIdentityHint(row);
       const tooltip = hint ? ` data-dwrt-tooltip="${escapeAttr(hint)}" tabindex="0"` : '';
-      return `<span class="insights-audit-main-cell is-unidentified"${tooltip}>`
-        + `<strong>未识别</strong>`
-        + (fallback ? `<small>${html(fallback)}</small>` : '')
-        + `</span>`;
+      return auditIconCell(
+        auditIconMarkup('', fallback || '未识别'),
+        `<span class="insights-audit-main-cell is-unidentified"${tooltip}>`
+          + `<strong>未识别</strong>`
+          + (fallback ? `<small>${html(fallback)}</small>` : '')
+          + `</span>`
+      );
     }
 
     function auditMetric(label, value, hint = '') {
@@ -2734,6 +2923,12 @@
         app: firstText(row.app, row.application, row.app_name),
         category: firstText(row.category, row.type, row.class),
         action: firstText(row.action, row.verdict, row.policy_action),
+        /* 应用图标字段原样带下来。URL 审计的行在识别成功时带
+           `icon_key` / `icon_file` / `icon_url`（30.1 实测 `谷歌通用协议` →
+           `/static/images/logo/google.svg`），归一化时丢掉就再也拿不回来。 */
+        icon_url: firstText(row.icon_url),
+        icon_file: firstText(row.icon_file),
+        icon_key: firstText(row.icon_key),
         /* 识别标记必须原样带下来，否则下游只剩一个 `app` 字符串，无法区分
            「应用名」和「协议/端口兜底标识」。URL 审计路径给的是
            `app_name_source` + `app_unresolved`（`jmx_dreamingwrt_api.c` 的
@@ -2771,6 +2966,9 @@
         host: firstText(row.host, row.domain, row.name),
         app: firstText(row.app, row.application, row.app_name),
         category: firstText(row.category, row.type),
+        icon_url: firstText(row.icon_url),
+        icon_file: firstText(row.icon_file),
+        icon_key: firstText(row.icon_key),
         /* 与记录视图同一套识别标记，聚合时一并带过来（见 deriveUrlDomains）。 */
         app_id: firstNumber(row.app_id, row.appid, row.canonical_app_id),
         app_unresolved: row.app_unresolved === true,
@@ -2812,7 +3010,12 @@
           application_name_is_fallback: row.application_name_is_fallback,
           service: row.service,
           app_proto: row.app_proto,
-          protocol: row.protocol
+          protocol: row.protocol,
+          /* 图标跟着识别标记一起走。下面「先有应用名才换标记」的分支会整组覆盖，
+             图标留在同一个对象里才不会出现「换了应用名却还挂着上一个图标」。 */
+          icon_url: row.icon_url,
+          icon_file: row.icon_file,
+          icon_key: row.icon_key
         };
         const current = map.get(host) || { host, app: row.app, category: row.category, ...identity, clientsSet: new Set(), hits: 0, up_bytes: 0, down_bytes: 0, first_seen: row.ts, last_seen: row.ts, action: row.action };
         if (row.mac || row.ip || row.client) current.clientsSet.add(row.mac || row.ip || row.client);
@@ -2940,6 +3143,14 @@
         vendor: firstText(row.vendor, row.brand),
         device_type: firstText(row.device_type, row.type),
         os: firstText(row.os, row.os_name),
+        /* `DWRT_DEVICE_IMAGES.resolve()` 按 vendor / model / hostname 匹配品牌
+           logo，也认指纹图字段。归一化里丢掉 model 就等于把 `Lester-Synology
+           SA6400` 这类型号扔了，品牌匹配会少一条线索，所以一并带下来。 */
+        model: firstText(row.model, row.device_model),
+        image_url: firstText(row.image_url, row.web_image),
+        image: firstText(row.image),
+        icon_url: firstText(row.icon_url),
+        icon: firstText(row.icon),
         source: firstText(row.source, row.evidence),
         reason: firstText(row.reason, row.detail)
       }));
@@ -2959,7 +3170,17 @@
       const roam = rows.filter((row) => /漫游|roam/i.test(row.action)).length;
       const columns = [
         { label: '时间', sort: 'ts', render: (row) => html(auditTime(row.ts)) },
-        { label: '设备', sort: 'client', render: (row) => auditMainCell(row.client || '--', [row.vendor, row.device_type, row.os].filter(Boolean).join(' / ')) },
+        /* 设备图在前、MAC 在后（用户 2026-08-09 的要求）。图走全局
+           `DWRT_DEVICE_IMAGES.resolve()`，与仪表盘/终端列表同一套优先级；
+           `client` 在这份数据里就是 MAC（后端未给主机名时的取值）。 */
+        {
+          label: '设备',
+          sort: 'client',
+          render: (row) => auditIconCell(
+            auditIconMarkup(auditDeviceIconSrc(row), firstText(row.vendor, row.client), 'is-device'),
+            auditMainCell(row.client || '--', [row.vendor, row.device_type, row.os].filter(Boolean).join(' / '))
+          )
+        },
         { label: '动作', sort: 'action', render: (row) => `<span class="insights-audit-pill ${auditTone(row.action)}">${html(auditActionLabel(row.action))}</span>` },
         { label: 'IP / MAC', sort: 'ip', render: (row) => auditMainCell(row.ip || '--', row.mac || '') },
         { label: '接口', sort: 'ifname', render: (row) => html(row.ifname || '--') },
@@ -3045,6 +3266,12 @@
           kind,
           name: firstText(row.name, row.app, row.protocol, row.application),
           type,
+          /* `/audit/apps` 的行带 `icon_key` / `icon_file` / `icon_url`
+             （30.1 实测 `IOS更新` → `/static/images/logo/ios.svg`）；
+             `/audit/protocols` 的行只有一个空 `icon`，出不了图，走字形兜底。 */
+          icon_url: firstText(row.icon_url),
+          icon_file: firstText(row.icon_file),
+          icon_key: firstText(row.icon_key),
           category: firstText(row.category, parts[0], type),
           subcategory: firstText(row.subcategory, parts.slice(1).join('/')),
           /* 识别标记原样带下来。30.1 实测 `audit/protocols` 的行带
@@ -3132,7 +3359,12 @@
           sort: 'name',
           render: (row) => (query.view === 'apps' && !auditRowIsIdentifiedApp(row)
             ? auditAppCell(row, row.name)
-            : auditMainCell(row.name || '--', auditEvidenceText(row) || firstText(row.domains) || ''))
+            /* 图标在前、名字在后。「应用」页用后端给的品牌图标；「协议」页
+               的行不带 icon 字段，出首字母字形，列对齐仍然一致。 */
+            : auditIconCell(
+              auditIconMarkup(auditAppIconSrc(row), row.name),
+              auditMainCell(row.name || '--', auditEvidenceText(row) || firstText(row.domains) || '')
+            ))
         },
         { label: '分类', sort: 'category', render: (row) => auditMainCell(row.category || '--', row.subcategory || row.type || '') },
         { label: '连接数', sort: 'connections', className: 'num', render: (row) => html(formatInteger(row.connections)) },
@@ -3347,6 +3579,17 @@
         if (layer) {
           const limit = role === 'overview' ? 16 : 32;
           layer.innerHTML = state.mapEnabled ? points.slice(0, limit).map((point, index) => mapPointMarkup(point, index)).join('') : '';
+        }
+        /*
+         * 图例也必须走增量更新。首次 render() 时 geo 还没回来（routes / points 全空），
+         * 图例算不出档位，此后所有刷新都走这条路径 —— 不在这里重建，图例就永远
+         * 不出现（实测就是这样：shell 里只有 6 个子节点，没有 legend）。
+         * 档位随数据变化，所以每次刷新都按当前数据重算，而不是只补一次。
+         */
+        const legend = shell.querySelector('[data-insights-map-legend]');
+        if (legend && role !== 'overview') {
+          legend.innerHTML = state.mapEnabled ? mapLegendInnerMarkup() : '';
+          legend.hidden = !legend.innerHTML;
         }
       });
       /* render() rebuilds the shell from markup, so the pending/failed classes
@@ -4079,8 +4322,11 @@
                 period: Math.max(2.2, 4.8 - Math.min(2.1, item.dataInfo.metric / maxRoute * 2.1)),
                 delay: (index % 5) * 0.22,
                 trailLength: 0,
-                symbol: 'circle',
-                symbolSize: item.dataInfo.direction === 'inbound' ? 5.6 : 4.8,
+                /* 方向靠符号说，不靠颜色说：出站是沿弧飞行的箭头，入站是实心圆点。
+                   `rotate: auto` 由 lines series 的 effect 自行处理箭头朝向，
+                   所以箭头始终指向流向的下游。 */
+                symbol: item.dataInfo.direction === 'inbound' ? 'circle' : 'arrow',
+                symbolSize: item.dataInfo.direction === 'inbound' ? 5.0 : [5.4, 7.2],
                 color: item.dataInfo.packetColor
               }
             }))
@@ -4146,10 +4392,18 @@
       const key = `${Number(coords[0]).toFixed(5)},${Number(coords[1]).toFixed(5)}`;
       const local = Boolean(point.is_local || point.local || point.role === 'local');
       const metric = Math.max(1, Number(route.metric) || 1);
+      /*
+       * 端点对象上没有 risk —— 实测 `flows/geo` 的 `routes[].from/to` 只有地理字段，
+       * 风险挂在 route 自身（30/30 条带 `risk_level`）和 `regions[]` 上。所以点位的
+       * 风险从落到它身上的弧继承，多条弧汇到同一点时取最坏档（mergeRiskBuckets）。
+       * 不这样做的话点位会全部画成"未评级"，即使弧已经标红。
+       */
+      const routeRisk = mapRiskBucket(route.route);
       const current = points.get(key);
       if (current) {
         current.metric += metric;
         current.routeCount += 1;
+        current.riskBucket = mergeRiskBuckets(current.riskBucket, routeRisk);
         if (local) {
           current.local = true;
           current.point = point;
@@ -4166,6 +4420,7 @@
         routeCount: 1,
         label,
         local,
+        riskBucket: routeRisk,
         shortLabel: local ? firstText(point.public_ip, point.ip, point.address, '本机') : label
       });
     }
@@ -4218,6 +4473,9 @@
         existing.route.total_bytes = firstNumber(existing.route.total_bytes) + firstNumber(route.route.total_bytes);
         existing.route.count = firstNumber(existing.route.count, existing.route.flow_count, 1) + firstNumber(route.route.count, route.route.flow_count, 1);
         existing.route.flow_count = existing.route.count;
+        /* 这一层也会合并成一条弧，风险同样取最坏档，不让高风险被普通流量洗白。 */
+        existing.route.risk_level = mergeRiskBuckets(mapRiskBucket(existing.route), mapRiskBucket(route.route));
+        existing.route.risk = existing.route.risk_level;
         existing.coincident.push(route);
       });
       /* 同坐标的多条弧展开成独立弧线，各自带 fanIndex/fanTotal 供曲率错开。
@@ -4263,14 +4521,26 @@
 
     function cyberPointSeriesItem(point, maxPoint) {
       const value = [point.coords[0], point.coords[1], point.metric];
+      /*
+       * 点位颜色也归风险。以前用 cyberMetricColor() 按流量占比分档，于是「流量大」
+       * 被画成琥珀/红，和摘要的「可疑 / 令人担忧」同色不同义。流量大小改由点径
+       * （cyberPointSize）单独表达，颜色只说风险。
+       */
+      /* 点位风险优先用弧继承来的档（端点对象自身没有 risk 字段），
+         没有弧的点位（regions 直接出图）再退回读它自己的 risk。 */
+      const riskBucket = point.local
+        ? 'local'
+        : (MAP_RISK_COLORS[point.riskBucket] ? point.riskBucket : mapRiskBucket(point.point));
+      const palette = mapRiskPalette(riskBucket);
+      const color = point.local ? MAP_LOCAL_COLOR : palette.line;
       return {
         name: point.label,
         value,
         symbolSize: cyberPointSize(point.metric, maxPoint, point.local),
         itemStyle: {
-          color: point.local ? '#27f0a8' : cyberMetricColor(point.metric, maxPoint, 'point'),
+          color,
           shadowBlur: point.local ? 24 : 16,
-          shadowColor: point.local ? 'rgba(39,240,168,0.86)' : 'rgba(57,217,255,0.70)',
+          shadowColor: point.local ? 'rgba(39,240,168,0.86)' : hexToRgba(color, 0.66),
           borderColor: 'rgba(238, 252, 255, 0.82)',
           borderWidth: 0.8
         },
@@ -4283,15 +4553,26 @@
           bytes: firstNumber(point.point.bytes, point.point.total_bytes, point.point.traffic_bytes),
           count: firstNumber(point.point.count, point.point.flow_count, point.point.total, point.point.value),
           ip: firstText(point.point.public_ip, point.point.public_ipv4, point.point.ip, point.point.address),
-          approximate: isApproximateMapPoint(point.point)
+          approximate: isApproximateMapPoint(point.point),
+          riskBucket: point.local ? '' : riskBucket,
+          riskLabel: point.local ? '' : palette.label,
+          riskReason: point.local ? '' : firstText(point.point.risk_reason),
+          riskUnknownCount: point.local ? 0 : firstNumber(point.point.risk_unknown)
         }
       };
     }
 
     function cyberRouteSeriesItem(route, index, maxRoute) {
       const inbound = route.direction === 'inbound';
-      const color = inbound ? '#ffb25f' : '#38d8ff';
-      const packetColor = inbound ? '#ffd49b' : '#eefbff';
+      /*
+       * 颜色 = 风险，形状 = 方向。旧写法用琥珀表示入站，与摘要「可疑」的琥珀
+       * 撞车（用户 2026-08-09 直接读错了图），所以方向改由弯向 + 光点符号 +
+       * 虚实表达，颜色腾出来给风险。
+       */
+      const riskBucket = mapRiskBucket(route.route);
+      const palette = mapRiskPalette(riskBucket);
+      const color = palette.line;
+      const packetColor = palette.packet;
       const ratio = Math.max(0.08, Math.min(1, route.metric / maxRoute));
       /*
        * 同坐标的多条弧靠曲率错开，而不是合并掉。基础曲率 ±0.31 保持不变（单条弧
@@ -4315,7 +4596,10 @@
           color,
           opacity: 0.38 + ratio * 0.30,
           width: 1.0 + ratio * 2.2,
-          curveness
+          curveness,
+          /* 入站画虚线：颜色已被风险占用，方向靠线型 + 弯向 + 箭头三重冗余表达，
+             这样即使同一档风险的进出两条弧并排，也分得清谁进谁出。 */
+          type: inbound ? 'dashed' : 'solid'
         },
         dataInfo: {
           type: 'route',
@@ -4337,6 +4621,10 @@
           fanPeers: Array.isArray(route.fanPeers) ? route.fanPeers : [],
           direction: route.direction,
           packetColor,
+          riskBucket,
+          riskLabel: palette.label,
+          riskSupported: route.route.risk_supported,
+          riskSource: route.route.risk_source,
           index
         }
       };
@@ -4352,12 +4640,18 @@
       return Math.max(local ? 7 : 4, Math.min(local ? 12 : 10, (local ? 7 : 4) + ratio * (local ? 5 : 6)));
     }
 
-    function cyberMetricColor(value, maxValue, mode) {
+    /*
+     * 流量占比的色阶。旧实现用 `#ff6f83` / `#ffb45f` 分档，把「流量大」画成了
+     * 「令人担忧 / 可疑」的颜色（用户 2026-08-09 因此读错整张图）。流量不是风险，
+     * 所以这一档只在同一色相里走深浅：浅青 → 亮蓝，越亮代表占比越高。
+     * 点位当前按风险上色，此函数保留给需要"按量深浅"的图元使用。
+     */
+    function cyberMetricColor(value, maxValue) {
       const ratio = Math.max(0, Math.min(1, Number(value || 0) / Math.max(1, Number(maxValue) || 1)));
-      if (ratio > 0.78) return '#ff6f83';
-      if (ratio > 0.54) return '#ffb45f';
-      if (ratio > 0.30) return '#8fffe0';
-      return mode === 'point' ? '#39d9ff' : '#38d8ff';
+      if (ratio > 0.78) return '#8ef0ff';
+      if (ratio > 0.54) return '#5ce2ff';
+      if (ratio > 0.30) return '#39d9ff';
+      return '#2bb8e8';
     }
 
     function cyberMapTooltip(params) {
@@ -4516,16 +4810,20 @@
     const count = Number(point.count || point.flow_count || point.bytes || 1);
     const size = Math.max(9, Math.min(24, 9 + Math.log10(Math.max(1, count)) * 5));
     const local = point.is_local || point.local || point.role === 'local';
+    /* 兜底层与主图同源：点位颜色说风险，大小说流量。本机是拓扑身份，不参与风险分档。 */
+    const riskBucket = local ? '' : mapRiskBucket(point);
     const classes = [
       'insights-map-point',
       local ? 'is-local' : '',
+      riskBucket ? `risk-${riskBucket}` : '',
       isApproximateMapPoint(point) ? 'is-approximate' : ''
     ].filter(Boolean).join(' ');
     const title = mapPointTitle(point);
     const localLabel = local
       ? `<span class="insights-map-point-label">${escapeAttr(point.public_ip || point.ip || point.address || '本机')}</span>`
       : '';
-    return `<span class="${classes}" style="--point-x:${x}%;--point-y:${y}%;--point-size:${size}px" title="${escapeAttr(title)}"><i class="insights-map-point-halo"></i><i class="insights-map-point-core"></i>${localLabel}</span>`;
+    const pointColor = local ? MAP_LOCAL_COLOR : mapRiskPalette(riskBucket).line;
+    return `<span class="${classes}" style="--point-x:${x}%;--point-y:${y}%;--point-size:${size}px;--point-color:${pointColor}" title="${escapeAttr(title)}"><i class="insights-map-point-halo"></i><i class="insights-map-point-core"></i>${localLabel}</span>`;
   }
 
   function mapRouteLayerMarkup(routes) {
@@ -4579,6 +4877,9 @@
       existing.mergedCount += 1;
       existing.count = numberOr(existing.count) + numberOr(route.count);
       existing.bytes = numberOr(existing.bytes) + numberOr(route.bytes);
+      /* 合并后的弧只有一个颜色，风险取最坏档（见 mergeRiskBuckets 注释）。 */
+      existing.risk_level = mergeRiskBuckets(mapRiskBucket(existing), mapRiskBucket(route));
+      existing.risk = existing.risk_level;
       existing.label = aggregatedRouteLabel(remoteEndpointOf(existing), existing.label, existing.mergedCount, scope);
     });
     return annotateCoincidentRoutes(mergeAdjacentRoutes(Array.from(grouped.values()), scope), scope);
@@ -4624,6 +4925,8 @@
       near.mergedCount = numberOr(near.mergedCount || 1) + numberOr(route.mergedCount || 1);
       near.count = numberOr(near.count) + numberOr(route.count);
       near.bytes = numberOr(near.bytes) + numberOr(route.bytes);
+      near.risk_level = mergeRiskBuckets(mapRiskBucket(near), mapRiskBucket(route));
+      near.risk = near.risk_level;
       // 同上：inbound 的远端在 from，用 to 会把境外来源标成本机所在国。
       near.label = aggregatedRouteLabel(remoteEndpointOf(near), near.label, near.mergedCount, scope);
     });
@@ -4706,15 +5009,19 @@
     const metric = routeWeight(route);
     const width = Math.max(1.15, Math.min(3.2, 1.15 + Math.log10(metric) * 0.42));
     const duration = Math.max(2.4, Math.min(4.8, 4.8 - Math.log10(metric) * 0.34)).toFixed(2);
-    const color = inbound ? '#ffb25f' : '#38d8ff';
-    const accent = inbound ? '#ffd49b' : '#effbff';
+    /* 与 ECharts 主图同源：颜色说风险，方向由弯向 + 线型 + 光点符号表达。
+       兜底层与主图必须用同一套色，否则同一条弧在两条渲染路径上颜色不同。 */
+    const riskBucket = mapRiskBucket(route);
+    const palette = mapRiskPalette(riskBucket);
+    const color = palette.line;
+    const accent = palette.packet;
     return `
-      <path class="insights-map-route-glow ${inbound ? 'is-inbound' : 'is-outbound'}" d="${path}" pathLength="1" style="--route-width:${(width + 4).toFixed(2)};--route-color:${color};--route-delay:${delay}s"></path>
-      <path class="insights-map-route-path ${inbound ? 'is-inbound' : 'is-outbound'}" d="${path}" pathLength="1" style="--route-width:${width.toFixed(2)};--route-color:${color};--route-delay:${delay}s"></path>
-      <circle class="insights-map-route-packet primary" r="1.08" style="--route-delay:${delay}s;--packet-color:${accent}">
+      <path class="insights-map-route-glow ${inbound ? 'is-inbound' : 'is-outbound'} risk-${riskBucket}" d="${path}" pathLength="1" style="--route-width:${(width + 4).toFixed(2)};--route-color:${color};--route-delay:${delay}s"></path>
+      <path class="insights-map-route-path ${inbound ? 'is-inbound' : 'is-outbound'} risk-${riskBucket}" d="${path}" pathLength="1" style="--route-width:${width.toFixed(2)};--route-color:${color};--route-delay:${delay}s"></path>
+      <circle class="insights-map-route-packet primary ${inbound ? 'is-inbound' : 'is-outbound'}" r="1.08" style="--route-delay:${delay}s;--packet-color:${accent}">
         <animateMotion dur="${duration}s" begin="${delay}s" repeatCount="indefinite" path="${path}" rotate="auto"></animateMotion>
       </circle>
-      <circle class="insights-map-route-packet secondary" r="0.72" style="--route-delay:${delay}s;--packet-color:${color}">
+      <circle class="insights-map-route-packet secondary ${inbound ? 'is-inbound' : 'is-outbound'}" r="0.72" style="--route-delay:${delay}s;--packet-color:${color}">
         <animateMotion dur="${duration}s" begin="${(Number(delay) + Number(duration) / 2).toFixed(2)}s" repeatCount="indefinite" path="${path}" rotate="auto"></animateMotion>
       </circle>`;
   }
@@ -5190,7 +5497,14 @@
       /* 实测 routes[] 不含 remote_ip；保留读取只为兼容将来补上该键的情况，
          真正的远端地址来自 from/to 端点对象。 */
       remote_ip: firstFilled(route.remote_ip),
-      client_ip: firstFilled(route.client_ip)
+      client_ip: firstFilled(route.client_ip),
+      /* 风险要一路带到渲染层，弧线按它上色。后端 30/30 条都给了这几个键，
+         `risk_supported` 缺键时按支持处理（与 source_port_supported 同一口径）。 */
+      risk: firstFilled(route.risk),
+      risk_level: firstFilled(route.risk_level, route.risk),
+      risk_matched: route.risk_matched,
+      risk_source: firstFilled(route.risk_source),
+      risk_supported: route.risk_supported
     };
   }
 

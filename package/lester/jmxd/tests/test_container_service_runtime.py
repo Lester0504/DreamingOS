@@ -7,13 +7,15 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -175,30 +177,12 @@ def json_c_flags() -> list[str]:
         assert static_library.is_file(), f"json-c library missing below {prefix}"
         return ["-I", str(prefix / "include"), str(static_library)]
 
-    pkg_config = shutil.which("pkg-config")
-    if pkg_config:
-        proc = subprocess.run(
-            [pkg_config, "--cflags", "--libs", "json-c"],
-            text=True, capture_output=True,
-        )
-        if proc.returncode == 0:
-            return shlex.split(proc.stdout)
-    brew = shutil.which("brew")
-    if brew:
-        proc = subprocess.run([brew, "--prefix", "json-c"], text=True,
-                              capture_output=True)
-        if proc.returncode == 0:
-            prefix = Path(proc.stdout.strip())
-            if (prefix / "include/json-c/json.h").is_file():
-                return ["-I", str(prefix / "include"), "-L", str(prefix / "lib"),
-                        "-ljson-c"]
-    temporary_cellar = Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c")
-    for header in sorted(temporary_cellar.glob("*/include/json-c/json.h"), reverse=True):
-        prefix = header.parents[2]
-        library = prefix / "lib/libjson-c.a"
-        if library.is_file():
-            return ["-I", str(prefix / "include"), str(library)]
-    raise AssertionError("json-c development headers and library unavailable")
+    # pkg-config is consulted inside the resolver. Both former fallbacks
+    # (brew --prefix, then the temporary cellar) resolved on 31.6 to an LTO
+    # archive the host linker rejects with "bytecode stream ... generated with
+    # LTO version 16.0", so defer to the shared resolver, which prefers a
+    # linkable .so and knows about the staging_dir.
+    return apd_test_deps.package_flags("json-c")
 
 
 def compile_fixture(temp: Path, db: Path) -> Path:

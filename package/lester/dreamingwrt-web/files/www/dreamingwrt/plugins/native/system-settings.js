@@ -12,7 +12,7 @@ export function mount(context = {}) {
     return { name, ok, data: json?.data ?? json, raw: json, error: ok ? null : new Error(json?.error?.message || json?.message || response.statusText || 'request failed') };
   });
 
-  const VERSION = '20260808-api-key-management-card-01';
+  const VERSION = '20260809-advanced-capability-truth-01';
   const MODULE_CLASS = 'system-settings-route-host';
   const ENDPOINT = '/api/v1/system/basic';
   const SAVE_ENDPOINTS = ['/api/v1/system/settings', '/api/v1/save_system_settings'];
@@ -172,38 +172,41 @@ export function mount(context = {}) {
     pairTimer: 0,
     pairPollTicks: 0,
     pairPollBusy: false,
+    /*
+     * 手机上显示的 6 位配对码，由管理员输入到这里。
+     * 不走 data-system-field：那条路径会写进 state.data 并让保存条以为有未保存的
+     * 系统设置，而配对码是一次性凭据，不属于保存条管辖的内容。
+     */
+    pairCodeInput: '',
+    pairCodeError: '',
     cloudStatus: null,
     cloudIdentity: null,
     cloudStatusError: '',
     deviceCapabilities: null,
     deviceIdentity: '',
+    /*
+     * 设备启用/停用与云端注册都是高危写入，按 design.md 规则 17 走 Kit 的
+     * confirmationMarkup()，不用「再次点击按钮确认」。这里只存待确认的意图：
+     *   deviceConfirm  { id, name, enabled }  停用/启用某台已绑定 App
+     *   cloudConfirm   'enroll-force' | 'disable'
+     * 两者互斥，同一时刻只允许一个确认窗。
+     */
+    deviceConfirm: null,
+    deviceMessage: '',
+    cloudConfirm: '',
+    cloudWorking: '',
+    cloudMessage: '',
+    cloudActionError: '',
     qrGeneratorLoading: false,
     qrGeneratorError: '',
     deviceWorking: '',
-    /*
-     * API-Key 管理。`apiKeyPlaintext` 只在创建响应返回后短暂驻留内存，
-     * 供一次性展示用；不写 localStorage / sessionStorage / URL，
-     * 关闭一次性展示即置空，此后任何视图只出现 key_id。
-     */
-    apiKeys: null,
-    apiKeysLoading: false,
-    apiKeysError: '',
-    apiKeyDialog: '',
-    apiKeyWorking: '',
-    apiKeyError: '',
-    apiKeyDraft: null,
-    apiKeyPlaintext: '',
-    apiKeyCreated: null,
-    apiKeyConfirm: null,
-    apiKeyAuditFor: '',
-    apiKeyAudit: null,
-    apiKeyAuditLoading: false,
-    apiKeyAuditError: '',
     loading: true,
     error: '',
     saving: false,
     avatarWorking: false,
     saveError: '',
+    /* 保存失败时后端给的字段级细节（field / capability / reason），供文案拼装。 */
+    saveErrorDetail: null,
     savedAt: 0,
     timer: 0,
     clockTimer: 0,
@@ -347,6 +350,157 @@ export function mount(context = {}) {
       node = node[key];
     }
     node[parts[0]] = clone(value);
+  }
+
+  /*
+   * 提交面的字段闸门。
+   *
+   * 后端 `nc_sys_build_settings_delta()` 是 fail-closed 的：请求里任何一个「值有变化
+   * 且不在 writable 白名单」的字段都会让整张表单被拒（capability_disabled /
+   * transactional_runtime_executor_pending）。而本页的 normalizer 会给未取到值的字段
+   * 造默认值（zram 256 / lz4、ntp_servers ['']、log_level warning…），把整张 GET 快照
+   * 原样回传时，这些凭空产生的取值就成了「用户没改过却在变」的字段。
+   *
+   * 所以提交时只带：用户真正碰过（touchedFields）且后端合同允许写的字段。
+   * 判定顺序是 field_contracts（字段/分组粒度，GET 直接给出）-> capabilities 闸门位,
+   * 两者都没说话时才放行——不猜测后端支持什么，也不替后端加严。
+   */
+  const SYSTEM_FIELD_CONTRACT_GROUPS = [
+    [/^general\.(timezone|time_sync|ntp_servers|ntp_mode|ntp_interval|ntp_server_enabled|ntp_use_dhcp)$/, 'general.time_policy', 'general_time_write', '时间与 NTP'],
+    [/^general\.(log_level|kernel_log_level|cron_log_level|log_buffer_kb|log_file_path|remote_log_enabled|remote_log_host|remote_log_port|remote_log_protocol)$/, 'general.logging', 'general_logs_write', '日志'],
+    [/^advanced\.zram_/, 'advanced.zram', 'zram_write', 'ZRam'],
+    /*
+     * 高级页的能力位后端一直在下发（30.1 实测 11 个 `advanced_*` 位），但这张表里没有
+     * 对应条目，于是 systemFieldWritable() 走到最后的"默认放行"，把整页渲染成可写控件。
+     * 结果是控件可点可改、看着像生效，实际后端整段不可写 —— 用户称之为"摆件"。
+     * 这里把每个控件接到它自己的闸门位上，false 时由 systemFieldLockAttrs() 置灰并说明原因。
+     */
+    [/^advanced\.packet_steering$/, 'advanced.packet_steering', 'advanced_packet_steering', 'Packet Steering'],
+    [/^advanced\.irq_balance$/, 'advanced.irq_balance', 'advanced_irq_balance', 'IRQ Balance'],
+    [/^advanced\.flow_offloading$/, 'advanced.flow_offloading', 'advanced_flow_offloading', 'Flow Offloading'],
+    [/^advanced\.kernel_slim_mode$/, 'advanced.kernel_slim_mode', 'advanced_kernel_slim_mode', '内核精简模式'],
+    [/^advanced\.scheduler_priority$/, 'advanced.scheduler_priority', 'advanced_scheduler_priority', '调度优先级'],
+    [/^advanced\.crash_dump$/, 'advanced.crash_dump', 'advanced_crash_dump', 'Crash Dump'],
+    [/^advanced\.collect_diagnostics$/, 'advanced.collect_diagnostics', 'advanced_collect_diagnostics', '诊断采集'],
+    /*
+     * ALG 与 conntrack 超时：后端没有这两组的能力位，也没有 `/advanced/alg`、`/advanced/kernel`
+     * 路由（30.1 实测均 404）。这里指向一个后端尚未下发的位，`systemFieldWritable()` 因此
+     * 落到"默认放行"——所以**光靠这张表挡不住它们**，另见 systemAdvancedUnbackedNotice()：
+     * 这两组走"整组标注未接入 + 只读呈现"，不靠置灰。
+     */
+    [/^advanced\.alg_/, 'advanced.alg', 'advanced_alg_write', 'ALG'],
+    [/^advanced\.(nf_tcp_|nf_udp_|nf_icmp_|tcp_bbr)/, 'advanced.kernel', 'advanced_kernel_write', '内核参数']
+  ];
+
+  /* 派生/只读字段：后端从运行时算出来回给前端，提交它们没有意义。 */
+  const SYSTEM_DERIVED_FIELDS = new Set([
+    'general.model', 'general.version', 'general.version_source', 'general.version_error',
+    'general.runtime_hostname', 'general.configured_hostname', 'general.hostname_in_sync',
+    'general.apply_state', 'general.apply_error', 'general.last_apply_at',
+    'general.last_time_sync_at', 'general.led_policy', 'general.update_channel',
+    'advanced.config_backend', 'advanced.memory_total_mb', 'advanced.cpu_interrupts',
+    'advanced.nic_interrupts', 'advanced.interrupt_runtime_source',
+    'advanced.disabled_func_path', 'ssh.key_management'
+  ]);
+
+  function systemFieldContract(path) {
+    const contracts = state.data.field_contracts && typeof state.data.field_contracts === 'object'
+      ? state.data.field_contracts
+      : {};
+    if (contracts[path] && typeof contracts[path] === 'object') return contracts[path];
+    const group = SYSTEM_FIELD_CONTRACT_GROUPS.find(([pattern]) => pattern.test(path));
+    if (group && contracts[group[1]] && typeof contracts[group[1]] === 'object') return contracts[group[1]];
+    return null;
+  }
+
+  /*
+   * 该字段能不能提交。`write` 由后端明说时以它为准；没有合同条目时退到 capabilities
+   * 的闸门位；两者都没提到的字段默认放行，交给后端裁决。
+   */
+  function systemFieldWritable(path) {
+    if (SYSTEM_DERIVED_FIELDS.has(path)) return false;
+    const contract = systemFieldContract(path);
+    if (contract && typeof contract.write === 'boolean') return contract.write;
+    const group = SYSTEM_FIELD_CONTRACT_GROUPS.find(([pattern]) => pattern.test(path));
+    if (group) {
+      const caps = state.data.capabilities || {};
+      if (caps[group[2]] === false) return false;
+    }
+    return true;
+  }
+
+  /* 控件置灰用：不可写时给出「哪个能力关着、后端给的原因」。 */
+  function systemFieldLockReason(path) {
+    if (systemFieldWritable(path)) return '';
+    const group = SYSTEM_FIELD_CONTRACT_GROUPS.find(([pattern]) => pattern.test(path));
+    const contract = systemFieldContract(path);
+    const label = group ? group[3] : '该项';
+    const reason = contract && contract.reason ? systemSettingsReasonText(contract.reason) : '';
+    if (reason) return `${label}：当前不可写，${reason}`;
+    /*
+     * 没有 field_contracts 条目时，不可写只可能来自 capabilities 的闸门位为 false。
+     * 把那个位的名字说出来，比一句"后端未开放写入"有用得多：读到的人能直接去查
+     * 后端为什么把它关着。高级页 7 个字段就是这种情况（30.1 上后端只给闸门位、
+     * 不给 field_contracts 条目）。
+     */
+    if (group) {
+      const caps = state.data.capabilities || {};
+      if (caps[group[2]] === false) {
+        return `${label}：当前不可写，后端能力位 ${group[2]} 为 false`;
+      }
+    }
+    return `${label}：当前不可写（后端未开放写入）`;
+  }
+
+  /* 后端令牌 -> 人话。后端会补 message，但前端不依赖它是人话。 */
+  function systemSettingsReasonText(code) {
+    const token = String(code || '').trim();
+    if (!token) return '';
+    const table = {
+      transactional_runtime_executor_pending: '后端事务执行器尚未上线，该组配置暂不支持写入',
+      capability_disabled: '该能力被后端闸门关闭',
+      signing_key_unknown: '签名密钥不在信任列表内'
+    };
+    return table[token] || token;
+  }
+
+  /* 字段路径 -> 中文名。用于保存失败时说清「哪个字段」。 */
+  const SYSTEM_FIELD_LABELS = {
+    'general.hostname': '主机名',
+    'general.timezone': '时区',
+    'general.ntp_servers': 'NTP 服务器',
+    'general.time_sync': '自动同步时间',
+    'general.log_level': '系统日志级别',
+    'general.cron_log_level': '计划任务日志级别',
+    'general.log_buffer_kb': '日志缓冲区大小',
+    'general.remote_log_host': '外部日志服务器',
+    'advanced.zram_size_mb': 'ZRam 大小',
+    'advanced.zram_algorithm': 'ZRam 压缩算法'
+  };
+
+  function systemFieldLabel(path) {
+    const key = String(path || '').trim();
+    if (!key) return '';
+    if (SYSTEM_FIELD_LABELS[key]) return SYSTEM_FIELD_LABELS[key];
+    const group = SYSTEM_FIELD_CONTRACT_GROUPS.find(([pattern]) => pattern.test(key));
+    return group ? group[3] : key;
+  }
+
+  /*
+   * 保存失败文案。后端此刻把裸令牌塞在 error.message 里
+   * （`transactional_runtime_executor_pending`），直接显示等于让用户读源码。
+   * 优先用 `state.saveErrorDetail`（后端 field_results / error 里的 field+capability）
+   * 拼出「哪个字段、为什么」，拿不到细节时再退回原文。
+   */
+  function systemSaveErrorText(error) {
+    const detail = state.saveErrorDetail;
+    if (detail && detail.field) {
+      const label = systemFieldLabel(detail.field);
+      const reason = systemSettingsReasonText(detail.reason || detail.capability || detail.code);
+      return reason ? `${label}无法写入（${reason}）` : `${label}无法写入`;
+    }
+    const readable = systemSettingsReasonText(error);
+    return readable || String(error || '未知错误');
   }
 
   function applyHydratedSettings(incoming = {}) {
@@ -666,7 +820,8 @@ export function mount(context = {}) {
         ${systemLoadingStatus()}
         ${systemCurrentPanel(state.data)}
         ${systemBindingDialog()}
-        ${systemApiKeyDialog()}
+        ${systemDeviceConfirmDialog()}
+        ${systemCloudConfirmDialog()}
         ${systemFlashApplyDialog()}
         ${systemSettingsSavebar()}
       </div>
@@ -678,8 +833,6 @@ export function mount(context = {}) {
     ui.scheduleGlassCardsRender?.(160);
     restoreScrollState(scrollSnapshot);
     if (state.bindingDialog) focusBindingDialog();
-    if (state.apiKeyConfirm) focusApiKeyConfirmation();
-    else if (state.apiKeyDialog) focusBindingDialog();
   }
 
   function systemCurrentPanel(data) {
@@ -781,7 +934,7 @@ export function mount(context = {}) {
             ${systemSelectControl('general.log_level', sysLevel, systemLogLevelOptions(), 'level-select')}
             ${systemLevelBadge(sysLevel)}
           `, 'center', 'wide-label inline-control')}
-          ${systemSettingsRow('计划任务日志级别', systemSelectControl('general.cron_log_level', g.cron_log_level || 'error', [['disabled', '已禁用'], ['error', '仅记录错误'], ['all', '全部记录']]), 'center', 'wide-label')}
+          ${systemSettingsRow('计划任务日志级别', systemSelectControl('general.cron_log_level', g.cron_log_level ?? 'disabled', [['disabled', '已禁用'], ['error', '仅记录错误'], ['all', '全部记录']]), 'center', 'wide-label')}
         </section>
         <section class="system-demo-panel system-log-panel">
           <div class="system-demo-panel-title">${systemSettingsIcon('globe')}<span>外部系统日志 (Syslog)</span></div>
@@ -816,9 +969,10 @@ export function mount(context = {}) {
           ${servers.map((server, index) => systemServerItem(index, server)).join('')}
         </div>
         <div class="system-server-add-row">
-          <button class="system-circle-btn add" type="button" data-system-action="ntp-add">+</button>
+          <button class="system-circle-btn add" type="button" data-system-action="ntp-add"${systemFieldLockAttrs('general.ntp_servers')}>+</button>
           <span>添加服务器</span>
         </div>
+        ${systemFieldLockReason('general.ntp_servers') ? `<div class="system-input-hint padded is-locked">${escapeHtml(systemFieldLockReason('general.ntp_servers'))}</div>` : ''}
         <div class="system-input-hint padded">候选的上游 NTP 服务器列表，用于同步本设备时间。</div>
       </section>
     `;
@@ -1389,6 +1543,67 @@ export function mount(context = {}) {
    *
    * 定时重启也因此不是前端起个定时器（页面一关就没了），而是落到后端电源计划表里。
    */
+  /*
+   * 危险操作确认窗。按 design.md 规则 17 统一走 Kit 的 confirmationMarkup()：
+   * 页面只提供标题、后果说明和语义色，不自建确认抽屉，也不用「再次点击确认」。
+   * 两个确认窗共用一个渲染出口，同一时刻只可能有一个 state 命中。
+   */
+  function systemKitConfirmation(options) {
+    const renderer = ui.confirmationMarkup || window.DWRT_UI_KIT?.confirmationMarkup;
+    return typeof renderer === 'function' ? renderer(options) : '';
+  }
+
+  function systemDeviceConfirmDialog() {
+    const target = state.deviceConfirm;
+    if (!target || !target.id) return '';
+    const busy = state.deviceWorking === target.id;
+    const name = target.name || 'App 设备';
+    /*
+     * 停用的后果要写实：令牌被吊销（revoke_tokens_on_disable），
+     * 但配对关系保留，所以和「撤销」不同，不需要重新配对。
+     */
+    return systemKitConfirmation({
+      id: 'system-device-enabled-confirmation',
+      action: target.enabled ? 'enable-app-device' : 'disable-app-device',
+      tone: target.enabled ? 'warning' : 'danger',
+      title: target.enabled ? `启用“${name}”` : `停用“${name}”`,
+      description: target.enabled
+        ? `${name} 将恢复访问权限，该设备需重新登录后生效。`
+        : `${name} 会立刻失去访问权限，其登录令牌将被吊销，需重新登录才能恢复。配对关系保留，不需要重新配对。`,
+      cancelLabel: '取消',
+      confirmLabel: busy ? '正在提交' : (target.enabled ? '确认启用' : '确认停用'),
+      disabled: busy
+    });
+  }
+
+  function systemCloudConfirmDialog() {
+    const kind = state.cloudConfirm;
+    if (!kind) return '';
+    const busy = Boolean(state.cloudWorking);
+    if (kind === 'enroll-force') {
+      return systemKitConfirmation({
+        id: 'system-cloud-enroll-confirmation',
+        action: 'cloud-reenroll',
+        tone: 'danger',
+        title: '重新注册到云端',
+        description: '重新注册会立刻吊销当前隧道令牌，正在使用远程接入的 App 会断开，直到新令牌生效。局域网管理与 SSH 不受影响。',
+        cancelLabel: '取消',
+        confirmLabel: busy ? '正在注册' : '确认重新注册',
+        disabled: busy
+      });
+    }
+    return systemKitConfirmation({
+      id: 'system-cloud-disable-confirmation',
+      action: 'cloud-disable',
+      tone: 'danger',
+      title: '停用远程接入',
+      description: '停用后所有走中继的 App 会失去连接。局域网管理与 SSH 不受影响，重新启用需再注册一次。',
+      cancelLabel: '取消',
+      confirmLabel: busy ? '正在停用' : '确认停用',
+      disabled: busy
+    });
+  }
+
   function systemFlashApplyDialog() {
     if (!state.flashApplyDialog) return '';
     const op = state.flashFirmwareOperation;
@@ -1963,7 +2178,7 @@ export function mount(context = {}) {
           <span><i class="zram"></i>ZRam 交换区（${formatInteger(zramMb)}MB）</span>
         </div>
         ${systemZramItem('ZRam 大小', '虚拟内存设备的大小（建议设为物理内存的 50%-100%）', `<div class="system-field-wrap">${systemInputControl('advanced.zram_size_mb', zramMb, 'number')}<span class="system-field-unit">MiB</span></div>`)}
-        ${systemZramItem('压缩算法', 'lz4 速度最快，zstd 压缩率最高', `<div class="system-field-wrap">${systemSelectControl('advanced.zram_algorithm', a.zram_algorithm || 'lz4', [['lzo', 'lzo'], ['lz4', 'lz4（推荐）'], ['zstd', 'zstd（平衡）'], ['deflate', 'deflate']])}</div>`)}
+        ${systemZramItem('压缩算法', 'lz4 速度最快，zstd 压缩率最高', `<div class="system-field-wrap">${systemSelectControl('advanced.zram_algorithm', a.zram_algorithm || 'lz4', systemZramAlgorithmOptions(a.zram_algorithm))}</div>`)}
       </section>
     `;
   }
@@ -2021,19 +2236,20 @@ export function mount(context = {}) {
     return `
       <section class="system-demo-panel system-advanced-panel">
         <div class="system-advanced-title">${systemSettingsIcon('route')}<span>ALG 协议设置</span></div>
-        <div class="system-advanced-debug-grid">
-          ${systemAdvancedDebugTile('FTP ALG', '允许 FTP 控制连接触发相关数据连接跟踪', 'advanced.alg_ftp', a.alg_ftp !== false)}
-          ${systemAdvancedDebugTile('TFTP ALG', '允许 TFTP 会话通过连接跟踪辅助 NAT', 'advanced.alg_tftp', a.alg_tftp !== false)}
-          ${systemAdvancedDebugTile('SIP ALG', '处理 SIP 信令中的地址和端口改写', 'advanced.alg_sip', a.alg_sip !== false)}
-          ${systemAdvancedDebugTile('H323 ALG', '处理 H.323 语音视频会话辅助穿透', 'advanced.alg_h323', a.alg_h323 !== false)}
+        ${systemAdvancedUnbackedNotice('后端尚未提供 ALG 读写接口（/api/v1/system/advanced/alg 当前 404，响应中也没有 alg_* 字段），因此这里只能如实显示状态未确认，不放可点的开关。等后端补上字段与能力位后，这一段会改为真实控件。')}
+        <div class="system-advanced-cap-list">
+          ${systemAdvancedTriStateRow('FTP ALG', '允许 FTP 控制连接触发相关数据连接跟踪', a.alg_ftp)}
+          ${systemAdvancedTriStateRow('TFTP ALG', '允许 TFTP 会话通过连接跟踪辅助 NAT', a.alg_tftp)}
+          ${systemAdvancedTriStateRow('SIP ALG', '处理 SIP 信令中的地址和端口改写', a.alg_sip)}
+          ${systemAdvancedTriStateRow('H323 ALG', '处理 H.323 语音视频会话辅助穿透', a.alg_h323)}
         </div>
       </section>
       <section class="system-demo-panel system-advanced-panel">
         <div class="system-advanced-title">${systemSettingsIcon('tools')}<span>非标准端口</span></div>
-        <div class="system-advanced-well system-advanced-port-grid">
-          ${systemAdvancedTextField('FTP 非标准端口（可选）', 'advanced.alg_ftp_ports', a.alg_ftp_ports || '', '例如：2121,2122')}
-          ${systemAdvancedTextField('TFTP 非标准端口（可选）', 'advanced.alg_tftp_ports', a.alg_tftp_ports || '', '例如：6969,6970')}
-          ${systemAdvancedTextField('SIP 非标准端口（可选）', 'advanced.alg_sip_ports', a.alg_sip_ports || '', '例如：5061,5062')}
+        <div class="system-advanced-cap-list">
+          ${systemAdvancedReadonlyRow('FTP 非标准端口', a.alg_ftp_ports, '')}
+          ${systemAdvancedReadonlyRow('TFTP 非标准端口', a.alg_tftp_ports, '')}
+          ${systemAdvancedReadonlyRow('SIP 非标准端口', a.alg_sip_ports, '')}
         </div>
       </section>
     `;
@@ -2525,42 +2741,122 @@ export function mount(context = {}) {
     return `
       <section class="system-demo-panel system-advanced-panel">
         <div class="system-advanced-title">${systemSettingsIcon('terminal')}<span>连接设置</span></div>
-        <div class="system-advanced-well system-advanced-kernel-grid">
-          ${systemAdvancedTextField('TCP Syn Sent 超时（秒）', 'advanced.nf_tcp_syn_sent', a.nf_tcp_syn_sent ?? 120, '默认：5', 'number')}
-          ${systemAdvancedTextField('TCP Syn Received 超时（秒）', 'advanced.nf_tcp_syn_recv', a.nf_tcp_syn_recv ?? 60, '默认：5', 'number')}
-          ${systemAdvancedTextField('TCP Established 超时（秒）', 'advanced.nf_tcp_established', a.nf_tcp_established ?? 7440, '默认：1800', 'number')}
-          ${systemAdvancedTextField('TCP Fin Wait 超时（秒）', 'advanced.nf_tcp_fin_wait', a.nf_tcp_fin_wait ?? 120, '默认：10', 'number')}
-          ${systemAdvancedTextField('TCP Close Wait 超时（秒）', 'advanced.nf_tcp_close_wait', a.nf_tcp_close_wait ?? 60, '默认：10', 'number')}
-          ${systemAdvancedTextField('TCP Last Ack 超时（秒）', 'advanced.nf_tcp_last_ack', a.nf_tcp_last_ack ?? 30, '默认：10', 'number')}
-          ${systemAdvancedTextField('TCP Time Wait（秒）', 'advanced.nf_tcp_time_wait', a.nf_tcp_time_wait ?? 120, '默认：10', 'number')}
-          ${systemAdvancedTextField('TCP Close（秒）', 'advanced.nf_tcp_close', a.nf_tcp_close ?? 10, '默认：5', 'number')}
-          ${systemAdvancedTextField('UDP 超时（秒）', 'advanced.nf_udp_timeout', a.nf_udp_timeout ?? 60, '默认：10', 'number')}
-          ${systemAdvancedTextField('UDP Stream 超时（秒）', 'advanced.nf_udp_stream', a.nf_udp_stream ?? 180, '默认：60', 'number')}
-          ${systemAdvancedTextField('ICMP 超时（秒）', 'advanced.nf_icmp_timeout', a.nf_icmp_timeout ?? 30, '默认：5', 'number')}
+        ${systemAdvancedUnbackedNotice('后端尚未提供 conntrack 超时的读写接口（/api/v1/system/advanced/kernel 当前 404，响应中也没有 nf_* 字段）。原先这里填的是前端常量，且恰好与设备实际值相同，看不出是假数据——现在改为如实显示未提供，避免在别的设备上给出错误数字。')}
+        <div class="system-advanced-cap-list">
+          ${systemAdvancedReadonlyRow('TCP Syn Sent 超时（秒）', a.nf_tcp_syn_sent, '')}
+          ${systemAdvancedReadonlyRow('TCP Syn Received 超时（秒）', a.nf_tcp_syn_recv, '')}
+          ${systemAdvancedReadonlyRow('TCP Established 超时（秒）', a.nf_tcp_established, '')}
+          ${systemAdvancedReadonlyRow('TCP Fin Wait 超时（秒）', a.nf_tcp_fin_wait, '')}
+          ${systemAdvancedReadonlyRow('TCP Close Wait 超时（秒）', a.nf_tcp_close_wait, '')}
+          ${systemAdvancedReadonlyRow('TCP Last Ack 超时（秒）', a.nf_tcp_last_ack, '')}
+          ${systemAdvancedReadonlyRow('TCP Time Wait（秒）', a.nf_tcp_time_wait, '')}
+          ${systemAdvancedReadonlyRow('TCP Close（秒）', a.nf_tcp_close, '')}
+          ${systemAdvancedReadonlyRow('UDP 超时（秒）', a.nf_udp_timeout, '')}
+          ${systemAdvancedReadonlyRow('UDP Stream 超时（秒）', a.nf_udp_stream, '')}
+          ${systemAdvancedReadonlyRow('ICMP 超时（秒）', a.nf_icmp_timeout, '')}
         </div>
       </section>
       <section class="system-demo-panel system-advanced-panel">
         <div class="system-advanced-title">${systemSettingsIcon('gear')}<span>参数设置</span></div>
-        <div class="system-advanced-debug-grid">${systemAdvancedDebugTile('TCP BBR', '启用 BBR/BBRPlus 拥塞控制与 fq 队列', 'advanced.tcp_bbr', a.tcp_bbr !== false)}</div>
+        ${systemAdvancedCongestionRow(a)}
         <div class="system-advanced-footer"><button class="glass-btn glass-btn--ghost" type="button" data-system-action="advanced-kernel-restore-defaults" ${state.operationWorking === 'advanced:kernel-defaults' ? 'disabled' : ''}>${state.operationWorking === 'advanced:kernel-defaults' ? '恢复中…' : '恢复默认配置'}</button></div>
       </section>
     `;
   }
 
   function systemAdvancedHeroCard(label, desc, field, checked, icon) {
-    return `<label class="system-advanced-hero-card ${checked ? 'active' : ''}"><input type="checkbox" ${checked ? 'checked' : ''} data-system-field="${escapeHtml(field)}"><span class="system-advanced-status-box" aria-hidden="true">${systemSettingsIcon(icon)}</span><strong>${escapeHtml(label)}</strong><em>${escapeHtml(desc)}</em></label>`;
+    const lock = systemFieldLockAttrs(field);
+    const reason = systemFieldLockReason(field);
+    return `<label class="system-advanced-hero-card ${checked ? 'active' : ''}${lock ? ' is-locked' : ''}"${reason ? ` title="${escapeHtml(reason)}"` : ''}><input type="checkbox" ${checked ? 'checked' : ''} data-system-field="${escapeHtml(field)}"${lock}><span class="system-advanced-status-box" aria-hidden="true">${systemSettingsIcon(icon)}</span><strong>${escapeHtml(label)}</strong><em>${escapeHtml(desc)}</em></label>`;
   }
 
   function systemAdvancedSelect(label, field, current, options) {
-    return `<label class="system-advanced-field"><span>${escapeHtml(label)}</span><select class="system-advanced-select" data-native-select="true" data-system-field="${escapeHtml(field)}">${options.map(([value, text]) => `<option value="${escapeHtml(value)}" ${String(current) === String(value) ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></label>`;
+    return `<label class="system-advanced-field"><span>${escapeHtml(label)}</span><select class="system-advanced-select" data-native-select="true" data-system-field="${escapeHtml(field)}"${systemFieldLockAttrs(field)}>${options.map(([value, text]) => `<option value="${escapeHtml(value)}" ${String(current) === String(value) ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></label>`;
   }
 
   function systemAdvancedTextField(label, field, value, placeholder = '', type = 'text') {
-    return `<label class="system-advanced-field"><span>${escapeHtml(label)}</span><input class="system-advanced-input" type="${escapeHtml(type)}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(placeholder)}" data-system-field="${escapeHtml(field)}"></label>`;
+    return `<label class="system-advanced-field"><span>${escapeHtml(label)}</span><input class="system-advanced-input" type="${escapeHtml(type)}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(placeholder)}" data-system-field="${escapeHtml(field)}"${systemFieldLockAttrs(field)}></label>`;
   }
 
   function systemAdvancedDebugTile(label, desc, field, checked) {
     return `<div class="system-advanced-debug-tile"><span><strong>${escapeHtml(label)}</strong><em>${escapeHtml(desc)}</em></span>${systemIosSwitch(field, checked)}</div>`;
+  }
+
+  /*
+   * 后端整组未提供时的说明条。
+   *
+   * 这是本页最要紧的一条：ALG 7 项与内核页签 12 项后端**全仓 0 命中**
+   * （`/api/v1/system/advanced/alg` 与 `/kernel` 在 30.1 均为 404，
+   * 响应里 alg_* / nf_* / tcp_bbr 均 0 处），所以 `a.xxx` 恒为 undefined。
+   * 原代码用 `a.alg_ftp !== false` 和 `a.nf_tcp_syn_sent ?? 120` 兜底，
+   * 于是页面显示的永远是前端常量：开关一律"已开启"、超时一律那 11 个数字。
+   *
+   * 最容易骗过检查的是那 11 个 conntrack 超时**恰好等于** 30.1 的实际值，
+   * 肉眼看不出是假的，换一台机器就露馅。按 design.md「Capability truth」第 4 条，
+   * 字段与能力位都缺时只能如实说"未确认"，不得用硬编码值假装有数据。
+   */
+  function systemAdvancedUnbackedNotice(text) {
+    return `<div class="system-advanced-cap-note system-advanced-unbacked">${escapeHtml(text)}</div>`;
+  }
+
+  /*
+   * 拥塞控制算法。**不能做成布尔开关。**
+   *
+   * 设备真值是字符串枚举：30.1 的 `tcp_available_congestion_control` 为
+   * `reno cubic bbrplus brutal bbr`，实际生效的是 `bbrplus`（rc.local 里
+   * `sysctl -w net.ipv4.tcp_congestion_control=bbrplus`）。一个 `TCP BBR` 开关
+   * 表达不了"哪一种"，打开也说不清是 bbr 还是 bbrplus —— 原代码还用
+   * `a.tcp_bbr !== false` 兜底，字段缺失时一律显示"已开启"，等于凭空断言。
+   *
+   * 后端补 `tcp_congestion_control` 字段前，这里只标注未接入，不放控件。
+   */
+  function systemAdvancedCongestionRow(a = {}) {
+    const current = a.tcp_congestion_control;
+    const available = Array.isArray(a.tcp_available_congestion_control)
+      ? a.tcp_available_congestion_control.join('、')
+      : (typeof a.tcp_available_congestion_control === 'string' ? a.tcp_available_congestion_control.trim().split(/\s+/).join('、') : '');
+    if (current === undefined || current === null || String(current).trim() === '') {
+      return systemAdvancedUnbackedNotice('拥塞控制算法尚未接入：后端未下发 tcp_congestion_control 字段。它是字符串枚举（设备上可选 reno / cubic / bbrplus / brutal / bbr），不是开关，所以这里不放布尔控件，也不显示推测值。');
+    }
+    return `
+      <div class="system-advanced-cap-list">
+        <div class="system-advanced-knob-row is-three-col">
+          <strong>拥塞控制算法</strong>
+          <span class="system-advanced-knob-value">${escapeHtml(String(current))}</span>
+          <em>${escapeHtml(available ? `设备可选：${available}` : '当前生效值，由后端上报')}</em>
+        </div>
+      </div>
+    `;
+  }
+
+  /* 字段缺失时如实显示"未提供"，不填前端常量。value 只在后端真的送了值时才有。 */
+  function systemAdvancedReadonlyRow(label, value, hint) {
+    const has = value !== undefined && value !== null && String(value).trim() !== '';
+    return `
+      <div class="system-advanced-knob-row is-three-col">
+        <strong>${escapeHtml(label)}</strong>
+        <span class="system-advanced-knob-value">${escapeHtml(has ? String(value) : '未提供')}</span>
+        <em>${escapeHtml(has ? (hint || '') : '后端未下发该字段，值未确认')}</em>
+      </div>
+    `;
+  }
+
+  /*
+   * 三态开关行：能力位/字段都缺时不显示成"已开启"。
+   * `a.alg_ftp !== false` 在字段缺失时为 true，是本页最容易误导用户的写法。
+   */
+  function systemAdvancedTriStateRow(label, desc, value) {
+    let cls = 'is-unknown';
+    let text = '未确认';
+    if (value === true) { cls = 'is-on'; text = '已启用'; }
+    else if (value === false) { cls = 'is-off'; text = '已关闭'; }
+    return `
+      <div class="system-advanced-cap-row">
+        <strong>${escapeHtml(label)}</strong>
+        <span class="system-advanced-state ${cls}">${escapeHtml(text)}</span>
+        <em>${escapeHtml(value === undefined || value === null ? '后端未下发该字段，状态未确认' : desc)}</em>
+      </div>
+    `;
   }
 
 
@@ -3072,7 +3368,6 @@ export function mount(context = {}) {
         </div>
         <div class="system-admin-security-grid">
           ${systemCloudAccessPanel(twofa, apiData)}
-          ${systemApiKeyPanel()}
         </div>
       </div>
     `;
@@ -3169,13 +3464,7 @@ export function mount(context = {}) {
             <button class="system-demo-btn secondary compact-btn system-admin-fingerprint-copy" type="button" data-system-action="cloud-copy-fingerprint" data-system-copy="${escapeHtml(fingerprint)}">${systemSettingsIcon('copy')}<span>复制指纹</span></button>
           </div>` : `
           <div class="system-api-empty">云端身份接口未返回路由器指纹，无法在此比对。</div>`}
-          <div class="system-admin-cloud-notice">
-            ${systemSettingsIcon('warning')}
-            <div>
-              <strong>Web 端暂无写入口</strong>
-              <em>云端接口目前只提供只读状态，没有可用的注册与启用接口，因此这里不提供操作按钮。中继接入需在路由器侧配置。</em>
-            </div>
-          </div>
+          ${systemCloudEnrollBlock(status)}
         </div>
       </section>
     `;
@@ -3214,6 +3503,97 @@ export function mount(context = {}) {
   }
 
   /*
+   * 云端注册与远程接入的写入口。
+   *
+   * 这里原先是一段固定文案，说「云端接口只提供只读状态，没有可用的注册与启用接口」。
+   * 那句话在 2026-08-03 写下时是对的，现在不成立：webd 已注册三条写路由
+   * （jmx_app_api.c 的 cloud/config、cloud/enroll、cloud/disable），
+   * 且 status 会用 `self_enroll_supported` 明确告诉前端本机能不能自助注册。
+   * 所以这一块按能力位与注册状态分支，而不是断言一个不存在的限制。
+   *
+   * 三种状态各自处置不同：
+   *   status 读不到                        —— 说明状态不可读，不假装不支持
+   *   self_enroll_supported=false          —— 本机确实不能自助注册（relay_router_id 为空）
+   *   self_enroll_supported=true           —— 给注册 / 重新注册 + 停用远程接入
+   *
+   * `enrollment` 子对象（state/code/message/relay_status/started_at/finished_at）
+   * 是后端为轮询进度准备的，注册是异步 job，发起后用它显示过程而不是只给 loading。
+   */
+  function systemCloudEnrollBlock(status) {
+    if (!status) {
+      return `<div class="system-api-empty">云端状态接口未返回，无法判断是否可在此注册。${state.cloudStatusError ? escapeHtml(` 原因：${state.cloudStatusError}`) : ''}</div>`;
+    }
+    const supported = status.self_enroll_supported === true;
+    const enrolled = status.enrolled === true;
+    const config = status.config && typeof status.config === 'object' ? status.config : {};
+    const relayEnabled = config.enabled === true;
+    const job = status.enrollment && typeof status.enrollment === 'object' ? status.enrollment : {};
+    const jobRunning = String(job.state || '') === 'running';
+    const busy = Boolean(state.cloudWorking) || jobRunning;
+
+    if (!supported) {
+      /*
+       * 能力位为假才是真的没有自助注册入口。原因来自 relay_router_id 为空，
+       * 后端会用 router_id_reason 说明，照抄它而不是自己编一个理由。
+       */
+      const reason = String(status.router_id_reason || '').trim();
+      return `
+        <div class="system-admin-cloud-notice">
+          ${systemSettingsIcon('warning')}
+          <div>
+            <strong>本机不支持在 Web 端自助注册</strong>
+            <em>云端状态里 <code>self_enroll_supported</code> 为 false，需在路由器侧完成中继接入。${reason ? escapeHtml(`后端给出的原因：${reason}。`) : ''}</em>
+          </div>
+        </div>`;
+    }
+
+    const jobLine = systemCloudEnrollJobText(job);
+    const actions = enrolled
+      ? `
+        <button class="system-demo-btn secondary compact-btn" type="button" data-system-action="cloud-reenroll" ${busy ? 'disabled' : ''}>重新注册</button>
+        ${relayEnabled ? `<button class="system-demo-btn secondary compact-btn" type="button" data-system-action="cloud-disable" ${busy ? 'disabled' : ''}>停用远程接入</button>` : ''}`
+      : `<button class="system-demo-btn primary compact-btn" type="button" data-system-action="cloud-enroll" ${busy ? 'disabled' : ''}>注册到云端</button>`;
+
+    return `
+      <div class="system-admin-cloud-enroll">
+        <div class="system-admin-status-row">
+          <span class="system-admin-status-light ${enrolled ? 'ok' : ''}" aria-hidden="true">${systemSettingsIcon('cloud')}</span>
+          <div>
+            <strong>${enrolled ? '已注册到云端中继' : '尚未注册到云端'}</strong>
+            <em>${enrolled
+                ? `可在此重新注册或停用远程接入。${relayEnabled ? '' : '当前中继开关为关闭状态。'}`
+                : '注册后 App 可通过云端中继远程访问本路由器。'}</em>
+          </div>
+          <span class="system-api-row-actions">${actions}</span>
+        </div>
+        ${jobLine ? `<p class="system-admin-access-note">${escapeHtml(jobLine)}</p>` : ''}
+        ${state.cloudMessage ? `<p class="system-admin-access-note">${escapeHtml(state.cloudMessage)}</p>` : ''}
+        ${state.cloudActionError ? `<p class="system-admin-access-note system-admin-cloud-error">${escapeHtml(state.cloudActionError)}</p>` : ''}
+      </div>`;
+  }
+
+  /*
+   * 注册 job 的进度行。state 取值为 idle / running / succeeded / failed
+   * （cloud_enroll.c）。idle 表示这次启动后没跑过，没有可显示的进度，返回空串。
+   */
+  function systemCloudEnrollJobText(job) {
+    const jobState = String(job?.state || '').toLowerCase();
+    if (!jobState || jobState === 'idle') return '';
+    const code = String(job?.code || '').trim();
+    const message = String(job?.message || '').trim();
+    const relayStatus = Number(job?.relay_status || 0);
+    const detail = [
+      message,
+      code ? `code=${code}` : '',
+      relayStatus > 0 ? `中继返回 ${relayStatus}` : ''
+    ].filter(Boolean).join(' · ');
+    if (jobState === 'running') return `注册进行中${detail ? `：${detail}` : '，正在等待云端确认。'}`;
+    if (jobState === 'succeeded') return `上次注册成功${detail ? `：${detail}` : '。'}`;
+    if (jobState === 'failed') return `上次注册失败${detail ? `：${detail}` : '。'}`;
+    return `注册状态：${jobState}${detail ? `（${detail}）` : ''}`;
+  }
+
+  /*
    * 把 status 归成一个四态判定，顺序即优先级：状态不可读 > 未注册 > 隧道未启用 >
    * 隧道异常 > 已就绪（再按有无远程痕迹分待机/在用）。
    */
@@ -3224,11 +3604,17 @@ export function mount(context = {}) {
     const reasonText = systemCloudTunnelReasonText(tunnel.reason);
     const suffix = reasonText ? `（${reasonText}）` : '';
     if (!status.enrolled) {
+      /*
+       * 「需在路由器侧配置」只有在本机不支持自助注册时才成立。
+       * self_enroll_supported 为真时 Web 端就有注册入口（见 systemCloudEnrollBlock），
+       * 这里再说一次"去路由器侧配置"会和同一张卡里的按钮互相矛盾。
+       */
+      const selfEnroll = status.self_enroll_supported === true;
       return {
         id: 'not-enrolled',
         tone: 'warn',
         title: '中继未注册',
-        hint: `路由器还没有在云平台注册${suffix}，App 无法从外网接入。注册需要在路由器侧配置中继接入。`
+        hint: `路由器还没有在云平台注册${suffix}，App 无法从外网接入。${selfEnroll ? '可在下方「路由器硬件身份」中直接注册。' : '本机不支持自助注册，需在路由器侧配置中继接入。'}`
       };
     }
     if (tunnelState === 'disabled' || tunnelState === 'off') {
@@ -3253,418 +3639,9 @@ export function mount(context = {}) {
     `;
   }
 
-  /* ── API-Key 管理 ── */
-
-  const SYSTEM_API_KEY_TIERS = [
-    ['read_only', '只读', '只能调用读取类接口。'],
-    ['control', '读写控制', '可修改设备配置，能力接近管理员。']
-  ];
-
-  /* 建议轮换的阈值。用户要的是提示、不是强制，所以只在列表里加一个柔和标记。 */
-  const SYSTEM_API_KEY_AGE_HINT_DAYS = 90;
-
-  function systemApiKeyTierLabel(tier) {
-    const found = SYSTEM_API_KEY_TIERS.find(([id]) => id === String(tier || ''));
-    return found ? found[1] : String(tier || '未知');
-  }
-
-  function systemApiKeyDays(seconds) {
-    const value = Number(seconds || 0);
-    if (value <= 0) return 0;
-    return Math.max(0, Math.floor((Date.now() / 1000 - value) / 86400));
-  }
-
-  /*
-   * key 的「最近使用」可能是几天前，而 relativeSeconds() 到小时就封顶
-   * （「128 小时前」读起来没有意义），所以这里超过一天按天说。
-   */
-  function systemApiKeyWhenText(ts) {
-    const value = Number(ts || 0);
-    if (value <= 0) return '从未使用';
-    const diff = Math.max(0, Math.floor(Date.now() / 1000) - value);
-    if (diff < 86400) return relativeSeconds(value);
-    const days = Math.floor(diff / 86400);
-    if (days < 30) return `${days} 天前`;
-    return systemApiKeyAuditTime(value);
-  }
-
-  function systemApiKeyExpiryText(row) {
-    const expires = Number(row?.expires_at || 0);
-    if (expires <= 0) return '长期有效';
-    const remain = Math.ceil((expires - Date.now() / 1000) / 86400);
-    if (remain <= 0) return '已过期';
-    return `${remain} 天后过期`;
-  }
-
-  function systemApiKeyStateMeta(row) {
-    /* 状态取后端 `state`，不在前端重算，避免与服务端放行判定漂移。 */
-    const value = String(row?.state || '');
-    if (value === 'revoked') return { tone: 'revoked', label: '已吊销' };
-    if (value === 'expired') return { tone: 'expired', label: '已过期' };
-    return { tone: 'active', label: '生效中' };
-  }
-
-  function systemApiKeyPanel() {
-    const rows = Array.isArray(state.apiKeys) ? state.apiKeys : [];
-    const unreadable = state.apiKeys === null && !state.apiKeysLoading;
-    const active = rows.filter((row) => String(row?.state || '') === 'active').length;
-    const pill = unreadable
-      ? { tone: 'pending', text: '列表不可读' }
-      : { tone: active ? 'ready' : 'pending', text: `${active} 把生效中` };
-    return `
-      <section class="system-demo-panel system-api-key-panel">
-        <header class="system-admin-access-header">
-          <div class="system-demo-panel-title">${systemSettingsIcon('key')}<span>API-Key 管理</span></div>
-          <em class="system-admin-access-pill ${pill.tone}">${escapeHtml(pill.text)}</em>
-        </header>
-        <div class="system-admin-access-section">
-          <span class="system-admin-access-legend">对外访问凭据</span>
-          <p class="system-admin-access-note">供外部程序不经网页会话调用本机 API。明文密钥只在创建时返回一次，之后只能看到 key_id。<strong>建议定期更换，降低泄漏后的暴露时长。</strong></p>
-          <div class="system-api-key-toolbar">
-            <button class="system-demo-btn primary" type="button" data-system-action="api-key-create-open" ${state.apiKeyWorking ? 'disabled' : ''}>新建 API-Key</button>
-            <button class="system-demo-btn secondary" type="button" data-system-action="api-key-refresh" ${state.apiKeysLoading ? 'disabled' : ''}>${state.apiKeysLoading ? '读取中…' : '刷新'}</button>
-          </div>
-          ${state.apiKeyError ? `<div class="system-inline-error">${escapeHtml(state.apiKeyError)}</div>` : ''}
-          ${systemApiKeyListMarkup(rows, unreadable)}
-        </div>
-      </section>
-    `;
-  }
-
-  function systemApiKeyListMarkup(rows, unreadable) {
-    if (state.apiKeysLoading && !rows.length) {
-      return `<div class="system-api-key-empty" role="status">正在读取 API-Key 列表…</div>`;
-    }
-    if (unreadable) {
-      return `<div class="system-api-key-empty is-error">读不到 API-Key 列表${state.apiKeysError ? `：${escapeHtml(state.apiKeysError)}` : ''}。这不代表没有 key，只是当前查询失败。</div>`;
-    }
-    if (!rows.length) {
-      return `<div class="system-api-key-empty">尚未创建 API-Key。外部程序需要调用本机 API 时，在上方新建一把。</div>`;
-    }
-    return `
-      <div class="system-api-key-table-wrap">
-        <div class="dwrt-kit-table-scroll" data-system-scroll="api-keys">
-          <table class="dwrt-kit-table system-api-key-table">
-            <thead>
-              <tr>
-                <th scope="col">名称 / key_id</th>
-                <th scope="col">权限档</th>
-                <th scope="col">有效期</th>
-                <th scope="col">最近使用</th>
-                <th scope="col">来源限制</th>
-                <th scope="col">状态</th>
-                <th scope="col" class="system-api-key-ops-col">操作</th>
-              </tr>
-            </thead>
-            <tbody>${rows.map(systemApiKeyRow).join('')}</tbody>
-          </table>
-        </div>
-      </div>
-    `;
-  }
-
-  function systemApiKeyRow(row) {
-    const keyId = String(row?.key_id || '');
-    const meta = systemApiKeyStateMeta(row);
-    const ageDays = systemApiKeyDays(row?.created_at);
-    const lastUsed = Number(row?.last_used_at || 0);
-    const lastIp = String(row?.last_used_ip || '');
-    const allowIps = String(row?.allow_ips || '').trim();
-    const busy = String(state.apiKeyWorking || '').endsWith(`:${keyId}`);
-    const stale = ageDays >= SYSTEM_API_KEY_AGE_HINT_DAYS && meta.tone === 'active';
-    return `
-      <tr>
-        <td>
-          <div class="system-api-key-name">
-            <strong>${escapeHtml(row?.name || '未命名')}</strong>
-            <code>${escapeHtml(keyId)}</code>
-          </div>
-        </td>
-        <td>${escapeHtml(systemApiKeyTierLabel(row?.tier))}</td>
-        <td>
-          <div class="system-api-key-cell-stack">
-            <span>${escapeHtml(systemApiKeyExpiryText(row))}</span>
-            <em class="${stale ? 'is-hint' : ''}">已使用 ${formatInteger(ageDays)} 天${stale ? ' · 建议更换' : ''}</em>
-          </div>
-        </td>
-        <td>
-          <div class="system-api-key-cell-stack">
-            <span>${escapeHtml(systemApiKeyWhenText(lastUsed))}</span>
-            <em>${lastIp ? escapeHtml(lastIp) : '无来源记录'}</em>
-          </div>
-        </td>
-        <td>${allowIps ? `<span class="system-api-key-ips">${escapeHtml(allowIps)}</span>` : '<em class="system-api-key-muted">不限制</em>'}</td>
-        <td><span class="system-api-key-state is-${meta.tone}">${escapeHtml(meta.label)}</span></td>
-        <td class="system-api-key-ops-col">
-          <div class="system-api-key-ops">
-            <button class="system-demo-btn compact-btn secondary" type="button" data-system-action="api-key-audit" data-api-key-id="${escapeHtml(keyId)}">审计</button>
-            ${meta.tone === 'revoked' ? '' : `<button class="system-demo-btn compact-btn secondary danger" type="button" data-system-action="api-key-revoke" data-api-key-id="${escapeHtml(keyId)}" ${busy ? 'disabled' : ''}>吊销</button>`}
-            <button class="system-demo-btn compact-btn secondary danger" type="button" data-system-action="api-key-delete" data-api-key-id="${escapeHtml(keyId)}" ${busy ? 'disabled' : ''}>删除</button>
-          </div>
-        </td>
-      </tr>
-    `;
-  }
-
   function systemBindingDialog() {
     if (page !== 'admin' || !state.bindingDialog) return '';
     return state.bindingDialog === 'otp' ? systemOtpBindingDialog() : systemAppBindingDialog();
-  }
-
-  /*
-   * API-Key 弹窗组：新建表单、明文一次性展示、审计轨迹。
-   * 三者互斥，同一时刻只渲染一个；危险操作的二次确认走 Kit 的 confirmationMarkup。
-   */
-  function systemApiKeyDialog() {
-    if (page !== 'admin') return '';
-    if (state.apiKeyConfirm) return systemApiKeyConfirmMarkup();
-    if (state.apiKeyDialog === 'create') return systemApiKeyCreateDialog();
-    if (state.apiKeyDialog === 'created') return systemApiKeyRevealDialog();
-    if (state.apiKeyDialog === 'audit') return systemApiKeyAuditDialog();
-    return '';
-  }
-
-  function systemApiKeyConfirmMarkup() {
-    const pending = state.apiKeyConfirm || {};
-    const revoking = pending.action === 'revoke';
-    const name = String(pending.name || pending.keyId || '');
-    const description = revoking
-      ? `吊销后这把 key 立即失效，正在使用它的外部程序会开始收到拒绝。审计记录会保留。`
-      : `删除后这把 key 从列表消失且无法恢复，正在使用它的外部程序会开始收到拒绝。已产生的审计记录仍会保留。`;
-    const markup = ui.confirmationMarkup?.({
-      id: 'system-api-key-confirmation',
-      action: `api-key-${revoking ? 'revoke' : 'delete'}`,
-      tone: 'danger',
-      title: `确认${revoking ? '吊销' : '删除'}「${name}」`,
-      description,
-      confirmLabel: state.apiKeyWorking ? '正在提交' : `确认${revoking ? '吊销' : '删除'}`,
-      cancelLabel: '返回',
-      disabled: Boolean(state.apiKeyWorking)
-    });
-    return markup || '';
-  }
-
-  function systemApiKeyCreateDialog() {
-    const draft = state.apiKeyDraft || apiKeyDraftDefaults();
-    const nameOk = Boolean(String(draft.name || '').trim());
-    const busy = state.apiKeyWorking === 'create';
-    return `
-      <div class="dwrt-kit-modal-layer system-api-key-layer is-open" data-system-dialog="api-key-create">
-        <button class="dwrt-kit-modal-backdrop" type="button" aria-label="关闭新建 API-Key 窗口" data-system-action="api-key-close"></button>
-        <section class="dwrt-kit-modal system-binding-dialog system-api-key-dialog" role="dialog" aria-modal="true" aria-labelledby="systemApiKeyCreateTitle">
-          <header class="dwrt-kit-modal-header">
-            <div>
-              <h2 id="systemApiKeyCreateTitle">新建 API-Key</h2>
-              <p>创建后明文密钥只显示一次，请当场复制保存。</p>
-            </div>
-            <button class="dwrt-kit-modal-close" type="button" aria-label="关闭" data-system-action="api-key-close">${systemSettingsIcon('close')}</button>
-          </header>
-          <div class="dwrt-kit-modal-body system-binding-body system-api-key-form">
-            <label class="system-admin-input-group">
-              <span>名称备注</span>
-              <input class="system-glass-input" type="text" maxlength="64" value="${escapeHtml(draft.name || '')}" placeholder="例如：家庭助理只读采集" data-system-api-key-field="name" autofocus>
-            </label>
-            <div class="system-api-key-field">
-              <span class="system-api-key-field-label">权限档</span>
-              <div class="system-api-key-segment" role="radiogroup" aria-label="权限档">
-                ${SYSTEM_API_KEY_TIERS.map(([id, label]) => `
-                  <button class="system-api-key-segment-btn ${draft.tier === id ? 'is-active' : ''}" type="button" role="radio" aria-checked="${draft.tier === id ? 'true' : 'false'}" data-system-api-key-segment="tier" data-system-api-key-value="${escapeHtml(id)}">${escapeHtml(label)}</button>
-                `).join('')}
-              </div>
-              <em class="system-api-key-field-hint">${escapeHtml((SYSTEM_API_KEY_TIERS.find(([id]) => id === draft.tier) || SYSTEM_API_KEY_TIERS[0])[2])}</em>
-            </div>
-            <div class="system-api-key-field">
-              <span class="system-api-key-field-label">有效期</span>
-              <div class="system-api-key-segment" role="radiogroup" aria-label="有效期">
-                ${[['', '长期'], ['30', '30 天'], ['90', '90 天'], ['365', '365 天']].map(([value, label]) => `
-                  <button class="system-api-key-segment-btn ${String(draft.expires_days || '') === value ? 'is-active' : ''}" type="button" role="radio" aria-checked="${String(draft.expires_days || '') === value ? 'true' : 'false'}" data-system-api-key-segment="expires_days" data-system-api-key-value="${escapeHtml(value)}">${escapeHtml(label)}</button>
-                `).join('')}
-              </div>
-              <em class="system-api-key-field-hint">选择「长期」则不自动过期，建议定期更换。</em>
-            </div>
-            <label class="system-admin-input-group">
-              <span>来源 IP 白名单（可选）</span>
-              <input class="system-glass-input" type="text" value="${escapeHtml(draft.allow_ips || '')}" placeholder="留空为不限制，例如 192.168.30.0/24, 10.0.0.5" data-system-api-key-field="allow_ips">
-            </label>
-            <div class="system-api-key-warning">
-              ${systemSettingsIcon('warning')}
-              <div>
-                <strong>这是一把可被程序直接使用的凭据</strong>
-                <span>读写档的 key 能修改设备配置，泄漏后可能造成配置被改或数据受损。请只发给可信程序，并按需限制来源 IP。具体可调用范围由后端权限表决定。</span>
-              </div>
-            </div>
-            ${state.apiKeyError ? `<div class="system-inline-error">${escapeHtml(state.apiKeyError)}</div>` : ''}
-          </div>
-          <footer class="dwrt-kit-modal-footer">
-            <button class="system-demo-btn secondary" type="button" data-system-action="api-key-close">取消</button>
-            <button class="system-demo-btn primary" type="button" data-system-action="api-key-create-submit" ${(!nameOk || busy) ? 'disabled' : ''}>${busy ? '创建中…' : '创建'}</button>
-          </footer>
-        </section>
-      </div>`;
-  }
-
-  /*
-   * 明文一次性展示。值只从 state 内存读，不落任何持久化存储，
-   * 关闭窗口即清空（closeApiKeyDialog）。
-   */
-  function systemApiKeyRevealDialog() {
-    const created = state.apiKeyCreated || {};
-    const plain = String(state.apiKeyPlaintext || '');
-    return `
-      <div class="dwrt-kit-modal-layer system-api-key-layer is-open" data-system-dialog="api-key-created">
-        <button class="dwrt-kit-modal-backdrop" type="button" aria-label="关闭密钥展示窗口" data-system-action="api-key-close"></button>
-        <section class="dwrt-kit-modal system-binding-dialog system-api-key-dialog" role="dialog" aria-modal="true" aria-labelledby="systemApiKeyRevealTitle">
-          <header class="dwrt-kit-modal-header">
-            <div>
-              <h2 id="systemApiKeyRevealTitle">API-Key 已创建</h2>
-              <p>「${escapeHtml(created.name || '')}」· ${escapeHtml(systemApiKeyTierLabel(created.tier))}</p>
-            </div>
-            <button class="dwrt-kit-modal-close" type="button" aria-label="关闭" data-system-action="api-key-close">${systemSettingsIcon('close')}</button>
-          </header>
-          <div class="dwrt-kit-modal-body system-binding-body">
-            <div class="system-api-key-reveal-warning">
-              ${systemSettingsIcon('warning')}
-              <span><strong>关闭后无法再次查看。</strong>密钥只在本次响应中返回，路由器只保存它的摘要，没有任何途径可以重新读出明文。</span>
-            </div>
-            <div class="system-api-key-reveal-box">
-              <code data-system-api-key-plain>${escapeHtml(plain)}</code>
-              <button class="system-demo-btn compact-btn" type="button" data-system-action="api-key-copy">复制</button>
-            </div>
-            <div class="system-api-key-reveal-meta">
-              <span><b>key_id</b><em>${escapeHtml(created.key_id || '')}</em></span>
-              <span><b>有效期</b><em>${Number(created.expires_at || 0) > 0 ? escapeHtml(systemApiKeyExpiryText(created)) : '长期有效'}</em></span>
-            </div>
-          </div>
-          <footer class="dwrt-kit-modal-footer">
-            <button class="system-demo-btn primary" type="button" data-system-action="api-key-close">我已保存，关闭</button>
-          </footer>
-        </section>
-      </div>`;
-  }
-
-  function systemApiKeyAuditDialog() {
-    const keyId = String(state.apiKeyAuditFor || '');
-    const rows = Array.isArray(state.apiKeyAudit) ? state.apiKeyAudit : [];
-    return `
-      <div class="dwrt-kit-modal-layer system-api-key-layer is-open" data-system-dialog="api-key-audit">
-        <button class="dwrt-kit-modal-backdrop" type="button" aria-label="关闭审计记录窗口" data-system-action="api-key-close"></button>
-        <section class="dwrt-kit-modal system-binding-dialog system-api-key-audit-dialog" role="dialog" aria-modal="true" aria-labelledby="systemApiKeyAuditTitle">
-          <header class="dwrt-kit-modal-header">
-            <div>
-              <h2 id="systemApiKeyAuditTitle">API-Key 审计记录</h2>
-              <p>key_id ${escapeHtml(keyId)} · 最近 100 条，按时间倒序</p>
-            </div>
-            <button class="dwrt-kit-modal-close" type="button" aria-label="关闭" data-system-action="api-key-close">${systemSettingsIcon('close')}</button>
-          </header>
-          <div class="dwrt-kit-modal-body system-api-key-audit-body">
-            ${systemApiKeyAuditTable(rows)}
-          </div>
-          <footer class="dwrt-kit-modal-footer">
-            <button class="system-demo-btn secondary" type="button" data-system-action="api-key-audit-refresh" ${state.apiKeyAuditLoading ? 'disabled' : ''}>${state.apiKeyAuditLoading ? '读取中…' : '刷新'}</button>
-            <button class="system-demo-btn primary" type="button" data-system-action="api-key-close">关闭</button>
-          </footer>
-        </section>
-      </div>`;
-  }
-
-  function systemApiKeyAuditTable(rows) {
-    if (state.apiKeyAuditLoading && !rows.length) {
-      return `<div class="system-api-key-empty" role="status">正在读取审计记录…</div>`;
-    }
-    if (state.apiKeyAudit === null) {
-      return `<div class="system-api-key-empty is-error">读不到审计记录${state.apiKeyAuditError ? `：${escapeHtml(state.apiKeyAuditError)}` : ''}。</div>`;
-    }
-    if (!rows.length) {
-      return `<div class="system-api-key-empty">这把 key 还没有产生审计记录。</div>`;
-    }
-    return `
-      <div class="system-api-key-table-wrap">
-        <div class="dwrt-kit-table-scroll" data-system-scroll="api-key-audit">
-          <table class="dwrt-kit-table system-api-key-audit-table">
-            <thead>
-              <tr>
-                <th scope="col">时间</th>
-                <th scope="col">操作</th>
-                <th scope="col">目标</th>
-                <th scope="col">来源 IP</th>
-                <th scope="col">User-Agent</th>
-                <th scope="col">结果</th>
-              </tr>
-            </thead>
-            <tbody>${rows.map(systemApiKeyAuditRow).join('')}</tbody>
-          </table>
-        </div>
-      </div>
-    `;
-  }
-
-  /*
-   * 审计行。`source_ip` 与 `user_agent` 都是请求方可控输入，后端原样存原样返回，
-   * 所以这里必须全部走 escapeHtml，绝不能拼进 innerHTML —— 否则审计页就是一个
-   * 直接面向管理员的存储型 XSS 入口。UA 很长，列内截断，完整值走项目自有 tooltip。
-   */
-  function systemApiKeyAuditRow(row) {
-    const failure = String(row?.failure_reason || '');
-    const result = String(row?.result || '');
-    const tone = systemApiKeyAuditTone(result, failure);
-    const ua = String(row?.user_agent || '');
-    const ip = String(row?.source_ip || row?.peer_ip || '');
-    return `
-      <tr class="${tone.rowClass}">
-        <td>${escapeHtml(systemApiKeyAuditTime(row?.ts))}</td>
-        <td>${escapeHtml(row?.action || '')}</td>
-        <td class="system-api-key-audit-target">${escapeHtml(row?.target || '')}</td>
-        <td>${ip ? escapeHtml(ip) : '<em class="system-api-key-muted">未记录</em>'}</td>
-        <td class="system-api-key-audit-ua">${ua ? `<span data-dwrt-tooltip="${escapeHtml(ua)}">${escapeHtml(ua)}</span>` : '<em class="system-api-key-muted">未记录</em>'}</td>
-        <td><span class="system-api-key-audit-result is-${tone.tone}">${escapeHtml(tone.label)}</span></td>
-      </tr>
-    `;
-  }
-
-  function systemApiKeyAuditTime(ts) {
-    const value = Number(ts || 0);
-    if (value <= 0) return '未记录';
-    try {
-      /* 补零的固定宽度格式，等宽数字下各行时间列能对齐扫读。 */
-      return new Date(value * 1000).toLocaleString('zh-CN', {
-        year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', second: '2-digit',
-        hour12: false
-      });
-    } catch (_) {
-      return String(value);
-    }
-  }
-
-  /*
-   * 拒绝原因用后端稳定的机器可读值分类（webd_api_key_result_str 那套），
-   * 不靠 result 文案猜。命中不了就原样显示，不假装认识。
-   */
-  function systemApiKeyAuditTone(result, failure) {
-    const reason = String(failure || '').toLowerCase();
-    const map = {
-      scope_denied: '越权',
-      forbidden_route: '禁止路由',
-      expired: '已过期',
-      revoked: '已吊销',
-      rate_limited: '限速',
-      ip_not_allowed: '来源不许可',
-      unknown: '未知 key',
-      malformed: '格式错误',
-      not_presented: '未提供凭据',
-      db_error: '存储错误'
-    };
-    if (reason && map[reason]) return { tone: 'denied', label: map[reason], rowClass: 'is-failed' };
-    if (reason) return { tone: 'denied', label: reason, rowClass: 'is-failed' };
-    /* 成功类结果统一说人话，不把 `ok` / `200` 这类机器值直接摊给用户。 */
-    const success = {
-      ok: '成功', success: '成功', allowed: '允许', created: '已创建',
-      revoked: '已吊销', deleted: '已删除', 200: '成功'
-    };
-    const key = String(result || '').toLowerCase();
-    if (success[key]) return { tone: 'ok', label: success[key], rowClass: '' };
-    if (!result) return { tone: 'ok', label: '成功', rowClass: '' };
-    return { tone: 'denied', label: result, rowClass: 'is-failed' };
   }
 
   function systemOtpBindingDialog() {
@@ -3715,6 +3692,8 @@ export function mount(context = {}) {
     const candidate = state.pairCandidate || null;
     const qrPayload = appPairQrPayload();
     const qr = appPairQrMarkup(qrPayload);
+    const pairCode = state.pairCodeInput || '';
+    const codeReady = /^[0-9]{6}$/.test(pairCode);
     return `
       <div class="dwrt-kit-modal-layer system-binding-layer is-open" data-system-dialog="app">
         <button class="dwrt-kit-modal-backdrop" type="button" aria-label="关闭 App 配对窗口" data-system-action="binding-close"></button>
@@ -3722,7 +3701,7 @@ export function mount(context = {}) {
           <header class="dwrt-kit-modal-header">
             <div>
               <h2 id="systemAppDialogTitle">App 配对</h2>
-              <p>让 App 扫描二维码，并由 App 使用自身设备身份发起配对。</p>
+              <p>输入 App 屏幕上显示的 6 位配对码即可完成配对；也可让 App 扫描二维码后在此确认。</p>
             </div>
             <button class="dwrt-kit-modal-close" type="button" aria-label="关闭" data-system-action="binding-close">${systemSettingsIcon('close')}</button>
           </header>
@@ -3730,13 +3709,21 @@ export function mount(context = {}) {
             ${pairState === 'paired' ? `
               <div class="system-binding-complete">${systemSettingsIcon('shield')}<strong>App 已完成配对</strong><span>设备列表已刷新，可以关闭此窗口。</span></div>
             ` : `
+              <div class="system-pair-code-entry">
+                <label class="system-binding-code-field">
+                  <span>手机上显示的配对码</span>
+                  <input class="system-glass-input system-binding-code-input" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" value="${escapeHtml(pairCode)}" placeholder="输入 6 位配对码" data-system-pair-code-field="true" ${state.pairWorking ? 'disabled' : ''} autofocus>
+                </label>
+                <button class="system-demo-btn primary" type="button" data-system-action="api-approve-pairing-by-code" ${(!codeReady || state.pairWorking) ? 'disabled' : ''}>${state.pairWorking ? '处理中…' : '确认配对'}</button>
+              </div>
+              ${state.pairCodeError ? `<div class="system-binding-warning">${escapeHtml(state.pairCodeError)}</div>` : ''}
               <div class="system-binding-qr-grid">
                 <div class="system-binding-qr" aria-label="App 配对二维码">${qr}</div>
                 <div class="system-pair-code-block">
                   <span>${pairState === 'requested' ? 'App 已发起配对' : '等待 App 扫描'}</span>
                   <strong class="system-pair-device-name">${escapeHtml(pairState === 'requested' ? (candidate?.name || candidate?.id || '待确认设备') : '扫描二维码')}</strong>
                   <em data-system-pair-countdown>${pairState === 'requested' && candidate?.expires_at ? `${pairingRemainingSeconds(candidate)} 秒后过期` : '请在 Dreaming OS App 中继续'}</em>
-                  <p>${pairState === 'requested' ? '配对码由 App 获取并确认；此窗口正在等待真实设备状态变为 paired。' : `二维码包含路由器地址 <b>${escapeHtml(appPairBaseUrl())}</b> 和真实 App 配对端点。`}</p>
+                  <p>${pairState === 'requested' ? 'App 已取到配对码；输入上方输入框，或直接批准这台设备。' : `二维码包含路由器地址 <b>${escapeHtml(appPairBaseUrl())}</b> 和真实 App 配对端点。`}</p>
                 </div>
               </div>
               ${state.qrGeneratorError ? `<div class="system-binding-warning">${escapeHtml(state.qrGeneratorError)}，仍可使用 6 位配对码。</div>` : ''}
@@ -3852,17 +3839,6 @@ export function mount(context = {}) {
     }));
   }
 
-  /* 确认层叠在最上面，焦点必须落在它里面，否则 Tab 会走到被遮住的表单上。 */
-  function focusApiKeyConfirmation() {
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      const dialog = root?.querySelector('.dwrt-kit-confirmation');
-      const target = dialog?.querySelector('[data-dwrt-confirm-accept]:not(:disabled), [data-dwrt-confirm-cancel]');
-      if (target instanceof HTMLElement && !dialog.contains(document.activeElement)) {
-        try { target.focus({ preventScroll: true }); } catch (_) { target.focus(); }
-      }
-    }));
-  }
-
   function openBindingDialog(kind) {
     state.bindingDialog = kind === 'app' ? 'app' : 'otp';
     state.saveError = '';
@@ -3876,6 +3852,8 @@ export function mount(context = {}) {
     state.pairBaselineIds = devices.map(appDeviceId).filter(Boolean);
     state.pairCandidate = null;
     state.pairState = 'waiting';
+    state.pairCodeInput = '';
+    state.pairCodeError = '';
     ensureQrGenerator();
     render();
     startPairStatusTimer();
@@ -3885,6 +3863,9 @@ export function mount(context = {}) {
     const layer = root?.querySelector('.system-binding-layer');
     const returnSelector = layer?.dataset.dwrtReturnFocus || '';
     state.bindingDialog = '';
+    /* 配对码是一次性凭据，关窗即丢，不留在内存里等下次开窗复用。 */
+    state.pairCodeInput = '';
+    state.pairCodeError = '';
     stopPairStatusTimer();
     render();
     if (returnSelector) requestAnimationFrame(() => {
@@ -3897,19 +3878,6 @@ export function mount(context = {}) {
     if (event.key === 'Escape' && state.bindingDialog) {
       event.preventDefault();
       closeBindingDialog();
-      return;
-    }
-    if (event.key !== 'Escape') return;
-    /* 确认弹窗叠在其它 API-Key 弹窗之上，Escape 先退确认层再退弹窗本体。 */
-    if (state.apiKeyConfirm) {
-      event.preventDefault();
-      state.apiKeyConfirm = null;
-      render();
-      return;
-    }
-    if (state.apiKeyDialog) {
-      event.preventDefault();
-      closeApiKeyDialog();
     }
   }
 
@@ -4045,6 +4013,17 @@ export function mount(context = {}) {
             ${role && !SYSTEM_DEVICE_ROLES.some(([value]) => value === role) ? `<option value="${escapeHtml(role)}" selected>${escapeHtml(role)}（后端返回的未知角色）</option>` : ''}
           </select>`
       : `<span class="system-api-role-static">${escapeHtml(systemDeviceRoleLabel(device.role))}</span>`;
+    /*
+     * 启用/停用。后端 `enabled_write` 为真才给控件，否则保持只读徽标 —— 这与角色
+     * 下拉同一套门控写法。停用会吊销该设备令牌（capabilities.revoke_tokens_on_disable），
+     * 是用户可感知的副作用，因此走确认窗并在窗里说清；这里的按钮只负责发起确认。
+     * 「不能停用最后一个 owner」「不能停用当前设备」由后端判定并回原因，
+     * 前端不重复实现一套判断，以免和后端语义分叉。
+     */
+    const canWriteEnabled = caps.enabled_write === true;
+    const enabledControl = canWriteEnabled
+      ? `<button class="system-demo-btn secondary compact-btn" type="button" data-system-action="api-device-toggle" data-api-id="${escapeHtml(id)}" data-api-enabled="${enabled ? '1' : '0'}" data-api-name="${escapeHtml(device.name || 'App 设备')}" ${!id || busy ? 'disabled' : ''}>${enabled ? '停用' : '启用'}</button>`
+      : '';
     return `
       <article class="system-api-row ${enabled ? '' : 'disabled'}">
         <span class="system-api-row-icon" aria-hidden="true">${systemSettingsIcon(device.platform === 'android' ? 'android' : 'phone')}</span>
@@ -4053,8 +4032,11 @@ export function mount(context = {}) {
           <em>${escapeHtml(meta || id || '等待后端返回设备信息')}${fingerprint ? ` · <i class="system-api-row-fingerprint">指纹 ${escapeHtml(fingerprint)}</i>` : ''}</em>
         </span>
         <b class="${enabled ? 'good' : ''}">${enabled ? '启用' : '停用'}</b>
-        ${roleControl}
-        <button class="system-demo-btn secondary compact-btn" type="button" data-system-action="api-revoke-device" data-api-id="${escapeHtml(id)}" ${!id || busy ? 'disabled' : ''}>撤销</button>
+        <span class="system-api-row-actions">
+          ${roleControl}
+          ${enabledControl}
+          <button class="system-demo-btn secondary compact-btn" type="button" data-system-action="api-revoke-device" data-api-id="${escapeHtml(id)}" ${!id || busy ? 'disabled' : ''}>撤销</button>
+        </span>
       </article>
     `;
   }
@@ -4068,8 +4050,19 @@ export function mount(context = {}) {
     `;
   }
 
+  /*
+   * 控件工厂统一读闸门：`write=false` 的字段直接禁用并把原因挂到 title 上，
+   * 而不是让用户点得动、一存整页失败。判定集中在这里，凡走这几个工厂的字段
+   * 都自动跟随后端合同，不必逐个页面手写 disabled。
+   */
+  function systemFieldLockAttrs(field) {
+    const reason = systemFieldLockReason(field);
+    if (!reason) return '';
+    return ` disabled aria-disabled="true" data-system-locked="true" title="${escapeHtml(reason)}"`;
+  }
+
   function systemInputControl(field, value, type = 'text', placeholder = '') {
-    return `<input class="system-glass-input" type="${escapeHtml(type)}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(placeholder)}" data-system-field="${escapeHtml(field)}">`;
+    return `<input class="system-glass-input" type="${escapeHtml(type)}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(placeholder)}" data-system-field="${escapeHtml(field)}"${systemFieldLockAttrs(field)}>`;
   }
 
   function systemTextareaControl(field, value, placeholder = '') {
@@ -4077,10 +4070,26 @@ export function mount(context = {}) {
   }
 
   function systemSelectControl(field, current, options, extraClass = '') {
-    return `<select class="system-glass-input ${escapeHtml(extraClass)}" data-native-select="true" data-system-field="${escapeHtml(field)}">${options.map(([value, text]) => `<option value="${escapeHtml(value)}" ${String(current) === String(value) ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select>`;
+    return `<select class="system-glass-input ${escapeHtml(extraClass)}" data-native-select="true" data-system-field="${escapeHtml(field)}"${systemFieldLockAttrs(field)}>${options.map(([value, text]) => `<option value="${escapeHtml(value)}" ${String(current) === String(value) ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select>`;
   }
 
   function systemLogLevelOptions() {
+    return systemLogLevelOptionList();
+  }
+
+  /*
+   * ZRam 压缩算法。内核实际启用的算法不止这四个（30.1 跑的是 lzo-rle），
+   * 取值不在列表里时浏览器会静默回退到第一个 option，页面就会把 lzo-rle 显示成
+   * lzo——读数是错的。所以把后端真值补成一个选项，宁可多一项也不显示错的。
+   */
+  function systemZramAlgorithmOptions(current) {
+    const base = [['lzo', 'lzo'], ['lzo-rle', 'lzo-rle'], ['lz4', 'lz4（推荐）'], ['lz4hc', 'lz4hc'], ['zstd', 'zstd（平衡）'], ['deflate', 'deflate']];
+    const value = String(current || '').trim();
+    if (value && !base.some(([name]) => name === value)) base.unshift([value, `${value}（当前）`]);
+    return base;
+  }
+
+  function systemLogLevelOptionList() {
     return [
       ['emergency', '紧急（Emergency）'],
       ['alert', '警报（Alert）'],
@@ -4110,17 +4119,19 @@ export function mount(context = {}) {
   }
 
   function systemSegmentedControl(field, current, options) {
+    const lock = systemFieldLockAttrs(field);
     return `
       <div class="system-segmented-control" role="group">
-        ${options.map(([value, text]) => `<button class="system-segment-btn ${String(current) === String(value) ? 'active' : ''}" type="button" data-system-segment="${escapeHtml(field)}" data-system-value="${escapeHtml(value)}">${escapeHtml(text)}</button>`).join('')}
+        ${options.map(([value, text]) => `<button class="system-segment-btn ${String(current) === String(value) ? 'active' : ''}" type="button" data-system-segment="${escapeHtml(field)}" data-system-value="${escapeHtml(value)}"${lock}>${escapeHtml(text)}</button>`).join('')}
       </div>
     `;
   }
 
   function systemIosSwitch(field, checked) {
+    const lock = systemFieldLockAttrs(field);
     return `
-      <label class="system-ios-switch dwrt-switch ${checked ? 'on' : ''}">
-        <input type="checkbox" ${checked ? 'checked' : ''} data-system-field="${escapeHtml(field)}">
+      <label class="system-ios-switch dwrt-switch ${checked ? 'on' : ''}${lock ? ' is-locked' : ''}"${lock ? ` title="${escapeHtml(systemFieldLockReason(field))}"` : ''}>
+        <input type="checkbox" ${checked ? 'checked' : ''} data-system-field="${escapeHtml(field)}"${lock}>
         <span class="dwrt-slider" aria-hidden="true"></span>
       </label>
     `;
@@ -4136,10 +4147,12 @@ export function mount(context = {}) {
   }
 
   function systemServerItem(index, server) {
+    /* NTP 列表归 general.time_policy 闸门，关着时整行禁用（含增删按钮）。 */
+    const lock = systemFieldLockAttrs('general.ntp_servers');
     return `
       <div class="system-server-item">
-        <button class="system-circle-btn remove" type="button" data-system-action="ntp-remove" data-ntp-index="${index}">-</button>
-        <input class="system-glass-input" type="text" value="${escapeHtml(server || '')}" placeholder="例如：pool.ntp.org" data-system-ntp-index="${index}">
+        <button class="system-circle-btn remove" type="button" data-system-action="ntp-remove" data-ntp-index="${index}"${lock}>-</button>
+        <input class="system-glass-input" type="text" value="${escapeHtml(server || '')}" placeholder="例如：pool.ntp.org" data-system-ntp-index="${index}"${lock}>
       </div>
     `;
   }
@@ -4207,7 +4220,7 @@ export function mount(context = {}) {
     const savedAt = Number(state.savedAt || 0);
     let text = '配置已修改，请保存生效';
     if (state.saving) text = '正在保存系统设置…';
-    else if (error) text = `保存失败：${error}`;
+    else if (error) text = `保存失败：${systemSaveErrorText(error)}`;
     else if (!isDirty && savedAt) text = `已保存 ${relativeSeconds(savedAt)}`;
     return ui.floatingSavebarMarkup?.({
       visible: isDirty || state.saving || Boolean(error),
@@ -4277,13 +4290,27 @@ export function mount(context = {}) {
       el.addEventListener('change', onFlashScheduleFieldChange);
     });
     /*
-     * 新建表单的字段单独绑定，不走 data-system-field —— 那条路径会写进
-     * state.data 并让底部保存条以为有未保存的系统设置，而 key 是即时创建的，
+     * 配对码单独绑定，不走 data-system-field —— 那条路径会写进 state.data
+     * 并让底部保存条以为有未保存的系统设置，而配对码是一次性凭据，
      * 不属于保存条管辖的内容。
      */
-    root.querySelectorAll('[data-system-api-key-field]').forEach((el) => {
-      el.addEventListener('input', onApiKeyDraftInput);
+    root.querySelectorAll('[data-system-pair-code-field]').forEach((el) => {
+      el.addEventListener('input', onPairCodeInput);
     });
+    /*
+     * 设备角色下拉。它不走 data-system-field —— 那条路径会写进 state.data 并让底部
+     * 保存条以为有未保存的系统设置，而角色是立即生效的独立写入，不归保存条管辖。
+     * 之前这个 select 没有任何 change 绑定，选完不会发请求，控件形同装饰。
+     */
+    root.querySelectorAll('[data-system-action="api-device-role"]').forEach((el) => {
+      el.addEventListener('change', onDeviceRoleChange);
+    });
+  }
+
+  function onDeviceRoleChange(event) {
+    const el = event.currentTarget;
+    if (!el) return;
+    changeAppDeviceRole(el.dataset.apiId || '', el.value || '');
   }
 
   function captureSystemFocus() {
@@ -4525,6 +4552,30 @@ export function mount(context = {}) {
   }
 
   function onRootClick(event) {
+    /*
+     * Kit 确认窗的接受/取消要在 data-system-action 之前处理：
+     * 确认窗是覆盖层，它的按钮不带 data-system-action，落到下面的分支里会被忽略。
+     */
+    const confirmCancel = event.target.closest('[data-dwrt-confirm-cancel], [data-dwrt-modal-close]');
+    if (confirmCancel && root.contains(confirmCancel) && (state.deviceConfirm || state.cloudConfirm)) {
+      state.deviceConfirm = null;
+      state.cloudConfirm = '';
+      render();
+      return;
+    }
+    const confirmAccept = event.target.closest('[data-dwrt-confirm-accept]');
+    if (confirmAccept && root.contains(confirmAccept)) {
+      const device = state.deviceConfirm;
+      const cloud = state.cloudConfirm;
+      if (device || cloud) {
+        state.deviceConfirm = null;
+        state.cloudConfirm = '';
+        if (device) setAppDeviceEnabled(device.id, device.enabled);
+        else if (cloud === 'enroll-force') enrollCloud(true);
+        else if (cloud === 'disable') disableCloudRelay();
+        return;
+      }
+    }
     const savebarDiscard = event.target.closest('[data-dwrt-savebar-discard]');
     if (savebarDiscard && root.contains(savebarDiscard)) {
       event.preventDefault();
@@ -4588,32 +4639,14 @@ export function mount(context = {}) {
       return;
     }
     const action = event.target.closest('[data-system-action]');
-    /* Kit 确认弹窗的接受/取消：沿用 Kit 的 data 属性，不另造一套确认交互。 */
-    const confirmAccept = event.target.closest('[data-dwrt-confirm-accept]');
-    if (confirmAccept && root.contains(confirmAccept) && state.apiKeyConfirm) {
-      event.preventDefault();
-      commitApiKeyConfirm();
-      return;
-    }
-    const confirmCancel = event.target.closest('[data-dwrt-confirm-cancel]');
-    if (confirmCancel && root.contains(confirmCancel) && state.apiKeyConfirm) {
-      event.preventDefault();
-      state.apiKeyConfirm = null;
-      render();
-      return;
-    }
-    const apiKeySegment = event.target.closest('[data-system-api-key-segment]');
-    if (apiKeySegment && root.contains(apiKeySegment)) {
-      event.preventDefault();
-      state.apiKeyDraft = {
-        ...(state.apiKeyDraft || apiKeyDraftDefaults()),
-        [apiKeySegment.dataset.systemApiKeySegment]: apiKeySegment.dataset.systemApiKeyValue || ''
-      };
-      render();
-      return;
-    }
     if (!action || !root.contains(action)) return;
     const name = action.dataset.systemAction;
+    /*
+     * 角色下拉也带 data-system-action（用于标识用途），但它是 SELECT，
+     * 写入由 change 处理。在这里 preventDefault() 会压掉原生下拉的展开，
+     * 于是控件看起来点不开 —— 提前让路，不要吃掉这个 click。
+     */
+    if (action.tagName === 'SELECT') return;
     event.preventDefault();
     if (name === 'ntp-add') addNtpServer();
     else if (name === 'ntp-remove') removeNtpServer(Number(action.dataset.ntpIndex));
@@ -4629,17 +4662,13 @@ export function mount(context = {}) {
     else if (name === 'twofa-enable') enableTwofa();
     else if (name === 'twofa-disable') disableTwofa();
     else if (name === 'api-approve-pairing') approveAppPairing();
+    else if (name === 'api-approve-pairing-by-code') approveAppPairingByCode();
     else if (name === 'api-cancel-pairing') cancelAppPairing();
     else if (name === 'api-revoke-device') revokeAppDevice(action.dataset.apiId || '');
-    else if (name === 'api-key-create-open') openApiKeyCreate();
-    else if (name === 'api-key-close') closeApiKeyDialog();
-    else if (name === 'api-key-refresh') loadApiKeys(true);
-    else if (name === 'api-key-create-submit') createApiKey();
-    else if (name === 'api-key-copy') copyApiKeyPlaintext(action);
-    else if (name === 'api-key-revoke') openApiKeyConfirm('revoke', action.dataset.apiKeyId || '');
-    else if (name === 'api-key-delete') openApiKeyConfirm('delete', action.dataset.apiKeyId || '');
-    else if (name === 'api-key-audit') openApiKeyAudit(action.dataset.apiKeyId || '');
-    else if (name === 'api-key-audit-refresh') loadApiKeyAudit(state.apiKeyAuditFor, true);
+    else if (name === 'api-device-toggle') openDeviceEnabledConfirm(action);
+    else if (name === 'cloud-enroll') enrollCloud(false);
+    else if (name === 'cloud-reenroll') { state.cloudConfirm = 'enroll-force'; render(); }
+    else if (name === 'cloud-disable') { state.cloudConfirm = 'disable'; render(); }
     else if (name === 'cloud-copy-fingerprint') copyFingerprintValue(action);
     else if (startupServiceActionFromDataset(name)) handleStartupServiceAction(action.dataset.serviceName || '', startupServiceActionFromDataset(name));
     else if (name === 'mount-generate-config') handleMountOperation('generate');
@@ -5844,51 +5873,6 @@ export function mount(context = {}) {
   }
 
   /*
-   * API-Key 列表。后端 `GET /api/v1/auth/api-keys` 返回 `data.items[]`，
-   * 每行已带 `state`（active / expired / revoked）与 `revoked` / `expired` 布尔，
-   * 前端直接用后端的判定，不再自己比一遍时间戳 —— 两边算法一旦漂移，
-   * 界面上的「有效」会和服务端的实际放行结果对不上。
-   */
-  async function loadApiKeys(shouldRender = false) {
-    state.apiKeysLoading = true;
-    try {
-      const result = await fetchJson('/api/v1/auth/api-keys');
-      const payload = result?.data && typeof result.data === 'object' ? result.data : result;
-      state.apiKeys = Array.isArray(payload?.items) ? payload.items : [];
-      state.apiKeysError = '';
-    } catch (error) {
-      /* 读不到就说读不到，不用空数组冒充「还没有 key」。 */
-      state.apiKeys = null;
-      state.apiKeysError = error?.message || 'api key list unavailable';
-    } finally {
-      state.apiKeysLoading = false;
-      if (shouldRender) render();
-    }
-  }
-
-  /*
-   * 单把 key 的审计轨迹。key 被删除后轨迹仍在（后端按 api_key_id 查
-   * api_audit_log），所以这里不要求 key 还存在于列表里。
-   */
-  async function loadApiKeyAudit(keyId, shouldRender = true) {
-    if (!keyId) return;
-    state.apiKeyAuditLoading = true;
-    if (shouldRender) render();
-    try {
-      const result = await fetchJson(`/api/v1/auth/api-keys/${encodeURIComponent(keyId)}/audit?limit=100`);
-      const payload = result?.data && typeof result.data === 'object' ? result.data : result;
-      state.apiKeyAudit = Array.isArray(payload?.items) ? payload.items : [];
-      state.apiKeyAuditError = '';
-    } catch (error) {
-      state.apiKeyAudit = null;
-      state.apiKeyAuditError = error?.message || 'audit trail unavailable';
-    } finally {
-      state.apiKeyAuditLoading = false;
-      if (shouldRender) render();
-    }
-  }
-
-  /*
    * 云端中继状态与路由器身份。两个接口都是只读 GET，各自失败互不影响：
    * 拿不到 status 时面板会显示「状态不可读」，而不是假装中继未启用。
    */
@@ -6003,6 +5987,89 @@ export function mount(context = {}) {
     }
   }
 
+  /*
+   * 只更新状态并就地切换按钮可用性 —— 每次输入都 render() 会让输入框失焦。
+   * 同时把非数字字符剔掉，避免拿一个必然被后端拒的码去消耗失败限速的次数。
+   */
+  function onPairCodeInput(event) {
+    const el = event.currentTarget;
+    if (!el) return;
+    const digits = String(el.value || '').replace(/\D/g, '').slice(0, 6);
+    if (digits !== el.value) el.value = digits;
+    state.pairCodeInput = digits;
+    const submit = root.querySelector('[data-system-action="api-approve-pairing-by-code"]');
+    if (submit) submit.disabled = digits.length !== 6 || Boolean(state.pairWorking);
+  }
+
+  /*
+   * 按码审批：管理员把手机上的码输进来，后端用它定位那一行待批请求。
+   * App 侧在轮询 pair/status，转为 approved 后会自己调 confirm，这里不需要再做什么。
+   */
+  async function approveAppPairingByCode() {
+    if (state.pairWorking) return;
+    const code = String(state.pairCodeInput || '').trim();
+    if (!/^[0-9]{6}$/.test(code)) {
+      state.pairCodeError = '请输入手机上显示的 6 位配对码。';
+      render();
+      return;
+    }
+    state.pairWorking = true;
+    state.pairCodeError = '';
+    render();
+    try {
+      await postJson('/api/v1/auth/pair/approve-by-code', { code, approve: true });
+      state.pairCodeInput = '';
+      state.saveError = '';
+      /* 让下一轮 devices 轮询把 pairState 翻成 'paired'。 */
+      pollPairingProgress();
+    } catch (error) {
+      state.pairCodeError = pairCodeErrorText(error);
+    } finally {
+      state.pairWorking = false;
+      render();
+    }
+  }
+
+  /*
+   * 取后端错误码。这个端点会回两种**形状不同**的错误体，不能只看一处：
+   *   pair_error()/限速   {"ok":false,"error":"invalid_pair_code","message":"…"}   error 是字符串
+   *   webd_error()（403）  {"ok":false,"error":{"code":"…","message":"…"}}          error 是对象
+   * postJson() 抛出的 Error.message 在第一种形状下只拿到英文散文（因为字符串没有
+   * .message/.code），所以必须回到 payload 上取码，否则下面的匹配永远不命中。
+   */
+  function pairCodeErrorCode(error) {
+    const payload = error?.payload;
+    const raw = payload && payload.error;
+    if (typeof raw === 'string') return raw;
+    if (raw && typeof raw.code === 'string') return raw.code;
+    return '';
+  }
+
+  /*
+   * 把错误码翻成人话。限速命中必须说清楚是"被锁定"而不是"码不对"，
+   * 否则管理员会当成输错而反复重试，只会把锁定时间续得更长。
+   */
+  function pairCodeErrorText(error) {
+    const code = pairCodeErrorCode(error);
+    const status = Number(error?.status || 0);
+    const retryAfter = Number(error?.payload?.retry_after || 0);
+    if (code === 'pair_code_ambiguous') return '有多个待批请求匹配该码，请先在 App 上取消其中一个再重试。';
+    if (code === 'invalid_pair_code') return '配对码不正确，或该请求已过期（配对码有效期 5 分钟）。';
+    if (code === 'pair_not_pending') return '该配对请求已不在待批状态，请在 App 上重新发起配对。';
+    if (code === 'pair_role_resolve_failed') return '待批请求的角色状态读不出来，已拒绝授权；请重新发起配对。';
+    if (code === 'pair_code_query_failed') return '配对状态暂时不可用，请稍后重试。';
+    /* 限速表写不进去时后端拒绝放行，这里必须说明是后端状态问题，
+     * 否则只会显示一句英文散文，管理员无从判断该不该重试。 */
+    if (code === 'auth_failure_record_unavailable') return '登录失败计数暂时无法写入，为安全起见已拒绝本次批准；请稍后重试。';
+    if (/_locked$|_banned$|^pair_approve_locked$/.test(code) || status === 429) {
+      return retryAfter > 0
+        ? `错误尝试过多，已被暂时锁定，请 ${retryAfter} 秒后再试。`
+        : '错误尝试过多，已被暂时锁定，请稍后再试。';
+    }
+    if (code === 'web_owner_session_required' || status === 403) return '需要 Web owner 会话才能批准配对。';
+    return error?.message || '配对失败，请确认配对码与当前会话权限。';
+  }
+
   async function cancelAppPairing() {
     if (state.pairWorking) return;
     const pairId = appDeviceId(state.pairCandidate || {});
@@ -6091,6 +6158,10 @@ export function mount(context = {}) {
   }
 
   async function revokeAppDevice(id) {
+    /*
+     * 走到这里说明用户点的是「撤销」。停用/启用另有确认窗，不共用这条路径：
+     * 撤销不可逆（要重新配对），停用可逆（重新登录即可）。
+     */
     if (!id || state.deviceWorking) return;
     state.deviceWorking = id;
     render();
@@ -6106,177 +6177,188 @@ export function mount(context = {}) {
     }
   }
 
-  /* ── API-Key 写操作 ── */
-
-  function apiKeyDraftDefaults() {
-    return { name: '', tier: 'read_only', expires_days: '', allow_ips: '' };
-  }
-
   /*
-   * 表单输入只更新 state.apiKeyDraft，不整页 rerender —— 每敲一个字符重绘会让
-   * 输入框失焦（design.md 系统设置子页规则 6 记的就是这个坑）。
-   * 创建按钮的禁用态因此单独更新。
+   * 停用/启用先开确认窗，不直接写。停用会吊销令牌，属于用户可感知的副作用，
+   * 后果必须在动手之前讲清楚。
    */
-  function onApiKeyDraftInput(event) {
-    const el = event.currentTarget;
-    if (!el) return;
-    const field = el.dataset.systemApiKeyField;
-    if (!field) return;
-    state.apiKeyDraft = { ...(state.apiKeyDraft || apiKeyDraftDefaults()), [field]: el.value };
-    const submit = root.querySelector('[data-system-action="api-key-create-submit"]');
-    if (submit) submit.disabled = !String(state.apiKeyDraft.name || '').trim() || Boolean(state.apiKeyWorking);
-  }
-
-  function openApiKeyConfirm(action, keyId) {
-    if (!keyId) return;
-    const row = (Array.isArray(state.apiKeys) ? state.apiKeys : []).find((item) => String(item?.key_id || '') === keyId);
-    state.apiKeyConfirm = { action, keyId, name: String(row?.name || keyId) };
-    state.apiKeyError = '';
-    render();
-  }
-
-  function openApiKeyAudit(keyId) {
-    if (!keyId) return;
-    state.apiKeyAuditFor = keyId;
-    state.apiKeyAudit = [];
-    state.apiKeyAuditError = '';
-    state.apiKeyDialog = 'audit';
-    loadApiKeyAudit(keyId, true);
-  }
-
-  /*
-   * 复制明文。只从内存中的 state.apiKeyPlaintext 读，不额外留副本；
-   * 剪贴板不可用时退回选中复制。不写 localStorage / sessionStorage，也不进任何日志。
-   */
-  async function copyApiKeyPlaintext(button) {
-    const value = String(state.apiKeyPlaintext || '');
-    if (!value || !button) return;
-    let ok = false;
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(value);
-        ok = true;
-      }
-    } catch (_) {
-      ok = false;
-    }
-    if (!ok) ok = copyFingerprintFallback(value);
-    if (button.dataset.systemCopyBusy === '1') return;
-    button.dataset.systemCopyBusy = '1';
-    const original = button.textContent;
-    button.textContent = ok ? '已复制' : '复制失败';
-    button.classList.add(ok ? 'is-copied' : 'is-copy-failed');
-    window.setTimeout(() => {
-      button.textContent = original;
-      button.classList.remove('is-copied', 'is-copy-failed');
-      delete button.dataset.systemCopyBusy;
-    }, ok ? 1100 : 1400);
-  }
-
-  function openApiKeyCreate() {
-    state.apiKeyDraft = apiKeyDraftDefaults();
-    state.apiKeyError = '';
-    state.apiKeyDialog = 'create';
-    render();
-  }
-
-  /*
-   * 关闭任一 API-Key 弹窗。明文 key 在这里被清掉：这是它唯一的生命周期终点，
-   * 内存之外没有第二份副本，关掉就真的再也读不到了。
-   */
-  function closeApiKeyDialog() {
-    state.apiKeyDialog = '';
-    state.apiKeyDraft = null;
-    state.apiKeyPlaintext = '';
-    state.apiKeyCreated = null;
-    state.apiKeyConfirm = null;
-    state.apiKeyError = '';
-    state.apiKeyAuditFor = '';
-    state.apiKeyAudit = null;
-    state.apiKeyAuditError = '';
-    render();
-  }
-
-  async function createApiKey() {
-    const draft = state.apiKeyDraft || apiKeyDraftDefaults();
-    const name = String(draft.name || '').trim();
-    if (!name || state.apiKeyWorking) return;
-    const days = Number(draft.expires_days || 0);
-    const body = {
-      name,
-      tier: draft.tier === 'control' ? 'control' : 'read_only',
-      allow_ips: String(draft.allow_ips || '').trim()
+  function openDeviceEnabledConfirm(node) {
+    const id = node?.dataset?.apiId || '';
+    if (!id || state.deviceWorking) return;
+    state.deviceConfirm = {
+      id,
+      name: node?.dataset?.apiName || '',
+      /* 当前是启用态就要停用，反之要启用。 */
+      enabled: node?.dataset?.apiEnabled !== '1'
     };
-    /*
-     * 留空即长期有效（用户 08-07 拍板：允许长期 key，不强制过期）。
-     * 后端要的是绝对时间戳（秒），且拒绝过去的时间，所以按天换算。
-     */
-    if (days > 0) body.expires_at = Math.floor(Date.now() / 1000) + Math.round(days * 86400);
-    state.apiKeyWorking = 'create';
-    state.apiKeyError = '';
+    state.deviceMessage = '';
+    state.saveError = '';
+    render();
+  }
+
+  /*
+   * 改设备角色。控件早就渲染出来了，但没有任何 change 绑定，
+   * 于是选了之后什么也不发生 —— 这里补上真正的写入。
+   * `role_changed` 为假说明后端认为角色没变（例如选回原值），不当成失败。
+   */
+  async function changeAppDeviceRole(id, nextRole) {
+    const role = String(nextRole || '').trim();
+    if (!id || !role || state.deviceWorking) return;
+    state.deviceWorking = id;
+    state.deviceMessage = '';
     render();
     try {
-      const result = await postJson('/api/v1/auth/api-keys', body);
+      const result = await fetchJson(`/api/v1/auth/devices/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role })
+      });
       const payload = result?.data && typeof result.data === 'object' ? result.data : result;
-      state.apiKeyPlaintext = String(payload?.api_key || '');
-      state.apiKeyCreated = {
-        key_id: String(payload?.key_id || ''),
-        name: String(payload?.name || name),
-        tier: String(payload?.tier || body.tier),
-        expires_at: Number(payload?.expires_at || 0)
-      };
-      state.apiKeyDialog = 'created';
-      state.apiKeyDraft = null;
-      await loadApiKeys(false);
+      applyDevicePatchResult(payload);
+      state.deviceMessage = payload?.role_changed === false
+        ? '角色未变化。'
+        : `角色已改为${systemDeviceRoleLabel(role)}。`;
+      state.saveError = '';
     } catch (error) {
-      state.apiKeyError = apiKeyErrorText(error);
+      /* 后端的拒绝原因原样呈现，不吞成「操作失败」。 */
+      state.saveError = deviceWriteErrorText(error, '角色修改失败');
+      await loadAppDevices(false);
     } finally {
-      state.apiKeyWorking = '';
-      render();
-    }
-  }
-
-  async function commitApiKeyConfirm() {
-    const pending = state.apiKeyConfirm;
-    if (!pending || state.apiKeyWorking) return;
-    const { action, keyId } = pending;
-    state.apiKeyWorking = `${action}:${keyId}`;
-    render();
-    try {
-      if (action === 'revoke') {
-        await postJson(`/api/v1/auth/api-keys/${encodeURIComponent(keyId)}/revoke`, {});
-      } else {
-        await fetchJson(`/api/v1/auth/api-keys/${encodeURIComponent(keyId)}`, { method: 'DELETE' });
-      }
-      state.apiKeyConfirm = null;
-      state.apiKeyError = '';
-      await loadApiKeys(false);
-    } catch (error) {
-      state.apiKeyError = apiKeyErrorText(error);
-    } finally {
-      state.apiKeyWorking = '';
+      state.deviceWorking = '';
       render();
     }
   }
 
   /*
-   * 后端错误码转人话。命中不了就原样透出后端消息，不编一句更好听的
-   * ——猜错原因比说不清原因更难排查。
+   * 启用/停用已绑定 App。与「撤销」的区别是可逆：撤销要重新配对，
+   * 停用只吊销令牌，设备重新登录即可恢复。
    */
-  function apiKeyErrorText(error) {
-    const code = String(error?.payload?.error?.code || '');
-    const map = {
-      invalid_name: '名称不合法：只能包含字母、数字、空格和 - _ .，且不能为空。',
-      invalid_tier: '权限档不合法。',
-      invalid_allow_ips: 'IP 白名单格式不对：请用逗号分隔的 IP 或 CIDR。',
-      expires_at_in_past: '有效期必须是将来的时间。',
-      scope_too_long: '权限范围文档过长。',
-      key_not_found: '这把 key 已经不存在了，列表可能不是最新的。',
-      api_key_create_failed: '后端创建失败，key 未生成。',
-      api_key_store_unavailable: 'key 存储不可读。',
-      api_key_self_management_forbidden: 'API-Key 不能用来管理 API-Key，请用网页会话身份操作。'
-    };
-    return map[code] || error?.message || '操作失败';
+  async function setAppDeviceEnabled(id, enabled) {
+    if (!id || state.deviceWorking) return;
+    state.deviceWorking = id;
+    state.deviceMessage = '';
+    render();
+    try {
+      const result = await fetchJson(`/api/v1/auth/devices/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: Boolean(enabled) })
+      });
+      const payload = result?.data && typeof result.data === 'object' ? result.data : result;
+      applyDevicePatchResult(payload);
+      state.deviceMessage = enabled
+        ? '设备已启用，可重新登录。'
+        : '设备已停用，其令牌已吊销，需重新登录才能恢复。';
+      state.saveError = '';
+    } catch (error) {
+      state.saveError = deviceWriteErrorText(error, enabled ? '启用失败' : '停用失败');
+      await loadAppDevices(false);
+    } finally {
+      state.deviceWorking = '';
+      render();
+    }
+  }
+
+  /*
+   * PATCH 成功时后端直接带回刷新后的 devices[]，用它重渲染，
+   * 省掉一次 GET，也避免两次请求之间的状态闪烁。带不回来才回读。
+   */
+  function applyDevicePatchResult(payload) {
+    const devices = Array.isArray(payload?.devices) ? payload.devices : null;
+    if (!devices) {
+      loadAppDevices(false);
+      return;
+    }
+    state.data = mergeSystemSettingsValue(state.data, { api: { paired_devices: devices } });
+  }
+
+  /*
+   * 后端对这条路由的四种拒绝各有措辞（-5/-6/-7/-8），必须原样带给用户：
+   * 「不能停用当前登录设备」和「事务不可用，稍后重试」是完全不同的处置。
+   */
+  const SYSTEM_DEVICE_WRITE_REASONS = {
+    'owner role changes require owner': '改动 owner 角色需要 owner 身份。',
+    'owner device enabled changes require owner': '改动 owner 设备的启用状态需要 owner 身份。',
+    'cannot remove last owner': '这是最后一个 owner，不能改成其他角色。',
+    'cannot disable last owner': '这是最后一个 owner，不能停用。',
+    'cannot disable current app device': '不能停用当前正在使用的设备。',
+    'device state transaction unavailable': '设备状态事务不可用，请稍后重试。',
+    'device not found or unchanged': '设备不存在，或本次没有任何变化。',
+    'invalid role': '角色取值无效。'
+  };
+
+  function deviceWriteErrorText(error, fallback) {
+    const raw = String(error?.payload?.message || error?.message || '').trim();
+    const mapped = SYSTEM_DEVICE_WRITE_REASONS[raw];
+    if (mapped) return mapped;
+    return raw ? `${fallback}：${raw}` : fallback;
+  }
+
+  /*
+   * 注册到云端。不带 force 时后端组件返回 `already_enrolled` 且 **HTTP 200 / ok:true**
+   * （cloud_ubus.c:343），所以它不会走到 catch 里 —— 必须读 code 才能识别。
+   * 这是「需要用户确认是否强制」的信号，不是失败，因此这里把它转成确认窗，
+   * 而不是报错。
+   */
+  async function enrollCloud(force = false) {
+    if (state.cloudWorking) return;
+    state.cloudWorking = force ? 'reenroll' : 'enroll';
+    state.cloudMessage = '';
+    state.cloudActionError = '';
+    render();
+    try {
+      const result = await postJson('/api/v1/cloud/enroll', force ? { force: true } : {});
+      const payload = result?.data && typeof result.data === 'object' ? result.data : result;
+      const code = String(result?.code || payload?.code || '').trim();
+      if (!force && code === 'already_enrolled') {
+        /* 已有令牌。要替换必须显式强制，交回用户确认。 */
+        state.cloudWorking = '';
+        state.cloudConfirm = 'enroll-force';
+        render();
+        return;
+      }
+      state.cloudMessage = code === 'enrollment_start_failed'
+        ? '注册未能启动，请稍后重试。'
+        : '注册已提交，正在等待云端确认，可稍候查看进度。';
+    } catch (error) {
+      state.cloudActionError = cloudWriteErrorText(error, '注册失败');
+    } finally {
+      state.cloudWorking = '';
+      await loadCloudStatus(false);
+      render();
+    }
+  }
+
+  /*
+   * 停用远程接入。后端要求 body 带 `confirm: true`，否则回 409 requires_confirm
+   * （jmx_app_api.c 的 cloud/disable）。确认窗已经承担了这个确认语义，
+   * 所以这里直接带上，不让用户在窗里点完确认还撞一次 409。
+   */
+  async function disableCloudRelay() {
+    if (state.cloudWorking) return;
+    state.cloudWorking = 'disable';
+    state.cloudMessage = '';
+    state.cloudActionError = '';
+    render();
+    try {
+      await postJson('/api/v1/cloud/disable', { confirm: true });
+      state.cloudMessage = '远程接入已停用，走中继的 App 会失去连接；局域网管理与 SSH 不受影响。';
+    } catch (error) {
+      state.cloudActionError = cloudWriteErrorText(error, '停用失败');
+    } finally {
+      state.cloudWorking = '';
+      await loadCloudStatus(false);
+      render();
+    }
+  }
+
+  function cloudWriteErrorText(error, fallback) {
+    const payload = error?.payload || {};
+    const detail = payload?.error && typeof payload.error === 'object' ? payload.error : {};
+    const code = String(detail.code || payload.code || '').trim();
+    const raw = String(detail.message || payload.message || error?.message || '').trim();
+    if (code === 'requires_confirm') return '此操作需要确认后才会执行。';
+    if (code === 'signing_key_unknown') return `${fallback}：云端不认识本机的签名密钥。`;
+    return raw ? `${fallback}：${raw}` : fallback;
   }
 
   async function loadSystemSettings() {
@@ -6293,7 +6375,7 @@ export function mount(context = {}) {
       state.saveError = '';
       render();
       if (page === 'admin') {
-        await Promise.allSettled([loadTwofaStatus(false), loadAppDevices(false), loadCloudStatus(false), loadApiKeys(false)]);
+        await Promise.allSettled([loadTwofaStatus(false), loadAppDevices(false), loadCloudStatus(false)]);
         if (!state.mounted || loadId !== state.seq) return;
         render();
       }
@@ -6380,6 +6462,7 @@ export function mount(context = {}) {
     if (!dirty() || state.saving) return;
     state.saving = true;
     state.saveError = '';
+    state.saveErrorDetail = null;
     render();
     const draft = systemSettingsSaveDraft();
     let specialUpdates = {};
@@ -6389,6 +6472,7 @@ export function mount(context = {}) {
     } catch (error) {
       state.saving = false;
       state.saveError = error?.message || 'apply failed';
+      state.saveErrorDetail = systemSaveErrorDetail(error);
       render();
       return;
     }
@@ -6416,7 +6500,48 @@ export function mount(context = {}) {
     }
     state.saving = false;
     state.saveError = lastError?.message || 'save endpoint unavailable';
+    state.saveErrorDetail = systemSaveErrorDetail(lastError);
     render();
+  }
+
+  /*
+   * 从失败响应里抠出字段级原因。后端 capabilities 自述有
+   * `system_settings_field_results`。30.1 实测（直打 core）的真实形状是
+   * field/capability/reason 挂在 `data` 上，`field_results` 是**以字段名为键的对象**
+   * 而不是数组：
+   *
+   *   { code: 4000, data: { ok:false, error:"capability_disabled",
+   *       field:"general.ntp_servers", capability:"general_time_write",
+   *       reason:"transactional_runtime_executor_pending",
+   *       field_results:{ "general.ntp_servers": { supported:false, capability:…, reason:… } } } }
+   *
+   * webd 走 HTTP 时可能再包一层 `error` 对象，所以两种位置都认；`field_results`
+   * 对象/数组两种形态也都认。取不到就返回 null，文案退回原文。
+   */
+  function systemSaveErrorDetail(error) {
+    const payload = error && error.payload && typeof error.payload === 'object' ? error.payload : null;
+    if (!payload) return null;
+    const err = payload.error && typeof payload.error === 'object' ? payload.error : {};
+    const data = payload.data && typeof payload.data === 'object' ? payload.data : {};
+    const raw = data.field_results || err.field_results;
+    let failedField = '';
+    let failed = {};
+    if (Array.isArray(raw)) {
+      const hit = raw.find((item) => item && item.supported === false) || raw.find((item) => item && item.ok === false);
+      if (hit) { failed = hit; failedField = hit.field || ''; }
+    } else if (raw && typeof raw === 'object') {
+      const key = Object.keys(raw).find((name) => raw[name] && (raw[name].supported === false || raw[name].ok === false))
+        || Object.keys(raw)[0];
+      if (key) { failed = raw[key] || {}; failedField = key; }
+    }
+    const field = err.field || data.field || failedField || '';
+    if (!field) return null;
+    return {
+      field,
+      capability: err.capability || data.capability || failed.capability || '',
+      reason: err.reason || data.reason || failed.reason || '',
+      code: err.code || data.error || payload.code || ''
+    };
   }
 
   function systemSettingsSaveDraft() {
@@ -6451,6 +6576,37 @@ export function mount(context = {}) {
     if (Object.keys(admin).length) payload.admin = admin;
     else delete payload.admin;
     delete payload.admins;
+    return systemSettingsFilterTouchedSections(payload);
+  }
+
+  /*
+   * `general` / `advanced` / `ssh` 收敛成「只带 touched 且可写的字段」。
+   *
+   * 这三节原先是把整个 GET 快照回传，其中包含 normalizer 造出来的默认值，于是
+   * 「只改主机名」会连带提交 zram 256 / lz4 / ntp_servers ['']，被后端 fail-closed
+   * 整页拒掉。`admin` 早就是按 touched 组装的，这里把同一套做法推广到其余三节。
+   *
+   * 取值一律取 `payload`（即 draft + specialUpdates 合并后的当前值），不是 normalizer
+   * 的兜底值——兜底值只服务渲染，不进 payload。
+   */
+  const SYSTEM_TOUCH_FILTERED_SECTIONS = ['general', 'advanced', 'ssh'];
+
+  function systemSettingsFilterTouchedSections(payload) {
+    SYSTEM_TOUCH_FILTERED_SECTIONS.forEach((section) => {
+      const source = payload[section];
+      if (!source || typeof source !== 'object' || Array.isArray(source)) return;
+      const next = {};
+      state.touchedFields.forEach((path) => {
+        if (!path.startsWith(`${section}.`)) return;
+        const key = path.slice(section.length + 1);
+        if (!key || key.includes('.')) return;
+        if (!systemFieldWritable(path)) return;
+        if (!Object.prototype.hasOwnProperty.call(source, key)) return;
+        next[key] = source[key];
+      });
+      if (Object.keys(next).length) payload[section] = next;
+      else delete payload[section];
+    });
     return payload;
   }
 

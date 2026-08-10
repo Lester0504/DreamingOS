@@ -745,6 +745,46 @@ static struct json_object *aegisxd_capabilities_json(void)
     json_object_object_add(cap, "policy_hit_log_schema", json_object_new_boolean(1));
     json_object_object_add(cap, "policy_hit_logging", json_object_new_boolean(1));
     json_object_object_add(cap, "dns_filter_hit_logging", json_object_new_boolean(1));
+    /*
+     * Collection scope for the traffic log. Distinct from the two bits above,
+     * and the distinction is the whole point:
+     *
+     *   policy_hit_logging / dns_filter_hit_logging  whether a category of hit
+     *                                                is logged at all
+     *   traffic_log_scope                            of what is logged, keep
+     *                                                everything or only the
+     *                                                hits that were blocked
+     *
+     * So the two are a source filter and this is a verdict filter; neither
+     * subsumes the other, and scope 'blocked' does not turn either of them off.
+     * Both spellings are advertised because the frontend accepts either
+     * (aegisx.js reads traffic_log_scope_supported first).
+     */
+    json_object_object_add(cap, "traffic_log_scope_supported", json_object_new_boolean(1));
+    json_object_object_add(cap, "traffic_logging_scope_supported", json_object_new_boolean(1));
+    {
+        struct json_object *values = json_object_new_array();
+
+        json_object_array_add(values, json_object_new_string("all"));
+        json_object_array_add(values, json_object_new_string("blocked"));
+        json_object_object_add(cap, "traffic_log_scope_values", values);
+    }
+    json_object_object_add(cap, "traffic_log_scope_write_endpoint",
+                           json_object_new_string("/api/v1/aegis/settings"));
+    /* Scope covers security events, not forwarded traffic: 'all' is bounded by
+     * hit volume, which is why this needs no sampling or rate limit. */
+    json_object_object_add(cap, "traffic_log_scope_domain",
+                           json_object_new_string("security_events"));
+    json_object_object_add(cap, "traffic_log_source_toggles_supported",
+                           json_object_new_boolean(1));
+    /* The three sources have an enabled flag only; scope is global by design. */
+    json_object_object_add(cap, "traffic_log_per_source_scope",
+                           json_object_new_boolean(0));
+    json_object_object_add(cap, "traffic_log_scope_retroactive",
+                           json_object_new_boolean(0));
+    /* The scope filter runs inside each hit producer, so it governs what is
+     * written and not only what is displayed. */
+    json_object_object_add(cap, "traffic_log_scope_enforced", json_object_new_boolean(1));
     json_object_object_add(cap, "dns_filter_hit_producer", json_object_new_boolean(1));
     json_object_object_add(cap, "dns_filter_hit_log_work_file", json_object_new_boolean(1));
     json_object_object_add(cap, "dns_filter_client_attribution", json_object_new_boolean(1));
@@ -782,9 +822,9 @@ static struct json_object *aegisxd_capabilities_json(void)
     aegisxd_json_add_string(cap, "content_filter_safe_search_merge", "logical_or");
     json_object_object_add(cap, "content_filter_safe_search_dnsmasq_artifact",
                            json_object_new_boolean(1));
-    json_object_object_add(cap, "content_filter_schedule_supported", json_object_new_boolean(0));
+    json_object_object_add(cap, "content_filter_schedule_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "content_filter_all_scope_supported", json_object_new_boolean(1));
-    json_object_object_add(cap, "content_filter_device_scope_supported", json_object_new_boolean(0));
+    json_object_object_add(cap, "content_filter_device_scope_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "content_filter_network_scope_supported", json_object_new_boolean(0));
     json_object_object_add(cap, "pcdn_filter_supported", json_object_new_boolean(1));
     json_object_object_add(cap, "pcdn_feed_update", json_object_new_boolean(1));
@@ -993,6 +1033,53 @@ struct json_object *aegisxd_status_json(void)
                            json_object_new_int(settings.suricata_queue_num));
     json_object_object_add(resp, "suricata_fail_open",
                            json_object_new_boolean(settings.suricata_fail_open));
+    /*
+     * Traffic-log collection scope, read back so the UI shows the stored choice
+     * rather than a default. Nested under one object plus flat mirrors of the
+     * two the frontend reads directly.
+     */
+    aegisxd_json_add_string(resp, "traffic_log_scope", settings.traffic_log_scope);
+    {
+        struct json_object *log = json_object_new_object();
+        struct json_object *sources = json_object_new_object();
+
+        aegisxd_json_add_string(log, "scope", settings.traffic_log_scope);
+        json_object_object_add(sources, "gateway_dns",
+                               json_object_new_boolean(settings.traffic_log_gateway_dns));
+        json_object_object_add(sources, "aegisx_service",
+                               json_object_new_boolean(settings.traffic_log_aegisx_service));
+        json_object_object_add(sources, "device_admin",
+                               json_object_new_boolean(settings.traffic_log_device_admin));
+        json_object_object_add(log, "sources", sources);
+        /*
+         * Scope filters what gets written from now on; it does not rewrite or
+         * delete what is already stored. Said in the payload so the UI can be
+         * honest about it instead of implying a retroactive change.
+         */
+        json_object_object_add(log, "applies_to",
+                               json_object_new_string("future_writes_only"));
+        json_object_object_add(log, "history_rewritten",
+                               json_object_new_boolean(0));
+        /*
+         * Whether the setting is enforced on the write path, not merely stored.
+         * The first cut of this feature stored and read back the scope while
+         * every producer still logged everything, so the distinction is worth
+         * reporting rather than leaving the UI to assume it.
+         */
+        json_object_object_add(log, "enforced_on_write",
+                               json_object_new_boolean(1));
+        {
+            struct json_object *producers = json_object_new_array();
+
+            json_object_array_add(producers, json_object_new_string("dns_filter"));
+            json_object_array_add(producers, json_object_new_string("nft_counter"));
+            json_object_array_add(producers, json_object_new_string("reputation_flow"));
+            json_object_array_add(producers, json_object_new_string("suricata_eve"));
+            json_object_array_add(producers, json_object_new_string("policy_route"));
+            json_object_object_add(log, "enforced_producers", producers);
+        }
+        json_object_object_add(resp, "traffic_log", log);
+    }
     aegisxd_add_ids_ips_runtime_fields(resp, aegisxd_suricata_binary_path());
     json_object_object_add(resp, "apply_enabled", json_object_new_boolean(1));
     json_object_object_add(resp, "dataplane_enabled", json_object_new_boolean(access("/run/dreamingwrt/aegis/active.json", F_OK) == 0));

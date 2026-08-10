@@ -7,9 +7,26 @@ CORE = (ROOT / "src/jmx_dreamingwrt_api.c").read_text(encoding="utf-8")
 WEB = (ROOT / "src/webd/jmx_app_api.c").read_text(encoding="utf-8")
 
 
+def check(condition: bool, reason: str) -> None:
+    """Assert with a reason.
+
+    Bare `assert token in blob` and `str.index` report an empty AssertionError or
+    a ValueError traceback, which cannot distinguish a stale assertion from a
+    real regression without reading the source. Say what was expected instead.
+    """
+    if not condition:
+        raise AssertionError(reason)
+
+
 def body(text: str, start: str, end: str) -> str:
-    begin = text.index(start)
-    finish = text.index(end, begin)
+    try:
+        begin = text.index(start)
+    except ValueError:
+        raise AssertionError(f"anchor not found in source: {start!r}") from None
+    try:
+        finish = text.index(end, begin)
+    except ValueError:
+        raise AssertionError(f"closing anchor not found after {start!r}: {end!r}") from None
     return text[begin:finish]
 
 
@@ -31,9 +48,20 @@ def test_split_worker_sampler_uses_monotonic_deltas_and_truthful_completeness() 
         "DW_CLIENT_ACTIVE_RATE_THRESHOLD_BPS",
         "ring->today_sample_count++",
     ):
-        assert token in sampler
-    assert sampler.index("if (!client->mac[0] || !client->online)") < sampler.index(
-        "dw_client_today_add_interval(client, start, now, active)"
+        check(token in sampler, f"sampler lost {token!r}")
+    # The offline guard must precede the accumulate call, otherwise an offline
+    # client's interval still lands in the hourly buckets. Match the call by
+    # prefix rather than by a full argument list: the callee grew up_rate and
+    # down_rate parameters and is now split across lines, so the old exact
+    # string "dw_client_today_add_interval(client, start, now, active)" no
+    # longer occurs and str.index raised ValueError instead of checking order.
+    guard = "if (!client->mac[0] || !client->online)"
+    accumulate = "dw_client_today_add_interval(client, start, now, active"
+    check(guard in sampler, f"sampler lost the offline guard {guard!r}")
+    check(accumulate in sampler, f"sampler lost the accumulate call {accumulate!r}")
+    check(
+        sampler.index(guard) < sampler.index(accumulate),
+        "the offline guard must run before dw_client_today_add_interval",
     )
 
     handler = body(
@@ -131,7 +159,9 @@ def test_total_rate_ring_is_not_exposed_as_unknown_protocol_history() -> None:
     assert '"total_only_separate_from_protocol_history"' in summary
     assert '"per_app_protocol_hot_window_separate_from_client_total_ring"' in summary
     assert 'app_nc_json_str(protocol_history, "source", "unavailable")' in summary
-    assert '"same_flow_adjacent_counter_delta"' in summary
+    assert '"monotonic_client_app_counter_delta"' in summary
+    assert '"rate_history_fallback_available"' in summary
+    assert "protocol_history_fallback_available" in summary
     assert "client_runtime_total_unknown_category" not in summary
     assert 'json_object_object_add(cats, "unknown"' not in summary
 

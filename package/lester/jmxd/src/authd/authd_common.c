@@ -98,6 +98,14 @@ struct json_object *authd_capabilities_json(void)
     json_object_object_add(cap, "delegated_crud", json_object_new_boolean(1));
     json_object_object_add(cap, "delegated_import", json_object_new_boolean(1));
     json_object_object_add(cap, "delegated_runtime_apply", json_object_new_boolean(0));
+    /*
+     * The delegated interface is enumerable and optional. Without these two
+     * flags the UI cannot tell "old build, keep the free-text box" from "new
+     * build, render a picker", and an empty submit used to fail outright with
+     * delegated_interface_not_found.
+     */
+    json_object_object_add(cap, "delegated_interface_options", json_object_new_boolean(1));
+    json_object_object_add(cap, "delegated_interface_optional", json_object_new_boolean(1));
     json_object_object_add(cap, "write_notifications", json_object_new_boolean(1));
     json_object_object_add(cap, "notification_config_write", json_object_new_boolean(1));
     json_object_object_add(cap, "notification_periodic_crud", json_object_new_boolean(1));

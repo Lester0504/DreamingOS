@@ -2,8 +2,12 @@
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -180,20 +184,9 @@ def json_c_flags() -> list[str]:
     explicit = os.environ.get("WEBD_VPN_TEST_FLAGS", "").strip()
     if explicit:
         return shlex.split(explicit)
-    candidates = [Path("/opt/homebrew/opt/json-c")]
-    candidates.extend(Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c").glob("*"))
-    for prefix in candidates:
-        header = prefix / "include/json-c/json.h"
-        static = prefix / "lib/libjson-c.a"
-        dynamic = prefix / "lib/libjson-c.dylib"
-        if header.is_file() and static.is_file():
-            return [f"-I{prefix / 'include'}", str(static)]
-        if header.is_file() and dynamic.is_file():
-            return [f"-I{prefix / 'include'}", f"-L{prefix / 'lib'}", "-ljson-c"]
-    output = subprocess.check_output(
-        ["pkg-config", "--cflags", "--libs", "json-c"], text=True
-    )
-    return shlex.split(output)
+    # WEBD_VPN_TEST_FLAGS still wins. The old search tried Homebrew's static
+    # archive first, which on 31.6 is an LTO archive the host linker rejects.
+    return apd_test_deps.package_flags("json-c")
 
 
 def main() -> None:

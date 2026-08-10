@@ -59,6 +59,13 @@ struct json_object *authd_ledger_json(struct json_object *query);
 struct json_object *authd_account_management_json(struct json_object *query);
 struct json_object *authd_vouchers_json(struct json_object *query);
 struct json_object *authd_delegated_json(struct json_object *query);
+/*
+ * Delegated dialing has to name a real WAN. Both helpers read the shared
+ * config.db `wan` table so the picker the UI offers and the value the write
+ * path accepts can never drift apart.
+ */
+struct json_object *authd_delegated_interface_options(void);
+int authd_delegated_interface_default(char *out, size_t out_len);
 struct json_object *authd_notifications_json(void);
 struct json_object *authd_package_upsert(struct json_object *request);
 struct json_object *authd_package_delete(struct json_object *request);

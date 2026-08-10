@@ -143,11 +143,37 @@ def test_local_ubus_has_bounded_management_and_public_readback() -> None:
         "radio_job_create", "radio_job_status", "radio_job_cancel",
         "radio_job_result", "radio_job_list", "radio_job_latest_results",
         "survey_history", "station_events", "wifi_transaction_validate",
+        # Read-only enumeration of APs seen on the wire but not yet adopted.
+        "discovery_list",
+        # Inventory-only write. Its policy accepts exactly ap_id, name and
+        # model_override; ac_db_ap_update() UPDATEs only those two label columns
+        # on ac_aps WHERE adoption_state='adopted', bumps no desired_revision,
+        # and opens no session to the AP. So it cannot reach AP configuration
+        # and does not widen the frozen transactional-apply surface. Renaming
+        # an AP is deliberately available while apply stays closed.
+        "ap_update",
+        # Periodic survey scheduling. Bounded on purpose and justified before
+        # being allowed through this gate:
+        #   * survey_schedule_get is read-only.
+        #   * survey_schedule_set writes one settings row (enabled +
+        #     interval_seconds) and creates no job itself; the uloop tick does,
+        #     through ac_db_radio_job_create() with the same eligibility checks
+        #     the manual path enforces.
+        #   * mode is fixed at 'survey' by a schema CHECK and the set policy
+        #     accepts no mode field, so neighbour scans -- the only mode that
+        #     leaves the working channel and interrupts clients -- cannot be
+        #     scheduled. A survey job dwells on the in-use channel reading
+        #     driver airtime counters.
+        # So this reaches no AP configuration and does not widen the frozen
+        # transactional-apply surface.
+        "survey_schedule_get",
+        "survey_schedule_set",
     }, (
         "AC ubus must expose only health, managed-AP readback, administrator "
         "pairing-token methods, the bounded radio scan job control plane, "
         "the bounded survey/station-event history queries and the read-only "
-        "W1 transaction validate; "
+        "W1 transaction validate, plus discovery enumeration and the "
+        "inventory-only ap_update; "
         f"actual methods: {sorted(ac_methods)}"
     )
     validate_body = function_body(ac_ubus,
@@ -168,9 +194,35 @@ def test_local_ubus_has_bounded_management_and_public_readback() -> None:
     assert "pairing_token_redeem" not in ac_methods, (
         "node token redemption must not be exposed by the local management ubus"
     )
-    assert apd_methods == {"status", "capabilities", "identity", "pairing_status"}, (
-        "APD ubus must expose only health, identity, and non-secret pairing readback; "
+    assert apd_methods == {
+        "status", "capabilities", "identity", "pairing_status",
+        # Destructive but AP-local and consent-gated: apd_unpair_json() refuses
+        # without {"confirm": true}, and it only clears this AP's own
+        # certificate, enrollment, bootstrap and pairing state. It revokes an
+        # adoption rather than configuring anything, and its REST path
+        # /api/v1/apd/unpair is registered JMX_RISK_HIGH, so viewer and operator
+        # roles cannot reach it.
+        "unpair",
+    }, (
+        "APD ubus must expose only health, identity, non-secret pairing "
+        "readback, and the consent-gated AP-local unpair; "
         f"actual methods: {sorted(apd_methods)}"
+    )
+    # ubus_methods() only sees the UBUS_METHOD macros, so a method declared with
+    # a plain struct initializer (currently "snapshot") slips past the set
+    # comparison above. Pin it explicitly rather than leaving the gate blind to
+    # that declaration style.
+    apd_ubus_source = read_required(SRC / "apd/apd_ubus.c")
+    # Scope to the methods array: .name also labels blobmsg policy fields and
+    # the ubus object names, which are not methods.
+    methods_array = apd_ubus_source[
+        apd_ubus_source.index("static const struct ubus_method apd_methods[]"):
+    ]
+    methods_array = methods_array[: methods_array.index("\n};")]
+    struct_declared = set(re.findall(r'\.name\s*=\s*"([^"]+)"', methods_array))
+    assert struct_declared <= {"snapshot"}, (
+        "a new APD ubus method is declared with a struct initializer and would "
+        f"bypass this gate: {sorted(struct_declared)}"
     )
 
 
@@ -253,7 +305,7 @@ def test_status_event_and_readback_outputs_cannot_serialize_secrets() -> None:
         "psk",
         "secret",
         "secret_value",
-        "cipher_text",
+        "ciphertext",
         "private_key",
         "pairing_token",
     )

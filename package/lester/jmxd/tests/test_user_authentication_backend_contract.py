@@ -81,16 +81,26 @@ def test_phase_one_capabilities_are_honest() -> None:
     for capability in (
         "extend_session",
         "disconnect",
-        "write_accounts",
         "portal_runtime",
         "radius_accounting",
         "radius_disconnect",
         "websocket_sessions",
     ):
         assert f'"{capability}", json_object_new_boolean(0)' in common
-    for capability in ("account_crud", "package_crud", "voucher_crud", "voucher_one_time_reveal"):
-        assert f'"{capability}", json_object_new_boolean(1)' in common
-    for capability in ("account_bulk", "account_import", "password_policy_write", "ledger_write",
+    # The account-management group is no longer hardcoded: every underlying
+    # write is implemented and reachable, so these follow whether the account
+    # store is actually writable. Pinning them to a literal made the honest
+    # dynamic form fail the "honesty" test, which is backwards. Assert the
+    # binding instead, plus the reason published when it is false.
+    for capability in ("write_accounts", "account_crud", "package_crud",
+                       "voucher_crud", "account_bulk", "account_import"):
+        assert f'"{capability}", json_object_new_boolean(accounts_writable)' in common, (
+            f"{capability} must follow account-store writability, not a literal"
+        )
+    assert '"write_accounts_reason"' in common
+    assert '"account_store_not_writable"' in common
+    assert "static int authd_accounts_writable(void)" in common
+    for capability in ("voucher_one_time_reveal", "password_policy_write", "ledger_write",
                        "update_web", "web_config_write", "portal_config_write", "access_rule_crud",
                        "write_delegated", "delegated_crud", "delegated_import",
                        "write_notifications", "notification_config_write",

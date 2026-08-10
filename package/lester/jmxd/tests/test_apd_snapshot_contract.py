@@ -180,7 +180,11 @@ def test_hostapd_runtime_is_bounded_secret_safe_and_normalized() -> None:
         "APD_HOSTAPD_SOCKET_SCAN_LIMIT",
     ):
         assert limit in collect + collect_bss
-    assert collect.index("if (phy_count == 0)") < collect.index("opendir(APD_HOSTAPD_RUN_DIR)")
+    # The guarantee is that a box with no PHY returns before the hostapd control
+    # directory is touched at all. The directory probe was refactored from
+    # opendir() to lstat(), so the old anchor no longer existed and this
+    # assertion raised ValueError instead of checking the order.
+    assert collect.index("if (phy_count == 0)") < collect.index("lstat(APD_HOSTAPD_RUN_DIR")
     assert '"no_phy_detected"' in collect
     for safe_key in (
         '"state"',

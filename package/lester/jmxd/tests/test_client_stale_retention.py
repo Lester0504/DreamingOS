@@ -20,6 +20,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 DB_C = ROOT / "src/jmx_db.c"
 DB_H = ROOT / "src/jmx_db.h"
@@ -96,14 +99,14 @@ def parse_output(text: str) -> dict:
 
 
 def json_c_flags() -> tuple[list[str], list[str]]:
+    # Falling back to a bare -ljson-c left this test skipping on 31.6, where the
+    # library exists in the staging_dir but not on the host link path. The
+    # resolver finds it, so have_host_json_c() below now succeeds there and the
+    # predicate is actually exercised.
     try:
-        cflags = subprocess.run(["pkg-config", "--cflags", "json-c"],
-                                capture_output=True, text=True, check=True)
-        libs = subprocess.run(["pkg-config", "--libs", "json-c"],
-                              capture_output=True, text=True, check=True)
-    except (OSError, subprocess.CalledProcessError):
+        return apd_test_deps.split_package_flags("json-c")
+    except AssertionError:
         return ([], ["-ljson-c"])
-    return (cflags.stdout.split(), libs.stdout.split())
 
 
 def have_host_json_c(cflags: list[str], libs: list[str]) -> bool:

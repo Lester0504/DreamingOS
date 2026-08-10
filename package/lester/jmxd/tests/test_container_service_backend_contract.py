@@ -179,7 +179,11 @@ def test_docker_image_network_volume_service_and_config_routes_are_complete() ->
 
 
 def test_ids_names_and_all_command_parameters_are_strictly_validated() -> None:
-    id_validator = function_body(NETCONFIG, "nc_docker_id_valid")
+    # nc_docker_id_valid() was refactor residue and is gone; every container
+    # entry point validates through nc_docker_resource_id_valid(), which is
+    # strictly tighter (first character must be alphanumeric, and ':' '@' '+'
+    # are rejected). Anchor on the validator that is actually called.
+    id_validator = function_body(NETCONFIG, "nc_docker_resource_id_valid")
     name_validator = function_body(NETCONFIG, "nc_docker_name_valid")
     require_one(id_validator, ("strlen", "strnlen"), "bounded Docker ID validation")
     require_one(name_validator, ("strlen", "strnlen"), "bounded Docker name validation")

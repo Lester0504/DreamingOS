@@ -11,6 +11,9 @@ import sys
 import tempfile
 from typing import List
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src/storage/storage_files.c"
@@ -55,36 +58,11 @@ def json_c_flags() -> tuple[List[str], List[str]]:
         assert static_library.is_file(), f"json-c library missing below {prefix}"
         return (["-I", str(prefix / "include")], [str(static_library)])
 
-    pkg_config = shutil.which("pkg-config")
-    if pkg_config:
-        probe = subprocess.run(
-            [pkg_config, "--cflags", "--libs", "json-c"],
-            text=True, capture_output=True,
-        )
-        if probe.returncode == 0:
-            flags = probe.stdout.split()
-            return ([flag for flag in flags if flag.startswith("-I")],
-                    [flag for flag in flags if not flag.startswith("-I")])
-
-    brew = shutil.which("brew")
-    if brew:
-        probe = subprocess.run([brew, "--prefix", "json-c"], text=True,
-                               capture_output=True)
-        if probe.returncode == 0:
-            prefix = Path(probe.stdout.strip())
-            header = prefix / "include/json-c/json.h"
-            library = prefix / "lib/libjson-c.a"
-            if header.is_file() and library.is_file():
-                return (["-I", str(prefix / "include")], [str(library)])
-
-    temporary_cellar = Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c")
-    for header in sorted(temporary_cellar.glob("*/include/json-c/json.h"),
-                         reverse=True):
-        prefix = header.parents[2]
-        library = prefix / "lib/libjson-c.a"
-        if library.is_file():
-            return (["-I", str(prefix / "include")], [str(library)])
-    raise AssertionError("json-c development headers and library unavailable")
+    # Every former fallback below pkg-config ended at a Homebrew static
+    # archive, which on 31.6 is an LTO archive built by a different compiler
+    # and fails the link. The shared resolver prefers a real .so and knows the
+    # staging_dir layout, so the fixture compiles on both machines.
+    return apd_test_deps.split_package_flags("json-c")
 
 
 def main() -> None:
@@ -115,7 +93,15 @@ def main() -> None:
         )
         binary = temp / "storage-files-fixture"
         subprocess.run([
-            compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+            # gnu11, not c11: PATH_MAX/NAME_MAX are POSIX rather than ISO C, and
+            # strict -std=c11 switches off glibc's default _DEFAULT_SOURCE, so
+            # <limits.h> stops declaring them and storage_files.h fails to
+            # compile on the Linux tree.  The macOS SDK defines them
+            # unconditionally, which is why this only broke there.
+            # Passing -D_GNU_SOURCE instead is not an option: storage_files.c
+            # already defines it itself, and the redefinition is fatal under
+            # -Werror.
+            compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
             "-DSTORAGE_FILES_TEST_ALLOW_PROTECTED_DEVICE=1",
             "-DSTORAGE_FILES_TEST_ALLOW_ANY_MOUNT_ROOT=1",
             f'-DSTORAGE_FILES_MOUNTINFO="{mountinfo}"',
@@ -129,6 +115,26 @@ def main() -> None:
         assert listing["capabilities"]["list"] is True
         assert listing["capabilities"]["read"] is False
         assert listing["capabilities"]["download"] is False
+        # A writable root reports exactly the four actions
+        # POST /storage/files/mutate accepts.  These were pinned false until
+        # 2026-08-08, which greyed out the file manager's create/save/rename
+        # buttons even after the write route was wired.
+        for capability in ("mkdir", "create", "rename", "write"):
+            assert listing["capabilities"][capability] is True, (
+                f"{capability} must follow root writability"
+            )
+        # Everything below has no backend endpoint; reporting it true would
+        # enable UI controls that cannot work.
+        for capability in ("upload", "delete", "copy", "move", "compress",
+                           "extract", "permissions", "download_url",
+                           "install_package"):
+            assert listing["capabilities"][capability] is False, (
+                f"{capability} has no backend endpoint and must stay false"
+            )
+        # The write route is wired, so no stale "jobs pending" attribution.
+        assert "write" not in listing["capability_reasons"], (
+            "a writable root has nothing to explain about write"
+        )
         assert listing["limits"]["max_text_read_bytes"] == 256 * 1024
         assert listing["limits"]["max_text_probe_bytes_per_listing"] == 4 * 1024 * 1024
         assert listing["roots"][0]["read_only"] is False
@@ -311,6 +317,13 @@ def main() -> None:
         )
         read_only = data(run(binary))
         assert read_only["roots"][0]["read_only"] is True
+        # A read-only root keeps all four false.  The mutate handler refuses it
+        # anyway, but a disabled button beats an error after the click.
+        for capability in ("mkdir", "create", "rename", "write"):
+            assert read_only["capabilities"][capability] is False, (
+                f"{capability} must be false on a read-only root"
+            )
+        assert read_only["capability_reasons"]["write"] == "storage_root_read_only"
         rejected_write = mutate(binary, {
             "action": "mkdir", "root_id": root_id, "path": str(mount),
             "name": "read-only", "confirm": True,

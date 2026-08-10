@@ -2,10 +2,13 @@
 """Static and executable contracts for flowd runtime/apply capability truth."""
 
 from pathlib import Path
-import shlex
 import subprocess
+import sys
 import tempfile
 import textwrap
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -151,14 +154,12 @@ def test_runtime_contract_behavior() -> None:
             return 0;
         }
     ''')
-    pkg_config = subprocess.run(
-        ["pkg-config", "--cflags", "--libs", "json-c"],
-        check=False, capture_output=True, text=True,
-    )
-    if pkg_config.returncode != 0:
+    # Keyed on real resolvability: pkg-config has no json-c entry on 31.6, so
+    # the old probe printed "skip" there and the contract went unexercised.
+    if not apd_test_deps.have_package("json-c"):
         print("skip: executable flowd contract fixture requires host json-c development metadata")
         return
-    flags = shlex.split(pkg_config.stdout)
+    flags = apd_test_deps.package_flags("json-c")
     with tempfile.TemporaryDirectory() as td:
         source = Path(td) / "flowd_runtime_contract_test.c"
         binary = Path(td) / "flowd_runtime_contract_test"

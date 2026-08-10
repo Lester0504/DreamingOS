@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import shlex
 import subprocess
+import sys
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -180,11 +183,9 @@ int main(void)
 
 
 def json_c_flags() -> list[str]:
-    result = subprocess.run(
-        ["pkg-config", "--cflags", "--libs", "json-c"], text=True,
-        capture_output=True, check=True,
-    )
-    return shlex.split(result.stdout)
+    # 31.6 ships no json-c .pc file; the shared resolver falls back to the
+    # staging_dir prefix instead of raising CalledProcessError.
+    return apd_test_deps.package_flags("json-c")
 
 
 def main() -> None:

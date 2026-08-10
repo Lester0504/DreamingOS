@@ -44,15 +44,6 @@
     visibility 0s linear 120ms;
 }
 
-/* WebKit pays a disproportionate compositing cost when an SVG sampling chain
-   and backdrop-filter are active on the same surface. Safari uses the static,
-   single-channel sampling profile and never needs the scroll fallback layer. */
-.dwrt-sampled-glass[data-glass-renderer="safari-light-sampling"] .dwrt-sampled-glass-scroll-fallback {
-  display: none;
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
-}
-
 .dwrt-sampled-glass.is-scroll-tracking .dwrt-sampled-glass-media {
   opacity: 0;
   visibility: hidden;

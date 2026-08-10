@@ -8,9 +8,25 @@ CORE = (ROOT / "src/jmx_netconfig_db.c").read_text(encoding="utf-8")
 PERMS = (ROOT / "src/webd/jmx_app_perms.c").read_text(encoding="utf-8")
 
 
+def check(condition: bool, reason: str) -> None:
+    """Assert with a reason.
+
+    A bare `assert token in blob` raises an empty AssertionError, which cannot
+    distinguish a stale assertion from a real regression without reading source.
+    """
+    if not condition:
+        raise AssertionError(reason)
+
+
 def body(text: str, start: str, end: str) -> str:
-    begin = text.index(start)
-    finish = text.index(end, begin)
+    try:
+        begin = text.index(start)
+    except ValueError:
+        raise AssertionError(f"anchor not found in source: {start!r}") from None
+    try:
+        finish = text.index(end, begin)
+    except ValueError:
+        raise AssertionError(f"closing anchor not found after {start!r}: {end!r}") from None
     return text[begin:finish]
 
 
@@ -90,10 +106,12 @@ def test_supported_write_reports_runtime_truth() -> None:
         "static struct json_object *webd_client_control_rule_toggle_response",
     )
     for token in (
-        '"persisted", json_object_new_boolean(schedule_tick_ok && (!enabled || runtime_apply))',
+        '"persisted", json_object_new_boolean(compensation_ok && schedule_tick_ok && (!enabled || runtime_apply))',
         '"applied", json_object_new_boolean(runtime_apply)',
         '"runtime_apply_failed"',
         '"schedule_worker_unavailable"',
+        '"rollback_failed_runtime_state_unknown"',
+        '"rollback_verified", json_object_new_boolean(compensation_ok)',
         '"runtime_scope", "client_mac_on_lan_bridge"',
         '"client_mac_and_l4_protocol"',
     ):
@@ -137,6 +155,47 @@ def test_toggle_allows_cleanup_but_blocks_reenable_of_legacy_unsupported_rules()
     assert toggle.index("if (enabled)") < toggle.index("UPDATE client_control_rules SET enabled")
     assert "webd_client_control_rule_snapshot" in toggle
     assert "webd_client_control_rule_restore_snapshot" in toggle
+    assert "webd_client_control_runtime_restore_from_db" in toggle
+    assert '"rollback_verified", json_object_new_boolean(compensation_ok)' in toggle
+
+
+def test_create_update_toggle_compensation_is_read_back_and_fail_closed() -> None:
+    helpers = body(
+        WEB,
+        "static int webd_client_control_rule_restore_snapshot",
+        "static struct json_object *webd_client_control_rule_upsert_response",
+    )
+    upsert = body(
+        WEB,
+        "static struct json_object *webd_client_control_rule_upsert_response",
+        "static struct json_object *webd_client_control_rule_toggle_response",
+    )
+    for token in (
+        "webd_client_control_rule_compensating_delete",
+        "webd_client_control_runtime_reconcile_after_create_rollback",
+        "BEGIN IMMEDIATE",
+        "COMMIT",
+        "ROLLBACK",
+        "SELECT COUNT(*) FROM main.client_control_rules WHERE id=?1 AND mac=?2",
+        "webd_client_control_runtime_restore_from_db",
+        '"client_rate_limit_delete"',
+        "last_runtime_enabled=-1",
+        "last_runtime_apply_at=0",
+        "rollback_runtime_reconcile",
+        "apply_state IN ('failed','pending','queued')",
+    ):
+        assert token in helpers
+    assert "webd_client_control_rule_compensating_delete(id, norm_mac) == 0" in upsert
+    assert "webd_client_control_runtime_reconcile_after_create_rollback(" in upsert
+    assert "webd_client_control_runtime_restore_from_db(id, norm_mac) == 0" in upsert
+    assert '"unknown_manual_reconciliation_required"' in upsert
+    toggle = body(
+        WEB,
+        "static struct json_object *webd_client_control_rule_toggle_response",
+        "static struct json_object *webd_client_control_rule_delete_response",
+    )
+    assert "webd_client_control_runtime_restore_from_db(id, norm_mac) == 0" in toggle
+    assert '"unknown_manual_reconciliation_required"' in toggle
 
 
 def test_core_scheduler_cannot_reanimate_degraded_legacy_rules() -> None:
@@ -212,8 +271,6 @@ def test_profile_capabilities_are_split_by_maturity() -> None:
         'json_object_object_add(cap, "bandwidth_history"',
     )
     for token in (
-        '"client_control_fail_closed", json_object_new_boolean(1)',
-        '"client_control_rate_limit", json_object_new_boolean(1)',
         '"client_control_l4_filter", json_object_new_boolean(1)',
         '"client_control_l4_filter_action", json_object_new_string("rate_limit_only")',
         '"client_control_app_policy", json_object_new_boolean(0)',
@@ -221,7 +278,33 @@ def test_profile_capabilities_are_split_by_maturity() -> None:
         '"client_control_shared_rate_limit", json_object_new_boolean(0)',
         '"client_control_schedule_plan", json_object_new_boolean(0)',
     ):
-        assert token in profile
+        check(token in profile, f"capability profile lost {token!r}")
+
+    # These two used to be asserted as hardcoded boolean(1). They are now gated on
+    # runtime probes -- store_ready (the client_control_rules table is queryable)
+    # and rate_limit_ready (store_ready plus an executable /sbin/tc) -- see
+    # webd_client_control_add_capabilities() in src/webd/jmx_app_api.c. That is
+    # strictly more honest than a constant 1, so assert the gating rather than
+    # the old literal, and pin the gate so it cannot silently regress to a
+    # hardcoded truth that lies when the dataplane is missing.
+    for token in (
+        '"client_control_fail_closed", json_object_new_boolean(store_ready)',
+        '"client_control_rate_limit",\n                           json_object_new_boolean(rate_limit_ready)',
+    ):
+        check(token in profile, f"capability must stay runtime-gated: {token!r}")
+    gate = body(
+        WEB,
+        "static void webd_client_control_add_capabilities",
+        '"client_control_l4_filter"',
+    )
+    check(
+        "store_ready = webd_client_control_store_ready();" in gate,
+        "fail_closed capability must be gated on the rules store being queryable",
+    )
+    check(
+        'rate_limit_ready = store_ready && access("/sbin/tc", X_OK) == 0;' in gate,
+        "rate_limit capability must be gated on the tc dataplane being present",
+    )
 
 
 def test_independent_protocol_control_remains_zero_write_unsupported() -> None:

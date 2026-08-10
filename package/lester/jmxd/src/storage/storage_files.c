@@ -840,12 +840,24 @@ static int storage_files_name_matches(const char *name, const char *search)
     return 0;
 }
 
+/*
+ * "writable" means a mutable storage root was selected, so the four actions
+ * POST /api/v1/storage/files/mutate accepts -- mkdir, create, write, rename --
+ * can really be performed.  Everything else stays false because no backend
+ * endpoint exists for it; upload, delete, copy, move, compress, extract,
+ * permissions, download_url and install_package are deliberately not covered
+ * by that route, and reporting them true would grey-in buttons that cannot work.
+ *
+ * A read-only root keeps all four false.  storage_files_mutate() refuses it
+ * anyway with storage_root_read_only, but a disabled button beats an error
+ * after the click.
+ */
 static struct json_object *storage_files_capabilities(int directory,
-                                                      int text_read)
+                                                      int text_read,
+                                                      int writable)
 {
-    static const char *const disabled[] = {
-        "download", "write", "mkdir", "create", "rename",
-        "permissions", "upload", "download_url", "copy", "move",
+    static const char *const unsupported[] = {
+        "download", "permissions", "upload", "download_url", "copy", "move",
         "compress", "extract", "delete", "install_package", NULL
     };
     struct json_object *caps = json_object_new_object();
@@ -854,8 +866,15 @@ static struct json_object *storage_files_capabilities(int directory,
     json_object_object_add(caps, "list", json_object_new_boolean(directory));
     json_object_object_add(caps, "read", json_object_new_boolean(text_read));
     json_object_object_add(caps, "preview", json_object_new_boolean(text_read));
-    for (i = 0; disabled[i]; i++)
-        json_object_object_add(caps, disabled[i], json_object_new_boolean(0));
+    /* mkdir/create/rename act on the containing directory; write replaces the
+     * contents of a readable text file. */
+    json_object_object_add(caps, "mkdir", json_object_new_boolean(writable));
+    json_object_object_add(caps, "create", json_object_new_boolean(writable));
+    json_object_object_add(caps, "rename", json_object_new_boolean(writable));
+    json_object_object_add(caps, "write",
+                           json_object_new_boolean(writable && (text_read || directory)));
+    for (i = 0; unsupported[i]; i++)
+        json_object_object_add(caps, unsupported[i], json_object_new_boolean(0));
     return caps;
 }
 
@@ -897,7 +916,7 @@ static struct json_object *storage_files_empty(void)
     json_object_object_add(data, "roots", json_object_new_array());
     json_object_object_add(data, "entries", json_object_new_array());
     json_object_object_add(data, "entries_truncated", json_object_new_boolean(0));
-    json_object_object_add(data, "capabilities", storage_files_capabilities(0, 0));
+    json_object_object_add(data, "capabilities", storage_files_capabilities(0, 0, 0));
     json_object_object_add(limits, "max_entries", json_object_new_int(
         STORAGE_FILES_MAX_ENTRIES));
     json_object_object_add(limits, "max_path_depth", json_object_new_int(
@@ -1025,7 +1044,8 @@ struct json_object *jmx_storage_files_list(const char *root_id,
         json_object_object_add(item, "capabilities",
                                storage_files_capabilities(S_ISDIR(st.st_mode) &&
                                                           st.st_dev == root->dev,
-                                                          text_read));
+                                                          text_read,
+                                                          !root->read_only));
         json_object_array_add(entries, item);
         emitted++;
     }
@@ -1041,7 +1061,8 @@ struct json_object *jmx_storage_files_list(const char *root_id,
     json_object_object_add(data, "roots", root_array);
     json_object_object_add(data, "entries", entries);
     json_object_object_add(data, "entries_truncated", json_object_new_boolean(truncated));
-    json_object_object_add(data, "capabilities", storage_files_capabilities(1, 0));
+    json_object_object_add(data, "capabilities",
+                           storage_files_capabilities(1, 0, !root->read_only));
     json_object_object_add(limits, "max_entries", json_object_new_int(STORAGE_FILES_MAX_ENTRIES));
     json_object_object_add(limits, "max_path_depth",
                            json_object_new_int(STORAGE_FILES_MAX_PATH_DEPTH));
@@ -1054,8 +1075,12 @@ struct json_object *jmx_storage_files_list(const char *root_id,
     json_object_object_add(data, "limits", limits);
     json_object_object_add(reasons, "content_read",
                            json_object_new_string("small_utf8_text_only"));
-    json_object_object_add(reasons, "write",
-                           json_object_new_string("storage_file_write_jobs_pending"));
+    /* The write route is wired, so the only remaining reason to refuse is a
+     * read-only root.  The former "jobs pending" reason would misattribute the
+     * refusal in the UI, so it is gone rather than reworded. */
+    if (root->read_only)
+        json_object_object_add(reasons, "write",
+                               json_object_new_string("storage_root_read_only"));
     json_object_object_add(reasons, "download_url",
                            json_object_new_string("ssrf_safe_download_job_pending"));
     json_object_object_add(reasons, "archive",

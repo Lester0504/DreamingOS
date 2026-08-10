@@ -6,7 +6,11 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,22 +35,10 @@ def dependency_flags() -> list[str]:
     explicit = os.environ.get("JMX_TEST_DEPENDENCY_FLAGS")
     if explicit:
         return shlex.split(explicit)
-    pkg_config = shutil.which("pkg-config")
-    if pkg_config:
-        result = subprocess.run(
-            [pkg_config, "--cflags", "--libs", "json-c", "sqlite3"],
-            text=True, capture_output=True,
-        )
-        if result.returncode == 0:
-            return shlex.split(result.stdout)
-    brew = shutil.which("brew")
-    if brew:
-        prefix = subprocess.check_output(
-            [brew, "--prefix", "json-c"], text=True
-        ).strip()
-        return [f"-I{prefix}/include", f"-L{prefix}/lib", "-ljson-c",
-                f"-Wl,-rpath,{prefix}/lib", "-lsqlite3"]
-    raise AssertionError("json-c/sqlite3 development files unavailable")
+    # JMX_TEST_DEPENDENCY_FLAGS still wins. Otherwise resolve both packages
+    # through the shared helper: pkg-config cannot answer for json-c on 31.6,
+    # and the old `brew --prefix` fallback pointed at an unusable LTO archive.
+    return apd_test_deps.package_flags("json-c", "sqlite3")
 
 
 FIXTURE = r'''

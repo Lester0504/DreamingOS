@@ -51,7 +51,13 @@
   height: 100%;
   align-self: stretch;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  /* Two children only: the scroll body and the footer. The old three-row track
+     (auto minmax(0,1fr) auto) put the scroll body in the leading `auto` row, so
+     it grew to its full content height while the 1fr track stayed empty at 0px.
+     The rail then overflowed the stage, which clips at the footer, and the tail
+     of the filter list was cut off -- read as "the footer slices the side menu".
+     Keep the row count equal to the child count. */
+  grid-template-rows: minmax(0, 1fr) auto;
   padding: 11px;
   border-radius: 0;
   overflow: hidden;
@@ -954,25 +960,7 @@
   opacity: 0;
 }
 
-.insights-summary-section {
-  display: grid;
-  min-width: 0;
-  min-height: 0;
-  height: 100%;
-}
 
-.insights-summary-card {
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 156px;
-  display: grid;
-  align-content: start;
-  gap: 14px;
-  padding: 16px 18px 15px;
-  border-radius: var(--app-radius-card, 24px);
-  overflow: hidden;
-}
 
 .insights-card-content {
   width: 100%;
@@ -980,20 +968,7 @@
   min-height: 0;
 }
 
-.insights-summary-card > .insights-card-content {
-  display: grid;
-  align-content: start;
-  gap: 14px;
-}
 
-.insights-summary-card h2 {
-  margin: 0;
-  color: var(--dwrt-ink);
-  font-size: 18px;
-  line-height: 1.1;
-  font-weight: 760;
-  letter-spacing: 0;
-}
 
 .insights-summary-list {
   display: grid;
@@ -1009,41 +984,13 @@
   color: var(--dwrt-muted);
 }
 
-.insights-summary-mark {
-  width: 31px;
-  height: 24px;
-  display: inline-grid;
-  place-items: center start;
-  color: #44bfff;
-}
 
-.insights-summary-mark svg {
-  width: 26px;
-  height: 26px;
-}
 
 .insights-summary-risk-entry {
   min-width: 0;
 }
 
-.insights-summary-risk-bars {
-  width: 31px;
-  min-width: 31px;
-  height: 6px;
-  gap: 4px;
-  justify-self: start;
-}
 
-.insights-summary-risk-bars > i {
-  flex-basis: 7px;
-  width: 7px;
-  min-width: 7px;
-  max-width: 7px;
-  height: 6px;
-  min-height: 6px;
-  max-height: 6px;
-  border-radius: 2px;
-}
 
 .insights-summary-label {
   min-width: 0;
@@ -1065,83 +1012,299 @@
   white-space: nowrap;
 }
 
-.insights-top-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 9px;
+/*
+ * 三档下方的统计范围说明。这是摘要模块唯一允许换行的文字：三档数值本身
+ * `white-space: nowrap`，范围信息塞不进那一行，而角标只有 11px 且在标题行
+ * 右端，与三档没有视觉关联（「30 万条 + 三个 0 + 一枚小角标」的误读正出自此）。
+ * 放在三档正下方、与其同一视觉块，读者才会把它当作这三个数的限定条件。
+ * 不设 `height`：文字长度随窗口行数变化，写死高度会截断第二句。
+ */
+.insights-summary-scope {
+  margin: 0;
+  min-width: 0;
+  color: color-mix(in srgb, var(--dwrt-muted) 92%, transparent);
+  font-size: 11px;
+  line-height: 1.42;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-wrap: pretty;
 }
 
+/*
+ * 「270 / 300,147 条」这个比例必须整块换行。1440px 下摘要列只有约 170px，
+ * 实测断在斜杠处，读成「分档仅覆盖 270」换行「/ 300,147 条」——分母被甩到下一行，
+ * 那一瞥的读法就变成了「覆盖 270 条」，正是这次要修掉的误读本身。
+ */
+.insights-summary-scope > b {
+  font-weight: inherit;
+  white-space: nowrap;
+}
+
+/* 覆盖率极低时三档显示「未检出」，说明文字同步压暗一档，避免读成一个结论。 */
+.insights-summary-scope[data-risk-scope-unmeasured="on"] {
+  color: color-mix(in srgb, var(--dwrt-muted) 78%, transparent);
+}
+
+
+/*
+ * 地图上方的一体化控制台：一张通栏玻璃，四个等高模块用竖分割线分隔。
+ * 玻璃由 `.dwrt-glass-card.insights-stable-glass` 提供，这里只排几何。
+ * 摘要与客户端窄，目的地与应用要放长域名/应用名，所以给宽一点。
+ */
 .insights-overview-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1.08fr) repeat(3, minmax(180px, 0.92fr));
-  gap: clamp(12px, 1vw, 16px);
+  grid-template-columns: 1.15fr 1.4fr 1.15fr 1.4fr;
+  gap: clamp(12px, 1.15vw, 20px);
   align-items: stretch;
   min-width: 0;
-  overflow: hidden;
-}
-
-.insights-top-card {
-  min-width: 0;
-  min-height: 156px;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  gap: 9px;
-  padding: 13px;
+  padding: 16px 18px;
   border-radius: var(--app-radius-card, 24px);
   overflow: hidden;
 }
 
-.insights-top-card > .insights-card-content {
+.insights-console-module {
+  min-width: 0;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  gap: 9px;
+  align-content: start;
+  /* 分割线画在模块右侧，最后一个不画。用 border 而不是卡片间距，
+     四个模块才读起来是一体的。 */
+  border-right: 1px solid color-mix(in srgb, var(--dwrt-ink) 12%, transparent);
+  padding-right: clamp(12px, 1.15vw, 20px);
 }
 
-.insights-card-title {
+.insights-overview-row > .insights-console-module:last-child {
+  border-right: 0;
+  padding-right: 0;
+}
+
+.insights-console-module > .insights-card-content {
+  min-width: 0;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 14px;
+}
+
+.insights-console-head {
+  min-width: 0;
   display: flex;
+  align-items: center;
   justify-content: space-between;
   gap: 10px;
 }
 
-.insights-card-title strong {
-  font-size: 14px;
-  font-weight: 760;
-}
-
-.insights-card-title span {
+.insights-console-title {
+  min-width: 0;
   color: var(--dwrt-muted);
   font-size: 12px;
-  font-weight: 650;
-}
-
-.insights-list {
-  display: grid;
-  gap: 8px;
-  align-content: start;
-}
-
-.insights-list-item {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: center;
-  color: var(--dwrt-text);
-  font-size: 13px;
-}
-
-.insights-list-item b {
+  font-weight: 780;
+  letter-spacing: 0.4px;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 650;
 }
 
-.insights-list-item small {
-  color: var(--dwrt-muted);
-  font-size: 12px;
+.insights-console-count {
+  flex: 0 0 auto;
+  color: color-mix(in srgb, var(--dwrt-muted) 84%, transparent);
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.insights-console-body {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+}
+
+.insights-console-total {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.insights-console-total strong {
+  color: var(--dwrt-ink);
+  font-size: 26px;
+  line-height: 1;
+  font-weight: 800;
+  letter-spacing: -0.4px;
   font-variant-numeric: tabular-nums;
 }
+
+.insights-console-total-mark {
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  color: #44bfff;
+}
+
+.insights-console-total-mark svg {
+  width: 22px;
+  height: 22px;
+}
+
+.insights-console-total-unit {
+  color: var(--dwrt-muted);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.insights-console-dot {
+  width: 7px;
+  height: 7px;
+  min-width: 7px;
+  border-radius: 50%;
+  justify-self: start;
+  background: var(--dwrt-muted);
+}
+
+.insights-console-dot.low { background: var(--dwrt-ok, #30d158); }
+.insights-console-dot.suspicious { background: var(--dwrt-warn, #ff9f0a); }
+.insights-console-dot.concern { background: var(--dwrt-bad, #ff453a); }
+
+.insights-console-list {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.insights-console-rank-item {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.insights-console-rank-info {
+  min-width: 0;
+  display: grid;
+  /* 第 4 列给「未识别」标注；只有应用榜的兜底条目会用到它，
+     其余条目少一个子元素，末列自然为空，不影响既有三列的位置。 */
+  grid-template-columns: 18px minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+}
+
+/*
+ * 榜单图标（用户 2026-08-04：应用要图标、设备用设备图标、目的地加国旗）。
+ * 固定 18px 槽位，图标缺失时槽位仍在，名字列不会左右跳动。
+ * `is-glyph` 由 img 的 onerror 补上，此时显示首字母兜底。
+ */
+.insights-rank-icon {
+  position: relative;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--dwrt-ink) 8%, transparent);
+}
+
+.insights-rank-icon > img {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: inherit;
+  object-fit: contain;
+}
+
+/* 国旗按原比例铺满，圆角小一点，读起来更像旗子而不是应用图标。 */
+.insights-rank-icon.is-flag {
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--dwrt-ink) 12%, transparent);
+}
+
+.insights-rank-icon.is-flag > img { object-fit: cover; }
+
+.insights-rank-icon > i {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: grid;
+  place-items: center;
+  color: var(--dwrt-muted);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 760;
+  line-height: 1;
+}
+
+/* 图标正常显示时不需要首字母垫在下面，避免半透明图标透出字来。 */
+.insights-rank-icon:not(.is-glyph) > i { visibility: hidden; }
+
+.insights-console-rank-name {
+  min-width: 0;
+  max-width: 100%;
+  display: block;
+  color: var(--dwrt-ink);
+  font-size: 12.5px;
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* DPI 未命中的协议/端口兜底条目：视觉降级 + 明确标注，避免被读成应用名。
+   letter-spacing 保持 0，不随视口缩放字号（design.md）。 */
+.insights-console-rank-unidentified {
+  flex: 0 0 auto;
+  align-self: center;
+  padding: 0 5px;
+  border-radius: 999px;
+  color: var(--dwrt-muted);
+  background: rgba(255,255,255,0.08);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12);
+  font-size: 9.5px;
+  font-style: normal;
+  font-weight: 800;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.insights-console-rank-metric {
+  color: var(--dwrt-muted);
+  font-size: 11.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.insights-console-bar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--dwrt-ink) 10%, transparent);
+  overflow: hidden;
+}
+
+.insights-console-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--dwrt-accent, #0a84ff);
+}
+
+/* 进度条颜色是模块语义，不是装饰：目的地蓝、客户端紫、应用绿。 */
+.insights-console-rank.is-destination .insights-console-bar > i { background: #0a84ff; }
+.insights-console-rank.is-client .insights-console-bar > i { background: #bf5af2; }
+.insights-console-rank.is-application .insights-console-bar > i { background: #30d158; }
+
+
+
+
+
+
+
 
 .insights-empty {
   min-height: 76px;
@@ -1317,6 +1480,44 @@
   display: none;
 }
 
+/*
+ * 2026-08-05: geo 取数状态。贴左上角。
+ * 左下被 .insights-map-controls（重置/放大/缩小三个按钮）占着、
+ * 右下被 .insights-map-credit 占着，实测放左下会盖住那三个按钮，
+ * 所以只剩左上可用；居中留给 .insights-map-scope-empty。
+ * 作用域切换先用缓存出图，所以慢请求或失败请求本来完全不可见 ——
+ * 旧图会被当成新数据读。这条提示是唯一能区分两者的东西。
+ */
+.insights-map-status {
+  position: absolute;
+  left: 14px;
+  top: 14px;
+  z-index: 5;
+  max-width: min(320px, calc(100% - 28px));
+  padding: 6px 10px;
+  border-radius: 8px;
+  color: rgba(48, 58, 72, 0.82);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.35;
+  background: rgba(255, 255, 255, 0.58);
+  border: 1px solid rgba(214, 222, 232, 0.58);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.62),
+    0 10px 24px rgba(34, 48, 68, 0.10);
+  backdrop-filter: blur(10px) saturate(1.08);
+  -webkit-backdrop-filter: blur(10px) saturate(1.08);
+}
+
+.insights-map-status[hidden] {
+  display: none !important;
+}
+
+.insights-map-large.is-geo-failed .insights-map-status {
+  color: rgba(150, 44, 44, 0.92);
+  border-color: rgba(214, 138, 138, 0.62);
+}
+
 .insights-map-controls {
   position: absolute;
   left: 18px;
@@ -1404,6 +1605,148 @@
   text-shadow:
     0 1px 2px rgba(0,0,0,0.34),
     0 0 10px rgba(0,0,0,0.20);
+}
+
+/*
+ * 地图图例。位置只剩右上：左上是 .insights-map-status，左下是三个控制按钮，
+ * 右下是 .insights-map-credit，居中留给 .insights-map-scope-empty。
+ * 宽度上限留出左上状态条的位置（实测状态条 max-width 320px），两者不会相撞。
+ * 图例不吃指针事件，否则会挡住底图的拖拽与 tooltip。
+ */
+.insights-map-legend {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  z-index: 5;
+  max-width: min(340px, calc(100% - 28px));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  pointer-events: none;
+  color: rgba(232, 244, 255, 0.90);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.2;
+  background: rgba(8, 17, 31, 0.56);
+  border: 1px solid rgba(123, 220, 255, 0.16);
+  box-shadow: 0 10px 24px rgba(2, 8, 18, 0.30);
+  backdrop-filter: blur(8px) saturate(1.06);
+  -webkit-backdrop-filter: blur(8px) saturate(1.06);
+}
+
+/* `display: flex` 会盖掉 hidden 的默认 display:none，数据未到时图例必须真的不占位。 */
+.insights-map-legend[hidden] {
+  display: none !important;
+}
+
+.insights-map-legend-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  min-width: 0;
+}
+
+.insights-map-legend-title {
+  flex: 0 0 auto;
+  color: rgba(186, 208, 228, 0.72);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.insights-map-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  pointer-events: auto;
+  white-space: nowrap;
+}
+
+.insights-map-legend-swatch {
+  width: 8px;
+  height: 8px;
+  min-width: 8px;
+  border-radius: 999px;
+  background: var(--legend-color, #39d9ff);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--legend-color, #39d9ff) 55%, transparent);
+}
+
+/* 本机是拓扑身份而不是风险档，用方块与风险圆点区分开。 */
+.insights-map-legend-swatch.is-local {
+  border-radius: 2px;
+}
+
+/* 方向样例复用地图的线型：出站实线，入站短划。颜色刻意用中性灰，
+   避免图例自己又把某个颜色和方向绑在一起（这正是这次要修的缺陷）。 */
+.insights-map-legend-line {
+  width: 18px;
+  height: 0;
+  min-width: 18px;
+  border-top: 2px solid rgba(214, 232, 248, 0.78);
+}
+
+.insights-map-legend-line.is-inbound {
+  border-top-style: dashed;
+}
+
+.insights-map-legend-scale {
+  width: 20px;
+  height: 6px;
+  min-width: 20px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(214, 232, 248, 0.28), rgba(214, 232, 248, 0.82));
+  clip-path: polygon(0 40%, 100% 0, 100% 100%, 0 60%);
+}
+
+/* 宽视口写全句，窄视口只留「流量」两个字（见下方 media query）。 */
+.insights-map-legend-scale-short {
+  display: none;
+}
+
+/*
+ * 窄视口：地图只有约 260px 高，把图例通栏铺开会盖掉半张地图（实测 366x64
+ * 压在弧线正中）。所以这里反而要收紧：贴右上、去掉分组标题、只留色块与文字，
+ * 三组竖排成窄条，宽度不超过地图的 46%。
+ */
+@media (max-width: 900px) {
+  .insights-map-legend {
+    right: 10px;
+    top: 10px;
+    max-width: 46%;
+    gap: 3px;
+    padding: 6px 8px;
+    font-size: 10px;
+    background: rgba(8, 17, 31, 0.68);
+  }
+
+  .insights-map-legend-group {
+    gap: 3px 7px;
+  }
+
+  /* 标题在窄条里换行后会把图例顶成三行高，色块自身已经足够指认这一组。 */
+  .insights-map-legend-title {
+    display: none;
+  }
+
+  .insights-map-legend-line,
+  .insights-map-legend-scale {
+    width: 14px;
+    min-width: 14px;
+  }
+
+  /* 「越粗越大代表流量越多」在窄条里会把图例撑到两行，换成「流量」二字；
+     粗细本身在图上一眼可辨，这一行只需要标出这个通道存在。 */
+  .insights-map-legend-scale-text {
+    display: none;
+  }
+
+  .insights-map-legend-scale-short {
+    display: inline;
+  }
 }
 
 .insights-table-card {
@@ -1581,6 +1924,13 @@
   overflow: hidden;
 }
 
+/* 统计 off: the chart is not in the DOM, so the board must drop to one row.
+   Keeping the two-row template would leave the table in the first row and hand
+   50% of the height to an empty track. Row count follows child count. */
+.insights-activity-board.is-chart-hidden {
+  grid-template-rows: minmax(0, 1fr);
+}
+
 .insights-activity-chart {
   position: relative;
   min-width: 0;
@@ -1596,54 +1946,15 @@
   padding-right: 14px;
 }
 
-.activity-axis-unit {
-  position: absolute;
-  left: 31px;
-  top: 20px;
-  z-index: 1;
-  color: var(--dwrt-muted);
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.insights-activity-chart svg {
+/* ECharts sizes itself from this box, so it needs a real height rather than one
+   derived from its (empty) content. The old hand-drawn SVG rules are gone with
+   the SVG: its viewBox was scaled with preserveAspectRatio="none", which is what
+   deformed the axis numbers. */
+.insights-activity-chart-canvas {
   width: 100%;
   height: 100%;
-  display: block;
+  min-height: 0;
 }
-
-.activity-grid-line {
-  fill: none;
-  stroke: color-mix(in srgb, var(--dwrt-text) 9%, transparent);
-  stroke-width: 1;
-}
-
-.activity-y-label,
-.activity-x-label {
-  fill: var(--dwrt-muted);
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.activity-y-label {
-  text-anchor: end;
-  dominant-baseline: middle;
-}
-
-.activity-area-download {
-  fill: rgba(126, 86, 255, 0.12);
-  stroke: none;
-}
-
-.activity-line-download,
-.activity-line-upload {
-  fill: none;
-  stroke-width: 1.8;
-  vector-effect: non-scaling-stroke;
-}
-
-.activity-line-download { stroke: #7d62ff; }
-.activity-line-upload { stroke: #46c6ff; }
 
 .insights-activity-table {
   min-width: 0;
@@ -1653,12 +1964,130 @@
   border-radius: var(--app-radius-card, 24px);
 }
 
-.insights-activity-table-scroll {
+/* 卡内是「覆盖率条 + 滚动表格」两个子项。这里用弹性列而不是写死行数的
+   grid：覆盖率条在无数据时不渲染，行数会变，grid 的行模板随即算错（design.md
+   规则 11 记过这一笔）。滚动器 `min-height: 0` 必须留着，否则它会被内容顶开
+   到自然高度，卡片跟着溢出。 */
+.insights-activity-table-content {
   height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.insights-activity-table-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
   padding: 0 16px 16px;
   border-radius: inherit;
   scrollbar-width: thin;
+}
+
+/* 识别覆盖率条。它在滚动器之外，滚动表格时不会跟着滑走。 */
+.insights-activity-coverage {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 16px;
+  padding: 14px 16px 12px;
+  color: var(--dwrt-muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.insights-activity-coverage-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.insights-activity-coverage-main b {
+  color: var(--dwrt-ink);
+  font-size: 20px;
+  font-weight: 780;
+}
+
+.insights-activity-coverage-split {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+
+.insights-activity-coverage-split i {
+  margin-right: 4px;
+  color: var(--dwrt-ink);
+  font-style: normal;
+  font-weight: 720;
+}
+
+.insights-activity-coverage p {
+  flex: 1 1 240px;
+  min-width: 0;
+  margin: 0;
+}
+
+/* The header stays put while the body scrolls, so the columns stay identified at
+   any scroll offset (480 rows / ~19000px against a ~400px viewport, measured on
+   30.1). Sticky needs an opaque-enough background of its own: the card is glass,
+   so without one the rows show through the header as it passes under.
+
+   The top offset is 0 against this scroller, not the page: position:sticky
+   resolves against the nearest scrolling ancestor, which is
+   .insights-activity-table-scroll. The scroller's own top padding is 0 for the
+   same reason -- a padding-top here would leave a transparent gap above the
+   header that rows would be visible in. */
+.insights-activity-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  /* A sticky header has to hide the rows travelling under it, so this background
+     must be opaque -- and it must be a real color. Two things measured on 30.1
+     that both failed: color-mix() on --dwrt-glass-surface computes to transparent
+     because that token is a gradient *list*, not a color; and the audit table's
+     rgba(255,255,255,0.035) is far too sheer over this card (7.66% of header
+     pixels still changed while scrolling, max channel delta 245 -- row text
+     reading straight through the labels).
+
+     The card itself is intentionally near-transparent glass, so there is no
+     opaque surface token to inherit. The header supplies its own, tinted per
+     theme so it sits with the page instead of punching a grey bar through it. */
+  background: var(--insights-sticky-head-bg, rgba(242,244,248,0.98));
+  backdrop-filter: blur(10px) saturate(130%);
+  -webkit-backdrop-filter: blur(10px) saturate(130%);
+}
+
+:root {
+  /* Alpha was measured, not guessed. Scrolling the body under the header and
+     diffing the header strip pixel-for-pixel: 0.035 -> 7.66% of the strip changed
+     (row text straight through the labels), 0.90 -> 1.64%, 0.94 -> 0.98%,
+     0.96 -> 0.34%, 0.98 -> 0.01% (3 pixels, delta 14, i.e. antialiasing on the
+     column divider only). 0.98 is where bleed-through stops while the band keeps
+     a trace of the card's material instead of reading as a flat grey bar. */
+  --insights-sticky-head-bg: rgba(242,244,248,0.98);
+}
+
+html[data-theme-resolved="dark"] {
+  --insights-sticky-head-bg: rgba(27,34,48,0.98);
+}
+
+/* The band has to be keyed to the *ink*, not to the theme preference.
+   `data-theme-resolved` is the light/dark preference; the text colour comes from
+   `data-adaptive-foreground`, which runtime wallpaper sampling sets
+   independently. On 30.1 the two disagree in the default state -- measured
+   `data-theme-resolved="light"` together with `data-adaptive-foreground="light"`
+   (near-white ink, rgba(251,253,255,0.99), because the wallpaper is dark) -- so
+   the light-theme band painted rgba(242,244,248,0.98) under near-white labels
+   and the header read as blank. Following the foreground attribute keeps the
+   band opposite the ink in every combination. */
+html[data-adaptive-foreground="light"] {
+  --insights-sticky-head-bg: rgba(27,34,48,0.98);
+}
+
+html[data-adaptive-foreground="dark"] {
+  --insights-sticky-head-bg: rgba(242,244,248,0.98);
 }
 
 .insights-activity-table table {
@@ -1685,8 +2114,98 @@
   font-weight: 760;
 }
 
+/* 与审计表同一处理：这条 sticky 带子有自己的不透明底色，墨色跟着底色定，
+   不跟着壁纸采样跑。活动表不是 `dwrt-kit-table-wrap`，眼下没有被登记成采样单元，
+   但底色的口径与审计表一致，墨色也保持一致，避免两张表在同一页里读起来不一样。 */
+.insights-activity-table thead th,
+.insights-activity-table thead th * {
+  --adaptive-ink: rgba(251,253,255,0.99);
+  --adaptive-text: rgba(251,253,255,0.96);
+  --adaptive-muted: rgba(251,253,255,0.88);
+  --dwrt-ink: rgba(251,253,255,0.99);
+  --dwrt-text: rgba(251,253,255,0.96);
+  --dwrt-muted: rgba(251,253,255,0.88);
+}
+
+html[data-adaptive-foreground="dark"] .insights-activity-table thead th,
+html[data-adaptive-foreground="dark"] .insights-activity-table thead th * {
+  --adaptive-ink: rgba(8,13,21,0.98);
+  --adaptive-text: rgba(8,13,21,0.96);
+  --adaptive-muted: rgba(8,13,21,0.88);
+  --dwrt-ink: rgba(8,13,21,0.98);
+  --dwrt-text: rgba(8,13,21,0.96);
+  --dwrt-muted: rgba(8,13,21,0.88);
+}
+
 .insights-activity-table .traffic-down { color: #7d62ff; }
 .insights-activity-table .traffic-up { color: #46c6ff; }
+
+/* 分组表头行。它在 tbody 里，不参与 thead 的 sticky，避免两层 sticky 互相顶。 */
+.insights-activity-table tr.insights-activity-group th {
+  padding: 14px 12px 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--dwrt-text) 12%, transparent);
+  color: var(--dwrt-muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: normal;
+}
+
+.insights-activity-group-label {
+  color: var(--dwrt-ink);
+  font-size: 13px;
+  font-weight: 780;
+}
+
+.insights-activity-group-count {
+  margin-left: 8px;
+}
+
+.insights-activity-group-detail {
+  margin-left: 10px;
+  font-weight: 620;
+}
+
+/* 未识别条目：标识按机器字符串等宽显示，旁边一枚中性标记说明它不是应用名。
+   两者都不换行，行高与其他单元格一致，不把行撑高。 */
+.insights-activity-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* 应用名从裸文本节点改成 `<b>`，这样它才能是 flex 项、跟着收，图标不会被文字挤扁。
+   字重与表格其它单元格一致，不额外加粗。 */
+.insights-activity-name > b {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.insights-activity-name.is-service code {
+  overflow: hidden;
+  color: var(--dwrt-muted);
+  font-family: var(--dwrt-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 13px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.insights-activity-name.is-service em {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border: 1px solid color-mix(in srgb, var(--dwrt-text) 16%, transparent);
+  border-radius: 999px;
+  color: var(--dwrt-muted);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+  white-space: nowrap;
+}
 
 .insights-activity-empty {
   min-height: 260px;
@@ -1793,27 +2312,60 @@ html[data-theme-resolved="light"] .insights-action-button {
     --insights-panel: clamp(268px, 24vw, 304px);
     grid-template-columns: var(--insights-panel) minmax(0, 1fr);
   }
-
-  .insights-overview-row {
-    grid-template-columns: minmax(190px, 1.08fr) repeat(3, minmax(148px, 0.92fr));
-  }
 }
 
-@container insights-main (max-width: 920px) {
+/*
+ * 窄视口降级：竖分割线换成横分割线，否则折行后 border-right 会挂在
+ * 每行的行末，读起来像随机竖线。padding 也要跟着换边，不然模块之间贴死。
+ */
+/*
+ * 阈值定在 760px 而不是 920px。这页的主区被左侧 332px 筛选栏和外壳导航挤过，
+ * 1440px 视口下实测只有 839px；沿用旧的 920px 会让通栏控制台在**默认视口**
+ * 就折成 2x2，竖分割线被这里关掉，四模块一体的形态根本看不到。
+ * 839px 四列每列约 190px，放得下 down.debian7.com 这类域名（超长仍走 ellipsis）。
+ */
+@container insights-main (max-width: 760px) {
   .insights-overview-row {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px 22px;
   }
 
-  .insights-summary-section,
-  .insights-summary-card,
-  .insights-top-card {
-    min-height: 156px;
+  .insights-console-module,
+  .insights-overview-row > .insights-console-module:last-child {
+    border-right: 0;
+    padding-right: 0;
+    padding-bottom: 14px;
+    border-bottom: 1px solid color-mix(in srgb, var(--dwrt-ink) 12%, transparent);
+  }
+
+  .insights-overview-row > .insights-console-module:nth-last-child(-n + 2) {
+    padding-bottom: 0;
+    border-bottom: 0;
   }
 }
 
 @container insights-main (max-width: 560px) {
   .insights-overview-row {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 单列时"最后一行"只有一个模块，所以倒数第二个要把横线加回来；
+     上面那条 -n+2 是给两列写的，在单列下会漏掉一条分隔线。 */
+  .insights-overview-row > .insights-console-module:nth-last-child(2) {
+    padding-bottom: 14px;
+    border-bottom: 1px solid color-mix(in srgb, var(--dwrt-ink) 12%, transparent);
+  }
+}
+
+/*
+ * 980px 媒体查询把控制台压成单列（见下方），同样需要单列的横线口径。
+ * 容器查询按 `.insights-main` 的宽度算，媒体查询按视口算，两者不一定同时命中，
+ * 所以这条不能省——z=1.5 实测就是只命中媒体查询、漏了一条横线。
+ */
+@media (max-width: 980px) {
+  .insights-overview-row > .insights-console-module:nth-last-child(2) {
+    padding-bottom: 14px;
+    border-bottom: 1px solid color-mix(in srgb, var(--dwrt-ink) 12%, transparent);
   }
 }
 
@@ -1823,36 +2375,109 @@ html[data-theme-resolved="light"] .insights-action-button {
     padding: var(--app-page-gutter-block, 12px) var(--app-page-gutter-inline, 12px);
   }
 
-  .insights-shell {
+  /* 舞台给了 `overflow: auto`，但 host 是 `height: 100%` + `overflow: hidden`，
+     溢出会先被 host 吃掉，舞台永远拿不到可滚内容——实测页面可滚余量为 0，
+     用户根本滚不到活动表格。窄视口下 host 必须按内容高度并停止裁剪，把滚动
+     交给舞台。 */
+  .route-insights-host {
     height: auto;
-    min-height: 100dvh;
-    grid-template-columns: minmax(0, 1fr);
-    padding: 0;
+    min-height: var(--app-stage-height);
+    overflow: visible;
   }
 
+  .insights-shell {
+    height: auto;
+    /* 100dvh is the whole viewport, but this stage is already shorter than the
+       viewport by the page footer's reserved strip. Claiming the full height
+       here made the rail overflow the stage, and the stage clips, so the tail of
+       the filter list plus its own footer buttons were cut off. This is what the
+       user kept reporting as the footer slicing the side menu, and it only
+       appeared under browser zoom, which shrinks the CSS viewport under 980px.
+       Use the shared stage token so the strip stays accounted for. */
+    min-height: var(--app-stage-height);
+    grid-template-columns: minmax(0, 1fr);
+    padding: 0;
+    /* 单列下筛选栏和内容是上下两块，各自按内容取高，不再是等高两栏。
+       基础规则里的 `align-items: stretch` 在单列会把两行一起拉伸，这里显式
+       把行高交回内容。 */
+    grid-template-rows: auto auto;
+    align-items: start;
+    row-gap: var(--app-page-gap, clamp(12px, 1.15vw, 18px));
+  }
+
+  /*
+   * 这里曾是 `height: var(--app-stage-height)`，即筛选栏独占整屏。单列下它
+   * 后面还排着活动板，于是活动板只剩 0 高度，表格卡塌成 2px（实测 390x844
+   * 卡高 2px / 板高 0 / 滚动器 clientH 16px 装 19241px 内容），用户看不到任何
+   * 一行数据。改为按内容取高并加 max-height 上限：
+   *   - `height: auto` 让筛选栏只占自己需要的高度，把剩下的让给内容区；
+   *   - `max-height` 仍以 `--app-stage-height` 为界，筛选项很多时栏内自己滚
+   *     （`.insights-filter-scroll` 已经是 `overflow: auto`），不会顶出一屏
+   *     以上把内容推到远处；
+   *   - 不要退回 `100dvh` 或其它视口单位：那样筛选栏会溢出舞台、尾部按钮被裁，
+   *     这是上面注释记录过的返工，实测 390 档 `筛选栏页脚可见=false` 就是它。
+   */
   .insights-filter {
-    height: 100dvh;
-    max-height: none;
+    height: auto;
+    min-height: 0;
+    max-height: var(--app-stage-height);
     border-radius: 0;
   }
 
   .insights-main {
     padding: 0 0 var(--app-page-gutter-block, 12px);
+    /* 与 host 同理：`height: 100%` + `overflow: hidden` 会把活动板压成 0 并
+       裁掉。单列下按内容取高，滚动统一由舞台负责。 */
+    height: auto;
+    overflow: visible;
   }
 
-  .insights-overview-row,
-  .insights-top-grid {
+  /* 活动板在窄视口拿一个真实的最小高度，而不是从父级分到的 0。
+     图表 + 表格两行都按内容取高，表格自己保留 `--insights-narrow-table` 的
+     可视高度，滚够一屏又不至于长到把页面拉成无限列表。 */
+  .insights-main-activity {
+    --insights-narrow-table: clamp(320px, 62vh, 560px);
+  }
+
+  .insights-activity-board {
+    height: auto;
+    min-height: 0;
+    grid-template-rows: auto auto;
+    overflow: visible;
+  }
+
+  .insights-activity-chart {
+    min-height: 240px;
+  }
+
+  /* 卡片本身要有高度，`sticky` 表头才有可粘的范围；高度为 0 时 sticky 失效，
+     这正是实测 `表头在最上=false` 的原因，而不是另一个独立缺陷。 */
+  .insights-activity-table {
+    height: var(--insights-narrow-table);
+    min-height: var(--insights-narrow-table);
+    overflow: hidden;
+  }
+
+  .insights-overview-row {
     grid-template-columns: 1fr;
-  }
-
-  .insights-summary-card {
-    width: 100%;
   }
 
   .insights-map-panel,
   .insights-map-large,
   .insights-map-large svg {
     min-height: 260px;
+  }
+
+  /* 窄视口只收紧留白，不隐藏口径说明：那句话是这次要给用户看的结论之一。
+     卡片现在有真实高度（见上面的 `--insights-narrow-table`），覆盖率条在
+     滚动器之外按内容占位，剩下的高度归表格。 */
+  .insights-activity-coverage {
+    gap: 4px 10px;
+    padding: 10px 12px 8px;
+  }
+
+  .insights-activity-coverage-main b {
+    font-size: 17px;
   }
 }
 
@@ -1874,10 +2499,14 @@ html[data-theme-resolved="light"] .insights-action-button {
   grid-template-rows: minmax(0, 1fr);
 }
 
+/*
+ * 地图关掉时不要把控制台拉满整个工作区高度。它是一条固定高度的通栏条，
+ * 拉满会让四个模块中间撑出大片空白，正是这次要修掉的观感。
+ */
 .insights-main-grid.is-map-hidden .insights-overview-row {
-  height: 100%;
+  height: auto;
   min-height: 0;
-  align-content: start;
+  align-self: start;
 }
 
 .insights-audit-empty {
@@ -2168,6 +2797,16 @@ html[data-theme-resolved="light"] .insights-action-button {
   min-width: 0;
   display: grid;
   gap: 2px;
+  /* Bounded by its column, or the ellipsis never engages: an unbounded grid item
+     just grows and, since both rows are nowrap, the text ran straight over the
+     next column (measured 146px of spill on 终端, 110px on 域名 / URL). The full
+     value is on a tooltip, so clipping loses nothing. */
+  max-width: 100%;
+}
+
+.insights-audit-table td,
+.insights-audit-table th {
+  overflow: hidden;
 }
 
 .insights-audit-main-cell strong,
@@ -2188,6 +2827,113 @@ html[data-theme-resolved="light"] .insights-action-button {
   color: var(--dwrt-muted);
   font-size: 11px;
   font-weight: 650;
+}
+
+/* 未识别为具体应用的行：主位是「未识别」，副位是后端给的协议/端口标识。标识按机器
+   字符串等宽显示，与真实应用名在视觉上分开，读者不会把 tcp/10195 当成应用名。
+   主位降到 --dwrt-muted，避免未识别项在列里比真实应用更显眼。 */
+.insights-audit-main-cell.is-unidentified strong {
+  color: var(--dwrt-muted);
+  font-weight: 700;
+}
+
+/* 服务/端口标识是机器字符串，按等宽排，与真实应用名在视觉上分开。
+   等宽字体的行盒比正文高，必须显式压 line-height：不压的话未识别行把 44px 的
+   行高顶到 45.8px（1440px 实测），同一张表里行高参差。 */
+.insights-audit-main-cell.is-unidentified small {
+  font-family: var(--dwrt-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 14px;
+  letter-spacing: 0;
+}
+
+/* 图标在前、名字在后的单元格。
+
+   图标是固定尺寸的 flex 项（`flex: 0 0 auto`），文字块 `min-width: 0` —— 两者缺
+   一个，省略号就不工作：图标会被压缩成一条，或文字块撑着不肯收，直接溢出到下一
+   列（.insights-audit-main-cell 的注释里记过同一个坑）。行高交给 td 的 44px，
+   这里不加纵向 padding，否则未识别行的两行文字会把行高顶高。 */
+.insights-audit-icon-cell {
+  min-width: 0;
+  max-width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.insights-audit-icon-cell > .insights-audit-main-cell {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.insights-audit-cell-icon {
+  position: relative;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--dwrt-ink) 8%, transparent);
+}
+
+.insights-audit-cell-icon > img {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: inherit;
+  object-fit: contain;
+}
+
+/* 设备图多是宽幅产品照，按 contain 收进方框会留大片空白，改用 cover 裁切，
+   与拓扑图里的设备图同一口径。 */
+.insights-audit-cell-icon.is-device > img { object-fit: cover; }
+
+.insights-audit-cell-icon > i {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: grid;
+  place-items: center;
+  color: var(--dwrt-muted);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 760;
+  line-height: 1;
+}
+
+/* 图标正常显示时不需要首字母垫在下面，避免半透明图标透出字来。 */
+.insights-audit-cell-icon:not(.is-glyph) > i { visibility: hidden; }
+
+/* 带图标的列要多出图标 + 间距的宽度，否则文字被挤掉一截。
+
+   两件事必须一起做对，少一件就白写：
+
+   (a) **宽度只能写在 `th` 上，而且必须是 `width`，不是 `min-width`。**
+       表是 `table-layout: fixed`，这种布局只认第一行（`thead tr`）的列宽，
+       单元格上的 `min-width` 直接被忽略 —— 实测给 `th`/`td` 加 240px
+       `min-width` 后列宽仍是等分出来的 132px，MAC 照样截断。
+   (b) **要留出图标真正占走的宽度。** 20px 图标 + 8px 间距 = 28px，是从文字那里
+       扣的。实测 `bc:24:11:52:56:eb` 需要 113px 文字宽，而它只拿到 104px。
+
+   这几个表名类挂在卡片 `<section>` 上（见 `auditTableMarkup`），不在 `<table>`
+   上，所以选择器要从卡片往下走。只钉带图标的那一列，其余列继续按剩余空间等分；
+   窄视口下仍由 `.insights-audit-table` 的 1120px 最小宽度接管横向滚动。 */
+.online-record-table .insights-audit-table thead th:nth-child(2) {
+  /* 113px 文字 + 28px 图标位 + 28px 左右 padding，留一点余量。 */
+  width: 184px;
+}
+
+.url-audit-table .insights-audit-table thead th:nth-child(4) {
+  width: 168px;
+}
+
+.protocol-app-table .insights-audit-table thead th:nth-child(1) {
+  width: 188px;
 }
 
 .insights-audit-pill {
@@ -2571,14 +3317,71 @@ html[data-theme-resolved="light"] .insights-action-button {
   table-layout: fixed;
 }
 
-.insights-audit-table thead th {
+/* 选择器必须比材质层那条更具体。材质层是
+   `.dwrt-app .dwrt-kit-table-wrap .dwrt-kit-table thead th`（0,4,1 + !important），
+   只写 `.insights-audit-table thead th`（0,2,1）即使加 !important 也压不过它 ——
+   实测改完仍是 rgba(0,0,0,0)，表头照旧透明。带上同样的祖先链再加自己的类，
+   到 0,5,1，才真正生效。 */
+.dwrt-app .dwrt-kit-table-wrap .dwrt-kit-table.insights-audit-table thead th {
   position: sticky;
   top: 0;
   z-index: 2;
   height: 40px;
-  background: rgba(255,255,255,0.035);
-  backdrop-filter: blur(8px) saturate(125%);
-  -webkit-backdrop-filter: blur(8px) saturate(125%);
+  /* 这一条原来是 rgba(255,255,255,0.035) —— 几乎完全透明，壁纸直接透上来，
+     表头在亮色区域读成一片白（用户 2026-08-09 报的「表头泛白」）。而且 kit 的
+     材质层对 `.dwrt-kit-table-wrap .dwrt-kit-table thead th` 打了
+     `background: transparent !important`，等于连这 3.5% 都被抹掉，`thead` 自己
+     的底色又画不到 sticky 单元格背后，所以滚动时行文字会从标签里穿过去。
+
+     改用活动页那条已经量过的 sticky 底色（同一个变量、同一套按前景翻转的口径），
+     并用 `!important` 压过材质层的 transparent —— 这是 sticky 表头必须自带不透明
+     底色的那一类例外，不是给页面开后门改材质。 */
+  background: var(--insights-sticky-head-bg, rgba(27,34,48,0.98)) !important;
+  backdrop-filter: blur(10px) saturate(130%) !important;
+  -webkit-backdrop-filter: blur(10px) saturate(130%) !important;
+}
+
+/* 表头一旦有了自己的不透明底色，它就不再是「壁纸上的一块玻璃」，逐 `th` 采样出来
+   的墨色反而会读错。宿主把 `.dwrt-kit-table thead th` 登记成独立采样单元
+   (`ADAPTIVE_FOREGROUND_DETAIL_SELECTOR`)，采的是底下壁纸的亮度，于是同一条表头
+   里出现了两种墨色 —— 实测「分类 / 连接数 / 终端 / 线路 / 端口」被判成 dark 区域
+   拿到深墨(luma 0.049)，压在深色带(0.131)上几乎看不见，而「名称 / 累计流量」是
+   浅墨(0.991)。
+
+   这里不改宿主的采样清单（那是 Frontend 共享设施，`menu-shell.js` 还有别人在写），
+   只在本页把这条带子的墨色按它**自己的底色**定死：底色是已知的深色，墨色就取
+   浅色那一档。区域别名一并覆盖，因为 kit 的表头文字走的是 `--dwrt-kit-*`。
+   采样器写在元素上的 `data-adaptive-region` 仍然存在，只是不再决定这一条的颜色。 */
+.dwrt-app .dwrt-kit-table-wrap .dwrt-kit-table.insights-audit-table thead th,
+.dwrt-app .dwrt-kit-table-wrap .dwrt-kit-table.insights-audit-table thead th * {
+  --adaptive-ink: rgba(251,253,255,0.99);
+  --adaptive-text: rgba(251,253,255,0.96);
+  --adaptive-muted: rgba(251,253,255,0.88);
+  --adaptive-faint: rgba(251,253,255,0.78);
+  --dwrt-ink: rgba(251,253,255,0.99);
+  --dwrt-text: rgba(251,253,255,0.96);
+  --dwrt-muted: rgba(251,253,255,0.88);
+  --dwrt-kit-text: rgba(251,253,255,0.96);
+  --dwrt-kit-muted: rgba(251,253,255,0.88);
+  --app-text: rgba(251,253,255,0.96);
+  color: rgba(251,253,255,0.96) !important;
+}
+
+/* 浅底那一档同理反过来。`--insights-sticky-head-bg` 在 `data-adaptive-foreground:
+   dark` 下是浅色带，这时墨色必须是深的。 */
+html[data-adaptive-foreground="dark"] .dwrt-app .dwrt-kit-table-wrap .dwrt-kit-table.insights-audit-table thead th,
+html[data-adaptive-foreground="dark"] .dwrt-app .dwrt-kit-table-wrap .dwrt-kit-table.insights-audit-table thead th * {
+  --adaptive-ink: rgba(8,13,21,0.98);
+  --adaptive-text: rgba(8,13,21,0.96);
+  --adaptive-muted: rgba(8,13,21,0.88);
+  --adaptive-faint: rgba(8,13,21,0.78);
+  --dwrt-ink: rgba(8,13,21,0.98);
+  --dwrt-text: rgba(8,13,21,0.96);
+  --dwrt-muted: rgba(8,13,21,0.88);
+  --dwrt-kit-text: rgba(8,13,21,0.96);
+  --dwrt-kit-muted: rgba(8,13,21,0.88);
+  --app-text: rgba(8,13,21,0.96);
+  color: rgba(8,13,21,0.96) !important;
 }
 
 .insights-audit-table tbody td {
@@ -2885,6 +3688,23 @@ html[data-theme-resolved="light"] .insights-action-button {
     0 14px 34px rgba(0,0,0,0.18);
 }
 
+/* 暗色 cyber map 上的 geo 取数状态，材质与 scope-empty 同源。 */
+.insights-map-status {
+  color: rgba(229, 242, 255, 0.86);
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.12), rgba(255,255,255,0.045)),
+    rgba(8, 18, 34, 0.58);
+  border-color: rgba(139, 220, 255, 0.16);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.14),
+    0 10px 24px rgba(0,0,0,0.18);
+}
+
+.insights-map-large.is-geo-failed .insights-map-status {
+  color: rgba(255, 196, 196, 0.94);
+  border-color: rgba(255, 138, 138, 0.30);
+}
+
 .insights-map-credit {
   color: rgba(188, 230, 255, 0.76);
   font-size: 11px;
@@ -2953,20 +3773,25 @@ html[data-theme-resolved="light"] .insights-action-button {
 .insights-map-point-halo {
   width: calc(var(--point-size, 12px) * 2.35);
   height: calc(var(--point-size, 12px) * 2.35);
-  border: 1px solid rgba(57, 217, 255, 0.42);
-  background: radial-gradient(circle, rgba(57,217,255,0.20), rgba(57,217,255,0.055) 42%, transparent 70%);
-  box-shadow: 0 0 24px rgba(57, 217, 255, 0.28);
+  /* 光环与核心跟随 `--point-color`（由 JS 按风险档给出）。写死青色会让绿点/红点
+     都罩一层青光，档位之间在地图上反而分不开。 */
+  border: 1px solid color-mix(in srgb, var(--point-color, #39d9ff) 42%, transparent);
+  background: radial-gradient(circle,
+    color-mix(in srgb, var(--point-color, #39d9ff) 20%, transparent),
+    color-mix(in srgb, var(--point-color, #39d9ff) 6%, transparent) 42%,
+    transparent 70%);
+  box-shadow: 0 0 24px color-mix(in srgb, var(--point-color, #39d9ff) 28%, transparent);
   animation: insights-map-point-pulse 2.8s ease-out infinite;
 }
 
 .insights-map-point-core {
   width: var(--point-size, 12px);
   height: var(--point-size, 12px);
-  background: #39d9ff;
+  background: var(--point-color, #39d9ff);
   border: 1px solid rgba(239, 252, 255, 0.86);
   box-shadow:
-    0 0 12px rgba(57, 217, 255, 0.62),
-    0 0 28px rgba(57, 217, 255, 0.30);
+    0 0 12px color-mix(in srgb, var(--point-color, #39d9ff) 62%, transparent),
+    0 0 28px color-mix(in srgb, var(--point-color, #39d9ff) 30%, transparent);
 }
 
 .insights-map-point.is-local .insights-map-point-halo {
@@ -3018,6 +3843,13 @@ html[data-theme-resolved="light"] .insights-action-button {
   filter: drop-shadow(0 0 3px var(--route-color, #38d8ff));
   animation: insights-route-dash 2.8s linear infinite;
   animation-delay: var(--route-delay, 0s);
+}
+
+/* 方向靠线型说，不靠颜色说（颜色已归风险）。入站的短划更疏、行进方向相反，
+   与 ECharts 主图的 dashed / solid 区分同源。 */
+.insights-map-route-path.is-inbound {
+  stroke-dasharray: 0.010 0.026;
+  animation-direction: reverse;
 }
 
 .insights-map-route-packet {

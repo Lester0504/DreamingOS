@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import hashlib
-import shlex
 import sqlite3
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,14 +47,12 @@ def create_fingerprint(path: Path, version: str) -> None:
     db.close()
 
 
-def compile_harness(root: Path, firmware: Path, runtime: Path, state: Path,
-                    release: Path) -> Path:
+def compile_harness(root: Path, legacy_firmware: Path, new_firmware: Path,
+                    runtime: Path, state: Path, release: Path) -> Path:
     binary = root / "system-db-sync"
-    flags = shlex.split(
-        subprocess.check_output(
-            ["pkg-config", "--cflags", "--libs", "openssl", "sqlite3"], text=True
-        )
-    )
+    # Resolved through the shared helper so a host without .pc files still
+    # finds a usable prefix instead of failing here.
+    flags = apd_test_deps.package_flags("openssl", "sqlite3")
     subprocess.run(
         [
             "cc",
@@ -59,12 +60,15 @@ def compile_harness(root: Path, firmware: Path, runtime: Path, state: Path,
             "-Wall",
             "-Wextra",
             "-Werror",
-            f'-DDWRT_SYSTEM_DB_DIR="{firmware}"',
+            f'-DDWRT_SYSTEM_DB_LEGACY_DIR="{legacy_firmware}"',
+            f'-DDWRT_SYSTEM_DB_NEW_DIR="{new_firmware}"',
             f'-DDWRT_RUNTIME_DB_DIR="{runtime}"',
             f'-DDWRT_SYSTEM_DB_STATE_DIR="{state}"',
             f'-DDWRT_FIRMWARE_RELEASE_PATH="{release}"',
+            f"-I{ROOT / 'src'}",
             f"-I{ROOT / 'src/init'}",
             str(ROOT / "src/init/system_db_sync.c"),
+            str(ROOT / "src/jmx_path_provider.c"),
             str(ROOT / "tests/system_db_sync_harness.c"),
             *flags,
             "-o",
@@ -80,23 +84,52 @@ def run(binary: Path) -> str:
                           stdout=subprocess.PIPE).stdout
 
 
+def test_system_db_startup_contract() -> None:
+    init = (ROOT / "src/init/dreamingwrt_init.c").read_text(encoding="utf-8")
+    makefile = (ROOT / "src/Makefile").read_text(encoding="utf-8")
+    sync = (ROOT / "src/init/system_db_sync.c").read_text(encoding="utf-8")
+
+    assert "jmx_path_provider.o" in makefile
+    wait = init.index("wait_for_persistent_store()")
+    system_db = init.index("dwrt_system_db_sync(&system_db_status)", wait)
+    conflict = init.index("if (system_db_status.conflicts)", system_db)
+    abort = init.index("return 1;", conflict)
+    load_config = init.index("load_config();", system_db)
+    start_all = init.index("start_all(&dummy, 1);", load_config)
+    assert wait < system_db < conflict < abort < load_config < start_all
+    command = init.index('if (strcmp(cmd, "system-db") == 0')
+    command_end = init.index('if (strcmp(cmd, "config-restore") == 0', command)
+    command_body = init[command:command_end]
+    assert "emit_system_db_status(out, 1, json, &conflicts)" in command_body
+    assert "if (!conflicts)\n                start_all(out, 1);" in command_body
+    assert "components remain stopped: system database source conflict" in command_body
+    assert "components_restart_allowed" in init
+    assert "DWRT_SYSTEM_DB_NEW_DIR \"/usr/share/dreamingos/system-db\"" in sync
+    assert "DWRT_SYSTEM_DB_LEGACY_DIR \"/usr/share/dreamingwrt/system-db\"" in sync
+    assert "DWRT_RUNTIME_DB_DIR \"/etc/dreamingwrt\"" in sync
+    assert "Preflight every immutable source before replacing either runtime DB" in sync
+
+
 def test_system_db_sync_contract() -> None:
     with tempfile.TemporaryDirectory(prefix="dwrt-system-db-") as tmp:
         root = Path(tmp)
-        firmware = root / "firmware"
+        firmware = root / "firmware-legacy"
+        new_firmware = root / "firmware-new"
         runtime = root / "runtime"
         state = root / "state"
         release = root / "dreamingwrt-release.json"
         firmware.mkdir()
+        new_firmware.mkdir()
         runtime.mkdir()
         release.write_text('{"build_id":"firmware-v1"}\n')
         create_dpi(firmware / "dreamingwrt_signatures.db", "firmware-v1")
         create_fingerprint(firmware / "fingerprint.db", "firmware-v1")
         create_dpi(runtime / "dreamingwrt_signatures.db", "old-runtime")
 
-        binary = compile_harness(root, firmware, runtime, state, release)
+        binary = compile_harness(root, firmware, new_firmware, runtime, state, release)
         first = run(binary)
         assert "changed=2 errors=0" in first
+        assert "selection=legacy-fallback" in first
         assert sha256(runtime / "dreamingwrt_signatures.db") == sha256(
             firmware / "dreamingwrt_signatures.db"
         )
@@ -140,7 +173,59 @@ def test_system_db_sync_contract() -> None:
         assert "firmware_source_invalid" in failed.stdout
         assert sha256(runtime / "dreamingwrt_signatures.db") == good_hash
 
+        # Identical new/legacy firmware paths select the new slug without
+        # creating a second runtime writer.
+        (firmware / "dreamingwrt_signatures.db").write_bytes(
+            (runtime / "dreamingwrt_signatures.db").read_bytes()
+        )
+        (new_firmware / "dreamingwrt_signatures.db").write_bytes(
+            (firmware / "dreamingwrt_signatures.db").read_bytes()
+        )
+        (new_firmware / "fingerprint.db").write_bytes(
+            (firmware / "fingerprint.db").read_bytes()
+        )
+        identical = run(binary)
+        assert identical.count("selection=new-identical-to-legacy") == 2
+
+        # Divergent copies are an identity conflict.  Preflight rejects the
+        # whole pair before either persistent runtime database is replaced.
+        release.write_text('{"build_id":"firmware-conflict"}\n')
+        (new_firmware / "dreamingwrt_signatures.db").unlink()
+        create_dpi(new_firmware / "dreamingwrt_signatures.db", "conflicting-new")
+        dpi_before = sha256(runtime / "dreamingwrt_signatures.db")
+        fingerprint_before = sha256(runtime / "fingerprint/fingerprint.db")
+        conflict = subprocess.run([str(binary), "sync"], text=True,
+                                  stdout=subprocess.PIPE)
+        assert conflict.returncode != 0
+        assert "conflicts=1" in conflict.stdout
+        assert "firmware_source_identity_conflict" in conflict.stdout
+        assert sha256(runtime / "dreamingwrt_signatures.db") == dpi_before
+        assert sha256(runtime / "fingerprint/fingerprint.db") == fingerprint_before
+
+        # Existing symlinks are not accepted as immutable firmware authority.
+        (new_firmware / "dreamingwrt_signatures.db").unlink()
+        (new_firmware / "dreamingwrt_signatures.db").symlink_to(
+            runtime / "dreamingwrt_signatures.db"
+        )
+        unsafe = subprocess.run([str(binary), "sync"], text=True,
+                                stdout=subprocess.PIPE)
+        assert unsafe.returncode != 0
+        assert "conflicts=1" in unsafe.stdout
+        assert "firmware_source_identity_conflict" in unsafe.stdout
+        assert sha256(runtime / "dreamingwrt_signatures.db") == dpi_before
+        (new_firmware / "dreamingwrt_signatures.db").unlink()
+        create_dpi(new_firmware / "dreamingwrt_signatures.db", "new-only")
+
+        # A new-only firmware source is accepted and still writes only the
+        # existing legacy runtime authority.
+        (firmware / "dreamingwrt_signatures.db").unlink()
+        (firmware / "fingerprint.db").unlink()
+        release.write_text('{"build_id":"firmware-new-only"}\n')
+        new_only = run(binary)
+        assert new_only.count("selection=new-only") == 2
+
 
 if __name__ == "__main__":
+    test_system_db_startup_contract()
     test_system_db_sync_contract()
     print("ok: firmware system database promotion contract")

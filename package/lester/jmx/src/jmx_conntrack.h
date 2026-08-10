@@ -89,6 +89,30 @@ enum jmx_carrier_id {
 #define JMX_NL_ACT_CARRIER_FLUSH 40
 #define JMX_NL_ACT_CARRIER_ADD   41
 
+#define JMX_NL_ACT_APPCAT_FLUSH  42
+#define JMX_NL_ACT_APPCAT_ADD    43
+
+/*
+ * Per-WAN x per-category forwarding statistics.
+ *
+ * Category ids mirror the userspace signature database `app_category` table.
+ * That table is sparse (1..17 plus 99 for "unknown"), so the kernel keeps a
+ * dense slot array and maps id 99 onto JMX_APP_CAT_UNKNOWN.  Any appid the
+ * kernel has no mapping for is also counted as unknown; traffic is never
+ * redistributed across categories to make the table look complete.
+ */
+#define JMX_APP_CAT_UNKNOWN     0
+#define JMX_APP_CAT_SLOTS       18
+#define JMX_APP_CAT_DB_UNKNOWN  99
+
+typedef struct jmx_wan_cat_stat {
+	atomic64_t active_conn;
+	atomic64_t tx_packets;
+	atomic64_t rx_packets;
+	atomic64_t tx_bytes;
+	atomic64_t rx_bytes;
+} jmx_wan_cat_stat_t;
+
 typedef struct jmx_wan_iface {
 	u8   wan_id;
 	char name[16];
@@ -100,6 +124,8 @@ typedef struct jmx_wan_iface {
 	atomic64_t rx_bytes;
 	atomic64_t active_conn;
 	u32  generation;
+	/* Fixed-size table: no per-flow allocation on the forwarding path. */
+	jmx_wan_cat_stat_t cats[JMX_APP_CAT_SLOTS];
 } jmx_wan_iface_t;
 
 typedef struct jmx_route_rule {
@@ -128,6 +154,30 @@ jmx_wan_iface_t *jmx_wan_find(u8 wan_id);
 int  jmx_wan_get_count(void);
 void jmx_wan_flow_account_rx(u8 wan_id, u32 generation, u64 bytes);
 void jmx_wan_flow_release(u8 wan_id, u32 generation);
+
+/* Direction-aware accounting.  is_reply selects the download column. */
+void jmx_wan_flow_account(u8 wan_id, u32 generation, u8 cat_slot,
+			  u64 bytes, bool is_reply);
+void jmx_wan_flow_cat_acquire(u8 wan_id, u32 generation, u8 cat_slot);
+void jmx_wan_flow_cat_release(u8 wan_id, u32 generation, u8 cat_slot);
+
+/*
+ * active_conn reconciliation.  The incremental gauge drifts upward because the
+ * increment is unconditional while the decrement is gated on a generation
+ * match, so a periodic walk of the conntrack table re-measures it instead.
+ * Snapshot the generations first, walk without holding jmx_route_lock, then
+ * assign; see the comments on both functions in jmx_route.c.
+ */
+void jmx_wan_active_conn_reconcile(const u64 *counts, const u64 *cat_counts,
+				   const u32 *generations, u8 count);
+u8   jmx_wan_generation_snapshot(u32 *generations, u8 count);
+
+/* appid -> category slot map, pushed down from jmxd. */
+int  jmx_app_cat_add(u32 appid, u16 db_category_id);
+void jmx_app_cat_flush(void);
+u8   jmx_app_cat_slot(u32 appid);
+const char *jmx_app_cat_name(u8 cat_slot);
+int  jmx_app_cat_map_count(void);
 
 int  jmx_route_rule_add(const jmx_route_rule_t *rule);
 void jmx_route_rule_del(u16 prio);

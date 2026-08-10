@@ -4,10 +4,13 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,22 +19,10 @@ FIXTURE = ROOT / "tests/jmx_defensive_runtime_fixture.c"
 
 
 def json_c_flags() -> list[str]:
-    pkg_config = shutil.which("pkg-config")
-    if pkg_config:
-        result = subprocess.run(
-            [pkg_config, "--cflags", "--libs", "json-c"],
-            text=True, capture_output=True,
-        )
-        if result.returncode == 0:
-            return shlex.split(result.stdout)
-    brew = shutil.which("brew")
-    if brew:
-        prefix = subprocess.check_output(
-            [brew, "--prefix", "json-c"], text=True
-        ).strip()
-        return [f"-I{prefix}/include", f"-L{prefix}/lib", "-ljson-c",
-                f"-Wl,-rpath,{prefix}/lib"]
-    raise AssertionError("json-c development files unavailable")
+    # The old fallback asked `brew --prefix json-c`, which on 31.6 answers with
+    # a prefix whose only library is an LTO archive the host linker rejects.
+    # The shared resolver prefers a real .so and finds the staging_dir copy.
+    return apd_test_deps.package_flags("json-c")
 
 
 def run(binary: Path, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -45,7 +36,13 @@ def compile_fixture(temp: Path, proc_root: Path, ifstatus: Path) -> Path:
     assert compiler, "host C compiler unavailable"
     binary = temp / "jmx-defensive-runtime"
     subprocess.run([
-        compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+        # gnu11, not c11: jmx_utils.c/jmx_network.c use strtok_r() and IFNAMSIZ,
+        # which are POSIX rather than ISO C.  Strict -std=c11 switches off
+        # glibc's default _DEFAULT_SOURCE, so both vanish and the build fails
+        # with implicit-declaration and int-conversion errors on the Linux
+        # tree.  The macOS SDK exposes them regardless, which is why this only
+        # broke there.
+        compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
         "-DJMX_NETWORK_DEFENSIVE_ONLY=1",
         f'-DJMX_PROC_SYS_ROOT="{proc_root}"',
         f'-DJMX_IFSTATUS_PATH="{ifstatus}"',

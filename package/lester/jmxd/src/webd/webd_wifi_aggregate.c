@@ -2034,6 +2034,21 @@ void webd_wifi_merge_environment_scan(struct json_object *data,
         samples_available ? "latest_neighbor_scan_available" :
         execution_available ? "scan_not_yet_run" :
                               "ap_control_v2_scan_execution_unavailable");
+    /*
+     * TX retry ("TX n") history: reported false because it genuinely is not
+     * implemented. The APD collector does read the counter
+     * (apd_backend_openwrt.c: airtime "retries"), but nothing persists it as a
+     * series -- ac_radio_survey_bucket has no retry column, so there is no
+     * table to query for a chart.
+     *
+     * The bit exists so the page can stop hardcoding a denial. design.md asks
+     * for exactly this: a frontend string that says "the backend does not
+     * provide TX n history" keeps denying the feature after it ships, whereas a
+     * capability bit flips on its own.
+     */
+    wifi_capability_bool(capabilities, "tx_n_history", 0);
+    wifi_replace_string(reasons, "tx_n_history",
+                        "tx_retry_series_not_persisted");
 }
 
 struct wifi_survey_history_point {
@@ -2302,6 +2317,19 @@ static void wifi_capability_reason(struct json_object *capabilities,
     struct json_object *reasons = wifi_ensure_object(capabilities, "reasons");
 
     wifi_replace_string(reasons, key, reason);
+}
+
+/* Reads a capability bit that was already published, so scope reporting can
+ * follow the flat bits instead of duplicating the logic that produced them. */
+static int wifi_capability_true(struct json_object *capabilities,
+                                const char *key)
+{
+    struct json_object *value = NULL;
+
+    if (!capabilities || !key ||
+        !json_object_object_get_ex(capabilities, key, &value) || !value)
+        return 0;
+    return json_object_get_boolean(value) ? 1 : 0;
 }
 
 /* Flip the connectivity/roaming capability truthfully once the AC
@@ -3089,14 +3117,23 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
         int has_managed = ac_items && json_object_array_length(ac_items) > 0;
         int local_present = local_radio_count > 0 || local_ssid_count > 0;
 
+        /* The local scope now follows what jmxd actually reports for this box.
+         * Secrets survive a save (AEAD vault keyed by secret_id) and apply
+         * verifies by readback, so hardcoding false here would understate a
+         * path that works.  It still reads false on a unit with no PHY, and it
+         * deliberately does not consult the managed-AP state. */
+        int local_write = local_present &&
+                          wifi_capability_true(capabilities, "save_config") &&
+                          wifi_capability_true(capabilities, "apply_config");
+
         json_object_object_add(local_scope, "present",
                                json_object_new_boolean(local_present));
         json_object_object_add(local_scope, "supported",
-                               json_object_new_boolean(0));
+                               json_object_new_boolean(local_write));
         json_object_object_add(local_scope, "reason",
-            json_object_new_string(local_present ?
-                "local_write_path_not_implemented" :
-                "no_local_phy_detected"));
+            json_object_new_string(!local_present ? "no_local_phy_detected" :
+                local_write ? "available" :
+                "local_write_capability_reported_false"));
 
         json_object_object_add(managed_scope, "present",
                                json_object_new_boolean(has_managed));

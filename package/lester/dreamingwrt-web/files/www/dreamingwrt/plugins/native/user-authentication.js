@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260804-speed-limit-two-tabs-02';
+  const VERSION = '20260809-front-w13-delegated-iface-select-01';
   const MODULE_CLASS = 'user-authentication-route-host';
   const stage = root?.closest('.console-stage');
   const PAGE_BY_ID = {
@@ -79,6 +79,12 @@ export function mount(context = {}) {
     selected: new Set(),
     drawer: '',
     editor: {},
+    /*
+     * 创建响应里那一次性的明文券码。只活在内存里：不写 localStorage、不写日志、
+     * 不进导出，抽屉关掉即丢。后端 capabilities.voucher_one_time_reveal 就是在说
+     * 「这一次不接、以后再也拿不到」。
+     */
+    voucherReveal: null,
     preview: false,
     confirmDelete: false,
     deleteTarget: null,
@@ -203,6 +209,14 @@ export function mount(context = {}) {
     if (!response.ok || json?.ok === false || payload?.ok === false) {
       const error = new Error(firstText(payload?.message, payload?.error, json?.message, json?.error, `HTTP ${response.status}`));
       error.status = response.status;
+      /*
+       * 保留 error/field/options 三件套：后端用 data.error 给机器可读的码、data.field
+       * 指向出错的表单项、data.options 附候选。只取 message 会把一切都压成一句
+       * 「保存失败」，用户看不出是哪一项、该填什么。
+       */
+      error.code = firstText(payload?.error, payload?.code, json?.error, json?.code);
+      error.field = firstText(payload?.field, json?.field);
+      error.options = asArray(payload?.options || json?.options, ['items']);
       throw error;
     }
     return payload || {};
@@ -237,6 +251,44 @@ export function mount(context = {}) {
     const caps = state.data.capabilities || {};
     const local = caps[state.page] || {};
     return caps.write === true || caps[action] === true || caps[`${state.page}_${action}`] === true || local.write === true || local[action] === true;
+  }
+
+  /*
+   * 代拨接口的候选来自后端枚举的启用中 WAN（按 metric, priority, id 排序，第一项就是
+   * 留空时后端会选的那条）。旧 authd 上这两个能力位缺失或为 false，此时必须退回自由
+   * 文本框——写成「字段一定存在」会让旧设备出现一个空下拉，等于把接口锁死。
+   */
+  function delegatedInterfaceOptions() {
+    return asArray(state.data.delegated?.interface_options, ['items']);
+  }
+  function delegatedInterfaceSelectable() {
+    const caps = state.data.capabilities || {};
+    return caps.delegated_interface_options === true && delegatedInterfaceOptions().length > 0;
+  }
+  function delegatedInterfaceOptional() {
+    return (state.data.capabilities || {}).delegated_interface_optional === true;
+  }
+  /*
+   * 某条服务引用的线路后来被停用时，它的 interface 不在候选里。此时保留原值并显式
+   * 标注异常，不能静默改成候选里的第一条——那会在用户不知情时换掉拨号线路。
+   */
+  function delegatedInterfaceField(editor) {
+    if (!delegatedInterfaceSelectable()) {
+      return field('代拨接口', 'interface', editor.interface, { placeholder: 'wan', help: '当前后端未提供可选线路枚举，请手工填写启用中的 WAN 接口名' });
+    }
+    const options = delegatedInterfaceOptions();
+    const current = firstText(editor.interface);
+    const autoLabel = options.length ? `自动（默认线路：${firstText(options[0].label, options[0].value)}）` : '自动（默认线路）';
+    const entries = [['', autoLabel], ...options.map((item) => {
+      const value = firstText(item.value, item.ifname, item.id);
+      return [value, firstText(item.label, value)];
+    })];
+    const known = entries.some(([value]) => value === current);
+    if (current && !known) entries.push([current, `${current}（该线路已不在启用中的 WAN 里）`]);
+    const help = current && !known
+      ? '这条服务绑定的线路当前不是启用中的 WAN，保存前请确认是否改选其他线路'
+      : delegatedInterfaceOptional() ? '留空即由后端选择优先级最高的启用 WAN' : '';
+    return field('代拨接口', 'interface', current, { tag: 'select', options: entries, help });
   }
 
   function icon(name) {
@@ -453,7 +505,29 @@ export function mount(context = {}) {
     if (state.tab === 'packages') return rows.map((row, index) => { const id = firstText(row.id, row.name, `package-${index}`); return `<tr>${selectedCell(id)}<td><strong>${escapeHtml(firstText(row.name, '--'))}</strong></td><td>${escapeHtml(firstText(row.validity, row.duration, '--'))}</td><td>${escapeHtml(firstText(row.price, row.fee, '--'))}</td><td>${escapeHtml(firstText(row.up_rate, row.upload, '--'))}</td><td>${escapeHtml(firstText(row.down_rate, row.download, '--'))}</td><td>${escapeHtml(firstText(row.note, '--'))}</td><td>${rowActions('package', id)}</td></tr>`; });
     if (state.tab === 'accounts') return rows.map((row, index) => { const id = firstText(row.id, row.account, row.username, `account-${index}`); return `<tr>${selectedCell(id)}<td><strong>${escapeHtml(firstText(row.account, row.username, '--'))}</strong></td><td>${escapeHtml(firstText(row.name, '--'))}</td><td>${escapeHtml(firstText(row.auth_type, row.type, '--'))}</td><td>${escapeHtml(firstText(row.package_name, row.package, '--'))}</td><td>${escapeHtml(firstText(row.expires_at, row.expiry, '--'))}</td><td>${escapeHtml(firstText(row.online_duration, row.duration, '--'))}</td><td>${statusPill(row.enabled === false ? '停用' : row.expired ? '过期' : '启用', row.enabled !== false && !row.expired, row.expired)}</td><td>${escapeHtml(firstText(row.note, '--'))}</td><td>${rowActions('account', id)}</td></tr>`; });
     if (state.tab === 'ledger') return rows.map((row, index) => { const id = firstText(row.id, `ledger-${index}`); return `<tr>${selectedCell(id)}<td>${escapeHtml(firstText(row.account, '--'))}</td><td>${escapeHtml(firstText(row.name, '--'))}</td><td>${escapeHtml(firstText(row.charged_at, row.time, '--'))}</td><td>${escapeHtml(firstText(row.operator, '--'))}</td><td>${escapeHtml(firstText(row.description, '--'))}</td><td>${escapeHtml(firstText(row.amount, '--'))}</td><td>${escapeHtml(firstText(row.note, '--'))}</td><td>${rowActions('ledger', id)}</td></tr>`; });
-    return rows.map((row, index) => { const id = firstText(row.id, row.code, `voucher-${index}`); return `<tr>${selectedCell(id)}<td><code>${escapeHtml(firstText(row.code, '--'))}</code></td><td>${escapeHtml(firstText(row.expires_at, row.expiry, '--'))}</td><td>${escapeHtml(firstText(row.duration, '--'))}</td><td>${escapeHtml(firstText(row.used_by, row.usage, '未使用'))}</td><td>${statusPill(row.used ? '已使用' : row.expired ? '已过期' : '未使用', !row.used && !row.expired, row.expired)}</td><td>${escapeHtml(firstText(row.note, '--'))}</td><td>${rowActions('voucher', id)}</td></tr>`; });
+    return rows.map((row, index) => { const id = firstText(row.id, row.code, `voucher-${index}`); return `<tr>${selectedCell(id)}<td>${voucherCodeCell(row)}</td><td>${escapeHtml(firstText(row.expires_at, row.expiry, '不过期'))}</td><td>${escapeHtml(firstText(row.duration, '按门户默认时长'))}</td><td>${escapeHtml(voucherUsageText(row))}</td><td>${statusPill(row.used ? '已使用' : row.expired ? '已过期' : '未使用', !row.used && !row.expired, row.expired)}</td><td>${escapeHtml(firstText(row.note, '--'))}</td><td>${rowActions('voucher', id)}</td></tr>`; });
+  }
+
+  /*
+   * 上网码列。列表接口永远不返回 `code`：authd 只存 code_digest / code_cipher，
+   * SELECT 只取 display_hint 并固定加 code_redacted=true。此前这一列读 row.code，
+   * 于是每一行恒为「--」，用户看到的就是「生成了一个空的东西」——券其实已经入库。
+   * 明文只在创建响应里出现一次，由 voucherRevealDrawer() 负责展示。
+   */
+  function voucherCodeCell(row) {
+    const hint = firstText(row.display_hint, row.code);
+    if (!hint) return `<code>--</code>${bool(row.has_code, false) ? '<small class="user-auth-voucher-note">码已加密存储，仅创建时可见</small>' : ''}`;
+    const redacted = bool(row.code_redacted, false) && !firstText(row.code);
+    return `<code>${escapeHtml(hint)}</code>${redacted ? '<small class="user-auth-voucher-note">仅显示部分字符</small>' : ''}`;
+  }
+
+  function voucherUsageText(row) {
+    const used = firstNumber(row.used_count, 0);
+    const max = firstNumber(row.max_uses, 0);
+    if (used > 0) return max > 0 ? `已用 ${used} / ${max} 次` : `已用 ${used} 次`;
+    const explicit = firstText(row.used_by, row.usage);
+    if (explicit) return explicit;
+    return max > 0 ? `未使用（限 ${max} 次）` : '未使用';
   }
 
   function rowActions(kind, id) {
@@ -571,7 +645,8 @@ export function mount(context = {}) {
   }
 
   function drawerTitle() {
-    const labels = { web: '编辑 WEB 认证设置', portal: '编辑门户页面', 'password-policy': '编辑自助密码设置', access: '添加访问控制规则', package: '认证套餐', account: '认证账号', voucher: '上网码', 'voucher-print': '打印上网码', delegated: '代拨账号', periodic: '定期通知', ledger: '账目记录', 'import-accounts': '导入账号数据', 'import-delegated': '导入代拨账号' };
+    const labels = { web: '编辑 WEB 认证设置', portal: '编辑门户页面', 'password-policy': '编辑自助密码设置', access: '添加访问控制规则', package: '认证套餐', account: '认证账号', voucher: '上网码', 'voucher-print': '打印上网码', 'voucher-reveal': '上网码已生成', delegated: '代拨账号', periodic: '定期通知', ledger: '账目记录', 'import-accounts': '导入账号数据', 'import-delegated': '导入代拨账号' };
+    if (state.drawer === 'voucher-reveal') return '上网码已生成';
     return `${state.editor._new ? '新建' : '编辑'}${labels[state.drawer] || '配置'}`.replace('新建编辑', '编辑').replace('编辑编辑', '编辑');
   }
 
@@ -585,23 +660,46 @@ export function mount(context = {}) {
     if (state.drawer === 'account') return `<div class="user-auth-form-grid">${field('账号', 'account', editor.account, { wide: true, required: true })}${field('用户姓名', 'name', editor.name)}${field('认证类型', 'auth_type', editor.auth_type || 'web_account', { tag: 'select', options: [['web_account','WEB 账号'],['pppoe','PPPoE'],['pppoe_relay','PPPoE 透传'],['l2tp','L2TP'],['pptp','PPTP'],['openvpn','OpenVPN']] })}${field('密码', 'password', '', { type: 'password', placeholder: editor._new ? '设置密码' : '留空保持现有密码' })}${field('当前套餐', 'package_id', editor.package_id)}${field('到期时间', 'expires_at', editor.expires_at, { type: 'datetime-local' })}${field('绑定 MAC', 'mac', editor.mac, { placeholder: 'AA:BB:CC:DD:EE:FF' })}${field('允许地址', 'source_addresses', asArray(editor.source_addresses).join('\n'), { tag: 'textarea', wide: true })}${field('联系方式', 'phone', editor.phone)}${field('备注', 'note', editor.note, { tag: 'textarea', wide: true })}</div>`;
     if (state.drawer === 'voucher') return `<div class="user-auth-form-grid">${field('上网码', 'code', editor.code, { wide: true, placeholder: '留空由后端生成' })}${field('生成数量', 'count', editor.count || 1, { type: 'number', min: 1, max: 10000 })}${field('码长度', 'length', editor.length || 12, { type: 'number', min: 6, max: 64 })}${field('过期时间', 'expires_at', editor.expires_at, { type: 'datetime-local' })}${field('限时', 'duration', editor.duration, { placeholder: '8 小时' })}${field('使用次数', 'quota', editor.quota || 1, { type: 'number', min: 1 })}${field('上行带宽', 'up_rate', editor.up_rate)}${field('下行带宽', 'down_rate', editor.down_rate)}${field('备注', 'note', editor.note, { tag: 'textarea', wide: true })}</div>`;
     if (state.drawer === 'voucher-print') return `<div class="user-auth-form-grid">${field('打印范围', 'scope', editor.scope, { tag: 'select', wide: true, options: [['selected','当前选择'],['unused','全部未使用'],['all','全部上网码'],['batch','指定批次']] })}${editor.scope === 'batch' ? field('批次标识', 'batch', editor.batch, { wide: true, required: true }) : ''}</div><div class="user-auth-capability">打印使用当前已加载的数据生成独立打印页，不会修改上网码状态。</div>`;
+    if (state.drawer === 'voucher-reveal') return voucherRevealFields();
     if (state.drawer === 'import-accounts' || state.drawer === 'import-delegated') {
       const rows = asArray(editor.rows);
       return `<div class="user-auth-import-summary"><strong>${escapeHtml(editor.file_name || '导入文件')}</strong><span>${rows.length} 条记录</span></div>${asArray(editor.errors).length ? `<div class="user-auth-import-errors">${editor.errors.map((error) => `<span>${escapeHtml(error)}</span>`).join('')}</div>` : `<div class="user-auth-import-preview">${rows.slice(0, 8).map((row) => `<div><strong>${escapeHtml(firstText(row.account, row.code, row.name, '--'))}</strong><span>${escapeHtml(firstText(row.auth_type, row.interface, row.note, '待导入'))}</span></div>`).join('')}${rows.length > 8 ? `<small>另有 ${rows.length - 8} 条记录</small>` : ''}</div>`}`;
     }
-    if (state.drawer === 'delegated') return `<div class="user-auth-drawer-section">${switchField('启用代拨', '允许下游账号使用该上游拨号连接', 'enabled', editor.enabled !== false)}</div><div class="user-auth-form-grid">${field('代拨线路名称', 'name', editor.name, { wide: true, required: true })}${field('代拨账号', 'account', editor.account, { required: true })}${field('代拨密码', 'password', '', { type: 'password', placeholder: editor._new ? '输入密码' : '留空保持现有密码' })}${field('代拨接口', 'interface', editor.interface, { placeholder: 'wan' })}${field('被代拨账号', 'delegated_account', editor.delegated_account, { wide: true })}${field('备注', 'note', editor.note, { tag: 'textarea', wide: true })}</div>`;
+    /* 新建时密码是必填（后端 password_required），只靠 placeholder 区分用户看不出来。 */
+    if (state.drawer === 'delegated') return `<div class="user-auth-drawer-section">${switchField('启用代拨', '允许下游账号使用该上游拨号连接', 'enabled', editor.enabled !== false)}</div><div class="user-auth-form-grid">${field('代拨线路名称', 'name', editor.name, { wide: true, required: true })}${field('代拨账号', 'account', editor.account, { required: true })}${field('代拨密码', 'password', '', { type: 'password', required: editor._new, placeholder: editor._new ? '输入密码' : '留空保持现有密码', help: editor._new ? '新建代拨服务必须设置密码' : '' })}${delegatedInterfaceField(editor)}${field('被代拨账号', 'delegated_account', editor.delegated_account, { wide: true })}${field('备注', 'note', editor.note, { tag: 'textarea', wide: true })}</div>`;
     if (state.drawer === 'periodic') return `<div class="user-auth-drawer-section">${switchField('启用通知', '按设定周期推送页面通知', 'enabled', editor.enabled !== false)}</div><div class="user-auth-form-grid">${field('名称', 'name', editor.name, { wide: true, required: true })}${field('接收对象', 'recipients', editor.recipients, { wide: true, placeholder: '拨号用户、IP 分组或地址列表' })}${field('推送周期', 'schedule', editor.schedule, { placeholder: '每天 / 每周一' })}${field('推送时间', 'time', editor.time, { type: 'time' })}${field('跳转页面', 'redirect_url', editor.redirect_url, { wide: true })}${field('倒计时（秒）', 'countdown', editor.countdown || 60, { type: 'number', min: 0 })}${field('通知内容', 'content', editor.content, { tag: 'textarea', wide: true })}${field('备注', 'note', editor.note, { tag: 'textarea', wide: true })}</div>`;
     return '';
+  }
+
+  /*
+   * 一次性明文展示。authd 创建时返回 code 后立即抹掉，库里只有摘要，
+   * 所以这一屏是用户唯一一次拿到明文的机会，必须把「关掉就没了」说清楚。
+   */
+  function voucherRevealFields() {
+    const reveal = state.voucherReveal;
+    if (!reveal) return '';
+    const cards = reveal.codes.map((entry) => `<div><strong>${escapeHtml(firstText(entry.code, entry.hint, '--'))}</strong><span>${escapeHtml(entry.code ? '明文，仅此一次' : '后端未返回明文')}</span></div>`).join('');
+    return `<div class="user-auth-capability">这是唯一一次显示上网码明文。后端不保存明文，关闭后无法再次查看：现在复制或打印，丢了只能作废这一批并重新生成。不要写进聊天记录或工单。</div>`
+      + `<div class="user-auth-import-summary"><strong>已生成 ${reveal.count} 个上网码</strong><span>${escapeHtml(reveal.batchId ? `批次 ${reveal.batchId}` : '批次未返回')}</span></div>`
+      + `<div class="user-auth-import-preview user-auth-voucher-reveal" data-user-auth-voucher-codes>${cards}</div>`;
   }
 
   function drawerMarkup() {
     if (!state.drawer) return '';
     const writeAction = ['web', 'portal', 'access'].includes(state.drawer) ? 'update_web' : state.drawer === 'password-policy' ? 'write_accounts' : state.drawer === 'delegated' ? 'write_delegated' : state.drawer === 'periodic' ? 'write_notifications' : state.drawer === 'import-delegated' ? 'write_delegated' : 'write_accounts';
-    const localAction = state.drawer === 'voucher-print';
+    const localAction = state.drawer === 'voucher-print' || state.drawer === 'voucher-reveal';
     const writable = (localAction || capability(writeAction)) && !asArray(state.editor.errors).length;
     const canDelete = !state.editor._new && ['package', 'account', 'voucher', 'delegated', 'periodic', 'ledger'].includes(state.drawer);
-    const saveLabel = state.drawer === 'voucher-print' ? '打开打印页' : state.drawer.startsWith('import-') ? '确认导入' : '保存并应用';
-    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-user-auth-close aria-label="关闭设置"></button><aside class="user-auth-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" aria-label="${escapeHtml(drawerTitle())}"><header class="dwrt-kit-sheet-header"><div><span>USER AUTHENTICATION</span><strong>${escapeHtml(drawerTitle())}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-user-auth-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body user-auth-drawer-body">${editorFields()}${!writable ? '<div class="user-auth-capability">后端写入合同尚未开放。当前可以核对完整字段，但不会把配置写入浏览器、localStorage 或 /etc/config。</div>' : ''}${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer user-auth-drawer-footer">${canDelete ? `<button class="policy-secondary danger" type="button" data-user-auth-delete-editor ${state.saving ? 'disabled' : ''}>${state.confirmDelete ? '再次点击确认删除' : '删除'}</button>` : '<span></span>'}<div><button class="policy-secondary" type="button" data-user-auth-close>取消</button><button class="policy-primary" type="button" data-user-auth-save ${writable && !state.saving ? '' : 'disabled'}>${state.saving ? '正在处理' : writable ? saveLabel : '等待后端能力'}</button></div></footer></aside>`;
+    const saveLabel = state.drawer === 'voucher-print' ? '打开打印页' : state.drawer === 'voucher-reveal' ? '我已保存' : state.drawer.startsWith('import-') ? '确认导入' : '保存并应用';
+    /*
+     * 一次性明文屏不给「取消」：关闭就是丢弃明文，两个按钮都通向同一结果反而误导。
+     * 复制与打印在这里是本地动作，不写任何状态。
+     */
+    const revealing = state.drawer === 'voucher-reveal';
+    const secondary = revealing
+      ? `<button class="policy-secondary" type="button" data-user-auth-voucher-copy>复制全部</button><button class="policy-secondary" type="button" data-user-auth-voucher-print-reveal>打印这一批</button>`
+      : `<button class="policy-secondary" type="button" data-user-auth-close>取消</button>`;
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-user-auth-close aria-label="关闭设置"></button><aside class="user-auth-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" aria-label="${escapeHtml(drawerTitle())}"><header class="dwrt-kit-sheet-header"><div><span>USER AUTHENTICATION</span><strong>${escapeHtml(drawerTitle())}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-user-auth-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body user-auth-drawer-body">${editorFields()}${!writable ? '<div class="user-auth-capability">后端写入合同尚未开放。当前可以核对完整字段，但不会把配置写入浏览器、localStorage 或 /etc/config。</div>' : ''}${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer user-auth-drawer-footer">${canDelete ? `<button class="policy-secondary danger" type="button" data-user-auth-delete-editor ${state.saving ? 'disabled' : ''}>${state.confirmDelete ? '再次点击确认删除' : '删除'}</button>` : '<span></span>'}<div>${secondary}<button class="policy-primary" type="button" data-user-auth-save ${writable && !state.saving ? '' : 'disabled'}>${state.saving ? '正在处理' : writable ? saveLabel : '等待后端能力'}</button></div></footer></aside>`;
   }
 
   function previewMarkup() {
@@ -761,27 +859,163 @@ export function mount(context = {}) {
     return payload;
   }
 
+  /*
+   * 后端错误码翻中文，并指向具体表单项。`delegated_interface_not_found` 会附
+   * data.options 候选，直接列进提示里，用户不用回头猜接口名怎么写。
+   * 认不出的码继续走原来的 message 兜底，不要吞掉后端的原文。
+   */
+  const SAVE_ERROR_FIELD_LABELS = {
+    interface: '代拨接口', delegated_account: '被代拨账号', password: '代拨密码', account: '代拨账号', name: '代拨线路名称'
+  };
+  function saveErrorText(error) {
+    const code = firstText(error?.code);
+    const options = asArray(error?.options, ['items'])
+      .map((item) => firstText(item?.label, item?.value, item)).filter(Boolean);
+    const candidates = options.length ? `可选：${options.join('、')}` : '';
+    const texts = {
+      delegated_interface_not_found: `接口 ${firstText(state.editor?.interface, '（空）')} 不是启用中的 WAN，请从列表中选择${candidates ? `。${candidates}` : ''}`,
+      delegated_interface_unavailable: '当前没有启用的 WAN，请先在网络设置中启用一条线路',
+      delegated_account_not_found: '被代拨账号不存在',
+      password_required: '新建代拨服务必须设置密码',
+      delegated_username_conflict: '该代拨账号已被其它线路占用'
+    };
+    const body = texts[code] || `保存失败：${firstText(error?.message, '后端未接受配置')}`;
+    const label = SAVE_ERROR_FIELD_LABELS[firstText(error?.field)];
+    return texts[code] && label ? `${label}：${body}` : body;
+  }
+
   async function saveEditor() {
     if (state.saving || !state.drawer) return;
     if (state.drawer === 'voucher-print') { printVouchers(); return; }
+    if (state.drawer === 'voucher-reveal') { closeVoucherReveal(); return; }
+    const creatingVouchers = state.drawer === 'voucher' && state.editor._new;
+    /* 抽屉在响应之后就被清空，判据必须在发请求前取。 */
+    const savingDelegated = state.drawer === 'delegated';
     state.saving = true;
     render();
     try {
-      await requestJson(currentEndpoint(), { method: state.editor._new ? 'POST' : 'PUT', body: JSON.stringify(cleanEditorPayload()) });
+      const response = await requestJson(currentEndpoint(), { method: state.editor._new ? 'POST' : 'PUT', body: JSON.stringify(cleanEditorPayload()) });
       if (!state.mounted) return;
       state.saving = false;
       state.drawer = '';
       state.editor = {};
-      state.notice = '配置已保存并应用';
-      state.noticeTone = 'ok';
+      /*
+       * 批量生成上网码时，明文 code 只在这一个响应里出现，authd 随后 OPENSSL_cleanse
+       * 抹掉它，库里只剩摘要。此前这里直接丢掉响应然后重新拉列表，用户那一批券的明文
+       * 就永久不可恢复了。现在把它接住，交给一次性展示抽屉。
+       */
+      const reveal = creatingVouchers ? voucherRevealFromResponse(response) : null;
+      if (reveal) {
+        state.voucherReveal = reveal;
+        state.drawer = 'voucher-reveal';
+        state.notice = reveal.missingCode
+          ? `已生成 ${reveal.count} 个上网码，但后端未在响应中返回明文。这批码无法再次读取，请作废后重新生成。`
+          : '';
+        state.noticeTone = reveal.missingCode ? 'warning' : 'ok';
+        /* 先把明文摆出来，再后台刷新列表：load(true) 只 patch 工作区，不会重建抽屉。 */
+        render();
+      } else {
+        /*
+         * 留空时后端会挑一条 WAN 并在响应里回带 interface + interface_defaulted。
+         * 多 WAN 环境下不说清楚，用户会以为自己选中的是别的线路。
+         */
+        const appliedInterface = firstText(response?.interface);
+        state.notice = (savingDelegated && appliedInterface && response?.interface_defaulted)
+          ? `配置已保存并应用，代拨接口自动选用 ${appliedInterface}`
+          : '配置已保存并应用';
+        state.noticeTone = 'ok';
+      }
       await load(true);
     } catch (error) {
       if (!state.mounted) return;
       state.saving = false;
-      state.notice = `保存失败：${firstText(error.message, '后端未接受配置')}`;
+      state.notice = saveErrorText(error);
       state.noticeTone = 'error';
       render();
     }
+  }
+
+  /*
+   * 归一化 voucher_create 的响应。webd 把 authd 的 envelope 原样透传，requestJson()
+   * 已剥掉一层 data，所以这里看到的是 { ok, batch_id, count, created[], codes_returned_once }。
+   */
+  function voucherRevealFromResponse(response) {
+    const created = asArray(response?.created, ['created', 'vouchers']);
+    if (!created.length) return null;
+    const codes = created.map((item, index) => ({
+      id: firstText(item?.id, `voucher-${index}`),
+      code: firstText(item?.code),
+      hint: firstText(item?.display_hint)
+    }));
+    return {
+      batchId: firstText(response?.batch_id, created[0]?.batch_id),
+      count: firstNumber(response?.count, codes.length) || codes.length,
+      codes,
+      missingCode: codes.every((entry) => !entry.code)
+    };
+  }
+
+  function closeVoucherReveal() {
+    state.voucherReveal = null;
+    state.drawer = '';
+    state.editor = {};
+    state.notice = '';
+    render();
+  }
+
+  /*
+   * 复制这一批明文。面板走 http://，不是安全上下文，navigator.clipboard 通常直接不存在，
+   * 所以必须留 execCommand 兜底，再退一步就选中节点让用户自己复制。
+   * 反馈只改按钮自身文字，不为一次复制触发整页 render()（那会重建抽屉、丢掉选区）。
+   */
+  async function copyVoucherCodes(button) {
+    const codes = asArray(state.voucherReveal?.codes).map((entry) => firstText(entry.code)).filter(Boolean);
+    if (!codes.length) { flashButton(button, '没有可复制的明文'); return; }
+    const text = codes.join('\n');
+    try {
+      if (navigator.clipboard?.writeText && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        flashButton(button, `已复制 ${codes.length} 个`);
+        return;
+      }
+      throw new Error('clipboard unavailable');
+    } catch (_) {
+      if (copyViaExecCommand(text)) { flashButton(button, `已复制 ${codes.length} 个`); return; }
+      const node = root?.querySelector('[data-user-auth-voucher-codes]');
+      if (node && window.getSelection) {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      flashButton(button, '已选中，请手动复制');
+    }
+  }
+
+  function copyViaExecCommand(text) {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', 'readonly');
+    area.style.cssText = 'position:fixed;top:0;left:-9999px;opacity:0';
+    document.body.appendChild(area);
+    let ok = false;
+    try {
+      area.select();
+      ok = document.execCommand('copy');
+    } catch (_) {
+      ok = false;
+    }
+    area.remove();
+    return ok;
+  }
+
+  function flashButton(button, label) {
+    if (!button) return;
+    const original = button.dataset.userAuthLabel || button.textContent;
+    button.dataset.userAuthLabel = original;
+    button.textContent = label;
+    window.setTimeout(() => { if (button.isConnected) button.textContent = button.dataset.userAuthLabel || original; }, 2000);
   }
 
   async function deleteEditor() {
@@ -806,24 +1040,64 @@ export function mount(context = {}) {
     }
   }
 
-  function printVouchers() {
+  /*
+   * 打印。列表接口不返回明文，只有刚创建的那一批在 state.voucherReveal 里带明文，
+   * 所以历史券只能印脱敏的 display_hint 并注明「非完整码」。
+   * 此前这里读 row.code，整页印出来是一排「--」—— 一张都不能用，却看着像可发的券。
+   */
+  function printVouchers(revealOnly = false) {
+    const reveal = state.voucherReveal;
+    const plaintextById = new Map(asArray(reveal?.codes).filter((entry) => entry.code).map((entry) => [String(entry.id), entry.code]));
     const all = asArray(state.data.account_management.vouchers);
     const selected = state.selected;
-    const rows = all.filter((row, index) => {
-      const id = firstText(row.id, row.code, `voucher-${index}`);
-      if (state.editor.scope === 'selected') return selected.has(String(id));
-      if (state.editor.scope === 'unused') return !bool(row.used, false) && !bool(row.expired, false);
-      if (state.editor.scope === 'batch') return firstText(row.batch, row.batch_id) === firstText(state.editor.batch);
-      return true;
-    });
+    const scope = revealOnly ? 'reveal' : firstText(state.editor.scope, 'all');
+    const rows = revealOnly
+      ? asArray(reveal?.codes).map((entry) => ({
+        ...(all.find((row) => firstText(row.id) === entry.id) || {}),
+        id: entry.id,
+        display_hint: entry.hint,
+        code: entry.code
+      }))
+      : all.filter((row, index) => {
+        const id = firstText(row.id, row.code, `voucher-${index}`);
+        if (scope === 'selected') return selected.has(String(id));
+        if (scope === 'unused') return !bool(row.used, false) && !bool(row.expired, false);
+        if (scope === 'batch') return firstText(row.batch, row.batch_id) === firstText(state.editor.batch);
+        return true;
+      });
+    /* 印不出任何码的行不进打印页：一张写着「--」的卡片不是一张可用的券。 */
+    const printable = rows
+      .map((row) => {
+        const id = firstText(row.id);
+        const plaintext = firstText(row.code, plaintextById.get(String(id)));
+        return { row, plaintext, hint: firstText(row.display_hint) };
+      })
+      .filter((entry) => entry.plaintext || entry.hint);
+    const skipped = rows.length - printable.length;
+    if (!printable.length) {
+      state.notice = rows.length
+        ? '这一范围内没有可打印的码：历史上网码的明文后端不保存，只有创建时那一次可见。'
+        : '当前范围没有可打印的上网码。';
+      state.noticeTone = 'warning';
+      render();
+      return;
+    }
     const popup = window.open('', '_blank');
     if (!popup) { state.notice = '浏览器阻止了打印窗口，请允许本站打开弹出窗口。'; state.noticeTone = 'warning'; render(); return; }
     try { popup.opener = null; } catch (_) {}
-    const cards = rows.map((row) => `<article><strong>${escapeHtml(firstText(row.code, '--'))}</strong><span>${escapeHtml(firstText(row.duration, '按门户默认时长'))}</span><small>${escapeHtml(firstText(row.expires_at, row.expiry, '不过期'))}</small></article>`).join('');
-    popup.document.write(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Dreaming OS 上网码</title><style>body{font-family:system-ui,sans-serif;margin:24px;color:#111}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}article{border:1px dashed #777;padding:18px;text-align:center;break-inside:avoid}strong,span,small{display:block}strong{font:700 20px ui-monospace,monospace;letter-spacing:2px}span{margin:8px 0;font-size:12px}small{color:#666}@media print{body{margin:10mm}}</style><div class="grid">${cards || '<p>当前范围没有可打印的上网码。</p>'}</div><script>addEventListener('load',()=>print())<\/script></html>`);
+    const cards = printable.map(({ row, plaintext, hint }) => `<article><strong>${escapeHtml(plaintext || hint)}</strong><span>${escapeHtml(firstText(row.duration, '按门户默认时长'))}</span><small>${escapeHtml(firstText(row.expires_at, row.expiry, '不过期'))}</small>${plaintext ? '' : '<em>脱敏显示，非完整上网码</em>'}</article>`).join('');
+    popup.document.write(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Dreaming OS 上网码</title><style>body{font-family:system-ui,sans-serif;margin:24px;color:#111}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}article{border:1px dashed #777;padding:18px;text-align:center;break-inside:avoid}strong,span,small,em{display:block}strong{font:700 20px ui-monospace,monospace;letter-spacing:2px}span{margin:8px 0;font-size:12px}small{color:#666}em{margin-top:6px;font-size:11px;color:#a33;font-style:normal}@media print{body{margin:10mm}}</style><div class="grid">${cards}</div><script>addEventListener('load',()=>print())<\/script></html>`);
     popup.document.close();
+    if (revealOnly) {
+      state.notice = skipped ? `已打开打印页，其中 ${skipped} 条没有可印的码已跳过。` : '';
+      state.noticeTone = 'ok';
+      render();
+      return;
+    }
     state.drawer = '';
     state.editor = {};
+    state.notice = skipped ? `已打开打印页，其中 ${skipped} 条没有可印的码已跳过。` : '';
+    state.noticeTone = 'warning';
     render();
   }
 
@@ -1005,7 +1279,9 @@ export function mount(context = {}) {
   function onClick(event) {
     if (event.target.closest('[data-user-auth-web-reset]')) { state.webDraft = clone(state.data.web); rerenderWebDesigner(); return; }
     if (event.target.closest('[data-user-auth-web-save]')) { saveWebDesigner(); return; }
-    if (event.target.closest('[data-user-auth-close]')) { state.drawer = ''; state.editor = {}; state.notice = ''; render(); return; }
+    if (event.target.closest('[data-user-auth-voucher-copy]')) { copyVoucherCodes(event.target.closest('[data-user-auth-voucher-copy]')); return; }
+    if (event.target.closest('[data-user-auth-voucher-print-reveal]')) { printVouchers(true); return; }
+    if (event.target.closest('[data-user-auth-close]')) { state.drawer = ''; state.editor = {}; state.voucherReveal = null; state.notice = ''; render(); return; }
     if (event.target.closest('[data-user-auth-preview-close]')) { state.preview = false; render(); return; }
     if (event.target.closest('[data-user-auth-save]')) { saveEditor(); return; }
     if (event.target.closest('[data-user-auth-delete-editor]')) { deleteEditor(); return; }
@@ -1113,13 +1389,14 @@ export function mount(context = {}) {
     state.statusFilter = 'all';
     state.selected.clear();
     state.drawer = '';
+    state.voucherReveal = null;
     state.notice = '';
     state.notificationDraft = state.page === 'notifications' ? clone(state.data.notifications[next] || {}) : null;
     render();
   }
 
   function onKeyDown(event) {
-    if (event.key === 'Escape' && (state.drawer || state.preview)) { state.drawer = ''; state.preview = false; render(); }
+    if (event.key === 'Escape' && (state.drawer || state.preview)) { state.drawer = ''; state.voucherReveal = null; state.preview = false; render(); }
   }
 
   root?.addEventListener('click', onClick);
@@ -1149,6 +1426,9 @@ export function mount(context = {}) {
     unmount() {
       state.mounted = false;
       state.seq += 1;
+      /* 明文随页面一起丢掉，不留在闭包里等下一次挂载。 */
+      state.voucherReveal = null;
+      state.editor = {};
       window.clearInterval(state.pollTimer);
       root?.removeEventListener('click', onClick);
       root?.removeEventListener('input', onInput);

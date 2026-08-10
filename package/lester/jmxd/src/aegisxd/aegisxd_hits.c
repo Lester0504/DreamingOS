@@ -589,6 +589,115 @@ static const char *aegisxd_hits_risk_from_category(const char *category, int sev
     return "medium";
 }
 
+/* ── Traffic-log collection scope ─────────────────────────────────────────
+ *
+ * One global scope ('all' | 'blocked') filtering security events, plus three
+ * per-source toggles. This is where the stored setting actually takes effect:
+ * without this gate the configuration was readable but inert.
+ *
+ * The settings row is cached for a few seconds. Every DNS answer and every nft
+ * counter delta passes through here, so re-reading SQLite per event would put a
+ * query on the hot path to save a stale window that does not matter -- a scope
+ * change applies to subsequent writes, and "subsequent" a second later is the
+ * same promise.
+ */
+#define AEGISXD_SCOPE_CACHE_TTL 5
+
+enum aegisxd_hit_source {
+    AEGISXD_HIT_SOURCE_GATEWAY_DNS = 0,
+    AEGISXD_HIT_SOURCE_AEGISX_SERVICE,
+    AEGISXD_HIT_SOURCE_DEVICE_ADMIN,
+};
+
+static struct {
+    int64_t loaded_at;
+    int blocked_only;
+    int gateway_dns;
+    int aegisx_service;
+    int device_admin;
+} g_scope_cache;
+
+static void aegisxd_scope_refresh(int64_t now)
+{
+    struct aegisxd_settings settings;
+
+    if (g_scope_cache.loaded_at > 0 &&
+        now - g_scope_cache.loaded_at < AEGISXD_SCOPE_CACHE_TTL)
+        return;
+    /*
+     * Fail open on a read error: dropping security events because a settings
+     * query failed would turn a storage hiccup into a silent blind spot, which
+     * is the worse failure for a security log.
+     */
+    if (aegisxd_settings_load(&settings) != 0) {
+        g_scope_cache.blocked_only = 0;
+        g_scope_cache.gateway_dns = 1;
+        g_scope_cache.aegisx_service = 1;
+        g_scope_cache.device_admin = 1;
+    } else {
+        g_scope_cache.blocked_only = !strcmp(settings.traffic_log_scope, "blocked");
+        g_scope_cache.gateway_dns = settings.traffic_log_gateway_dns;
+        g_scope_cache.aegisx_service = settings.traffic_log_aegisx_service;
+        g_scope_cache.device_admin = settings.traffic_log_device_admin;
+    }
+    g_scope_cache.loaded_at = now;
+}
+
+/*
+ * Did this event stop traffic?
+ *
+ * 'blocked' keeps only hits that were actually enforced. 'monitor' and 'alert'
+ * observed and let the packet through, so they are not blocks; 'route' and
+ * 'limit' steered or shaped rather than stopped. Anything unrecognised counts as
+ * blocked: under-reporting an enforcement action is worse than including one
+ * extra row, because the operator would conclude nothing was stopped.
+ */
+static int aegisxd_action_is_block(const char *action)
+{
+    if (!action || !action[0])
+        return 1;
+    if (!strcmp(action, "monitor") || !strcmp(action, "alert") ||
+        !strcmp(action, "allow") || !strcmp(action, "accept") ||
+        !strcmp(action, "pass") || !strcmp(action, "log") ||
+        !strcmp(action, "route") || !strcmp(action, "limit") ||
+        !strcmp(action, "observed"))
+        return 0;
+    return 1;
+}
+
+/*
+ * Whether this event should be written at all.
+ * Returns 1 to keep, 0 to drop, and never mutates state.
+ */
+static int aegisxd_hits_scope_admits(enum aegisxd_hit_source source,
+                                     const char *action, int64_t now)
+{
+    aegisxd_scope_refresh(now);
+    switch (source) {
+    case AEGISXD_HIT_SOURCE_GATEWAY_DNS:
+        if (!g_scope_cache.gateway_dns)
+            return 0;
+        break;
+    case AEGISXD_HIT_SOURCE_AEGISX_SERVICE:
+        if (!g_scope_cache.aegisx_service)
+            return 0;
+        break;
+    case AEGISXD_HIT_SOURCE_DEVICE_ADMIN:
+        if (!g_scope_cache.device_admin)
+            return 0;
+        break;
+    }
+    if (g_scope_cache.blocked_only && !aegisxd_action_is_block(action))
+        return 0;
+    return 1;
+}
+
+/* Test seam: force the next scope read to hit the database. */
+void aegisxd_hits_scope_cache_invalidate(void)
+{
+    g_scope_cache.loaded_at = 0;
+}
+
 static void aegisxd_hits_prune_if_needed(int64_t now)
 {
     sqlite3_stmt *st = NULL;
@@ -648,6 +757,13 @@ static int aegisxd_hits_insert_dns_event(const char *domain, const char *source_
 
     if (!domain || !domain[0])
         return -1;
+    /*
+     * Collection scope. A DNS filter hit in monitor mode observed the query and
+     * let it resolve, so scope 'blocked' excludes it while keeping the drops.
+     */
+    if (!aegisxd_hits_scope_admits(AEGISXD_HIT_SOURCE_GATEWAY_DNS,
+                                   monitor ? "monitor" : "block", now))
+        return 0;
     if (monitor) {
         is_pcdn = aegisxd_pcdn_installed_monitor_match(domain, matched_rule,
                                                         artifact_sha256);
@@ -866,6 +982,13 @@ static int aegisxd_hits_insert_nft_counter_delta(const char *rule_id,
 
     if (!rule_id || !rule_id[0] || delta_packets == 0)
         return -1;
+    /*
+     * An nft counter delta is by construction traffic the ruleset dropped, so
+     * it survives scope 'blocked'; only the Aegisx-service source toggle can
+     * exclude it.
+     */
+    if (!aegisxd_hits_scope_admits(AEGISXD_HIT_SOURCE_AEGISX_SERVICE, "drop", now))
+        return 0;
     meta = json_object_new_object();
     aegisxd_json_add_string(meta, "counter_source", "nftables");
     aegisxd_json_add_string(meta, "table", AEGISXD_NFT_TABLE);
@@ -1049,6 +1172,15 @@ static int aegisxd_hits_insert_reputation_flow(const struct aegisxd_conntrack_tu
 
     if (!ct || !matched_ip || !matched_ip[0] || !match)
         return -1;
+    /*
+     * Reputation matches are observations over conntrack: the flow was seen and
+     * scored, not stopped (the insert below records action 'alert'). So scope
+     * 'blocked' excludes these -- which is the point of the setting, since these
+     * are the highest-volume source and the one an operator most often wants out
+     * of a blocked-only view.
+     */
+    if (!aegisxd_hits_scope_admits(AEGISXD_HIT_SOURCE_AEGISX_SERVICE, "alert", now))
+        return 0;
     bytes = ct->orig_bytes + ct->reply_bytes;
     risk = aegisxd_hits_risk_from_category(match->category, match->severity);
     meta = json_object_new_object();
@@ -1326,6 +1458,14 @@ static int aegisxd_hits_insert_suricata_event_ex(struct json_object *eve,
     app_proto = aegisxd_json_str(eve, "app_proto", "");
     alert_action = aegisxd_json_nested_str(eve, "alert", "action", "");
     action = aegisxd_suricata_action_from_event(event_type, alert_action);
+    /*
+     * Gate after `action` is resolved: an IDS event is either 'drop' (IPS
+     * enforced) or 'alert' (observed only), and only the former survives scope
+     * 'blocked'. Deciding earlier from event_type alone would misclassify an
+     * alert-typed event whose rule action was a drop.
+     */
+    if (!aegisxd_hits_scope_admits(AEGISXD_HIT_SOURCE_AEGISX_SERVICE, action, now))
+        return 0;
     risk = aegisxd_suricata_risk_from_severity(severity);
     event_source = (ingest_source && ingest_source[0]) ? ingest_source : "aegisxd.suricata";
     manual_ingest = strstr(event_source, ".manual") != NULL ||
@@ -1732,6 +1872,13 @@ static int aegisxd_policy_insert_event(int64_t sample_id, int64_t ts,
         rule_id = "policy_route";
     if (ts <= 0)
         ts = now;
+    /*
+     * Policy-route hits are the device-administration source. norm_action is
+     * already normalised to block/drop/allow/route/limit, so scope 'blocked'
+     * keeps the first two and drops the steering and shaping matches.
+     */
+    if (!aegisxd_hits_scope_admits(AEGISXD_HIT_SOURCE_DEVICE_ADMIN, norm_action, now))
+        return 0;
     meta = json_object_new_object();
     json_object_object_add(meta, "sample_id", json_object_new_int64(sample_id));
     aegisxd_json_add_string(meta, "producer_source", producer_source ? producer_source : "");

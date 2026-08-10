@@ -45,8 +45,30 @@ def test_capabilities_describe_real_closure_not_route_presence() -> None:
         assert f'"{capability}"' in NETCONFIG
     assert '"runtime_dependencies"' in NETCONFIG
     assert '"reasons"' in NETCONFIG
-    assert '"transactional_secret_safe_save_pending"' in NETCONFIG
     assert '"transactional_apply_readback_pending"' in NETCONFIG
+    # save_config / apply_config are no longer hardcoded to 0: the local-phy
+    # write path preserves secrets through the AEAD vault and verifies apply by
+    # readback.  What must stay true is that the bits are *computed* from real
+    # preconditions rather than asserted, and that each failure still names a
+    # cause.  The old "transactional_secret_safe_save_pending" reason belongs to
+    # the ubus rejection path in jmx_dreamingwrt_api.c, which still fires when
+    # jmx_wifi_config_save() refuses.
+    assert 'nc_wifi_add_capability(cap, reasons, "save_config", local_write' in NETCONFIG
+    assert '"secret_vault_unavailable"' in NETCONFIG
+    # Reporting a capability must not have side effects: the capability path
+    # uses the read-only probe, so a plain GET cannot generate key material.
+    # Only the save path may create the key on first use.
+    assert 'int vault_ok = nc_wifi_secret_key_present() == 0;' in NETCONFIG
+    # Slice the *definition*, not the forward declaration: splitting on the bare
+    # signature lands on the prototype near the top of the file and yields an
+    # empty body, which made this assertion pass no matter what the probe did.
+    probe = NETCONFIG.split(
+        "static int nc_wifi_secret_key_present(void)\n{")[1].split("\n}")[0]
+    assert "ac_secrets_open(" in probe, "probe must open the vault to report on it"
+    assert "ac_secrets_open_or_create" not in probe, (
+        "the read-only probe must not create the vault key"
+    )
+    assert '"transactional_secret_safe_save_pending"' in API
 
 
 def test_disabled_capabilities_never_report_successful_write_apply_or_scan() -> None:

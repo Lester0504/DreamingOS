@@ -47,8 +47,49 @@ typedef struct {
     int checked;
     int online;
     int latency_ms;
-    int loss_pct;
+    /*
+     * probe_loss_pct is the ping result. It is a 3-packet sample, so its only
+     * possible values are 0/33/67/100 and it cannot express a line losing a few
+     * percent. It is kept for online/RTT judgement and reported under its own
+     * name; it must not be published as the line's packet loss.
+     */
+    int probe_loss_pct;
+    int probe_packets_sent;
+    /*
+     * Real loss comes from the interface counters, split by direction:
+     *   down = rx_drop / rx_packets, up = tx_drop / tx_packets
+     * measured as a delta between two samples of /proc/net/dev.
+     */
+    int counters_valid;
+    char counter_ifname[WAN_HEALTH_DEVICE_LEN];
+    double up_loss_pct;
+    double down_loss_pct;
+    uint64_t rx_packets_delta;
+    uint64_t rx_drops_delta;
+    uint64_t tx_packets_delta;
+    uint64_t tx_drops_delta;
+    int64_t counter_window_sec;
 } health_wan_state_t;
+
+/*
+ * Per-interface counter baseline, so a delta can be taken between rounds.
+ *
+ * The first round after start has no baseline and therefore no loss figure;
+ * that case reports null rather than 0, because "no sample yet" and "no loss"
+ * are different statements.
+ */
+typedef struct {
+    char ifname[WAN_HEALTH_DEVICE_LEN];
+    int used;
+    int have_baseline;
+    uint64_t rx_packets;
+    uint64_t rx_drops;
+    uint64_t tx_packets;
+    uint64_t tx_drops;
+    int64_t ts;
+} health_netdev_baseline_t;
+
+static health_netdev_baseline_t g_netdev_baselines[WAN_HEALTH_MAX_WANS];
 
 static struct {
     u_int32_t last_exec_time;    
@@ -543,7 +584,12 @@ static int health_store_wan(health_wan_state_t *wans, int *count,
     wans[*count] = *cur;
     health_select_wan_device(&wans[*count]);
     wans[*count].latency_ms = -1;
-    wans[*count].loss_pct = -1;
+    wans[*count].probe_loss_pct = -1;
+    wans[*count].probe_packets_sent = 0;
+    /* -1 means "not sampled", distinct from a genuine 0% loss. */
+    wans[*count].counters_valid = 0;
+    wans[*count].up_loss_pct = -1;
+    wans[*count].down_loss_pct = -1;
     health_copy_string(wans[*count].reason, sizeof(wans[*count].reason), "unmeasured");
     (*count)++;
     return 0;
@@ -690,6 +736,150 @@ static int health_ping_bound(const char *dev, const char *target,
     return rc == 0 ? 0 : -1;
 }
 
+/*
+ * Reads rx/tx packet and drop counters for one interface from /proc/net/dev.
+ *
+ * Field order per line after the colon is:
+ *   rx: bytes packets errs drop fifo frame compressed multicast
+ *   tx: bytes packets errs drop fifo colls carrier compressed
+ */
+static int health_read_netdev_counters(const char *ifname, uint64_t *rx_packets,
+                                       uint64_t *rx_drops, uint64_t *tx_packets,
+                                       uint64_t *tx_drops)
+{
+    FILE *fp;
+    char line[512];
+    int found = 0;
+
+    if (!ifname || !ifname[0])
+        return -1;
+    fp = fopen("/proc/net/dev", "r");
+    if (!fp)
+        return -1;
+    while (fgets(line, sizeof(line), fp)) {
+        char *colon = strchr(line, ':');
+        char *name;
+        unsigned long long rb, rp, re, rd, rf, rfr, rc, rm;
+        unsigned long long tb, tp, te, td;
+
+        if (!colon)
+            continue;
+        *colon = '\0';
+        name = line;
+        while (*name == ' ' || *name == '\t')
+            name++;
+        if (strcmp(name, ifname) != 0)
+            continue;
+        if (sscanf(colon + 1,
+                   "%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &rb, &rp, &re, &rd, &rf, &rfr, &rc, &rm,
+                   &tb, &tp, &te, &td) == 12) {
+            if (rx_packets) *rx_packets = (uint64_t)rp;
+            if (rx_drops)   *rx_drops   = (uint64_t)rd;
+            if (tx_packets) *tx_packets = (uint64_t)tp;
+            if (tx_drops)   *tx_drops   = (uint64_t)td;
+            found = 1;
+        }
+        break;
+    }
+    fclose(fp);
+    return found ? 0 : -1;
+}
+
+static health_netdev_baseline_t *health_netdev_baseline_for(const char *ifname)
+{
+    int i;
+    int free_slot = -1;
+
+    for (i = 0; i < WAN_HEALTH_MAX_WANS; i++) {
+        if (g_netdev_baselines[i].used &&
+            !strcmp(g_netdev_baselines[i].ifname, ifname))
+            return &g_netdev_baselines[i];
+        if (!g_netdev_baselines[i].used && free_slot < 0)
+            free_slot = i;
+    }
+    if (free_slot < 0)
+        return NULL;
+    memset(&g_netdev_baselines[free_slot], 0, sizeof(g_netdev_baselines[free_slot]));
+    g_netdev_baselines[free_slot].used = 1;
+    health_copy_string(g_netdev_baselines[free_slot].ifname,
+                       sizeof(g_netdev_baselines[free_slot].ifname), ifname);
+    return &g_netdev_baselines[free_slot];
+}
+
+/*
+ * Computes real forwarding loss for one WAN from interface counter deltas.
+ *
+ * A negative delta means the counter wrapped, the interface was recreated, or
+ * the WAN redialled. Those are clamped to zero and the round is treated as
+ * having no sample instead of producing a nonsense percentage.
+ */
+static void health_sample_wan_counters(health_wan_state_t *wan)
+{
+    health_netdev_baseline_t *base;
+    uint64_t rx_packets = 0, rx_drops = 0, tx_packets = 0, tx_drops = 0;
+    int64_t now = (int64_t)time(NULL);
+
+    if (!wan)
+        return;
+    wan->counters_valid = 0;
+    wan->up_loss_pct = -1;
+    wan->down_loss_pct = -1;
+    wan->rx_packets_delta = 0;
+    wan->rx_drops_delta = 0;
+    wan->tx_packets_delta = 0;
+    wan->tx_drops_delta = 0;
+    wan->counter_window_sec = 0;
+    wan->counter_ifname[0] = '\0';
+
+    /*
+     * Take counters from the WAN's actual egress device. For PPPoE the pppoe-*
+     * interface carries the session's own counters, which differ from the
+     * ethernet device underneath it, so the name is reported back for checking.
+     */
+    if (!wan->device[0] || !health_netdev_name_ok(wan->device))
+        return;
+    if (health_read_netdev_counters(wan->device, &rx_packets, &rx_drops,
+                                    &tx_packets, &tx_drops) != 0)
+        return;
+    health_copy_string(wan->counter_ifname, sizeof(wan->counter_ifname),
+                       wan->device);
+
+    base = health_netdev_baseline_for(wan->device);
+    if (!base)
+        return;
+    if (base->have_baseline &&
+        rx_packets >= base->rx_packets && rx_drops >= base->rx_drops &&
+        tx_packets >= base->tx_packets && tx_drops >= base->tx_drops &&
+        now > base->ts) {
+        uint64_t rx_p = rx_packets - base->rx_packets;
+        uint64_t rx_d = rx_drops - base->rx_drops;
+        uint64_t tx_p = tx_packets - base->tx_packets;
+        uint64_t tx_d = tx_drops - base->tx_drops;
+
+        wan->rx_packets_delta = rx_p;
+        wan->rx_drops_delta = rx_d;
+        wan->tx_packets_delta = tx_p;
+        wan->tx_drops_delta = tx_d;
+        wan->counter_window_sec = now - base->ts;
+        /* Denominator is received+dropped, so loss is a share of offered packets. */
+        if (rx_p + rx_d > 0) {
+            wan->down_loss_pct = (double)rx_d * 100.0 / (double)(rx_p + rx_d);
+            wan->counters_valid = 1;
+        }
+        if (tx_p + tx_d > 0) {
+            wan->up_loss_pct = (double)tx_d * 100.0 / (double)(tx_p + tx_d);
+            wan->counters_valid = 1;
+        }
+    }
+    base->rx_packets = rx_packets;
+    base->rx_drops = rx_drops;
+    base->tx_packets = tx_packets;
+    base->tx_drops = tx_drops;
+    base->ts = now;
+    base->have_baseline = 1;
+}
+
 static void health_probe_wan(health_wan_state_t *wan)
 {
     static const char * const targets[] = {
@@ -704,7 +894,8 @@ static void health_probe_wan(health_wan_state_t *wan)
     wan->checked = 1;
     wan->online = 0;
     wan->latency_ms = 999;
-    wan->loss_pct = 100;
+    wan->probe_loss_pct = 100;
+    wan->probe_packets_sent = 0;
     wan->target[0] = '\0';
     health_copy_string(wan->reason, sizeof(wan->reason), "probe_failed");
 
@@ -725,7 +916,8 @@ static void health_probe_wan(health_wan_state_t *wan)
         if (health_ping_bound(wan->device, targets[i], &loss, &latency) == 0 || loss < 100) {
             wan->online = loss < 100;
             wan->latency_ms = latency > 0 ? latency : (loss < 100 ? 1 : 999);
-            wan->loss_pct = loss;
+            wan->probe_loss_pct = loss;
+            wan->probe_packets_sent = 3;   /* ping -c 3 above */
             if (loss == 0 && wan->latency_ms < 80)
                 health_copy_string(wan->reason, sizeof(wan->reason), "ok");
             else if (loss >= 50)
@@ -754,15 +946,37 @@ static void health_write_wan_status(health_wan_state_t *wans, int count,
         return;
     fprintf(fp, "updated_at=%u\nwan_count=%d\n", ts, count);
     for (i = 0; i < count; i++) {
+        /*
+         * loss= is kept as the probe value for compatibility with readers that
+         * still parse it, but it is now also published under probe_loss= so no
+         * caller has to guess which measurement it is holding. The real
+         * forwarding loss is up_loss=/down_loss=, which are -1 when there is no
+         * sample yet rather than a misleading 0.
+         */
         fprintf(fp,
-                "wan=%s device=%s proto=%s checked=%d online=%d latency=%d loss=%d target=%s reason=%s\n",
+                "wan=%s device=%s proto=%s checked=%d online=%d latency=%d loss=%d "
+                "probe_loss=%d probe_packets=%d counters_valid=%d counter_ifname=%s "
+                "up_loss=%.4f down_loss=%.4f rx_packets_delta=%llu rx_drops_delta=%llu "
+                "tx_packets_delta=%llu tx_drops_delta=%llu counter_window=%lld "
+                "target=%s reason=%s\n",
                 wans[i].name,
                 wans[i].device,
                 wans[i].proto,
                 wans[i].checked ? 1 : 0,
                 wans[i].online ? 1 : 0,
                 wans[i].latency_ms,
-                wans[i].loss_pct,
+                wans[i].probe_loss_pct,
+                wans[i].probe_loss_pct,
+                wans[i].probe_packets_sent,
+                wans[i].counters_valid ? 1 : 0,
+                wans[i].counter_ifname[0] ? wans[i].counter_ifname : "-",
+                wans[i].up_loss_pct,
+                wans[i].down_loss_pct,
+                (unsigned long long)wans[i].rx_packets_delta,
+                (unsigned long long)wans[i].rx_drops_delta,
+                (unsigned long long)wans[i].tx_packets_delta,
+                (unsigned long long)wans[i].tx_drops_delta,
+                (long long)wans[i].counter_window_sec,
                 wans[i].target,
                 wans[i].reason);
     }
@@ -777,8 +991,15 @@ static void check_wan_health(void)
 
     memset(wans, 0, sizeof(wans));
     count = health_load_wans(wans, WAN_HEALTH_MAX_WANS);
-    for (i = 0; i < count; i++)
+    for (i = 0; i < count; i++) {
         health_probe_wan(&wans[i]);
+        /*
+         * Counter sampling is deliberately independent of the probe: an
+         * unreachable ping target must not zero or invalidate real loss, and a
+         * clean ping must not hide it.
+         */
+        health_sample_wan_counters(&wans[i]);
+    }
     health_write_wan_status(wans, count, (u_int32_t)time(NULL));
 }
 

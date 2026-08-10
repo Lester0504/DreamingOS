@@ -2,7 +2,11 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -179,12 +183,9 @@ def main():
         fixture = tmp_path / "fixture.c"
         binary = tmp_path / "fixture"
         fixture.write_text(source)
-        cflags = subprocess.check_output(
-            ["pkg-config", "--cflags", "sqlite3", "json-c"], text=True
-        ).split()
-        libs = subprocess.check_output(
-            ["pkg-config", "--libs", "sqlite3", "json-c"], text=True
-        ).split()
+        # json-c has no .pc file on 31.6, so resolve both packages through the
+        # shared helper; the flags stay split because the compile line does.
+        cflags, libs = apd_test_deps.split_package_flags("sqlite3", "json-c")
         cc = os.environ.get("CC", "cc")
         subprocess.run(
             [cc, "-std=c11", "-Wall", "-Wextra", "-Werror", *cflags,
