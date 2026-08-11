@@ -3,7 +3,7 @@ export function mount(context = {}) {
   const api = context.api || {};
   const ui = context.ui || {};
   const utils = context.utils || {};
-  const VERSION = '20260719-02';
+  const VERSION = '20260810-front-release-01';
   const BASIC_ENDPOINT = '/api/v1/system/basic';
   const CONFIG_ENDPOINT = '/api/v1/system/ttyd';
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
@@ -249,7 +249,7 @@ export function mount(context = {}) {
   }
 
   function switchField(label, key, checked, help = '') {
-    return `<label class="system-terminal-switch-field"><span><strong>${escapeHtml(label)}</strong>${help ? `<small>${escapeHtml(help)}</small>` : ''}</span><input type="checkbox" data-terminal-field="${key}" ${checked ? 'checked' : ''} ${canWriteConfig() ? '' : 'disabled'}><i></i></label>`;
+    return `<label class="system-terminal-switch-field dwrt-kit-switch" data-dwrt-component="switch"><span><strong>${escapeHtml(label)}</strong>${help ? `<small>${escapeHtml(help)}</small>` : ''}</span><input type="checkbox" data-terminal-field="${key}" ${checked ? 'checked' : ''} ${canWriteConfig() ? '' : 'disabled'}></label>`;
   }
 
   function inputField(label, key, value, options = {}) {

@@ -6,7 +6,7 @@ export function mount(context = {}) {
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character])));
   const signal = context.signal;
   const stage = root?.closest('.console-stage');
-  const VERSION = '20260805-drawer-width-portal-02';
+  const VERSION = '20260810-front-release-01';
 
   const state = {
     mounted: true,
@@ -445,6 +445,23 @@ export function mount(context = {}) {
     replaceMarkup(pageHost, workbenchMarkup());
   }
 
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单）。
+   *
+   * 只有页面主体走这条路：抽屉宿主仍用 replaceMarkup()，因为抽屉会被 kit 搬进传送门，
+   * 归属标记与回收逻辑都挂在整块替换那条路径上，morph 一棵被搬走的子树只会两头都错。
+   */
+  function renderPagePreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(pageHost, (target) => {
+      target.replaceChildren(document.createRange().createContextualFragment(workbenchMarkup()));
+    })) {
+      ui.mountAll?.(pageHost);
+      return;
+    }
+    renderPage();
+  }
+
   function renderOverlay() {
     if (!state.mounted) return;
     replaceMarkup(overlayHost, detailMarkup());
@@ -485,7 +502,7 @@ export function mount(context = {}) {
       if (state.source !== 'all' && !sources.has(state.source)) state.source = 'all';
       if (state.selectedId && !selectedAddress()) state.selectedId = '';
     }
-    renderPage();
+    renderPagePreservingInteraction();
     renderOverlay();
   }
 

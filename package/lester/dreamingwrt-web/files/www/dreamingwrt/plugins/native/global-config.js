@@ -1,4 +1,4 @@
-import { mount as mountNetworkInterfaceConfig } from './network-interface-config.js?v=20260806-lan-delete-gate-01';
+import { mount as mountNetworkInterfaceConfig } from './network-interface-config.js?v=20260810-front-release-01';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -6,7 +6,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
-  const VERSION = '20260806-wan-policy-location-04';
+  const VERSION = '20260810-front-release-01';
   const MODULE_CLASS = 'global-config-route-host';
   const ENDPOINTS = {
     overview: '/api/v1/network/overview',
@@ -932,7 +932,7 @@ export function mount(context = {}) {
   }
   function globalField(label, control, hint = '') { return `<label class="global-setting-row"><span><strong>${escapeHtml(label)}</strong>${hint ? `<small>${escapeHtml(hint)}</small>` : ''}</span>${control}</label>`; }
   function globalSelect(key, value, options, enabled = true) { return `<select data-dwrt-component="select" data-global-setting="${key}" ${enabled ? '' : 'disabled'}>${options.map(([id,label])=>`<option value="${escapeHtml(id)}" ${String(value)===String(id)?'selected':''}>${escapeHtml(label)}</option>`).join('')}</select>`; }
-  function globalSwitch(key, checked, enabled = true, attributes = '') { return `<span class="global-switch"><input type="checkbox" data-global-setting="${key}" ${checked?'checked':''} ${enabled?'':'disabled'} ${attributes}><i></i></span>`; }
+  function globalSwitch(key, checked, enabled = true, attributes = '') { return `<span class="global-switch dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-global-setting="${key}" ${checked?'checked':''} ${enabled?'':'disabled'} ${attributes}></span>`; }
   function cap(key) { return state.capabilities[key] !== false; }
   function strictCap(key) { return state.capabilities[key] === true; }
   function globalDirty() { return JSON.stringify(state.globalDraft) !== JSON.stringify(state.global); }
@@ -1144,7 +1144,26 @@ export function mount(context = {}) {
     const nextDrawer = root.querySelector('.global-drawer .dwrt-kit-sheet-body');
     if (nextDrawer && drawerMode === state.drawer) nextDrawer.scrollTop = drawerScroll;
   }
+  /*
+   * 交互状态兜底（Acceptance P0 单）。
+   *
+   * 这一页的 render() 自己保留了「接口工作台子宿主」与抽屉滚动位置，morph 一棵被
+   * `replaceWith` 搬来搬去的子树会和那套机制互相拆台，所以这里不套 kit 的 morph，
+   * 只借它的 capture/restore 把焦点、光标与选区兜住——搜索框每敲一个字都会重画表格，
+   * 焦点掉出去最容易被用户直接看到。
+   */
+  function withInteractionPreserved(redraw) {
+    const kit = ui;
+    const snapshot = kit.captureInteractionState?.(root) || null;
+    redraw();
+    if (snapshot) kit.restoreInteractionState?.(root, snapshot);
+  }
+
   function patchMain() {
+    withInteractionPreserved(patchMainInner);
+  }
+
+  function patchMainInner() {
     if (!root?.querySelector('.global-config-shell') || state.drawer) { render(); return; }
     if (state.pageTab !== 'global') { render(); return; }
     const gateway = root.querySelector('[data-global-gateway]');

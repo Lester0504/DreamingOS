@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260810-front-release-01';
   const service = ({ 'dhcp-service': 'dhcp', 'dns-service': 'dns', 'upnp-service': 'upnp' })[context.item?.id] || 'dhcp';
   const MODULE_CLASS = `is-${service}`;
   const stage = root?.closest('.console-stage');
@@ -393,7 +393,7 @@ export function mount(context = {}) {
       if (!state.mounted || seq !== state.seq) return;
       state.loading = false;
       state.refreshing = false;
-      render();
+      if (background) renderPreservingInteraction(); else render();
     }
   }
 
@@ -451,7 +451,7 @@ export function mount(context = {}) {
   }
 
   function switchControl(field, checked, disabled = false, scope = '') {
-    return `<label class="network-service-switch ${disabled ? 'is-disabled' : ''}"><input type="checkbox" data-service-field="${escapeHtml(field)}" ${scope ? `data-service-scope="${escapeHtml(scope)}"` : ''} ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}><i></i></label>`;
+    return `<label class="network-service-switch dwrt-kit-switch ${disabled ? 'is-disabled' : ''}" data-dwrt-component="switch"><input type="checkbox" data-service-field="${escapeHtml(field)}" ${scope ? `data-service-scope="${escapeHtml(scope)}"` : ''} ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}></label>`;
   }
 
   function fieldMarkup(label, field, value, options = {}) {
@@ -696,16 +696,31 @@ export function mount(context = {}) {
     return '';
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.remove('is-dhcp', 'is-dns', 'is-upnp');
     root.classList.add('route-workspace', 'policy-table-route-host', 'network-service-route-host', MODULE_CLASS);
     const content = service === 'dhcp' ? renderDhcp() : service === 'dns' ? renderDns() : renderUpnp();
-    root.innerHTML = `<section class="network-service-shell">${pageHeaderMarkup()}<main class="network-service-workbench">${noticeMarkup()}${content}</main>${detailDrawer()}${dnsEditorDrawer()}${upnpMappingDrawer()}${serviceEditorDrawer()}${dnsDeleteConfirmationMarkup()}</section>`;
-    ui.mountAll?.(root);
-    ui.scheduleAdaptiveForegroundSample?.(20, root);
+    target.innerHTML = `<section class="network-service-shell">${pageHeaderMarkup()}<main class="network-service-workbench">${noticeMarkup()}${content}</main>${detailDrawer()}${dnsEditorDrawer()}${upnpMappingDrawer()}${serviceEditorDrawer()}${dnsDeleteConfirmationMarkup()}</section>`;
+    ui.mountAll?.(target);
+    ui.scheduleAdaptiveForegroundSample?.(20, target);
   }
 
   function patchDnsOverview() {

@@ -1,4 +1,4 @@
-const LEGACY_CONTROLLER_URL = '/static/js/log-center.js?v=20260804-native-plugin-menu-merge-01';
+const LEGACY_CONTROLLER_URL = '/static/js/log-center.js?v=20260810-front-release-01';
 
 let controllerPromise = null;
 

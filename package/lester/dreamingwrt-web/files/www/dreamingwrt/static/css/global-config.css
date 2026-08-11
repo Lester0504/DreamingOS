@@ -737,13 +737,8 @@
 .global-setting-row input:disabled,
 .global-port-config select:disabled { opacity: .52; cursor: not-allowed; }
 
-.global-switch { width: 42px; height: 24px; position: relative; justify-self: end; }
-.global-switch input { position: absolute; inset: 0; opacity: 0; }
-.global-switch i { display: block; width: 42px; height: 24px; position: relative; border-radius: 999px; background: rgba(128,140,158,.28); box-shadow: inset 0 0 0 1px rgba(255,255,255,.10); cursor: pointer; }
-.global-switch i::after { content: ''; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #e7edf5; transition: transform 160ms ease; }
-.global-switch input:checked + i { background: rgba(46,139,255,.80); }
-.global-switch input:checked + i::after { transform: translateX(18px); }
-.global-switch input:disabled + i { opacity: .48; cursor: not-allowed; }
+.global-switch { justify-self: end; }
+.global-switch:has(input:disabled) { opacity: .48; cursor: not-allowed; }
 
 .global-advanced-panel .global-setting-row {
   min-height: 48px;
@@ -754,11 +749,6 @@
 .global-advanced-panel .global-setting-row small { max-width: 68ch; font-size: 9px; line-height: 1.45; }
 .global-advanced-panel .global-setting-row select,
 .global-advanced-panel .global-setting-row input[type=number] { height: 34px; border-radius: 8px; font-size: 11px; }
-.global-advanced-panel .global-switch { width: 36px; height: 20px; }
-.global-advanced-panel .global-switch i { width: 36px; height: 20px; }
-.global-advanced-panel .global-switch i::after { top: 2px; left: 2px; width: 16px; height: 16px; }
-.global-advanced-panel .global-switch input:checked + i::after { transform: translateX(16px); }
-.global-advanced-panel .global-switch input:focus-visible + i { outline: 2px solid #5c9fff; outline-offset: 3px; }
 .global-advanced-panel .global-mode-options { grid-template-columns: repeat(2, minmax(0, 220px)); gap: 6px; }
 .global-advanced-panel .global-mode-options label > span { min-height: 54px; border-radius: 8px; padding: 8px 10px; }
 .global-advanced-panel .global-mode-options input:focus-visible + span { outline: 2px solid #5c9fff; outline-offset: 2px; }
@@ -810,8 +800,7 @@
 @media (prefers-reduced-motion: reduce) {
   .global-advanced-module::before,
   .global-advanced-module-heading > button,
-  .global-advanced-module-chevron,
-  .global-advanced-panel .global-switch i::after { transition: none; }
+  .global-advanced-module-chevron { transition: none; }
 }
 
 .global-port-summary { display: flex; align-items: center; gap: 13px; min-width: 0; }

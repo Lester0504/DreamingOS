@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '20260809-audit-icon-cells-sticky-head-02';
+  const VERSION = '20260810-insights-audit-poll-stability-02';
   const PERIODS = {
     hour: { label: '1 小时', api: 'hour', ms: 3600000 },
     day: { label: '1 天', api: 'day', ms: 86400000 },
@@ -1154,7 +1154,7 @@
         if (!state.root || requestSeq !== state.refreshSeq) return;
         state.loading = false;
         state.audit.loading = false;
-        render();
+        renderAuditPoll();
         restoreFocusState(focusState);
         scheduleGlassCardsRender?.(260);
         return;
@@ -1305,9 +1305,8 @@
         <section class="insights-filter-section insights-activity-stats">
           <label class="insights-switch-row">
             <span>统计</span>
-            <span class="insights-switch">
+            <span class="insights-switch dwrt-kit-switch" data-dwrt-component="switch">
               <input type="checkbox" data-activity-chart-toggle ${state.activityChartEnabled ? 'checked' : ''}>
-              <span class="insights-switch-ui" aria-hidden="true"></span>
             </span>
           </label>
           <details class="insights-activity-stat-select">
@@ -1363,9 +1362,8 @@
         <section class="insights-filter-section">
           <label class="insights-switch-row">
             <span>流量摘要</span>
-            <span class="insights-switch">
+            <span class="insights-switch dwrt-kit-switch" data-dwrt-component="switch">
               <input type="checkbox" data-summary-toggle ${state.summaryEnabled ? 'checked' : ''}>
-              <span class="insights-switch-ui" aria-hidden="true"></span>
             </span>
           </label>
         </section>
@@ -1395,9 +1393,8 @@
         <section class="insights-filter-section insights-map-toggle-section">
           <label class="insights-switch-row">
             <span>地图上的流量</span>
-            <span class="insights-switch">
+            <span class="insights-switch dwrt-kit-switch" data-dwrt-component="switch">
               <input type="checkbox" data-map-toggle ${state.mapEnabled ? 'checked' : ''}>
-              <span class="insights-switch-ui" aria-hidden="true"></span>
             </span>
           </label>
           ${state.mapEnabled ? `
@@ -2379,18 +2376,35 @@
         </section>`;
     }
 
+    /*
+     * 「自定义列」用 kit 的 modal（Acceptance-to-Front P1 单：本页自建 `.insights-modal`，
+     * 没有 Escape 处理、关闭后焦点也不回到触发按钮，键盘用户打开后出不来）。
+     *
+     * 结构按 kit 的 modal 契约给：`.dwrt-kit-modal-layer[data-dwrt-component="modal"]` 外层、
+     * `.dwrt-kit-modal[role=dialog]` 面板、关闭控件带 `data-dwrt-modal-close`。kit 的
+     * `mountModal()` 据此接管 Escape、Tab 焦点陷阱与 `returnFocus`，本页不再自备这些。
+     *
+     * 保留 `data-insights-modal` 与 `data-modal-close`：现有的开关逻辑按它们取节点。
+     * 开合仍走 `hidden`（不是 kit 的 is-open），所以两边都留着 —— 换开合机制属于另一件事，
+     * 本单要的是把焦点与键盘语义交给 kit。
+     */
     function modalMarkup() {
       return `
-        <div class="insights-modal" data-insights-modal hidden>
-          <button class="insights-modal-backdrop" data-modal-close type="button" aria-label="关闭"></button>
-          <section class="insights-modal-panel dwrt-glass-card insights-stable-glass" role="dialog" aria-modal="true" aria-label="自定义列">
-            <h3>自定义列</h3>
-            <div class="insights-column-grid">
-              ${DEFAULT_COLUMNS.map(([id, label]) => `
-                <label>
-                  <input type="checkbox" data-column="${id}" ${state.columns.has(id) ? 'checked' : ''}>
-                  <span>${html(label)}</span>
-                </label>`).join('')}
+        <div class="dwrt-kit-modal-layer insights-modal is-open" data-dwrt-component="modal" data-insights-modal hidden>
+          <button class="dwrt-kit-modal-backdrop insights-modal-backdrop" data-dwrt-modal-close data-modal-close type="button" aria-label="关闭"></button>
+          <section class="dwrt-kit-modal insights-modal-panel dwrt-glass-card insights-stable-glass" data-dwrt-modal-variant="copilot" role="dialog" aria-modal="true" aria-label="自定义列">
+            <header class="dwrt-kit-modal-header">
+              <h3>自定义列</h3>
+              <button class="dwrt-kit-modal-close" type="button" data-dwrt-modal-close data-modal-close aria-label="关闭"><i data-lucide="x" aria-hidden="true"></i></button>
+            </header>
+            <div class="dwrt-kit-modal-body">
+              <div class="insights-column-grid">
+                ${DEFAULT_COLUMNS.map(([id, label]) => `
+                  <label class="dwrt-kit-field" data-dwrt-component="field">
+                    <input type="checkbox" data-column="${id}" ${state.columns.has(id) ? 'checked' : ''}>
+                    <span>${html(label)}</span>
+                  </label>`).join('')}
+              </div>
             </div>
           </section>
         </div>`;
@@ -3473,27 +3487,46 @@
       return snapshot.input;
     }
 
-    function render() {
-      if (!state.root) return;
-      const preservedSearch = preserveActiveSearch();
-      if (state.mounted) disposeRenderedMaps(state.root);
-      const scrollState = captureUiScrollState();
-      state.root.classList.add('route-workspace', 'route-insights-host');
-      state.root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-home');
-      state.root.hidden = false;
+    function render(target) {
+      target = target || state.root;
+      if (!target) return;
+      const liveRender = target === state.root;
+      const preservedSearch = liveRender ? preserveActiveSearch() : null;
+      if (liveRender && state.mounted) disposeRenderedMaps(target);
+      const scrollState = liveRender ? captureUiScrollState() : null;
+      target.classList.add('route-workspace', 'route-insights-host');
+      target.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-home');
+      target.hidden = false;
       const auditSection = isAuditActivitySection();
-      state.root.innerHTML = `
+      target.innerHTML = `
         <div class="insights-shell ${auditSection ? 'is-audit-section' : ''}">
           ${auditSection ? '' : filterMarkup()}
           ${mainMarkup()}
         </div>
         ${modalMarkup()}`;
-      const preservedInput = restorePreservedSearch(preservedSearch);
-      mountUiKit?.(state.root);
-      bindDom(preservedInput);
+      const preservedInput = liveRender ? restorePreservedSearch(preservedSearch) : null;
+      mountUiKit?.(target);
+      bindDom(preservedInput, target);
+      if (liveRender) {
+        restoreUiScrollState(scrollState);
+        scheduleMapRender();
+        renderActivityChart();
+      }
+    }
+
+    function renderAuditPoll() {
+      const scrollState = captureUiScrollState();
+      const preserve = window.DWRT_UI_KIT && window.DWRT_UI_KIT.preserveInteractionState;
+      if (typeof preserve === 'function') {
+        preserve(state.root, render);
+      } else {
+        render();
+      }
+      /* Kit restores immediately after morph. Audit rows can change the table's
+         scroll geometry during that commit, and WebKit then clamps the same
+         scroller to 0 on the next layout frame. Reapply the module's existing
+         scroll snapshot after layout; node identity still comes from Kit. */
       restoreUiScrollState(scrollState);
-      scheduleMapRender();
-      renderActivityChart();
     }
 
     function renderWithoutDisposingMaps() {
@@ -3658,8 +3691,7 @@
       restoreUiScrollState(scrollState);
     }
 
-    function bindDom(preservedInput = null) {
-      const root = state.root;
+    function bindDom(preservedInput = null, root = state.root) {
       root.querySelector('[data-insights-tabs]')?.addEventListener('dwrt-tab-change', (event) => {
         const mode = event.detail && event.detail.value === 'activity' ? 'activity' : 'flows';
         if (mode === state.mode) return;

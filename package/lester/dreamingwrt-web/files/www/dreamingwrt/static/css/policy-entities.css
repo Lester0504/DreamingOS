@@ -418,6 +418,12 @@
   white-space: nowrap;
 }
 
+/* alert 的纸面与墨色成对取自主题层的 --color-surface-alert-paper /
+   --color-surface-alert-ink（dwrt-theme.css，随 light/dark 翻转）。
+   原先底色引用的 --color-surface-subtle 全站从未定义，于是一路 fallback 到
+   transparent：alert 没有自己的纸面，壁纸直接透到文字背后；墨色又跟随
+   --app-text 这个随壁纸翻转的自适应前景，于是出现浅字压浅壁纸。
+   纸面接近不透明之后墨色才能确定，所以这两个变量必须一起用，不能只取其一。 */
 .policy-entity-alert {
   min-width: 0;
   min-height: 48px;
@@ -426,9 +432,25 @@
   align-items: center;
   gap: 10px;
   padding: 10px 14px;
+  border-radius: var(--app-radius-control, 12px);
   border-inline-start: 3px solid var(--color-info, currentColor);
-  color: var(--app-text, var(--dwrt-kit-text));
-  background: var(--color-surface-subtle, transparent);
+  color: var(--color-surface-alert-ink);
+  background: var(--color-surface-alert-paper);
+}
+
+/* 自适应前景采样会给命中的元素挂上 [data-adaptive-region]，而
+   `.dwrt-app [data-adaptive-region]`（dwrt-theme.css，特异性 0,1,1）直接设
+   `color: var(--adaptive-text)`，压过上面的单类规则 —— 实测 light 区域下第一条
+   alert 的墨色仍被翻成近白，压在这里钉住的浅底上。
+   alert 自带不透明纸面，不参与随壁纸翻转的前景决策，所以用同等特异性收回墨色，
+   并去掉那条规则附带的 text-shadow：钉住的纸面上不需要描边。 */
+.dwrt-app .policy-entity-alert[data-adaptive-region],
+.dwrt-app .policy-entity-alert[data-adaptive-region] span,
+.dwrt-app .policy-entity-alert[data-adaptive-region] strong,
+.dwrt-app .policy-entity-alert[data-adaptive-region] span > .policy-entity-alert-link,
+.dwrt-app .policy-entity-alert[data-adaptive-region] span > code {
+  color: var(--color-surface-alert-ink);
+  text-shadow: none;
 }
 
 .policy-entity-alert.is-warning {
@@ -437,6 +459,10 @@
 
 .policy-entity-alert.is-error {
   border-inline-start-color: var(--color-danger, currentColor);
+}
+
+.policy-entity-alert.is-success {
+  border-inline-start-color: var(--color-success, currentColor);
 }
 
 .policy-entity-alert strong,
@@ -449,7 +475,9 @@
 }
 
 .policy-entity-alert span {
-  color: var(--app-text-secondary, var(--dwrt-kit-muted));
+  /* alert 自带钉在主题上的纸面，正文墨色不能再交回随壁纸翻转的自适应前景，
+     否则底色修好了反而变成浅字压浅底。弱化改由字号承担。 */
+  color: var(--color-surface-alert-ink);
   font-size: 12px;
   line-height: 1.5;
 }
@@ -460,9 +488,9 @@
 .policy-entity-alert span > .policy-entity-alert-link {
   margin-inline-start: 6px;
   /* 不用 --color-info：实测那个青色在本页玻璃面板上只有 2.22:1，
-     12px 正文需要 4.5:1。跟随正文色实测 4.41:1，
+     12px 正文需要 4.5:1。跟随 alert 自己的墨色，
      可及性靠下划线与字重承载，不靠色相。 */
-  color: var(--app-text, var(--dwrt-kit-text, currentColor));
+  color: var(--color-surface-alert-ink);
   font-size: 12px;
   font-weight: 600;
   text-decoration: underline;
@@ -481,10 +509,11 @@
   display: inline;
   padding: 1px 4px;
   border-radius: 3px;
-  /* --color-surface-control 是主题里真实定义的那一个（dwrt-theme.css:45，
-     随 light/dark 自动换）。同文件上方那些 --color-surface-subtle 其实没有定义，
-     所以那里的底色一直是透明的。 */
-  background: var(--color-surface-control);
+  /* 底色相对 alert 自己的墨色偏移，而不是相对 --app-text：alert 的纸面已钉在
+     主题上，用随壁纸翻转的自适应前景做 color-mix 会让这一小块在某些壁纸下
+     和纸面同色、看不出是代码。墨色同样跟随 alert。 */
+  background: color-mix(in srgb, var(--color-surface-alert-ink) 10%, transparent);
+  color: var(--color-surface-alert-ink);
   font-family: var(--app-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: 11px;
 }
@@ -550,6 +579,29 @@
   --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
 }
 
+/*
+ * 抽屉页头的「归属 + 标题」要分两行。kit 的 `.dwrt-kit-sheet-header > div` 只设了
+ * min-width:0，不定方向，于是 span 与 strong 并排挤在一行，中文标题一长就被截断。
+ * 其他用 kit 抽屉的页面（aegisx 等）也是各自补这条规则。
+ */
+.policy-entity-sheet .dwrt-kit-sheet-header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.policy-entity-sheet .dwrt-kit-sheet-header span {
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.policy-entity-sheet .dwrt-kit-sheet-header strong {
+  font-size: 15px;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .policy-entity-sheet-body {
   display: grid;
   align-content: start;
@@ -567,6 +619,234 @@
   min-width: 0;
   display: grid;
   gap: 8px;
+}
+
+/* --- flowd country / time 对象的写入面 --- */
+
+/* 工具栏右端：条数徽标与新建按钮同一行，窄屏时按钮换行而不是挤压标题。 */
+.policy-object-table-toolbar-end {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.policy-object-table-actions {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 行内动作固定三格，hover 不改几何，避免整行回流（design.md 交互规则）。 */
+.policy-object-row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.policy-object-row-actions > button[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.policy-object-picker-field {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.policy-object-picker-toolbar {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.policy-object-picker-toolbar > span {
+  color: var(--app-text-muted, var(--dwrt-kit-muted));
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.policy-object-picker-search {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-inline-start: 10px;
+  border: 1px solid var(--color-border-control, color-mix(in srgb, var(--app-text) 18%, transparent));
+  border-radius: 6px;
+  background: var(--color-surface-control, color-mix(in srgb, var(--app-text) 5%, transparent));
+}
+
+.policy-object-picker-search > :where(svg, .dwrt-lucide-icon) {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  opacity: 0.6;
+}
+
+.policy-object-picker-search > input {
+  min-width: 0;
+  flex: 1 1 auto;
+  min-height: 38px;
+  border: 0;
+  padding: 0 10px 0 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  font-size: 14px;
+}
+
+.policy-object-picker-search > input:focus {
+  outline: none;
+}
+
+/* 249 条候选必须自己滚，不能把抽屉正文撑成一条长卷。 */
+.policy-object-pick-list {
+  min-width: 0;
+  max-height: 300px;
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--color-border-control, color-mix(in srgb, var(--app-text) 14%, transparent));
+  border-radius: 8px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.policy-object-pick {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.policy-object-pick:hover {
+  background: color-mix(in srgb, var(--app-text) 7%, transparent);
+}
+
+.policy-object-pick > input {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--color-accent, var(--dwrt-kit-accent));
+}
+
+.policy-object-pick > span {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.policy-object-pick strong {
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.policy-object-pick small {
+  flex: none;
+  color: var(--app-text-muted, var(--dwrt-kit-muted));
+  font-size: 11px;
+}
+
+.policy-object-time-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+/* 七个固定格：用等宽轨道而不是 auto-fit，否则勾选态会让格子宽度跳变。 */
+.policy-object-weekdays {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.policy-object-weekday {
+  min-width: 0;
+  min-height: 40px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--color-border-control, color-mix(in srgb, var(--app-text) 18%, transparent));
+  border-radius: 6px;
+  background: var(--color-surface-control, color-mix(in srgb, var(--app-text) 5%, transparent));
+  cursor: pointer;
+}
+
+.policy-object-weekday > input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.policy-object-weekday > span {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.policy-object-weekday:has(> input:checked) {
+  border-color: var(--color-accent, var(--dwrt-kit-accent));
+  background: color-mix(in srgb, var(--color-accent, var(--dwrt-kit-accent)) 18%, transparent);
+}
+
+.policy-object-weekday:has(> input:focus-visible) {
+  outline: 2px solid var(--color-accent, var(--dwrt-kit-accent));
+  outline-offset: 2px;
+}
+
+.policy-object-enable-check {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.policy-object-enable-check > input {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  accent-color: var(--color-accent, var(--dwrt-kit-accent));
+}
+
+.policy-object-enable-check > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.policy-object-enable-check strong {
+  font-size: 13px;
+}
+
+.policy-object-enable-check small {
+  color: var(--app-text-muted, var(--dwrt-kit-muted));
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .policy-object-reference-list h3 {

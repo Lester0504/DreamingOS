@@ -1,4 +1,4 @@
-const VERSION = '20260805-kit-material-radius-01';
+const VERSION = '20260810-front-release-01';
 const ENDPOINT = '/api/v1/container_service';
 const REFRESH_MS = 5000;
 
@@ -335,11 +335,26 @@ export function mount(context = {}) {
     return `<div class="container-service-panel" data-container-panel>${mode === 'docker' ? dockerPanel() : lxcPanel()}</div>`;
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root || !state.mounted) return;
     root.className = `route-preview route-workspace policy-table-route-host container-service-route-host is-${mode}`;
-    root.innerHTML = `<div class="container-service-shell">${toolbar()}<main class="container-service-workbench">${state.error ? `<div class="container-service-notice is-error">读取失败：${escapeHtml(state.error)}</div>` : ''}${panel()}</main></div>`;
-    ui.mountAll?.(root);
+    target.innerHTML = `<div class="container-service-shell">${toolbar()}<main class="container-service-workbench">${state.error ? `<div class="container-service-notice is-error">读取失败：${escapeHtml(state.error)}</div>` : ''}${panel()}</main></div>`;
+    ui.mountAll?.(target);
   }
 
   function patchPanel() {
@@ -364,7 +379,9 @@ export function mount(context = {}) {
       state.signature = signature;
       state.loading = false;
       state.refreshing = false;
-      if (changed || explicit) render();
+      // explicit 是用户主动刷新，DOM 本来就该整块换；轮询走保状态路径。
+      if (explicit) render();
+      else if (changed) renderPreservingInteraction();
     } catch (error) {
       if (!state.mounted || seq !== state.seq) return;
       state.loading = false;

@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260810-front-release-01';
   const MODULE_CLASS = 'quick-tools-route-host';
   const ASSET_ROOT = '/static/toolkit';
   /* ubus ping is asynchronous: the first call returns latency 0 / loss 100 with
@@ -161,7 +161,7 @@ export function mount(context = {}) {
     </button>`).join('')}</section>`;
   }
 
-  function field(label, input) { return `<label class="quick-tool-field"><span>${escapeHtml(label)}</span>${input}</label>`; }
+  function field(label, input) { return `<label class="quick-tool-field dwrt-kit-field" data-dwrt-component="field"><span>${escapeHtml(label)}</span>${input}</label>`; }
   function textInput(name, value, placeholder = '') { return `<input name="${name}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" autocomplete="off">`; }
   function numberInput(name, value, min, max) { return `<input name="${name}" type="number" value="${value}" min="${min}" max="${max}">`; }
   function wanOptions() { return `<option value="">自动选择</option>${state.wans.map((wan) => `<option value="${escapeHtml(firstText(wan.ifname, wan.interface, wan.id))}">${escapeHtml(firstText(wan.name, wan.label, wan.ifname, wan.id))}</option>`).join('')}`; }
@@ -356,15 +356,30 @@ export function mount(context = {}) {
     return `<section class="quick-tool-workspace"><header class="quick-tool-header"><button class="quick-tool-back" type="button" data-tool-back aria-label="返回快捷工具">${icon('back')}</button><div><span>快捷工具</span><strong>${escapeHtml(tool.title)}</strong><p>${escapeHtml(tool.description)}</p></div><img src="${ASSET_ROOT}/${tool.image}" alt=""></header><main class="quick-tool-body">${panelMarkup(tool)}</main></section>`;
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root || !state.mounted) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', MODULE_CLASS);
     const tool = TOOLS.find((item) => item.id === state.active);
-    root.innerHTML = tool ? detailMarkup(tool) : toolCards();
-    bindEvents();
-    ui.mountAll?.(root);
+    target.innerHTML = tool ? detailMarkup(tool) : toolCards();
+    bindEvents(target);
+    ui.mountAll?.(target);
     ui.scheduleGlassCardsRender?.(100);
   }
 
@@ -560,7 +575,7 @@ export function mount(context = {}) {
       if (stale(seq)) return;
       if (background) return;
       state.notice = failureNotice(error, '进度读取失败');
-    } finally { if (!stale(seq)) { if (!background) { state.busy = false; state.progress = ''; } render(); } }
+    } finally { if (!stale(seq)) { if (!background) { state.busy = false; state.progress = ''; render(); } else renderPreservingInteraction(); } }
   }
 
   async function loadHealth() {
@@ -591,7 +606,7 @@ export function mount(context = {}) {
       const data = await requestJson('/api/v1/insights/flows/current');
       state.flows = asArray(data, ['flows', 'connections', 'items']);
     } catch (error) { if (!background) state.notice = `流表读取失败：${firstText(error.message)}`; }
-    finally { if (!background) state.busy = false; render(); }
+    finally { if (!background) { state.busy = false; render(); } else renderPreservingInteraction(); }
   }
 
   async function stopCapture(id) {
@@ -599,8 +614,9 @@ export function mount(context = {}) {
     catch (error) { state.notice = `停止失败：${firstText(error.message)}`; render(); }
   }
 
-  function bindEvents() {
-    root.querySelectorAll('[data-quick-tool]').forEach((button) => button.addEventListener('click', () => {
+  /* render() 可能渲进离屏容器，事件必须绑到那个容器；缺省仍是真实 root。 */
+  function bindEvents(scope = root) {
+    scope.querySelectorAll('[data-quick-tool]').forEach((button) => button.addEventListener('click', () => {
       clearTimers(); state.seq += 1;
       state.active = button.dataset.quickTool;
       state.result = null; state.notice = ''; state.progress = ''; state.busy = false; state.throughput = null;
@@ -608,15 +624,15 @@ export function mount(context = {}) {
       if (state.active === 'packet-capture') loadCaptures();
       if (state.active === 'flow-table') loadFlows();
     }));
-    root.querySelector('[data-tool-back]')?.addEventListener('click', () => {
+    scope.querySelector('[data-tool-back]')?.addEventListener('click', () => {
       clearTimers(); state.seq += 1;
       state.active = ''; state.result = null; state.notice = ''; state.progress = ''; state.busy = false; state.throughput = null;
       render();
     });
-    root.querySelectorAll('[data-tool-form]').forEach((form) => form.addEventListener('submit', (event) => { event.preventDefault(); runTool(form); }));
-    root.querySelector('[data-tool-health]')?.addEventListener('click', loadHealth);
-    root.querySelector('[data-throughput-stop]')?.addEventListener('click', stopThroughput);
-    root.querySelectorAll('[data-capture-stop]').forEach((button) => button.addEventListener('click', () => stopCapture(button.dataset.captureStop)));
+    scope.querySelectorAll('[data-tool-form]').forEach((form) => form.addEventListener('submit', (event) => { event.preventDefault(); runTool(form); }));
+    scope.querySelector('[data-tool-health]')?.addEventListener('click', loadHealth);
+    scope.querySelector('[data-throughput-stop]')?.addEventListener('click', stopThroughput);
+    scope.querySelectorAll('[data-capture-stop]').forEach((button) => button.addEventListener('click', () => stopCapture(button.dataset.captureStop)));
   }
 
   async function loadWans() {

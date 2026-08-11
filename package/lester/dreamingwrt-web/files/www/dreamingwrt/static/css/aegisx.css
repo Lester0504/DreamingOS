@@ -364,7 +364,7 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-honeypot-list article > div:last-child { display: flex; gap: 4px; }
 .aegisx-honeypot-list button { min-height: 30px; border: 0; border-radius: var(--app-radius-compact); padding: 0 8px; color: var(--app-accent); background: transparent; font: inherit; font-size: 11px; cursor: pointer; }
 .aegisx-honeypot-list button:last-child { color: var(--app-danger); }
-.aegisx-drawer-empty { min-height: 120px; display: grid; place-items: center; color: var(--app-text-muted); font-size: 12px; }
+.aegisx-drawer-empty { min-height: 120px; font-size: 12px; }
 .aegisx-honeypot-events { display: grid; gap: 5px; }
 .aegisx-honeypot-events > strong { color: var(--app-text); font-size: 12px; }
 .aegisx-honeypot-events > span { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 9px; border-radius: var(--app-radius-compact); background: color-mix(in srgb, var(--app-text) 3%, transparent); }
@@ -373,6 +373,19 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
 .aegisx-service-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
 .aegisx-service-grid > label { min-height: 38px; display: flex; align-items: center; gap: 8px; border-radius: var(--app-radius-compact); padding: 0 9px; color: var(--app-text-secondary); background: color-mix(in srgb, var(--app-text) 4%, transparent); font-size: 11px; cursor: pointer; }
 .aegisx-service-grid > label:has(input:disabled) { opacity: .5; cursor: not-allowed; }
+
+/*
+ * 导出设置抽屉的运行态计数。
+ *
+ * 用 auto-fit + minmax 而不是固定列数：计数标签是中文短词，固定三列在窄抽屉里会把
+ * "已发送数据包"折成两行并顶开行高。minmax 的下限按最长标签给足，宽度不够时自然降列。
+ */
+.aegisx-netflow-counters { display: grid; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); gap: 8px; }
+.aegisx-netflow-counters > div { min-width: 0; display: grid; gap: 2px; border-radius: var(--app-radius-compact); padding: 8px 10px; background: color-mix(in srgb, var(--app-text) 4%, transparent); }
+.aegisx-netflow-counters > div > span { color: var(--app-text-muted); font-size: 10px; line-height: 1.3; }
+.aegisx-netflow-counters > div > strong { color: var(--app-text); font-size: 14px; font-variant-numeric: tabular-nums; }
+.aegisx-netflow-runtime { border-top: 1px solid color-mix(in srgb, var(--app-text-muted) 18%, transparent); padding-top: 14px; }
+.aegisx-netflow-warn { color: color-mix(in srgb, var(--dwrt-tone-warn, #e0a83a) 82%, var(--app-text)); }
 
 @media (max-width: 1000px) {
   .aegisx-resource-meta { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
@@ -402,6 +415,13 @@ input:checked + .aegisx-checkmark::after { content: ''; width: 7px; height: 4px;
   .aegisx-content-drawer,
   .aegisx-content-drawer.dwrt-page-glass-surface,
   .aegisx-content-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full); --dwrt-kit-sheet-max-width: 100vw; }
+  /*
+   * 导出抽屉在手机宽度下同样满宽。缺这一条时它保持 form 宽度，右侧留出一条缝，
+   * 底下的设置页透过来与抽屉文字叠在一起看 —— 实测 390px 下就是这个样子。
+   */
+  .aegisx-netflow-drawer,
+  .aegisx-netflow-drawer.dwrt-page-glass-surface,
+  .aegisx-netflow-drawer.dwrt-page-liquid-glass { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full); --dwrt-kit-sheet-max-width: 100vw; }
   .aegisx-content-form-row { grid-template-columns: 96px minmax(0, 1fr); gap: 10px; }
   .aegisx-drawer-toolbar { align-items: stretch; flex-direction: column; }
   .aegisx-drawer-toolbar > label { flex: 0 0 auto; width: 100%; }

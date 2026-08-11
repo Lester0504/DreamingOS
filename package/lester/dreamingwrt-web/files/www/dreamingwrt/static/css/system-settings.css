@@ -179,10 +179,10 @@
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--appearance-accent, #0a84ff) 42%, transparent);
 }
 
-.system-advanced-hero-card input {
+.system-advanced-card-switch {
   position: absolute;
-  opacity: 0;
-  pointer-events: none;
+  right: 13px;
+  bottom: 8px;
 }
 
 .system-advanced-hero-card > strong {
@@ -434,6 +434,25 @@
 
 .system-advanced-knob-row + .system-advanced-knob-row {
   margin-top: 8px;
+}
+
+/*
+ * 三列变体：标签 / 值 / 说明。基础 .system-advanced-knob-row 是五列
+ * （标签 / sysctl 名 / 值 / 状态徽标 / 说明），只发三个子元素时说明会落到第三列、
+ * 右侧留两条空轨。高级页的只读行没有 sysctl 名也没有状态徽标，用这个变体。
+ */
+.system-advanced-knob-row.is-three-col {
+  grid-template-columns: minmax(0, 16em) minmax(0, 10em) minmax(0, 1fr);
+}
+
+/* 整组未接入的说明条：比普通 cap-note 更醒目一档，但不用告警色——它不是故障。 */
+.system-advanced-unbacked {
+  margin-bottom: 10px;
+  padding: 9px 12px;
+  border-radius: var(--app-radius-compact);
+  border-left: 2px solid color-mix(in srgb, var(--system-muted) 55%, transparent);
+  background: rgba(255,255,255,0.04);
+  line-height: 1.55;
 }
 
 .system-advanced-knob-row > strong {
@@ -1477,6 +1496,40 @@ textarea.system-glass-input {
   color: color-mix(in srgb, var(--system-muted) 56%, transparent);
 }
 
+/*
+ * 被后端能力闸门关住的字段（field_contracts write=false）。
+ * 材质不变，只降对比并挂 not-allowed，让"点不动"看起来是设计而不是坏了；
+ * 原因通过 title 给出，不额外占版面。
+ */
+.system-glass-input:disabled,
+.system-glass-input[data-system-locked="true"] {
+  opacity: 0.52;
+  cursor: not-allowed;
+  color: var(--system-muted);
+}
+
+.system-segment-btn:disabled,
+.system-circle-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.system-ios-switch.is-locked {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.system-input-hint.is-locked {
+  color: color-mix(in srgb, #ffb454 72%, var(--system-muted));
+}
+
+.system-advanced-hero-card.is-locked,
+.system-advanced-select:disabled,
+.system-advanced-input:disabled {
+  opacity: 0.52;
+  cursor: not-allowed;
+}
+
 .system-glass-input option {
   background: #111827;
   color: #f8fbff;
@@ -1796,54 +1849,7 @@ textarea.system-glass-input {
   min-width: 0;
 }
 
-.system-ios-switch.dwrt-switch {
-  position: relative;
-  display: inline-flex;
-  width: 50px;
-  height: 28px;
-  flex: 0 0 50px;
-  cursor: pointer;
-}
-
-.system-ios-switch.dwrt-switch input {
-  position: absolute;
-  inset: 0;
-  opacity: 0;
-  cursor: pointer;
-}
-
-.system-ios-switch.dwrt-switch .dwrt-slider {
-  position: relative;
-  width: 50px;
-  height: 28px;
-  border-radius: 999px;
-  background: rgba(0, 0, 0, 0.20);
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12);
-  transition: background 180ms ease;
-}
-
-.system-ios-switch.dwrt-switch .dwrt-slider::after {
-  content: "";
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  background: #ffffff;
-  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.24);
-  transition: transform 180ms cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.system-ios-switch.dwrt-switch.on .dwrt-slider,
-.system-ios-switch.dwrt-switch input:checked + .dwrt-slider {
-  background: #32d74b;
-}
-
-.system-ios-switch.dwrt-switch.on .dwrt-slider::after,
-.system-ios-switch.dwrt-switch input:checked + .dwrt-slider::after {
-  transform: translateX(22px);
-}
+.system-ios-switch { flex: 0 0 auto; }
 
 .system-server-list {
   display: grid;
@@ -2371,8 +2377,11 @@ textarea.system-glass-input {
   height: 13px;
 }
 
+/* design.md 交互契约第 3、4 条：按压缩放只给命令按钮，且 hover 不得改变交互几何。
+   原来的 scale(1.06) 让 13px 的图标在 hover 时长大，指针容易掉出触发区。 */
 .system-admin-avatar-box:hover .system-admin-avatar-trigger {
-  transform: scale(1.06);
+  background: var(--dwrt-interactive-hover-bg);
+  border-color: var(--dwrt-interactive-hover-border);
 }
 
 .system-admin-avatar-label {
@@ -2516,9 +2525,7 @@ textarea.system-glass-input {
   font-weight: 780;
 }
 
-.system-admin-policy-tile .dwrt-switch {
-  flex: 0 0 50px;
-}
+.system-admin-policy-tile .system-ios-switch { flex: 0 0 auto; }
 
 .system-admin-unit-field {
   position: relative;
@@ -2736,6 +2743,18 @@ textarea.system-glass-input {
   font-style: normal;
   font-weight: 620;
   line-height: 1.6;
+}
+
+/* 云端注册入口：状态行 + 动作按钮 + 进度/结果说明，几何沿用同段其他状态行。 */
+.system-admin-cloud-enroll {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 失败原因原样呈现，语义色区别于普通说明文字，但不改字重去补对比度。 */
+.system-admin-cloud-error {
+  color: #ff9f8f;
 }
 
 /* 路由器指纹行：与 App 侧比对用的带外核验信息，取中性材质，
@@ -2976,6 +2995,29 @@ textarea.system-glass-input {
   font-variant-numeric: tabular-nums;
 }
 
+/*
+ * 配对码输入行：输入框吃掉剩余宽度，按钮按内容定宽并与输入框底边对齐
+ * （align-items:end，因为 label 内含一行说明文字，比按钮高一截）。
+ */
+.system-pair-code-entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+  min-width: 0;
+}
+
+.system-pair-code-entry > .system-demo-btn {
+  min-height: 46px;
+  white-space: nowrap;
+}
+
+@media (max-width: 620px) {
+  .system-pair-code-entry {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .system-pair-code-block {
   display: grid;
   gap: 9px;
@@ -3176,6 +3218,32 @@ textarea.system-glass-input {
 
 .system-api-row.disabled {
   opacity: 0.68;
+}
+
+/*
+ * 角色下拉、启用/停用与撤销合并成一个动作组，占 grid 的最后一列。
+ * 不给每个控件单开一列：`enabled_write` 能力位决定中间那颗按钮是否存在，
+ * 列数会随之变化，固定列模板对不上就会出现空列或换行错位。
+ */
+.system-api-row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+/*
+ * 角色下拉在动作组里必须自己收宽。`.system-glass-input` 是 width:100%，
+ * 放进 flex 行会把整行吃满，把「停用 / 撤销」挤到第二行去（1440 实测）。
+ * 这里给它一个够放最长选项（Administrator（读 + 中风险管理））的上限。
+ */
+.system-api-row-actions .system-api-role-select {
+  width: auto;
+  min-width: 168px;
+  max-width: 232px;
+  flex: 0 1 auto;
 }
 
 .system-api-row > span:nth-child(2) {
@@ -3858,7 +3926,7 @@ textarea.system-glass-input {
   white-space: nowrap;
 }
 
-.system-mount-enabled-cell .system-ios-switch.dwrt-switch {
+.system-mount-enabled-cell .system-ios-switch {
   display: inline-flex;
   vertical-align: middle;
 }
@@ -4055,517 +4123,13 @@ textarea.system-glass-input {
   }
 }
 
-/*
- * ── API-Key 管理卡 ──
- *
- * 沿用「云端与安全接入」那张舱的形制：同一个 .system-demo-panel 玻璃底、同一套
- * .system-admin-access-header / -section / -legend / -note 骨架，所以这里只写
- * 表格几何与状态语义色，不重新定义卡片材质，也不引入第二种状态胶囊。
- */
-.system-api-key-panel {
-  align-content: start;
-  gap: 0;
-}
-
-.system-api-key-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-}
-
-.system-api-key-empty {
-  border-radius: var(--app-radius-panel);
-  background: rgba(255,255,255,0.045);
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.07);
-  color: var(--system-muted);
-  font-size: 12px;
-  font-weight: 760;
-  line-height: 1.55;
-  padding: 14px 16px;
-}
-
-.system-api-key-empty.is-error {
-  color: #ff9aa4;
-  box-shadow: inset 0 0 0 1px rgba(222,57,78,0.28);
-}
-
-/*
- * 表格容器只负责裁剪与圆角，不带卡片材质：它已经在 .system-demo-panel 这张卡
- * 里面了，套 .dwrt-kit-table-wrap 会把 kit 的卡片底色/边框再画一遍，形成卡中卡
- * （design.md 系统设置子页规则 8、以及"不得把页面区块做成浮动卡"）。
- * 表体仍用 .dwrt-kit-table，行高与表头材质因此保持与全站一致。
- */
-.system-api-key-table-wrap {
-  min-width: 0;
-  border-radius: var(--app-radius-panel);
-  overflow: hidden;
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.07);
-}
-
-/*
- * 七列在常规桌面宽度下靠列宽与 ellipsis fit 容器；真放不下时才在
- * .dwrt-kit-table-scroll 内横向滚动，页面本身不横向溢出（design.md 表格规则 11）。
- */
-.system-api-key-table {
-  min-width: 760px;
-}
-
-.system-api-key-table th,
-.system-api-key-table td {
-  vertical-align: middle;
-}
-
-.system-api-key-name {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
-
-.system-api-key-name strong {
-  color: var(--system-ink);
-  font-size: 13px;
-  font-weight: 820;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.system-api-key-name code,
-.system-api-key-ips {
-  color: var(--system-muted);
-  font-family: var(--dwrt-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .02em;
-}
-
-.system-api-key-cell-stack {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
-
-.system-api-key-cell-stack span {
-  color: var(--system-text);
-  font-size: 12px;
-  font-weight: 760;
-}
-
-.system-api-key-cell-stack em {
-  color: var(--system-muted);
-  font-size: 11px;
-  font-style: normal;
-  font-weight: 700;
-}
-
-/* 轮换提示是柔和标记，不是告警：用中性琥珀而不是红色描边。 */
-.system-api-key-cell-stack em.is-hint {
-  color: #ffc36a;
-}
-
-.system-api-key-muted {
-  color: var(--system-faint);
-  font-size: 11px;
-  font-style: normal;
-  font-weight: 700;
-}
-
-.system-api-key-state {
-  display: inline-flex;
-  align-items: center;
-  padding: 4px 10px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 820;
-  white-space: nowrap;
-}
-
-.system-api-key-state.is-active {
-  background: rgba(52,199,89,0.10);
-  box-shadow: inset 0 0 0 1px rgba(52,199,89,0.20);
-  color: #75df91;
-}
-
-.system-api-key-state.is-expired {
-  background: rgba(255,149,0,0.10);
-  box-shadow: inset 0 0 0 1px rgba(255,159,10,0.20);
-  color: #ffc36a;
-}
-
-.system-api-key-state.is-revoked {
-  background: rgba(222,57,78,0.10);
-  box-shadow: inset 0 0 0 1px rgba(222,57,78,0.22);
-  color: #ff9aa4;
-}
-
-/*
- * 操作列固定不换行。按钮高度锁 30px（design.md 系统设置子页规则 3），
- * 否则会被 table 单元格拉成竖条。
- */
-.system-api-key-ops {
-  display: flex;
-  gap: 6px;
-  justify-content: flex-end;
-  white-space: nowrap;
-}
-
-.system-api-key-table .system-api-key-ops-col {
-  text-align: right;
-  width: 1%;
-}
-
-.system-api-key-ops .system-demo-btn.compact-btn {
-  min-height: 30px;
-  flex: 0 0 auto;
-}
-
-/* ── 新建 / 展示 / 审计 弹窗 ── */
-
-/*
- * 自己的 layer 类而不是复用 .system-binding-layer：那个类是 OTP / App 配对两条
- * 短流程的，合同测试按它的出现次数守「只有两条短流程」。这里沿用同一套语义色
- * 变量与 Kit 模态骨架，只是不共用那个身份。
- */
-.system-api-key-layer {
-  --dwrt-kit-modal-width: 640px;
-  --system-ink: var(--app-text, var(--dwrt-glass-ink));
-  --system-text: var(--app-text-secondary, var(--dwrt-glass-text));
-  --system-muted: var(--app-text-muted, var(--dwrt-glass-muted));
-}
-
-.system-api-key-dialog,
-.system-api-key-audit-dialog {
-  color: var(--system-text);
-}
-
-.system-api-key-dialog .dwrt-kit-modal-header h2,
-.system-api-key-audit-dialog .dwrt-kit-modal-header h2 {
-  color: var(--system-ink);
-}
-
-.system-api-key-dialog .dwrt-kit-modal-header p,
-.system-api-key-audit-dialog .dwrt-kit-modal-header p {
-  color: var(--system-muted);
-}
-
-.system-api-key-dialog {
-  width: min(560px, calc(100vw - 32px));
-}
-
-.system-api-key-form {
-  display: grid;
-  gap: 14px;
-}
-
-.system-api-key-field {
-  display: grid;
-  gap: 6px;
-  min-width: 0;
-}
-
-.system-api-key-field-label {
-  color: var(--system-muted);
-  font-size: 11px;
-  font-weight: 820;
-  letter-spacing: .08em;
-  text-transform: uppercase;
-}
-
-.system-api-key-field-hint {
-  color: var(--system-muted);
-  font-size: 11px;
-  font-style: normal;
-  font-weight: 700;
-  line-height: 1.5;
-}
-
-/*
- * 权限档与有效期用分段控件而不是自由文本输入。分段按内容等分，
- * 窄屏换行而不是压扁按钮，保证最长的一项也放得下。
- */
-.system-api-key-segment {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.system-api-key-segment-btn {
-  flex: 1 1 auto;
-  min-width: max-content;
-  min-height: 34px;
-  padding: 0 14px;
-  border: 0;
-  border-radius: var(--app-radius-control, 10px);
-  background: rgba(255,255,255,0.05);
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.09);
-  color: var(--system-text);
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 800;
-  transition: background .18s ease, box-shadow .18s ease, color .18s ease;
-}
-
-.system-api-key-segment-btn:hover {
-  background: rgba(255,255,255,0.08);
-  color: var(--system-ink);
-}
-
-.system-api-key-segment-btn.is-active {
-  background: rgba(10,132,255,0.16);
-  box-shadow: inset 0 0 0 1px rgba(94,199,255,0.34);
-  color: #cde8ff;
-}
-
-.system-api-key-warning,
-.system-api-key-reveal-warning {
-  display: flex;
-  gap: 10px;
-  align-items: flex-start;
-  padding: 12px 14px;
-  border-radius: var(--app-radius-panel);
-  background: rgba(255,149,0,0.08);
-  box-shadow: inset 0 0 0 1px rgba(255,159,10,0.22);
-  color: #ffd7a3;
-}
-
-.system-api-key-warning svg,
-.system-api-key-reveal-warning svg {
-  display: block;
-  flex: 0 0 auto;
-  width: 18px;
-  height: 18px;
-  margin-top: 1px;
-}
-
-.system-api-key-warning div {
-  display: grid;
-  gap: 3px;
-  min-width: 0;
-}
-
-.system-api-key-warning strong {
-  font-size: 12px;
-  font-weight: 840;
-}
-
-.system-api-key-warning span,
-.system-api-key-reveal-warning span {
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.55;
-  overflow-wrap: anywhere;
-}
-
-.system-api-key-reveal-box {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  margin-top: 12px;
-  padding: 12px 14px;
-  border-radius: var(--app-radius-panel);
-  background: rgba(255,255,255,0.05);
-  box-shadow: inset 0 0 0 1px rgba(94,199,255,0.24);
-}
-
-/*
- * 明文很长（dwrt_ + 16 hex + 64 hex）。允许任意位置换行并自己滚动，
- * 不把弹窗撑宽，也不让它盖到相邻元素上。
- */
-.system-api-key-reveal-box code {
-  flex: 1 1 auto;
-  min-width: 0;
-  max-height: 84px;
-  overflow: auto;
-  color: var(--system-ink);
-  font-family: var(--dwrt-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-  font-size: 12px;
-  font-weight: 720;
-  line-height: 1.6;
-  overflow-wrap: anywhere;
-  user-select: all;
-}
-
-/*
- * 复制按钮必须自带底色：裸 .system-demo-btn 没有 background，压在明文框
- * 那层浅色玻璃上几乎看不见，而这是这个弹窗里唯一必须点的按钮。
- */
-.system-api-key-reveal-box .system-demo-btn {
-  flex: 0 0 auto;
-  border-color: rgba(94, 199, 255, 0.28);
-  background: rgba(10, 132, 255, 0.18);
-  color: #cde8ff;
-}
-
-.system-api-key-reveal-box .system-demo-btn:hover:not(:disabled) {
-  background: rgba(10, 132, 255, 0.26);
-}
-
-.system-api-key-reveal-box .system-demo-btn.is-copied {
-  border-color: rgba(52, 199, 89, 0.35);
-  background: rgba(52, 199, 89, 0.16);
-  color: #75df91;
-}
-
-.system-api-key-reveal-box .system-demo-btn.is-copy-failed {
-  border-color: rgba(222, 57, 78, 0.35);
-  background: rgba(222, 57, 78, 0.16);
-  color: #ff9aa4;
-}
-
-.system-api-key-reveal-meta {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 10px;
-  margin-top: 12px;
-}
-
-.system-api-key-reveal-meta span {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
-
-.system-api-key-reveal-meta b {
-  color: var(--system-muted);
-  font-size: 10px;
-  font-weight: 820;
-  letter-spacing: .08em;
-  text-transform: uppercase;
-}
-
-.system-api-key-reveal-meta em {
-  color: var(--system-text);
-  font-family: var(--dwrt-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-  font-size: 12px;
-  font-style: normal;
-  font-weight: 720;
-  overflow-wrap: anywhere;
-}
-
-.system-api-key-audit-dialog {
-  width: min(920px, calc(100vw - 32px));
-}
-
-.system-api-key-audit-body {
-  min-width: 0;
-  max-height: min(60vh, 520px);
-  overflow: auto;
-  padding: 18px 20px;
-}
-
-/*
- * 六列在弹窗宽度内 fit，不要一上来就横向滚动（design.md 表格规则 11：
- * 先靠列宽与 ellipsis 装下，真放不下才滚）。UA 列吃掉剩余宽度并截断。
- */
-.system-api-key-audit-table {
-  min-width: 0;
-  table-layout: fixed;
-}
-
-/*
- * 时间列给足宽度：截断成「2026/8/8 19:0…」等于没给出时间，而排查时最先看的
- * 就是它。UA 列不设宽度，吃掉剩余空间并截断（它是唯一可以被截断的字段）。
- */
-.system-api-key-audit-table th:nth-child(1),
-.system-api-key-audit-table td:nth-child(1) { width: 20ch; }
-.system-api-key-audit-table th:nth-child(2),
-.system-api-key-audit-table td:nth-child(2) { width: 12%; }
-.system-api-key-audit-table th:nth-child(3),
-.system-api-key-audit-table td:nth-child(3) { width: 20%; }
-.system-api-key-audit-table th:nth-child(4),
-.system-api-key-audit-table td:nth-child(4) { width: 14%; }
-.system-api-key-audit-table th:nth-child(6),
-.system-api-key-audit-table td:nth-child(6) { width: 9ch; }
-
-/* 时间是等宽数字，截断后无法辨认，所以这一列不参与省略号截断。 */
-.system-api-key-audit-table td:nth-child(1) {
-  font-variant-numeric: tabular-nums;
-  overflow: visible;
-  text-overflow: clip;
-}
-
-.system-api-key-audit-table td {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.system-api-key-audit-table td {
-  font-size: 12px;
-  font-weight: 720;
-}
-
-.system-api-key-audit-target {
-  white-space: nowrap;
-}
-
-/*
- * UA 极长，列内截断，完整值走项目自有 tooltip（design.md 规则 12：
- * 不用浏览器原生 title 作为正式 hover 样式）。
- */
-
-.system-api-key-audit-ua span {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.system-api-key-audit-result {
-  display: inline-flex;
-  align-items: center;
-  padding: 3px 9px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 800;
-  white-space: nowrap;
-}
-
-.system-api-key-audit-result.is-ok {
-  background: rgba(52,199,89,0.10);
-  box-shadow: inset 0 0 0 1px rgba(52,199,89,0.20);
-  color: #75df91;
-}
-
-.system-api-key-audit-result.is-denied {
-  background: rgba(222,57,78,0.10);
-  box-shadow: inset 0 0 0 1px rgba(222,57,78,0.22);
-  color: #ff9aa4;
-}
-
-/* 失败行整行淡红底，扫读时不必逐格找结果列。 */
-.system-api-key-audit-table tr.is-failed td {
-  background: rgba(222,57,78,0.045);
-}
-
-@media (max-width: 900px) {
-  .system-api-key-audit-body {
-    padding: 16px;
-  }
-}
-
-@media (max-width: 720px) {
-  .system-api-key-toolbar .system-demo-btn {
-    flex: 1 1 auto;
-  }
-
-  .system-api-key-reveal-box {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .system-api-key-reveal-box .system-demo-btn {
-    width: 100%;
-  }
-}
-
 /* ── 升级确认弹窗 ───────────────────────────────────────────────────────────
-   宽度沿用 API-Key 弹窗那一档（560px），不另立尺寸。材质与圆角全部走 kit 与
-   token，本节只写这张弹窗特有的排布。 */
+   宽度锁 560px 这一档，不另立尺寸。材质与圆角全部走 kit 与 token，
+   本节只写这张弹窗特有的排布。 */
 
 /*
  * 墨色三档必须在**这一层**声明。它们是 layer 级的局部变量：`.system-binding-layer`
- * 与 `.system-api-key-layer` 各自写了一份，不是全局默认。少写这一段，弹窗里的
+ * 与本层各自写了一份，不是全局默认。少写这一段，弹窗里的
  * `--system-ink` / `--system-muted` 全部落空，文字实测只有 1.11:1（旁边同一张卡上的
  * 按钮是 18.77:1），肉眼就是一片几乎看不见的灰。
  */

@@ -528,43 +528,6 @@
   background: rgba(255,255,255,0.050);
 }
 
-.log-settings-switch input {
-  position: absolute;
-  inline-size: 1px;
-  block-size: 1px;
-  opacity: 0;
-}
-
-.log-settings-switch span {
-  width: 28px;
-  height: 16px;
-  border-radius: 999px;
-  background: rgba(154,168,187,0.34);
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.16);
-  position: relative;
-  flex: 0 0 auto;
-}
-
-.log-settings-switch span::after {
-  content: "";
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 10px;
-  height: 10px;
-  border-radius: 999px;
-  background: rgba(255,255,255,0.92);
-  transition: transform 160ms ease;
-}
-
-.log-settings-switch input:checked + span {
-  background: rgba(42,132,255,0.72);
-}
-
-.log-settings-switch input:checked + span::after {
-  transform: translateX(12px);
-}
-
 .log-settings-switch strong {
   min-width: 0;
   color: var(--dwrt-ink, var(--app-text));

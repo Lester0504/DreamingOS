@@ -505,31 +505,6 @@ body:has(.network-interface-drawer.is-open) .ai-orb-restore {
 .network-interface-switch-row > span { min-width: 0; display: grid; gap: 2px; }
 .network-interface-switch-row strong { color: var(--app-text-secondary); font-size: 11px; font-weight: 730; }
 .network-interface-switch-row small { color: var(--app-text-muted); font-size: 9px; line-height: 1.35; }
-.network-interface-switch-row input { position: absolute; opacity: 0; pointer-events: none; }
-.network-interface-switch-row > i {
-  width: 36px;
-  height: 20px;
-  position: relative;
-  flex: 0 0 36px;
-  border-radius: 999px;
-  background: rgba(110,126,146,0.34);
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.09);
-  transition: background 160ms ease;
-}
-.network-interface-switch-row > i::after {
-  content: '';
-  width: 16px;
-  height: 16px;
-  position: absolute;
-  left: 2px;
-  top: 2px;
-  border-radius: 50%;
-  background: #f7f9fc;
-  box-shadow: 0 2px 5px rgba(0,0,0,0.22);
-  transition: transform 180ms cubic-bezier(.2,.8,.2,1);
-}
-.network-interface-switch-row input:checked + i { background: #3389ff; }
-.network-interface-switch-row input:checked + i::after { transform: translateX(16px); }
 .network-interface-switch-row:has(input:focus-visible) { outline: 2px solid #68b7ff; outline-offset: 2px; }
 
 .network-interface-port-picker { min-width: 0; display: grid; gap: 14px; }
@@ -594,7 +569,7 @@ body:has(.network-interface-drawer.is-open) .ai-orb-restore {
   font-size: 10px;
 }
 .network-interface-field.is-invalid > input,
-.network-interface-field.is-invalid > select { box-shadow: inset 0 0 0 1px rgba(246,91,108,0.55); }
+.network-interface-field.is-invalid select { box-shadow: inset 0 0 0 1px rgba(246,91,108,0.55); }
 
 /* 一口多主冲突横幅：把双方都点出来，界面不替用户二选一。 */
 .network-interface-conflict { display: grid; gap: 3px; margin: 14px 0 0; }
@@ -643,8 +618,6 @@ body:has(.network-interface-drawer.is-open) .ai-orb-restore {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .network-interface-switch-row > i,
-  .network-interface-switch-row > i::after,
   .network-interface-editor-group > h3 i { transition: none; }
   .network-interface-row-actions button.is-busy svg { animation: none; }
 }

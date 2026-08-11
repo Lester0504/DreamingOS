@@ -28,8 +28,13 @@ assert "['mac', 'MAC 限速']" in MODULE
 assert "['ip', 'IP 限速']" in MODULE
 assert "tab: 'mac'" in MODULE, "默认必须停在真正可用的 MAC tab"
 assert "data-client-speed-tab" in MODULE
-# 复用兄弟页同一套分段控件，不引入第二种
-assert "user-auth-segmented client-speed-tabs" in MODULE
+# 页面级 tab 必须消费 Kit 的 62px page-tabs，不再复用表格内分段控件。
+assert 'class="dwrt-kit-tabs dwrt-kit-page-tabs client-speed-tabs"' in MODULE
+assert 'role="tablist"' in MODULE
+assert 'class="dwrt-kit-tab' in MODULE
+assert 'role="tab"' in MODULE
+assert 'data-value="${id}"' in MODULE
+assert "user-auth-segmented client-speed-tabs" not in MODULE
 
 # 2) 主体按 tab 切换
 body = MODULE[MODULE.index("function bodyMarkup"):MODULE.index("function macTableMarkup")]
@@ -42,8 +47,16 @@ for fake in ("<input", "<select", "<textarea", "<button", "data-client-speed-fie
     assert fake not in placeholder, f"IP 占位不得包含 {fake}（后端无 IP 字段，填了无处保存）"
 # 必须如实说明为什么不可用，并指向可用的替代路径
 assert "尚未开放" in placeholder
-assert "client_mac_on_lan_bridge" in placeholder, "应给出后端真实的匹配作用域作为依据"
 assert "MAC 限速" in placeholder, "应告诉用户改用哪条可用路径"
+#
+# 文案口径在 2026-08-08 由用户改判，见交接单
+# `Acceptance-to-Front-acl-expires-and-schedule-copy-is-stale.md` 第 3 条：
+# 面向客户的占位文案**不得**暴露内部实现口径（原先要求出现
+# `client_mac_on_lan_bridge`、以及「填了也无处保存」），也**不得**论证
+# MAC 维度比 IP 更好。改为中性的「即将开放」。
+# 判据随之反转：这些说辞出现即为回归。
+for banned in ("client_mac_on_lan_bridge", "填了也无处保存", "无处保存", "优势"):
+    assert banned not in placeholder, f"占位文案不得再出现「{banned}」（用户明确否决这种答复）"
 
 # 4) 轮询不得整页重建 —— 这是本轮实测抓到的真缺陷。
 #

@@ -12,7 +12,7 @@ export function mount(context = {}) {
     return { name, ok, data: json?.data ?? json, raw: json, error: ok ? null : new Error(json?.error?.message || json?.message || response.statusText || 'request failed') };
   });
 
-  const VERSION = '20260809-advanced-capability-truth-01';
+  const VERSION = '20260810-front-release-01';
   const MODULE_CLASS = 'system-settings-route-host';
   const ENDPOINT = '/api/v1/system/basic';
   const SAVE_ENDPOINTS = ['/api/v1/system/settings', '/api/v1/save_system_settings'];
@@ -906,9 +906,8 @@ export function mount(context = {}) {
           ${systemSettingsRow('时区', systemSelectControl('general.timezone', g.timezone || 'Asia/Shanghai', systemTimezoneOptions()))}
           ${systemSettingsRow('时间格式', systemSelectControl('general.time_format', g.time_format || '24h', [['24h', '默认（24小时制）'], ['12h', '12小时制（AM/PM）']]))}
           ${systemSettingsRow('', `
-            <label class="system-demo-check glass-check-label">
+            <label class="system-demo-check dwrt-kit-switch" data-dwrt-component="switch">
               <input type="checkbox" ${g.show_timezone_name !== false ? 'checked' : ''} data-system-field="general.show_timezone_name">
-              <span class="glass-check-box" aria-hidden="true"></span>
               <span>显示完整时区名</span>
             </label>
             <span class="system-input-hint">取消勾选表示显示时区偏移（如 GMT+8）</span>
@@ -2010,9 +2009,8 @@ export function mount(context = {}) {
             <strong>启用定时备份</strong>
             <em>按下面的频率与时刻自动生成配置备份（范围 ${escapeHtml(String(SYSTEM_BACKUP_SCOPE_TEXT))}）。</em>
           </span>
-          <label class="system-ios-switch dwrt-switch ${enabled ? 'on' : ''}">
+          <label class="system-ios-switch dwrt-kit-switch" data-dwrt-component="switch">
             <input type="checkbox" ${enabled ? 'checked' : ''} data-system-schedule-field="enabled">
-            <span class="dwrt-slider" aria-hidden="true"></span>
           </label>
         </div>
         <div class="system-flash-schedule-fields ${enabled ? '' : 'is-idle'}">
@@ -2767,7 +2765,7 @@ export function mount(context = {}) {
   function systemAdvancedHeroCard(label, desc, field, checked, icon) {
     const lock = systemFieldLockAttrs(field);
     const reason = systemFieldLockReason(field);
-    return `<label class="system-advanced-hero-card ${checked ? 'active' : ''}${lock ? ' is-locked' : ''}"${reason ? ` title="${escapeHtml(reason)}"` : ''}><input type="checkbox" ${checked ? 'checked' : ''} data-system-field="${escapeHtml(field)}"${lock}><span class="system-advanced-status-box" aria-hidden="true">${systemSettingsIcon(icon)}</span><strong>${escapeHtml(label)}</strong><em>${escapeHtml(desc)}</em></label>`;
+    return `<label class="system-advanced-hero-card ${checked ? 'active' : ''}${lock ? ' is-locked' : ''}"${reason ? ` title="${escapeHtml(reason)}"` : ''}><span class="system-advanced-card-switch dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" ${checked ? 'checked' : ''} data-system-field="${escapeHtml(field)}"${lock}></span><span class="system-advanced-status-box" aria-hidden="true">${systemSettingsIcon(icon)}</span><strong>${escapeHtml(label)}</strong><em>${escapeHtml(desc)}</em></label>`;
   }
 
   function systemAdvancedSelect(label, field, current, options) {
@@ -4130,9 +4128,8 @@ export function mount(context = {}) {
   function systemIosSwitch(field, checked) {
     const lock = systemFieldLockAttrs(field);
     return `
-      <label class="system-ios-switch dwrt-switch ${checked ? 'on' : ''}${lock ? ' is-locked' : ''}"${lock ? ` title="${escapeHtml(systemFieldLockReason(field))}"` : ''}>
+      <label class="system-ios-switch dwrt-kit-switch${lock ? ' is-locked' : ''}" data-dwrt-component="switch"${lock ? ` title="${escapeHtml(systemFieldLockReason(field))}"` : ''}>
         <input type="checkbox" ${checked ? 'checked' : ''} data-system-field="${escapeHtml(field)}"${lock}>
-        <span class="dwrt-slider" aria-hidden="true"></span>
       </label>
     `;
   }

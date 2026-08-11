@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260809-front-w13-delegated-iface-select-01';
+  const VERSION = '20260810-front-release-01';
   const MODULE_CLASS = 'user-authentication-route-host';
   const stage = root?.closest('.console-stage');
   const PAGE_BY_ID = {
@@ -352,7 +352,7 @@ export function mount(context = {}) {
   }
 
   function switchField(label, help, path, checked, disabled = false) {
-    return `<label class="user-auth-setting-row"><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(help)}</small></span><span class="user-auth-switch"><input type="checkbox" data-user-auth-draft="${escapeHtml(path)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}><i></i></span></label>`;
+    return `<label class="user-auth-setting-row"><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(help)}</small></span><span class="user-auth-switch dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-user-auth-draft="${escapeHtml(path)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}></span></label>`;
   }
 
   function field(label, path, value, options = {}) {
@@ -439,8 +439,9 @@ export function mount(context = {}) {
     const web = state.webDraft || state.data.web;
     const portal = web.portal || state.data.web.portal;
     const writable = capability('update_web');
-    const switchControl = (path, checked, disabled = false) => `<span class="user-auth-switch"><input type="checkbox" data-user-auth-web="${escapeHtml(path)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}><i></i></span>`;
-    const optionRow = (path, title, description, checked, disabled = false) => `<label class="user-auth-web-option"><span class="user-auth-web-checkbox">${switchControl(path, checked, disabled)}</span><span>${icon(path.includes('external') ? 'disconnect' : 'preview')}<strong>${escapeHtml(title)}</strong><small>${escapeHtml(description)}</small></span></label>`;
+    const switchControl = (path, checked, disabled = false) => `<span class="user-auth-switch dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-user-auth-web="${escapeHtml(path)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}></span>`;
+    const checkboxControl = (path, checked, disabled = false) => `<span class="user-auth-checkbox"><input type="checkbox" data-user-auth-web="${escapeHtml(path)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}><i aria-hidden="true"></i></span>`;
+    const optionRow = (path, title, description, checked, disabled = false) => `<label class="user-auth-web-option"><span class="user-auth-web-checkbox">${checkboxControl(path, checked, disabled)}</span><span>${icon(path.includes('external') ? 'disconnect' : 'preview')}<strong>${escapeHtml(title)}</strong><small>${escapeHtml(description)}</small></span></label>`;
     const value = (path, fallback = '') => path.split('.').reduce((current, key) => current?.[key], web) ?? fallback;
     const inputValue = (path, fallback = '') => {
       const current = value(path, fallback);
@@ -708,7 +709,17 @@ export function mount(context = {}) {
     return `<button class="user-auth-preview-overlay" type="button" data-user-auth-preview-close aria-label="关闭预览"></button><section class="user-auth-preview-dialog dwrt-kit-glass-surface" role="dialog" aria-modal="true"><header><strong>${state.page === 'web' ? '门户页面预览' : '认证通知预览'}</strong><button type="button" data-user-auth-preview-close aria-label="关闭">×</button></header>${content}</section>`;
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：本页实测丢焦点与内层滚动位置）。
+   * 用户主动操作仍走 render()。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
@@ -718,14 +729,15 @@ export function mount(context = {}) {
     // 导致 alignPageToolbar() 找不到宿主、工具栏留在 workbench 内，
     // 页面顶部出现一整条空白带。只要该页有工具栏就必须建出 header。
     const needsHeader = Boolean(tabs) || state.page !== 'web';
-    root.innerHTML = `<section class="user-auth-shell is-${state.page}">${needsHeader ? `<header class="user-auth-page-header${tabs ? '' : ' is-toolbar-only'}">${tabs}</header>` : ''}${noticeMarkup()}<main class="user-auth-workbench">${mainMarkup()}</main>${drawerMarkup()}${previewMarkup()}<input type="file" data-user-auth-import-file accept=".json,.csv,application/json,text/csv" hidden></section>`;
-    alignPageToolbar();
-    ui.mountAll?.(root);
+    target.innerHTML = `<section class="user-auth-shell is-${state.page}">${needsHeader ? `<header class="user-auth-page-header${tabs ? '' : ' is-toolbar-only'}">${tabs}</header>` : ''}${noticeMarkup()}<main class="user-auth-workbench">${mainMarkup()}</main>${drawerMarkup()}${previewMarkup()}<input type="file" data-user-auth-import-file accept=".json,.csv,application/json,text/csv" hidden></section>`;
+    // 工具栏搬迁必须作用在刚写入的容器上，否则离屏渲染时搬的是上一轮的节点。
+    alignPageToolbar(target);
+    ui.mountAll?.(target);
   }
 
-  function alignPageToolbar() {
-    const header = root?.querySelector('.user-auth-page-header');
-    const toolbar = root?.querySelector('.user-auth-workbench > .user-auth-toolbar');
+  function alignPageToolbar(scope = root) {
+    const header = scope?.querySelector('.user-auth-page-header');
+    const toolbar = scope?.querySelector('.user-auth-workbench > .user-auth-toolbar');
     if (!header) return;
     header.querySelectorAll(':scope > .user-auth-toolbar').forEach((node) => node.remove());
     if (toolbar) header.appendChild(toolbar);
@@ -733,14 +745,29 @@ export function mount(context = {}) {
     if (!header.children.length) header.remove();
   }
 
+  /*
+   * 后台刷新的重绘入口（Acceptance P0 单：本页实测丢焦点与内层滚动位置）。
+   *
+   * 原来是 `current.innerHTML = mainMarkup()`，整块工作台连同表格一起重建，滚动、焦点、
+   * 选区全丢。工作台容器本身是稳定的，只有内容在变，正好交给 kit 按语义 key patch。
+   */
   function patchWorkbench() {
     const current = root?.querySelector('.user-auth-workbench');
     if (!current) { render(); return; }
+    const redrawNotice = () => {
+      root.querySelector(':scope .user-auth-shell > .user-auth-notice')?.remove();
+      const notice = noticeMarkup();
+      if (notice) current.insertAdjacentHTML('beforebegin', notice);
+    };
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(current, (target) => { target.innerHTML = mainMarkup(); })) {
+      redrawNotice();
+      alignPageToolbar();
+      ui.mountAll?.(root);
+      return;
+    }
     current.innerHTML = mainMarkup();
-    const oldNotice = root.querySelector(':scope .user-auth-shell > .user-auth-notice');
-    oldNotice?.remove();
-    const notice = noticeMarkup();
-    if (notice) current.insertAdjacentHTML('beforebegin', notice);
+    redrawNotice();
     alignPageToolbar();
     ui.mountAll?.(root);
   }

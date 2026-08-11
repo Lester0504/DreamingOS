@@ -1,4 +1,4 @@
-const VERSION = '20260802-sheet-portal-scope-01';
+const VERSION = '20260810-front-release-01';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -125,7 +125,8 @@ export function mount(context = {}) {
     } catch (error) {
       if (state.mounted) state.error = `读取失败：${firstText(error.message, '高可用性接口不可用')}`;
     } finally {
-      state.loading = false; state.refreshing = false; render();
+      state.loading = false; state.refreshing = false;
+      if (background) renderPreservingInteraction(); else render();
     }
   }
 
@@ -410,7 +411,7 @@ export function mount(context = {}) {
     const body = options.unit
       ? `<span class="shadow-field-unit-wrap">${control}<em class="shadow-field-unit">${escapeHtml(options.unit)}</em></span>`
       : control;
-    return `<label class="shadow-field ${options.wide ? 'is-wide' : ''}"><span>${label}</span>${body}${options.help ? `<small>${options.help}</small>` : ''}</label>`;
+    return `<label class="shadow-field dwrt-kit-field ${options.wide ? 'is-wide' : ''}" data-dwrt-component="field"><span>${label}</span>${body}${options.help ? `<small>${options.help}</small>` : ''}</label>`;
   }
 
   function switchField(label, name, help) {
@@ -508,11 +509,26 @@ export function mount(context = {}) {
     return statusMarkup();
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root || !state.mounted) return;
     root.hidden = false; root.className = 'route-preview route-workspace gateway-shadow-route-host';
-    root.innerHTML = `<section class="gateway-shadow-shell" data-shadow-version="${VERSION}">${toolbarMarkup()}<main class="gateway-shadow-workbench">${noticeMarkup()}${renderContent()}</main>${confirmationMarkup()}</section>`;
-    ui.mountAll?.(root); ui.scheduleAdaptiveForegroundSample?.(20, root);
+    target.innerHTML = `<section class="gateway-shadow-shell" data-shadow-version="${VERSION}">${toolbarMarkup()}<main class="gateway-shadow-workbench">${noticeMarkup()}${renderContent()}</main>${confirmationMarkup()}</section>`;
+    ui.mountAll?.(target); ui.scheduleAdaptiveForegroundSample?.(20, target);
   }
 
   function updateField(target) {

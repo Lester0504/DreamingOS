@@ -13,7 +13,8 @@ const source = fs.readFileSync(path.join(root, 'files/www/dreamingwrt/plugins/na
 const css = fs.readFileSync(path.join(root, 'files/www/dreamingwrt/static/css/quick-tools.css'), 'utf8');
 const menu = JSON.parse(fs.readFileSync(path.join(root, 'files/www/dreamingwrt/static/menu/main.json'), 'utf8'));
 
-const VERSION = '20260802-ui-batch-01';
+const VERSION = source.match(/const VERSION = '([^']+)'/)?.[1];
+if (!VERSION) throw new Error('quick-tools must declare VERSION');
 
 for (const expected of [
   `const VERSION = '${VERSION}'`,

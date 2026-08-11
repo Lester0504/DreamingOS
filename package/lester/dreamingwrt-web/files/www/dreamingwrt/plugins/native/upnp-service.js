@@ -1,4 +1,4 @@
-const VERSION = '20260802-ui-batch-01';
+const VERSION = '20260810-front-release-01';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -290,7 +290,7 @@ export function mount(context = {}) {
       state.loading = false;
       state.refreshing = false;
       state.saving = false;
-      render();
+      if (background) renderPreservingInteraction(); else render();
     }
   }
 
@@ -381,7 +381,7 @@ export function mount(context = {}) {
     const disabled = options.disabled === true;
     const attribute = options.editor ? 'data-upnp-editor-field' : 'data-upnp-field';
     const attributeValue = options.editor ? String(field).replace(/^editor\./, '') : field;
-    return `<label class="upnp-switch ${disabled ? 'is-disabled' : ''}" data-dwrt-component="switch"><input type="checkbox" ${attribute}="${escapeHtml(attributeValue)}" aria-label="${escapeHtml(options.label || field)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}></label>`;
+    return `<label class="upnp-switch dwrt-kit-switch ${disabled ? 'is-disabled' : ''}" data-dwrt-component="switch"><input type="checkbox" ${attribute}="${escapeHtml(attributeValue)}" aria-label="${escapeHtml(options.label || field)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}></label>`;
   }
 
   function switchRow(field, title, detail, options = {}) {
@@ -563,14 +563,29 @@ export function mount(context = {}) {
     return staticMarkup();
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'upnp-service-route-host');
-    root.innerHTML = `<section class="upnp-service-shell" data-upnp-version="${VERSION}">${toolbarMarkup()}${overviewMarkup()}<main class="upnp-service-workbench">${noticeMarkup()}${renderContent()}</main>${aclDrawer()}${mappingDrawer()}${deleteConfirmationMarkup()}</section>`;
-    ui.mountAll?.(root);
-    ui.scheduleAdaptiveForegroundSample?.(20, root);
+    target.innerHTML = `<section class="upnp-service-shell" data-upnp-version="${VERSION}">${toolbarMarkup()}${overviewMarkup()}<main class="upnp-service-workbench">${noticeMarkup()}${renderContent()}</main>${aclDrawer()}${mappingDrawer()}${deleteConfirmationMarkup()}</section>`;
+    ui.mountAll?.(target);
+    ui.scheduleAdaptiveForegroundSample?.(20, target);
   }
 
   function readPath(object, path) {

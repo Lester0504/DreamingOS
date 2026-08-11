@@ -6,7 +6,7 @@ export function mount(context = {}) {
   if (!root) return () => {};
   const stage = root.closest('.console-stage');
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260810-front-release-01';
   const TABS = [
     ['overview', '总览'],
     ['igmp', 'IGMP / MLD 代理'],
@@ -285,7 +285,7 @@ export function mount(context = {}) {
     state.loading = false;
     state.refreshing = false;
     state.lastUpdated = Date.now();
-    render();
+    if (refreshing) renderPreservingInteraction(); else render();
   }
 
   function configPayload() {
@@ -527,7 +527,7 @@ export function mount(context = {}) {
   }
 
   function udpxyRow(item, index) {
-    return `<tr><td><label class="dwrt-kit-switch multicast-row-switch"><input type="checkbox" data-multicast-instance="${index}" data-instance-field="enabled" ${item.enabled ? 'checked' : ''} ${!canWrite() ? 'disabled' : ''}><span>${item.enabled ? '启用' : '关闭'}</span></label></td><td><input aria-label="实例名称" type="text" value="${escapeHtml(item.name)}" data-multicast-instance="${index}" data-instance-field="name" ${!canWrite() ? 'disabled' : ''}></td><td><select aria-label="信号源接口" data-multicast-instance="${index}" data-instance-field="source_iface" ${!canWrite() ? 'disabled' : ''}>${interfaceOptions('wan', item.source_iface).map(([key, text]) => `<option value="${escapeHtml(key)}" ${key === item.source_iface ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></td><td><select aria-label="监听接口" data-multicast-instance="${index}" data-instance-field="listen_iface" ${!canWrite() ? 'disabled' : ''}>${interfaceOptions('lan', item.listen_iface).map(([key, text]) => `<option value="${escapeHtml(key)}" ${key === item.listen_iface ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></td><td><input aria-label="监听端口" type="number" min="1" max="65535" value="${item.listen_port}" data-multicast-instance="${index}" data-instance-field="listen_port" ${!canWrite() ? 'disabled' : ''}></td><td><input aria-label="订阅周期" type="number" min="1" value="${item.subscribe_interval}" data-multicast-instance="${index}" data-instance-field="subscribe_interval" ${!canWrite() ? 'disabled' : ''}></td><td><label class="dwrt-kit-switch multicast-row-switch"><input type="checkbox" data-multicast-instance="${index}" data-instance-field="external_access" ${item.external_access ? 'checked' : ''} ${!canWrite() ? 'disabled' : ''}><span>${item.external_access ? '允许' : '拒绝'}</span></label></td><td>${statusBadge(item.status === 'running' ? '运行中' : item.status === 'stopped' ? '已停止' : '未验证', item.status === 'running' ? 'success' : item.status === 'stopped' ? 'error' : 'warning')}</td><td><button class="dwrt-kit-button dwrt-kit-icon-button" type="button" data-remove-instance="${index}" aria-label="删除 ${escapeHtml(item.name)}" ${!canWrite() ? 'disabled' : ''}>${icon('trash')}</button></td></tr>`;
+    return `<tr><td><label class="dwrt-kit-switch multicast-row-switch"><input type="checkbox" data-multicast-instance="${index}" data-instance-field="enabled" ${item.enabled ? 'checked' : ''} ${!canWrite() ? 'disabled' : ''}><span>${item.enabled ? '启用' : '关闭'}</span></label></td><td><input aria-label="实例名称" type="text" value="${escapeHtml(item.name)}" data-multicast-instance="${index}" data-instance-field="name" ${!canWrite() ? 'disabled' : ''}></td><td><label class="dwrt-kit-field" data-dwrt-component="field"><select aria-label="信号源接口" data-multicast-instance="${index}" data-instance-field="source_iface" ${!canWrite() ? 'disabled' : ''}>${interfaceOptions('wan', item.source_iface).map(([key, text]) => `<option value="${escapeHtml(key)}" ${key === item.source_iface ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></label></td><td><label class="dwrt-kit-field" data-dwrt-component="field"><select aria-label="监听接口" data-multicast-instance="${index}" data-instance-field="listen_iface" ${!canWrite() ? 'disabled' : ''}>${interfaceOptions('lan', item.listen_iface).map(([key, text]) => `<option value="${escapeHtml(key)}" ${key === item.listen_iface ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></label></td><td><input aria-label="监听端口" type="number" min="1" max="65535" value="${item.listen_port}" data-multicast-instance="${index}" data-instance-field="listen_port" ${!canWrite() ? 'disabled' : ''}></td><td><input aria-label="订阅周期" type="number" min="1" value="${item.subscribe_interval}" data-multicast-instance="${index}" data-instance-field="subscribe_interval" ${!canWrite() ? 'disabled' : ''}></td><td><label class="dwrt-kit-switch multicast-row-switch"><input type="checkbox" data-multicast-instance="${index}" data-instance-field="external_access" ${item.external_access ? 'checked' : ''} ${!canWrite() ? 'disabled' : ''}><span>${item.external_access ? '允许' : '拒绝'}</span></label></td><td>${statusBadge(item.status === 'running' ? '运行中' : item.status === 'stopped' ? '已停止' : '未验证', item.status === 'running' ? 'success' : item.status === 'stopped' ? 'error' : 'warning')}</td><td><button class="dwrt-kit-button dwrt-kit-icon-button" type="button" data-remove-instance="${index}" aria-label="删除 ${escapeHtml(item.name)}" ${!canWrite() ? 'disabled' : ''}>${icon('trash')}</button></td></tr>`;
   }
 
   function udpxyPanel() {
@@ -540,7 +540,7 @@ export function mount(context = {}) {
   }
 
   function allowedRow(item, index) {
-    return `<tr><td><label class="dwrt-kit-switch multicast-row-switch"><input type="checkbox" data-multicast-allow="${index}" data-allow-field="enabled" ${item.enabled ? 'checked' : ''} ${!canWrite() ? 'disabled' : ''}><span>${item.enabled ? '启用' : '关闭'}</span></label></td><td><input aria-label="组地址" type="text" value="${escapeHtml(item.group)}" placeholder="239.0.0.0/8" data-multicast-allow="${index}" data-allow-field="group" ${!canWrite() ? 'disabled' : ''}></td><td><input aria-label="源地址" type="text" value="${escapeHtml(item.source)}" placeholder="0.0.0.0/0" data-multicast-allow="${index}" data-allow-field="source" ${!canWrite() ? 'disabled' : ''}></td><td><select aria-label="下联接口" data-multicast-allow="${index}" data-allow-field="downstream" ${!canWrite() ? 'disabled' : ''}>${interfaceOptions('lan', item.downstream).map(([key, text]) => `<option value="${escapeHtml(key)}" ${key === item.downstream ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></td><td><input aria-label="备注" type="text" value="${escapeHtml(item.remark)}" data-multicast-allow="${index}" data-allow-field="remark" ${!canWrite() ? 'disabled' : ''}></td><td><button class="dwrt-kit-button dwrt-kit-icon-button" type="button" data-remove-allow="${index}" aria-label="删除允许组 ${escapeHtml(item.group || String(index + 1))}" ${!canWrite() ? 'disabled' : ''}>${icon('trash')}</button></td></tr>`;
+    return `<tr><td><label class="dwrt-kit-switch multicast-row-switch"><input type="checkbox" data-multicast-allow="${index}" data-allow-field="enabled" ${item.enabled ? 'checked' : ''} ${!canWrite() ? 'disabled' : ''}><span>${item.enabled ? '启用' : '关闭'}</span></label></td><td><input aria-label="组地址" type="text" value="${escapeHtml(item.group)}" placeholder="239.0.0.0/8" data-multicast-allow="${index}" data-allow-field="group" ${!canWrite() ? 'disabled' : ''}></td><td><input aria-label="源地址" type="text" value="${escapeHtml(item.source)}" placeholder="0.0.0.0/0" data-multicast-allow="${index}" data-allow-field="source" ${!canWrite() ? 'disabled' : ''}></td><td><label class="dwrt-kit-field" data-dwrt-component="field"><select aria-label="下联接口" data-multicast-allow="${index}" data-allow-field="downstream" ${!canWrite() ? 'disabled' : ''}>${interfaceOptions('lan', item.downstream).map(([key, text]) => `<option value="${escapeHtml(key)}" ${key === item.downstream ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></label></td><td><input aria-label="备注" type="text" value="${escapeHtml(item.remark)}" data-multicast-allow="${index}" data-allow-field="remark" ${!canWrite() ? 'disabled' : ''}></td><td><button class="dwrt-kit-button dwrt-kit-icon-button" type="button" data-remove-allow="${index}" aria-label="删除允许组 ${escapeHtml(item.group || String(index + 1))}" ${!canWrite() ? 'disabled' : ''}>${icon('trash')}</button></td></tr>`;
   }
 
   function discoveryPanel() {
@@ -607,14 +607,29 @@ export function mount(context = {}) {
     }) : '';
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root || !state.mounted) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'multicast-service-route-host');
-    root.innerHTML = `<section class="multicast-service-shell" data-multicast-version="${VERSION}">${pageToolbar()}${overviewCardsRow()}<main class="multicast-service-main">${noticeMarkup()}${panelMarkup()}</main>${savebarMarkup()}${confirmationMarkup()}</section>`;
-    ui.mountAll?.(root);
-    ui.scheduleAdaptiveForegroundSample?.(20, root);
+    target.innerHTML = `<section class="multicast-service-shell" data-multicast-version="${VERSION}">${pageToolbar()}${overviewCardsRow()}<main class="multicast-service-main">${noticeMarkup()}${panelMarkup()}</main>${savebarMarkup()}${confirmationMarkup()}</section>`;
+    ui.mountAll?.(target);
+    ui.scheduleAdaptiveForegroundSample?.(20, target);
   }
 
   function markDirty() {

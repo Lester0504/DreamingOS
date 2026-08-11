@@ -112,6 +112,61 @@
 .appearance-field-stack .dwrt-kit-segmented { width: 100%; }
 .appearance-field-stack .dwrt-kit-segmented [data-dwrt-segment] { min-width: 0; padding-inline: 8px; }
 
+.appearance-density-presets { min-width: 0; display: flex; flex-wrap: wrap; gap: 8px; margin-top: -6px; }
+.appearance-density-presets > button[aria-pressed="true"] { border-color: var(--color-accent); color: var(--color-accent); }
+
+.appearance-contrast-notice {
+  min-width: 0;
+  margin: 0;
+  border-inline-start: 2px solid var(--color-border-control);
+  color: var(--color-text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  padding-inline-start: 10px;
+}
+
+.appearance-contrast-notice.is-large-only { border-inline-start-color: var(--color-warning); color: var(--color-text-secondary); }
+.appearance-contrast-notice.is-fail { border-inline-start-color: var(--color-danger); color: var(--color-text-secondary); }
+.appearance-contrast-notice[hidden] { display: none; }
+
+.appearance-locked-note {
+  margin: 0 0 12px;
+  border-inline-start: 2px solid var(--color-warning);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  padding-inline-start: 10px;
+}
+
+.appearance-material-readonly {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 16px;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.appearance-material-readonly > dt { color: var(--color-text-muted); }
+.appearance-material-readonly > dd { margin: 0; color: var(--color-text-secondary); }
+
+.appearance-field-stack > [data-appearance-disclosure="material-advanced"] { padding-top: 4px; border-top: 1px solid var(--color-border-subtle); }
+
+/*
+ * 嵌套折叠区（高级材质参数）要自己排版。
+ *
+ * 上面那组 trigger 样式选择器是 `.appearance-groups > .dwrt-kit-disclosure > ...`，
+ * 只作用于直接子级；嵌套这一层匹配不到，于是标题与摘要退化成同一行内联文本，
+ * 实测渲染为「高级材质参数折射、高光与边缘光」连在一起。
+ */
+[data-appearance-disclosure="material-advanced"] > [data-dwrt-disclosure-trigger] { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+[data-appearance-disclosure="material-advanced"] > [data-dwrt-disclosure-trigger] > span { min-width: 0; display: grid; gap: 3px; text-align: start; }
+[data-appearance-disclosure="material-advanced"] > [data-dwrt-disclosure-trigger] strong { color: var(--color-text-primary); font-size: 13px; line-height: 1.4; }
+[data-appearance-disclosure="material-advanced"] > [data-dwrt-disclosure-trigger] small { color: var(--color-text-muted); font-size: 12px; font-weight: 500; line-height: 1.4; }
+[data-appearance-disclosure="material-advanced"] > [data-dwrt-disclosure-trigger] svg { width: 18px; height: 18px; flex: 0 0 18px; transition: transform 120ms ease; }
+[data-appearance-disclosure="material-advanced"][data-dwrt-open="true"] > [data-dwrt-disclosure-trigger] svg { transform: rotate(180deg); }
+
 .appearance-preview {
   position: sticky;
   top: 0;
@@ -140,6 +195,14 @@
 
 .appearance-preview-stage > img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 
+/*
+ * 预览卡只**引用**共享材质令牌，不新增档位、不定义私有玻璃参数。
+ * backdrop 用 --dwrt-glass-backdrop（= blur(--dwrt-glass-base-blur) saturate(--dwrt-glass-saturation)），
+ * 这两个变量由外观页设置经 menu-shell 写到根元素，所以拖模糊/饱和度时这张卡实时跟随。
+ *
+ * 不挂 .dwrt-kit-glass-surface / data-dwrt-surface="stable-glass"：那两个选择器会让
+ * 宿主把这张卡当页面级采样目标，而它浮在预览台自己的图上，不是桌面壁纸。
+ */
 .appearance-preview-glass {
   position: relative;
   z-index: 1;
@@ -150,12 +213,13 @@
   border: 1px solid var(--dwrt-glass-edge);
   border-radius: 8px;
   color: var(--color-text-primary);
-  background:
-    linear-gradient(rgb(var(--dwrt-glass-neutral-color) / var(--appearance-preview-density)), rgb(var(--dwrt-glass-neutral-color) / var(--appearance-preview-density))),
-    var(--dwrt-glass-surface);
+  background: var(--dwrt-glass-surface);
   box-shadow: var(--dwrt-glass-shadow-raised);
+  backdrop-filter: var(--dwrt-glass-backdrop);
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop);
   padding: 22px;
 }
+
 
 .appearance-preview-kicker { color: var(--appearance-preview-accent); font-size: 12px; font-weight: 800; }
 .appearance-preview-glass > strong { color: var(--color-text-primary); font-size: 20px; line-height: 1.3; }

@@ -316,6 +316,14 @@
 .wifi-band-pill.is-5g { color: #286fc0; background: color-mix(in srgb, #3c91ee 11%, transparent); }
 .wifi-band-pill.is-6g { color: #9d6112; background: color-mix(in srgb, #eeb34b 13%, transparent); }
 
+/* 后端没给频段时的占位。刻意不做成药丸徽章 —— 它要看起来像「没有数据」，
+   而不是像又一个频段标签，否则等于换个样子继续暗示一个不存在的事实。 */
+.wifi-band-unknown {
+  color: var(--app-text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .wifi-table-empty,
 .airview-empty {
   display: flex;
@@ -874,21 +882,15 @@
 }
 
 .wireless-status-route-host .airview-view-tabs {
-  width: 100%;
+  width: fit-content;
+  max-width: 100%;
   min-width: 0;
-  flex: 1 1 auto;
-  background: transparent;
-  box-shadow: none;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
+  flex: 0 1 auto;
 }
 
-.airview-view-tabs.topology-panel-tabs { flex: 0 1 auto; height: 40px; padding: 2px; border: 0; border-radius: 12px; background: color-mix(in srgb, currentColor 6%, transparent); }
-.airview-view-tabs .topology-panel-tab { flex: 1 1 0; width: auto; height: 36px; padding: 0 8px; border-radius: 10px; }
-.airview-view-tabs .topology-panel-tab[aria-selected="true"] { flex-grow: 1.7; width: auto; min-width: 88px; }
-.airview-view-tabs .topology-panel-tab span { display: none; white-space: nowrap; }
-.airview-view-tabs .topology-panel-tab[aria-selected="true"] span { display: inline; }
-.airview-view-tabs .topology-panel-tab svg { width: 20px; height: 20px; fill: currentColor; stroke: none; }
+.airview-view-tabs .airview-view-tab { gap: 8px; }
+.airview-view-tabs .airview-view-tab span { display: inline; white-space: nowrap; }
+.airview-view-tabs .airview-view-tab svg { width: 20px; height: 20px; fill: currentColor; stroke: none; }
 
 .airview-layout {
   display: grid;
@@ -1236,19 +1238,62 @@
 
 .airview-empty { height: 100%; min-height: 360px; }
 .airview-radio-table { width: 100%; }
-.airview-radio-table table { min-width: 980px; }
+/* 10 列自然宽实测 981px，而侧栏占掉约 300px 后 1440 视口只剩 823px 可用，
+   于是最后一列「平均干扰」默认落在滚动区之外，看起来像被裁掉
+   （design.md：右缘裁切算布局缺陷）。这里按列压缩把缺口补平：
+   名称列去掉冗余的 220px 下限、量化型列收窄内边距，10 列即可排进 823px。
+   min-width 仍然保留，只是降到压缩后的自然宽，宽表在更窄的容器里照旧横向滚动。 */
+.airview-radio-table table { min-width: 760px; }
 .airview-radio-table td small { display: block; margin-top: 2px; color: var(--wifi-muted); font-size: 10px; }
 .airview-radio-table th,
 .airview-radio-table td { white-space: nowrap; }
+/* 量化型列的文案都很短（频段/信道/宽度/功率/客户端/干扰），16px 的通用内边距
+   在这里是纯浪费。收到 10px 一列省 12px，六列合计 72px。 */
+.airview-radio-table th:nth-child(n + 3),
+.airview-radio-table td:nth-child(n + 3) { padding-inline: 10px; }
+/* 缺值单元格附一行后端 reason。整表是 nowrap，所以这里单独放开换行并限宽，
+   否则「未采集 24 小时历史」这类文案会把列撑开、把右侧列推出滚动区。 */
+.airview-radio-table .airview-cell-reason { display: inline-block; max-width: 132px; white-space: normal; vertical-align: top; line-height: 1.3; }
+.airview-radio-table .airview-cell-reason small { display: block; margin-top: 2px; color: var(--wifi-muted); font-size: 10px; overflow-wrap: anywhere; }
 .airview-radio-table .airview-select-column { width: 38px; min-width: 38px; padding-inline: 10px; text-align: center; }
 .airview-radio-table .airview-select-column input { width: 16px; height: 16px; margin: 0; accent-color: var(--wifi-accent); }
+/* 1440 起 10 列排得下，但更窄的容器仍需横向滚动，而浮层滚动条会淡出、
+   实测也不占高度（offsetHeight - clientHeight = 0），用户看不出右边还有列。
+   这里在卡片右缘画一道渐变，只在还能继续右滚时出现：JS 侧滚动时切换
+   data-scroll-end，滚到底就淡出，避免在已经到底时还暗示有内容。
+   遮罩画在卡片自身的 ::after 上，只占右缘 40px，不碰共享玻璃材质的中心
+   （design.md 材质契约：路由 CSS 可保留几何与层次，不另画中心）。
+
+   content 与 background 必须带 !important：卡片挂着共享玻璃类，上游有同特异性
+   且更晚的规则把这两个属性压成 none（实测本规则进了 CSSOM、选择器也命中，
+   但计算值仍是 content:none / background:none；换成 !important 后立刻生效）。
+   opacity 与 width 不受影响，所以只在这两个属性上加。 */
+.airview-radio-table[data-scroll-x="true"]::after {
+  content: "" !important;
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  bottom: 1px;
+  z-index: 2;
+  width: 40px;
+  pointer-events: none;
+  border-start-end-radius: inherit;
+  border-end-end-radius: inherit;
+  background: linear-gradient(to right, transparent, rgb(6 10 18 / 42%)) !important;
+  opacity: 1;
+  transition: opacity .18s ease;
+}
+.airview-radio-table[data-scroll-x="end"]::after { opacity: 0; }
 .airview-radio-table tbody tr[data-airview-radio-row] { cursor: pointer; }
 .airview-radio-table tbody tr[data-airview-radio-row].is-selected td { background: color-mix(in srgb, var(--wifi-accent) 12%, transparent); }
 .airview-radio-table tbody tr[data-airview-radio-row]:focus-visible { outline: 2px solid color-mix(in srgb, var(--wifi-accent) 72%, transparent); outline-offset: -2px; }
-.airview-ap-cell { display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: center; gap: 9px; width: max-content; min-width: 220px; max-width: 300px; }
+/* 名称列原来有 220px 下限，但标签本身已被 JS 的 LABEL_MAX_CHARS(22) 截断并加省略号，
+   下限只是把短名字的行也撑到 220px，是 10 列排不下的最大单项。改为按内容自适应，
+   上限仍然保留以防长型号把右侧列顶出滚动区。 */
+.airview-ap-cell { display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: center; gap: 9px; width: max-content; min-width: 0; max-width: 260px; }
 .airview-ap-cell > span:last-child { display: block; min-width: 0; }
 .airview-ap-cell strong,
-.airview-ap-cell small { display: block; max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.airview-ap-cell small { display: block; max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .airview-meter {
   position: relative;
@@ -1930,8 +1975,7 @@
   .wifi-page-toolbar,
   .airview-top-actions { width: 100%; }
   .wireless-status-route-host .airview-top-actions { width: auto; margin-left: auto; }
-  .airview-view-tabs .topology-panel-tab { width: auto; padding: 0 8px; }
-  .airview-view-tabs .topology-panel-tab[aria-selected="true"] { min-width: 76px; }
+  .airview-view-tabs .airview-view-tab { min-width: 116px; padding-inline: 18px; }
   .wifi-search { margin-right: auto; }
   .wifi-settings-list.two-columns,
   .wifi-extension-grid,

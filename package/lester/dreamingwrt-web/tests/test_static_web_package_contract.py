@@ -58,20 +58,36 @@ authentication = next(item for item in menu["items"] if item.get("id") == "user-
 assert authentication["label"] == "认证与管控"
 assert authentication["override_runtime_label"] is True
 authentication_children = {item.get("id"): item for item in authentication["children"]}
-for child_id in (
-    "authentication-web-access-control",
-    "authentication-app-filter",
-    "authentication-client-network-control",
-):
-    assert authentication_children[child_id]["availability"] == "unavailable"
-    assert authentication_children[child_id]["capability"]
-    assert authentication_children[child_id]["unavailable_reason"]
+# 认证与管控下每个子项都必须声明 capability；仍为占位的还必须给出不可用原因。
+for child in authentication["children"]:
+    assert child.get("capability") or child.get("id") in {"authentication-web", "authentication-online-users", "authentication-accounts", "authentication-delegated", "authentication-notifications"}, child.get("id")
+    if child.get("availability") == "unavailable":
+        assert child.get("unavailable_reason"), child.get("id")
+# 终端联网控制已实现：MAC ACL 的真实数据面早就在位（config.db network_control_mac_rule
+# + nftables），写入走 policy-table 的 acl_type=mac 且需显式 apply=true。30.1 实测
+# capabilities.acl_write=true、acl_write_supported_types 含 mac，preview 回 can_apply=true，
+# 因此该条目不再是 unavailable 占位。后端确实不支持的白名单/生效时段/到期时间三项
+# 由页面如实说明原因，不做假控件。
+client_network_control = authentication_children["authentication-client-network-control"]
+assert client_network_control["availability"] == "available"
+assert client_network_control["frontend_owned"] is True
+assert client_network_control["module"] == "native/client-network-control.js"
+assert client_network_control["style"] == "/static/css/user-authentication.css"
+assert (WWW / "plugins/native/client-network-control.js").is_file()
 client_speed_limit = authentication_children["authentication-client-speed-limit"]
 assert client_speed_limit["availability"] == "available"
 assert client_speed_limit["frontend_owned"] is True
 assert client_speed_limit["module"] == "native/client-speed-limit.js"
 assert client_speed_limit["style"] == "/static/css/user-authentication.css"
 assert (WWW / "plugins/native/client-speed-limit.js").is_file()
+# APP 过滤已实现：aegis/app-blocks 三条路由与 ubus 方法在 jmxd 中就绪，
+# 30.1 实测 GET 返回 200 且 capabilities.supported 为真，因此该条目不再是 unavailable 占位。
+app_filter = authentication_children["authentication-app-filter"]
+assert app_filter["availability"] == "available"
+assert app_filter["frontend_owned"] is True
+assert app_filter["module"] == "native/app-filter.js"
+assert app_filter["style"] == "/static/css/user-authentication.css"
+assert (WWW / "plugins/native/app-filter.js").is_file()
 network_children = {item.get("id"): item for item in network["children"]}
 assert network_children["bulk-ip"]["label"] == "IP 地址管理"
 assert network_children["bulk-ip"]["availability"] == "available"
@@ -112,17 +128,19 @@ assert (WWW / "static/css/system-power.css").is_file()
 terminal = next(item for item in system["children"] if item.get("id") == "system-terminal")
 assert terminal["path"] == "/app/#/system/terminal"
 assert terminal["module"] == "native/system-terminal.js"
-assert terminal["module_version"] == "20260722-overlay-01"
+_terminal_version = re.search(r"const VERSION = '([^']+)'", (WWW / "plugins/native/system-terminal.js").read_text(encoding="utf-8")).group(1)
+assert terminal["module_version"] == _terminal_version
 assert terminal["style"] == "/static/css/system-terminal.css"
 assert terminal["icon"] == "system_terminal"
 assert terminal["frontend_owned"] is True
 assert (WWW / "plugins/native/system-terminal.js").is_file()
 assert (WWW / "static/css/system-terminal.css").is_file()
 logs = next(item for item in menu["items"] if item.get("id") == "log-center")
+_log_version = re.search(r"const VERSION = '([^']+)'", (WWW / "static/js/log-center.js").read_text(encoding="utf-8")).group(1)
 assert logs["module"] == "native/log-center.js"
-assert logs["module_version"] == "20260802-ui-batch-01"
+assert logs["module_version"] == _log_version
 assert logs["style"] == "/static/css/log-center.css"
-assert logs["style_version"] == "20260802-ui-batch-01"
+assert logs["style_version"] == _log_version
 assert logs["frontend_owned"] is True
 assert (WWW / "plugins/native/log-center.js").is_file()
 assert (WWW / "static/js/log-center.js").is_file()
@@ -297,8 +315,24 @@ _shell_key = re.search(r"const VERSION = '([^']+)'", prewarm)
 assert _shell_key, "shell-prewarm.js missing const VERSION"
 _shell_key = _shell_key.group(1)
 assert f"/static/js/menu-shell.js?v={_shell_key}" in prewarm
-assert "/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260730-safari-glass-lite-06" in prewarm
-assert '/static/ui-kit/dwrt-sampled-liquid-glass.js?v=20260730-safari-glass-lite-06' in app_html
+# UI Kit 的 JS/CSS 也是 app 入口与预热脚本各一处。四个引用点必须成对同键，
+# 否则预热命中旧缓存、页面再拉一份新资源，或直接继续运行旧 Kit。
+for _kit_asset in ("dwrt-ui-kit.css", "dwrt-ui-kit.js"):
+    _kit_re = re.compile(rf"/static/ui-kit/{re.escape(_kit_asset)}\?v=([^'\"]+)")
+    _kit_prewarm = _kit_re.findall(prewarm)
+    _kit_app = _kit_re.findall(app_html)
+    assert len(_kit_prewarm) == 1, f"shell-prewarm.js must reference {_kit_asset} once"
+    assert len(_kit_app) == 1, f"app/index.html must reference {_kit_asset} once"
+    assert _kit_prewarm == _kit_app, (
+        f"{_kit_asset} cache key drift: app={_kit_app}, prewarm={_kit_prewarm}"
+    )
+# 玻璃键同样每次改动都会 bump，断言"预热与真实加载指向同一个键"而不是某个字面量（design.md:1028-1029）。
+_glass_key = re.search(r"/static/ui-kit/dwrt-sampled-liquid-glass\.js\?v=([^'\"]+)", prewarm)
+assert _glass_key, "shell-prewarm.js missing sampled-liquid-glass.js cache key"
+_glass_key = _glass_key.group(1)
+assert f"/static/ui-kit/dwrt-sampled-liquid-glass.js?v={_glass_key}" in app_html
+assert f"/static/ui-kit/dwrt-sampled-liquid-glass.css?v={_glass_key}" in prewarm
+assert f"/static/ui-kit/dwrt-sampled-liquid-glass.css?v={_glass_key}" in app_html
 assert f'/static/js/menu-shell.js?v={_shell_key}' in app_html
 assert f'/static/js/shell-prewarm.js?v={_shell_key}' in app_html
 assert '/static/js/device-images.js?v=20260723-airview-radio-sheet-01' in app_html

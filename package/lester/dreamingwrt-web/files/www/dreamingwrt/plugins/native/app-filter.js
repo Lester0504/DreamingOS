@@ -25,7 +25,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260804-app-filter-01';
+  const VERSION = '20260810-front-release-01';
   const stage = root?.closest('.console-stage');
   /* 后端 weekdays 用 0=周日..6=周六，展示按中国习惯从周一起排。 */
   const WEEKDAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
@@ -504,7 +504,7 @@ export function mount(context = {}) {
     return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-app-filter-close aria-label="关闭 APP 过滤编辑"></button><aside class="user-auth-drawer app-filter-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" aria-label="${editing ? '编辑 APP 过滤规则' : '新建 APP 过滤规则'}">
       <header class="dwrt-kit-sheet-header"><div><span>APP FILTER</span><strong>${editing ? '编辑 APP 过滤规则' : '新建 APP 过滤规则'}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-app-filter-close aria-label="关闭">×</button></header>
       <div class="dwrt-kit-sheet-body user-auth-drawer-body">
-        <div class="user-auth-drawer-section"><strong>规则状态</strong><label class="user-auth-setting-row"><span><strong>启用规则</strong><small>保存后由 rulesd 下发内核，运行状态按回读结果显示</small></span><span class="user-auth-switch"><input type="checkbox" data-app-filter-field="enabled" ${draft.enabled ? 'checked' : ''}><i></i></span></label></div>
+        <div class="user-auth-drawer-section"><strong>规则状态</strong><label class="user-auth-setting-row"><span><strong>启用规则</strong><small>保存后由 rulesd 下发内核，运行状态按回读结果显示</small></span><span class="dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-app-filter-field="enabled" ${draft.enabled ? 'checked' : ''}></span></label></div>
         <div class="user-auth-form-grid"><label class="user-auth-field is-wide" data-dwrt-component="field"><span>规则名称</span><input type="text" maxlength="64" data-app-filter-field="name" value="${escapeHtml(draft.name)}" placeholder="例如 孩子设备禁用短视频"></label>${deviceFieldMarkup(draft)}</div>
         <div class="app-filter-drawer-section"><div class="app-filter-drawer-section-head"><strong>选择要拉黑的应用</strong><small>只列出特征库里可下规则的应用；协议与端口兜底值（https、tcp/11881 这类）不是应用，不在此列。</small></div>
           <label class="app-filter-inline-search" data-dwrt-component="field">${icon('search')}<input type="search" data-app-filter-app-search value="${escapeHtml(state.appQuery)}" placeholder="搜索应用名称、分类或特征族" aria-label="搜索应用"></label>
@@ -559,27 +559,13 @@ export function mount(context = {}) {
     const markup = `${drawerMarkup()}${confirmationMarkup()}`;
     if (host.dataset.appFilterOverlayMarkup === markup) return;
     host.dataset.appFilterOverlayMarkup = markup;
-    releasePortaledOverlays();
+    /*
+     * 抽屉已被 kit 搬到 body 级 portal，清空本容器关不掉它。kit 的 `unmount(host)` 现在
+     * 按 portalHome 反查回收传送出去的抽屉与遮罩，本页不再自备 portal 清理代码。
+     */
+    window.DWRT_UI_KIT?.unmount?.(host);
     host.innerHTML = markup;
     ui.mountAll?.(host);
-  }
-
-  function releasePortaledOverlays() {
-    const portal = document.getElementById('dwrtKitSheetPortal');
-    if (!portal) return;
-    Array.from(portal.children).forEach((node) => {
-      if (!node.classList?.contains('dwrt-kit-sheet')) return;
-      if (!node.classList.contains('app-filter-drawer')) return;
-      const overlay = node.previousElementSibling?.classList?.contains('dwrt-kit-sheet-overlay')
-        ? node.previousElementSibling
-        : null;
-      const shim = document.createElement('div');
-      portal.insertBefore(shim, node);
-      shim.appendChild(node);
-      ui.unmount?.(shim);
-      shim.remove();
-      overlay?.remove();
-    });
   }
 
   function render() {
@@ -622,9 +608,32 @@ export function mount(context = {}) {
     else workbench.insertBefore(next, workbench.firstChild);
   }
 
+  /*
+   * 表格重画走 kit 的共享保状态入口（Acceptance P0 单）。
+   *
+   * 原来是 `current.replaceWith(...)` 再把 scrollTop 复位：节点换了身份，滚动靠事后补救，
+   * 焦点与选区直接丢。交给 kit 按语义 key patch 之后三样都留着。
+   */
   function patchTable() {
     const current = root?.querySelector('[data-app-filter-table]');
     if (!current) { renderShell(); return; }
+    /*
+     * 直接在表格卡上 patch。tableMarkup() 返回的就是这张卡，所以渲染进 staging 之后
+     * 取它的首个元素，把卡的属性与内容一起交给 morph 配对。
+     *
+     * 不要在父容器上做：`.app-filter-workbench` 里还挂着提示条、模式块与能力说明，
+     * 只写 tableMarkup() 会把那些兄弟节点当成"新树里没有"而删掉。
+     */
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(current, (target) => {
+      const template = document.createElement('template');
+      template.innerHTML = tableMarkup();
+      const fresh = template.content.firstElementChild;
+      if (fresh) {
+        Array.from(fresh.attributes).forEach((attribute) => target.setAttribute(attribute.name, attribute.value));
+        target.innerHTML = fresh.innerHTML;
+      }
+    })) return;
     const scroll = current.querySelector('.dwrt-kit-table-scroll');
     const position = { top: scroll?.scrollTop || 0, left: scroll?.scrollLeft || 0 };
     const template = document.createElement('template');
@@ -1113,7 +1122,8 @@ export function mount(context = {}) {
       root?.removeEventListener('input', onInput);
       root?.removeEventListener('change', onChange);
       document.removeEventListener('keydown', onKeyDown);
-      releasePortaledOverlays();
+      /* 路由离开：让 kit 回收本页传送到 portal 的抽屉与遮罩，别把遮罩留给下一页 */
+      window.DWRT_UI_KIT?.unmount?.(root);
       root?.replaceChildren();
       root?.classList.remove('route-workspace', 'user-authentication-route-host', 'app-filter-route-host');
       stage?.classList.remove('is-user-authentication');

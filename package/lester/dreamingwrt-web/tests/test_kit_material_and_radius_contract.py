@@ -22,7 +22,25 @@ DESIGN = ROOT / 'DESIGN.md'
 
 # 允许保留字面量的半径：药丸形（DESIGN.md 明确列出），以及由元素尺寸反推的
 # 极小半径（滑块轨道 15px 高、游标 5px 宽，套 8px 会糊成一团）。
-ALLOWED_LITERALS = {'999', '99', '9999', '3', '4', '5'}
+# 1px / 2px 是勾号与分隔条一类的装饰细节，6px 用在 18px 见方的复选框和
+# 行内 `code` 上——这些尺寸下 8px 已经接近半个元素，不属于漂移。
+ALLOWED_LITERALS = {'999', '99', '9999', '1', '2', '3', '4', '5', '6'}
+
+# 第一节点名的漂移档位。收敛后这些值不得再出现在已处理的文件里。
+DRIFT_STEPS = ('7', '9', '10', '11', '13', '14', '15', '16', '20', '22', '26', '30')
+
+# 已完成收敛的文件。每收一个就加进来，让契约随进度一起长。
+CONVERGED_CSS = (
+    'client-details.css',
+    'user-authentication.css',
+    'system-settings.css',
+)
+
+# 拟物插画的例外：模拟真实设备外框的圆角不套 UI token，
+# 42px 外框配 24px 屏幕是机身比例，换成 --app-radius-card 两者会一样圆。
+PHYSICAL_EXCEPTIONS = {
+    'user-authentication.css': {'42', '26', '24', '15'},
+}
 
 
 def strip_comments(text):
@@ -47,6 +65,44 @@ def test_radius_tokens_still_defined_as_four_steps():
     for token in ('--app-radius-card', '--app-radius-panel',
                   '--app-radius-control', '--app-radius-compact'):
         assert token in design, f'DESIGN.md 缺少 {token}'
+
+
+def test_converged_files_have_no_drifted_radii():
+    """已收敛的文件里不得再出现四档之外的圆角。
+
+    这条随进度增长：每收一个文件就加进 CONVERGED_CSS，
+    既锁住已完成的成果，也避免把还没处理的文件当成回归报出来。
+    """
+    for name in CONVERGED_CSS:
+        css = strip_comments((WWW / 'static' / 'css' / name).read_text(encoding='utf-8'))
+        allowed = ALLOWED_LITERALS | PHYSICAL_EXCEPTIONS.get(name, set())
+        literals = re.findall(r'border-radius:\s*(\d+)px', css)
+        stray = sorted({v for v in literals if v not in allowed}, key=int)
+        assert not stray, f'{name} 仍有非 token 圆角：{stray}px'
+
+        for value in DRIFT_STEPS:
+            if value in PHYSICAL_EXCEPTIONS.get(name, set()):
+                continue
+            assert f'border-radius: {value}px' not in css, f'{name} 里 {value}px 圆角仍然存在'
+
+
+def test_pill_shapes_are_written_as_pills_not_half_height():
+    """药丸形要写 999px，不要写「刚好等于半高」的字面量。
+
+    iOS 开关轨道高 28px、圆角写 15px，内存条高 10px、圆角写 6px —— 两者的意图都是
+    「完全圆头」，但写成半高值时读者无从判断，改了高度也不会跟着变。写 999px 之后
+    意图自明，且高度再变都还是药丸。
+    """
+    kit_css = strip_comments((WWW / 'static' / 'ui-kit' / 'dwrt-ui-kit.css').read_text(encoding='utf-8'))
+    system_css = strip_comments((WWW / 'static' / 'css' / 'system-settings.css').read_text(encoding='utf-8'))
+    for css, selector in ((kit_css, '.dwrt-kit-switch input[type="checkbox"]::before'), (system_css, '.system-mem-preview')):
+        block = re.search(re.escape(selector) + r'\s*\{([^}]*)\}', css)
+        assert block, f'找不到 {selector}'
+        radius = re.search(r'border-radius:\s*([^;]+)', block.group(1))
+        assert radius, f'{selector} 没有 border-radius'
+        assert '999' in radius.group(1), (
+            f'{selector} 的药丸形要写 999px，当前是 {radius.group(1).strip()}'
+        )
 
 
 def test_client_detail_cards_take_material_from_kit():

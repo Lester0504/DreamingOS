@@ -1,4 +1,4 @@
-const VERSION = '20260805-storage-layout-toolbar-03';
+const VERSION = '20260810-front-release-01';
 const PARTITION_ENDPOINT = '/api/v1/storage/partitions';
 const OVERVIEW_ENDPOINT = '/api/v1/storage/overview?range=1h';
 const MOUNTS_ENDPOINT = '/api/v1/system/mounts';
@@ -318,7 +318,7 @@ export function mount(context = {}) {
       if (!state.mounted || seq !== state.seq) return;
       state.loading = false;
       state.refreshing = false;
-      render();
+      if (background) renderPreservingInteraction(); else render();
     }
   }
 
@@ -552,14 +552,29 @@ export function mount(context = {}) {
     }) || '';
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!state.mounted) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'storage-partitions-route-host');
     stage?.classList.add('is-storage-partitions');
-    root.innerHTML = `<section class="storage-partitions-shell">${noticeMarkup()}<main class="storage-partitions-workbench">${workbenchMarkup()}</main>${sheetMarkup()}${confirmationMarkup()}</section>`;
-    ui.mountAll?.(root);
+    target.innerHTML = `<section class="storage-partitions-shell">${noticeMarkup()}<main class="storage-partitions-workbench">${workbenchMarkup()}</main>${sheetMarkup()}${confirmationMarkup()}</section>`;
+    ui.mountAll?.(target);
   }
 
   /* 删掉手动刷新按钮的前提是页面自己会更新，所以这里补一条可见性受控的轮询。 */

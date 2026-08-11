@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260804-speed-limit-two-tabs-02';
+  const VERSION = '20260810-front-release-01';
   const stage = root?.closest('.console-stage');
   const WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日'];
 
@@ -266,7 +266,10 @@ export function mount(context = {}) {
    */
   function tabsMarkup() {
     const tabs = [['mac', 'MAC 限速'], ['ip', 'IP 限速']];
-    return `<div class="user-auth-segmented client-speed-tabs">${tabs.map(([id, label]) => `<button type="button" data-client-speed-tab="${id}" class="${state.tab === id ? 'is-active' : ''}">${escapeHtml(label)}</button>`).join('')}</div>`;
+    return `<nav class="dwrt-kit-tabs dwrt-kit-page-tabs client-speed-tabs" data-dwrt-component="tabs" role="tablist" aria-label="终端限速">`
+      + `<span class="dwrt-kit-tab-pill" aria-hidden="true"></span>`
+      + `${tabs.map(([id, label]) => `<button class="dwrt-kit-tab ${state.tab === id ? 'is-active' : ''}" type="button" role="tab" aria-selected="${state.tab === id ? 'true' : 'false'}" data-value="${id}" data-client-speed-tab="${id}">${escapeHtml(label)}</button>`).join('')}`
+      + `</nav>`;
   }
 
   /*
@@ -275,19 +278,22 @@ export function mount(context = {}) {
    * 后端现状（2026-08-04 实测 + 源码）：`client_control_rules` 没有 IP 列，
    * 写入路径 `jmx_app_api.c:13663` 又要求 `control_type == 'IP限速'` 才放行 ——
    * 也就是说那个名字已经被 MAC 维度占用了。真做 IP 限速需要后端先加
-   * `ip_addr` + `target_kind`（或另建表）并给出数据面，见交接单
-   * `Acceptance-to-Front-Backend-client-speed-limit-two-tabs-ip-and-mac.md`。
+   * `ip_addr` + `target_kind`（或另建表）并给出数据面。路由缺口已单独提给后端：
+   * `Acceptance-to-Backend-network-control-no-http-route-ip-and-line-rate-limit.md`。
    *
    * 在那之前放一个表单只有两种下场：把 IP 写进 `mac` 列污染数据，
-   * 或者做个存不进去的空壳。两者都比如实说明更糟。
+   * 或者做个存不进去的空壳。所以这里只放中性的「即将开放」说明。
+   *
+   * 文案约束（用户明确要求，2026-08-08）：**不要论证 MAC 维度比 IP 更好**，
+   * 也不要写「填了也无处保存」这类内部实现口径 —— 客户不接受这种答复。
    */
   function ipPlaceholderMarkup() {
     return `<section class="user-auth-main-surface client-speed-ip-card dwrt-kit-glass-surface">
       <div class="client-speed-ip-body">
         ${icon('info')}
-        <strong>IP 限速尚未开放</strong>
-        <p>当前固件的终端限速数据面按 <b>终端 MAC</b> 精确匹配（<code>client_mac_on_lan_bridge</code>），限速规则表也只保存 MAC，没有 IP 字段。按 IP 网段或单个 IP 限速需要后端先提供对应的数据面与存储，因此这里不提供表单 —— 填了也无处保存。</p>
-        <p class="client-speed-ip-hint">需要限制某台终端时，请在「MAC 限速」中按终端添加规则；同一台设备换 IP 后规则依然生效，这是 MAC 维度相对 IP 的优势。</p>
+        <strong>IP 限速即将开放</strong>
+        <p>按 IP 或网段限速的能力正在开发中，当前固件版本尚未开放这个维度，因此这里暂不提供表单。</p>
+        <p class="client-speed-ip-hint">在此期间，可以在「MAC 限速」中按终端添加限速规则。</p>
       </div>
     </section>`;
   }
@@ -341,7 +347,7 @@ export function mount(context = {}) {
     const editing = Boolean(editor.id);
     const selectedDays = new Set(editor.days || WEEKDAYS);
     const showDays = !['always', 'all', 'daily'].includes(String(editor.schedule_mode || '').toLowerCase());
-    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-client-speed-close aria-label="关闭终端限速编辑"></button><aside class="user-auth-drawer client-speed-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" aria-label="${editing ? '编辑终端限速' : '新建终端限速'}"><header class="dwrt-kit-sheet-header"><div><span>CLIENT RATE LIMIT</span><strong>${editing ? '编辑终端限速' : '新建终端限速'}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-client-speed-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body user-auth-drawer-body"><div class="user-auth-drawer-section"><strong>规则状态</strong><label class="user-auth-setting-row"><span><strong>启用规则</strong><small>保存后由终端管控调度器应用并回读运行状态</small></span><span class="user-auth-switch"><input type="checkbox" data-client-speed-field="enabled" ${editor.enabled !== false ? 'checked' : ''}><i></i></span></label></div><div class="user-auth-form-grid">${editorField('终端', 'mac', editor.mac, { type: 'select', options: clientOptions(), disabled: editing, wide: true })}${editorField('规则名称', 'name', editor.name, { wide: true })}${editorField('计划模式', 'schedule_mode', editor.schedule_mode, { type: 'select', options: [['always', '始终'], ['daily', '每天'], ['week', '按周循环'], ['range', '指定星期与时间段']] })}${editorField('协议', 'protocol', editor.protocol, { type: 'select', options: [['任意', '任意'], ['TCP', 'TCP'], ['UDP', 'UDP'], ['ICMP', 'ICMP'], ['ICMPv6', 'ICMPv6']] })}</div>${showDays ? `<div class="client-speed-weekdays"><span>生效星期</span><div>${WEEKDAYS.map((day) => `<label class="${selectedDays.has(day) ? 'is-active' : ''}"><input type="checkbox" data-client-speed-day="${day}" ${selectedDays.has(day) ? 'checked' : ''}>${day}</label>`).join('')}</div></div>` : ''}<div class="user-auth-form-grid">${editor.schedule_mode !== 'always' ? `${editorField('开始时间', 'start_time', editor.start_time, { type: 'time' })}${editorField('结束时间', 'end_time', editor.end_time, { type: 'time' })}` : ''}${editorField('上行限速', 'up_limit', editor.up_limit, { type: 'number', min: 0, help: '填 0 表示不限速（后端回读 zero_limit_means_unlimited）' })}${editorField('上行单位', 'up_unit', editor.up_unit, { type: 'select', options: [['KB/s', 'KB/s'], ['MB/s', 'MB/s'], ['Kbps', 'Kbps'], ['Mbps', 'Mbps']] })}${editorField('下行限速', 'down_limit', editor.down_limit, { type: 'number', min: 0, help: '填 0 表示不限速（后端回读 zero_limit_means_unlimited）' })}${editorField('下行单位', 'down_unit', editor.down_unit, { type: 'select', options: [['KB/s', 'KB/s'], ['MB/s', 'MB/s'], ['Kbps', 'Kbps'], ['Mbps', 'Mbps']] })}${editorField('备注', 'note', editor.note, { type: 'textarea', wide: true })}</div><div class="user-auth-capability">运行范围为终端 MAC + 可选 L4 协议，当前统一作用于 LAN 桥接流量。线路维度、共享限速和应用级管控没有数据面合同，因此本页不提供这些选项。</div>${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer user-auth-drawer-footer"><span></span><div><button class="policy-secondary" type="button" data-client-speed-close>取消</button><button class="policy-primary" type="button" data-client-speed-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存规则'}</button></div></footer></aside>`;
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-client-speed-close aria-label="关闭终端限速编辑"></button><aside class="user-auth-drawer client-speed-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" aria-label="${editing ? '编辑终端限速' : '新建终端限速'}"><header class="dwrt-kit-sheet-header"><div><span>CLIENT RATE LIMIT</span><strong>${editing ? '编辑终端限速' : '新建终端限速'}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-client-speed-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body user-auth-drawer-body"><div class="user-auth-drawer-section"><strong>规则状态</strong><label class="user-auth-setting-row"><span><strong>启用规则</strong><small>保存后由终端管控调度器应用并回读运行状态</small></span><span class="dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-client-speed-field="enabled" ${editor.enabled !== false ? 'checked' : ''}></span></label></div><div class="user-auth-form-grid">${editorField('终端', 'mac', editor.mac, { type: 'select', options: clientOptions(), disabled: editing, wide: true })}${editorField('规则名称', 'name', editor.name, { wide: true })}${editorField('计划模式', 'schedule_mode', editor.schedule_mode, { type: 'select', options: [['always', '始终'], ['daily', '每天'], ['week', '按周循环'], ['range', '指定星期与时间段']] })}${editorField('协议', 'protocol', editor.protocol, { type: 'select', options: [['任意', '任意'], ['TCP', 'TCP'], ['UDP', 'UDP'], ['ICMP', 'ICMP'], ['ICMPv6', 'ICMPv6']] })}</div>${showDays ? `<div class="client-speed-weekdays"><span>生效星期</span><div>${WEEKDAYS.map((day) => `<label class="${selectedDays.has(day) ? 'is-active' : ''}"><input type="checkbox" data-client-speed-day="${day}" ${selectedDays.has(day) ? 'checked' : ''}>${day}</label>`).join('')}</div></div>` : ''}<div class="user-auth-form-grid">${editor.schedule_mode !== 'always' ? `${editorField('开始时间', 'start_time', editor.start_time, { type: 'time' })}${editorField('结束时间', 'end_time', editor.end_time, { type: 'time' })}` : ''}${editorField('上行限速', 'up_limit', editor.up_limit, { type: 'number', min: 0, help: '填 0 表示不限速（后端回读 zero_limit_means_unlimited）' })}${editorField('上行单位', 'up_unit', editor.up_unit, { type: 'select', options: [['KB/s', 'KB/s'], ['MB/s', 'MB/s'], ['Kbps', 'Kbps'], ['Mbps', 'Mbps']] })}${editorField('下行限速', 'down_limit', editor.down_limit, { type: 'number', min: 0, help: '填 0 表示不限速（后端回读 zero_limit_means_unlimited）' })}${editorField('下行单位', 'down_unit', editor.down_unit, { type: 'select', options: [['KB/s', 'KB/s'], ['MB/s', 'MB/s'], ['Kbps', 'Kbps'], ['Mbps', 'Mbps']] })}${editorField('备注', 'note', editor.note, { type: 'textarea', wide: true })}</div><div class="user-auth-capability">运行范围为终端 MAC + 可选 L4 协议，当前统一作用于 LAN 桥接流量。线路维度、共享限速与应用级管控即将开放，当前固件版本尚未提供这些选项。</div>${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer user-auth-drawer-footer"><span></span><div><button class="policy-secondary" type="button" data-client-speed-close>取消</button><button class="policy-primary" type="button" data-client-speed-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存规则'}</button></div></footer></aside>`;
   }
 
   function confirmationMarkup() {
@@ -400,39 +406,14 @@ export function mount(context = {}) {
     if (host.dataset.clientSpeedOverlayMarkup === markup) return;
     host.dataset.clientSpeedOverlayMarkup = markup;
     /*
-     * 清空容器**关不掉抽屉**：kit 已经把它搬到 body 级的 sheet portal，
-     * 容器里其实是空的（实测关闭时 sheet 数 1 → 1）。必须先让 kit 卸载
-     * 搬走的那份，它会连遮罩一起回收，然后再重绘容器。
+     * 清空容器**关不掉抽屉**：kit 已经把它搬到 body 级的 sheet portal，容器里其实是空的
+     * （实测关闭时 sheet 数 1 → 1）。必须先让 kit 卸载搬走的那份，它会连遮罩一起回收。
+     * kit 的 `unmount(host)` 现在按 portalHome 反查得到传送出去的抽屉，本页不再需要自备
+     * 一份 portal 清理代码（同一个缺陷曾被 5 个页面各抄一遍）。
      */
-    releasePortaledOverlays();
+    window.DWRT_UI_KIT?.unmount?.(host);
     host.innerHTML = markup;
     ui.mountAll?.(host);
-  }
-
-  /* 卸载已被搬进 portal、且属于本页的抽屉与弹层。 */
-  function releasePortaledOverlays() {
-    const portal = document.getElementById('dwrtKitSheetPortal');
-    if (!portal) return;
-    Array.from(portal.children).forEach((node) => {
-      if (!node.classList?.contains('dwrt-kit-sheet')) return;
-      // 只动本页自己的抽屉，别碰其他路由留下的（正常情况下不该有）。
-      if (!node.classList.contains('client-speed-drawer')) return;
-      /*
-       * `unmount(context)` 是按 context 往下找抽屉的，直接传 portal 会把同在
-       * portal 里的其他抽屉一起卸掉。包一层只含这一个节点的容器最省事：
-       * 用节点自身当 context 找不到它自己（querySelectorAll 不含根），
-       * 所以先摘遮罩、再让 kit 处理它的父级里仅剩这一个的情形。
-       */
-      const overlay = node.previousElementSibling?.classList?.contains('dwrt-kit-sheet-overlay')
-        ? node.previousElementSibling
-        : null;
-      const shim = document.createElement('div');
-      portal.insertBefore(shim, node);
-      shim.appendChild(node);
-      ui.unmount?.(shim);
-      shim.remove();
-      overlay?.remove();
-    });
   }
 
   function render() {
@@ -516,6 +497,22 @@ export function mount(context = {}) {
     if (state.tab === 'ip') return;
     const current = root?.querySelector('[data-client-speed-table]');
     if (!current) { render(); return; }
+    /*
+     * 走 kit 的共享保状态入口（Acceptance P0 单：本页实测丢焦点）。
+     *
+     * 原来是 `current.replaceWith(...)` 再复位 scrollTop：滚动能救，焦点与选区不能。
+     * tableMarkup() 返回的就是这张卡，所以把卡的属性与内容一起交给 morph 配对。
+     */
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(current, (target) => {
+      const staging = document.createElement('template');
+      staging.innerHTML = tableMarkup();
+      const fresh = staging.content.firstElementChild;
+      if (fresh) {
+        Array.from(fresh.attributes).forEach((attribute) => target.setAttribute(attribute.name, attribute.value));
+        target.innerHTML = fresh.innerHTML;
+      }
+    })) return;
     const scroll = current.querySelector('.dwrt-kit-table-scroll');
     const position = { top: scroll?.scrollTop || 0, left: scroll?.scrollLeft || 0 };
     const template = document.createElement('template');

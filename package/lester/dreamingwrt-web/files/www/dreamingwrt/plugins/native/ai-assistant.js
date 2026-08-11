@@ -16,7 +16,7 @@ export function mount(context = {}) {
     return { name, ok, data: json?.data ?? json, raw: json, error: ok ? null : new Error(apiErrorText(json, response.statusText)) };
   });
 
-  const VERSION = '20260804-llm-tabs-demo-02';
+  const VERSION = '20260810-front-release-01';
   const INSTANCE_ID = `ai-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
   const MODULE_CLASS = 'ai-assistant-route-host';
   const ACTIVE_CONVERSATION_KEY = 'dreamingwrt.ai.activeConversation';
@@ -51,13 +51,19 @@ export function mount(context = {}) {
      * 它是**静态说明文本**，不是能力声明：真正可选的模型来自
      * `/api/v1/ai/models` 同步结果，别把这里的字样当成后端已支持的模型清单。
      */
-    { id: 'openai', label: 'OpenAI', mark: 'OpenAI', hint: 'GPT 系列', base: 'https://api.openai.com/v1' },
-    { id: 'anthropic', label: 'Anthropic', mark: 'Claude', hint: 'Claude 系列', base: 'https://api.anthropic.com' },
-    { id: 'gemini', label: 'Google Gemini', mark: 'Gemini', hint: 'Gemini 系列', base: 'https://generativelanguage.googleapis.com/v1beta' },
-    { id: 'kimi', label: 'Kimi Code', mark: 'Moonshot', hint: 'Kimi 系列', base: 'https://api.kimi.com/coding/v1' },
-    { id: 'deepseek', label: 'DeepSeek', mark: 'DeepSeek', hint: 'DeepSeek 系列', base: 'https://api.deepseek.com' },
-    { id: 'qwen', label: '通义千问', mark: 'Qwen', hint: 'Qwen 系列', base: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
-    { id: 'openai_compatible', label: 'OpenAI 兼容', mark: 'API', hint: '自建或反代端点', base: '' }
+    /*
+     * `logo` 是固件自带的品牌图标（`/static/images/logo/`，4694 个），
+     * 用户 2026-08-09：「供应商选择的小按钮卡片应该加上 logo，更直观」。
+     * 只填**确认存在**的文件名，取不到图的（openai_compatible 是自建端点，
+     * 没有品牌）留空，回落到 `mark` 字形，不硬塞一张不相干的图。
+     */
+    { id: 'openai', label: 'OpenAI', mark: 'OpenAI', hint: 'GPT 系列', logo: 'openai.svg', base: 'https://api.openai.com/v1' },
+    { id: 'anthropic', label: 'Anthropic', mark: 'Claude', hint: 'Claude 系列', logo: 'claude.svg', base: 'https://api.anthropic.com' },
+    { id: 'gemini', label: 'Google Gemini', mark: 'Gemini', hint: 'Gemini 系列', logo: 'gemini.svg', base: 'https://generativelanguage.googleapis.com/v1beta' },
+    { id: 'kimi', label: 'Kimi Code', mark: 'Moonshot', hint: 'Kimi 系列', logo: 'kimi.svg', base: 'https://api.kimi.com/coding/v1' },
+    { id: 'deepseek', label: 'DeepSeek', mark: 'DeepSeek', hint: 'DeepSeek 系列', logo: 'deepseek.svg', base: 'https://api.deepseek.com' },
+    { id: 'qwen', label: '通义千问', mark: 'Qwen', hint: 'Qwen 系列', logo: 'qwen.svg', base: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+    { id: 'openai_compatible', label: 'OpenAI 兼容', mark: 'API', hint: '自建或反代端点', logo: '', base: '' }
   ];
   const OAUTH_REASON_LABELS = {
     requires_preconfigured_anthropic_workload_identity_federation: '需要预先配置 Anthropic Workload Identity Federation。',
@@ -1946,9 +1952,8 @@ export function mount(context = {}) {
         <strong>启用 LLM 服务<span class="ai-master-badge is-${badgeTone}">${escapeHtml(badge)}</span></strong>
         <small>路由器统一管理模型接入凭据，供本机诊断、日志解读与自然语言操作使用。</small>
       </div>
-      <label class="ai-switch" data-dwrt-tooltip="启用 AI">
+      <label class="ai-switch dwrt-kit-switch" data-dwrt-component="switch" data-dwrt-tooltip="启用 AI">
         <input type="checkbox" data-ai-config="enabled" ${on ? 'checked' : ''} aria-label="启用 LLM 服务">
-        <span aria-hidden="true"></span>
       </label>
     </section>`;
   }
@@ -1973,7 +1978,7 @@ export function mount(context = {}) {
     const tab = settingsTab();
     if (tab === 'overview') return settingsOverviewSection();
     if (tab === 'advanced') return settingsAdvancedSection(provider, apiBaseHelp);
-    return settingsProviderSection();
+    return settingsProviderSection(provider, apiBaseHelp);
   }
 
   function settingsOverviewCards() {
@@ -2034,14 +2039,14 @@ export function mount(context = {}) {
    * 能力位为假或端点读取失败时，走的是「未确认 / 未实现」的分类文案，
    * 而不是把列表画成空的假控件。
    */
-  function settingsProviderSection() {
+  function settingsProviderSection(provider, apiBaseHelp) {
     // 「模型提供商 / MODEL PROVIDER」这类小标题复述了 Tab 名与控件语义，按用户要求删除。
     return `${dispatchStrategySection()}
         <div class="ai-settings-section">
           <div class="ai-provider-grid" role="radiogroup" aria-label="模型提供商">
             ${PROVIDERS.map((item) => `
               <button class="ai-provider-button ${state.config.provider === item.id ? 'is-active' : ''}" type="button" role="radio" aria-checked="${state.config.provider === item.id ? 'true' : 'false'}" data-ai-provider="${item.id}">
-                <span class="ai-provider-mark">${escapeHtml(item.mark)}</span>
+                ${providerLogoMarkup(item)}
                 <strong>${escapeHtml(item.label)}</strong>
                 <small class="ai-provider-hint">${escapeHtml(item.hint || '')}</small>
                 ${state.config.provider === item.id ? icon('check') : ''}
@@ -2056,11 +2061,42 @@ export function mount(context = {}) {
           </div>
           ${state.oauth.available && oauthProvider() && oauthProvider()?.supported !== true ? `<div class="ai-auth-mode-hint">${icon('key')}<span>${escapeHtml(oauthReason(oauthProvider()?.reason, '当前提供商仅支持 API Key 接入。'))}</span></div>` : ''}
           ${state.config.auth_mode === 'oauth' ? oauthPanel() : `<div class="ai-settings-grid"><label class="ai-field ai-field-wide"><span>API Key</span><input type="password" autocomplete="new-password" value="${escapeHtml(state.config.api_key_input)}" placeholder="${state.config.api_key_set ? `已保存 ${state.config.api_key_hint || ''}，留空不修改` : '输入 API Key'}" data-ai-config="api_key_input"><small>${state.config.clear_api_key ? '保存后将清除已保存密钥' : state.config.api_key_set ? '密钥已保存，页面不会回显完整内容' : '密钥仅提交到路由器配置接口'}</small></label>${state.config.api_key_set ? `<button class="ai-secondary-button ai-clear-key-button" type="button" data-ai-clear-key>${state.config.clear_api_key ? '撤销清除密钥' : '清除已保存密钥'}</button>` : ''}</div>`}
+          ${apiBaseField(provider, apiBaseHelp)}
           ${multiProviderUsable() ? `<div class="ai-provider-draft-actions">
             <button class="ai-secondary-button" type="button" data-ai-provider-add ${state.providerBusy.action === 'add' ? 'disabled' : ''}>${state.providerBusy.action === 'add' ? icon('loader') : icon('check')}添加到已配置列表</button>
           </div>` : ''}
         </div>
         ${settingsProviderList()}`;
+  }
+
+  /*
+   * API Base URL。**和凭据放在同一页**：用户 2026-08-09 明确指出
+   * 「openai 兼容的 API key，设置它主要是方便用户用中转站，结果你只让我填写 key
+   * 没让我填写上游 URL……把 api 地址放到了高级设置里？拿过来，为什么要换个页面
+   * 才能配完这个东西？」——中转站的 key 与端点是一组凭据，分到两个 Tab 意味着
+   * 配一个供应商要来回切页，是错的。高级设置页不再重复渲染这个字段。
+   *
+   * 标题按用户要求保留英文原名 `API Base URL`，不译成「API 基础地址」。
+   */
+  function apiBaseField(provider, apiBaseHelp) {
+    const compat = state.config.provider === 'openai_compatible';
+    return `<label class="ai-field ai-field-wide ai-api-base-field"><span>API Base URL${compat ? '<em class="ai-field-tag">必填</em>' : ''}</span>`
+      + `<input type="url" value="${escapeHtml(state.config.api_base)}" placeholder="${escapeHtml(provider?.base || 'https://example.com/v1')}" data-ai-config="api_base">`
+      + `<small>${escapeHtml(apiBaseHelp)}</small></label>`;
+  }
+
+  /*
+   * 供应商磁贴上的品牌图标。图标来自固件自带的 `/static/images/logo/`，
+   * 加载失败就隐藏 img 让底下的 `mark` 字形显出来 —— 一个 404 不该在磁贴上
+   * 留个破图占位（与 insights-flows 的图标兜底同一口径）。
+   */
+  function providerLogoMarkup(item) {
+    const mark = escapeHtml(item.mark || 'API');
+    if (!item.logo) return `<span class="ai-provider-mark is-glyph" aria-hidden="true"><i>${mark}</i></span>`;
+    return `<span class="ai-provider-mark" aria-hidden="true">`
+      + `<img src="/static/images/logo/${encodeURIComponent(item.logo)}" alt="" loading="lazy" decoding="async"`
+      + ` onerror="this.remove();this.parentElement.classList.add('is-glyph')">`
+      + `<i>${mark}</i></span>`;
   }
 
   const STRATEGY_LABELS = {
@@ -2310,8 +2346,12 @@ export function mount(context = {}) {
     const chambers = [
       {
         key: 'runtime', title: '运行时与接口',
-        body: `<label class="ai-field ai-field-wide"><span>API 基础地址</span><input type="url" value="${escapeHtml(state.config.api_base)}" placeholder="${escapeHtml(provider.base || 'https://example.com/v1')}" data-ai-config="api_base"><small>${escapeHtml(apiBaseHelp)}</small></label>
-          <div class="ai-chamber-grid">
+        /*
+         * API Base URL 已经移到「供应商设置」页（与 API Key 同一组凭据），
+         * 这里**不再渲染第二个同名字段** —— 两个绑定同一个 `data-ai-config="api_base"`
+         * 的输入框会让「哪个才是生效值」变成猜谜，也是用户要求「拿过来」的原意。
+         */
+        body: `<div class="ai-chamber-grid">
             <label class="ai-field"><span>默认模型</span><select data-ai-config="model">${modelOptions(state.config.model)}</select></label>
             <label class="ai-field"><span>最大输出 Token</span><input type="number" min="1" max="131072" step="1" value="${state.config.max_tokens}" data-ai-config="max_tokens"></label>
           </div>`

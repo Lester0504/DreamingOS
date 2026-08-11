@@ -305,41 +305,9 @@
 .network-service-setting-row strong { color: var(--app-text); font-size: 13px; font-weight: 720; }
 .network-service-setting-row small { overflow: hidden; color: var(--app-text-muted); font-size: 10px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
 
-.network-service-switch {
-  width: 40px;
-  height: 22px;
-  position: relative;
-  display: block;
-}
-
-.network-service-switch input { position: absolute; opacity: 0; pointer-events: none; }
-.network-service-switch i {
-  width: 40px;
-  height: 22px;
-  position: relative;
-  display: block;
-  border-radius: 999px;
-  background: rgba(128, 140, 158, 0.28);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.10);
-  cursor: pointer;
-}
-
-.network-service-switch i::after {
-  content: '';
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: #e7edf5;
-  transition: transform 160ms ease;
-}
-
-.network-service-switch input:checked + i { background: rgba(46, 139, 255, 0.78); }
-.network-service-switch input:checked + i::after { transform: translateX(18px); }
+.network-service-switch { justify-self: end; }
 .network-service-switch.is-disabled { opacity: 0.52; }
-.network-service-switch.is-disabled i { cursor: not-allowed; }
+.network-service-switch.is-disabled input { cursor: not-allowed; }
 
 .network-service-form {
   min-width: 0;
@@ -617,6 +585,5 @@ html[data-theme-resolved="light"] .network-service-icon-button {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .network-service-switch i::after,
   .is-dns .dns-control-group-chevron { transition: none; }
 }

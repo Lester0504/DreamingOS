@@ -15,6 +15,7 @@ MENU_PATH = WWW / "static/menu/main.json"
 MODULE = MODULE_PATH.read_text(encoding="utf-8")
 STYLE = STYLE_PATH.read_text(encoding="utf-8")
 MENU = json.loads(MENU_PATH.read_text(encoding="utf-8"))
+VERSION = re.search(r"const VERSION = '([^']+)'", MODULE).group(1)
 
 
 def walk(items):
@@ -28,8 +29,8 @@ assert route["availability"] == "available"
 assert route["frontend_owned"] is True
 assert route["module"] == "native/multicast-service.js"
 assert route["style"] == "/static/css/multicast-service.css"
-assert route["module_version"] == "20260802-ui-batch-01"
-assert route["style_version"] == "20260802-ui-batch-01"
+assert route["module_version"] == VERSION
+assert route["style_version"] == VERSION
 
 for label in ("总览", "IGMP / MLD 代理", "IPTV 透传", "UDPXY", "局域发现"):
     assert label in MODULE
@@ -97,7 +98,6 @@ assert "data-multicast-retry" in MODULE
 assert "state.pollTimer = window.setInterval" in MODULE
 
 for workbench_contract in (
-    "20260802-ui-batch-01",
     'role="tablist"',
     'role="tab"',
     "overviewCardsRow",

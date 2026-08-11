@@ -1,13 +1,236 @@
 /*
  * 网址浏览控制页样式。
  *
- * 材质、表格与抽屉几何全部复用 ui-kit 与 user-authentication.css，这里只补本页
- * 独有的分类网格、动作徽标与开关。抽屉宽度只引用 Kit 的四档变量（design.md
- * 「抽屉几何与实时刷新」第 7 条），不写逐页魔法值。
+ * 表格与抽屉的材质来自 ui-kit。**注意本路由只加载这一张页面样式表**：
+ * `loadRouteItemStyle()` 按菜单项加载它自己那一个 style，本页 main.json 指向的是
+ * web-access-control.css，所以 user-authentication.css 与 policy-table.css 都不在
+ * 清单里（30.1 实测该路由只有 ui-kit / sampled-glass / menu-shell / notifications /
+ * dwrt-theme / web-access-control / control-material 七张）。
+ *
+ * 因此本页 DOM 上用到的 `user-auth-*` 与 `policy-*` 类必须在这里重申材质，见下方
+ * 「借用类的材质重申」两节。抽屉宽度只引用 Kit 的四档变量（design.md「抽屉几何与
+ * 实时刷新」第 7 条），不写逐页魔法值。
  */
+
+/* ===== 缺席规则的重申（0/2）：舞台与路由宿主 =====
+ *
+ * 模块给舞台加了 `is-user-authentication` 类
+ * （web-access-control.js:1310），但那个类对应的三条规则同样住在 user-authentication.css
+ * 里，所以加类这个动作原本毫无效果 —— 舞台不定高、舞台头不隐藏、宿主不满高
+ * （实测 stageRows 走通用的 `auto + 1fr`、宿主只拿到 274px 内容高度）。
+ *
+ * 作用域必须用 `:has(> .web-access-control-route-host)` 收到本路由。裸写
+ * `.console-stage.is-user-authentication` 会波及认证与管控组的其他页面，而它们本来就从
+ * user-authentication.css 拿到了这三条，重复定义只会多出一个真相来源。这个写法照
+ * routing-table.css 的既有先例（它对 policy-table.css 缺席的处理方式完全同源）。
+ */
+.console-stage.is-user-authentication:has(> .web-access-control-route-host) {
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
+  height: var(--app-stage-height);
+  min-height: 0;
+  padding: var(--app-page-gutter-block, 14px) var(--app-page-gutter-inline, 14px);
+  overflow: hidden;
+}
+
+/*
+ * 壳层自己已经渲染了一级 Tab，舞台头再写一遍页面名字属于 design.md 第 1203 条 (c)
+ * 点名的「页面不得重复壳层已经写出的名字」。
+ */
+.console-stage.is-user-authentication:has(> .web-access-control-route-host) .stage-header {
+  display: none;
+}
+
+/*
+ * 宿主：撤掉 .route-preview 那张 560px 预览卡的几何（宽度、外边距、边框、圆角、底色），
+ * 并满高。`.route-workspace` 已经处理了其中大部分，这里补 height/min-height ——
+ * 少了满高，壳层的 height:100% 就没有可参照的高度，退回内容高度。
+ */
+.route-preview.web-access-control-route-host {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ===== 借用类的材质重申（1/2）：user-auth-* 壳层与控件 =====
+ *
+ * 定义住在 user-authentication.css，本路由不加载它。这里只抄本页 DOM 真正用到的那些，
+ * 数值与 user-authentication.css 保持一致，别就地发明第二套标准；那张表改了，这里要跟。
+ * 权重一律保持裸单类，好让下方 `.web-access-*` 的本页意图仍能压过它们。
+ */
+.user-auth-shell {
+  width: 100%; height: 100%; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; gap: var(--app-page-gap, 12px);
+  color: var(--app-text); overflow: hidden;
+}
+.user-auth-page-header {
+  min-width: 0; min-height: var(--app-tabs-height, 52px);
+  display: flex; align-items: center; justify-content: space-between; gap: 14px; flex: 0 0 auto;
+}
+/* 本页 header 只承载一级 Tab（is-toolbar-only），高度收敛到 Tab 自身。 */
+.user-auth-page-header.is-toolbar-only { min-height: 0; }
+.user-auth-workbench {
+  min-width: 0; min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr);
+  flex: 1 1 auto; gap: var(--app-page-gap, 12px); overflow: hidden;
+}
+.user-auth-notice {
+  min-height: 38px; display: flex; align-items: center; padding: 8px 12px;
+  border-radius: var(--app-radius-control, 10px);
+  color: color-mix(in srgb, #ffcb65 82%, var(--app-text) 18%);
+  background: color-mix(in srgb, #d68a18 11%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, #ffc65a 22%, transparent);
+  font-size: 12px; line-height: 1.45; flex: 0 0 auto;
+}
+.user-auth-notice.is-ok { color: color-mix(in srgb, #59dda0 82%, var(--app-text) 18%); background: rgba(45, 181, 112, .10); }
+.user-auth-notice.is-error { color: color-mix(in srgb, #ff7f8b 82%, var(--app-text) 18%); background: rgba(220, 52, 73, .10); }
+
+.user-auth-segmented {
+  height: 38px; display: inline-flex; align-items: center; gap: 3px; padding: 3px;
+  border-radius: var(--app-radius-control); background: rgba(8, 14, 26, .14);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .10);
+}
+.user-auth-segmented button {
+  height: 32px; border: 0; border-radius: var(--app-radius-compact); padding: 0 11px;
+  color: var(--app-text-muted); background: transparent; font: inherit; font-size: 11px;
+  font-weight: 680; cursor: pointer;
+}
+.user-auth-segmented button:hover { color: var(--app-text); background: var(--dwrt-interactive-hover-bg); }
+.user-auth-segmented button.is-active {
+  color: var(--app-selected-text, #fff); background: rgba(47, 125, 235, .76);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .16);
+}
+
+/*
+ * 开关行是本单的主症状：没有这条，行退回 display:block，标题与说明挤成一行连续文字、
+ * 滑块脱开右侧（30.1 实测行高 20px、grid-template-columns:none）。
+ */
+.user-auth-setting-row {
+  min-width: 0; min-height: 64px; display: grid;
+  grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, .075);
+}
+.user-auth-setting-row:last-child { border-bottom: 0; }
+.user-auth-setting-row > span:first-child { min-width: 0; display: grid; gap: 4px; }
+.user-auth-setting-row strong { font-size: 13px; font-weight: 720; }
+.user-auth-setting-row small { color: var(--app-text-muted); font-size: 11px; line-height: 1.4; }
+
+.user-auth-capability {
+  padding: 11px 12px; border-radius: var(--app-radius-compact);
+  color: color-mix(in srgb, #f5c76d 78%, var(--app-text) 22%);
+  background: rgba(217, 145, 37, .09);
+  box-shadow: inset 0 0 0 1px rgba(238, 181, 86, .16);
+  font-size: 11px; line-height: 1.55;
+}
+
+.user-auth-table-controls {
+  /* 卡内控件比独立工具栏矮一档，改 Kit 变量而不是硬写 height（同 user-authentication.css）。 */
+  --dwrt-search-size: 36px;
+  min-width: 0; margin-left: auto; display: flex; align-items: center; gap: 10px;
+}
+.user-auth-table-controls .user-auth-toolbar-leading { min-width: 0; flex: 0 1 auto; }
+.user-auth-table-controls .policy-toolbar-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 9px; }
+.user-auth-table-controls .policy-create-button { height: 36px; }
+.user-auth-table-controls .policy-search-main { width: min(280px, 26vw); }
+.user-auth-table-controls .user-auth-segmented button { height: 30px; }
+.user-auth-toolbar-leading { min-width: 0; display: flex; align-items: center; gap: 10px; }
+
+/*
+ * 行内动作用固定轨道而不是自动宽度：按钮内容一变（启停图标切换）自动宽度会重算，
+ * 整行随之位移，表现为「点一下就跳」。
+ */
+.user-auth-row-actions {
+  display: inline-grid; grid-auto-flow: column; grid-auto-columns: 32px;
+  align-items: center; justify-content: start; gap: 5px;
+}
+.user-auth-icon-button {
+  width: 32px; height: 32px; display: inline-grid; place-items: center; border: 0;
+  border-radius: var(--app-radius-control, 9px); color: var(--app-text-muted);
+  background: transparent; cursor: pointer;
+}
+.user-auth-row-actions .user-auth-icon-button { min-width: 32px; max-width: 32px; padding: 0; flex: 0 0 auto; }
+/* SVG 尺寸锁死：不写这条，24 viewBox 的图标会按容器撑开。 */
+.user-auth-icon-button svg { display: block; width: 18px; height: 18px; }
+.user-auth-icon-button:hover:not(:disabled) {
+  color: var(--app-text); background: var(--dwrt-interactive-hover-bg);
+  box-shadow: inset 0 0 0 1px var(--dwrt-interactive-hover-border);
+}
+.user-auth-icon-button.danger:hover:not(:disabled) { color: #ff7d88; background: rgba(222, 57, 78, .11); }
+.user-auth-icon-button:disabled { opacity: .36; cursor: not-allowed; }
+
+.user-auth-form-grid { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
+.user-auth-field { min-width: 0; display: grid; align-content: start; gap: 6px; }
+.user-auth-field.is-wide { grid-column: 1 / -1; }
+.user-auth-field > span { color: var(--app-text-secondary); font-size: 12px; font-weight: 700; }
+.user-auth-field > small { color: var(--app-text-muted); font-size: 10px; line-height: 1.45; }
+
+.user-auth-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form); --dwrt-kit-sheet-z: 72; }
+.user-auth-drawer-body { display: grid; align-content: start; gap: 18px; padding: 18px var(--dwrt-kit-sheet-padding-x); }
+.user-auth-drawer-section { display: grid; gap: 0; }
+.user-auth-drawer-section > strong { padding-bottom: 9px; border-bottom: 1px solid rgba(255, 255, 255, .09); font-size: 13px; }
+.user-auth-drawer-footer { justify-content: space-between; }
+.user-auth-drawer-footer > div { display: flex; gap: 10px; }
+
+/* ===== 借用类的材质重申（2/2）：policy-* 工具栏控件 =====
+ *
+ * 定义住在 policy-table.css（user-authentication.css 用 @import 拉它，本页没有）。
+ * 只抄本页用到的：创建按钮、动作容器、搜索框、主/次按钮。其中主/次按钮是
+ * 「保存并应用」「保存规则」「取消」「清空已选」，缺样式时会退回浏览器原生灰按钮。
+ *
+ * 搜索框这条是「Kit 未挂载时的兜底」：`mountExpandSearch()` 会用 `!important`
+ * 全面接管 `.dwrt-kit-expand-search` 的几何，所以这里的裸单类不会与它打架；一旦 Kit
+ * 那条路径不生效，`.policy-search svg` 的 18px 约束缺失会让图标按容器撑满
+ * （本 harness 实测 982px）。
+ */
+.policy-create-button,
+.policy-primary,
+.policy-secondary { appearance: none; border: 0; font: inherit; cursor: pointer; }
+
+.policy-toolbar-actions { display: flex; align-items: center; gap: 9px; }
+.policy-create-button {
+  min-width: 0; height: 40px; display: inline-flex; align-items: center; gap: 7px;
+  padding: 0 14px; border: 0; border-radius: 999px; color: var(--app-selected-text, #fff);
+  background: rgba(47, 125, 235, .82); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .16);
+  font: inherit; font-size: 12px; font-weight: 720; white-space: nowrap; cursor: pointer;
+}
+.policy-create-button svg { display: block; width: 16px; height: 16px; }
+.policy-create-button:disabled { opacity: .45; cursor: not-allowed; }
+
+/* 数值照 policy-table.css 的 34px / 10px 一档，别在本页发明第二种按钮尺寸。 */
+.policy-primary,
+.policy-secondary {
+  height: 34px; display: inline-flex; align-items: center; justify-content: center;
+  gap: 7px; padding: 0 14px; border-radius: 10px; color: var(--app-text);
+  background: rgba(8, 14, 26, .20); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .12);
+  font-size: 12px; font-weight: 700; white-space: nowrap;
+}
+.policy-primary { color: #fff; background: rgba(38, 122, 255, .72); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .16); }
+.policy-primary:disabled,
+.policy-secondary:disabled { opacity: .48; cursor: not-allowed; }
+.policy-secondary.danger { color: color-mix(in srgb, #ff5b6b 86%, var(--app-text) 14%); }
+
+.policy-search {
+  min-width: 0; height: 40px; display: grid; grid-template-columns: 38px minmax(0, 1fr);
+  align-items: center; border-radius: 999px; color: var(--app-text-muted);
+  background: rgba(8, 14, 26, .16); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .14);
+}
+.policy-search svg { display: block; width: 18px; height: 18px; margin: auto; }
+.policy-search input {
+  width: 100%; min-width: 0; height: 100%; border: 0; outline: 0; padding: 0 14px 0 0;
+  background: transparent; color: var(--app-text); font: inherit; font-size: 13px;
+  appearance: none; -webkit-appearance: none;
+}
+.policy-search input::-webkit-search-cancel-button,
+.policy-search input::-webkit-search-decoration { display: none; }
+
+/* ===== 本页自有样式 ===== */
 
 .web-access-shell { min-width: 0; }
 .web-access-header { gap: 10px; }
+/* 页面级 tab 已收敛到 kit 的 .dwrt-kit-page-tabs，宽度与高度由 kit 负责。 */
 .web-access-tabs { flex: 0 0 auto; }
 
 /*
@@ -25,11 +248,75 @@
 .web-access-workbench > .web-access-table-card { flex: 1 1 auto; min-height: 0; }
 .web-access-overview { margin-bottom: 4px; }
 
-.web-access-panel { display: grid; align-content: start; min-width: 0; }
-.web-access-panel-body { display: grid; align-content: start; gap: 18px; padding: 16px 18px 18px; min-width: 0; }
+/*
+ * 面板体自己滚，不靠页面整体滚。
+ *
+ * `.user-auth-shell` 的权威定义是 height:100% + overflow:hidden（上面已重申），它配的是
+ * 定高舞台。而 `.dwrt-kit-table-wrap` 也是 overflow:hidden —— 于是一旦宿主被限高，
+ * 「策略与防护」这类长内容（作用对象列表 + 时段 + 三项安全搜索 + 两条说明条）会超出面板，
+ * 而链路上没有任何可滚祖先：实测 1440x800 定高宿主下面板 693px、内容 1332px，
+ * 「保存并应用」落在 y=1387 被永久切掉，页面也滚不动，等于功能不可达。
+ *
+ * 行模板必须与子节点数一致（design.md 规则 11 / 第 1203 条 (a)）：卡片是「工具栏 + 面板体」
+ * 两个子节点，写成 auto + minmax(0,1fr)，让面板体吃掉剩余高度并在内部滚动。
+ * min-height:0 不能省，否则 grid 子项的 auto 下限会让它拒绝收缩、照旧溢出。
+ */
+.web-access-panel {
+  display: grid; grid-template-rows: auto minmax(0, 1fr); align-content: stretch;
+  min-width: 0; min-height: 0;
+}
+.web-access-panel-body {
+  display: grid; align-content: start; gap: 18px; padding: 16px 18px 18px;
+  min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
 
 .web-access-table-card { min-width: 0; }
-.web-access-table-controls { width: 100%; }
+/*
+ * 控件组贴右、标题留在左边，`width: 100%` 只在窄屏那档保留（见页尾 media）。
+ *
+ * 这里原本是无条件 `width: 100%`，与重申进来的 `.user-auth-table-controls`
+ * 的 `margin-left: auto` 目的相反：前者要占满一行，后者要贴右。结果控件组吃满 982px、
+ * 只给标题剩 350px，副标题「放行优先于拦截 · 生效范围 …」被挤成两行，工具栏 65px，
+ * 超出 design.md 第 1203 条要求的 48-58px。
+ *
+ * 另外补上兄弟页 `.user-auth-table-toolbar-rich` 的等效几何（min-height 52px、
+ * padding-block 8px、换行时的 row-gap）。那个类由各页 JS 写在 DOM 上（APP 过滤 /
+ * 终端限速 / 断网规则 / 在线用户四页都有），本页 DOM 没有它；这里按本页自己的卡片
+ * 作用域补出等效几何，不去改模块的类名。
+ *
+ * 但**宽屏不开 flex-wrap**。弹性行一旦允许换行，浏览器就优先把项目丢到下一行而不是
+ * 压缩它们：实测 1180 / 1100 / 960 三档下标题仍占满 488px、控件组被推到第二行、
+ * 工具栏 86px。宽屏保持 nowrap，让标题按下面那条收缩并截断副标题，三者留在一行；
+ * 换行只在窄屏那档打开（见页尾 media），那里确实放不下一行。
+ */
+.web-access-table-card > .dwrt-kit-table-toolbar {
+  flex-wrap: nowrap;
+  row-gap: 10px;
+  min-height: 52px;
+  padding-block: 8px;
+}
+
+/*
+ * 标题让位。工具栏是弹性行，里面三个兄弟：标题、条数徽标、控件组。Kit 给标题的是
+ * `display:flex; min-width:0`，但没给收缩意图，于是它按内容宽度占住 488px
+ * （「自定义域名」+ 那句较长的生效范围副标题），1180px 以下三者之和超过一行，
+ * 控件组被挤到第二行、工具栏顶到 86px。
+ *
+ * 让标题可收缩（`flex: 0 1 auto` + 副标题省略号）后，控件组留在同一行；副标题在
+ * 空间不足时截断，而不是把整条工具栏顶高。条数徽标与控件组都不收缩，保持可读与可点。
+ */
+.web-access-table-card > .dwrt-kit-table-toolbar > .dwrt-kit-table-title {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.web-access-table-card > .dwrt-kit-table-toolbar > .dwrt-kit-table-title span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.web-access-table-card > .dwrt-kit-table-toolbar > .dwrt-kit-table-count { flex: 0 0 auto; }
 .web-access-table { min-width: 720px; }
 .web-access-domain { font-size: 12px; word-break: break-all; }
 .web-access-runtime { display: grid; gap: 3px; justify-items: start; min-width: 0; }
@@ -80,6 +367,20 @@
 .web-access-hint.is-warning { color: color-mix(in srgb, #f5c76d 78%, var(--app-text) 22%); }
 .web-access-hint code { font-size: 10px; }
 .web-access-capability code { font-size: 10px; }
+/*
+ * `.user-auth-capability` 的材质定义在 user-authentication.css 里，而本路由的样式清单
+ * 只有本文件（实测 30.1：该页只加载 ui-kit / sampled-glass / menu-shell / notifications /
+ * dwrt-theme / web-access-control / control-material 七个）。所以本页自己用到的提示条
+ * 必须在这里重申一次，否则会渲染成一段无框裸文字。
+ */
+.web-access-capability {
+  padding: 11px 12px; border-radius: var(--app-radius-compact, 8px);
+  color: color-mix(in srgb, #f5c76d 78%, var(--app-text) 22%);
+  background: rgba(217, 145, 37, .09);
+  box-shadow: inset 0 0 0 1px rgba(238, 181, 86, .16);
+  font-size: 11px; line-height: 1.55;
+}
+.web-access-capability strong { font-weight: 760; }
 
 .web-access-section-footer {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -87,34 +388,106 @@
 }
 .web-access-section-footer > span { color: var(--app-text-muted); font-size: 11px; }
 
-/* 开关沿用认证页开关的几何，避免各页自造尺寸。 */
-.web-access-switch { position: relative; flex: 0 0 auto; width: 38px; height: 22px; }
-.web-access-switch input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; }
-.web-access-switch i {
-  display: block; width: 100%; height: 100%; border-radius: 999px;
-  background: rgba(255, 255, 255, .16); transition: background .18s ease; pointer-events: none;
-}
-.web-access-switch i::after {
-  content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px;
-  border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, .28);
-  transition: transform .18s ease;
-}
-.web-access-switch input:checked + i { background: rgba(48, 126, 235, .72); }
-.web-access-switch input:checked + i::after { transform: translateX(16px); }
-.web-access-switch input:disabled + i { opacity: .45; }
-.web-access-switch input:disabled { cursor: not-allowed; }
-.web-access-switch input:focus-visible + i { box-shadow: 0 0 0 3px rgba(48, 126, 235, .22); }
+.web-access-switch { flex: 0 0 auto; }
 
-.web-access-category .web-access-switch { width: 22px; height: 22px; }
-.web-access-category .web-access-switch i { border-radius: 6px; background: rgba(255, 255, 255, .13); }
-.web-access-category .web-access-switch i::after {
-  top: 4px; left: 4px; width: 14px; height: 14px; border-radius: 3px;
-  box-shadow: none; opacity: 0; transform: none;
-}
-.web-access-category .web-access-switch input:checked + i::after { opacity: 1; transform: none; }
+/* 分类是多选集合，不是业务开关，保留 checkbox 语义和方形勾选材质。 */
+.web-access-checkbox { position: relative; flex: 0 0 22px; width: 22px; height: 22px; }
+.web-access-checkbox input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; }
+.web-access-checkbox i { position: absolute; inset: 0; border-radius: 6px; background: rgba(255, 255, 255, .13); box-shadow: inset 0 0 0 1px rgba(255,255,255,.16); pointer-events: none; }
+.web-access-checkbox i::after { content: ''; position: absolute; top: 4px; left: 4px; width: 14px; height: 14px; border-radius: 3px; background: #307eeb; opacity: 0; }
+.web-access-checkbox input:checked + i::after { opacity: 1; }
+.web-access-checkbox input:focus-visible + i { box-shadow: 0 0 0 3px rgba(48,126,235,.22), inset 0 0 0 1px rgba(255,255,255,.16); }
+.web-access-checkbox input:disabled { cursor: not-allowed; }
+.web-access-checkbox input:disabled + i { opacity: .45; }
 
 .web-access-action-switch { display: inline-flex; }
 .web-access-action-switch button { flex: 1; }
+
+/*
+ * 作用对象与生效时段。几何照终端联网控制页的同名控件（.cnc-schedule-switch /
+ * .cnc-weekdays），但样式必须写在本文件里：路由只加载 web-access-control.css，
+ * user-authentication.css 不在本页的样式清单里，直接复用 cnc-* 类名会拿不到任何材质。
+ */
+.web-access-scope-section,
+.web-access-schedule-section { gap: 10px; }
+.web-access-mode-switch { display: grid; gap: 5px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.web-access-mode-switch button {
+  min-width: 0; height: 32px; padding: 0 10px; border: 0;
+  border-radius: var(--app-radius-control, 10px); color: var(--app-text-muted);
+  background: var(--dwrt-control-material, rgba(255, 255, 255, .07));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .1);
+  font-size: 11px; font-weight: 700; cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.web-access-mode-switch button.is-active { color: #fff; background: rgba(47, 126, 234, .78); }
+.web-access-mode-switch button:disabled { opacity: .5; cursor: not-allowed; }
+
+.web-access-scope-picker { display: grid; gap: 8px; min-width: 0; }
+/*
+ * 搜索框自带几何，不借 `.policy-search`：那套样式（含 `.policy-search svg` 的 18px
+ * 约束）住在 policy-table.css 里，而本路由的样式清单只有 web-access-control.css。
+ * 借用会拿到一个没有尺寸约束的 SVG，图标会按容器高度撑满整列。
+ */
+.web-access-scope-search {
+  position: relative; display: grid; grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center; width: 100%; min-width: 0; height: 34px;
+  border: 1px solid rgba(255, 255, 255, .13); border-radius: var(--app-radius-control, 10px);
+  color: var(--app-text-muted); background: rgba(8, 14, 26, .16);
+}
+.web-access-scope-search-icon { display: grid; place-items: center; width: 34px; height: 34px; }
+.web-access-scope-search-icon svg { display: block; width: 15px; height: 15px; }
+.web-access-scope-search input {
+  width: 100%; min-width: 0; height: 100%; padding: 0 11px 0 0;
+  border: 0; outline: 0; background: transparent; color: var(--app-text, #eef3fb);
+  font: inherit; font-size: 12px; appearance: none; -webkit-appearance: none;
+}
+.web-access-scope-search input::-webkit-search-cancel-button,
+.web-access-scope-search input::-webkit-search-decoration { display: none; }
+/*
+ * 终端可能有几十台，列表必须自己滚而不是把面板顶长：面板体是 grid，子项无上限时
+ * 会把「保存并应用」推到视口外。max-height 用固定值而不是百分比，父级高度是内容驱动的。
+ */
+.web-access-scope-list {
+  display: grid; gap: 5px; min-width: 0; max-height: 236px; overflow-y: auto;
+  padding: 6px; border: 1px solid rgba(255, 255, 255, .10);
+  border-radius: var(--app-radius-control, 10px); background: rgba(8, 14, 26, .16);
+}
+.web-access-scope-item {
+  display: flex; align-items: center; gap: 10px; min-width: 0; padding: 8px 10px;
+  border: 1px solid transparent; border-radius: var(--app-radius-compact, 8px);
+  background: rgba(255, 255, 255, .04); cursor: pointer;
+}
+.web-access-scope-item.is-active { border-color: rgba(78, 151, 250, .45); background: rgba(48, 126, 235, .12); }
+.web-access-scope-item.is-orphan { border-style: dashed; }
+.web-access-scope-item > span { display: grid; gap: 2px; min-width: 0; }
+.web-access-scope-item strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.web-access-scope-item small { overflow: hidden; color: var(--app-text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.web-access-scope-item input { flex: 0 0 auto; margin: 0; accent-color: rgba(48, 126, 235, .9); }
+.web-access-scope-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
+.web-access-scope-foot > span { color: var(--app-text-muted); font-size: 11px; }
+.web-access-scope-foot .policy-secondary { height: 28px; padding: 0 12px; font-size: 11px; }
+
+.web-access-schedule-grid { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); min-width: 0; }
+.web-access-schedule-grid .user-auth-field { display: grid; gap: 5px; min-width: 0; }
+.web-access-schedule-grid .user-auth-field > span { color: var(--app-text-secondary); font-size: 11px; font-weight: 600; }
+.web-access-schedule-grid input {
+  width: 100%; min-width: 0; height: 34px; border: 1px solid rgba(255, 255, 255, .13);
+  border-radius: var(--app-radius-control, 10px); padding: 0 11px;
+  color: var(--app-text, #eef3fb); background: rgba(8, 14, 26, .16);
+  font: inherit; font-size: 13px; outline: 0;
+}
+.web-access-weekdays { display: grid; gap: 8px; min-width: 0; }
+.web-access-weekdays > span { color: var(--app-text-secondary); font-size: 12px; font-weight: 700; }
+.web-access-weekdays > div { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 5px; }
+.web-access-weekdays label {
+  position: relative; height: 34px; display: grid; place-items: center;
+  border-radius: var(--app-radius-compact, 8px); color: var(--app-text-muted);
+  background: var(--dwrt-control-material, rgba(255, 255, 255, .07));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .1); font-size: 11px; cursor: pointer;
+}
+.web-access-weekdays label.is-active { color: #fff; background: rgba(47, 126, 234, .78); }
+.web-access-weekdays input { position: absolute; opacity: 0; pointer-events: none; }
+.web-access-weekdays > small { color: var(--app-text-muted); font-size: 10px; }
 
 /* 抽屉：只引用 Kit 档位变量，双类提权避免与 Kit 基线同权重。 */
 .dwrt-kit-sheet.web-access-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form); }
@@ -133,12 +506,46 @@
 }
 
 html[data-theme-resolved="light"] .web-access-category,
+html[data-theme-resolved="light"] .web-access-scope-list,
+html[data-theme-resolved="light"] .web-access-scope-search,
+html[data-theme-resolved="light"] .web-access-schedule-grid input,
+html[data-theme-resolved="light"] .user-auth-segmented,
+html[data-theme-resolved="light"] .policy-search,
+html[data-theme-resolved="light"] .policy-secondary,
 html[data-theme-resolved="light"] .web-access-drawer .user-auth-field input,
 html[data-theme-resolved="light"] .web-access-drawer .user-auth-field textarea { background: rgba(255, 255, 255, .17); }
+
+/*
+ * 窄视口：控件组换行独占一行，不要把卡片标题挤成一列。
+ *
+ * 断点用 900px 而不是照抄 user-authentication.css 的 1180px。那个数字是给控件更多的页
+ * （在线用户 / 账号管理带筛选按钮与导入导出）定的；本页工具栏只有三个控件
+ * （四段筛选 + 搜索 + 拉黑域名），1100px 下标题 488 + 控件 490 仍然放得下一行。
+ * 沿用 1180px 实测会把控件组提前推成独占一行、工具栏顶到 86px，反而超出
+ * design.md 第 1203 条的 48-58px。
+ */
+@media (max-width: 900px) {
+  .user-auth-table-controls { width: 100%; margin-left: 0; justify-content: space-between; }
+  .user-auth-table-controls .policy-search-main { width: min(220px, 40vw); }
+  /* 这一档标题与控件组各占一行才放得下，宽屏撤掉的 width: 100% 在此回来。 */
+  .web-access-table-controls { width: 100%; }
+  /* 这一档才允许换行：控件组独占第二行，标题不必再截断。 */
+  .web-access-table-card > .dwrt-kit-table-toolbar { flex-wrap: wrap; }
+  .web-access-table-card > .dwrt-kit-table-toolbar > .dwrt-kit-table-title span { white-space: normal; }
+}
 
 @media (max-width: 900px) {
   .web-access-panel-body { padding: 14px; gap: 15px; }
   .web-access-section-footer { flex-direction: column; align-items: stretch; }
   .web-access-section-footer .policy-primary { width: 100%; }
   .web-access-runtime small { max-width: 150px; }
+  /* 七列在窄屏会把「日」挤成半个字，换四列两行。 */
+  .web-access-weekdays > div { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .web-access-scope-list { max-height: 200px; }
+  .user-auth-form-grid { grid-template-columns: 1fr; }
+  .user-auth-field.is-wide { grid-column: auto; }
+  .user-auth-segmented { max-width: 100%; overflow-x: auto; }
+  .user-auth-drawer-footer { align-items: stretch; flex-direction: column; }
+  .user-auth-drawer-footer > div { width: 100%; }
+  .user-auth-drawer-footer button { flex: 1; }
 }

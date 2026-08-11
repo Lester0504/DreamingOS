@@ -179,17 +179,9 @@
 
 .policy-status-empty {
   min-height: 106px;
-  display: grid;
-  place-items: center;
-  align-content: center;
-  gap: 5px;
-  padding: 20px;
-  border-radius: var(--app-radius-card, 18px);
-  color: var(--app-text-muted);
-  text-align: center;
 }
-.policy-status-empty strong { color: var(--app-text-secondary); font-size: 13px; }
-.policy-status-empty span { font-size: 11px; }
+.policy-status-empty > strong { font-size: 13px; }
+.policy-status-empty > p { font-size: 11px; }
 
 .policy-status-table { min-width: 0; overflow: hidden; border-radius: var(--app-radius-card, 18px); }
 .policy-status-toolbar { min-height: 62px; display: flex; align-items: center; gap: 10px; }

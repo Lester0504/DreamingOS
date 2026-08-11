@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260805-storage-layout-toolbar-03';
+  const VERSION = '20260810-front-release-01';
   const MODULE_CLASS = 'storage-raid-route-host';
   const stage = root?.closest('.console-stage');
   const ENDPOINT = '/api/v1/storage/raid';
@@ -218,7 +218,7 @@ export function mount(context = {}) {
       if (!state.mounted || seq !== state.seq) return;
       state.loading = false;
       state.refreshing = false;
-      render();
+      if (background) renderPreservingInteraction(); else render();
     }
   }
 
@@ -343,7 +343,7 @@ export function mount(context = {}) {
       : options.multiline
         ? `<textarea data-raid-draft="${escapeHtml(path)}" maxlength="${escapeHtml(options.maxlength || 256)}" placeholder="${escapeHtml(options.placeholder || '')}">${escapeHtml(value || '')}</textarea>`
         : `<input data-raid-draft="${escapeHtml(path)}" value="${escapeHtml(value || '')}" placeholder="${escapeHtml(options.placeholder || '')}" ${options.maxlength ? `maxlength="${escapeHtml(options.maxlength)}"` : ''}>`;
-    return `<label class="raid-field ${options.wide ? 'is-wide' : ''}"><span>${escapeHtml(label)}</span>${control}${options.help ? `<small>${escapeHtml(options.help)}</small>` : ''}</label>`;
+    return `<label class="raid-field dwrt-kit-field ${options.wide ? 'is-wide' : ''}" data-dwrt-component="field"><span>${escapeHtml(label)}</span>${control}${options.help ? `<small>${escapeHtml(options.help)}</small>` : ''}</label>`;
   }
 
   function selectedMemberCount() {
@@ -370,7 +370,7 @@ export function mount(context = {}) {
   function createDrawerBody() {
     const info = levelInfo(state.editor.level);
     const eligible = state.disks.filter((disk) => disk.eligible && !disk.in_use && !disk.system).length;
-    return `<div class="raid-form">${field('RAID 名称', 'name', state.editor.name, { wide: true, placeholder: '例如 data-array', maxlength: 64 })}${field('RAID 类型', 'level', state.editor.level, { wide: true, options: supportedLevelEntries().map(([id, item]) => [id, item.label]) })}</div><div class="raid-level-description"><strong>${escapeHtml(info.label)} · 至少 ${info.min} 块磁盘${info.even ? ' · 成员数须为偶数' : ''}</strong><span>${escapeHtml(info.description)}</span></div><section class="raid-member-section"><header><strong>磁盘阵列成员</strong><span>已选择 ${selectedMemberCount()} 块 · ${eligible} 块可用</span></header><div class="raid-disk-list">${state.disks.length ? state.disks.map(diskChoiceMarkup).join('') : '<div class="raid-disk-empty">后端尚未返回可用物理磁盘。USB 磁盘是否允许加入阵列必须由后端按设备稳定性明确标记。</div>'}</div></section><label class="raid-format-row"><input type="checkbox" data-raid-format ${state.editor.format ? 'checked' : ''}><span><strong>清除成员磁盘上的现有分区与文件系统签名</strong><small>创建阵列会破坏所选磁盘上的数据。后端必须再次确认并以事务方式执行。</small></span></label><div class="raid-form">${field('备注', 'note', state.editor.note, { wide: true, multiline: true, maxlength: 64, placeholder: '可选，最多 64 个字符' })}</div>${!hasCapability('create') ? '<div class="raid-capability">后端创建能力尚未开放。当前表单不会写入浏览器本地数据或直接调用 mdadm。</div>' : ''}${state.notice ? noticeMarkup() : ''}`;
+    return `<div class="raid-form">${field('RAID 名称', 'name', state.editor.name, { wide: true, placeholder: '例如 data-array', maxlength: 64 })}${field('RAID 类型', 'level', state.editor.level, { wide: true, options: supportedLevelEntries().map(([id, item]) => [id, item.label]) })}</div><div class="raid-level-description"><strong>${escapeHtml(info.label)} · 至少 ${info.min} 块磁盘${info.even ? ' · 成员数须为偶数' : ''}</strong><span>${escapeHtml(info.description)}</span></div><section class="raid-member-section"><header><strong>磁盘阵列成员</strong><span>已选择 ${selectedMemberCount()} 块 · ${eligible} 块可用</span></header><div class="raid-disk-list">${state.disks.length ? state.disks.map(diskChoiceMarkup).join('') : '<div class="raid-disk-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="dense-surface">后端尚未返回可用物理磁盘。USB 磁盘是否允许加入阵列必须由后端按设备稳定性明确标记。</div>'}</div></section><label class="raid-format-row"><input type="checkbox" data-raid-format ${state.editor.format ? 'checked' : ''}><span><strong>清除成员磁盘上的现有分区与文件系统签名</strong><small>创建阵列会破坏所选磁盘上的数据。后端必须再次确认并以事务方式执行。</small></span></label><div class="raid-form">${field('备注', 'note', state.editor.note, { wide: true, multiline: true, maxlength: 64, placeholder: '可选，最多 64 个字符' })}</div>${!hasCapability('create') ? '<div class="raid-capability">后端创建能力尚未开放。当前表单不会写入浏览器本地数据或直接调用 mdadm。</div>' : ''}${state.notice ? noticeMarkup() : ''}`;
   }
 
   function detailPair(label, value, options = {}) {
@@ -378,16 +378,16 @@ export function mount(context = {}) {
   }
 
   function detailDrawerBody(item) {
-    if (!item) return '<div class="raid-disk-empty">找不到该 RAID 阵列</div>';
+    if (!item) return '<div class="raid-disk-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="dense-surface">找不到该 RAID 阵列</div>';
     const level = levelInfo(item.level);
     const [statusLabel] = statusInfo(item.status);
-    const members = item.members.length ? item.members.map((member) => `<div class="raid-detail-member"><span class="raid-disk-icon">${icon('disk')}</span><span><strong>${escapeHtml(member.device || member.id)}</strong><small>${escapeHtml([member.model, member.serial, statusInfo(member.status)[0]].filter(Boolean).join(' · '))}</small></span></div>`).join('') : '<div class="raid-disk-empty">后端未返回阵列成员</div>';
+    const members = item.members.length ? item.members.map((member) => `<div class="raid-detail-member"><span class="raid-disk-icon">${icon('disk')}</span><span><strong>${escapeHtml(member.device || member.id)}</strong><small>${escapeHtml([member.model, member.serial, statusInfo(member.status)[0]].filter(Boolean).join(' · '))}</small></span></div>`).join('') : '<div class="raid-disk-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="dense-surface">后端未返回阵列成员</div>';
     const progress = item.status === 'syncing' ? `<section class="raid-sync"><header><strong>${escapeHtml(item.action || '阵列同步')}</strong><span>${Math.min(100, item.sync_percent).toFixed(1)}%</span></header><div><i style="width:${Math.min(100, Math.max(0, item.sync_percent))}%"></i></div></section>` : '';
     return `<dl class="raid-detail-list">${detailPair('设备', item.device, { code: true })}${detailPair('状态', statusLabel)}${detailPair('RAID 类型', level.label)}${detailPair('可用容量', formatBytes(item.size_bytes))}${detailPair('文件系统', item.filesystem)}${detailPair('挂载点', item.mount_point, { code: true })}${detailPair('备注', item.note)}</dl>${progress}<section class="raid-detail-members"><header><strong>磁盘成员</strong><span>${item.members.length} 块</span></header>${members}</section>${state.notice ? noticeMarkup() : ''}`;
   }
 
   function recoveryDrawerBody() {
-    return `<div class="raid-recovery-copy"><span class="raid-recovery-icon">${icon('recover')}</span><div><strong>扫描未组装的 RAID 元数据</strong><p>用于系统重启、重置或设备节点变化后重新发现已有阵列。扫描和恢复不得初始化、格式化或覆盖成员磁盘。</p></div></div><div class="raid-recovery-list">${state.recoverable.length ? state.recoverable.map((item) => `<article><div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml([item.device, levelInfo(item.level).label, `${item.members.length} 块成员`, formatBytes(item.size_bytes)].filter(Boolean).join(' · '))}</span></div><button class="policy-primary" type="button" data-raid-recover="${escapeHtml(item.id)}" ${hasCapability('recover', item) && !state.saving ? '' : 'disabled'}>恢复阵列</button></article>`).join('') : `<div class="raid-disk-empty">${hasCapability('scan') ? '尚未发现可恢复的 RAID 阵列' : '后端扫描与恢复能力尚未开放'}</div>`}</div>${state.notice ? noticeMarkup() : ''}`;
+    return `<div class="raid-recovery-copy"><span class="raid-recovery-icon">${icon('recover')}</span><div><strong>扫描未组装的 RAID 元数据</strong><p>用于系统重启、重置或设备节点变化后重新发现已有阵列。扫描和恢复不得初始化、格式化或覆盖成员磁盘。</p></div></div><div class="raid-recovery-list">${state.recoverable.length ? state.recoverable.map((item) => `<article><div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml([item.device, levelInfo(item.level).label, `${item.members.length} 块成员`, formatBytes(item.size_bytes)].filter(Boolean).join(' · '))}</span></div><button class="policy-primary" type="button" data-raid-recover="${escapeHtml(item.id)}" ${hasCapability('recover', item) && !state.saving ? '' : 'disabled'}>恢复阵列</button></article>`).join('') : `<div class="raid-disk-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="dense-surface">${hasCapability('scan') ? '尚未发现可恢复的 RAID 阵列' : '后端扫描与恢复能力尚未开放'}</div>`}</div>${state.notice ? noticeMarkup() : ''}`;
   }
 
   function detailFooter(item) {
@@ -409,29 +409,40 @@ export function mount(context = {}) {
     return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-raid-close aria-label="关闭 RAID 面板"></button><aside class="raid-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" aria-label="${escapeHtml(drawerTitle())}"><header class="dwrt-kit-sheet-header"><div><span>RAID</span><strong>${escapeHtml(drawerTitle())}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-raid-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body raid-drawer-body">${body}</div><footer class="dwrt-kit-sheet-footer raid-drawer-footer">${footer}</footer></aside>`;
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', MODULE_CLASS);
-    root.innerHTML = `<section class="raid-shell">${noticeMarkup()}<main class="raid-workbench">${tableMarkup()}</main>${drawerMarkup()}</section>`;
-    ui.mountAll?.(root);
+    target.innerHTML = `<section class="raid-shell">${noticeMarkup()}<main class="raid-workbench">${tableMarkup()}</main>${drawerMarkup()}</section>`;
+    ui.mountAll?.(target);
   }
 
+  /*
+   * 搜索框每敲一个字都会重画表格，所以这里最容易看出问题。
+   *
+   * 原来的做法是 `current.replaceWith(next)` 再把 scrollLeft/scrollTop 复位：节点换了身份，
+   * 滚动靠事后补救、焦点直接从搜索框掉出去（Acceptance P0 单点名的「保留 scrollTop 但没保
+   * 焦点」就是这一类）。改走 kit 的共享入口，节点原地 patch，焦点与光标位置都不用救。
+   */
   function patchTable() {
-    const current = root?.querySelector('.raid-table-card');
-    if (!current) { render(); return; }
-    const scroll = current.querySelector('.dwrt-kit-table-scroll');
-    const left = scroll?.scrollLeft || 0;
-    const top = scroll?.scrollTop || 0;
-    const template = document.createElement('template');
-    template.innerHTML = tableMarkup();
-    const next = template.content.firstElementChild;
-    if (!next) return;
-    current.replaceWith(next);
-    const nextScroll = next.querySelector('.dwrt-kit-table-scroll');
-    if (nextScroll) { nextScroll.scrollLeft = left; nextScroll.scrollTop = top; }
-    ui.mountAll?.(next);
+    if (!root?.querySelector('.raid-table-card')) { render(); return; }
+    renderPreservingInteraction();
   }
 
   function closeDrawer() {

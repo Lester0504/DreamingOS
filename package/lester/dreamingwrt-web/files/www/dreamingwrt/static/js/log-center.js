@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '20260804-native-plugin-menu-merge-01';
+  const VERSION = '20260810-front-release-01';
   const REFRESH_MS = 30000;
   const SEARCH_DEBOUNCE_MS = 650;
   const DEFAULT_PAGE_SIZE = 25;
@@ -1347,9 +1347,8 @@
     }
 
     function switchMarkup(name, label, checked) {
-      return `<label class="log-settings-switch">
+      return `<label class="log-settings-switch dwrt-kit-switch" data-dwrt-component="switch">
         <input type="checkbox" name="${html(name)}" ${checked ? 'checked' : ''}>
-        <span aria-hidden="true"></span>
         <strong>${html(label)}</strong>
       </label>`;
     }

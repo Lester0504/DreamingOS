@@ -10,7 +10,7 @@ export function mount(context = {}) {
     return { name, ok: response.ok && json?.ok !== false, data: json?.data ?? json, raw: json };
   });
 
-  const VERSION = '20260809-routing-empty-cell-semantics-01';
+  const VERSION = '20260810-front-release-01';
   const POLICY_ENDPOINT = '/api/v1/policy-engine/policy-table';
   const ROUTING_ENDPOINT = '/api/v1/routing';
   const RESOURCE_ENDPOINTS = {
@@ -222,11 +222,16 @@ export function mount(context = {}) {
     else if (key === 'cross') state.crossServices = asArray(data).map(normalizeCross).filter((item) => item.id);
     else if (key === 'external') state.externalPolicies = asArray(data).map((item) => ({ ...item, read_only: true }));
   }
-  async function load() {
+  /* background=true 是那条 20s 轮询：不打 loading 态、刷新走保状态路径。 */
+  async function load(background = false) {
     const seq = ++state.seq;
-    state.loading = true;
-    state.errors = {};
-    render();
+    if (!background) {
+      state.loading = true;
+      state.errors = {};
+      render();
+    } else {
+      state.errors = {};
+    }
     const requests = {
       snapshot: fetchApi('routing-snapshot', ROUTING_ENDPOINT),
       policies: fetchApi('routing-policy-table', `${POLICY_ENDPOINT}?include_default=0`),
@@ -244,7 +249,7 @@ export function mount(context = {}) {
       else state.errors[key] = result.status === 'rejected' ? firstText(result.reason?.message, '读取失败') : firstText(result.value?.raw?.message, result.value?.raw?.error, '读取失败');
     });
     state.loading = false;
-    render();
+    if (background) renderPreservingInteraction(); else render();
   }
   function formatTime(value) {
     const raw = Number(value) || 0;
@@ -398,7 +403,7 @@ export function mount(context = {}) {
     return `<label class="routing-field ${options.wide ? 'is-wide' : ''}"><span>${escapeHtml(label)}</span>${control}</label>`;
   }
   function switchField(label, description, checked, disabled = false) {
-    return `<label class="routing-switch" data-dwrt-component="switch"><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(description)}</small></span><input type="checkbox" data-routing-field-check="enabled" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}><i></i></label>`;
+    return `<label class="routing-switch dwrt-kit-switch" data-dwrt-component="switch"><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(description)}</small></span><input type="checkbox" data-routing-field-check="enabled" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}></label>`;
   }
   function editorFieldsMarkup() {
     const editor = state.editor;
@@ -438,14 +443,24 @@ export function mount(context = {}) {
       cancelLabel: '取消', confirmLabel: state.saving ? '正在删除' : '确认删除', disabled: state.saving
     });
   }
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：轮询整树重绘会把滚动、焦点、
+   * 选区一起丢掉）。用户主动操作仍走 render()。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', MODULE_CLASS);
-    root.innerHTML = `<section class="routing-table-shell" data-routing-version="${VERSION}">${toolbarMarkup()}<main class="routing-workbench">${state.notice && !state.drawer ? noticeMarkup() : ''}${contentMarkup()}</main>${drawerMarkup()}${confirmationMarkup()}</section>`;
-    bindEvents();
-    ui.mountAll?.(root);
+    target.innerHTML = `<section class="routing-table-shell" data-routing-version="${VERSION}">${toolbarMarkup()}<main class="routing-workbench">${state.notice && !state.drawer ? noticeMarkup() : ''}${contentMarkup()}</main>${drawerMarkup()}${confirmationMarkup()}</section>`;
+    bindEvents(target);
+    ui.mountAll?.(target);
   }
   function defaultEditor(kind) {
     if (kind === 'table') return { id: '', name: '', table_id: '', role: '', gateway: '', metric: 0, enabled: true };
@@ -523,24 +538,25 @@ export function mount(context = {}) {
       state.resolving = false; state.resolution = null; state.notice = errorText(error, '解析失败：'); render();
     }
   }
-  function bindEvents() {
-    root.querySelectorAll('[data-routing-tab]').forEach((button) => button.addEventListener('click', () => { state.tab = button.dataset.routingTab; state.query = ''; state.notice = ''; render(); }));
-    root.querySelectorAll('[data-routing-create]').forEach((button) => button.addEventListener('click', () => openCreate(button.dataset.routingCreate)));
-    root.querySelectorAll('[data-routing-open]').forEach((button) => button.addEventListener('click', () => openItem(button.dataset.routingOpen, button.dataset.routingId)));
-    root.querySelectorAll('[data-routing-close]').forEach((button) => button.addEventListener('click', closeDrawer));
-    root.querySelectorAll('[data-routing-field]').forEach((input) => input.addEventListener('input', () => { state.editor[input.dataset.routingField] = input.type === 'number' ? Number(input.value) : input.value; state.notice = ''; }));
-    root.querySelectorAll('[data-routing-field-check]').forEach((input) => input.addEventListener('change', () => { state.editor[input.dataset.routingFieldCheck] = input.checked; }));
-    root.querySelectorAll('[data-routing-save]').forEach((button) => button.addEventListener('click', saveEditor));
-    root.querySelectorAll('[data-routing-delete]').forEach((button) => button.addEventListener('click', () => { state.confirmDelete = true; render(); }));
-    root.querySelectorAll('[data-dwrt-confirm-cancel]').forEach((button) => button.addEventListener('click', () => { state.confirmDelete = false; render(); }));
-    root.querySelectorAll('[data-dwrt-confirm-accept]').forEach((button) => button.addEventListener('click', deleteEditor));
-    root.querySelectorAll('[data-routing-resolve-mode]').forEach((select) => select.addEventListener('change', () => { state.resolveMode = select.value; state.resolveValue = ''; state.resolution = null; render(); }));
-    root.querySelectorAll('[data-routing-resolve-value]').forEach((select) => select.addEventListener('change', () => { state.resolveValue = select.value; state.resolution = null; render(); }));
-    root.querySelectorAll('[data-routing-resolve]').forEach((button) => button.addEventListener('click', resolveRuntime));
-    root.querySelectorAll('[data-routing-search]').forEach((input) => input.addEventListener('input', () => {
+  /* render() 可能渲进离屏容器，事件必须绑到那个容器；缺省仍是真实 root。 */
+  function bindEvents(scope = root) {
+    scope.querySelectorAll('[data-routing-tab]').forEach((button) => button.addEventListener('click', () => { state.tab = button.dataset.routingTab; state.query = ''; state.notice = ''; render(); }));
+    scope.querySelectorAll('[data-routing-create]').forEach((button) => button.addEventListener('click', () => openCreate(button.dataset.routingCreate)));
+    scope.querySelectorAll('[data-routing-open]').forEach((button) => button.addEventListener('click', () => openItem(button.dataset.routingOpen, button.dataset.routingId)));
+    scope.querySelectorAll('[data-routing-close]').forEach((button) => button.addEventListener('click', closeDrawer));
+    scope.querySelectorAll('[data-routing-field]').forEach((input) => input.addEventListener('input', () => { state.editor[input.dataset.routingField] = input.type === 'number' ? Number(input.value) : input.value; state.notice = ''; }));
+    scope.querySelectorAll('[data-routing-field-check]').forEach((input) => input.addEventListener('change', () => { state.editor[input.dataset.routingFieldCheck] = input.checked; }));
+    scope.querySelectorAll('[data-routing-save]').forEach((button) => button.addEventListener('click', saveEditor));
+    scope.querySelectorAll('[data-routing-delete]').forEach((button) => button.addEventListener('click', () => { state.confirmDelete = true; render(); }));
+    scope.querySelectorAll('[data-dwrt-confirm-cancel]').forEach((button) => button.addEventListener('click', () => { state.confirmDelete = false; render(); }));
+    scope.querySelectorAll('[data-dwrt-confirm-accept]').forEach((button) => button.addEventListener('click', deleteEditor));
+    scope.querySelectorAll('[data-routing-resolve-mode]').forEach((select) => select.addEventListener('change', () => { state.resolveMode = select.value; state.resolveValue = ''; state.resolution = null; render(); }));
+    scope.querySelectorAll('[data-routing-resolve-value]').forEach((select) => select.addEventListener('change', () => { state.resolveValue = select.value; state.resolution = null; render(); }));
+    scope.querySelectorAll('[data-routing-resolve]').forEach((button) => button.addEventListener('click', resolveRuntime));
+    scope.querySelectorAll('[data-routing-search]').forEach((input) => input.addEventListener('input', () => {
       window.clearTimeout(searchTimer);
       const value = input.value;
-      searchTimer = window.setTimeout(() => { state.query = value; render(); root.querySelector('[data-routing-search]')?.focus(); }, 100);
+      searchTimer = window.setTimeout(() => { state.query = value; render(); scope.querySelector('[data-routing-search]')?.focus(); }, 100);
     }));
   }
 
@@ -555,7 +571,7 @@ export function mount(context = {}) {
     if (!state.mounted || document.hidden) return;
     if (state.loading || state.saving || state.resolving) return;
     if (state.drawer) return;
-    load();
+    load(true);
   }, 20000);
   return {
     unmount() {

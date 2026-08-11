@@ -186,10 +186,14 @@
 .user-auth-web-option > span:last-child svg { width: 17px; height: 17px; grid-row: 1 / 3; }
 .user-auth-web-option strong { font-size: 13px; font-weight: 680; }
 .user-auth-web-option small { color: var(--app-text-muted); font-size: 10px; line-height: 1.35; }
-.user-auth-web-checkbox .user-auth-switch { width: 22px; height: 22px; }
-.user-auth-web-checkbox .user-auth-switch i { border-radius: 5px; background: transparent; }
-.user-auth-web-checkbox .user-auth-switch i::after { top: 4px; left: 4px; width: 14px; height: 14px; border-radius: 3px; box-shadow: none; opacity: 0; }
-.user-auth-web-checkbox .user-auth-switch input:checked + i::after { transform: none; opacity: 1; }
+.user-auth-checkbox { position: relative; width: 22px; height: 22px; display: block; }
+.user-auth-checkbox input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; }
+.user-auth-checkbox i { position: absolute; inset: 0; border-radius: 5px; background: transparent; box-shadow: inset 0 0 0 1px rgba(255,255,255,.16); pointer-events: none; }
+.user-auth-checkbox i::after { content: ''; position: absolute; top: 4px; left: 4px; width: 14px; height: 14px; border-radius: 3px; background: #2e82ef; opacity: 0; }
+.user-auth-checkbox input:checked + i::after { opacity: 1; }
+.user-auth-checkbox input:focus-visible + i { box-shadow: 0 0 0 3px rgba(48,126,235,.22), inset 0 0 0 1px rgba(255,255,255,.16); }
+.user-auth-checkbox input:disabled { cursor: not-allowed; }
+.user-auth-checkbox input:disabled + i { opacity: .52; }
 
 .user-auth-web-form { display: grid; gap: 13px; padding: 14px 16px 18px; }
 .user-auth-web-field { min-width: 0; display: grid; gap: 6px; }
@@ -215,7 +219,7 @@
 .user-auth-web-field input:focus,
 .user-auth-web-field select:focus { border-color: rgba(76,150,252,.55); box-shadow: 0 0 0 3px rgba(48,126,235,.10); }
 .user-auth-web-checkline { min-height: 36px; display: flex; align-items: center; gap: 10px; font-size: 12px; cursor: pointer; }
-.user-auth-web-checkline .user-auth-switch { width: 38px; height: 22px; }
+.user-auth-web-checkline .user-auth-switch { flex: 0 0 auto; }
 
 .user-auth-web-choice { display: grid; gap: 7px; }
 .user-auth-web-choice > div { display: flex; flex-wrap: wrap; gap: 7px; }
@@ -501,13 +505,7 @@
 .user-auth-setting-row strong { font-size: 13px; font-weight: 720; }
 .user-auth-setting-row small { color: var(--app-text-muted); font-size: 11px; line-height: 1.4; }
 
-.user-auth-switch { position: relative; width: 42px; height: 24px; flex: 0 0 auto; }
-.user-auth-switch input { position: absolute; opacity: 0; pointer-events: none; }
-.user-auth-switch i { position: absolute; inset: 0; border-radius: 999px; background: rgba(125, 137, 154, .30); box-shadow: inset 0 0 0 1px rgba(255,255,255,.12); transition: background 150ms ease; }
-.user-auth-switch i::after { content: ''; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 2px 7px rgba(0,0,0,.28); transition: transform 150ms ease; }
-.user-auth-switch input:checked + i { background: #2e82ef; }
-.user-auth-switch input:checked + i::after { transform: translateX(18px); }
-.user-auth-switch input:disabled + i { opacity: .52; }
+.user-auth-switch { flex: 0 0 auto; }
 
 .user-auth-detail-list { margin: 0; display: grid; }
 .user-auth-detail-list > div { min-height: 52px; display: grid; grid-template-columns: minmax(105px, .42fr) minmax(0, 1fr); align-items: center; gap: 14px; border-bottom: 1px solid rgba(255,255,255,.075); }
@@ -661,11 +659,6 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
   .user-auth-web-savebar button { flex: 1; }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .user-auth-switch i,
-  .user-auth-switch i::after { transition: none; }
-}
-
 /* Client rate-limit page: same workbench, table, Sheet and sampled material as authentication. */
 .client-speed-limit-route-host { min-height: 0; }
 .client-speed-shell { min-height: 0; height: 100%; grid-template-rows: auto minmax(0, 1fr); }
@@ -687,7 +680,7 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
 /* IP 占位卡按内容高度，不吃剩余空间：它只有三段文字，撑满整屏会显得像加载失败。 */
 .client-speed-shell > .user-auth-workbench > .client-speed-ip-card { flex: 0 0 auto; min-height: 0; }
 .client-speed-header { flex: 0 0 auto; min-width: 0; }
-.client-speed-tabs { width: max-content; max-width: 100%; }
+/* 页面级 tab 已收敛到 kit 的 .dwrt-kit-page-tabs（62px + fit-content），不再由本页定几何。 */
 
 .client-speed-ip-card { min-width: 0; padding: 0; }
 .client-speed-ip-body {

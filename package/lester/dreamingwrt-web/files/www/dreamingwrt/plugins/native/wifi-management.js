@@ -1,4 +1,4 @@
-const VERSION = '20260805-wifi-ap-management-tab-01';
+const VERSION = '20260810-front-release-01';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -72,7 +72,7 @@ export function mount(context = {}) {
     },
     columnEditor: '',
     statusFiltersReady: false,
-    environmentHistory: { points: [], reason: 'not_loaded', resolution_seconds: 0, loading: false, error: '' },
+    environmentHistory: { points: [], reason: 'not_loaded', resolution_seconds: 0, latest_received_at: 0, loading: false, error: '' },
     environmentHistorySeq: 0,
     connectivityEvents: { items: [], reason: 'not_loaded', loading: false, error: '' },
     connectivityEventsSeq: 0,
@@ -137,6 +137,17 @@ export function mount(context = {}) {
     return null;
   }
 
+  /* 后端的平均值是未取整的浮点（avg_signal_dbm 会给 -42.666666666666664），
+     直接落进表格会挤破列宽。null 仍然返回 null，交给调用方按 reason 呈现，
+     绝不折叠成 0。 */
+  function metricValue(value, unit = '', digits = 1) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    if (!Number.isFinite(number)) return null;
+    const rounded = Number.isInteger(number) ? String(number) : String(Number(number.toFixed(digits)));
+    return unit ? `${rounded} ${unit}`.trim() : rounded;
+  }
+
   function bool(value, fallback = false) {
     if (value === undefined || value === null || value === '') return fallback;
     if (typeof value === 'string') return !['0', 'false', 'off', 'no', 'disabled', 'down'].includes(value.toLowerCase());
@@ -184,12 +195,19 @@ export function mount(context = {}) {
     };
   }
 
+  /*
+   * 频段归一。认不出来的值一律返回空，**不原样透出**：
+   * 30.1 的 capabilities.bands 实测是 ['3']、radios[].band 也出现 '3'（QSDK 数字编码），
+   * 原先最后一行 `return text || ''` 会把 '3' 当成一个合法频段传下去，于是频段筛选器里
+   * 冒出一个名为「3」的伪频段、编辑抽屉的复选框也会按它判定可用性。
+   * 数字编码应由后端先归一（见配套后端单），前端这里只做保守判定：认识才认，不猜。
+   */
   function normalizeBand(value) {
     const text = String(value || '').toLowerCase().replace(/\s/g, '');
     if (['2g', '2.4g', '2.4ghz', 'ng', '11ng', 'radio0'].includes(text) || text.includes('2.4')) return '2g';
     if (['5g', '5ghz', 'na', '11ac', '11ax', 'radio1'].includes(text) || text.startsWith('5')) return '5g';
     if (['6g', '6ghz', '11be', 'radio2'].includes(text) || text.startsWith('6')) return '6g';
-    return text || '';
+    return '';
   }
 
   // Driver/regdb channel truth from the APD iw-phy channel_catalog.
@@ -241,14 +259,21 @@ export function mount(context = {}) {
       utilization_reason: firstText(radio.channel_utilization_reason, radio.utilization_reason, runtime.channel_utilization_reason, ''),
       utilization_source: firstText(radio.channel_utilization_source, runtime.channel_utilization_source, ''),
       interference: firstNumber(radio.interference, radio.external_interference, runtime.interference),
-      avg_interference: optionalNumber(radio.avg_interference, radio.average_interference, runtime.avg_interference, runtime.average_interference),
+      // 后端字段带单位后缀：avg_interference_pct（0..100）、avg_signal_dbm。
+      // 此前只读无后缀名，真机上 AP 在线且有实数据时这两列仍恒为 "--"。
+      avg_interference: optionalNumber(radio.avg_interference, radio.avg_interference_pct, radio.average_interference, runtime.avg_interference, runtime.avg_interference_pct, runtime.average_interference),
+      avg_interference_source: firstText(radio.avg_interference_source, runtime.avg_interference_source, ''),
+      avg_interference_reason: firstText(radio.avg_interference_reason, runtime.avg_interference_reason, ''),
       retry_rate: firstNumber(radio.retry_rate, radio.tx_retry, runtime.retry_rate),
       noise: optionalNumber(radio.noise_dbm, radio.noise, radio.noise_floor, runtime.noise_dbm, runtime.noise, runtime.noise_floor),
       noise_reason: firstText(radio.noise_reason, runtime.noise_reason, ''),
       noise_source: firstText(radio.noise_source, runtime.noise_source, ''),
       tx_power_mode_reason: firstText(radio.tx_power_mode_reason, runtime.tx_power_mode_reason, ''),
-      avg_signal: firstText(radio.avg_signal, radio.average_signal, radio.signal, runtime.avg_signal, runtime.average_signal),
-      past_24h: firstText(radio.past_24h, radio.last_24h, radio.history_24h, runtime.past_24h, runtime.last_24h),
+      avg_signal: optionalNumber(radio.avg_signal, radio.avg_signal_dbm, radio.average_signal, radio.signal, runtime.avg_signal, runtime.avg_signal_dbm, runtime.average_signal),
+      avg_signal_reason: firstText(radio.avg_signal_reason, runtime.avg_signal_reason, ''),
+      avg_signal_source: firstText(radio.avg_signal_source, runtime.avg_signal_source, ''),
+      past_24h: firstText(radio.past_24h, radio.last_24h, radio.history_24h, runtime.past_24h, runtime.last_24h, runtime.history_24h),
+      past_24h_reason: firstText(radio.history_24h_reason, radio.past_24h_reason, runtime.history_24h_reason, runtime.past_24h_reason, ''),
       mimo: firstText(radio.mimo, radio.spatial_streams, runtime.mimo, ''),
       type: firstText(radio.uplink_type, radio.connection_type, runtime.uplink_type, runtime.connection_type),
       enabled: bool(radio.enabled, true),
@@ -417,7 +442,19 @@ export function mount(context = {}) {
       network: firstText(ssid.network, ssid.lan, ssid.network_name, 'lan'),
       broadcast: firstText(ssid.broadcast, ssid.ap_group, ssid.broadcasting_aps, '全部 AP'),
       broadcast_mode: firstText(ssid.broadcast_mode, 'all'),
-      bands: bands.length ? bands : ['2g', '5g'],
+      /*
+       * 后端没给频段就是空，绝不补默认值。原先这里写 `bands.length ? bands : ['2g','5g']`,
+       * 而 GET /api/v1/wifi/config 的 SSID 对象里 bands / radio_bands / wlan_bands 三个键
+       * 都不存在、band 也是 null，于是 14 个 SSID 一律亮起「2.4 GHz + 5 GHz」两个徽章 ——
+       * 一个后端数据里毫无依据的双频事实，且与真实数据无法区分。
+       *
+       * 真实频段在 ac/aps 的 runtime.snapshot.ssids[].band 里（每条只属单一频段），
+       * 但那套 id 是运行态 VAP 名（ath0/ath11/ath21），与本端点的 UCI 段名
+       * （ath0/wifinet0）只有 3/14 能对上；按 SSID 名合并更不行 —— 同名 SSID 确实跨频段
+       * （Xiaomi_DE23 同时存在 2.4/5/6GHz 三条 VAP），按名字并起来等于换一种方式编造。
+       * 所以在后端把 band 写进本端点之前，这里保持空值，由渲染层显示 --。
+       */
+      bands,
       clients: firstNumber(ssid.clients, ssid.station_count),
       enabled: bool(ssid.enabled, true),
       security,
@@ -459,6 +496,11 @@ export function mount(context = {}) {
         bands,
         save_config: bool(caps.save_config ?? caps.config_write ?? caps.update, false),
         apply_config: bool(caps.apply_config ?? caps.apply, false),
+        /* 逐 scope 的原因（local / managed_ap 各一条），置灰提示要按 scope 说明，
+           不能用一句笼统的"没有能力"盖掉两种不同原因。展开 ...caps 已经带进了这个键，
+           这里显式保留是为了让契约可见、并挡住后续 normalize 覆盖。 */
+        write_scopes: caps.write_scopes && typeof caps.write_scopes === 'object' ? caps.write_scopes : {},
+        reasons: caps.reasons && typeof caps.reasons === 'object' ? caps.reasons : {},
         scan: bool(caps.scan ?? caps.airtime_scan, false)
       },
       regdomains: asArray(source.regdomains || source.regions),
@@ -536,12 +578,17 @@ export function mount(context = {}) {
         points: asArray(payload.points),
         reason: firstText(payload.reason, asArray(payload.points).length ? 'available' : 'no_samples'),
         resolution_seconds: firstNumber(payload.resolution_seconds),
+        /* 后端 ac_db_survey_history_json() 只统计**查询窗口内**命中行的最大
+           last_received_at，窗口内没有行时它就是 null。所以这个值能回答"最近一次采集
+           有多旧"，但不能回答"窗口外是否还存着更老的数据"——后者要另开一次更宽的查询，
+           前端不假装知道。 */
+        latest_received_at: firstNumber(payload.latest_received_at),
         loading: false,
         error: ''
       };
     } catch (error) {
       if (!state.mounted || seq !== state.environmentHistorySeq) return;
-      state.environmentHistory = { points: [], reason: 'request_failed', resolution_seconds: 0, loading: false, error: firstText(error.message, '读取失败') };
+      state.environmentHistory = { points: [], reason: 'request_failed', resolution_seconds: 0, latest_received_at: 0, loading: false, error: firstText(error.message, '读取失败') };
     }
     patchLiveRegion();
   }
@@ -798,7 +845,12 @@ export function mount(context = {}) {
 
   function bandLabel(band) { return ({ '2g': '2.4 GHz', '5g': '5 GHz', '6g': '6 GHz' })[band] || band || '--'; }
   function securityLabel(value) { return SECURITY.find(([id]) => id === value)?.[1] || value || '--'; }
-  function bandPills(bands) { return (bands || []).map((band) => `<span class="wifi-band-pill is-${escapeHtml(band)}">${escapeHtml(bandLabel(band))}</span>`).join(''); }
+  /* 没有可靠频段来源时显示 --，让「后端没给」和「真的是某个频段」在界面上可区分。 */
+  function bandPills(bands) {
+    const list = (bands || []).filter(Boolean);
+    if (!list.length) return '<span class="wifi-band-unknown">--</span>';
+    return list.map((band) => `<span class="wifi-band-pill is-${escapeHtml(band)}">${escapeHtml(bandLabel(band))}</span>`).join('');
+  }
 
   function deviceImage(device = {}, className = 'airview-device-image') {
     const shared = window.DWRT_DEVICE_IMAGES;
@@ -871,7 +923,7 @@ export function mount(context = {}) {
   }
 
   function channelPlan() {
-    return `<section class="wifi-panel-section"><header class="wifi-section-head"><div><strong>信道计划</strong><small>点击信道以将其从使用中排除</small></div></header><div class="wifi-channel-scroll">${BANDS.map(channelPlanBand).join('')}</div><div class="wifi-channel-legend"><span class="using">使用中</span><span class="enabled">已启用</span><span class="dfs">DFS</span><span class="unavailable">不可用</span><span class="excluded">已排除</span></div><button class="wifi-link-button" type="button" data-wifi-reset-channels ${canConfigWrite() ? '' : 'disabled'}>恢复默认</button></section>`;
+    return `<section class="wifi-panel-section"><header class="wifi-section-head"><div><strong>信道计划</strong><small>${escapeHtml(canConfigWrite() ? '点击信道以将其从使用中排除' : `只读：${configWriteGateNote() || '后端未开放信道写入'}`)}</small></div></header><div class="wifi-channel-scroll">${BANDS.map(channelPlanBand).join('')}</div><div class="wifi-channel-legend"><span class="using">使用中</span><span class="enabled">已启用</span><span class="dfs">DFS</span><span class="unavailable">不可用</span><span class="excluded">已排除</span></div><button class="wifi-link-button" type="button" data-wifi-reset-channels ${canConfigWrite() ? '' : 'disabled'}>恢复默认</button></section>`;
   }
 
   function defaultSpeed() {
@@ -882,7 +934,7 @@ export function mount(context = {}) {
       ['5g', '5 GHz', [20, 40, 80, 160]],
       ['6g', '6 GHz', [20, 40, 80, 160, 320]]
     ];
-    return `<section class="wifi-panel-section wifi-unifi-global"><div class="wifi-unifi-setting-grid"><div class="wifi-unifi-label"><strong>默认 Wi-Fi 速度</strong><small>为全部 AP 设置默认信道宽度策略。</small></div><div class="wifi-speed-controls"><div class="wifi-radio-options">${[['maximum', '最高速度'], ['conservative', '保守'], ['custom', '自定义']].map(([value, label]) => `<label><input type="radio" name="wifi-speed-profile" value="${value}" data-wifi-setting="global.speed_profile" ${profile === value ? 'checked' : ''} ${canConfigWrite() ? '' : 'disabled'}><span>${label}</span></label>`).join('')}<button class="wifi-link-button is-inline" type="button" data-wifi-apply-all ${canConfigWrite() ? '' : 'disabled'}>应用于所有 AP</button></div><div class="wifi-width-picker"><strong>信道宽度 (MHz)</strong><div>${bands.map(([band, label, options]) => `<fieldset><legend>${label}</legend><span>${options.map((width) => `<button type="button" class="${Number(widths[band]) === width ? 'is-active' : ''}" data-wifi-width-band="${band}" data-wifi-width="${width}" ${canConfigWrite() ? '' : 'disabled'}>${width}</button>`).join('')}</span></fieldset>`).join('')}</div></div>${switchRow('global.dfs_enabled', '扩展 5 GHz 频谱 (DFS)', '允许自动信道使用 DFS 频段。', state.config.global.dfs_enabled, !canConfigWrite())}</div></div></section>`;
+    return `<section class="wifi-panel-section wifi-unifi-global"><div class="wifi-unifi-setting-grid"><div class="wifi-unifi-label"><strong>默认 Wi-Fi 速度</strong><small>${escapeHtml(canConfigWrite() ? '为全部 AP 设置默认信道宽度策略。' : `只读：${configWriteGateNote() || '后端未开放全局写入'}`)}</small></div><div class="wifi-speed-controls"><div class="wifi-radio-options">${[['maximum', '最高速度'], ['conservative', '保守'], ['custom', '自定义']].map(([value, label]) => `<label><input type="radio" name="wifi-speed-profile" value="${value}" data-wifi-setting="global.speed_profile" ${profile === value ? 'checked' : ''} ${canConfigWrite() ? '' : 'disabled'}><span>${label}</span></label>`).join('')}<button class="wifi-link-button is-inline" type="button" data-wifi-apply-all ${canConfigWrite() ? '' : 'disabled'}>应用于所有 AP</button></div><div class="wifi-width-picker"><strong>信道宽度 (MHz)</strong><div>${bands.map(([band, label, options]) => `<fieldset><legend>${label}</legend><span>${options.map((width) => `<button type="button" class="${Number(widths[band]) === width ? 'is-active' : ''}" data-wifi-width-band="${band}" data-wifi-width="${width}" ${canConfigWrite() ? '' : 'disabled'}>${width}</button>`).join('')}</span></fieldset>`).join('')}</div></div>${switchRow('global.dfs_enabled', '扩展 5 GHz 频谱 (DFS)', '允许自动信道使用 DFS 频段。', state.config.global.dfs_enabled, !canConfigWrite())}</div></div></section>`;
   }
 
   function globalSettings() {
@@ -900,7 +952,7 @@ export function mount(context = {}) {
     const global = state.config.global;
     const disabled = !canConfigWrite();
     const regions = state.config.regdomains.length ? state.config.regdomains : [{ code: global.country || 'CN', name: global.country || 'CN' }];
-    return `<section class="wifi-panel-section"><header class="wifi-section-head"><div><strong>Dreaming OS 扩展设置</strong><small>OpenWrt、hostapd 与 QCA 驱动提供的附加配置维度。</small></div></header><div class="wifi-extension-grid"><label class="wifi-field"><span>地区码</span><select data-wifi-setting="global.country" ${disabled ? 'disabled' : ''}>${regions.map((region) => `<option value="${escapeHtml(region.code)}" ${String(region.code) === String(global.country) ? 'selected' : ''}>${escapeHtml(`${region.code} · ${region.name || region.code}`)}</option>`).join('')}</select><small>最终合法信道以后端 regdb 与驱动裁剪结果为准。</small></label><label class="wifi-field"><span>5 GHz 漫游阈值</span><div class="wifi-field-unit"><input type="number" min="-95" max="-45" data-wifi-setting="global.roam_threshold" value="${firstNumber(global.roam_threshold, -75)}" ${disabled ? 'disabled' : ''}><b>dBm</b></div></label></div><div class="wifi-settings-list two-columns">${switchRow('global.band_steering', '频段引导', '引导兼容终端优先使用高频段。', global.band_steering, disabled)}${switchRow('global.fast_roaming', '快速漫游', '启用 802.11k/v 的全局默认值。', global.fast_roaming, disabled)}${switchRow('global.mlo', 'MLO', 'Wi-Fi 7 多链路操作，需至少两个 Radio。', global.mlo, disabled)}${switchRow('global.airtime_fairness', 'Airtime Fairness', '避免低速终端长期占用空口。', global.airtime_fairness, disabled)}${switchRow('global.multicast_enhance', '组播增强', '将部分无线组播转换为单播，降低空口占用。', global.multicast_enhance, disabled)}${switchRow('global.qca_rrm', 'RRM', '启用 QCA/OpenWrt 无线资源测量。', global.qca_rrm, disabled)}${switchRow('global.qca_qbssload', 'QBSS Load', '广播 BSS 负载辅助终端选择 AP。', global.qca_qbssload, disabled)}${switchRow('global.mu_beamformer', 'MU Beamformer', '启用支持硬件的多用户波束成形。', global.mu_beamformer, disabled)}${switchRow('global.doth', '802.11h / DFS', '启用频谱管理与雷达检测相关能力。', global.doth, disabled)}${switchRow('global.sae_pwe', 'SAE PWE', '使用 WPA3 SAE H2E/兼容模式。', global.sae_pwe, disabled)}${switchRow('global.roam_assist', '漫游辅助', '根据阈值辅助低信号终端重新关联。', global.roam_assist, disabled)}</div></section>`;
+    return `<section class="wifi-panel-section"><header class="wifi-section-head"><div><strong>Dreaming OS 扩展设置</strong><small>OpenWrt、hostapd 与 QCA 驱动提供的附加配置维度。</small></div></header><div class="wifi-extension-grid"><label class="wifi-field dwrt-kit-field" data-dwrt-component="field"><span>地区码</span><select data-wifi-setting="global.country" ${disabled ? 'disabled' : ''}>${regions.map((region) => `<option value="${escapeHtml(region.code)}" ${String(region.code) === String(global.country) ? 'selected' : ''}>${escapeHtml(`${region.code} · ${region.name || region.code}`)}</option>`).join('')}</select><small>最终合法信道以后端 regdb 与驱动裁剪结果为准。</small></label><label class="wifi-field dwrt-kit-field" data-dwrt-component="field"><span>5 GHz 漫游阈值</span><div class="wifi-field-unit"><input type="number" min="-95" max="-45" data-wifi-setting="global.roam_threshold" value="${firstNumber(global.roam_threshold, -75)}" ${disabled ? 'disabled' : ''}><b>dBm</b></div></label></div><div class="wifi-settings-list two-columns">${switchRow('global.band_steering', '频段引导', '引导兼容终端优先使用高频段。', global.band_steering, disabled)}${switchRow('global.fast_roaming', '快速漫游', '启用 802.11k/v 的全局默认值。', global.fast_roaming, disabled)}${switchRow('global.mlo', 'MLO', 'Wi-Fi 7 多链路操作，需至少两个 Radio。', global.mlo, disabled)}${switchRow('global.airtime_fairness', 'Airtime Fairness', '避免低速终端长期占用空口。', global.airtime_fairness, disabled)}${switchRow('global.multicast_enhance', '组播增强', '将部分无线组播转换为单播，降低空口占用。', global.multicast_enhance, disabled)}${switchRow('global.qca_rrm', 'RRM', '启用 QCA/OpenWrt 无线资源测量。', global.qca_rrm, disabled)}${switchRow('global.qca_qbssload', 'QBSS Load', '广播 BSS 负载辅助终端选择 AP。', global.qca_qbssload, disabled)}${switchRow('global.mu_beamformer', 'MU Beamformer', '启用支持硬件的多用户波束成形。', global.mu_beamformer, disabled)}${switchRow('global.doth', '802.11h / DFS', '启用频谱管理与雷达检测相关能力。', global.doth, disabled)}${switchRow('global.sae_pwe', 'SAE PWE', '使用 WPA3 SAE H2E/兼容模式。', global.sae_pwe, disabled)}${switchRow('global.roam_assist', '漫游辅助', '根据阈值辅助低信号终端重新关联。', global.roam_assist, disabled)}</div></section>`;
   }
 
   /*
@@ -1003,10 +1055,20 @@ export function mount(context = {}) {
     return `<div class="wifi-management-shell wifi-config-shell">${configNavigation()}${pageError ? `<div class="wifi-notice is-error">${icon('info')}<span>${escapeHtml(pageError)}</span></div>` : ''}${state.notice ? `<div class="wifi-notice ${state.noticeTone ? `is-${state.noticeTone}` : ''}">${icon('info')}<span>${escapeHtml(state.notice)}</span></div>` : ''}${configStatePanel()}${savebar}${sheetMarkup()}${apConfirmationMarkup()}</div>`;
   }
 
+  /* 后端 capabilities.bands 里被 normalizeBand 归一成 2g/5g/6g 的那些才可预选。
+     30.1 实测该值是 ['3']（QSDK 数字编码），normalizeBand 无映射会原样返回 '3'，
+     因此这里再过一道白名单，避免把 '3' 当成一个可勾选频段塞进草稿。 */
+  function defaultDraftBands() {
+    const known = ['2g', '5g', '6g'];
+    return asArray(state.config?.capabilities?.bands).map(normalizeBand).filter((band) => known.includes(band));
+  }
+
   function defaultDraft() {
     return normalizeSsid({
       id: `wifi-${Date.now()}`,
-      name: '', network: 'lan', broadcast: '全部 AP', broadcast_mode: 'all', bands: ['2g', '5g'], enabled: true,
+      /* 新建时的默认勾选取后端声明可用的频段，没有声明就不预选 —— 由用户明确选择，
+         而不是替他假定这台设备有 2.4G 与 5G。这与「不编造已有 SSID 的频段」是同一条原则。 */
+      name: '', network: 'lan', broadcast: '全部 AP', broadcast_mode: 'all', bands: defaultDraftBands(), enabled: true,
       security: 'wpa2-wpa3', pmf: 'optional', protocol: 'auto', encryption: 'psk2+ccmp', fast_roaming: false,
       reassociation_deadline: 1000, ft_over_ds: true, ft_psk_generate_local: true, speed_limit_id: 'default'
     });
@@ -1015,8 +1077,8 @@ export function mount(context = {}) {
   function sheetField(label, path, value, options = {}) {
     const type = options.type || 'text';
     const help = options.help ? `<small>${escapeHtml(options.help)}</small>` : '';
-    if (options.options) return `<label class="wifi-field ${options.wide ? 'is-wide' : ''}"><span>${escapeHtml(label)}</span><select data-wifi-draft="${escapeHtml(path)}" ${options.disabled ? 'disabled' : ''}>${optionList(options.options, value)}</select>${help}</label>`;
-    return `<label class="wifi-field ${options.wide ? 'is-wide' : ''}"><span>${escapeHtml(label)}</span><input type="${type}" data-wifi-draft="${escapeHtml(path)}" value="${escapeHtml(value ?? '')}" ${options.placeholder ? `placeholder="${escapeHtml(options.placeholder)}"` : ''} ${options.min !== undefined ? `min="${options.min}"` : ''} ${options.max !== undefined ? `max="${options.max}"` : ''} ${options.disabled ? 'disabled' : ''}>${help}</label>`;
+    if (options.options) return `<label class="wifi-field dwrt-kit-field ${options.wide ? 'is-wide' : ''}" data-dwrt-component="field"><span>${escapeHtml(label)}</span><select data-wifi-draft="${escapeHtml(path)}" ${options.disabled ? 'disabled' : ''}>${optionList(options.options, value)}</select>${help}</label>`;
+    return `<label class="wifi-field dwrt-kit-field ${options.wide ? 'is-wide' : ''}" data-dwrt-component="field"><span>${escapeHtml(label)}</span><input type="${type}" data-wifi-draft="${escapeHtml(path)}" value="${escapeHtml(value ?? '')}" ${options.placeholder ? `placeholder="${escapeHtml(options.placeholder)}"` : ''} ${options.min !== undefined ? `min="${options.min}"` : ''} ${options.max !== undefined ? `max="${options.max}"` : ''} ${options.disabled ? 'disabled' : ''}>${help}</label>`;
   }
 
   function draftToggle(path, title, detail, disabled = false) {
@@ -1026,11 +1088,14 @@ export function mount(context = {}) {
   function ssidSheet() {
     const draft = state.draft || defaultDraft();
     const isNew = !state.config.ssids.some((ssid) => ssid.id === draft.id);
+    /* 置灰要带原因。原文案只说"当前设备没有可验证的 Wi-Fi 保存与应用能力"，
+       而后端给的是两条不同的 scope 原因，用户看到的是一片不能改、却看不出为什么。 */
+    const writeGate = configWriteGateNote();
     const six = draft.bands.includes('6g');
     const multiBand = draft.bands.length >= 2;
     const forceWpa3 = six || draft.mlo;
     const ppskDisabled = six || draft.mlo || draft.security !== 'wpa2-personal';
-    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-wifi-sheet-close aria-label="关闭 Wi-Fi 编辑"></button><aside class="dwrt-kit-sheet wifi-sheet policy-stable-glass is-open" aria-label="${isNew ? '新建 Wi-Fi' : '编辑 Wi-Fi'}"><header class="dwrt-kit-sheet-header"><div><strong>${isNew ? '新建 Wi-Fi' : '编辑 Wi-Fi'}</strong><small>${escapeHtml(draft.name || '配置无线广播')}</small></div><button class="dwrt-kit-sheet-close wifi-icon-button" type="button" data-wifi-sheet-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-sheet-body wifi-sheet-body">${canConfigWrite() ? '' : `<div class="wifi-inline-warning">${icon('info')}<span>当前设备没有可验证的 Wi-Fi 保存与应用能力。可以查看和调整草稿，最终保存保持禁用。</span></div>`}<section><h3>常规</h3><div class="wifi-sheet-fields">${sheetField('名称 / SSID', 'name', draft.name, { wide: true, placeholder: 'Wi-Fi 名称' })}${sheetField('网络', 'network', draft.network, { options: [['lan', 'LAN'], ['guest', '访客网络'], ['iot', 'IoT 网络']] })}${sheetField('VLAN ID', 'vlan', draft.vlan, { type: 'number', min: 1, max: 4094 })}${sheetField('广播 AP', 'broadcast_mode', draft.broadcast_mode, { options: [['all', '全部 AP'], ['group', 'AP 组'], ['specific', '指定 AP']] })}</div><div class="wifi-band-picker"><span>无线电频段</span>${['2g', '5g', '6g'].map((band) => `<label><input type="checkbox" data-wifi-draft-band="${band}" ${draft.bands.includes(band) ? 'checked' : ''} ${!state.config.capabilities.bands.includes(band) ? 'disabled' : ''}><i></i><span>${bandLabel(band)}</span></label>`).join('')}</div><div class="wifi-sheet-fields">${sheetField('安全协议', 'security', forceWpa3 ? 'wpa3-personal' : draft.security, { options: SECURITY.map(([value, label]) => [value, label]), disabled: forceWpa3 })}${sheetField('密码', 'password', '', { type: 'password', wide: true, placeholder: draft.password_present ? '已保存，留空保持不变' : '8-63 个字符' })}${sheetField('PMF', 'pmf', forceWpa3 ? 'required' : draft.pmf, { options: [['disabled', '关闭'], ['optional', '可选'], ['required', '强制']], disabled: forceWpa3 })}</div>${forceWpa3 ? `<div class="wifi-inline-warning">${icon('info')}<span>${six ? '6 GHz' : 'MLO'} 要求 WPA3 与强制 PMF，保存时将按该组合提交。</span></div>` : ''}</section><section><h3>高级</h3><div class="wifi-settings-list">${draftToggle('mlo', 'MLO', multiBand ? '允许兼容的 Wi-Fi 7 终端同时关联多个频段。' : 'MLO 至少需要选择两个频段。', !multiBand)}${draftToggle('ppsk', '私有预共享密钥', ppskDisabled ? '仅 WPA2 Personal 且不含 6 GHz/MLO 时可用。' : '不同密码可映射到不同网络或 VLAN。', ppskDisabled)}${draftToggle('band_steering', '频段引导', '引导兼容的 2.4 GHz 终端使用 5/6 GHz。')}${draftToggle('fast_roaming', '快速漫游 (802.11r)', draft.mlo ? 'MLO 终端可能与快速漫游存在兼容问题。' : '不支持 802.11r 的终端可能出现连接问题。')}${draftToggle('isolate', '客户端设备隔离', '阻止同一 AP 下的无线客户端互相通信。')}${draftToggle('hidden', '隐藏 Wi-Fi 名称', '不在 Beacon 中公开 SSID。')}${draftToggle('multicast_enhance', '组播增强', '将组播转换为单播以降低空口占用。')}${draftToggle('multicast_control', '组播与广播控制', '阻止不必要的组播和广播流量。')}${draftToggle('proxy_arp', 'Proxy ARP', '由 AP 代理常见广播帧，可能改善延迟。')}${draftToggle('radius_mac_auth', 'RADIUS MAC 认证', '使用终端 MAC 作为 RADIUS 凭据。', draft.ppsk)}${draftToggle('schedule_enabled', 'Wi-Fi 计划', '指定该 Wi-Fi 停止广播的时间。')}${draftToggle('force_wifi4', '强制 Wi-Fi 4 模式', '提高旧 IoT 终端兼容性。')}</div><div class="wifi-sheet-fields">${sheetField('MAC 地址筛选', 'mac_filter', draft.mac_filter, { options: [['off', '关闭'], ['allow', '允许列表'], ['deny', '拒绝列表']] })}${sheetField('RADIUS Profile', 'radius_profile', draft.radius_profile, { placeholder: '未配置' })}${sheetField('速度限制', 'speed_limit_id', draft.speed_limit_id, { options: state.config.speed_limits.map((limit) => [limit.id, limit.name]) })}${sheetField('计划', 'schedule', draft.schedule, { placeholder: '例如 周一至周五 08:00-20:00' })}</div></section><section><h3>Dreaming OS 扩展</h3><div class="wifi-sheet-fields">${sheetField('Wi-Fi 协议', 'protocol', draft.protocol, { options: [['auto', '自动'], ['11n', 'Wi-Fi 4 / 802.11n'], ['11ac', 'Wi-Fi 5 / 802.11ac'], ['11ax', 'Wi-Fi 6 / 802.11ax'], ['11be', 'Wi-Fi 7 / 802.11be']] })}${sheetField('UCI 加密', 'encryption', draft.encryption, { options: [['sae+ccmp', 'sae+ccmp'], ['sae-mixed', 'sae-mixed'], ['psk2+ccmp', 'psk2+ccmp'], ['psk-mixed', 'psk-mixed'], ['none', 'none']] })}</div><div class="wifi-settings-list">${draftToggle('ieee80211r', '802.11r Fast Transition', '启用 FT 漫游。')}${draftToggle('ieee80211k', '802.11k 邻居报告', '向终端提供候选 AP。')}${draftToggle('ieee80211v', '802.11v BSS Transition', '允许 AP 建议终端漫游。')}${draftToggle('rrm', 'RRM', '启用无线资源测量。')}${draftToggle('qbssload', 'QBSS Load', '广播 BSS 负载。')}${draftToggle('ft_over_ds', 'FT over DS', '通过分布式系统完成 Fast Transition。')}${draftToggle('ft_psk_generate_local', '本地生成 FT PSK', '由本机生成 R0/R1 密钥材料。')}</div><div class="wifi-sheet-fields">${sheetField('Mobility Domain', 'mobility_domain', draft.mobility_domain, { placeholder: '4 位十六进制' })}${sheetField('NAS ID', 'nasid', draft.nasid, { placeholder: '留空自动生成' })}${sheetField('重关联期限', 'reassociation_deadline', draft.reassociation_deadline, { type: 'number', min: 100, max: 20000 })}${sheetField('备注', 'remark', draft.remark, { wide: true })}</div></section></div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-wifi-sheet-close>取消</button><button class="policy-primary" type="button" data-wifi-draft-save ${canConfigWrite() && draft.name.trim() && draft.bands.length ? '' : 'disabled'}>保存 Wi-Fi</button></footer></aside>`;
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-wifi-sheet-close aria-label="关闭 Wi-Fi 编辑"></button><aside class="dwrt-kit-sheet wifi-sheet policy-stable-glass is-open" aria-label="${isNew ? '新建 Wi-Fi' : '编辑 Wi-Fi'}"><header class="dwrt-kit-sheet-header"><div><strong>${isNew ? '新建 Wi-Fi' : '编辑 Wi-Fi'}</strong><small>${escapeHtml(draft.name || '配置无线广播')}</small></div><button class="dwrt-kit-sheet-close wifi-icon-button" type="button" data-wifi-sheet-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-sheet-body wifi-sheet-body">${canConfigWrite() ? '' : `<div class="wifi-inline-warning">${icon('info')}<span>${escapeHtml(writeGate ? `当前无法保存 Wi-Fi 配置 —— ${writeGate}。可以查看和调整草稿，最终保存保持禁用。` : '当前设备没有可验证的 Wi-Fi 保存与应用能力。可以查看和调整草稿，最终保存保持禁用。')}</span></div>`}<section><h3>常规</h3><div class="wifi-sheet-fields">${sheetField('名称 / SSID', 'name', draft.name, { wide: true, placeholder: 'Wi-Fi 名称' })}${sheetField('网络', 'network', draft.network, { options: [['lan', 'LAN'], ['guest', '访客网络'], ['iot', 'IoT 网络']] })}${sheetField('VLAN ID', 'vlan', draft.vlan, { type: 'number', min: 1, max: 4094 })}${sheetField('广播 AP', 'broadcast_mode', draft.broadcast_mode, { options: [['all', '全部 AP'], ['group', 'AP 组'], ['specific', '指定 AP']] })}</div><div class="wifi-band-picker"><span>无线电频段</span>${['2g', '5g', '6g'].map((band) => `<label><input type="checkbox" data-wifi-draft-band="${band}" ${draft.bands.includes(band) ? 'checked' : ''} ${!state.config.capabilities.bands.includes(band) ? 'disabled' : ''}><i></i><span>${bandLabel(band)}</span></label>`).join('')}</div><div class="wifi-sheet-fields">${sheetField('安全协议', 'security', forceWpa3 ? 'wpa3-personal' : draft.security, { options: SECURITY.map(([value, label]) => [value, label]), disabled: forceWpa3 })}${sheetField('密码', 'password', '', { type: 'password', wide: true, placeholder: draft.password_present ? '已保存，留空保持不变' : '8-63 个字符' })}${sheetField('PMF', 'pmf', forceWpa3 ? 'required' : draft.pmf, { options: [['disabled', '关闭'], ['optional', '可选'], ['required', '强制']], disabled: forceWpa3 })}</div>${forceWpa3 ? `<div class="wifi-inline-warning">${icon('info')}<span>${six ? '6 GHz' : 'MLO'} 要求 WPA3 与强制 PMF，保存时将按该组合提交。</span></div>` : ''}</section><section><h3>高级</h3><div class="wifi-settings-list">${draftToggle('mlo', 'MLO', multiBand ? '允许兼容的 Wi-Fi 7 终端同时关联多个频段。' : 'MLO 至少需要选择两个频段。', !multiBand)}${draftToggle('ppsk', '私有预共享密钥', ppskDisabled ? '仅 WPA2 Personal 且不含 6 GHz/MLO 时可用。' : '不同密码可映射到不同网络或 VLAN。', ppskDisabled)}${draftToggle('band_steering', '频段引导', '引导兼容的 2.4 GHz 终端使用 5/6 GHz。')}${draftToggle('fast_roaming', '快速漫游 (802.11r)', draft.mlo ? 'MLO 终端可能与快速漫游存在兼容问题。' : '不支持 802.11r 的终端可能出现连接问题。')}${draftToggle('isolate', '客户端设备隔离', '阻止同一 AP 下的无线客户端互相通信。')}${draftToggle('hidden', '隐藏 Wi-Fi 名称', '不在 Beacon 中公开 SSID。')}${draftToggle('multicast_enhance', '组播增强', '将组播转换为单播以降低空口占用。')}${draftToggle('multicast_control', '组播与广播控制', '阻止不必要的组播和广播流量。')}${draftToggle('proxy_arp', 'Proxy ARP', '由 AP 代理常见广播帧，可能改善延迟。')}${draftToggle('radius_mac_auth', 'RADIUS MAC 认证', '使用终端 MAC 作为 RADIUS 凭据。', draft.ppsk)}${draftToggle('schedule_enabled', 'Wi-Fi 计划', '指定该 Wi-Fi 停止广播的时间。')}${draftToggle('force_wifi4', '强制 Wi-Fi 4 模式', '提高旧 IoT 终端兼容性。')}</div><div class="wifi-sheet-fields">${sheetField('MAC 地址筛选', 'mac_filter', draft.mac_filter, { options: [['off', '关闭'], ['allow', '允许列表'], ['deny', '拒绝列表']] })}${sheetField('RADIUS Profile', 'radius_profile', draft.radius_profile, { placeholder: '未配置' })}${sheetField('速度限制', 'speed_limit_id', draft.speed_limit_id, { options: state.config.speed_limits.map((limit) => [limit.id, limit.name]) })}${sheetField('计划', 'schedule', draft.schedule, { placeholder: '例如 周一至周五 08:00-20:00' })}</div></section><section><h3>Dreaming OS 扩展</h3><div class="wifi-sheet-fields">${sheetField('Wi-Fi 协议', 'protocol', draft.protocol, { options: [['auto', '自动'], ['11n', 'Wi-Fi 4 / 802.11n'], ['11ac', 'Wi-Fi 5 / 802.11ac'], ['11ax', 'Wi-Fi 6 / 802.11ax'], ['11be', 'Wi-Fi 7 / 802.11be']] })}${sheetField('UCI 加密', 'encryption', draft.encryption, { options: [['sae+ccmp', 'sae+ccmp'], ['sae-mixed', 'sae-mixed'], ['psk2+ccmp', 'psk2+ccmp'], ['psk-mixed', 'psk-mixed'], ['none', 'none']] })}</div><div class="wifi-settings-list">${draftToggle('ieee80211r', '802.11r Fast Transition', '启用 FT 漫游。')}${draftToggle('ieee80211k', '802.11k 邻居报告', '向终端提供候选 AP。')}${draftToggle('ieee80211v', '802.11v BSS Transition', '允许 AP 建议终端漫游。')}${draftToggle('rrm', 'RRM', '启用无线资源测量。')}${draftToggle('qbssload', 'QBSS Load', '广播 BSS 负载。')}${draftToggle('ft_over_ds', 'FT over DS', '通过分布式系统完成 Fast Transition。')}${draftToggle('ft_psk_generate_local', '本地生成 FT PSK', '由本机生成 R0/R1 密钥材料。')}</div><div class="wifi-sheet-fields">${sheetField('Mobility Domain', 'mobility_domain', draft.mobility_domain, { placeholder: '4 位十六进制' })}${sheetField('NAS ID', 'nasid', draft.nasid, { placeholder: '留空自动生成' })}${sheetField('重关联期限', 'reassociation_deadline', draft.reassociation_deadline, { type: 'number', min: 100, max: 20000 })}${sheetField('备注', 'remark', draft.remark, { wide: true })}</div></section></div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-wifi-sheet-close>取消</button><button class="policy-primary" type="button" data-wifi-draft-save ${canConfigWrite() && draft.name.trim() && draft.bands.length ? '' : 'disabled'}>保存 Wi-Fi</button></footer></aside>`;
   }
 
   function speedSheet() {
@@ -1093,7 +1158,7 @@ export function mount(context = {}) {
 
   function statusToolbar() {
     const views = [['radios', 'radio', '射频'], ['connectivity', 'connectivity', '连接性'], ['environment', 'environment', '环境']];
-    return `<header class="airview-topbar"><div class="topology-panel-tabs airview-view-tabs" role="tablist" aria-label="无线状态视图">${views.map(([value, glyph, label]) => `<button class="topology-panel-tab" type="button" data-airview-view="${value}" aria-label="${label}" aria-selected="${state.statusView === value}">${icon(glyph)}<span>${label}</span></button>`).join('')}</div></header>`;
+    return `<header class="airview-topbar"><nav class="dwrt-kit-tabs dwrt-kit-page-tabs airview-view-tabs" data-dwrt-component="tabs" role="tablist" aria-label="无线状态视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${views.map(([value, glyph, label]) => `<button class="dwrt-kit-tab airview-view-tab ${state.statusView === value ? 'is-active' : ''}" type="button" role="tab" data-value="${value}" data-airview-view="${value}" aria-label="${label}" aria-selected="${state.statusView === value}">${icon(glyph)}<span>${label}</span></button>`).join('')}</nav></header>`;
   }
 
   function filterCheckbox(group, value, label, checked = false, extra = '', disabled = false) {
@@ -1239,7 +1304,7 @@ export function mount(context = {}) {
   function environmentApPicker(aps) {
     const selected = selectedEnvironmentAp(aps);
     const selectedId = selected?.id || '';
-    return `<div class="airview-ap-picker"><label class="airview-ap-select">${selected ? deviceImage(selected, 'airview-filter-device-image') : `<span class="airview-filter-device-image is-fallback">${icon('radio')}</span>`}<select data-airview-environment-ap aria-label="选择 Access Point">${aps.map((ap) => `<option value="${escapeHtml(ap.id)}" ${selectedId === ap.id ? 'selected' : ''}>${escapeHtml(ap.name)}</option>`).join('')}</select><span class="airview-ap-chevron" aria-hidden="true">${icon('chevron')}</span></label><button class="airview-ap-insights" type="button" data-airview-ap-details="${escapeHtml(selectedId)}" aria-label="打开 ${escapeHtml(selected?.name || 'AP')} 详情" ${selected ? '' : 'disabled'}>${icon('insights')}</button></div>`;
+    return `<div class="airview-ap-picker"><label class="airview-ap-select dwrt-kit-field" data-dwrt-component="field">${selected ? deviceImage(selected, 'airview-filter-device-image') : `<span class="airview-filter-device-image is-fallback">${icon('radio')}</span>`}<select data-airview-environment-ap aria-label="选择 Access Point">${aps.map((ap) => `<option value="${escapeHtml(ap.id)}" ${selectedId === ap.id ? 'selected' : ''}>${escapeHtml(ap.name)}</option>`).join('')}</select><span class="airview-ap-chevron" aria-hidden="true">${icon('chevron')}</span></label><button class="airview-ap-insights" type="button" data-airview-ap-details="${escapeHtml(selectedId)}" aria-label="打开 ${escapeHtml(selected?.name || 'AP')} 详情" ${selected ? '' : 'disabled'}>${icon('insights')}</button></div>`;
   }
 
   function airviewSidebar() {
@@ -1256,7 +1321,7 @@ export function mount(context = {}) {
       const bandSegment = envBands.length ? `<div class="airview-band-segment" role="group" aria-label="频段">${envBands.map((band) => `<button type="button" data-airview-environment-band="${band}" aria-pressed="${activeEnvBand === band}">${escapeHtml(bandLabel(band))}</button>`).join('')}</div>` : '';
       body = `${environmentApPicker(aps)}${bandSegment}<button type="button" class="policy-primary compact airview-scan-button" data-airview-scan ${scannerAvailable && !state.scanning && aps.length ? '' : 'disabled'}>${icon('scan')}<span>${state.scanning ? '扫描任务执行中' : '扫描环境'}</span></button>${scanJobsPanel()}<details open><summary>时间范围</summary><div class="airview-range-picker compact">${[['30m','30 分钟'],['1h','1 小时'],['1d','1 天'],['1w','1 周'],['1m','1 月']].map(([value, label]) => `<button type="button" data-airview-environment-range="${value}" aria-pressed="${state.filters.environmentRange === value}">${label}</button>`).join('')}</div></details><details open><summary>信道宽度</summary><div class="airview-filter-list two-columns">${[20,40,80,160,240].map((width) => filterCheckbox('environmentWidths', width, String(width), state.filters.environmentWidths.has(String(width)))).join('')}</div></details><details open><summary>信号</summary>${signalRangeControl()}</details><div class="airview-link-actions">${columnEditor('environment')}<button type="button" class="wifi-link-button" data-airview-clear>清除筛选条件</button></div>`;
     } else {
-      body = `<div class="airview-ai-row"><span>信道 AI 视图</span><label class="airview-switch"><input type="checkbox" data-airview-ai ${state.filters.ai ? 'checked' : ''} ${channelAiAvailable ? '' : 'disabled'} aria-label="信道 AI 视图"><i></i></label></div><div class="airview-ai-map ${channelAiAvailable ? '' : 'is-unavailable'}" aria-label="信道 AI 状态" data-dwrt-tooltip="${channelAiAvailable ? '显示信道 AI 建议' : '后端尚未提供信道 AI 建议'}">${airviewAiCells()}</div><label class="airview-broadcast-select">${icon('search')}<select data-airview-broadcast><option value="all">所有 WiFi 广播 (${broadcasts.length})</option>${broadcasts.map((broadcast) => `<option value="${escapeHtml(broadcast.id)}" ${state.filters.broadcast === broadcast.id ? 'selected' : ''}>${escapeHtml(broadcast.name)}</option>`).join('')}</select></label><details open><summary>Access Point</summary><div class="airview-filter-list">${aps.length ? aps.map((ap) => filterCheckbox('aps', ap.id, ap.name, state.filters.aps.has(ap.id), deviceImage(ap, 'airview-filter-device-image'))).join('') : '<small class="airview-filter-empty">未检测到 AP</small>'}</div></details><details open><summary>频段</summary><div class="airview-filter-list">${['2g', '5g', '6g'].map((band) => filterCheckbox('bands', band, bandLabel(band), state.filters.bands.has(band))).join('')}</div></details><details open><summary>信道计划</summary>${miniChannelPlan()}</details><details open><summary>MIMO</summary><div class="airview-filter-list">${['1x1', '2x2', '3x3', '4x4'].map((mimo) => filterCheckbox('mimo', mimo, mimo, state.filters.mimo.has(mimo))).join('')}</div></details><details open><summary>类型</summary><div class="airview-filter-list">${[['wired', '有线'], ['meshed', '已 Mesh']].map(([value, label]) => filterCheckbox('types', value, label, state.filters.types.has(value))).join('')}</div></details><details open><summary>状态</summary><div class="airview-filter-list">${[['online', '在线'], ['offline', '离线']].map(([value, label]) => filterCheckbox('status', value, label, state.filters.status.has(value))).join('')}</div></details><button type="button" class="wifi-link-button" data-airview-clear ${radioFiltersDefault() ? 'disabled' : ''}>清除筛选条件</button>`;
+      body = `<div class="airview-ai-row"><span>信道 AI 视图</span><label class="airview-switch"><input type="checkbox" data-airview-ai ${state.filters.ai ? 'checked' : ''} ${channelAiAvailable ? '' : 'disabled'} aria-label="信道 AI 视图"><i></i></label></div><div class="airview-ai-map ${channelAiAvailable ? '' : 'is-unavailable'}" aria-label="信道 AI 状态" data-dwrt-tooltip="${channelAiAvailable ? '显示信道 AI 建议' : '后端尚未提供信道 AI 建议'}">${airviewAiCells()}</div><label class="airview-broadcast-select dwrt-kit-field" data-dwrt-component="field">${icon('search')}<select data-airview-broadcast><option value="all">所有 WiFi 广播 (${broadcasts.length})</option>${broadcasts.map((broadcast) => `<option value="${escapeHtml(broadcast.id)}" ${state.filters.broadcast === broadcast.id ? 'selected' : ''}>${escapeHtml(broadcast.name)}</option>`).join('')}</select></label><details open><summary>Access Point</summary><div class="airview-filter-list">${aps.length ? aps.map((ap) => filterCheckbox('aps', ap.id, ap.name, state.filters.aps.has(ap.id), deviceImage(ap, 'airview-filter-device-image'))).join('') : '<small class="airview-filter-empty">未检测到 AP</small>'}</div></details><details open><summary>频段</summary><div class="airview-filter-list">${['2g', '5g', '6g'].map((band) => filterCheckbox('bands', band, bandLabel(band), state.filters.bands.has(band))).join('')}</div></details><details open><summary>信道计划</summary>${miniChannelPlan()}</details><details open><summary>MIMO</summary><div class="airview-filter-list">${['1x1', '2x2', '3x3', '4x4'].map((mimo) => filterCheckbox('mimo', mimo, mimo, state.filters.mimo.has(mimo))).join('')}</div></details><details open><summary>类型</summary><div class="airview-filter-list">${[['wired', '有线'], ['meshed', '已 Mesh']].map(([value, label]) => filterCheckbox('types', value, label, state.filters.types.has(value))).join('')}</div></details><details open><summary>状态</summary><div class="airview-filter-list">${[['online', '在线'], ['offline', '离线']].map(([value, label]) => filterCheckbox('status', value, label, state.filters.status.has(value))).join('')}</div></details><button type="button" class="wifi-link-button" data-airview-clear ${radioFiltersDefault() ? 'disabled' : ''}>清除筛选条件</button>`;
     }
     return `<aside class="airview-sidebar topology-control-panel policy-stable-glass">${statusToolbar()}<div class="airview-sidebar-scroll">${body}</div></aside>`;
   }
@@ -1367,9 +1432,21 @@ export function mount(context = {}) {
   function surveyHistoryChart() {
     const samples = state.environmentHistory.points;
     const points = linePoints(samples, 900, 210);
+    /* 见 surveyHistoryFreshnessNote()：空态要区分"没采过"和"采过但都过期了"。 */
     if (!points) {
-      const detail = state.environmentHistory.loading ? '正在读取所选时间范围的 Survey 历史。' : state.environmentHistory.error ? state.environmentHistory.error : environmentReason(state.environmentHistory.reason);
-      return `<div class="airview-environment-history-empty"><strong>暂无可绘制的信道利用率历史</strong><span>${escapeHtml(detail)}</span></div>`;
+      const history = state.environmentHistory;
+      /* 三态分开：读取中 / 读取失败 / 后端如实回了空。前两种不能说成"没有数据"，
+         那会把一次失败的请求渲染成一个确定的业务结论（design.md「Capability truth」
+         第 3、4 条）。 */
+      if (history.loading) {
+        return `<div class="airview-environment-history-empty"><strong>正在读取信道利用率历史</strong><span>${escapeHtml('正在请求所选时间范围的 Survey 历史。')}</span></div>`;
+      }
+      if (history.error) {
+        return `<div class="airview-environment-history-empty"><strong>信道利用率历史读取失败</strong><span>${escapeHtml(`${history.error}。请求未成功，不能据此判断有无历史数据。`)}</span></div>`;
+      }
+      const copy = historyReasonCopy(history.reason);
+      const freshness = surveyHistoryFreshnessNote();
+      return `<div class="airview-environment-history-empty"><strong>${escapeHtml(copy.title)}</strong><span>${escapeHtml(freshness ? `${copy.detail}${freshness}` : copy.detail)}</span></div>`;
     }
     return `<svg class="airview-environment-history-line" viewBox="0 0 900 210" preserveAspectRatio="none" aria-label="信道利用率历史"><polyline points="${points}"></polyline></svg>`;
   }
@@ -1559,7 +1636,8 @@ export function mount(context = {}) {
   function radioHistory(radio) {
     const points = linePoints(radio.channel_history);
     const historyAvailable = bool(state.status.capabilities.airview_history, false) && points;
-    return `<div class="airview-radio-history" role="img" aria-label="${escapeHtml(`${radio.ap} ${bandLabel(radio.band)} 信道历史`)}"><div class="airview-radio-chart-grid" aria-hidden="true"></div>${historyAvailable ? `<svg viewBox="0 0 560 118" preserveAspectRatio="none" aria-hidden="true"><polyline points="${points}"></polyline></svg>` : `<div class="airview-radio-chart-empty"><strong>暂无信道历史</strong><span>${escapeHtml(firstText(state.status.capabilities.reasons?.airview_history, '后端尚未提供按 Radio 的历史样本'))}</span></div>`}<div class="airview-radio-chart-axis"><span>12 小时前</span><span>8 小时前</span><span>4 小时前</span><span>现在</span></div></div>`;
+    const empty = historyReasonCopy(state.status.capabilities.reasons?.airview_history);
+    return `<div class="airview-radio-history" role="img" aria-label="${escapeHtml(`${radio.ap} ${bandLabel(radio.band)} 信道历史`)}"><div class="airview-radio-chart-grid" aria-hidden="true"></div>${historyAvailable ? `<svg viewBox="0 0 560 118" preserveAspectRatio="none" aria-hidden="true"><polyline points="${points}"></polyline></svg>` : `<div class="airview-radio-chart-empty"><strong>${escapeHtml(empty.title)}</strong><span>${escapeHtml(empty.detail)}</span></div>`}<div class="airview-radio-chart-axis"><span>12 小时前</span><span>8 小时前</span><span>4 小时前</span><span>现在</span></div></div>`;
   }
 
   function signalDistribution(radio) {
@@ -1571,7 +1649,8 @@ export function mount(context = {}) {
     });
     const max = Math.max(1, ...counts);
     const available = bool(state.status.capabilities.station_metrics, false) && samples.length > 0;
-    return `<div class="airview-signal-distribution"><div class="airview-signal-scale" aria-hidden="true">${buckets.map((value, index) => `<span style="--signal-tone:${index}"></span>`).join('')}</div><div class="airview-signal-labels">${buckets.map((value) => `<span>${value}</span>`).join('')}</div><div class="airview-signal-bars" aria-label="${escapeHtml(`${radio.ap} 活动客户端信号分布`)}">${available ? counts.map((count, index) => `<i style="--bar:${Math.max(3, count / max * 100).toFixed(1)}%;--signal-tone:${index}" data-dwrt-tooltip="${escapeHtml(`${buckets[index]} dBm：${count} 个客户端`)}"></i>`).join('') : `<div class="airview-radio-chart-empty compact"><strong>暂无客户端信号样本</strong><span>${escapeHtml(firstText(state.status.capabilities.reasons?.station_metrics, '后端尚未提供 Station RSSI 分布'))}</span></div>`}</div></div>`;
+    const empty = signalDistributionEmptyCopy(radio, samples);
+    return `<div class="airview-signal-distribution"><div class="airview-signal-scale" aria-hidden="true">${buckets.map((value, index) => `<span style="--signal-tone:${index}"></span>`).join('')}</div><div class="airview-signal-labels">${buckets.map((value) => `<span>${value}</span>`).join('')}</div><div class="airview-signal-bars" aria-label="${escapeHtml(`${radio.ap} 活动客户端信号分布`)}">${available ? counts.map((count, index) => `<i style="--bar:${Math.max(3, count / max * 100).toFixed(1)}%;--signal-tone:${index}" data-dwrt-tooltip="${escapeHtml(`${buckets[index]} dBm：${count} 个客户端`)}"></i>`).join('') : `<div class="airview-radio-chart-empty compact"><strong>${escapeHtml(empty.title)}</strong><span>${escapeHtml(empty.detail)}</span></div>`}</div></div>`;
   }
 
   function radioBandSheet(band, radios) {
@@ -1584,7 +1663,7 @@ export function mount(context = {}) {
     const widths = Array.from(new Set(radios.flatMap(radioWidths))).sort((left, right) => left - right);
     const channels = Array.from(new Set(radios.flatMap(radioChannels))).sort((left, right) => left - right);
     const metricRadio = radios[0];
-    return `<section class="airview-radio-sheet-band"><header><strong>${escapeHtml(bandLabel(band))}</strong></header><div class="airview-selected-aps">${radios.map((radio) => `<button type="button" data-airview-radio-remove="${escapeHtml(radio.id)}" aria-label="移除 ${escapeHtml(radio.ap)} ${escapeHtml(bandLabel(radio.band))}">${deviceImage(radio, 'airview-chip-device-image')}<span>${escapeHtml(radio.ap)}</span>${icon('close')}</button>`).join('')}</div><div class="airview-radio-controls"><fieldset><legend>信道宽度</legend><div class="airview-segmented">${widths.map((value) => `<button type="button" data-airview-radio-width="${escapeHtml(band)}:${value}" aria-pressed="${Number(width) === value}" ${writable ? '' : 'disabled'}>${value}</button>`).join('')}</div></fieldset><label><span>信道</span><select data-airview-radio-channel="${escapeHtml(band)}" ${writable ? '' : 'disabled'}>${channels.map((value) => `<option value="${value}" ${Number(channel) === value ? 'selected' : ''}>${value}</option>`).join('')}</select></label></div><fieldset class="airview-radio-power"><legend>发射功率 ${icon('info')}</legend><div class="airview-segmented wrap">${[['auto','自动'],['high','高'],['medium','中'],['low','低'],['custom','自定义'],['disabled','已禁用']].map(([value, label]) => `<button type="button" data-airview-radio-power="${escapeHtml(band)}:${value}" aria-pressed="${powerMode === value}" ${writable ? '' : 'disabled'}>${label}</button>`).join('')}</div>${powerMode ? '' : '<small>当前 AP 未上报发射功率模式。</small>'}${powerMode === 'custom' ? `<label class="airview-custom-power"><span>自定义功率</span><input type="number" min="1" max="40" value="${escapeHtml(commonRadioValue(radios, 'tx_power_custom'))}" data-airview-radio-custom-power="${escapeHtml(band)}" ${writable ? '' : 'disabled'}><b>dBm</b></label>` : ''}</fieldset><label class="airview-min-rssi"><input type="checkbox" data-airview-radio-min-rssi="${escapeHtml(band)}" ${minRssiEnabled ? 'checked' : ''} ${writable ? '' : 'disabled'}><i></i><span>最小 RSSI ${icon('info')}</span>${minRssiEnabled ? `<input type="number" min="-95" max="-45" value="${escapeHtml(minRssi ?? '')}" data-airview-radio-min-rssi-value="${escapeHtml(band)}" ${writable ? '' : 'disabled'}><b>dBm</b>` : ''}</label><details class="airview-radio-metrics" open><summary>关键指标</summary><div class="airview-radio-metric-device"><span>${deviceImage(metricRadio, 'airview-metric-device-image')}<strong>${escapeHtml(metricRadio.ap)}</strong></span><button type="button" data-airview-copy="${escapeHtml(metricRadio.ap)}" aria-label="复制 AP 名称">${icon('copy')}</button></div><p>信道: ${metricRadio.channel || '--'} (${metricRadio.width ? `${metricRadio.width} MHz` : '--'})</p>${radioHistory(metricRadio)}<h4>活动客户端分布</h4>${signalDistribution(metricRadio)}</details></section>`;
+    return `<section class="airview-radio-sheet-band"><header><strong>${escapeHtml(bandLabel(band))}</strong></header><div class="airview-selected-aps">${radios.map((radio) => `<button type="button" data-airview-radio-remove="${escapeHtml(radio.id)}" aria-label="移除 ${escapeHtml(radio.ap)} ${escapeHtml(bandLabel(radio.band))}">${deviceImage(radio, 'airview-chip-device-image')}<span>${escapeHtml(radio.ap)}</span>${icon('close')}</button>`).join('')}</div><div class="airview-radio-controls"><fieldset><legend>信道宽度</legend><div class="airview-segmented">${widths.map((value) => `<button type="button" data-airview-radio-width="${escapeHtml(band)}:${value}" aria-pressed="${Number(width) === value}" ${writable ? '' : 'disabled'}>${value}</button>`).join('')}</div></fieldset><label class="dwrt-kit-field" data-dwrt-component="field"><span>信道</span><select data-airview-radio-channel="${escapeHtml(band)}" ${writable ? '' : 'disabled'}>${channels.map((value) => `<option value="${value}" ${Number(channel) === value ? 'selected' : ''}>${value}</option>`).join('')}</select></label></div><fieldset class="airview-radio-power"><legend>发射功率 ${icon('info')}</legend><div class="airview-segmented wrap">${[['auto','自动'],['high','高'],['medium','中'],['low','低'],['custom','自定义'],['disabled','已禁用']].map(([value, label]) => `<button type="button" data-airview-radio-power="${escapeHtml(band)}:${value}" aria-pressed="${powerMode === value}" ${writable ? '' : 'disabled'}>${label}</button>`).join('')}</div>${powerMode ? '' : '<small>当前 AP 未上报发射功率模式。</small>'}${powerMode === 'custom' ? `<label class="airview-custom-power"><span>自定义功率</span><input type="number" min="1" max="40" value="${escapeHtml(commonRadioValue(radios, 'tx_power_custom'))}" data-airview-radio-custom-power="${escapeHtml(band)}" ${writable ? '' : 'disabled'}><b>dBm</b></label>` : ''}</fieldset><label class="airview-min-rssi"><input type="checkbox" data-airview-radio-min-rssi="${escapeHtml(band)}" ${minRssiEnabled ? 'checked' : ''} ${writable ? '' : 'disabled'}><i></i><span>最小 RSSI ${icon('info')}</span>${minRssiEnabled ? `<input type="number" min="-95" max="-45" value="${escapeHtml(minRssi ?? '')}" data-airview-radio-min-rssi-value="${escapeHtml(band)}" ${writable ? '' : 'disabled'}><b>dBm</b>` : ''}</label><details class="airview-radio-metrics" open><summary>关键指标</summary><div class="airview-radio-metric-device"><span>${deviceImage(metricRadio, 'airview-metric-device-image')}<strong>${escapeHtml(metricRadio.ap)}</strong></span><button type="button" data-airview-copy="${escapeHtml(metricRadio.ap)}" aria-label="复制 AP 名称">${icon('copy')}</button></div><p>信道: ${metricRadio.channel || '--'} (${metricRadio.width ? `${metricRadio.width} MHz` : '--'})</p>${radioHistory(metricRadio)}<h4>活动客户端分布</h4>${signalDistribution(metricRadio)}</details></section>`;
   }
 
   function radioSheet() {
@@ -1595,7 +1674,7 @@ export function mount(context = {}) {
       if (!groups.has(radio.band)) groups.set(radio.band, []);
       groups.get(radio.band).push(radio);
     });
-    const reason = firstText(state.status.capabilities.reasons?.radio_update, '无线电写入事务与 readback 尚未开放');
+    const reason = writeGateNote(firstText(state.status.capabilities.reasons?.radio_update, '')) || '无线电写入事务与 readback 尚未开放';
     return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-airview-radio-sheet-close aria-label="关闭无线电设置"></button><aside class="dwrt-kit-sheet airview-radio-sheet policy-stable-glass is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" data-dwrt-sheet-motion="settled" aria-label="无线电设置"><header class="dwrt-kit-sheet-header"><div><strong>无线电设置</strong><span>${radios.length} 个 Radio</span></div><button class="dwrt-kit-sheet-close wifi-icon-button" type="button" data-airview-radio-sheet-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-sheet-body airview-radio-sheet-body">${canRadioWrite() ? '' : `<div class="wifi-inline-warning">${icon('info')}<span>${escapeHtml(reason)}。当前展示真实运行值，修改与保存保持禁用。</span></div>`}${Array.from(groups.entries()).sort((left, right) => ({'2g':0,'5g':1,'6g':2}[left[0]] ?? 9) - ({'2g':0,'5g':1,'6g':2}[right[0]] ?? 9)).map(([band, entries]) => radioBandSheet(band, entries)).join('')}</div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-airview-radio-sheet-close>取消</button><button class="policy-primary" type="button" data-airview-radio-save ${canRadioWrite() && state.radioDirty ? '' : 'disabled'}>应用更改</button></footer></aside>`;
   }
 
@@ -1620,13 +1699,128 @@ export function mount(context = {}) {
     // not reported recently, which read as an unexplained blank before.
     telemetry_stale: '数据已过期，等待 AP 上报',
     managed_aps_offline_stale_or_without_snapshot: '受管 AP 离线，指标待其上线后恢复',
-    no_phy_detected: '本机无无线网卡，仅作为控制器'
+    no_phy_detected: '本机无无线网卡，仅作为控制器',
+    // 射频表「过去 24 小时」「平均信号」列的缺值原因。后端在 AP 在线且有实数据时
+    // 也可能只缺其中一项（例如历史序列未采集），逐列说明比整页一句话准确。
+    radio_history_not_collected: '未采集 24 小时历史',
+    radio_history_not_reported: 'AP 未上报历史序列',
+    no_associated_station_signal_samples: '该 Radio 暂无关联客户端',
+    obss_utilization_not_reported: '驱动未上报 OBSS 干扰',
+    apstats_failed_or_unsupported: 'apstats 未返回数据',
+    station_metrics_not_reported: 'AP 未上报客户端信号',
+    spatial_streams_not_reported: 'AP 未上报空间流',
+    partial_runtime_sources: '部分运行态数据源缺失',
+    ap_uplink_not_reported: 'AP 未上报上行方式',
+    channel_exclusion_producer_pending: '信道排除清单尚未产出'
   };
 
   function radioMetricNote(reason) {
     const key = String(reason || '').trim();
     if (!key) return '';
     return RADIO_METRIC_REASONS[key] || key;
+  }
+
+  /* 写入闸门的原因文案。置灰本身是对的（后端 save_config / apply_config 恒为 false），
+     但 30.1 上两种原因**同时存在**、含义不同，只写一句"没有能力"看不出差别：
+       no_local_phy_detected          本机没有无线网卡，配置无处落地
+       managed_ap_transaction_pending 受管 AP 的写事务与 readback 尚未开放
+     另外 reasons.radio_update 原先是裸码直出，用户看到的是英文标识符。
+     依据：Acceptance-to-Front-wireless-avg-signal-and-stale-data-honesty.md 第 3 节。 */
+  const WRITE_GATE_REASONS = {
+    no_local_phy_detected: '本机未检测到无线网卡，本地 Wi-Fi 配置无处落地',
+    managed_ap_transaction_pending: '受管 AP 的写入事务与配置回读尚未开放',
+    no_phy_detected: '本机无无线网卡，仅作为控制器',
+    regdomain_driver_channel_catalog_pending: '驱动尚未提供监管域信道表',
+    capability_disabled: '后端已停用该写入能力'
+  };
+
+  function writeGateNote(reason) {
+    const key = String(reason || '').trim();
+    if (!key) return '';
+    return WRITE_GATE_REASONS[key] || key;
+  }
+
+  /* 置灰原因合并成一句。两个 scope 各有自己的 reason，30.1 是两者同时不可写，
+     所以逐个列出而不是让其中一个覆盖另一个（design.md「Capability truth」第 15 条：
+     一句笼统的说法不得盖住一批各不相同的原因）。 */
+  function configWriteGateNote() {
+    const caps = state.config.capabilities;
+    const scopes = caps.write_scopes && typeof caps.write_scopes === 'object' ? caps.write_scopes : {};
+    const labels = { local: '本机', managed_ap: '受管 AP' };
+    const parts = ['local', 'managed_ap']
+      .filter((scope) => scopes[scope] && typeof scopes[scope] === 'object' && bool(scopes[scope].supported, false) !== true)
+      .map((scope) => `${labels[scope]}：${writeGateNote(firstText(scopes[scope].reason, '后端未说明原因'))}`);
+    if (parts.length) return parts.join('；');
+    const flat = firstText(caps.reasons?.save_config, caps.reasons?.apply_config);
+    return flat ? writeGateNote(flat) : '';
+  }
+
+  /* 历史类空态的标题 + 说明。「暂无」这个词把"从未采集"和"采集停了/样本已过保留期"
+     说成同一件事，排查方向会被带偏（验收单 Acceptance-to-Front-wireless-avg-signal-
+     and-stale-data-honesty.md 第 2 节）。后端 reason 已经把两者分开了：
+       no_samples / survey_history_empty          查询窗口内一条都没有
+       warming_up                                 只有 1 个点，画线还差一个
+       insufficient_complete_numeric_points       有点但 complete 数值不足 2 个
+       survey_history_source_unavailable          历史存储本身取不到
+       survey_history_radio_mapping_unavailable    有样本但对不上这个 Radio
+     所以标题按语义分档，而不是所有情况都写"暂无"。 */
+  const HISTORY_REASON_COPY = {
+    no_samples: { title: '尚未采集信道历史', detail: '所选时间范围内没有 Survey 样本落库。' },
+    survey_history_empty: { title: '尚未采集信道历史', detail: '所选时间范围内没有 Survey 样本落库。' },
+    warming_up: { title: '信道历史采集中', detail: '目前只有 1 个样本，至少需要 2 个才能连成曲线。' },
+    insufficient_complete_numeric_points: { title: '信道历史样本不足', detail: '已有样本，但完整的数值点少于 2 个，还画不出曲线。' },
+    survey_history_source_unavailable: { title: '历史存储当前不可用', detail: '后端未能读到 Survey 历史存储。' },
+    survey_history_radio_mapping_unavailable: { title: '历史样本无法对应到该 Radio', detail: '存储里有样本，但没有一条能匹配这个 Radio。' },
+    request_failed: { title: '信道历史读取失败', detail: '历史接口请求未成功，不能据此判断有无数据。' },
+    not_loaded: { title: '尚未读取信道历史', detail: '本次还没有请求历史接口。' }
+  };
+
+  function historyReasonCopy(reason) {
+    const key = String(reason || '').trim();
+    if (HISTORY_REASON_COPY[key]) return HISTORY_REASON_COPY[key];
+    /* 未收录的 reason 原样陈述，不套用"暂无"，避免把未知状态说成确定的空。 */
+    if (key) return { title: '信道历史当前不可用', detail: `后端原因：${key}` };
+    return { title: '信道历史状态未确认', detail: '后端未给出原因，能力位读取可能失败。' };
+  }
+
+  /* 把"从未采集"与"采集过但样本已过窗口"分开的唯一依据。
+     后端 ac_db_survey_history_json() 的 latest_received_at 只统计**查询窗口内**命中行的
+     最大 last_received_at：窗口内一条都没有时它是 null。所以有值才能说"最近一次采集在
+     N 前"；为 null 时只能说"这个范围内没有样本"，不得升级成"从未采集过"——窗口外是否还
+     存着更老的数据，这次请求答不了，前端不替后端下结论。
+     保留期由后端裁剪（ac_db.c: 细粒度桶 48h / 小时桶 31 天），不在前端推算。 */
+  function surveyHistoryFreshnessNote() {
+    const latest = firstNumber(state.environmentHistory.latest_received_at);
+    if (!latest) return '';
+    const relative = relativeSeconds(latest);
+    return relative ? `最近一次采集在${relative}，已不在当前所选范围内。` : '';
+  }
+
+  /* RSSI 分布空态。原先无条件把 reasons.station_metrics 当作"为什么是空"打印出来，
+     但 30.1 实测该 reason 是 `available`（能力就绪），于是空图下面写着"available"
+     这个裸码——既不是中文，也把一个就绪信号说成了故障原因。三态要分开：
+     能力 false 才陈述后端原因；能力 true 而分布为空时，空的原因是没有关联客户端
+     或该 Radio 未上报分布，与能力无关。 */
+  function signalDistributionEmptyCopy(radio, samples) {
+    const caps = state.status.capabilities;
+    const ready = bool(caps.station_metrics, false);
+    const reason = firstText(caps.reasons?.station_metrics);
+    if (!ready) {
+      return {
+        title: '客户端信号分布不可用',
+        detail: reason ? `后端原因：${radioMetricNote(reason)}` : '后端未声明 Station RSSI 采集能力。'
+      };
+    }
+    if (radio.clients === 0) {
+      return { title: '该 Radio 暂无关联客户端', detail: '没有关联客户端，因此没有 RSSI 样本可分布。' };
+    }
+    if (!samples.length && radio.clients) {
+      return {
+        title: '尚未收到该 Radio 的信号分布',
+        detail: `能力已就绪，${radio.clients} 个客户端在线，但 AP 本次未上报分桶后的 RSSI 分布。`
+      };
+    }
+    return { title: '暂无客户端信号样本', detail: '本次快照没有可分桶的 RSSI 样本。' };
   }
 
   function apRadioStandard(radio) {
@@ -1641,18 +1835,28 @@ export function mount(context = {}) {
 
   function apOverview(ap, radios) {
     const has6g = radios.some((radio) => radio.band === '6g');
+    /* TX 重试时间序列：本函数下方那句"后端尚未提供 TX 重试时间序列"是**临时写死**的
+       文案，不是能力位判定。核对过后端源码，`tx_retry_history` 在 jmxd/src 下 0 命中
+       （只有瞬时值 retry_rate / retry_rate_pct，没有时间序列采集），所以此刻这句为真。
+       但它不会随后端实现自动变化 —— 后端补上采集后必须改成读能力位：
+         判据字段  state.status.capabilities.tx_retry_history（待后端定名）
+         原因字段  state.status.capabilities.reasons?.tx_retry_history
+       归属确认见 Acceptance-to-Backend-metricsd-uloop-stalled-kills-periodic-
+       collectors.md，以及本页对应单 Acceptance-to-Front-wireless-avg-signal-and-
+       stale-data-honesty.md 第 2 节。届时按 design.md「Capability truth and failure
+       classification」第 4 条写三态，不要保留这句写死的否认。 */
     const broadcasts6g = state.status.ssids.filter((ssid) => ssid.ap_id === ap.id && ssid.enabled && ssid.bands.includes('6g'));
     const retryPoints = radios.flatMap((radio) => radio.tx_retry_history);
-    return `<div class="airview-ap-sheet-stack"><section class="airview-ap-summary-card">${deviceImage(ap, 'airview-ap-sheet-image')}<div class="airview-ap-summary-copy"><strong>${escapeHtml(firstText(ap.model, ap.name))}</strong><span>${ap.connection ? `已连接到 ${escapeHtml(ap.connection)}` : '连接对象 --'}</span></div><div class="airview-ap-radio-list">${radios.map((radio) => `<div><strong>信道 ${radio.channel || '--'} <span>(${escapeHtml(bandLabel(radio.band))}, ${radio.width ? `${radio.width} MHz` : '--'})</span></strong><span>${radio.interference ? `${radio.interference}%` : '--'}</span><span>${escapeHtml(apRadioStandard(radio))}</span><span class="airview-ap-clients">${icon('connectivity')}${radio.clients === null ? '--' : radio.clients}</span></div>`).join('')}</div>${has6g && !broadcasts6g.length ? `<div class="airview-ap-warning">${icon('info')}<span>当前没有 Wi-Fi 广播使用 6 GHz Radio。</span></div>` : ''}<footer><button type="button" class="policy-secondary" disabled>端口管理器</button><button type="button" class="policy-secondary" disabled>AirView</button></footer></section><section class="airview-ap-chart-card"><header><strong>TX 重试</strong><span>${retryPoints.length ? `${retryPoints.length} 个样本` : '--'}</span></header>${retryPoints.length > 1 ? radioHistory({ ...radios[0], channel_history: retryPoints, ap: ap.name }) : `<div class="airview-ap-empty-chart"><span>后端尚未提供 TX 重试时间序列</span></div>`}</section><section class="airview-ap-facts">${apSheetMetric('型号', ap.model)}${apSheetMetric('IP 地址', ap.ip)}${apSheetMetric('MAC 地址', ap.mac)}${apSheetMetric('设备版本', ap.version)}${apSheetMetric('运行时间', ap.uptime)}</section><section class="airview-ap-table-card"><header><strong>空中统计</strong><span>按 Radio</span></header><div class="wifi-table-scroll"><table class="dwrt-kit-table"><thead><tr><th>频段</th><th>Tx 包</th><th>Tx 字节</th><th>Rx 包</th><th>Rx 字节</th><th>重试</th><th>丢弃</th></tr></thead><tbody>${radios.map((radio) => `<tr><td>${escapeHtml(bandLabel(radio.band))}</td><td>${escapeHtml(firstText(radio.air_stats.tx_packets, '--'))}</td><td>${escapeHtml(firstText(radio.air_stats.tx_bytes, '--'))}</td><td>${escapeHtml(firstText(radio.air_stats.rx_packets, '--'))}</td><td>${escapeHtml(firstText(radio.air_stats.rx_bytes, '--'))}</td><td>${escapeHtml(firstText(radio.air_stats.retries, '--'))}</td><td>${escapeHtml(firstText(radio.air_stats.dropped, '--'))}</td></tr>`).join('')}</tbody></table></div></section><section class="airview-ap-facts">${apSheetMetric('Mesh 父级', ap.mesh_parent)}${apSheetMetric('AP 组', ap.ap_group)}</section></div>`;
+    return `<div class="airview-ap-sheet-stack"><section class="airview-ap-summary-card">${deviceImage(ap, 'airview-ap-sheet-image')}<div class="airview-ap-summary-copy"><strong>${escapeHtml(firstText(ap.model, ap.name))}</strong><span>${ap.connection ? `已连接到 ${escapeHtml(ap.connection)}` : '连接对象 --'}</span></div><div class="airview-ap-radio-list">${radios.map((radio) => `<div><strong>信道 ${radio.channel || '--'} <span>(${escapeHtml(bandLabel(radio.band))}, ${radio.width ? `${radio.width} MHz` : '--'})</span></strong><span>${escapeHtml(firstText(metricValue(radio.interference || radio.avg_interference, '%'), '--'))}</span><span>${escapeHtml(apRadioStandard(radio))}</span><span class="airview-ap-clients">${icon('connectivity')}${radio.clients === null ? '--' : radio.clients}</span></div>`).join('')}</div>${has6g && !broadcasts6g.length ? `<div class="airview-ap-warning">${icon('info')}<span>当前没有 Wi-Fi 广播使用 6 GHz Radio。</span></div>` : ''}<footer><button type="button" class="policy-secondary" disabled>端口管理器</button><button type="button" class="policy-secondary" disabled>AirView</button></footer></section><section class="airview-ap-chart-card"><header><strong>TX 重试</strong><span>${retryPoints.length ? `${retryPoints.length} 个样本` : '--'}</span></header>${retryPoints.length > 1 ? radioHistory({ ...radios[0], channel_history: retryPoints, ap: ap.name }) : `<div class="airview-ap-empty-chart"><span>后端尚未提供 TX 重试时间序列</span></div>`}</section><section class="airview-ap-facts">${apSheetMetric('型号', ap.model)}${apSheetMetric('IP 地址', ap.ip)}${apSheetMetric('MAC 地址', ap.mac)}${apSheetMetric('设备版本', ap.version)}${apSheetMetric('运行时间', ap.uptime)}</section><section class="airview-ap-table-card"><header><strong>空中统计</strong><span>按 Radio</span></header><div class="wifi-table-scroll"><table class="dwrt-kit-table"><thead><tr><th>频段</th><th>Tx 包</th><th>Tx 字节</th><th>Rx 包</th><th>Rx 字节</th><th>重试</th><th>丢弃</th></tr></thead><tbody>${radios.map((radio) => `<tr><td>${escapeHtml(bandLabel(radio.band))}</td><td>${escapeHtml(firstText(radio.air_stats.tx_packets, '--'))}</td><td>${escapeHtml(firstText(radio.air_stats.tx_bytes, '--'))}</td><td>${escapeHtml(firstText(radio.air_stats.rx_packets, '--'))}</td><td>${escapeHtml(firstText(radio.air_stats.rx_bytes, '--'))}</td><td>${escapeHtml(firstText(radio.air_stats.retries, '--'))}</td><td>${escapeHtml(firstText(radio.air_stats.dropped, '--'))}</td></tr>`).join('')}</tbody></table></div></section><section class="airview-ap-facts">${apSheetMetric('Mesh 父级', ap.mesh_parent)}${apSheetMetric('AP 组', ap.ap_group)}</section></div>`;
   }
 
   function apInsights(ap, radios) {
-    return `<div class="airview-ap-sheet-stack">${radios.map((radio) => `<section class="airview-ap-insight-card"><header><div>${deviceImage(ap, 'airview-metric-device-image')}<span><strong>${escapeHtml(bandLabel(radio.band))}</strong><small>信道 ${radio.channel || '--'} · ${radio.width ? `${radio.width} MHz` : '--'}</small></span></div><b>${radio.clients === null ? '--' : radio.clients} 客户端</b></header><h4>关键指标</h4><div class="airview-ap-kpis">${apSheetMetric('发射功率', radio.tx_power ? `${radio.tx_power} dBm` : '--')}${apSheetMetric('平均信号', radio.avg_signal)}${apSheetMetric('利用率', radio.utilization === null ? '--' : `${radio.utilization}%`, radio.utilization === null ? radioMetricNote(radio.utilization_reason) : '')}${apSheetMetric('重试率', radio.retry_rate ? `${radio.retry_rate}%` : '--')}</div><h4>历史</h4>${radioHistory(radio)}<h4>活动客户端 RSSI 分布</h4>${signalDistribution(radio)}<h4>统计</h4><div class="airview-ap-kpis">${apSheetMetric('噪声', radio.noise === null ? '--' : `${radio.noise} dBm`, radio.noise === null ? radioMetricNote(radio.noise_reason) : '')}${apSheetMetric('平均干扰', radio.avg_interference === null ? '--' : `${radio.avg_interference}%`)}${apSheetMetric('Wi-Fi 标准', apRadioStandard(radio))}${apSheetMetric('MIMO', radio.mimo)}</div></section>`).join('')}</div>`;
+    return `<div class="airview-ap-sheet-stack">${radios.map((radio) => `<section class="airview-ap-insight-card"><header><div>${deviceImage(ap, 'airview-metric-device-image')}<span><strong>${escapeHtml(bandLabel(radio.band))}</strong><small>信道 ${radio.channel || '--'} · ${radio.width ? `${radio.width} MHz` : '--'}</small></span></div><b>${radio.clients === null ? '--' : radio.clients} 客户端</b></header><h4>关键指标</h4><div class="airview-ap-kpis">${apSheetMetric('发射功率', radio.tx_power ? `${radio.tx_power} dBm` : '--')}${apSheetMetric('平均信号', metricValue(radio.avg_signal, 'dBm'), radio.avg_signal === null ? radioMetricNote(radio.avg_signal_reason) : '')}${apSheetMetric('利用率', radio.utilization === null ? '--' : `${radio.utilization}%`, radio.utilization === null ? radioMetricNote(radio.utilization_reason) : '')}${apSheetMetric('重试率', radio.retry_rate ? `${radio.retry_rate}%` : '--')}</div><h4>历史</h4>${radioHistory(radio)}<h4>活动客户端 RSSI 分布</h4>${signalDistribution(radio)}<h4>统计</h4><div class="airview-ap-kpis">${apSheetMetric('噪声', radio.noise === null ? '--' : `${radio.noise} dBm`, radio.noise === null ? radioMetricNote(radio.noise_reason) : '')}${apSheetMetric('平均干扰', metricValue(radio.avg_interference, '%'), radio.avg_interference === null ? radioMetricNote(firstText(radio.avg_interference_reason, radio.utilization_reason)) : '')}${apSheetMetric('Wi-Fi 标准', apRadioStandard(radio))}${apSheetMetric('MIMO', radio.mimo)}</div></section>`).join('')}</div>`;
   }
 
   function apSettings(ap, radios) {
-    const gate = firstText(state.status.capabilities.reasons?.radio_update, 'AP 与 Radio 写事务尚未开放');
-    return `<div class="airview-ap-sheet-stack"><div class="wifi-inline-warning">${icon('info')}<span>${escapeHtml(gate)}。当前设置仅用于核对字段与依赖关系。</span></div><section class="airview-ap-settings-card"><h3>设备</h3><div class="wifi-sheet-fields"><label class="wifi-field is-wide"><span>名称</span><input value="${escapeHtml(ap.name)}" disabled></label><label class="wifi-field is-wide"><span>设备标签</span><input value="${escapeHtml(ap.tags.join(', '))}" placeholder="未配置" disabled></label></div></section>${radios.map((radio) => `<section class="airview-ap-settings-card"><header><strong>${escapeHtml(bandLabel(radio.band))}</strong><small>Radio</small></header><div class="wifi-sheet-fields"><label class="wifi-field"><span>信道宽度</span><select disabled><option>${radio.width ? `${radio.width} MHz` : '--'}</option></select></label><label class="wifi-field"><span>信道</span><select disabled><option>${radio.channel || '--'}</option></select></label><label class="wifi-field"><span>发射功率</span><select disabled><option>${escapeHtml(firstText(radio.tx_power_mode, radio.tx_power ? `${radio.tx_power} dBm` : '--'))}</option></select></label><label class="wifi-field"><span>最小 RSSI</span><input value="${radio.min_rssi_enabled ? firstText(radio.min_rssi, '--') : '关闭'}" disabled></label></div></section>`).join('')}<section class="airview-ap-settings-card"><h3>Mesh</h3><div class="wifi-settings-list"><label class="wifi-setting-row"><span><strong>Mesh Connect</strong><small>允许无线 Mesh 上行。</small></span><input type="checkbox" role="switch" disabled></label></div><div class="wifi-sheet-fields"><label class="wifi-field"><span>Mesh 父级</span><select disabled><option>${escapeHtml(firstText(ap.mesh_parent, '--'))}</option></select></label><label class="wifi-field"><span>上行链路优先级</span><select disabled><option>--</option></select></label></div></section><section class="airview-ap-settings-card"><h3>网络</h3><div class="wifi-sheet-fields"><label class="wifi-field"><span>IP 配置</span><select disabled><option>${escapeHtml(firstText(ap.ip_mode, '--'))}</option></select></label><label class="wifi-field"><span>IP 地址</span><input value="${escapeHtml(firstText(ap.ip, '--'))}" disabled></label></div></section><section class="airview-ap-settings-card"><h3>设备操作</h3><div class="wifi-settings-list"><label class="wifi-setting-row"><span><strong>LED</strong><small>控制设备状态灯。</small></span><input type="checkbox" role="switch" ${ap.led_enabled === true ? 'checked' : ''} disabled></label></div><div class="airview-ap-actions">${['替换设备', '加载配置', '更新固件', '定位', '重启', '禁用', '移除'].map((label) => `<button type="button" class="policy-secondary" disabled>${label}</button>`).join('')}</div></section><footer class="airview-ap-settings-footer"><button class="policy-primary" type="button" disabled>应用更改</button></footer></div>`;
+    const gate = writeGateNote(firstText(state.status.capabilities.reasons?.radio_update, '')) || 'AP 与 Radio 写事务尚未开放';
+    return `<div class="airview-ap-sheet-stack"><div class="wifi-inline-warning">${icon('info')}<span>${escapeHtml(gate)}。当前设置仅用于核对字段与依赖关系。</span></div><section class="airview-ap-settings-card"><h3>设备</h3><div class="wifi-sheet-fields"><label class="wifi-field is-wide"><span>名称</span><input value="${escapeHtml(ap.name)}" disabled></label><label class="wifi-field is-wide"><span>设备标签</span><input value="${escapeHtml(ap.tags.join(', '))}" placeholder="未配置" disabled></label></div></section>${radios.map((radio) => `<section class="airview-ap-settings-card"><header><strong>${escapeHtml(bandLabel(radio.band))}</strong><small>Radio</small></header><div class="wifi-sheet-fields"><label class="wifi-field dwrt-kit-field" data-dwrt-component="field"><span>信道宽度</span><select disabled><option>${radio.width ? `${radio.width} MHz` : '--'}</option></select></label><label class="wifi-field dwrt-kit-field" data-dwrt-component="field"><span>信道</span><select disabled><option>${radio.channel || '--'}</option></select></label><label class="wifi-field dwrt-kit-field" data-dwrt-component="field"><span>发射功率</span><select disabled><option>${escapeHtml(firstText(radio.tx_power_mode, radio.tx_power ? `${radio.tx_power} dBm` : '--'))}</option></select></label><label class="wifi-field dwrt-kit-field" data-dwrt-component="field"><span>最小 RSSI</span><input value="${radio.min_rssi_enabled ? firstText(radio.min_rssi, '--') : '关闭'}" disabled></label></div></section>`).join('')}<section class="airview-ap-settings-card"><h3>Mesh</h3><div class="wifi-settings-list"><label class="wifi-setting-row"><span><strong>Mesh Connect</strong><small>允许无线 Mesh 上行。</small></span><input type="checkbox" role="switch" disabled></label></div><div class="wifi-sheet-fields"><label class="wifi-field dwrt-kit-field" data-dwrt-component="field"><span>Mesh 父级</span><select disabled><option>${escapeHtml(firstText(ap.mesh_parent, '--'))}</option></select></label><label class="wifi-field dwrt-kit-field" data-dwrt-component="field"><span>上行链路优先级</span><select disabled><option>--</option></select></label></div></section><section class="airview-ap-settings-card"><h3>网络</h3><div class="wifi-sheet-fields"><label class="wifi-field dwrt-kit-field" data-dwrt-component="field"><span>IP 配置</span><select disabled><option>${escapeHtml(firstText(ap.ip_mode, '--'))}</option></select></label><label class="wifi-field dwrt-kit-field" data-dwrt-component="field"><span>IP 地址</span><input value="${escapeHtml(firstText(ap.ip, '--'))}" disabled></label></div></section><section class="airview-ap-settings-card"><h3>设备操作</h3><div class="wifi-settings-list"><label class="wifi-setting-row"><span><strong>LED</strong><small>控制设备状态灯。</small></span><input type="checkbox" role="switch" ${ap.led_enabled === true ? 'checked' : ''} disabled></label></div><div class="airview-ap-actions">${['替换设备', '加载配置', '更新固件', '定位', '重启', '禁用', '移除'].map((label) => `<button type="button" class="policy-secondary" disabled>${label}</button>`).join('')}</div></section><footer class="airview-ap-settings-footer"><button class="policy-primary" type="button" disabled>应用更改</button></footer></div>`;
   }
 
   function apDetailsSheet() {
@@ -1675,7 +1879,14 @@ export function mount(context = {}) {
       return `<div class="airview-empty"><span>${icon('radio')}</span><strong>${noHardware ? '未检测到无线 Radio' : '未找到匹配项'}</strong><small>${noHardware ? `后端运行态：${reason}。页面不会生成模拟 AP、客户端或频谱数据。` : '调整左侧显示选项，或清除筛选条件查看全部 AP。'}</small>${noHardware ? '' : '<button type="button" class="wifi-link-button" data-airview-clear>重置筛选</button>'}</div>`;
     }
     const selectedVisible = radios.filter((radio) => state.selectedRadios.has(radio.id));
-    return `<div class="airview-radio-table policy-stable-glass" data-dwrt-component="data-table"><div class="wifi-table-scroll"><table><thead><tr><th class="airview-select-column"><input type="checkbox" data-airview-radio-select-all ${selectedVisible.length === radios.length ? 'checked' : ''} aria-label="选择全部射频"></th><th>名称</th><th>频段</th><th>信道</th><th>信道宽度</th><th>Tx 功率</th><th>客户端</th><th>平均信号</th><th>过去 24 小时</th><th>平均干扰</th></tr></thead><tbody>${radios.map((radio) => `<tr data-airview-radio-row="${escapeHtml(radio.id)}" class="${state.selectedRadios.has(radio.id) ? 'is-selected' : ''}" tabindex="0"><td class="airview-select-column"><input type="checkbox" data-airview-radio-select="${escapeHtml(radio.id)}" ${state.selectedRadios.has(radio.id) ? 'checked' : ''} aria-label="选择 ${escapeHtml(radio.ap)} ${escapeHtml(bandLabel(radio.band))}"></td><td><span class="airview-ap-cell">${deviceImage(radio)}<span><strong${radio.ap !== clipLabel(radio.ap) ? ` title="${escapeHtml(radio.ap)}"` : ''}>${escapeHtml(clipLabel(radio.ap))}</strong>${radio.model && radio.model !== radio.ap ? `<small${radio.model !== clipLabel(radio.model) ? ` title="${escapeHtml(radio.model)}"` : ''}>${escapeHtml(clipLabel(radio.model))}</small>` : ''}</span></span></td><td>${escapeHtml(bandLabel(radio.band))}</td><td>${radio.channel || '--'}</td><td>${radio.width || '--'}</td><td>${radio.tx_power_mode ? escapeHtml(radio.tx_power_mode) : radio.tx_power ? `${radio.tx_power} dBm` : '--'}</td><td>${radio.clients === null ? '--' : radio.clients}</td><td>${radio.avg_signal || '--'}</td><td>${radio.past_24h || '--'}</td><td>${radio.avg_interference === null ? '--' : `${radio.avg_interference}%`}</td></tr>`).join('')}</tbody></table></div></div>`;
+    /* 缺值的单元格显示后端 reason，而不是一个无从解释的 "--"。
+       有值时保留数值，null 时才落到 reason，两者不互相覆盖。 */
+    const metricCell = (value, reason) => {
+      if (value !== null) return escapeHtml(value);
+      const note = radioMetricNote(reason);
+      return note ? `<span class="airview-cell-reason" data-dwrt-tooltip="${escapeHtml(note)}">--<small>${escapeHtml(note)}</small></span>` : '--';
+    };
+    return `<div class="airview-radio-table policy-stable-glass" data-dwrt-component="data-table"><div class="wifi-table-scroll"><table><thead><tr><th class="airview-select-column"><input type="checkbox" data-airview-radio-select-all ${selectedVisible.length === radios.length ? 'checked' : ''} aria-label="选择全部射频"></th><th>名称</th><th>频段</th><th>信道</th><th>信道宽度</th><th>Tx 功率</th><th>客户端</th><th>平均信号</th><th>过去 24 小时</th><th>平均干扰</th></tr></thead><tbody>${radios.map((radio) => `<tr data-airview-radio-row="${escapeHtml(radio.id)}" class="${state.selectedRadios.has(radio.id) ? 'is-selected' : ''}" tabindex="0"><td class="airview-select-column"><input type="checkbox" data-airview-radio-select="${escapeHtml(radio.id)}" ${state.selectedRadios.has(radio.id) ? 'checked' : ''} aria-label="选择 ${escapeHtml(radio.ap)} ${escapeHtml(bandLabel(radio.band))}"></td><td><span class="airview-ap-cell">${deviceImage(radio)}<span><strong${radio.ap !== clipLabel(radio.ap) ? ` title="${escapeHtml(radio.ap)}"` : ''}>${escapeHtml(clipLabel(radio.ap))}</strong>${radio.model && radio.model !== radio.ap ? `<small${radio.model !== clipLabel(radio.model) ? ` title="${escapeHtml(radio.model)}"` : ''}>${escapeHtml(clipLabel(radio.model))}</small>` : ''}</span></span></td><td>${escapeHtml(bandLabel(radio.band))}</td><td>${radio.channel || '--'}</td><td>${radio.width || '--'}</td><td>${radio.tx_power_mode ? escapeHtml(radio.tx_power_mode) : radio.tx_power ? `${radio.tx_power} dBm` : '--'}</td><td>${radio.clients === null ? '--' : radio.clients}</td><td>${metricCell(metricValue(radio.avg_signal, 'dBm'), firstText(radio.avg_signal_reason, state.status.capabilities.reasons?.station_metrics))}</td><td>${metricCell(radio.past_24h || null, radio.past_24h_reason)}</td><td>${metricCell(metricValue(radio.avg_interference, '%'), firstText(radio.avg_interference_reason, radio.utilization_reason))}</td></tr>`).join('')}</tbody></table></div></div>`;
   }
 
   /* Client, signal and 24h columns come back blank whenever the managed AP has
@@ -1711,6 +1922,12 @@ export function mount(context = {}) {
     if (typeof ui.mountAll === 'function') ui.mountAll(root);
     else window.DWRT_UI_KIT?.mountAll?.(root);
     keepActiveTabVisible();
+    syncTableScrollHints();
+    if (resultsResizeObserver) {
+      resultsResizeObserver.disconnect();
+      const results = root.querySelector('[data-airview-results]');
+      if (results) resultsResizeObserver.observe(results);
+    }
   }
 
   /*
@@ -1787,6 +2004,7 @@ export function mount(context = {}) {
         const activeKey = scrollAnchorKey(document.activeElement, results);
         results.innerHTML = radioResults();
         restoreScrollOffsets(results, offsets);
+        syncTableScrollHints(results);
         if (activeKey) {
           const next = nodeFromAnchorKey(activeKey, results);
           if (next && typeof next.focus === 'function') next.focus({ preventScroll: true });
@@ -2406,16 +2624,52 @@ export function mount(context = {}) {
     setRadioSelection(id, !state.selectedRadios.has(id));
   }
 
+  /* 射频表在窄容器里仍需横向滚动，而浮层滚动条会淡出、也不占高度，用户看不出
+     右侧还有列（实测 1280 下最后一列在可见区外 140px）。这里给表卡标注滚动状态，
+     CSS 据此在右缘画渐变提示：还能右滚时显示，滚到底淡出。
+     用 data 属性而不是直接改样式，材质与几何仍然全部留在 CSS 里。 */
+  function syncTableScrollHints(boundary = root) {
+    if (!boundary) return;
+    boundary.querySelectorAll('.airview-radio-table > .wifi-table-scroll').forEach((node) => {
+      const card = node.parentElement;
+      if (!card) return;
+      const max = node.scrollWidth - node.clientWidth;
+      if (max <= 1) { card.removeAttribute('data-scroll-x'); return; }
+      card.dataset.scrollX = node.scrollLeft >= max - 1 ? 'end' : 'true';
+    });
+  }
+
+  /* 容器变宽/变窄会改变是否溢出（1440 排得下、1280 需要滚），所以尺寸变化也要重算。
+     5s 的局部刷新只换 .airview-results 的内容，不换它本身；render() 才会重建它，
+     所以在 render() 里重新 observe 一次，避免观察一堆已被替换的滚动节点。 */
+  const resultsResizeObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => {
+    if (state.mounted) syncTableScrollHints();
+  });
+
+  function onScroll(event) {
+    const node = event.target;
+    if (!(node instanceof HTMLElement) || !node.classList?.contains('wifi-table-scroll')) return;
+    syncTableScrollHints(node.closest('.airview-results') || root);
+  }
+
   root.addEventListener('click', onClick);
   root.addEventListener('input', onInput);
   root.addEventListener('change', onChange);
   root.addEventListener('keydown', onKeydown);
+  // 滚动事件不冒泡，只能在捕获阶段拿到。
+  root.addEventListener('scroll', onScroll, true);
   stage?.classList.add('is-wifi-management');
   render();
   load();
   state.refreshTimer = window.setInterval(() => {
     if (!state.mounted || document.hidden || state.refreshing || state.scanning) return;
-    if (state.dirty || state.radioDirty || state.saving || state.sheet) return;
+    /*
+     * 抽屉开着时不后台刷新。`state.sheet` 只覆盖配置侧那些抽屉，AP 详情抽屉走的是
+     * `state.apSheetAp`（见 apDetailsSheet()），漏掉它意味着 5s 轮询会在详情抽屉开着时
+     * 重绘宿主。重绘落在关闭动画的 480ms 内，就会把关闭按钮换掉，抽屉的第二拍丢失，
+     * 遮罩留在 portal 里吞掉全部点击。kit 侧已经有兜底，这里把触发源一并堵上。
+     */
+    if (state.dirty || state.radioDirty || state.saving || state.sheet || state.apSheetAp) return;
     /*
      * AP 管理 Tab 走自己的端点，所以后台刷新也走 loadAc。
      * 确认弹窗打开或写请求在飞时不刷，避免把用户正在看的确认对话重建掉。
@@ -2442,10 +2696,12 @@ export function mount(context = {}) {
       if (state.scanTimer) clearTimeout(state.scanTimer);
       if (state.scanWaitResolve) state.scanWaitResolve();
       state.scanWaitResolve = null;
-      root.removeEventListener('click', onClick);
+  root.removeEventListener('click', onClick);
       root.removeEventListener('input', onInput);
       root.removeEventListener('change', onChange);
       root.removeEventListener('keydown', onKeydown);
+      root.removeEventListener('scroll', onScroll, true);
+      resultsResizeObserver?.disconnect();
       root.replaceChildren();
       root.classList.remove('route-workspace', 'policy-table-route-host', 'wifi-management-route-host', 'wireless-status-route-host', 'wifi-config-route-host');
       stage?.classList.remove('is-wifi-management');

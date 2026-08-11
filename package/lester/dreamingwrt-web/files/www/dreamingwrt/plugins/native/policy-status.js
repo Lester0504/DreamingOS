@@ -7,7 +7,7 @@ export function mount(context = {}) {
   const formatBytes = utils.formatBytes || ((value) => `${Math.max(0, Number(value) || 0)} B`);
   const formatRate = utils.formatRate || ((value) => `${Math.max(0, Number(value) || 0)} B/s`);
   const formatInteger = utils.formatInteger || ((value) => Math.round(Number(value) || 0).toLocaleString());
-  const VERSION = '20260803-policy-flow-semantics-02';
+  const VERSION = '20260810-front-release-01';
   const REFRESH_MS = 5000;
   const WS_RECONCILE_MS = 30000;
   const ROUTE_STATUS_TOPIC = 'route.status';
@@ -623,8 +623,8 @@ export function mount(context = {}) {
       <div class="dwrt-kit-table-toolbar policy-status-toolbar">
         <div class="dwrt-kit-table-title"><strong>分流规则</strong><span data-policy-rule-count>${filteredRules().length} / ${state.data?.rules.length || 0} 条</span></div>
         <label class="policy-status-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg><input type="search" data-policy-status-search value="${escapeHtml(state.query)}" placeholder="搜索规则、匹配对象、出口" aria-label="搜索分流规则"></label>
-        <select data-policy-status-filter="action" aria-label="筛选动作"><option value="">全部动作</option>${['route', 'balance', 'vpn', 'direct', 'reject', 'fallback'].map((action) => `<option value="${action}" ${state.action === action ? 'selected' : ''}>${actionLabel(action)}</option>`).join('')}</select>
-        <select data-policy-status-filter="path" aria-label="筛选出口"><option value="">全部出口</option>${paths.map((path) => `<option value="${escapeHtml(path)}" ${state.path === path ? 'selected' : ''}>${escapeHtml(path)}</option>`).join('')}</select>
+        <label class="policy-status-filter dwrt-kit-field" data-dwrt-component="field"><select data-policy-status-filter="action" aria-label="筛选动作"><option value="">全部动作</option>${['route', 'balance', 'vpn', 'direct', 'reject', 'fallback'].map((action) => `<option value="${action}" ${state.action === action ? 'selected' : ''}>${actionLabel(action)}</option>`).join('')}</select></label>
+        <label class="policy-status-filter dwrt-kit-field" data-dwrt-component="field"><select data-policy-status-filter="path" aria-label="筛选出口"><option value="">全部出口</option>${paths.map((path) => `<option value="${escapeHtml(path)}" ${state.path === path ? 'selected' : ''}>${escapeHtml(path)}</option>`).join('')}</select></label>
       </div>
       ${runtimeEvidenceMarkup()}
       <div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr><th>${sortButton('prio', '优先级')}</th><th>${sortButton('name', '分流规则')}</th><th>匹配对象</th><th>出口通道</th><th>${sortButton('active_flows', '状态速率')}</th><th>${sortButton('hit_count', '聚合命中')}</th></tr></thead><tbody>${ruleRows()}</tbody></table></div>
@@ -638,8 +638,8 @@ export function mount(context = {}) {
     root.classList.add('route-workspace', 'policy-status-route-host');
     root.innerHTML = `<section class="policy-status-shell">
       ${overviewMarkup(state.data)}
-      <section class="policy-status-outlets" aria-label="出口状态">${state.data.outlets.map(outletCard).join('') || '<div class="policy-status-empty dwrt-kit-glass-surface policy-status-glass">暂无出口状态</div>'}</section>
-      <section class="policy-status-groups" aria-label="策略组状态">${state.data.groups.map(groupCard).join('') || '<div class="policy-status-empty dwrt-kit-glass-surface policy-status-glass"><strong>暂无策略组状态</strong><span>等待后端返回真实策略组运行态。</span></div>'}</section>
+      <section class="policy-status-outlets" aria-label="出口状态">${state.data.outlets.map(outletCard).join('') || '<div class="policy-status-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="stable-glass"><strong>暂无出口状态</strong></div>'}</section>
+      <section class="policy-status-groups" aria-label="策略组状态">${state.data.groups.map(groupCard).join('') || '<div class="policy-status-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="stable-glass"><strong>暂无策略组状态</strong><p>等待后端返回真实策略组运行态。</p></div>'}</section>
       ${rulesTable()}
     </section>`;
     bindEvents();
@@ -761,7 +761,7 @@ export function mount(context = {}) {
   function renderOutlets() {
     const section = root.querySelector('.policy-status-outlets');
     if (!section) return;
-    section.innerHTML = state.data.outlets.map(outletCard).join('') || '<div class="policy-status-empty dwrt-kit-glass-surface policy-status-glass">暂无出口状态</div>';
+    section.innerHTML = state.data.outlets.map(outletCard).join('') || '<div class="policy-status-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="stable-glass"><strong>暂无出口状态</strong></div>';
     state.outletKey = outletStructureKey();
     ui.mountAll?.(section);
   }
@@ -769,7 +769,7 @@ export function mount(context = {}) {
   function renderGroups() {
     const section = root.querySelector('.policy-status-groups');
     if (!section) return;
-    section.innerHTML = state.data.groups.map(groupCard).join('') || '<div class="policy-status-empty dwrt-kit-glass-surface policy-status-glass"><strong>暂无策略组状态</strong><span>等待后端返回真实策略组运行态。</span></div>';
+    section.innerHTML = state.data.groups.map(groupCard).join('') || '<div class="policy-status-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="stable-glass"><strong>暂无策略组状态</strong><p>等待后端返回真实策略组运行态。</p></div>';
     state.groupKey = groupStructureKey();
     ui.mountAll?.(section);
   }

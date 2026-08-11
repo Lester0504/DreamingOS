@@ -16,6 +16,28 @@ const sourceList = (value, keys = []) => {
 
 const sourceText = (...values) => values.map((value) => String(value ?? '').trim()).find(Boolean) || '';
 
+/*
+ * flowd 的两类资源都把「配置态可写」与「运行态是否已应用」分成两位下发：
+ * runtime_apply 恒为 false，原因串恒为 flowd_apply_mode_plan_only
+ * （flowd_db_init() 会主动把 apply_mode 拽回 plan-only）。
+ * 所以写入落库成功不等于已应用到数据面，两件事必须分开呈现，不能被 CRUD 位盖掉。
+ */
+const runtimeApplyState = (capabilities) => ({
+  runtimeApply: capabilities?.runtime_apply === true,
+  runtimeApplyKnown: typeof capabilities?.runtime_apply === 'boolean',
+  runtimeApplyReason: sourceText(capabilities?.runtime_apply_reason)
+});
+
+const RUNTIME_APPLY_REASONS = {
+  flowd_apply_mode_plan_only: 'flowd 的 apply_mode 恒为 plan-only，配置只落库不下发数据面'
+};
+
+export function runtimeApplyReasonText(reason) {
+  const key = sourceText(reason);
+  if (!key) return '';
+  return RUNTIME_APPLY_REASONS[key] || key;
+}
+
 export function normalizePolicyObjects(payload = {}) {
   const normalize = (item = {}, index = 0, legacy = false) => ({
     id: sourceText(item.id, `${legacy ? 'legacy' : 'object'}-${index + 1}`),
@@ -62,12 +84,23 @@ export function normalizeRoutingObjects(payload = {}) {
     source: sourceText(data?.source, 'dreamingwrt.routed'),
     revision: Number(data?.revision) || 0,
     capabilities,
-    readOnly: true
+    /*
+     * 只读判据取后端自述，不再写死。routed 在同一份载荷里给出 object_crud
+     * 与写入端点（30.1 实测 object_crud=true、
+     * object_crud_write_endpoint=/api/v1/routing/objects），策略引擎侧还另有
+     * legacy_route_objects_read_only=false 指同一件事。写死 true 会把一个真实
+     * 可写的资源说成后端不支持。
+     *
+     * 能力键缺失时保持只读：那是「能力未知」，不是「可写」，前端不替后端假设。
+     */
+    readOnly: capabilities.object_crud !== true,
+    writeEndpoint: sourceText(capabilities.object_crud_write_endpoint, '/api/v1/routing/objects')
   };
 }
 
 export function normalizeFlowdCustomProtocols(payload = {}) {
   const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+  const capabilities = data?.capabilities && typeof data.capabilities === 'object' ? data.capabilities : null;
   return {
     items: sourceList(data, ['protocols']).map((item = {}, index) => ({
       id: sourceText(item.id, `custom-protocol-${index + 1}`),
@@ -85,12 +118,29 @@ export function normalizeFlowdCustomProtocols(payload = {}) {
     })),
     source: sourceText(data?.source, 'dreamingwrt.flowd'),
     total: Number(data?.total) || sourceList(data, ['protocols']).length,
-    readOnly: true
+    /*
+     * flowd 的 custom_protocols_get 现在会下发 capabilities（2026-08-09 30.1 实测：
+     * custom_protocol_crud=true、object_crud_scope=flowd:custom_protocol，
+     * 另有按资源命名的别名键 custom_protocol_crud_write_endpoint /
+     * custom_protocol_delete_endpoint）。判据仍只取目标端点自身的 capabilities
+     * （design.md「Capability truth」第 1 条），并保持三态：
+     *   capabilityKnown=false → 能力未确认，不得断言后端不支持；
+     *   custom_protocol_crud=false → 后端明确为否；
+     *   custom_protocol_crud=true → 解开只读。
+     * 端点一律取能力位下发值，兜底串只在能力缺失时才生效，不作为可写判据。
+     */
+    capabilities: capabilities || {},
+    capabilityKnown: capabilities !== null,
+    readOnly: capabilities?.custom_protocol_crud !== true,
+    writeEndpoint: sourceText(capabilities?.custom_protocol_crud_write_endpoint, capabilities?.object_crud_write_endpoint, '/api/v1/flowd/custom-protocols'),
+    deleteEndpoint: sourceText(capabilities?.custom_protocol_delete_endpoint, capabilities?.object_delete_endpoint, '/api/v1/flowd/custom-protocols/delete'),
+    ...runtimeApplyState(capabilities)
   };
 }
 
 export function normalizeFlowdObjects(payload = {}) {
   const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+  const capabilities = data?.capabilities && typeof data.capabilities === 'object' ? data.capabilities : null;
   return {
     items: sourceList(data, ['objects']).map((item = {}, index) => ({
       id: sourceText(item.id, `flow-object-${index + 1}`),
@@ -114,9 +164,100 @@ export function normalizeFlowdObjects(payload = {}) {
     })),
     source: sourceText(data?.source, 'dreamingwrt.flowd'),
     total: Number(data?.total) || sourceList(data, ['objects']).length,
-    readOnly: true
+    /*
+     * 这里的 readOnly 只描述「除 country / time 之外的类型能不能写」。
+     * country 与 time 已由 FLOW_OBJECT_EDITABLE_TYPES 开放真实写入面，
+     * 不受这一位影响 —— 那两类的写入已在 30.1 实测通过。
+     *
+     * objects_get 现在会下发 capabilities（2026-08-09 30.1 实测：object_crud=true、
+     * object_crud_scope=flowd:object、写入/删除端点齐备），所以 readOnly 已按能力位解开。
+     * 但「写通道开放」不等于本页会给所有类型放表单：ipv4 / domain / app_set 等类型的
+     * 取值语义仍没有校验落点，给了输入框等于放行乱值，因此本页开放的类型集合仍由
+     * FLOW_OBJECT_EDITABLE_TYPES 决定，与 object_crud 是两个独立的门。
+     * 另外 runtime_apply=false 表示配置落库 ≠ 已应用到数据面，单独呈现，不被 CRUD 位盖掉。
+     */
+    capabilities: capabilities || {},
+    capabilityKnown: capabilities !== null,
+    readOnly: capabilities?.object_crud !== true,
+    writeEndpoint: sourceText(capabilities?.object_crud_write_endpoint, '/api/v1/flowd/objects'),
+    deleteEndpoint: sourceText(capabilities?.object_delete_endpoint, '/api/v1/flowd/objects/delete'),
+    ...runtimeApplyState(capabilities)
   };
 }
+
+/*
+ * 地区目录（策略表的「地区」选择器）唯一的数据来源就是 country 类型的 flowd
+ * 流量对象，计划目录同理来自 time 类型 —— webd 的 catalog 按 type 把 flowd
+ * 对象分流成 regions / schedules（jmx_app_api.c:35646）。在此之前全站没有任何
+ * 页面会发 `POST /api/v1/flowd/objects`，于是选择器恒空且用户无从下手。
+ * 这两类由本页承担写入面，其余类型（ipv4/domain/app_set 等）仍不在本页范围内。
+ */
+export const FLOW_OBJECT_EDITABLE_TYPES = ['country', 'time'];
+
+/*
+ * 国家码取值走后端权威清单，不在前端自造。/api/v1/firewall/geo-block 的
+ * `countries[]` 是 aegisxd 的官方目录（实测 249 条，带中文名与所属洲），
+ * aegisx 页的区域拦截用的就是它。这里只读它当候选项，不写它的任何状态。
+ */
+export function normalizeCountryCatalog(payload = {}) {
+  const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+  const items = sourceList(data, ['countries']).map((item = {}) => {
+    const code = sourceText(item.code, item.id).toUpperCase();
+    return {
+      code,
+      name: sourceText(item.name_zh, item.name, item.name_en, code),
+      continent: sourceText(item.continent)
+    };
+  }).filter((item) => /^[A-Za-z]{2}$/.test(item.code));
+  const seen = new Set();
+  return items.filter((item) => {
+    if (seen.has(item.code)) return false;
+    seen.add(item.code);
+    return true;
+  });
+}
+
+const WEEKDAY_LABELS = [['1', '一'], ['2', '二'], ['3', '三'], ['4', '四'], ['5', '五'], ['6', '六'], ['7', '日']];
+
+/*
+ * flowd 对 `time` 对象的 value 只做「能存进 FLOWD_MAX_JSON 的 JSON」这一层校验
+ * （flowd_db.c:3298 起，country 才有专门的 normalize），没有规定条目结构。
+ * 所以形状由前端定，取一个自洽且可读的最小结构：一段时间窗加生效星期。
+ */
+export function flowTimeValueFromDraft(draft = {}) {
+  const start = sourceText(draft.start);
+  const end = sourceText(draft.end);
+  const days = Array.isArray(draft.days) ? draft.days.map(String).filter((day) => WEEKDAY_LABELS.some(([key]) => key === day)) : [];
+  if (!/^\d{2}:\d{2}$/.test(start) || !/^\d{2}:\d{2}$/.test(end)) return null;
+  if (start === end) return null;
+  return [{ start, end, days: days.length ? days : WEEKDAY_LABELS.map(([key]) => key) }];
+}
+
+export function flowTimeDraftFromValue(value) {
+  const entry = Array.isArray(value) ? value[0] : value;
+  if (!entry || typeof entry !== 'object') return { start: '09:00', end: '18:00', days: WEEKDAY_LABELS.map(([key]) => key) };
+  const days = Array.isArray(entry.days) ? entry.days.map(String) : [];
+  return {
+    start: /^\d{2}:\d{2}$/.test(sourceText(entry.start)) ? sourceText(entry.start) : '09:00',
+    end: /^\d{2}:\d{2}$/.test(sourceText(entry.end)) ? sourceText(entry.end) : '18:00',
+    days: days.length ? days : WEEKDAY_LABELS.map(([key]) => key)
+  };
+}
+
+/* flowd_id_ok() → flowd_token_ok()：字母数字与 _-.:/ ，长度受 FLOWD_MAX_ID 限制。 */
+export function flowObjectIdFromName(type, name, taken = []) {
+  const slug = String(name ?? '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+  const base = `${type}-${slug || 'object'}`;
+  let candidate = base;
+  let serial = 2;
+  while (taken.includes(candidate)) {
+    candidate = `${base}-${serial}`;
+    serial += 1;
+  }
+  return candidate;
+}
+
+export { WEEKDAY_LABELS };
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -136,6 +277,13 @@ export function mount(context = {}) {
     refreshPromise: null,
     pollTimer: 0,
     detail: null,
+    /* country / time 的编辑抽屉：null 表示未打开。 */
+    editor: null,
+    /* 删除确认，走 kit 的 confirmationMarkup（design.md 规则 17）。 */
+    removing: null,
+    saving: false,
+    notice: '',
+    countries: { status: 'idle', items: [], error: '' },
     source: {
       routing: { status: 'loading', data: null, error: null },
       flowObjects: { status: 'loading', data: null, error: null },
@@ -192,16 +340,24 @@ export function mount(context = {}) {
     const flowd = state.source.flowd.data?.items.length ?? 0;
     const cards = [
       { key: 'composite', label: '复合策略对象', value: String(composite), detail: '策略引擎合同 · 只读', tone: 'info', icon: icon('boxes') },
-      { key: 'routing', label: '路由对象', value: state.source.routing.status === 'ready' ? String(routing) : '--', detail: '由“路由表”管理', tone: 'neutral', icon: icon('route') },
-      { key: 'flow-objects', label: '流量对象', value: state.source.flowObjects.status === 'ready' ? String(flowObjects) : '--', detail: 'flowd 配置态 · 只读', tone: 'neutral', icon: icon('braces') },
-      { key: 'flowd', label: '自定义协议', value: state.source.flowd.status === 'ready' ? String(flowd) : '--', detail: 'flowd 独立资源 · 只读', tone: 'neutral', icon: icon('scan-search') }
+      { key: 'routing', label: '路由对象', value: state.source.routing.status === 'ready' ? String(routing) : '--', detail: state.source.routing.data && !state.source.routing.data.readOnly ? '可写 · 写入面在路由表' : '由“路由表”管理', tone: 'neutral', icon: icon('route') },
+      { key: 'flow-objects', label: '流量对象', value: state.source.flowObjects.status === 'ready' ? String(flowObjects) : '--', detail: 'flowd 配置态 · 地区/计划可写', tone: 'neutral', icon: icon('braces') },
+      { key: 'flowd', label: '自定义协议', value: state.source.flowd.status === 'ready' ? String(flowd) : '--', detail: `flowd 独立资源 · ${flowdCardWritability()}`, tone: 'neutral', icon: icon('scan-search') }
     ];
     const renderer = ui.overviewCardsMarkup || window.DWRT_UI_KIT?.overviewCardsMarkup;
     return typeof renderer === 'function' ? renderer(cards, { className: 'policy-object-overview', label: '对象来源概览' }) : '';
   }
 
-  function tableMarkup({ title, description, rows, columns, empty, kind }) {
-    return `<section data-dwrt-component="data-table" class="policy-entity-table policy-object-table policy-object-table-${kind} dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(description)}</span></div><span class="dwrt-kit-table-count">${rows.length} 个</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr>${columns.map((column) => `<th>${escapeHtml(column)}</th>`).join('')}<th><span class="policy-entity-visually-hidden">详情</span></th></tr></thead><tbody>${rows.length ? rows.map((item) => rowMarkup(kind, item)).join('') : `<tr><td class="dwrt-kit-table-empty" colspan="${columns.length + 1}">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
+  /* 概览卡片一行字的可写性，判据与徽章、说明列同源，避免三处各说一套。 */
+  function flowdCardWritability() {
+    const data = state.source.flowd.data;
+    if (!data) return '读取中';
+    if (!data.readOnly) return '可写 · 表单待建';
+    return data.capabilityKnown ? '只读' : '可写性未确认';
+  }
+
+  function tableMarkup({ title, description, rows, columns, empty, kind, actions = '' }) {
+    return `<section data-dwrt-component="data-table" class="policy-entity-table policy-object-table policy-object-table-${kind} dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(description)}</span></div><div class="policy-object-table-toolbar-end"><span class="dwrt-kit-table-count">${rows.length} 个</span>${actions}</div></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr>${columns.map((column) => `<th>${escapeHtml(column)}</th>`).join('')}<th><span class="policy-entity-visually-hidden">操作</span></th></tr></thead><tbody>${rows.length ? rows.map((item) => rowMarkup(kind, item)).join('') : `<tr><td class="dwrt-kit-table-empty" colspan="${columns.length + 1}">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
   }
 
   function rowMarkup(kind, item) {
@@ -212,7 +368,16 @@ export function mount(context = {}) {
     }
     if (kind === 'flowObjects') {
       const reference = item.refCount ? `${item.refCount} 条引用` : '未引用';
-      return `<tr><td><strong>${escapeHtml(item.name)}</strong>${item.remark ? `<small>${escapeHtml(item.remark)}</small>` : ''}</td><td>${escapeHtml(item.type)}</td><td>${escapeHtml(String(item.valueCount))}</td><td>${escapeHtml(reference)}</td><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td>${detail}</tr>`;
+      const typeText = EDITABLE_TYPE_LABELS[item.type] ? `${EDITABLE_TYPE_LABELS[item.type]}（${item.type}）` : item.type;
+      /*
+       * 删除锁定由后端 reference_count 判定：被引用时 flowd 会以
+       * reference_conflict 拒绝，所以按钮直接禁用并说明原因，而不是让用户点一次
+       * 再吃一个报错。
+       */
+      const rowActions = isEditableFlowObject(item)
+        ? `<div class="policy-object-row-actions"><button type="button" data-dwrt-component="icon-button" data-object-edit="${escapeHtml(item.id)}" aria-label="编辑 ${escapeHtml(item.name)}" title="编辑">${icon('pencil')}</button><button type="button" data-dwrt-component="icon-button" data-object-remove="${escapeHtml(item.id)}" aria-label="删除 ${escapeHtml(item.name)}" title="${item.deleteLocked ? '被规则引用，无法删除' : '删除'}" ${item.deleteLocked ? 'disabled' : ''}>${icon('trash-2')}</button><button type="button" data-dwrt-component="icon-button" data-object-detail="${escapeHtml(`${kind}:${item.id}`)}" aria-label="查看 ${escapeHtml(item.name)}" title="详情">${icon('chevron-right')}</button></div>`
+        : `<div class="policy-object-row-actions"><button type="button" data-dwrt-component="icon-button" data-object-detail="${escapeHtml(`${kind}:${item.id}`)}" aria-label="查看 ${escapeHtml(item.name)}" title="详情">${icon('chevron-right')}</button></div>`;
+      return `<tr><td><strong>${escapeHtml(item.name)}</strong>${item.remark ? `<small>${escapeHtml(item.remark)}</small>` : ''}</td><td>${escapeHtml(typeText)}</td><td>${escapeHtml(String(item.valueCount))}</td><td>${escapeHtml(reference)}</td><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td>${rowActions}</td></tr>`;
     }
     const type = kind === 'routing' ? item.type : item.type;
     const owner = kind === 'routing' ? '路由表' : '策略引擎';
@@ -220,9 +385,23 @@ export function mount(context = {}) {
   }
 
   function compositeMarkup() {
+    /*
+     * 判 snapshot.error，而不是 snapshot.stale。
+     *
+     * registry 在真正 fetch 之前就按龄期置 stale（dwrt-data-registry.js 的
+     * request()：`entry.stale = hasValue && age > ttlMs`），与请求成败无关，所以
+     * 后端全程 200 时每个刷新窗口也会误报一次「刷新失败」。status === 'stale'
+     * 同样不行：中断（换页、卸载，AbortError）走的也是 stale，但 error 为 null，
+     * 那是正常取消。Boolean(snapshot.error) 是唯一能分离三种情形的信号。
+     */
+    function staleMarkup() {
+      if (!state.snapshot?.error) return '';
+      return `<div class="policy-entity-alert is-warning" role="status"><strong>正在显示上次可用快照</strong><span>复合对象（/api/v1/policy-engine/objects）刷新失败，页面仍保留最后一次成功数据。</span></div>`;
+    }
+
     const terminal = compositeTerminal();
     if (terminal) return statePanel(terminal.name, terminal.title, terminal.detail);
-    const stale = state.snapshot?.stale ? `<div class="policy-entity-alert is-warning" role="status"><strong>正在显示上次可用快照</strong><span>复合对象刷新失败，当前列表已保留。</span></div>` : '';
+    const stale = staleMarkup();
     const readOnly = state.composite.readOnly ? `<div class="policy-entity-alert is-warning" role="status"><strong>复合策略对象暂为只读</strong><span>${escapeHtml(compositeBlockReason())}。页面不会展示无法提交的名称、成员或模块开关。</span></div>` : '';
     return `${stale}${readOnly}${tableMarkup({ title: '复合策略对象', description: '权威来源：/api/v1/policy-engine/objects；不包含路由对象或系统应用目录', rows: state.composite.items, columns: ['名称', '类型', '地址族', '归属', '状态'], empty: '尚未创建复合策略对象', kind: 'composite' })}`;
   }
@@ -232,7 +411,30 @@ export function mount(context = {}) {
     if (terminal) return statePanel(terminal.name, terminal.title, terminal.detail);
     const data = state.source.routing.data;
     const stale = state.source.routing.status === 'ready' ? '' : `<div class="policy-entity-alert is-warning" role="status"><strong>正在显示上次可用快照</strong><span>${escapeHtml(state.source.routing.error || '路由对象刷新失败。')}</span></div>`;
-    return `${stale}<div class="policy-entity-alert" role="status"><strong>独立路由资源</strong><span>此处仅查看 routed 返回的路由对象；新增、编辑与删除归“策略引擎 → 路由表”所有，本页不会复制写入口。<a class="policy-entity-alert-link" href="#/policy-engine/routes">前往路由表管理路由对象</a></span></div>${tableMarkup({ title: '路由对象', description: `权威来源：/api/v1/routing/objects · ${data.source}`, rows: data.items, columns: ['名称', '类型', '地址族', '归属', '状态'], empty: '路由表尚未配置路由对象', kind: 'routing' })}`;
+    /*
+     * 写入归属与「后端是否支持写」是两件事，原文案把它们说成了一件。
+     *
+     * routed 声明 object_crud=true 时，路由对象是真实可写的，只是写入面在
+     * 「策略引擎 → 路由表」那一页（routing-table.js 的路由对象 tab 已按同一个
+     * 能力位开门）。此处给出可点入口即可，不在本页复制第二份表单。
+     * 能力位为假或缺失时才说明写入不可用，并区分这两种情形。
+     */
+    const notice = data.readOnly
+      ? `<div class="policy-entity-alert is-warning" role="status"><strong>路由对象当前不可写</strong><span>${escapeHtml(data.capabilities?.object_crud === false ? 'routed 声明 object_crud=false，写入通道未开放。' : 'routed 本次未声明 object_crud，可写性未确认；这不代表功能缺失。')}此处仍可查看 routed 返回的配置态列表。</span></div>`
+      : `<div class="policy-entity-alert" role="status"><strong>可写资源，写入面在路由表</strong><span>routed 已声明 <code>object_crud</code>，路由对象可新增、编辑与删除；写入面归“策略引擎 → 路由表”，本页只做查看，不复制第二份表单。<a class="policy-entity-alert-link" href="#/policy-engine/routes">前往路由表管理路由对象</a></span></div>`;
+    return `${stale}${notice}${tableMarkup({ title: '路由对象', description: `权威来源：${escapeHtml(data.writeEndpoint)} · ${data.source}`, rows: data.items, columns: ['名称', '类型', '地址族', '归属', '状态'], empty: '路由表尚未配置路由对象', kind: 'routing' })}`;
+  }
+
+  /*
+   * 运行态与配置态分开说。flowd 的 apply_mode 恒为 plan-only，所以写入落库成功
+   * 之后必须明确「还没应用到数据面」，否则用户会把保存成功读成已生效。
+   * 判据是 runtime_apply 这个布尔位：为真才说已应用，未下发时只说未确认。
+   */
+  function runtimeApplyMarkup(data, extra = '') {
+    if (!data?.runtimeApplyKnown) return '';
+    if (data.runtimeApply) return `<div class="policy-entity-alert is-success" role="status"><strong>配置态与运行态一致</strong><span>flowd 声明 <code>runtime_apply=true</code>，保存后的配置会应用到数据面。${extra}</span></div>`;
+    const reason = runtimeApplyReasonText(data.runtimeApplyReason);
+    return `<div class="policy-entity-alert is-warning" role="status"><strong>配置态已保存，运行态未应用</strong><span>flowd 声明 <code>runtime_apply=false</code>${reason ? `：${escapeHtml(reason)}` : ''}。写入成功只表示配置落进 flowd 配置库，数据面尚未生效，本页不提供运行态应用证明。${extra}</span></div>`;
   }
 
   function flowdMarkup() {
@@ -240,7 +442,18 @@ export function mount(context = {}) {
     if (terminal) return statePanel(terminal.name, terminal.title, terminal.detail);
     const data = state.source.flowd.data;
     const stale = state.source.flowd.status === 'ready' ? '' : `<div class="policy-entity-alert is-warning" role="status"><strong>正在显示上次可用快照</strong><span>${escapeHtml(state.source.flowd.error || '自定义协议刷新失败。')}</span></div>`;
-    return `${stale}<div class="policy-entity-alert" role="status"><strong>独立协议资源</strong><span>本表只列 flowd 用户自定义协议，不含系统内置应用签名与协议目录；那两类属于 <code>/api/v1/policy-engine/catalog</code>，由策略表的匹配条件直接引用。本页保持只读。</span></div>${tableMarkup({ title: 'flowd 自定义协议', description: `权威来源：/api/v1/flowd/custom-protocols · ${data.source}`, rows: data.items, columns: ['名称', '层级', '协议', '端口', '状态'], empty: 'flowd 尚未配置自定义协议', kind: 'flowd' })}`;
+    /*
+     * 三态分述，判据是 custom_protocol_crud 这个布尔位本身，不靠「有没有 reason」推断
+     * （design.md「Capability truth」第 14 条：那种写法会在后端就绪时反着说"尚未提供"）。
+     * 能力为真时不再挂只读提示；本页仍不放编辑表单，原因是入参 schema 未核，
+     * 这一点必须说成「表单待建」而不是「后端不支持」。
+     */
+    const capability = !data.readOnly
+      ? `<div class="policy-entity-alert" role="status"><strong>写入通道已开放，本页尚未提供表单</strong><span>flowd 已声明 <code>custom_protocol_crud=true</code>，写入端点 <code>${escapeHtml(data.writeEndpoint)}</code>、删除端点 <code>${escapeHtml(data.deleteEndpoint)}</code>。本页暂不放出编辑入口的原因只有一个：<code>custom_protocol_set</code> 的入参 schema 与必填字段尚未确认，建表单前先要拿到它。这不是后端不支持。</span></div>`
+      : data.capabilityKnown
+        ? `<div class="policy-entity-alert is-warning" role="status"><strong>写入能力为否</strong><span>flowd 声明 <code>custom_protocol_crud=false</code>，本页保持只读。</span></div>`
+        : `<div class="policy-entity-alert is-warning" role="status"><strong>写入能力未确认，本页暂不提供编辑</strong><span>本次 <code>custom_protocols</code> 载荷里没有可写能力位，因此本页不放出编辑入口；这不等于后端没有实现 —— 写入端点 <code>/api/v1/flowd/custom-protocols</code> 已注册。能力位到位后本页会自动解开。</span></div>`;
+    return `${stale}<div class="policy-entity-alert" role="status"><strong>独立协议资源</strong><span>本表只列 flowd 用户自定义协议，不含系统内置应用签名与协议目录；那两类属于 <code>/api/v1/policy-engine/catalog</code>，由策略表的匹配条件直接引用。</span></div>${capability}${runtimeApplyMarkup(data)}${tableMarkup({ title: 'flowd 自定义协议', description: `权威来源：${escapeHtml(data.writeEndpoint)} · ${data.source}`, rows: data.items, columns: ['名称', '层级', '协议', '端口', '状态'], empty: 'flowd 尚未配置自定义协议', kind: 'flowd' })}`;
   }
 
   function flowObjectsMarkup() {
@@ -248,7 +461,73 @@ export function mount(context = {}) {
     if (terminal) return statePanel(terminal.name, terminal.title, terminal.detail);
     const data = state.source.flowObjects.data;
     const stale = state.source.flowObjects.status === 'ready' ? '' : `<div class="policy-entity-alert is-warning" role="status"><strong>正在显示上次可用快照</strong><span>${escapeHtml(state.source.flowObjects.error || '流量对象刷新失败。')}</span></div>`;
-    return `${stale}<div class="policy-entity-alert is-warning" role="status"><strong>配置态对象</strong><span>引用关系仅覆盖 flowd 内部规则；runtime_kind 表示计划产物类型，不代表已经应用到数据面。</span></div>${tableMarkup({ title: 'flowd 流量对象', description: `权威来源：/api/v1/flowd/objects · ${data.source}`, rows: data.items, columns: ['名称', '类型', '值数量', '引用', '状态'], empty: 'flowd 尚未配置流量对象', kind: 'flowObjects' })}`;
+    /*
+     * 地区目录只由 country 类型对象喂养，所以这张表是「地区」选择器的唯一入口。
+     * 建 / 改 / 删只对 country 与 time 开放，其余类型（ipv4、domain、app_set…）
+     * 本页仍只读 —— 它们各自的取值语义没有校验落点，给了输入框等于放行乱值。
+     */
+    const editable = data.items.filter(isEditableFlowObject).length;
+    const notice = state.notice ? `<div class="policy-entity-alert is-success" role="status"><strong>已生效</strong><span>${escapeHtml(state.notice)}</span></div>` : '';
+    /*
+     * 类型范围与 object_crud 是两个门，分开说：能力位为真只表示写通道开放，
+     * 其余类型缺的是取值校验落点，不是后端能力。
+     */
+    const scope = data.readOnly
+      ? `<div class="policy-entity-alert is-warning" role="status"><strong>其余类型写入能力${data.capabilityKnown ? '为否' : '未确认'}</strong><span>${data.capabilityKnown ? `flowd 声明 <code>object_crud=false</code>` : '本次载荷未声明 <code>object_crud</code>'}，${EDITABLE_TYPE_LABELS.country} 与 ${EDITABLE_TYPE_LABELS.time} 之外的类型保持只读。</span></div>`
+      : `<div class="policy-entity-alert" role="status"><strong>写入通道已开放，本页开放的类型仍是两类</strong><span>flowd 已声明 <code>object_crud=true</code>，写入端点 <code>${escapeHtml(data.writeEndpoint)}</code>、删除端点 <code>${escapeHtml(data.deleteEndpoint)}</code>。本页仍只放出 ${EDITABLE_TYPE_LABELS.country} 与 ${EDITABLE_TYPE_LABELS.time} 的表单：<code>ipv4</code> / <code>domain</code> / <code>app_set</code> 等类型的取值语义还没有校验落点，给输入框等于放行乱值。这是前端表单缺口，不是后端能力缺口。</span></div>`;
+    /*
+     * 运行态那条与旧的「配置态对象」提示说的是同一件事，合成一条 ——
+     * 四条提示条叠在表格上面，读者会直接跳过它们。
+     * runtime_apply 缺失（旧后端）时仍要保留原来那条独立说明，否则这层结论会整块消失。
+     */
+    const configNote = '引用关系仅覆盖 flowd 内部规则；runtime_kind 表示计划产物类型，不代表已经应用到数据面。';
+    const runtime = runtimeApplyMarkup(data, configNote)
+      || `<div class="policy-entity-alert is-warning" role="status"><strong>配置态对象</strong><span>${configNote}</span></div>`;
+    return `${stale}${notice}<div class="policy-entity-alert" role="status"><strong>地区与计划对象在此创建</strong><span>策略表的「地区」候选项就是这里的 <code>country</code> 类型对象，建好即可在 QoS / PBR 里选到；<code>time</code> 类型写入 flowd 的 schedule_set。<a class="policy-entity-alert-link" href="#/policy-engine/table">前往策略表使用它们</a></span></div>${scope}${runtime}${tableMarkup({ title: 'flowd 流量对象', description: `权威来源：${escapeHtml(data.writeEndpoint)} · ${data.source} · 可编辑 ${editable} 个`, rows: data.items, columns: ['名称', '类型', '值数量', '引用', '状态'], empty: 'flowd 尚未配置流量对象，先新建一个地区对象让「地区」选择器可用', kind: 'flowObjects', actions: flowObjectCreateActions() })}`;
+  }
+
+  function flowObjectCreateActions() {
+    return `<div class="policy-object-table-actions">${button('新建地区对象', 'data-object-create="country"', 'primary', 'globe')}${button('新建计划对象', 'data-object-create="time"', 'secondary', 'clock')}</div>`;
+  }
+
+  /*
+   * 徽章必须逐 tab 说实话：固定挂「只读分类」会对可写来源撒谎。
+   * 路由对象在 routed 声明 object_crud 时是可写的（写入面在路由表），
+   * 流量对象已开放 country / time，复合对象确实只读，
+   * 自定义协议属于「能力未确认」而不是「后端不支持」。
+   */
+  function headerBadge() {
+    if (state.tab === 'flowObjects') return statusBadge('地区 / 计划可写', 'success');
+    if (state.tab === 'composite') return statusBadge('只读分类', 'warning');
+    if (state.tab === 'routing') {
+      const routing = state.source.routing.data;
+      if (!routing) return statusBadge('读取中', 'muted');
+      if (!routing.readOnly) return statusBadge('可写 · 写入面在路由表', 'success');
+      return statusBadge(routing.capabilities?.object_crud === false ? '只读分类' : '可写性未确认', 'warning');
+    }
+    if (state.tab === 'flowd') {
+      const flowd = state.source.flowd.data;
+      if (!flowd) return statusBadge('读取中', 'muted');
+      /* 能力位为真时不得再挂只读徽章 —— 页面同时说着「已开放」和「只读」会自相矛盾。 */
+      if (!flowd.readOnly) return statusBadge('可写 · 表单待建', 'info');
+      return statusBadge(flowd.capabilityKnown ? '只读分类' : '可写性未确认', 'warning');
+    }
+    return statusBadge('多来源混合', 'muted');
+  }
+
+  /* 概览「说明」列用的一句话可写性，判据与各 tab 徽章保持同源。 */
+  function sourceWritability(key) {
+    if (key === 'composite') return '只读 · 复合对象写入未开放';
+    if (key === 'routing') {
+      const routing = state.source.routing.data;
+      if (!routing) return '只读快照';
+      return routing.readOnly ? '可写性未确认 · 当前只读' : '可写 · 写入面在路由表';
+    }
+    if (key === 'flowObjects') return '地区 / 计划可写，其余类型只读';
+    const flowd = state.source.flowd.data;
+    if (!flowd) return '只读快照';
+    if (!flowd.readOnly) return '可写通道已开放 · 表单待建（缺入参 schema）';
+    return flowd.capabilityKnown ? '只读 · flowd 声明不可写' : '可写性未确认 · 当前只读';
   }
 
   function activeSourceMarkup() {
@@ -265,11 +544,12 @@ export function mount(context = {}) {
    * 知道的事，它原先只在切到对应 tab 之后才看得到。
    */
   function overviewSourcesMarkup() {
+    /* 说明列按各来源真实可写性分述，不再一律写「只读快照」。 */
     const rows = [
       ['composite', '复合策略对象', '/api/v1/policy-engine/objects'],
       ['routing', '路由对象', '/api/v1/routing/objects'],
       ['flowObjects', '流量对象', '/api/v1/flowd/objects'],
-      ['flowd', '自定义协议', '/api/v1/flowd/protocols']
+      ['flowd', '自定义协议', '/api/v1/flowd/custom-protocols']
     ].map(([key, label, endpoint]) => {
       const problem = key === 'composite' ? null : sourceTerminal(key);
       const count = key === 'composite'
@@ -277,7 +557,7 @@ export function mount(context = {}) {
         : (state.source[key]?.data?.items.length ?? null);
       const tone = problem ? (problem.name === 'loading' ? 'muted' : 'warning') : 'success';
       const stateText = problem ? problem.title : '已读取';
-      return `<tr><td><strong>${escapeHtml(label)}</strong><small>${escapeHtml(endpoint)}</small></td><td>${escapeHtml(count === null ? '--' : String(count))}</td><td>${statusBadge(stateText, tone)}</td><td>${escapeHtml(problem?.detail || '只读快照')}</td></tr>`;
+      return `<tr><td><strong>${escapeHtml(label)}</strong><small>${escapeHtml(endpoint)}</small></td><td>${escapeHtml(count === null ? '--' : String(count))}</td><td>${statusBadge(stateText, tone)}</td><td>${escapeHtml(problem?.detail || sourceWritability(key))}</td></tr>`;
     }).join('');
     return `<section class="policy-entity-table policy-object-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>来源读取状态</strong><span>四类对象各自的权威接口与当前可读性</span></div><span class="dwrt-kit-table-count">4 个来源</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr><th>来源</th><th>数量</th><th>状态</th><th>说明</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
   }
@@ -290,7 +570,17 @@ export function mount(context = {}) {
      */
     const overview = state.tab === 'overview' ? overviewMarkup() : '';
     const sourceView = `<section class="policy-object-source-view" data-object-source-view="${state.tab}">${activeSourceMarkup()}</section>`;
-    return `<section class="policy-entity-page policy-objects-page"><header class="policy-object-toolbar" data-adaptive-sample>${tabsMarkup()}<div class="policy-entity-header-actions"><span class="policy-object-readonly-status">${statusBadge('只读分类', 'warning')}</span></div></header><main class="policy-object-workbench">${overview}${sourceView}</main></section>`;
+    /*
+     * 页头徽章按当前 tab 判定，不再固定写「只读分类」。
+     *
+     * 流量对象页已经可以建 / 改 / 删 country 与 time，固定挂只读徽章会直接跟同一页
+     * 上的「新建」按钮打对台。其余三个 tab 的只读结论没有变化，仍照原样呈现 ——
+     * 路由对象与自定义协议的只读是否也该解开，属另一份交接单
+     * （Acceptance-to-Front-policy-objects-hardcoded-readonly-hides-real-writes.md），
+     * 本单不越界处理。
+     */
+    const badge = headerBadge();
+    return `<section class="policy-entity-page policy-objects-page"><header class="policy-object-toolbar" data-adaptive-sample>${tabsMarkup()}<div class="policy-entity-header-actions"><span class="policy-object-readonly-status">${badge}</span></div></header><main class="policy-object-workbench">${overview}${sourceView}</main></section>`;
   }
 
   function detailData() {
@@ -314,7 +604,39 @@ export function mount(context = {}) {
         ? [['对象标识', item.id], ['归属', owner], ['类型', item.type], ['配置值', formatFlowObjectValue(item.value)], ['值数量', String(item.valueCount)], ['计划产物', item.runtimeKind], ['flowd 内部引用', String(item.refCount)], ['删除锁定', item.deleteLocked ? '是' : '否'], ['状态', item.enabled ? '启用' : '停用']]
       : [['对象标识', item.id], ['归属', owner], ['类型', item.type], ['地址族', item.family || '--'], ['值', item.value || '--'], ['成员', kind === 'routing' ? item.members.map((member) => member.label ? `${member.label} (${member.value})` : member.value).join('、') || '--' : '--'], ['引用数', kind === 'routing' ? String(item.refCount) : '--'], ['状态', item.enabled ? '启用' : '停用']];
     const referenceMarkup = kind === 'flowObjects' ? flowObjectReferencesMarkup(item) : '';
-    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-object-detail-close aria-label="关闭对象详情"></button><aside data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" class="dwrt-kit-sheet policy-entity-sheet is-open"><header class="dwrt-kit-sheet-header"><div><span>${escapeHtml(title)}</span><strong>${escapeHtml(item.name)}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-object-detail-close aria-label="关闭">${icon('x')}</button></header><div class="dwrt-kit-sheet-body policy-entity-sheet-body"><dl class="policy-entity-detail-list">${fields.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>${referenceMarkup}${statePanel('unavailable', '此来源在对象页只读', kind === 'routing' ? '路由对象由“策略引擎 → 路由表”管理。' : kind === 'flowObjects' ? '当前只确认 flowd 配置存储与内部引用；数据面仍为 plan-only，未提供运行态应用证明。' : kind === 'flowd' ? '自定义协议属于 flowd 独立资源，本页不提供写操作。' : '复合对象写入需要跨组件原子事务，能力未开放前保持 fail-closed。')}</div><footer class="dwrt-kit-sheet-footer"><span></span>${button('关闭', 'data-object-detail-close', 'primary')}</footer></aside>`;
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-object-detail-close aria-label="关闭对象详情"></button><aside data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" class="dwrt-kit-sheet policy-entity-sheet is-open"><header class="dwrt-kit-sheet-header"><div><span>${escapeHtml(title)}</span><strong>${escapeHtml(item.name)}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-object-detail-close aria-label="关闭">${icon('x')}</button></header><div class="dwrt-kit-sheet-body policy-entity-sheet-body"><dl class="policy-entity-detail-list">${fields.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>${referenceMarkup}${detailWritabilityPanel(kind, item)}</div><footer class="dwrt-kit-sheet-footer"><span></span>${button('关闭', 'data-object-detail-close', 'primary')}</footer></aside>`;
+  }
+
+  /*
+   * 详情抽屉底部那块可写性说明。原先是三层嵌套三元，flowd 那支写死「尚未声明可写
+   * 能力位」，能力位到位后就成了假陈述。拆开按来源分述，判据一律取当前载荷。
+   */
+  function detailWritabilityPanel(kind, item) {
+    const runtimeNote = (data) => {
+      if (!data?.runtimeApplyKnown || data.runtimeApply) return '';
+      const reason = runtimeApplyReasonText(data.runtimeApplyReason);
+      return `配置落库后运行态仍未应用（<code>runtime_apply=false</code>${reason ? `：${reason}` : ''}）。`;
+    };
+    if (kind === 'flowObjects') {
+      const data = state.source.flowObjects.data;
+      if (isEditableFlowObject(item)) return statePanel('empty', '此对象可在本页编辑', `配置写入 flowd 配置库。${runtimeNote(data) || '当前只确认 flowd 配置存储与内部引用，未提供运行态应用证明。'}`);
+      const gate = data && !data.readOnly
+        ? `flowd 已声明 object_crud=true，写通道开放；本页尚未为该类型建表单，因为它的取值语义还没有校验落点。`
+        : `本页只开放 ${EDITABLE_TYPE_LABELS.country} 与 ${EDITABLE_TYPE_LABELS.time} 两类对象的写入，其余类型仍只读。`;
+      return statePanel('unavailable', '此类型在本页只读', `${gate}${runtimeNote(data)}`);
+    }
+    if (kind === 'routing') {
+      const routing = state.source.routing.data;
+      if (routing && !routing.readOnly) return statePanel('unavailable', '此对象可写，写入面在路由表', 'routed 已声明 object_crud，路由对象可增删改；写入面在“策略引擎 → 路由表”，本页只做查看。');
+      return statePanel('unavailable', '此来源在对象页只读', '路由对象由“策略引擎 → 路由表”管理；routed 本次未声明 object_crud，可写性未确认。');
+    }
+    if (kind === 'flowd') {
+      const data = state.source.flowd.data;
+      if (data && !data.readOnly) return statePanel('unavailable', '写入通道已开放，本页尚未提供表单', `flowd 已声明 custom_protocol_crud=true，写入端点 ${data.writeEndpoint}。本页暂不放出编辑入口是因为 custom_protocol_set 的入参 schema 尚未确认，不是后端不支持。${runtimeNote(data)}`);
+      if (data?.capabilityKnown) return statePanel('unavailable', '此来源在对象页只读', 'flowd 声明 custom_protocol_crud=false，写入通道未开放。');
+      return statePanel('unavailable', '写入能力未确认', '自定义协议的写入端点已在后端注册，但本次载荷未声明可写能力位，因此本页暂不放出编辑入口；这不等于后端不支持。');
+    }
+    return statePanel('unavailable', '此来源在对象页只读', '复合对象写入需要跨组件原子事务，能力未开放前保持 fail-closed。');
   }
 
   function formatFlowObjectValue(value) {
@@ -323,9 +645,271 @@ export function mount(context = {}) {
     return sourceText(value, '--');
   }
 
+  const EDITABLE_TYPE_LABELS = { country: '地区', time: '计划' };
+
+  function isEditableFlowObject(item) {
+    return Boolean(item) && FLOW_OBJECT_EDITABLE_TYPES.includes(item.type);
+  }
+
+  /*
+   * 地区对象的取值必须是国家码，候选项来自后端目录。目录没读到时不放行保存 ——
+   * 前端自造一份国家码列表就等于绕开 flowd_countries_normalize() 的权威判据。
+   */
+  async function loadCountryCatalog() {
+    if (state.countries.status === 'loading' || state.countries.status === 'ready') return;
+    if (typeof api.request !== 'function') {
+      state.countries = { status: 'unavailable', items: [], error: '页面没有获得 API 请求能力。' };
+      return;
+    }
+    state.countries = { status: 'loading', items: [], error: '' };
+    renderOverlay();
+    try {
+      const payload = await api.request('policy-object-country-catalog', '/api/v1/firewall/geo-block', { method: 'GET' });
+      const items = normalizeCountryCatalog(payload);
+      if (!state.mounted) return;
+      state.countries = items.length
+        ? { status: 'ready', items, error: '' }
+        : { status: 'unavailable', items: [], error: '后端国家或地区目录为空。' };
+    } catch (error) {
+      if (!state.mounted || signal?.aborted) return;
+      state.countries = {
+        status: error?.status === 403 ? 'forbidden' : 'error',
+        items: [],
+        error: error?.status === 403 ? '当前账号没有读取国家或地区目录的权限。' : (error?.message || '国家或地区目录读取失败。')
+      };
+    }
+    renderOverlay();
+  }
+
+  function openEditor(type, item = null) {
+    if (!EDITABLE_TYPE_LABELS[type]) return;
+    state.detail = null;
+    state.notice = '';
+    state.editor = item
+      ? {
+        mode: 'edit',
+        type: item.type,
+        id: item.id,
+        name: item.name,
+        remark: item.remark,
+        enabled: item.enabled,
+        codes: item.type === 'country' ? (Array.isArray(item.value) ? item.value.map((code) => String(code).toUpperCase()) : []) : [],
+        time: item.type === 'time' ? flowTimeDraftFromValue(item.value) : flowTimeDraftFromValue(null),
+        search: '',
+        error: ''
+      }
+      : {
+        mode: 'create',
+        type,
+        id: '',
+        name: '',
+        remark: '',
+        enabled: true,
+        codes: [],
+        time: flowTimeDraftFromValue(null),
+        search: '',
+        error: ''
+      };
+    renderPage();
+    renderOverlay();
+    if (type === 'country') loadCountryCatalog();
+  }
+
+  function closeEditor() {
+    state.editor = null;
+    renderPage();
+    renderOverlay();
+  }
+
+  function editorPayload() {
+    const draft = state.editor;
+    if (!draft) return { error: '编辑状态已丢失。' };
+    const name = sourceText(draft.name);
+    if (!name) return { error: '请填写名称。' };
+    if (name.length > 128) return { error: '名称不能超过 128 个字符。' };
+    if (sourceText(draft.remark).length > 256) return { error: '备注不能超过 256 个字符。' };
+    let value;
+    if (draft.type === 'country') {
+      if (state.countries.status !== 'ready') return { error: '国家或地区目录尚不可用，无法校验取值。' };
+      if (!draft.codes.length) return { error: '请至少选择一个国家或地区。' };
+      value = draft.codes.map((code) => String(code).toUpperCase());
+    } else {
+      value = flowTimeValueFromDraft(draft.time);
+      if (!value) return { error: '请填写有效的开始与结束时间，且两者不能相同。' };
+      if (!draft.time.days.length) return { error: '请至少选择一个生效日。' };
+    }
+    const taken = (state.source.flowObjects.data?.items || []).map((item) => item.id);
+    const id = draft.mode === 'edit' ? draft.id : flowObjectIdFromName(draft.type, name, taken);
+    return {
+      body: {
+        id,
+        type: draft.type,
+        name,
+        remark: sourceText(draft.remark),
+        enabled: draft.enabled !== false,
+        value
+      }
+    };
+  }
+
+  async function submitEditor() {
+    if (state.saving || !state.editor) return;
+    const prepared = editorPayload();
+    if (prepared.error) {
+      state.editor.error = prepared.error;
+      renderOverlay();
+      return;
+    }
+    if (typeof api.request !== 'function') {
+      state.editor.error = '页面没有获得 API 请求能力。';
+      renderOverlay();
+      return;
+    }
+    const label = EDITABLE_TYPE_LABELS[state.editor.type];
+    const creating = state.editor.mode === 'create';
+    state.saving = true;
+    state.editor.error = '';
+    renderOverlay();
+    try {
+      /*
+       * 这里保持字面量端点，不改成 data.writeEndpoint。
+       * test_policy_entities_phase2_contract.mjs 靠静态扫描这两个字面量把本页的写调用
+       * 框在 flowd 流量对象上（「不得顺手写别的资源」），改成表达式会让那道护栏失效。
+       * 能力位下发的端点与此一致（30.1 实测 object_crud_write_endpoint=/api/v1/flowd/objects），
+       * 且已用于文案展示；真要改成动态取值，得先替换那条护栏的判据，属另一份交接单。
+       */
+      await api.request('policy-object-flow-save', '/api/v1/flowd/objects', { method: 'POST', body: prepared.body });
+      if (!state.mounted) return;
+      state.saving = false;
+      state.editor = null;
+      state.notice = `${creating ? '已创建' : '已保存'}${label}对象「${prepared.body.name}」。`;
+      renderPage();
+      renderOverlay();
+      await refresh();
+    } catch (error) {
+      if (!state.mounted || signal?.aborted) return;
+      state.saving = false;
+      if (state.editor) state.editor.error = flowWriteErrorText(error);
+      renderOverlay();
+    }
+  }
+
+  async function submitRemove() {
+    const target = state.removing;
+    if (state.saving || !target) return;
+    if (typeof api.request !== 'function') {
+      state.removing = { ...target, error: '页面没有获得 API 请求能力。' };
+      renderOverlay();
+      return;
+    }
+    state.saving = true;
+    renderOverlay();
+    try {
+      await api.request('policy-object-flow-delete', '/api/v1/flowd/objects/delete', { method: 'POST', body: { id: target.id } });
+      if (!state.mounted) return;
+      state.saving = false;
+      state.removing = null;
+      state.notice = `已删除对象「${target.name}」。`;
+      renderPage();
+      renderOverlay();
+      await refresh();
+    } catch (error) {
+      if (!state.mounted || signal?.aborted) return;
+      state.saving = false;
+      state.removing = { ...target, error: flowWriteErrorText(error) };
+      renderOverlay();
+    }
+  }
+
+  /*
+   * flowd 的写入失败原样呈现后端判据，不吞掉改说成成功。`reference_conflict`
+   * 是删除被引用对象时的正常拒绝（flowd_db.c 里先查引用再决定），要说清原因。
+   */
+  function flowWriteErrorText(error) {
+    const code = sourceText(error?.payload?.error?.code, error?.payload?.code);
+    const known = {
+      reference_conflict: '该对象正被 flowd 规则引用，先解除引用再删除。',
+      not_found: '该对象已不存在，请刷新列表。',
+      invalid_id: '对象标识不合法。',
+      invalid_type: '对象类型不合法。',
+      invalid_request: '请求体不合法，后端拒绝了本次写入。',
+      partial_or_failed_save: '后端未能保存该对象，取值可能未通过校验。',
+      storage_error: 'flowd 配置库当前不可写。'
+    };
+    if (known[code]) return known[code];
+    if (error?.status === 403) return '当前账号没有写入 flowd 流量对象的权限。';
+    return error?.message || '写入失败。';
+  }
+
   function flowObjectReferencesMarkup(item) {
     if (!item.references.length) return `<section class="policy-object-reference-list"><h3>flowd 内部引用</h3>${statePanel('empty', '当前没有引用', '此结论仅覆盖 flowd 自身规则，不代表跨 routed、firewall 或 SQM 的统一 used-by。')}</section>`;
     return `<section class="policy-object-reference-list"><h3>flowd 内部引用</h3>${item.references.map((reference) => `<article><span><strong>${escapeHtml(reference.name)}</strong><small>${escapeHtml([reference.kind, reference.field, reference.id].filter(Boolean).join(' · '))}</small></span>${statusBadge(reference.enabled ? '启用' : '停用', reference.enabled ? 'success' : 'muted')}</article>`).join('')}</section>`;
+  }
+
+  function editorField(label, control, description = '') {
+    return `<div data-dwrt-component="field" class="dwrt-kit-field"><span>${escapeHtml(label)}</span>${control}${description ? `<small data-dwrt-field-description>${escapeHtml(description)}</small>` : ''}</div>`;
+  }
+
+  function countryRowMarkup(item, codes) {
+    const meta = [item.code, item.continent].filter(Boolean).join(' · ');
+    return `<label class="policy-object-pick"><input type="checkbox" data-object-country="${escapeHtml(item.code)}" ${codes.includes(item.code) ? 'checked' : ''}><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(meta)}</small></span></label>`;
+  }
+
+  function countryPickerMarkup(draft) {
+    const catalog = state.countries;
+    if (catalog.status === 'loading') return statePanel('loading', '正在读取国家或地区目录', '候选项来自后端权威目录，读取完成后才可勾选。');
+    if (catalog.status !== 'ready') {
+      return statePanel(catalog.status === 'forbidden' ? 'forbidden' : 'unavailable', '国家或地区目录不可用',
+        `${catalog.error || '目录读取失败。'}取值必须由后端目录提供，页面不会自造国家码列表，因此当前无法保存地区对象。`);
+    }
+    const query = sourceText(draft.search).toLowerCase();
+    const options = catalog.items.filter((item) => !query
+      || item.code.toLowerCase().includes(query)
+      || item.name.toLowerCase().includes(query)
+      || item.continent.toLowerCase().includes(query));
+    const rows = options.map((item) => countryRowMarkup(item, draft.codes)).join('');
+    return `<div class="policy-object-picker-field"><div class="policy-object-picker-toolbar"><label class="policy-object-picker-search" data-dwrt-component="field">${icon('search')}<input type="search" data-object-country-search value="${escapeHtml(draft.search)}" placeholder="搜索国家或地区" aria-label="搜索国家或地区"></label><span>已选 ${draft.codes.length} / 可选 ${catalog.items.length}</span></div><div class="policy-object-pick-list">${rows || statePanel('empty', '没有匹配的国家或地区', '换一个关键词再试。')}</div></div>`;
+  }
+
+  function timeEditorMarkup(draft) {
+    const time = draft.time;
+    return `<div class="policy-object-time-grid">${editorField('开始时间', `<input type="time" data-object-time="start" value="${escapeHtml(time.start)}">`)}${editorField('结束时间', `<input type="time" data-object-time="end" value="${escapeHtml(time.end)}">`)}</div>${editorField('生效日', `<div class="policy-object-weekdays">${WEEKDAY_LABELS.map(([key, label]) => `<label class="policy-object-weekday"><input type="checkbox" data-object-weekday="${escapeHtml(key)}" ${time.days.includes(key) ? 'checked' : ''}><span>${escapeHtml(label)}</span></label>`).join('')}</div>`, '结束时间早于开始时间表示跨零点的窗口。')}`;
+  }
+
+  function editorMarkup() {
+    const draft = state.editor;
+    if (!draft) return '';
+    const label = EDITABLE_TYPE_LABELS[draft.type];
+    const title = `${draft.mode === 'create' ? '新建' : '编辑'}${label}对象`;
+    const body = draft.type === 'country'
+      ? `${editorField('国家或地区', countryPickerMarkup(draft), '取值由 flowd 归一化校验，非法国家码后端会直接拒绝。')}`
+      : timeEditorMarkup(draft);
+    const idField = draft.mode === 'edit'
+      ? editorField('对象标识', `<input type="text" value="${escapeHtml(draft.id)}" disabled>`, '标识创建后不可更改。')
+      : '';
+    const errorMarkup = draft.error ? `<div class="policy-entity-alert is-warning" role="alert"><strong>无法保存</strong><span>${escapeHtml(draft.error)}</span></div>` : '';
+    const hint = draft.type === 'country'
+      ? '保存后即可在策略表的「地区」选择器里选到它。'
+      : '保存后成为 flowd 的 schedule_set 计划对象。当前策略表的「计划」用的是内置时间控件，不读这份目录。';
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-object-editor-close aria-label="关闭编辑"></button><aside data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" class="dwrt-kit-sheet policy-entity-sheet policy-object-editor-sheet is-open"><header class="dwrt-kit-sheet-header"><div><span>flowd 流量对象</span><strong>${escapeHtml(title)}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-object-editor-close aria-label="关闭">${icon('x')}</button></header><div class="dwrt-kit-sheet-body policy-entity-sheet-body">${errorMarkup}<div class="policy-entity-alert" role="status"><strong>写入 flowd 配置库</strong><span>${escapeHtml(hint)}</span></div>${editorField('名称', `<input type="text" data-object-draft="name" value="${escapeHtml(draft.name)}" placeholder="${escapeHtml(draft.type === 'country' ? '例如 海外常用地区' : '例如 工作时段')}" maxlength="128">`)}${idField}${body}${editorField('备注', `<textarea data-object-draft="remark" rows="2" maxlength="256" placeholder="可选">${escapeHtml(draft.remark)}</textarea>`)}<label class="policy-object-enable-check"><input type="checkbox" data-object-draft-enabled ${draft.enabled ? 'checked' : ''}><span><strong>启用</strong><small>停用的对象仍保留在配置里，但不参与规则匹配。</small></span></label></div><footer class="dwrt-kit-sheet-footer"><span></span><div>${button('取消', 'data-object-editor-close', 'secondary')}${button(state.saving ? '保存中…' : '保存', `data-object-editor-submit ${state.saving ? 'disabled' : ''}`, 'primary')}</div></footer></aside>`;
+  }
+
+  function removeMarkup() {
+    const target = state.removing;
+    if (!target) return '';
+    const description = target.error
+      ? target.error
+      : `将从 flowd 配置库删除「${target.name}」。引用它的规则会失去这个匹配条件，删除后不可撤销。`;
+    return ui.confirmationMarkup?.({
+      id: 'policy-object-remove',
+      action: 'policy-object-remove',
+      tone: 'danger',
+      title: `删除对象「${target.name}」`,
+      description,
+      confirmLabel: state.saving ? '删除中…' : '删除',
+      cancelLabel: '取消',
+      disabled: state.saving
+    }) || '';
   }
 
   function replaceMarkup(host, markup) {
@@ -364,15 +948,36 @@ export function mount(context = {}) {
     selectedTab?.scrollIntoView?.({ block: 'nearest', inline: 'center' });
   }
 
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单）。
+   *
+   * 只有页面主体走这条路：抽屉宿主仍用 replaceMarkup()，因为抽屉会被 kit 搬进传送门，
+   * 归属标记与回收逻辑都挂在整块替换那条路径上，morph 一棵被搬走的子树只会两头都错。
+   */
+  function renderPagePreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(pageHost, (target) => {
+      target.replaceChildren(document.createRange().createContextualFragment(workbenchMarkup()));
+    })) {
+      ui.mountAll?.(pageHost);
+      return;
+    }
+    renderPage();
+  }
+
   function renderOverlay() {
     if (!root || !state.mounted) return;
-    replaceMarkup(overlayHost, detailMarkup());
+    /*
+     * 三层叠加各自独立：编辑抽屉与删除确认优先于详情抽屉，同一时刻只渲染一个，
+     * 否则两张 sheet 会同时被 kit 搬进传送门、抢同一个遮罩。
+     */
+    replaceMarkup(overlayHost, state.removing ? removeMarkup() : state.editor ? editorMarkup() : detailMarkup());
   }
 
   function hydrate(snapshot) {
     state.snapshot = snapshot;
     if (snapshot?.value) state.composite = normalizePolicyObjects(snapshot.value);
-    renderPage();
+    renderPagePreservingInteraction();
   }
 
   async function loadSource(key) {
@@ -422,12 +1027,12 @@ export function mount(context = {}) {
       } while (state.mounted && state.refreshQueued);
       if (!state.mounted) return;
       state.refreshing = false;
-      renderPage();
+      renderPagePreservingInteraction();
     })().finally(() => {
       state.refreshPromise = null;
       if (state.mounted && state.refreshing) {
         state.refreshing = false;
-        renderPage();
+        renderPagePreservingInteraction();
       }
     });
     return state.refreshPromise;
@@ -444,7 +1049,8 @@ export function mount(context = {}) {
       if (!state.mounted) return;
       if (document.hidden) return;
       if (state.refreshing || state.refreshPromise) return;
-      if (state.detail) return;
+      /* 编辑抽屉与删除确认打开时不轮询：整页重绘会把正在填的草稿顶掉。 */
+      if (state.detail || state.editor || state.removing || state.saving) return;
       refresh();
     }, 20000);
   }
@@ -455,12 +1061,70 @@ export function mount(context = {}) {
     state.pollTimer = 0;
   }
 
+  /*
+   * 抽屉会被 kit 的 elevateSheet() 搬到 body 直属的 #dwrtKitSheetPortal，
+   * 从此不在 root 子树内。kit 的 bindSheetDelegation() 会把 click/input/change/
+   * keydown 重放回路由根，所以监听仍然挂在 root 上；但重放事件的 target 是
+   * 传送门里的真实节点，`root.contains(target)` 对它是 false。
+   * 因此判归属要额外认 replaceMarkup() 打过 `data-object-overlay-owned` 的搬迁节点，
+   * 否则抽屉里的每一次交互都会被当成别人的事件丢掉。
+   */
+  function ownsEvent(target) {
+    if (!(target instanceof Node)) return false;
+    if (root.contains(target)) return true;
+    const node = target instanceof Element ? target : target.parentElement;
+    return Boolean(node?.closest?.('[data-object-overlay-owned]'));
+  }
+
   function onClick(event) {
+    if (!ownsEvent(event.target)) return;
     const tab = event.target.closest('[data-object-tab]');
     if (tab) {
       state.tab = SOURCE_TABS.some(([id]) => id === tab.dataset.objectTab) ? tab.dataset.objectTab : 'overview';
       state.detail = null;
       renderPage();
+      renderOverlay();
+      return;
+    }
+    const create = event.target.closest('[data-object-create]');
+    if (create) {
+      openEditor(create.dataset.objectCreate);
+      return;
+    }
+    const edit = event.target.closest('[data-object-edit]');
+    if (edit) {
+      const item = state.source.flowObjects.data?.items.find((entry) => entry.id === edit.dataset.objectEdit);
+      if (item) openEditor(item.type, item);
+      return;
+    }
+    const remove = event.target.closest('[data-object-remove]');
+    if (remove) {
+      if (remove.disabled) return;
+      const item = state.source.flowObjects.data?.items.find((entry) => entry.id === remove.dataset.objectRemove);
+      if (!item) return;
+      state.detail = null;
+      state.notice = '';
+      state.removing = { id: item.id, name: item.name, error: '' };
+      renderPage();
+      renderOverlay();
+      return;
+    }
+    if (event.target.closest('[data-object-editor-close]')) {
+      if (state.saving) return;
+      closeEditor();
+      return;
+    }
+    if (event.target.closest('[data-object-editor-submit]')) {
+      submitEditor();
+      return;
+    }
+    if (event.target.closest('[data-dwrt-confirm-accept]')) {
+      submitRemove();
+      return;
+    }
+    if (event.target.closest('[data-dwrt-confirm-cancel], [data-dwrt-modal-close]')) {
+      if (state.saving) return;
+      state.removing = null;
       renderOverlay();
       return;
     }
@@ -477,10 +1141,115 @@ export function mount(context = {}) {
     }
   }
 
+  /*
+   * 文本与时间输入只更新 state，不重绘 —— 抽屉一旦整块 replaceMarkup，
+   * 正在输入的框就会失焦，中文输入法还会把未上屏的候选字丢掉。
+   * 需要改变可见结构的只有国家搜索（要过滤列表）和勾选（要更新计数）。
+   */
+  function onInput(event) {
+    const draft = state.editor;
+    if (!draft) return;
+    if (!ownsEvent(event.target)) return;
+    const field = event.target.closest('[data-object-draft]');
+    if (field) {
+      draft[field.dataset.objectDraft] = field.value;
+      return;
+    }
+    const time = event.target.closest('[data-object-time]');
+    if (time) {
+      draft.time = { ...draft.time, [time.dataset.objectTime]: time.value };
+      return;
+    }
+    const search = event.target.closest('[data-object-country-search]');
+    if (search) {
+      draft.search = search.value;
+      patchCountryList();
+    }
+  }
+
+  function onChange(event) {
+    const draft = state.editor;
+    if (!draft) return;
+    if (!ownsEvent(event.target)) return;
+    const enabled = event.target.closest('[data-object-draft-enabled]');
+    if (enabled) {
+      draft.enabled = enabled.checked;
+      return;
+    }
+    const country = event.target.closest('[data-object-country]');
+    if (country) {
+      const code = country.dataset.objectCountry;
+      draft.codes = country.checked
+        ? [...new Set([...draft.codes, code])]
+        : draft.codes.filter((entry) => entry !== code);
+      patchCountryCount();
+      return;
+    }
+    const weekday = event.target.closest('[data-object-weekday]');
+    if (weekday) {
+      const key = weekday.dataset.objectWeekday;
+      const days = weekday.checked
+        ? [...new Set([...draft.time.days, key])]
+        : draft.time.days.filter((entry) => entry !== key);
+      draft.time = { ...draft.time, days };
+    }
+  }
+
+  /* 抽屉可能已被搬进传送门，所以按归属标记全局找，而不是只在 overlayHost 里找。 */
+  function editorNode(selector) {
+    const local = overlayHost.querySelector(selector);
+    if (local) return local;
+    for (const owned of document.querySelectorAll('[data-object-overlay-owned]')) {
+      if (owned.matches?.(selector)) return owned;
+      const found = owned.querySelector?.(selector);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  /* 只换列表本体与计数，保住搜索框的焦点与光标位置。 */
+  function patchCountryList() {
+    const draft = state.editor;
+    const list = editorNode('.policy-object-pick-list');
+    if (!draft || !list || state.countries.status !== 'ready') return;
+    const query = sourceText(draft.search).toLowerCase();
+    const options = state.countries.items.filter((item) => !query
+      || item.code.toLowerCase().includes(query)
+      || item.name.toLowerCase().includes(query)
+      || item.continent.toLowerCase().includes(query));
+    /* 与本页其它替换保持同一写法：不用 innerHTML。 */
+    const markup = options.length
+      ? options.map((item) => countryRowMarkup(item, draft.codes)).join('')
+      : statePanel('empty', '没有匹配的国家或地区', '换一个关键词再试。');
+    list.replaceChildren(document.createRange().createContextualFragment(markup));
+  }
+
+  function patchCountryCount() {
+    const draft = state.editor;
+    const counter = editorNode('.policy-object-picker-toolbar > span');
+    if (!draft || !counter || state.countries.status !== 'ready') return;
+    counter.textContent = `已选 ${draft.codes.length} / 可选 ${state.countries.items.length}`;
+  }
+
+  function onKeydown(event) {
+    if (event.key !== 'Escape') return;
+    if (state.saving) return;
+    if (!state.editor && !state.removing) return;
+    if (state.removing) {
+      state.removing = null;
+      renderOverlay();
+      return;
+    }
+    if (state.editor) closeEditor();
+  }
+
   root.hidden = false;
   root.className = 'route-preview route-workspace policy-objects-route-host';
   root.replaceChildren(pageHost, overlayHost);
   root.addEventListener('click', onClick);
+  root.addEventListener('input', onInput);
+  root.addEventListener('change', onChange);
+  root.addEventListener('keydown', onKeydown);
   const unsubscribe = registry?.subscribe?.('policy.objects', hydrate) || null;
   renderPage();
   renderOverlay();
@@ -495,6 +1264,9 @@ export function mount(context = {}) {
       stopPolling();
       unsubscribe?.();
       root.removeEventListener('click', onClick);
+      root.removeEventListener('input', onInput);
+      root.removeEventListener('change', onChange);
+      root.removeEventListener('keydown', onKeydown);
       window.DWRT_UI_KIT?.unmount?.(root);
       root.replaceChildren();
       root.classList.remove('route-workspace', 'policy-objects-route-host');

@@ -13,9 +13,9 @@ const manifest = JSON.parse(readFileSync(new URL('redesign/route-manifest.json',
 const system = menu.items.find((item) => item.id === 'system');
 const page = system.children.find((item) => item.id === 'system-appearance');
 assert.equal(page.module, 'native/appearance-settings.js');
-assert.equal(page.module_version, '20260725-dreaming-os-01');
+assert.match(page.module_version, /^\d{8}-[a-z0-9-]+$/);
 assert.equal(page.style, '/static/css/appearance-settings.css');
-assert.equal(page.style_version, '20260722-04');
+assert.equal(page.style_version, page.module_version);
 assert.equal(page.frontend_owned, true);
 assert.equal(page.capability, 'appearance');
 
@@ -52,7 +52,20 @@ assert.match(source, /samplePreviewForeground\(image\)/);
 assert.match(source, /glass\.dataset\.adaptiveRegion = readableForegroundMode/);
 
 assert.doesNotMatch(source, /setInterval\s*\(|MutationObserver|<select(?![^>]*data-dwrt-component)/);
-assert.doesNotMatch(style, /!important|backdrop-filter|#[0-9a-fA-F]{3,8}|rgba?\(\s*[\d.]/);
+/*
+ * 页面 CSS 仍不得自定材质：禁字面色值、禁 !important。
+ *
+ * 但 backdrop-filter 由"整条禁止"收窄为"只能引用共享令牌"。原先的全禁把预览卡逼去借
+ * Kit 的 stable-glass 取材质，而那个属性同时命中 menu-shell 的 PAGE_GLASS_SELECTOR，
+ * 会把这张卡注册成页面级采样目标 —— 它浮在预览台自己的图上而不是桌面壁纸上，
+ * 两个采样器争写同一个 --adaptive-region-luma，对比度提示的趋势因此与真实渲染相反。
+ * 预览卡需要真实模糊（否则模糊滑块调了看不见），所以允许它声明 backdrop-filter，
+ * 前提是值必须是 var(--dwrt-glass-backdrop)，档位仍由合同与令牌决定。
+ */
+assert.doesNotMatch(style, /!important|#[0-9a-fA-F]{3,8}|rgba?\(\s*[\d.]/);
+for (const declaration of style.match(/backdrop-filter:[^;]+;/g) || []) {
+  assert.match(declaration, /var\(--dwrt-glass-backdrop\)/, `页面不得自定模糊档位: ${declaration}`);
+}
 assert.doesNotMatch(systemSource, /DREAMINGWRT_ACCENT_PRESETS|systemAppearancePanel|materialPreviewValue|emitMaterialPreview|updateAppearanceRangeValue|system-appearance/);
 assert.doesNotMatch(systemStyle, /system-appearance-|system-accent-picker/);
 

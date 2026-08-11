@@ -6,7 +6,7 @@ export function mount(context = {}) {
   if (!root) return () => {};
   const stage = root.closest('.console-stage');
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260802-sheet-portal-scope-01';
+  const VERSION = '20260810-front-release-01';
   const TABS = [
     ['overview', '概览'],
     ['slots', '模组与拨号'],
@@ -259,7 +259,7 @@ export function mount(context = {}) {
     state.loading = false;
     state.refreshing = false;
     state.lastUpdated = Date.now();
-    render();
+    if (refreshing) renderPreservingInteraction(); else render();
   }
 
   function icon(name, size = 18) {
@@ -412,7 +412,7 @@ export function mount(context = {}) {
     const slots = state.draft?.slots || [];
     const cards = slots.length
       ? `<div class="qwrt-slot-grid">${slots.map(slotCard).join('')}</div>`
-      : `<div class="qwrt-empty-block">${icon('info')}<span><strong>尚未登记蜂窝模组</strong><small>后端返回的槽位列表为空。这是正常的空态：在“模组与拨号”里新增槽位后，这里会显示每个模组的 SIM、运营商与信号。</small></span></div>`;
+      : `<div class="qwrt-empty-block dwrt-kit-state-panel" data-dwrt-component="state-panel" data-dwrt-state="empty">${icon('info')}<span><strong>尚未登记蜂窝模组</strong><small>后端返回的槽位列表为空。这是正常的空态：在“模组与拨号”里新增槽位后，这里会显示每个模组的 SIM、运营商与信号。</small></span></div>`;
     return settingsSurface(`${runtimePanel()}${cards}${runtimeFactsTable()}`);
   }
 
@@ -567,14 +567,29 @@ export function mount(context = {}) {
     }) : '';
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root || !state.mounted) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'qwrt-modules-route-host');
-    root.innerHTML = `<section class="qwrt-modules-shell" data-qwrt-version="${VERSION}">${pageToolbar()}${overviewCardsRow()}<main class="qwrt-modules-main">${noticeMarkup()}${panelMarkup()}</main>${savebarMarkup()}${sheetMarkup()}${confirmationMarkup()}</section>`;
-    ui.mountAll?.(root);
-    ui.scheduleAdaptiveForegroundSample?.(20, root);
+    target.innerHTML = `<section class="qwrt-modules-shell" data-qwrt-version="${VERSION}">${pageToolbar()}${overviewCardsRow()}<main class="qwrt-modules-main">${noticeMarkup()}${panelMarkup()}</main>${savebarMarkup()}${sheetMarkup()}${confirmationMarkup()}</section>`;
+    ui.mountAll?.(target);
+    ui.scheduleAdaptiveForegroundSample?.(20, target);
   }
 
   function markDirty() {

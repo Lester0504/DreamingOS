@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260808-storage-raw-download-route-01';
+  const VERSION = '20260810-front-release-01';
   const ENDPOINT = '/api/v1/storage/files';
   /* 写入是**单入口 + action 分发**，不是每功能一条 REST 路由：后端只有
    * jmx_storage_files_mutate()，action 白名单仅 mkdir/create/write/rename
@@ -286,7 +286,7 @@ export function mount(context = {}) {
       if (!state.mounted || seq !== state.seq) return;
       state.loading = false;
       state.refreshing = false;
-      render();
+      if (background) renderPreservingInteraction(); else render();
     }
   }
 
@@ -397,7 +397,7 @@ export function mount(context = {}) {
   function rootsMarkup() {
     if (!state.roots.length) return '';
     const options = state.roots.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === state.rootId ? 'selected' : ''}>${escapeHtml(rootOptionLabel(item))}</option>`).join('');
-    return `<select class="storage-file-root-select" data-file-root aria-label="存储位置">${options}</select>${isReadOnlyRoot() ? '<span class="storage-file-root-badge" data-dwrt-tooltip="该存储根只读，写入类操作已隐藏">只读</span>' : ''}`;
+    return `<label class="storage-file-root-field dwrt-kit-field" data-dwrt-component="field"><select class="storage-file-root-select" data-file-root aria-label="存储位置">${options}</select></label>${isReadOnlyRoot() ? '<span class="storage-file-root-badge" data-dwrt-tooltip="该存储根只读，写入类操作已隐藏">只读</span>' : ''}`;
   }
 
   function toolbarMarkup() {
@@ -484,7 +484,7 @@ export function mount(context = {}) {
       : options.multiline
         ? `<textarea data-file-draft="${escapeHtml(path)}" ${options.readonly ? 'readonly' : ''} placeholder="${escapeHtml(options.placeholder || '')}">${escapeHtml(value || '')}</textarea>`
         : `<input data-file-draft="${escapeHtml(path)}" value="${escapeHtml(value || '')}" ${options.type ? `type="${escapeHtml(options.type)}"` : ''} placeholder="${escapeHtml(options.placeholder || '')}" ${options.readonly ? 'readonly' : ''}>`;
-    return `<label class="storage-file-field ${options.wide ? 'is-wide' : ''}"><span>${escapeHtml(label)}</span>${control}${options.help ? `<small>${escapeHtml(options.help)}</small>` : ''}</label>`;
+    return `<label class="storage-file-field dwrt-kit-field ${options.wide ? 'is-wide' : ''}" data-dwrt-component="field"><span>${escapeHtml(label)}</span>${control}${options.help ? `<small>${escapeHtml(options.help)}</small>` : ''}</label>`;
   }
 
   function drawerTitle() {
@@ -493,14 +493,14 @@ export function mount(context = {}) {
   }
 
   function newDrawerBody() {
-    return `<div class="storage-file-choice-grid"><button type="button" data-file-new-kind="directory">${icon('folder')}<span><strong>新建文件夹</strong><small>在当前目录创建文件夹</small></span></button><button type="button" data-file-new-kind="file">${icon('file')}<span><strong>新建文件</strong><small>创建空文件后可继续编辑</small></span></button></div>${state.editor.kind ? `<div class="storage-file-form">${field(state.editor.kind === 'directory' ? '文件夹名称' : '文件名称', 'name', state.editor.name, { wide: true, placeholder: state.editor.kind === 'directory' ? '新建文件夹' : 'new-file.txt' })}</div>${!hasCapability(state.editor.kind === 'directory' ? 'mkdir' : 'create') ? '<div class="storage-file-capability">后端新建能力尚未开放。</div>' : ''}` : '<div class="storage-file-empty-hint">请选择要创建的类型</div>'}${state.notice ? noticeMarkup() : ''}`;
+    return `<div class="storage-file-choice-grid"><button type="button" data-file-new-kind="directory">${icon('folder')}<span><strong>新建文件夹</strong><small>在当前目录创建文件夹</small></span></button><button type="button" data-file-new-kind="file">${icon('file')}<span><strong>新建文件</strong><small>创建空文件后可继续编辑</small></span></button></div>${state.editor.kind ? `<div class="storage-file-form">${field(state.editor.kind === 'directory' ? '文件夹名称' : '文件名称', 'name', state.editor.name, { wide: true, placeholder: state.editor.kind === 'directory' ? '新建文件夹' : 'new-file.txt' })}</div>${!hasCapability(state.editor.kind === 'directory' ? 'mkdir' : 'create') ? '<div class="storage-file-capability">后端新建能力尚未开放。</div>' : ''}` : '<div class="storage-file-empty-hint" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="dense-surface">请选择要创建的类型</div>'}${state.notice ? noticeMarkup() : ''}`;
   }
 
   function uploadDrawerBody() {
     const files = state.uploadFiles;
     const max = firstNumber(state.limits.max_upload_bytes);
     const mode = state.editor.mode || 'local';
-    const local = `<label class="storage-file-dropzone"><input type="file" multiple data-file-upload-input><span>${icon('upload')}</span><strong>选择要上传的文件</strong><small>上传到 ${escapeHtml(state.path)}${max ? ` · 单文件上限 ${formatBytes(max)}` : ''}</small></label><div class="storage-file-upload-list">${files.length ? files.map((file) => `<div><span>${icon('file')}</span><span><strong>${escapeHtml(file.name)}</strong><small>${formatBytes(file.size)}</small></span></div>`).join('') : '<div class="storage-file-empty-hint">尚未选择文件</div>'}</div>${!hasCapability('upload') ? '<div class="storage-file-capability">后端上传能力尚未开放。浏览器不会把文件发送到其他地址。</div>' : ''}`;
+    const local = `<label class="storage-file-dropzone"><input type="file" multiple data-file-upload-input><span>${icon('upload')}</span><strong>选择要上传的文件</strong><small>上传到 ${escapeHtml(state.path)}${max ? ` · 单文件上限 ${formatBytes(max)}` : ''}</small></label><div class="storage-file-upload-list">${files.length ? files.map((file) => `<div><span>${icon('file')}</span><span><strong>${escapeHtml(file.name)}</strong><small>${formatBytes(file.size)}</small></span></div>`).join('') : '<div class="storage-file-empty-hint" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="dense-surface">尚未选择文件</div>'}</div>${!hasCapability('upload') ? '<div class="storage-file-capability">后端上传能力尚未开放。浏览器不会把文件发送到其他地址。</div>' : ''}`;
     const remote = `<div class="storage-file-form">${field('下载地址', 'url', state.editor.url, { wide: true, type: 'url', placeholder: 'https://example.com/file.bin', help: '后端必须限制协议、重定向、目标地址和下载大小，防止访问内网元数据或本机管理接口。' })}${field('保存文件名', 'name', state.editor.name, { wide: true, placeholder: 'file.bin' })}</div>${!hasCapability('download_url') ? '<div class="storage-file-capability">后端 URL 下载能力尚未开放。</div>' : ''}`;
     return `<div class="storage-file-segmented" role="group" aria-label="添加文件方式"><button type="button" class="${mode === 'local' ? 'is-active' : ''}" data-file-upload-mode="local">本地上传</button><button type="button" class="${mode === 'url' ? 'is-active' : ''}" data-file-upload-mode="url">URL 下载</button></div>${mode === 'local' ? local : remote}${state.notice ? noticeMarkup() : ''}`;
   }
@@ -551,7 +551,7 @@ export function mount(context = {}) {
     if (entry?.kind === 'image') return `<div class="storage-file-media"><img src="${escapeHtml(src)}" alt="${escapeHtml(entry.name)}"></div>`;
     if (entry?.kind === 'video') return `<div class="storage-file-media"><video src="${escapeHtml(src)}" controls></video></div>`;
     if (entry?.kind === 'audio') return `<div class="storage-file-media is-audio"><span>${icon('audio')}</span><strong>${escapeHtml(entry.name)}</strong><audio src="${escapeHtml(src)}" controls></audio></div>`;
-    return '<div class="storage-file-empty-hint">此文件类型不支持预览</div>';
+    return '<div class="storage-file-empty-hint" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="dense-surface">此文件类型不支持预览</div>';
   }
 
   function packageDrawerBody() {
@@ -603,13 +603,28 @@ export function mount(context = {}) {
     return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-file-close aria-label="关闭文件管理面板"></button><aside class="storage-file-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" aria-label="${escapeHtml(drawerTitle())}"><header class="dwrt-kit-sheet-header"><div><span>FILE MANAGER</span><strong>${escapeHtml(drawerTitle())}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-file-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body storage-file-drawer-body">${drawerBody()}</div><footer class="dwrt-kit-sheet-footer storage-file-drawer-footer"><span></span><div><button class="policy-secondary" type="button" data-file-close>${readonly ? '关闭' : '取消'}</button>${readonly ? '' : `<button class="policy-primary ${state.drawer === 'delete' ? 'danger' : ''}" type="button" data-file-save ${drawerCanSave() && !state.saving ? '' : 'disabled'}>${drawerSaveLabel()}</button>`}</div></footer></aside>`;
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', MODULE_CLASS);
-    root.innerHTML = `<section class="storage-file-shell">${noticeMarkup()}<main class="storage-file-workbench">${toolbarMarkup()}${tableMarkup()}</main>${drawerMarkup()}</section>`;
-    ui.mountAll?.(root);
+    target.innerHTML = `<section class="storage-file-shell">${noticeMarkup()}<main class="storage-file-workbench">${toolbarMarkup()}${tableMarkup()}</main>${drawerMarkup()}</section>`;
+    ui.mountAll?.(target);
   }
 
   function patchTable() {

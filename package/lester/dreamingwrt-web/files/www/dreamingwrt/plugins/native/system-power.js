@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260802-ui-batch-01';
+  const VERSION = '20260810-front-release-01';
   const MODULE_CLASS = 'system-power-route-host';
   const stage = root?.closest('.console-stage');
   const ENDPOINTS = {
@@ -235,7 +235,7 @@ export function mount(context = {}) {
     if (!powerReachable && fallbackPayloads.length === 0) state.error = '系统状态与电源计划接口均不可用。';
     state.loading = false;
     state.refreshing = false;
-    render();
+    if (background) renderPreservingInteraction(); else render();
   }
 
   function icon(name) {
@@ -341,7 +341,7 @@ export function mount(context = {}) {
   }
 
   function scheduleRow(schedule) {
-    return `<tr><td class="system-power-check-cell"><input type="checkbox" aria-label="选择 ${escapeHtml(schedule.name)}"></td><td><button class="system-power-name" type="button" data-power-edit="${escapeHtml(schedule.id)}">${escapeHtml(schedule.name)}</button></td><td><span class="system-power-event is-${schedule.event === 'shutdown' ? 'shutdown' : 'reboot'}">${eventLabel(schedule.event)}</span></td><td>${periodLabel(schedule)}</td><td>${escapeHtml(dateLabel(schedule))}</td><td><code>${escapeHtml(schedule.time || '--')}</code></td><td class="system-power-note">${escapeHtml(schedule.note || '--')}</td><td><label class="system-power-switch"><input type="checkbox" data-power-toggle="${escapeHtml(schedule.id)}" ${schedule.enabled ? 'checked' : ''} ${state.capabilities.scheduleUpdate && !state.saving ? '' : 'disabled'}><i></i><span>${schedule.enabled ? '启用' : '停用'}</span></label></td><td><div class="system-power-row-actions"><button type="button" data-power-edit="${escapeHtml(schedule.id)}" title="编辑计划">${icon('edit')}</button><button class="is-danger" type="button" data-power-delete="${escapeHtml(schedule.id)}" title="删除计划" ${state.capabilities.scheduleDelete && !state.saving ? '' : 'disabled'}>${icon('trash')}</button></div></td></tr>`;
+    return `<tr><td class="system-power-check-cell"><input type="checkbox" aria-label="选择 ${escapeHtml(schedule.name)}"></td><td><button class="system-power-name" type="button" data-power-edit="${escapeHtml(schedule.id)}">${escapeHtml(schedule.name)}</button></td><td><span class="system-power-event is-${schedule.event === 'shutdown' ? 'shutdown' : 'reboot'}">${eventLabel(schedule.event)}</span></td><td>${periodLabel(schedule)}</td><td>${escapeHtml(dateLabel(schedule))}</td><td><code>${escapeHtml(schedule.time || '--')}</code></td><td class="system-power-note">${escapeHtml(schedule.note || '--')}</td><td><label class="system-power-switch dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-power-toggle="${escapeHtml(schedule.id)}" ${schedule.enabled ? 'checked' : ''} ${state.capabilities.scheduleUpdate && !state.saving ? '' : 'disabled'}><span>${schedule.enabled ? '启用' : '停用'}</span></label></td><td><div class="system-power-row-actions"><button type="button" data-power-edit="${escapeHtml(schedule.id)}" title="编辑计划">${icon('edit')}</button><button class="is-danger" type="button" data-power-delete="${escapeHtml(schedule.id)}" title="删除计划" ${state.capabilities.scheduleDelete && !state.saving ? '' : 'disabled'}>${icon('trash')}</button></div></td></tr>`;
   }
 
   function schedulesMarkup() {
@@ -389,7 +389,7 @@ export function mount(context = {}) {
     if (!state.drawer) return '';
     const editing = Boolean(state.selected);
     const writable = editing ? state.capabilities.scheduleUpdate : state.capabilities.scheduleCreate;
-    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-power-close aria-label="关闭计划面板"></button><aside class="system-power-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" aria-label="${editing ? '编辑' : '添加'}电源计划"><header class="dwrt-kit-sheet-header"><div><span>POWER SCHEDULE</span><strong>${editing ? '编辑电源计划' : '添加电源计划'}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-power-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body system-power-drawer-body"><div class="system-power-form">${field('名称', 'name', state.draft.name, { required: true, wide: true })}${field('计划事件', 'event', state.draft.event, { required: true, options: [['reboot', '重启'], ['shutdown', '关机']], wide: true })}${field('周期', 'period', state.draft.period, { required: true, options: [['once', '一次'], ['daily', '每天'], ['weekly', '每周'], ['monthly', '每月']], wide: true })}${dynamicDateFields()}${field('时间', 'time', state.draft.time, { type: 'time', required: true })}${field('备注', 'note', state.draft.note, { textarea: true, wide: true })}<label class="system-power-enabled"><span><strong>启用计划</strong><small>保存后进入系统调度队列</small></span><input type="checkbox" data-power-draft="enabled" ${state.draft.enabled ? 'checked' : ''}><i></i></label>${!writable ? '<div class="system-power-capability">后端写入能力尚未开放。表单已经就绪，但不会把计划保存到浏览器或原始 crontab。</div>' : ''}${state.notice ? `<div class="system-power-form-notice">${escapeHtml(state.notice)}</div>` : ''}</div></div><footer class="dwrt-kit-sheet-footer"><span></span><div><button class="policy-secondary" type="button" data-power-close>取消</button><button class="policy-primary" type="button" data-power-save ${writable && !state.saving ? '' : 'disabled'}>${state.saving ? '正在保存' : writable ? '保存计划' : '等待后端能力'}</button></div></footer></aside>`;
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-power-close aria-label="关闭计划面板"></button><aside class="system-power-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" aria-label="${editing ? '编辑' : '添加'}电源计划"><header class="dwrt-kit-sheet-header"><div><span>POWER SCHEDULE</span><strong>${editing ? '编辑电源计划' : '添加电源计划'}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-power-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body system-power-drawer-body"><div class="system-power-form">${field('名称', 'name', state.draft.name, { required: true, wide: true })}${field('计划事件', 'event', state.draft.event, { required: true, options: [['reboot', '重启'], ['shutdown', '关机']], wide: true })}${field('周期', 'period', state.draft.period, { required: true, options: [['once', '一次'], ['daily', '每天'], ['weekly', '每周'], ['monthly', '每月']], wide: true })}${dynamicDateFields()}${field('时间', 'time', state.draft.time, { type: 'time', required: true })}${field('备注', 'note', state.draft.note, { textarea: true, wide: true })}<label class="system-power-enabled dwrt-kit-switch" data-dwrt-component="switch"><span><strong>启用计划</strong><small>保存后进入系统调度队列</small></span><input type="checkbox" data-power-draft="enabled" ${state.draft.enabled ? 'checked' : ''}></label>${!writable ? '<div class="system-power-capability">后端写入能力尚未开放。表单已经就绪，但不会把计划保存到浏览器或原始 crontab。</div>' : ''}${state.notice ? `<div class="system-power-form-notice">${escapeHtml(state.notice)}</div>` : ''}</div></div><footer class="dwrt-kit-sheet-footer"><span></span><div><button class="policy-secondary" type="button" data-power-close>取消</button><button class="policy-primary" type="button" data-power-save ${writable && !state.saving ? '' : 'disabled'}>${state.saving ? '正在保存' : writable ? '保存计划' : '等待后端能力'}</button></div></footer></aside>`;
   }
 
   function confirmMarkup() {
@@ -412,14 +412,29 @@ export function mount(context = {}) {
     return typeof renderer === 'function' ? renderer(options) : '';
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root) return;
     const hasNotice = Boolean(state.notice || state.error);
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', MODULE_CLASS);
-    root.innerHTML = `<section class="system-power-shell ${hasNotice ? 'has-notice' : ''}">${tabsMarkup()}${noticeMarkup()}${state.tab === 'overview' ? overviewMarkup() : schedulesMarkup()}${drawerMarkup()}${confirmMarkup()}</section>`;
-    ui.mountAll?.(root);
+    target.innerHTML = `<section class="system-power-shell ${hasNotice ? 'has-notice' : ''}">${tabsMarkup()}${noticeMarkup()}${state.tab === 'overview' ? overviewMarkup() : schedulesMarkup()}${drawerMarkup()}${confirmMarkup()}</section>`;
+    ui.mountAll?.(target);
     patchUptime();
   }
 

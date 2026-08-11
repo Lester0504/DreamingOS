@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260805-storage-layout-toolbar-03';
+  const VERSION = '20260810-front-release-01';
   const MODULE_CLASS = 'storage-file-services-route-host';
   const stage = root?.closest('.console-stage');
   const TABS = [['nfs', 'NFS'], ['samba', 'Samba'], ['webdav', 'WebDAV'], ['ftp', 'FTP']];
@@ -16,9 +16,32 @@ export function mount(context = {}) {
     ftp: '/api/v1/services/ftp'
   };
 
+  /*
+   * 后端 capability_reasons 的原因码 -> 用户可读措辞。判据始终是能力位布尔值本身，
+   * reason 只用于「不支持」时陈述后端原话；未知原因码原样透出，不猜、不改写语义。
+   */
+  const REASON_TEXT = {
+    nfs_mount_manager_pending: '远程挂载管理尚未提供',
+    service_settings_apply_pending: '服务设置下发尚未提供',
+    secret_encryption_apply_pending: '凭据加密下发尚未提供',
+    runtime_not_installed: '组件未安装'
+  };
+
+  /* 抽屉标题里的能力主体名。禁写说明必须指名道姓，不得用一句话否认整个服务。 */
+  const CAPABILITY_SUBJECT = {
+    'nfs-export': 'NFS 共享目录',
+    'nfs-mount': 'NFS 远程挂载',
+    samba: 'Samba 服务设置',
+    'samba-share': 'Samba 共享目录',
+    webdav: 'WebDAV 服务设置',
+    ftp: 'FTP 服务设置',
+    'ftp-user': 'FTP 用户'
+  };
+
   function emptyServiceData() {
     return {
       capabilities: {},
+      capability_reasons: {},
       nfs: { available: false, running: null, exports: [], mounts: [], capabilities: {} },
       samba: {
         available: false, running: null, enabled: false, workgroup: 'WORKGROUP', server_description: 'Dreaming OS',
@@ -255,6 +278,7 @@ export function mount(context = {}) {
     const fallback = emptyServiceData();
     return {
       capabilities: source.capabilities || {},
+      capability_reasons: source.capability_reasons || {},
       nfs: source.nfs && typeof source.nfs === 'object' ? normalizeNfs(source.nfs) : fallback.nfs,
       samba: source.samba && typeof source.samba === 'object' ? normalizeSamba(source.samba) : fallback.samba,
       webdav: source.webdav && typeof source.webdav === 'object' ? normalizeWebdav(source.webdav) : fallback.webdav,
@@ -292,7 +316,7 @@ export function mount(context = {}) {
       if (!state.mounted || seq !== state.seq) return;
       state.loading = false;
       state.refreshing = false;
-      render();
+      if (background) renderPreservingInteraction(); else render();
     }
   }
 
@@ -301,6 +325,27 @@ export function mount(context = {}) {
     const global = state.data.capabilities || {};
     return local[action] === true || local[`write_${action}`] === true || local.write === true
       || global[`${service}_${action}`] === true || global[service]?.[action] === true || global[service]?.write === true;
+  }
+
+  /*
+   * 取某个能力位的后端原因码。聚合端点把 reasons 按服务分组下发，单服务端点是平铺的，
+   * 两种形状都要认。返回空串表示后端没给原因，此时不得据此推断能力缺失。
+   */
+  function capabilityReason(service, action) {
+    const local = state.data[service]?.capability_reasons || {};
+    const global = state.data.capability_reasons || {};
+    const code = firstText(local[action], global[service]?.[action]);
+    if (!code) return '';
+    return REASON_TEXT[code] || code;
+  }
+
+  /*
+   * 能力未就绪时的说明文案：只否认这一个子功能，并带上后端原因码的可读措辞。
+   * 调用方自行补后半句上下文，避免同一段里出现两句重复的解释。
+   */
+  function capabilityNotice(subject, service, action) {
+    const reason = capabilityReason(service, action);
+    return `${subject}尚未提供写入接口${reason ? `（后端原因：${reason}）` : ''}。`;
   }
 
   function icon(name) {
@@ -351,11 +396,31 @@ export function mount(context = {}) {
   }
 
   function toolbarMarkup() {
+    /* 当前视图的「新建」会打开哪个抽屉，与 openCreate() 保持一致。 */
+    function createDrawerKind() {
+      if (state.tab === 'nfs') return state.nfsView === 'exports' ? 'nfs-export' : 'nfs-mount';
+      if (state.tab === 'samba' && state.sambaView === 'shares') return 'samba-share';
+      if (state.tab === 'ftp' && state.ftpView === 'users') return 'ftp-user';
+      return '';
+    }
+    function createCapabilityPath() {
+      const map = {
+        'nfs-export': ['nfs', 'exports'],
+        'nfs-mount': ['nfs', 'mounts'],
+        'samba-share': ['samba', 'shares'],
+        'ftp-user': ['ftp', 'users']
+      };
+      return map[createDrawerKind()] || ['', ''];
+    }
     const searchable = state.tab === 'nfs' || (state.tab === 'samba' && state.sambaView === 'shares') || (state.tab === 'ftp' && state.ftpView === 'users');
     const createLabel = state.tab === 'nfs' ? (state.nfsView === 'exports' ? '添加共享' : '添加挂载') : state.tab === 'samba' && state.sambaView === 'shares' ? '添加共享' : state.tab === 'ftp' && state.ftpView === 'users' ? '新建用户' : '';
     const settingsLabel = state.tab === 'webdav' || (state.tab === 'samba' && state.sambaView === 'settings') || (state.tab === 'ftp' && state.ftpView === 'settings') ? '编辑设置' : '';
     const placeholder = state.tab === 'nfs' ? '搜索路径、客户端或选项' : state.tab === 'samba' ? '搜索共享名称、路径、用户或备注' : '搜索用户名或目录';
-    return `<div class="file-service-table-actions">${searchable ? `<label class="policy-search policy-search-main" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-file-search value="${escapeHtml(state.query)}" placeholder="${placeholder}"></label>` : ''}<div class="policy-toolbar-actions">${settingsLabel ? `<button class="policy-create-button" type="button" data-file-settings="${state.tab}">${icon('edit')}<span>${settingsLabel}</span></button>` : ''}${createLabel ? `<button class="policy-create-button" type="button" data-file-create>${icon('plus')}<span>${createLabel}</span></button>` : ''}</div></div>`;
+    /* 新建入口按当前视图自己的能力位放开：导出可写不代表挂载可写，反之亦然。 */
+    const [createService, createAction] = createCapabilityPath();
+    const canCreate = createService ? capability(createService, createAction) : true;
+    const createHint = canCreate ? '' : capabilityNotice(CAPABILITY_SUBJECT[createDrawerKind()] || '该配置', createService, createAction);
+    return `<div class="file-service-table-actions">${searchable ? `<label class="policy-search policy-search-main" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-file-search value="${escapeHtml(state.query)}" placeholder="${placeholder}"></label>` : ''}<div class="policy-toolbar-actions">${settingsLabel ? `<button class="policy-create-button" type="button" data-file-settings="${state.tab}">${icon('edit')}<span>${settingsLabel}</span></button>` : ''}${createLabel ? `<button class="policy-create-button" type="button" data-file-create ${canCreate ? '' : `disabled data-dwrt-tooltip="${escapeHtml(createHint)}"`}>${icon('plus')}<span>${createLabel}</span></button>` : ''}</div></div>`;
   }
 
   function noticeMarkup() {
@@ -378,8 +443,11 @@ export function mount(context = {}) {
     return ui.statusBadgeMarkup?.(enabled ? '启用' : '停用', enabled ? 'success' : 'error') || `<span>${enabled ? '启用' : '停用'}</span>`;
   }
 
-  function tableMarkup(title, subtitle, headings, rows, empty) {
-    return `<section class="file-service-main-surface file-service-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong></div><span class="dwrt-kit-table-count">${rows.length} 条</span>${toolbarMarkup()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table file-service-table"><thead><tr>${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody>${state.loading && !state.loaded ? `<tr><td colspan="${headings.length}" class="dwrt-kit-table-empty">正在读取文件服务配置</td></tr>` : rows.length ? rows.join('') : `<tr><td colspan="${headings.length}" class="dwrt-kit-table-empty">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
+  function tableMarkup(title, subtitle, headings, rows, empty, options = {}) {
+    const scopeNotice = options.capabilityNotice
+      ? `<div class="file-service-capability is-inline" role="status">${escapeHtml(options.capabilityNotice)}</div>`
+      : '';
+    return `<section class="file-service-main-surface file-service-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong></div><span class="dwrt-kit-table-count">${rows.length} 条</span>${toolbarMarkup()}</div>${scopeNotice}<div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table file-service-table"><thead><tr>${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody>${state.loading && !state.loaded ? `<tr><td colspan="${headings.length}" class="dwrt-kit-table-empty">正在读取文件服务配置</td></tr>` : rows.length ? rows.join('') : `<tr><td colspan="${headings.length}" class="dwrt-kit-table-empty">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
   }
 
   function renderNfs() {
@@ -387,7 +455,14 @@ export function mount(context = {}) {
     if (state.nfsView === 'mounts') {
       const items = service.mounts.filter((item) => matchesQuery([item.source, item.target, item.options, item.delay]));
       const rows = items.map((item) => `<tr><td>${entryStatus(item.enabled)}</td><td><code>${escapeHtml(item.source || '--')}</code></td><td><code>${escapeHtml(item.target || '--')}</code></td><td><span class="file-service-ellipsis" data-dwrt-tooltip="${escapeHtml(item.options || '--')}">${escapeHtml(item.options || '--')}</span></td><td>${item.delay ? `${item.delay} 秒` : '立即'}</td><td>${rowAction('nfs-mount', item)}</td></tr>`);
-      return tableMarkup('已挂载的目录', `远程 NFS 目录挂载到本机 · ${serviceStatusText(service)}`, ['状态', '源目录', '挂载到', '选项', '延迟时间', '操作'], rows, '尚无远程 NFS 挂载配置');
+      /*
+       * 远程挂载单独判 capabilities.mounts。导出可写时不得因为这一位为 false 就否认整个 NFS，
+       * 两种空态也要分开说：能力未提供 vs 确实没有配置。
+       */
+      const mountWritable = capability('nfs', 'mounts');
+      return tableMarkup('已挂载的目录', `远程 NFS 目录挂载到本机 · ${serviceStatusText(service)}`, ['状态', '源目录', '挂载到', '选项', '延迟时间', '操作'], rows,
+        mountWritable ? '尚无远程 NFS 挂载配置' : '远程挂载管理尚未提供，后端未下发挂载配置',
+        { capabilityNotice: mountWritable ? '' : `${capabilityNotice('NFS 远程挂载', 'nfs', 'mounts')}NFS 共享目录不受影响，可正常新增与修改。` });
     }
     const items = service.exports.filter((item) => matchesQuery([item.path, item.clients, item.options]));
     const rows = items.map((item) => `<tr><td>${entryStatus(item.enabled)}</td><td><code>${escapeHtml(item.path || '--')}</code></td><td>${escapeHtml(item.clients || '*')}</td><td><span class="file-service-ellipsis" data-dwrt-tooltip="${escapeHtml(item.options || '--')}">${escapeHtml(item.options || '--')}</span></td><td>${rowAction('nfs-export', item)}</td></tr>`);
@@ -474,7 +549,7 @@ export function mount(context = {}) {
   }
 
   function switchField(label, description, path, checked) {
-    return `<label class="file-service-switch-row"><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(description)}</small></span><span class="file-service-switch"><input type="checkbox" data-file-draft="${escapeHtml(path)}" ${checked ? 'checked' : ''}><i></i></span></label>`;
+    return `<label class="file-service-switch-row"><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(description)}</small></span><span class="file-service-switch dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-file-draft="${escapeHtml(path)}" ${checked ? 'checked' : ''}></span></label>`;
   }
 
   function field(label, path, value, options = {}) {
@@ -486,6 +561,12 @@ export function mount(context = {}) {
   }
 
   function editorCapability() {
+    const [service, action] = editorCapabilityPath();
+    return service ? capability(service, action) : false;
+  }
+
+  /* 抽屉 -> 能力位。每个抽屉只认自己那一位，绝不用一个能力位控制整页禁写。 */
+  function editorCapabilityPath() {
     const map = {
       'nfs-export': ['nfs', 'exports'],
       'nfs-mount': ['nfs', 'mounts'],
@@ -495,8 +576,13 @@ export function mount(context = {}) {
       ftp: ['ftp', 'settings'],
       'ftp-user': ['ftp', 'users']
     };
-    const [service, action] = map[state.drawer] || ['', ''];
-    return service ? capability(service, action) : false;
+    return map[state.drawer] || ['', ''];
+  }
+
+  function editorCapabilityNotice() {
+    const [service, action] = editorCapabilityPath();
+    if (!service) return '';
+    return capabilityNotice(CAPABILITY_SUBJECT[state.drawer] || '该配置', service, action);
   }
 
   function drawerTitle() {
@@ -526,16 +612,31 @@ export function mount(context = {}) {
     if (!state.drawer) return '';
     const writable = editorCapability();
     const canDelete = !state.editor._new && ['nfs-export', 'nfs-mount', 'samba-share', 'ftp-user'].includes(state.drawer) && writable;
-    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-file-close aria-label="关闭文件服务设置"></button><aside class="file-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" aria-label="${escapeHtml(drawerTitle())}"><header class="dwrt-kit-sheet-header"><div><span>FILE SERVICES</span><strong>${escapeHtml(drawerTitle())}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-file-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body file-service-drawer-body">${drawerFields()}${!writable ? '<div class="file-service-capability">后端写能力尚未开放。可以查看完整配置项，但不会把未保存配置写入浏览器或 /etc/config。</div>' : ''}${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer file-service-drawer-footer">${canDelete ? `<button class="policy-secondary danger" type="button" data-file-delete ${state.saving ? 'disabled' : ''}>${state.confirmDelete ? '再次点击删除' : '删除'}</button>` : '<span></span>'}<div><button class="policy-secondary" type="button" data-file-close>取消</button><button class="policy-primary" type="button" data-file-save ${writable && !state.saving ? '' : 'disabled'}>${state.saving ? '正在保存' : writable ? '保存并应用' : '等待后端能力'}</button></div></footer></aside>`;
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-file-close aria-label="关闭文件服务设置"></button><aside class="file-service-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" aria-label="${escapeHtml(drawerTitle())}"><header class="dwrt-kit-sheet-header"><div><span>FILE SERVICES</span><strong>${escapeHtml(drawerTitle())}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-file-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body file-service-drawer-body">${drawerFields()}${!writable ? `<div class="file-service-capability">${escapeHtml(editorCapabilityNotice())}可以查看完整配置项，但不会把未保存配置写入浏览器或 /etc/config。</div>` : ''}${state.notice ? noticeMarkup() : ''}</div><footer class="dwrt-kit-sheet-footer file-service-drawer-footer">${canDelete ? `<button class="policy-secondary danger" type="button" data-file-delete ${state.saving ? 'disabled' : ''}>${state.confirmDelete ? '再次点击删除' : '删除'}</button>` : '<span></span>'}<div><button class="policy-secondary" type="button" data-file-close>取消</button><button class="policy-primary" type="button" data-file-save ${writable && !state.saving ? '' : 'disabled'}>${state.saving ? '正在保存' : writable ? '保存并应用' : '等待后端能力'}</button></div></footer></aside>`;
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', MODULE_CLASS);
-    root.innerHTML = `<section class="file-service-shell">${tabsMarkup()}${noticeMarkup()}<main class="file-service-workbench">${viewSwitchMarkup()}${mainSurfaceMarkup()}</main>${drawerMarkup()}</section>`;
-    ui.mountAll?.(root);
+    target.innerHTML = `<section class="file-service-shell">${tabsMarkup()}${noticeMarkup()}<main class="file-service-workbench">${viewSwitchMarkup()}${mainSurfaceMarkup()}</main>${drawerMarkup()}</section>`;
+    ui.mountAll?.(target);
   }
 
   function patchMainSurface() {

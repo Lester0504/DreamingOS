@@ -380,10 +380,31 @@ export function mount(context = {}) {
     return state.sheet.kind === 'pair' ? pairSheetMarkup() : zoneSheetMarkup();
   }
 
+  const SNAPSHOT_LABELS = {
+    regions: '区域', matrix: '关系矩阵', policies: '策略表', lans: 'LAN', wans: 'WAN'
+  };
+
+  /*
+   * 只有 snapshot.error 才代表这一次刷新真的失败了。
+   *
+   * 不能判 snapshot.stale：registry 在发请求之前就按龄期把 stale 置真
+   * （dwrt-data-registry.js 的 request()，`entry.stale = hasValue && age > ttlMs`），
+   * 与成败无关。本页 TTL 5000ms 而轮询周期 20000ms，龄期恒大于 TTL，于是后端全程
+   * 200 时每 20 秒也会闪一次「刷新失败」——把健康系统显示成故障，还会掩盖真故障。
+   *
+   * 也不能判 status === 'stale'：中断（换页、卸载）走的同样是 stale，但 error 为
+   * null，那属于正常取消而不是失败。
+   */
+  function refreshFailureMarkup() {
+    const failed = Object.entries(state.snapshots)
+      .filter(([, snapshot]) => snapshot?.error)
+      .map(([slot]) => SNAPSHOT_LABELS[slot] || slot);
+    if (!failed.length) return '';
+    return `<div class="policy-entity-alert is-warning" role="status"><strong>正在显示上次可用快照</strong><span>${escapeHtml(failed.join('、'))}刷新失败，页面仍保留最后一次成功数据。</span></div>`;
+  }
+
   function workbenchMarkup() {
-    const stale = Object.values(state.snapshots).some((snapshot) => snapshot?.stale)
-      ? `<div class="policy-entity-alert is-warning" role="status"><strong>正在显示上次可用快照</strong><span>部分刷新失败，区域和矩阵仍保留最后一次成功数据。</span></div>` : '';
-    return `<section class="policy-entity-page policy-regions-page"><div class="policy-region-workbench">${stale}${feedbackMarkup()}${topologyMarkup()}${zonesTableMarkup()}${matrixMarkup()}${policiesMarkup()}</div></section>`;
+    return `<section class="policy-entity-page policy-regions-page"><div class="policy-region-workbench">${refreshFailureMarkup()}${feedbackMarkup()}${topologyMarkup()}${zonesTableMarkup()}${matrixMarkup()}${policiesMarkup()}</div></section>`;
   }
 
   function replaceMarkup(host, markup) {
@@ -432,6 +453,27 @@ export function mount(context = {}) {
     }
   }
 
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：本页实测丢焦点与内层滚动位置）。
+   *
+   * renderPage() 现有的做法是整块替换 pageHost 再复位 workbench 的滚动位置：滚动能救回来，
+   * 焦点与选区不能。只有页面主体走 morph；叠加层宿主仍整块替换，抽屉被 kit 搬进传送门后
+   * morph 一棵已不在本宿主下的子树只会两头都错。
+   */
+  function renderPagePreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(pageHost, (target) => {
+      const terminal = pageState();
+      target.replaceChildren(document.createRange().createContextualFragment(terminal
+        ? `<section class="policy-entity-page policy-regions-page"><div class="policy-region-workbench">${statePanel(terminal.name, terminal.title, terminal.detail)}</div></section>`
+        : workbenchMarkup()));
+    })) {
+      ui.mountAll?.(pageHost);
+      return;
+    }
+    renderPage();
+  }
+
   function renderOverlay() {
     if (!root || !state.mounted) return;
     replaceMarkup(overlayHost, `${sheetMarkup()}${confirmationMarkup()}`);
@@ -471,12 +513,12 @@ export function mount(context = {}) {
       } while (state.mounted && state.refreshQueued);
       if (!state.mounted) return;
       state.refreshing = false;
-      renderPage();
+      renderPagePreservingInteraction();
     })().finally(() => {
       state.refreshPromise = null;
       if (state.mounted && state.refreshing) {
         state.refreshing = false;
-        renderPage();
+        renderPagePreservingInteraction();
       }
     });
     return state.refreshPromise;

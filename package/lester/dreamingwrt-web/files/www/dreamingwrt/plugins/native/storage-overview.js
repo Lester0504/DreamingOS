@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
   const formatBytes = utils.formatBytes || fallbackFormatBytes;
-  const VERSION = '20260805-storage-layout-toolbar-03';
+  const VERSION = '20260810-front-release-01';
   const MODULE_CLASS = 'storage-overview-route-host';
   const stage = root?.closest('.console-stage');
   const RANGE_LABELS = { '1h': '近一小时', '1d': '近一天', '7d': '近七天' };
@@ -188,7 +188,7 @@ export function mount(context = {}) {
       if (!state.mounted || seq !== state.seq) return;
       state.loading = false;
       state.refreshing = false;
-      render();
+      if (background) renderPreservingInteraction(); else render();
     }
   }
 
@@ -234,7 +234,22 @@ export function mount(context = {}) {
     return `<section class="storage-smart-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>SMART 信息</strong><span>磁盘健康、温度与寿命指标</span></div><span class="dwrt-kit-table-count">${state.data.smart.length ? `${state.data.smart.length} 块` : '--'}</span></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table storage-smart-table"><thead><tr><th>磁盘</th><th>型号</th><th>序列号</th><th>接口</th><th>健康</th><th>温度</th><th>通电时间</th><th>坏扇区</th></tr></thead><tbody>${rows.length ? rows.map((item, index) => { const disk = normalizeDisk(item, index); const healthy = /pass|healthy|good|ok|正常/i.test(disk.smartStatus); return `<tr><td><strong>${escapeHtml(disk.name)}</strong></td><td>${escapeHtml(disk.model || '--')}</td><td><code>${escapeHtml(disk.serial || '--')}</code></td><td>${escapeHtml(disk.transport || '--')}</td><td>${ui.statusBadgeMarkup?.(disk.smartStatus || '--', healthy ? 'success' : 'error') || escapeHtml(disk.smartStatus || '--')}</td><td>${disk.temperature === null ? '--' : `${disk.temperature} °C`}</td><td>${escapeHtml(firstText(item.power_on_hours, item.power_hours, '--'))}</td><td>${escapeHtml(firstText(item.reallocated_sector_count, item.bad_sectors, '--'))}</td></tr>`; }).join('') : `<tr><td colspan="8" class="dwrt-kit-table-empty">后端尚未提供 SMART 信息</td></tr>`}</tbody></table></div></section>`;
   }
 
-  function render() {
+  /*
+   * 轮询刷新走 kit 的共享保状态入口（Acceptance P0 单：30.1 实机 45 路由巡检，20 条路由在
+   * 一个轮询周期里丢滚动 / 焦点 / 选区，根因是整树重绘）。用户主动操作仍走 render()：
+   * 那时候 DOM 本来就应该变。
+   *
+   * render() 收一个可选目标：kit 会先让它渲进离屏容器，再按语义 key patch 回真实 DOM，
+   * 未变化的节点不换身份。宿主级设置（hidden / class）仍作用在真实 root 上，因为那些是
+   * 路由容器自身的状态，不属于本次要 patch 的内容。
+   */
+  function renderPreservingInteraction() {
+    const preserve = ui.preserveInteractionState;
+    if (typeof preserve === 'function' && preserve(root, render)) return;
+    render();
+  }
+
+  function render(target = root) {
     if (!root) return;
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
@@ -243,8 +258,8 @@ export function mount(context = {}) {
     /* 用户第 14 条：I/O 与读写延迟两张图搬到监控中心 - 系统健康（那边是时序图
        的归属地，且有范围/峰值工具栏），占用率变化整张删除。范围按钮随之删除：
        概览剩下的容量卡与 SMART 表都不是时序数据，范围对它们没有意义。 */
-    root.innerHTML = `<section class="storage-overview-shell"><main class="storage-overview-scroll">${notice}${summaryMarkup()}${smartMarkup()}</main></section>`;
-    ui.mountAll?.(root);
+    target.innerHTML = `<section class="storage-overview-shell"><main class="storage-overview-scroll">${notice}${summaryMarkup()}${smartMarkup()}</main></section>`;
+    ui.mountAll?.(target);
   }
 
 

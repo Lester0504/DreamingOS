@@ -512,7 +512,9 @@
   min-width: 0;
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 10px;
+  /* 与上方 `.ai-settings-summary` 四张卡同一个间距（实测 18px），
+     否则同一页上下两排卡片一个 18px 一个 10px，看起来像挤在一起。 */
+  gap: var(--app-page-gap, 16px);
 }
 
 .ai-overview-rows > article {
@@ -541,7 +543,8 @@
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ai-ink) 10%, transparent);
 }
 
-.ai-settings-chamber + .ai-settings-chamber { margin-top: 14px; }
+/* 舱位之间用页面级间距，与其他页面的分区间距同一来源；原先 14px 明显偏紧。 */
+.ai-settings-chamber + .ai-settings-chamber { margin-top: var(--app-page-gap, 16px); }
 .ai-settings-chamber > h3 { margin: 0; color: var(--ai-ink); font-size: 13px; font-weight: 820; }
 .ai-chamber-body { min-width: 0; display: grid; gap: 14px; }
 .ai-chamber-grid { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 14px 18px; }
@@ -797,8 +800,35 @@
   gap: 8px;
 }
 
+/*
+ * 三种提示都可能带图标，尺寸与描边必须一起给：
+ *
+ *   `.ai-configured-note` 原先两样都没有（`.ai-strategy-hint` 就是
+ *   `icon('alert') + span`）。svg 没有宽高约束时 `viewBox="0 0 24 24"` 会按可用
+ *   宽度铺开 —— 30.1 实测 539x539；`icon()` 的路径又是**只描边不填充**的线性图标，
+ *   缺 `fill: none` 就被浏览器按默认 `fill: black` 涂实。两件事叠起来正是用户看到的
+ *   「一个大的黑色三角形」。
+ */
+.ai-configured-note:has(> svg) {
+  display: grid;
+  grid-template-columns: 15px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+}
+
 .ai-configured-error > svg,
-.ai-configured-capability > svg { width: 15px; height: 15px; }
+.ai-configured-capability > svg,
+.ai-configured-note > svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .ai-configured-error { color: var(--app-danger, rgb(255, 122, 132)); }
 
 @media (max-width: 760px) {
@@ -822,9 +852,23 @@
   flex: 0 0 auto;
 }
 
+/*
+ * 设置页把概览四张卡 / 总开关卡提到了主卡片外面，但这个容器原先是块级、卡片自身
+ * `margin: 0`，于是相邻卡片之间**一点间距都没有**（30.1 实测概览页
+ * summary.bottom 248 → card.top 248、高级页 master.bottom 176 → card.top 176，
+ * 两处都是 0px），看起来像一整块被硬切开。用户 2026-08-09 指出这一点。
+ *
+ * 间距用 `--app-page-gap`，与其他页面卡片间距同一个来源（design.md
+ * implementation checklist 第 3 条），不新造一个局部常数。各行按内容高度排：
+ * 主卡片本身 `height: auto`，平分高度会把附属卡也拉高。
+ */
 .ai-view-host {
   min-width: 0;
   min-height: 0;
+  display: grid;
+  grid-auto-rows: min-content;
+  align-content: start;
+  gap: var(--app-page-gap, 16px);
   overflow: visible;
 }
 
@@ -1666,18 +1710,9 @@
 
 
 .ai-switch {
-  position: relative;
-  width: 50px;
-  height: 28px;
-  flex: 0 0 50px;
-  cursor: pointer;
+  flex: 0 0 auto;
+  margin-inline-start: auto;
 }
-
-.ai-switch input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
-.ai-switch > span { position: absolute; inset: 0; border-radius: 999px; background: rgba(0,0,0,0.20); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12); transition: background 180ms ease; }
-.ai-switch > span::after { content: ""; position: absolute; top: 2px; left: 2px; width: 24px; height: 24px; border-radius: 50%; background: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.24); transition: transform 180ms cubic-bezier(0.4,0,0.2,1); }
-.ai-switch input:checked + span { background: #32d74b; }
-.ai-switch input:checked + span::after { transform: translateX(22px); }
 
 .ai-settings-section {
   min-width: 0;
@@ -1724,7 +1759,45 @@
  * 其余 76px，同一排磁贴高低不齐。把对勾钉在第二行第二列（品牌名右侧）即可对齐。
  */
 .ai-provider-button strong { grid-column: 1; grid-row: 2; min-width: 0; overflow: hidden; color: var(--ai-ink); text-overflow: ellipsis; white-space: nowrap; font: inherit; font-size: 12px; font-weight: 800; }
-.ai-provider-mark { grid-column: 1 / -1; grid-row: 1; color: var(--ai-muted); font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+/*
+ * 品牌图标位（用户 2026-08-09：磁贴要带 provider 的 logo，更直观）。
+ * 图标是固件自带的品牌 svg，其中 openai / kimi 是**纯黑填充**，直接放在深色
+ * 磁贴上会看不见，所以垫一层近白色底板；`is-glyph` 时底板收掉，退回 `mark` 字形。
+ */
+.ai-provider-mark {
+  position: relative;
+  grid-column: 1;
+  grid-row: 1;
+  justify-self: start;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 5px;
+  background: rgba(255,255,255,0.92);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ai-ink) 10%, transparent);
+  color: var(--ai-muted);
+  font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.ai-provider-mark > img { position: relative; z-index: 1; width: 15px; height: 15px; display: block; object-fit: contain; }
+/* 字形兜底：图标正常显示时不垫在下面，避免半透明图标透出字来。 */
+.ai-provider-mark > i { position: absolute; inset: 0; z-index: 0; display: grid; place-items: center; font-size: 8px; font-style: normal; font-weight: 760; line-height: 1; }
+.ai-provider-mark:not(.is-glyph) > i { visibility: hidden; }
+/*
+ * 没有品牌图标时（自建端点没有品牌，或图标 404）不摆一块空白底板 ——
+ * 一块比 logo 还显眼的白色方块会把「没有图标」误读成「这里该有个图标但坏了」。
+ * 退回改版前的纯字形，行高与 logo 位一致，同排磁贴不会高低不齐。
+ */
+.ai-provider-mark.is-glyph {
+  width: auto;
+  height: 20px;
+  place-items: center start;
+  background: none;
+  box-shadow: none;
+}
+.ai-provider-mark.is-glyph > i { position: static; font-size: 10px; }
 /*
  * 品牌副标题（demo 1 磁贴里的 `.sub`）。占满整行放在品牌名下面，
  * 单行截断：品牌名与副标题都可能较长，任其换行会让同一排磁贴高度不齐。

@@ -3,6 +3,7 @@
 
 import gzip
 import json
+import re
 from pathlib import Path
 
 
@@ -132,12 +133,128 @@ def test_intrusion_feed_and_signature_control_plane_is_exposed() -> None:
 
 
 def test_optional_endpoints_do_not_break_existing_aegis_page() -> None:
-    assert "const optionalKeys = new Set(['appBlocks', 'appCatalog', 'pcdn', 'logSettings', 'clients'])" in MODULE
+    assert ("const optionalKeys = new Set(['appBlocks', 'appCatalog', 'pcdn', 'logSettings', "
+            "'clients', 'inspectionCa', 'inspectionCaDistributions'])") in MODULE
     assert "item.status === 'rejected' && !optionalKeys.has(key)" in MODULE
 
 
+def test_log_levels_are_wired_to_the_real_contract() -> None:
+    """The four log-level groups are readable and writable, not a hardcoded label.
+
+    Acceptance found `stateBadge('后端未开放')` written literally on this row while
+    /api/v1/logs/settings already returned all four groups and the route was
+    already in this module's own fetch list. The data was in hand and unused.
+    """
+    assert "/api/v1/logs/settings" in MODULE
+    for group in ("device", "management", "remote_access", "system"):
+        assert f"['{group}'," in MODULE
+    # Read shape is {level, min_severity_rank, keeps_debug}; write shape is a bare
+    # string. Sending the read shape back gets invalid_log_level.
+    assert "JSON.stringify({ log_levels: { [group]: value } })" in MODULE
+    for level in ("auto", "normal", "verbose", "debug"):
+        assert f"['{level}'," in MODULE
+    assert "function logLevelsSupported()" in MODULE
+    assert "data-aegis-log-level" in MODULE
+    assert "async function saveLogLevel(group, value)" in MODULE
+    assert "queryAll('[data-aegis-log-level]')" in MODULE
+
+
+def test_inspection_ca_capabilities_are_exposed_without_faking_the_dataplane() -> None:
+    """Certificate layer is real; the SSL inspection dataplane is not.
+
+    Backend ships 1320 lines of certificate code and six routes, but reports
+    ssl_inspection_reason=inspection_dataplane_not_implemented. Both facts have to
+    survive: expose generate/rotate/revoke/download/distribute, and keep saying the
+    block page cannot take effect yet. No switch that clicks but does nothing.
+    """
+    for endpoint in (
+        "/api/v1/aegis/certificates/inspection-ca",
+        "/api/v1/aegis/certificates/inspection-ca/generate",
+        "/api/v1/aegis/certificates/inspection-ca/rotate",
+        "/api/v1/aegis/certificates/inspection-ca/revoke",
+        "/api/v1/aegis/certificates/inspection-ca/download",
+        "/api/v1/aegis/certificates/inspection-ca/distributions",
+    ):
+        assert endpoint in MODULE
+    assert "'尚未实现'" not in MODULE
+    assert "证书生成、下载和终端分发接口尚未实现" not in MODULE
+    assert "ssl_inspection_reason" in MODULE
+    assert "inspection_dataplane_not_implemented" in MODULE
+    assert "trusted_terminal_certificate_agent_missing" in MODULE
+    # Every write the backend gates on confirm=true must go through a confirmation.
+    assert "JSON.stringify({ confirm: true })" in MODULE
+    for action in ("certificate-generate", "certificate-rotate", "certificate-revoke"):
+        assert action in MODULE
+    # Manual distribution needs a known client MAC, so it must offer a real picker.
+    assert "target_type: 'client', target_id: target, method: 'manual'" in MODULE
+    assert "data-certificate-target" in MODULE
+    assert "content_base64" in MODULE
+    # The old dead switch must be gone, not merely relabelled.
+    assert "switchControl('block-page'" not in MODULE
+
+
+def test_intrusion_row_surfaces_the_next_action() -> None:
+    """"运行组件未就绪" is accurate here, so it stays; the way forward is added."""
+    assert "ids_ips_next_action" in MODULE
+    assert "运行组件未就绪" in MODULE  # real state, deliberately preserved
+    for action in (
+        "import_suricata_rules", "install_suricata_runtime",
+        "configure_suricata_capture", "apply_suricata_with_confirm",
+        "restart_suricata_with_confirm", "wait_for_or_check_eve_log",
+    ):
+        assert action in MODULE
+
+
+def test_snmp_copy_matches_the_policy_engine_side() -> None:
+    """SNMP is storable but has no runtime consumer; both entry points must agree."""
+    assert "可保存，运行消费者未实现" in MODULE
+    assert "SNMP 监控" in MODULE
+
+
+def test_unavailable_labels_are_derived_from_capabilities_not_literals() -> None:
+    """No "后端未开放" may be written as a literal argument to stateBadge().
+
+    This is the assertion Acceptance asked for. It carries its own reverse
+    verification below: a literal badge injected into the source must turn it red,
+    otherwise the test proves nothing.
+    """
+    literal = re.compile(r"stateBadge\(\s*['\"]后端未开放['\"]")
+
+    def offending_lines(source: str) -> list[int]:
+        """Literal badges outside capabilityBadge(), which is the single funnel.
+
+        capabilityBadge() is allowed to contain the string because that is where the
+        wording is derived from a capability bit. Every caller must go through it.
+        """
+        offending = []
+        for index, line in enumerate(source.splitlines(), 1):
+            if not literal.search(line):
+                continue
+            if "supported ? stateBadge(readyLabel, readyTone)" in line:
+                continue
+            offending.append(index)
+        return offending
+
+    assert "function capabilityBadge(supported, readyLabel, readyTone = 'ok')" in MODULE
+
+    # Rows whose badge text is chosen by a capability expression are fine, so the
+    # check targets the literal form only.
+    assert offending_lines(MODULE) == [], offending_lines(MODULE)
+
+    # Reverse verification: the detector must fail on a planted literal.
+    planted = MODULE.replace(
+        "${stateBadge(logLevelSummary().label, logLevelSummary().tone)}",
+        "${stateBadge('后端未开放', 'neutral')}",
+    )
+    assert planted != MODULE, "anchor for the planted literal no longer exists"
+    assert offending_lines(planted), "detector missed a hardcoded 后端未开放 badge"
+
+
 def test_region_controls_are_compact_and_dependency_gated() -> None:
-    assert "const VERSION = '20260802-ui-batch-01'" in MODULE
+    # Not a version literal: design.md warns that pinning the string here produces a
+    # false failure on every bump. The real invariant is that the module and the menu
+    # cache keys agree, which is asserted in test_menu_versions_and_gzip_parity.
+    assert re.search(r"const VERSION = '[\w-]+';", MODULE)
     assert "switchControl('geo-enabled', regionEnabled, !state.saving" in MODULE
     assert "regionEnabled ? `<div class=\"aegisx-region-dependent\">" in MODULE
     assert "shieldBan:" in MODULE
@@ -205,8 +322,11 @@ def test_menu_versions_and_gzip_parity() -> None:
     menu = json.loads(MENU_PATH.read_text(encoding="utf-8"))
     policy = next(item for item in menu["items"] if item.get("id") == "policy-engine")
     aegis = next(item for item in policy["children"] if item.get("id") == "policy-aegisx")
-    assert aegis["module_version"] == "20260802-ui-batch-01"
-    assert aegis["style_version"] == "20260802-ui-batch-01"
+    # Assert agreement, not a pinned string, so a cache-key bump cannot pass while
+    # leaving the module and menu pointing at different keys.
+    module_version = re.search(r"const VERSION = '([\w-]+)';", MODULE).group(1)
+    assert aegis["module_version"] == module_version, (aegis["module_version"], module_version)
+    assert aegis["style_version"] == module_version, (aegis["style_version"], module_version)
     for source in (MODULE_PATH, STYLE_PATH, MENU_PATH):
         compressed = source.with_name(source.name + ".gz")
         assert compressed.is_file(), compressed

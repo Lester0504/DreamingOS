@@ -66,23 +66,26 @@ assert "requestToken !== this.mapRequestToken" in glass
 assert "this.pendingMapKey === key" in glass
 assert "window.addEventListener('pagehide', stopMapWorker)" in glass
 assert "this.filterPadding = Math.ceil(" in glass
-assert "const activeDisplacement = this.lightRenderer" in glass
+assert "const activeDisplacement = Math.max(" in glass
 assert "Math.max(Math.abs(redScale), Math.abs(greenScale), Math.abs(blueScale))" in glass
 assert "activeDisplacement * 0.5" in glass
 assert "this.filter.setAttribute('x', String(-filterPadding))" in glass
 assert "this.filter.setAttribute('width', String(width + filterPadding * 2))" in glass
-assert "const SAFARI_LIGHT_PROFILE" in glass
-assert "vendor === 'Apple Computer, Inc.'" in glass
-assert "this.trackMotion = !this.lightRenderer" in glass
-assert "this.trackScroll = !this.lightRenderer" in glass
-assert "this.root.dataset.glassRenderer = this.lightRenderer ? 'safari-light-sampling'" in glass
-light_filter_start = glass.index("if (this.lightRenderer) {", glass.index("buildSvg()"))
-light_filter_end = glass.index("} else {", light_filter_start)
-light_filter = glass[light_filter_start:light_filter_end]
-assert light_filter.count("svgNode('feDisplacementMap'") == 0
-assert "this.redDisplacement" in light_filter
-assert "this.greenDisplacement" not in light_filter
-assert "this.blueDisplacement" not in light_filter
+# Safari 的降级渲染分支已按 Acceptance-to-Front-drop-safari-glass-downgrade.md 第 66 条整体删除，
+# 这里改为反向断言：任何形式的 lightRenderer / 厂商嗅探都不得重新出现，否则等于降级分支回归。
+assert "lightRenderer" not in glass
+assert "SAFARI_LIGHT_PROFILE" not in glass
+assert "Apple Computer, Inc." not in glass
+assert "safari-light-sampling" not in glass
+# 全平台走同一条显式采样链路：三个通道各自有 feDisplacementMap，且运动/滚动跟踪不再按渲染器分叉。
+assert "this.trackMotion = this.options.trackMotion !== false" in glass
+assert "this.trackScroll = this.options.trackScroll !== false" in glass
+assert "this.root.dataset.glassRenderer = 'svg-explicit-sampling'" in glass
+build_svg_start = glass.index("buildSvg()")
+build_svg_source = glass[build_svg_start:glass.index("this.root.dataset.glassRenderer", build_svg_start)]
+assert build_svg_source.count("svgNode('feDisplacementMap'") == 3
+for _channel in ("this.redDisplacement", "this.greenDisplacement", "this.blueDisplacement"):
+    assert _channel in build_svg_source
 
 trim_start = shell.index("  function trimPageGlassMapCache() {")
 trim_source = shell[trim_start:map_start]
@@ -95,6 +98,32 @@ reconcile_end = shell.index("\n  function scheduleGlassCardsRender(", reconcile_
 reconcile_source = shell[reconcile_start:reconcile_end]
 assert "schedulePageGlassDisplacementMap(scope, geometry, signature)" in reconcile_source
 assert "pageGlassDisplacementMap(geometry).then" not in reconcile_source
+assert "scope.sampler.dataset.glassReady === 'true'" in reconcile_source
+assert "!scope || !canSample || !sharedReady" in reconcile_source
+assert "card.classList.add('dwrt-page-liquid-glass', 'dwrt-shared-glass-cutout')" in reconcile_source
+assert "scope.sampler.hidden = !sharedReady" in reconcile_source
+assert "card.classList.contains('dwrt-shared-glass-cutout')" in reconcile_source
+
+assert "function syncAdaptiveGlassProfile()" in shell
+assert "root.dataset.adaptiveForeground === 'light'" in shell
+assert "root.hasAttribute('data-adaptive-mixed')" in shell
+assert "overLight: false" in shell
+assert "state.liquidGlass.materialVersion += 1" not in shell[shell.index("  function syncAdaptiveGlassProfile()"):shell.index("  function coverDrawArgs(")]
+assert "this.options.neutralDensity +" not in glass
+assert "this.options.overLight ? Math.max(baseBlur, 8)" not in glass
+assert "const neutralDensity = clamp(this.options.neutralDensity, 0, 0.35);" in glass
+effective_density_start = shell.index("  function effectiveNeutralDensity()")
+effective_density_end = shell.index("\n  function applyAdaptiveRegion(", effective_density_start)
+effective_density_source = shell[effective_density_start:effective_density_end]
+assert "adaptiveOverLight" not in effective_density_source
+assert "+ 0.26" not in effective_density_source
+for selector in (
+    ".flow-engine-page-toolbar",
+    ".flow-engine-tab-content > .policy-entity-section > header",
+    ".flow-engine-tab-content > .policy-entity-section > .flow-engine-detail-list > div",
+    ".flow-balance-algorithm-fallback",
+):
+    assert selector in shell
 
 schedule_start = shell.index("  function schedulePageGlassDisplacementMap(scope, geometry, signature) {")
 schedule_end = shell.index("\n\n  function cancelPageGlassIdleWork()", schedule_start)
@@ -126,7 +155,8 @@ mount_source = kit[mount_start:mount_end]
 assert "const components = collectComponentRoots(context)" in mount_source
 assert "matchingRoots(context" not in mount_source
 assert "componentRoots(context" not in mount_source
-assert "matchingRoots(context, '[data-dwrt-component], .dwrt-kit-tabs, .dwrt-kit-sheet, .dwrt-kit-modal-layer')" in kit
+assert "matchingRoots(context, '[data-dwrt-component], .dwrt-kit-tabs, .dwrt-kit-sheet, .dwrt-kit-modal-layer, select')" in kit
+assert "root instanceof HTMLSelectElement" in kit
 
 assert 'data-dwrt-component="data-table" data-global-table' in global_config
 assert 'data-dwrt-component="select" data-gateway-assignment=' in global_config

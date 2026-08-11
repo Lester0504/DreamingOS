@@ -186,6 +186,14 @@
   grid-template-rows: auto minmax(0, 1fr);
 }
 
+/*
+ * 表格卡插入范围化能力说明时，它是第三个网格子项。若不显式加一行，说明会挤进
+ * minmax(0,1fr) 的滚动行里，把表格压成零高。
+ */
+.file-service-table-card:has(> .file-service-capability.is-inline) {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
 .file-service-table-card .dwrt-kit-table-scroll {
   min-width: 0;
   min-height: 0;
@@ -347,7 +355,7 @@
 .file-service-switch-row {
   min-height: 60px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 42px;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 15px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.07);
@@ -357,33 +365,7 @@
 .file-service-switch-row strong { color: var(--app-text); font-size: 13px; font-weight: 720; }
 .file-service-switch-row small { color: var(--app-text-muted); font-size: 10px; line-height: 1.4; }
 
-.file-service-switch { width: 40px; height: 22px; position: relative; display: block; }
-.file-service-switch input { position: absolute; opacity: 0; pointer-events: none; }
-.file-service-switch i {
-  width: 40px;
-  height: 22px;
-  position: relative;
-  display: block;
-  border-radius: 999px;
-  background: rgba(128, 140, 158, 0.28);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.10);
-  cursor: pointer;
-}
-
-.file-service-switch i::after {
-  content: '';
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: #e7edf5;
-  transition: transform 160ms ease;
-}
-
-.file-service-switch input:checked + i { background: rgba(46, 139, 255, 0.78); }
-.file-service-switch input:checked + i::after { transform: translateX(18px); }
+.file-service-switch { flex: 0 0 auto; }
 
 .file-service-form {
   min-width: 0;
@@ -429,6 +411,12 @@
   box-shadow: inset 0 0 0 1px rgba(245, 166, 35, 0.15);
   font-size: 11px;
   line-height: 1.5;
+}
+
+/* 表格内的范围化能力说明：只解释当前视图这一个子功能，不占抽屉那样的上边距。 */
+.file-service-capability.is-inline {
+  flex: 0 0 auto;
+  margin: 0 12px 8px;
 }
 
 .file-service-drawer-footer { justify-content: space-between; }
@@ -477,10 +465,6 @@ html[data-theme-resolved="light"] .file-service-field select {
   .file-service-segmented button { padding-inline: 10px; }
   .file-service-toolbar .policy-toolbar-actions { gap: 5px; }
   .file-service-toolbar .policy-toolbar-actions button { width: 40px; min-width: 40px; padding: 0; justify-content: center; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .file-service-switch i::after { transition: none; }
 }
 
 /*

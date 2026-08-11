@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const api = context.api || {};
   const utils = context.utils || {};
   const ui = context.ui || {};
-  const VERSION = '20260806-honeypot-form-confirm-gate-01';
+  const VERSION = '20260810-front-release-01';
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
   const ENDPOINTS = {
     status: '/api/v1/aegis/status',
@@ -38,6 +38,14 @@ export function mount(context = {}) {
     signatureSuppress: '/api/v1/aegis/signatures/suppress',
     signatureUnsuppress: '/api/v1/aegis/signatures/unsuppress',
     logSettings: '/api/v1/logs/settings',
+    /*
+     * NetFlow / IPFIX 导出配置。判据取这个端点**自身**的响应，不取 aegis/status 的
+     * 能力位——按 design.md「Capability truth」第 1 条，资源端点才是它自己可用性的
+     * 权威，用另一个端点的能力位当前置门会把真实存在的功能显示成"后端未提供"。
+     * 后端 flowd 侧 export_settings_get / _set 已就绪（jmxd/src/flowd/flowd_db.c），
+     * webd 路由是否已注册由这次请求的状态码回答，不在前端猜。
+     */
+    flowdExportSettings: '/api/v1/flowd/export-settings',
     inspectionCa: '/api/v1/aegis/certificates/inspection-ca',
     inspectionCaGenerate: '/api/v1/aegis/certificates/inspection-ca/generate',
     inspectionCaRotate: '/api/v1/aegis/certificates/inspection-ca/rotate',
@@ -70,6 +78,13 @@ export function mount(context = {}) {
     address_in_use: '该地址正在使用', honeypot_address_conflict: '该地址已用于其他蜜罐', honeypot_network_address_limit_reached: '该网络的蜜罐地址已达到上限',
     honeypotd_binary_missing: '设备缺少蜜罐运行程序', invalid_services: '至少选择一项蜜罐服务', unsupported_honeypot_service: '包含后端不支持的蜜罐服务',
     job_already_running: '已有 Aegisx 后台任务正在运行', aegis_job_running: '已有 Aegisx 后台任务正在运行',
+    /*
+     * dependency_timeout（HTTP 504）语义是「请求已被后端接受，可能已经生效」，
+     * 与 source_unavailable（HTTP 503，连不上 ubus，确实没生效）必须分开。
+     * 说成「失败」会重现用户原始报障的体感：报错了但设置其实生效了。
+     */
+    dependency_timeout: '正在应用，请稍后刷新查看结果',
+    source_unavailable: '后端服务暂时不可用，请稍后重试',
     pcdn_revision_conflict: 'PCDN 配置已被其他会话修改', pcdn_rules_not_ready: '请先同步 PCDN 规则',
     pcdn_apply_failed: 'PCDN 应用失败，旧配置已保留', signature_revision_mismatch: '签名规则已更新，请重新核对',
     revision_conflict: '配置已被其他会话修改', revision_required: '缺少配置修订号', signature_not_found: '找不到该签名规则',
@@ -89,6 +104,23 @@ export function mount(context = {}) {
     certificate_distribution_target_not_found: '设备库里找不到该终端',
     certificate_distribution_create_failed: '分发记录写入失败',
     certificate_distribution_state_unavailable: '分发记录不可读'
+    ,
+    /*
+     * NetFlow / IPFIX 导出的拒绝码，逐条对齐 jmxd/src/flowd/flowd_db.c:1180-1226 的
+     * 字面量与区间。交接单只列了 7 个，源码里实际还有 invalid_collector_host、
+     * invalid_observation_domain 与 export_settings_unavailable 三个，一并覆盖 ——
+     * 少一个就会把明确的拒绝理由降级成裸英文码。
+     */
+    collector_host_required: '请先填写收集器地址，导出会把流量元数据发往该主机',
+    invalid_collector_host: '收集器地址无效',
+    invalid_protocol: '导出协议只能是 IPFIX 或 NetFlow v9',
+    invalid_collector_port: '收集器端口必须在 1 到 65535 之间',
+    invalid_active_timeout: '活动流超时必须在 10 到 1800 秒之间',
+    invalid_inactive_timeout: '非活动流超时必须在 5 到 600 秒之间',
+    invalid_template_refresh: '模板刷新间隔必须在 30 到 3600 秒之间',
+    invalid_sampling_rate: '采样率必须在 1 到 65535 之间',
+    invalid_observation_domain: '观测域标识不能为负数',
+    export_settings_unavailable: '导出配置不可读'
   };
   function initialTab() {
     try {
@@ -108,6 +140,16 @@ export function mount(context = {}) {
     overrides: [], identification: {}, appBlocks: { items: [], capabilities: {} }, appCatalog: [], pcdn: {}, logSettings: {}, lans: [], clients: [],
     inspectionCa: {}, inspectionCaDistributions: { items: [], total: 0 }, logLevelDraft: {},
     certificateTarget: '',
+    /*
+     * 导出配置的三态：
+     *   netflowExport      读到的配置与运行计数（成功时的载荷）
+     *   netflowExportState '' 未请求 / 'ok' 读到 / 'missing' 路由未实现 /
+     *                      'forbidden' 权限不足 / 'error' 后端错误 / 'offline' 网络不可用
+     *   netflowExportReason 上面几种非 ok 状态的原始依据（状态码或 error.code）
+     * 「能力为假」与「能力未知」必须分开（design.md「Capability truth」第 4 条），
+     * 所以这里存的是分类结果，不是一个布尔。
+     */
+    netflowExport: null, netflowExportState: '', netflowExportReason: '', netflowExportDraft: null,
     feeds: {}, feedStatus: {}, feedImportStatus: {}, signatureCategories: {}, signaturePolicies: { items: [], counts: {}, total: 0, limit: 50, offset: 0 },
     contentDraft: null, appBlockDraft: null, honeypotDraft: null, signatureDraft: null, pcdnSyncPreview: null, pcdnPendingIntent: null, pcdnJobId: '', feedPreview: null,
     geoQuery: '', geoDraftEnabled: null, appQuery: '', eventQuery: '', signatureQuery: '', signaturePage: 0, jobPollAttempts: 0, mounted: true, seq: 0
@@ -149,6 +191,27 @@ export function mount(context = {}) {
     const key = firstText(error?.error, error?.message, error?.code, error);
     return ERROR_TEXT[key] || key || fallback;
   }
+  /*
+   * 504 + dependency_timeout：webd 已把请求交给 aegis，只是 dnsmasq 同步重启没在
+   * 预算内答复。请求可能已经生效，所以既不能报「失败/不可用」，也不能把开关弹回
+   * 原位——弹回会让「报错了但设置其实生效了」这个矛盾更明显。
+   *
+   * 判据同时接受 code 与 HTTP 状态：能力检测式的写法在后端未部署时也不会误伤，
+   * 而 503 source_unavailable 仍走原有的「不可用/重试」分支。
+   */
+  function isDependencyTimeout(error) {
+    return String(error?.code || '') === 'dependency_timeout' || Number(error?.status) === 504;
+  }
+  const APPLYING_NOTICE = '正在应用，请稍后刷新查看结果。';
+  /*
+   * 收到 504 后重新拉一次权威状态，让 UI 最终显示真实 apply_state 而不是我们的猜测。
+   * reload 自身再失败也不要把提示改成失败：那只是这一次回读没成功。
+   */
+  async function noteApplyingAndReread(reload) {
+    state.notice = APPLYING_NOTICE;
+    state.error = '';
+    try { await reload?.(); } catch (_) {}
+  }
   async function requestJson(url, options = {}) {
     if (typeof api.fetch === 'function' && !options.method) {
       const result = await api.fetch(`aegisx-${url}`, url);
@@ -162,11 +225,20 @@ export function mount(context = {}) {
     const json = await response.json().catch(() => ({}));
     const payload = json?.data ?? json;
     if (!response.ok || json?.ok === false || payload?.ok === false) {
-      const detail = payload?.error || payload?.message || json?.error || response.status;
+      /*
+       * 错误码可能是扁平的 `error: "<code>"`，也可能是嵌套的
+       * `error: { code, message, details }`（webd 新的 dependency_timeout 走后者）。
+       * firstText() 会跳过对象，所以嵌套形态必须先把 code 取出来，否则会退化成
+       * 显示后端的英文 message。
+       */
+      const nested = (payload?.error && typeof payload.error === 'object') ? payload.error
+        : (json?.error && typeof json.error === 'object') ? json.error : null;
+      const detail = nested?.code || nested?.message || payload?.error || payload?.message || json?.error || response.status;
       const error = new Error(message(detail));
-      error.code = firstText(payload?.error, payload?.code, json?.error, json?.code);
+      error.code = firstText(nested?.code, payload?.error, payload?.code, json?.error, json?.code);
       error.status = response.status;
       error.payload = payload;
+      error.details = nested?.details || payload?.details || null;
       throw error;
     }
     return payload;
@@ -279,6 +351,47 @@ export function mount(context = {}) {
     state.error = failures.length ? `部分状态读取失败：${[...new Set(failures)].join(' · ')}` : '';
     state.loading = false;
     render();
+  }
+  /*
+   * 导出配置单独一条请求，不并进 load() 的那批。
+   *
+   * 两个原因：(1) 这个端点的判据是**状态码**（404 才证明路由不存在，403 只说明当前账号
+   * 不能写，见 AGENTS.md「Probing whether a route exists」），而 load() 走 api.fetch 时
+   * 状态码会被壳层揉成一个字符串，分不出 404 与 403；(2) 它的失败不该污染
+   * state.error —— 那是页面级读取失败，而这里只是一个能力槽未确认。
+   */
+  async function loadNetflowExport() {
+    const seq = state.seq;
+    try {
+      const value = await requestJson(ENDPOINTS.flowdExportSettings, { method: 'GET' });
+      if (!state.mounted || seq !== state.seq) return;
+      state.netflowExport = value?.data || value || {};
+      state.netflowExportState = 'ok';
+      state.netflowExportReason = '';
+    } catch (error) {
+      if (!state.mounted || seq !== state.seq) return;
+      state.netflowExport = null;
+      state.netflowExportState = netflowFailureClass(error);
+      state.netflowExportReason = firstText(error?.code, error?.status);
+    }
+    render();
+  }
+  /*
+   * 按 design.md「Capability truth」第 3 条分类，code 优先于状态码。
+   * 404/405/501 与 method_not_registered 才是"路由没接上"；403 单独一档，
+   * 它不能被读成"功能不存在"，也不能被读成"功能已就绪"。
+   */
+  function netflowFailureClass(error) {
+    const code = String(error?.code || '');
+    const status = Number(error?.status) || 0;
+    if (code === 'method_not_registered') return 'missing';
+    if (code === 'source_unavailable') return 'error';
+    if ([404, 405, 501].includes(status)) return 'missing';
+    if (status === 403) return 'forbidden';
+    if (status === 401) return 'unauthorized';
+    if (status >= 500) return 'error';
+    if (!status) return 'offline';
+    return 'error';
   }
   async function loadIntrusion(options = {}) {
     const sid = Number.parseInt(state.signatureQuery.trim(), 10);
@@ -455,6 +568,49 @@ export function mount(context = {}) {
     }, 2200);
   }
   function feedItems() { return asArray(state.feeds, ['feeds']); }
+  /*
+   * 订阅源聚合健康。后端在 aegis/status 根节点新增了 per-feed 健康信息
+   * （feeds_total / feeds_failing / feeds_healthy / feeds_never_succeeded /
+   * feed_degradation_scope / feed_health[]），并且不再让单个源失败把整个服务
+   * 报成 degraded。所以不能再看 state / degraded 判断「安全服务异常」，
+   * 否则一个源挂掉会被漏报。scope 由后端给定：none / partial_feeds / all_feeds。
+   */
+  function feedHealth() {
+    const status = state.status || {};
+    const total = Number(status.feeds_total);
+    const failing = Number(status.feeds_failing);
+    const scope = firstText(status.feed_degradation_scope);
+    if (!Number.isFinite(total) || !scope) return null;
+    return {
+      total,
+      failing: Number.isFinite(failing) ? failing : 0,
+      healthy: Number.isFinite(Number(status.feeds_healthy)) ? Number(status.feeds_healthy) : null,
+      neverSucceeded: Number.isFinite(Number(status.feeds_never_succeeded)) ? Number(status.feeds_never_succeeded) : 0,
+      scope
+    };
+  }
+  const FEED_SCOPE_LABEL = {
+    none: { label: '订阅源全部正常', tone: 'ok' },
+    partial_feeds: { label: '部分订阅源不可用', tone: 'warn' },
+    all_feeds: { label: '订阅源全部不可用', tone: 'warn' }
+  };
+  function feedHealthBadge() {
+    const health = feedHealth();
+    if (!health) return '';
+    const preset = FEED_SCOPE_LABEL[health.scope];
+    if (!preset) return stateBadge(`订阅源状态未知（${health.scope}）`, 'neutral');
+    const label = health.scope === 'none'
+      ? preset.label
+      : `${preset.label}：${formatNumber(health.failing)}/${formatNumber(health.total)}`;
+    return stateBadge(label, preset.tone);
+  }
+  /* 「从未成功过」和「曾经成功、这次失败」是两种不同的故障：前者说明这个源
+     一条数据都没有，后者至少还有上次的存量。分开说，不合并成一个失败数。 */
+  function feedNeverSucceededText() {
+    const health = feedHealth();
+    if (!health || !health.neverSucceeded) return '';
+    return ` · ${formatNumber(health.neverSucceeded)} 个源从未成功`;
+  }
   function signatureItems() { return asArray(state.signaturePolicies, ['items']); }
   function signatureCounts() { return state.signaturePolicies?.counts || {}; }
   function idsManagementAvailable() {
@@ -654,12 +810,84 @@ export function mount(context = {}) {
     return Number(state.logSettings?.retention_days ?? state.logSettings?.settings?.retention_days) || 0;
   }
   /*
-   * NetFlow / IPFIX 与流量日志采集范围：后端目前确实没有实现（全树 netflow / ipfix
-   * 零命中；aegis/status 也没有采集范围维度的字段）。这里仍然走能力位而不是写死，
-   * 后端补上对应能力位后这两行会自己变成可配置。
+   * NetFlow / IPFIX 导出。
+   *
+   * 判据来自 /api/v1/flowd/export-settings 这个端点自身的响应，不再取 aegis/status 的
+   * netflow_export_supported —— 那个键后端从未下发（2026-08-09 30.1 实测 aegis/status
+   * 的 130 个能力位里没有它），而导出配置本来就住在 flowd，不在 aegisxd。
+   *
+   * 后端 flowd 侧 export_settings_get / _set 已实现（jmxd/src/flowd/flowd_db.c:1084、
+   * :1157），缺的只是 webd 的一行路由；路由在不在由这次请求的状态码回答。
    */
-  function netflowSupported() {
-    return bool(capabilities().netflow_export_supported ?? capabilities().ipfix_export_supported);
+  function netflowExportSettings() { return state.netflowExport || {}; }
+  function netflowExportRuntime() {
+    const runtime = netflowExportSettings().runtime;
+    return runtime && typeof runtime === 'object' ? runtime : {};
+  }
+  /* 读到配置才算可写。403 / 5xx / 未请求都不是"可写"，也不是"后端没实现"。 */
+  function netflowSupported() { return state.netflowExportState === 'ok'; }
+  /* "要求开"——配置态。与"真的在导出"分开，后者看 runtime.collecting。 */
+  function netflowEnabled() { return bool(netflowExportSettings().enabled); }
+  /* "真的在导出"——运行态。collecting 为真且已经有记录送出去过才算数。 */
+  function netflowCollecting() { return netflowSupported() && bool(netflowExportRuntime().collecting); }
+  function netflowRecordsExported() { return Number(netflowExportRuntime().records_exported) || 0; }
+  function netflowSendErrors() { return Number(netflowExportRuntime().send_errors) || 0; }
+  function netflowLastError() { return firstText(netflowExportRuntime().last_error); }
+  /*
+   * 状态徽章按四态分述。这里刻意不用 capabilityBadge()：那个函数只有
+   * "支持 / 后端未开放"两档，而 403 与 5xx 说的不是后端未开放。
+   */
+  function netflowStatusBadge() {
+    if (state.netflowExportState === 'ok') {
+      if (netflowCollecting()) return stateBadge(`正在导出 · ${formatNumber(netflowRecordsExported())} 条记录`, 'ok');
+      if (netflowEnabled()) return stateBadge('已启用，尚未导出记录', 'warn');
+      return stateBadge('可配置 · 未启用', 'info');
+    }
+    /*
+     * "后端未开放"只允许经 capabilityBadge() 产出（它是这句文案的唯一漏斗，
+     * 见 tests/test_aegisx_backend_open_contract.py 的 offending_lines 断言）。
+     * 这里能力确定为假，所以传 false 让它给出那句话，而不是自己写死字面量。
+     */
+    if (state.netflowExportState === 'missing') return capabilityBadge(false, '可配置');
+    if (state.netflowExportState === 'forbidden') return stateBadge('需要更高权限', 'warn');
+    if (state.netflowExportState === 'unauthorized') return stateBadge('会话已失效', 'warn');
+    if (state.netflowExportState === 'error') return stateBadge('后端读取失败', 'warn');
+    if (state.netflowExportState === 'offline') return stateBadge('网络不可用', 'warn');
+    return stateBadge('正在读取', 'info');
+  }
+  /*
+   * 说明文字同样四态。三条硬要求：
+   *   - 未确认时不得断言后端未实现（第 4 条）；
+   *   - "已配置"与"正在导出"必须分开（本交接单验收标准第 3 条）；
+   *   - send_errors / last_error 要显示出来，否则 collector 拒收在界面上看不见。
+   */
+  function netflowExplanation() {
+    if (state.netflowExportState === 'ok') {
+      const settings = netflowExportSettings();
+      const target = firstText(settings.collector_host) ? `${firstText(settings.collector_host)}:${firstText(settings.collector_port, 4739)}` : '未设置收集器地址';
+      const protocol = firstText(settings.protocol) === 'netflow9' ? 'NetFlow v9' : 'IPFIX';
+      const parts = [`${protocol} · ${escapeHtml(target)}`];
+      if (netflowEnabled()) {
+        parts.push(netflowCollecting()
+          ? `运行态：正在采集，已导出 ${formatNumber(netflowRecordsExported())} 条记录、${formatNumber(netflowExportRuntime().datagrams_sent)} 个数据包`
+          : '运行态：配置已启用，但采集尚未开始（配置在下一个周期生效，最长 5 秒）');
+      } else {
+        parts.push('运行态：未启用，不会向外发送任何流量元数据');
+      }
+      if (netflowSendErrors()) parts.push(`发送失败 ${formatNumber(netflowSendErrors())} 次，收集器可能拒收`);
+      if (netflowLastError()) parts.push(`最近错误：${escapeHtml(netflowLastError())}`);
+      return parts.join('；');
+    }
+    if (state.netflowExportState === 'missing') {
+      return 'flowd 已实现导出配置的读写与真实采集，但 webd 尚未注册 /api/v1/flowd/export-settings 路由，所以本页还读不到它。这不是采集能力缺失。';
+    }
+    if (state.netflowExportState === 'forbidden') {
+      return '当前账号没有读取导出配置的权限（后端回 403）。这只说明本账号读不到当前值，不代表功能不可用，请用管理员账号查看。';
+    }
+    if (state.netflowExportState === 'unauthorized') return '登录会话已失效，请重新登录后查看导出配置。';
+    if (state.netflowExportState === 'error') return `导出配置读取失败${state.netflowExportReason ? `（${escapeHtml(String(state.netflowExportReason))}）` : ''}，这是一次读取失败，不等于后端没有实现导出。`;
+    if (state.netflowExportState === 'offline') return '无法连接到网关，导出配置的可用性尚未确认。';
+    return '正在读取导出配置。';
   }
   function trafficLogScopeSupported() {
     return bool(capabilities().traffic_log_scope_supported ?? capabilities().traffic_logging_scope_supported);
@@ -678,7 +906,7 @@ export function mount(context = {}) {
         { key: 'honeypot', label: '蜜罐命中', value: formatNumber(stats.honeypot_hits), detail: '诱捕服务事件', tone: 'warn', icon: icon('trap') }
       ], 'Aegisx 流量日志概览')}
       <section class="aegisx-panel aegisx-unsupported-panel dwrt-kit-glass-surface">
-        ${row('NetFlow (IPFIX)', '捕获流量信息并导出到收集器。', `${switchControl('netflow', false, netflowSupported())}${capabilityBadge(netflowSupported(), '可配置')}`)}
+        ${row('NetFlow (IPFIX)', '采集流量元数据并按 NetFlow v9 或 IPFIX 导出到收集器。开启会把本网络的流量元数据发送到外部主机。', `${switchControl('netflow', netflowEnabled(), netflowSupported() && !state.saving, netflowSupported() ? '启用流量导出' : '导出配置尚未可读')}${netflowStatusBadge()}${actionButton('导出设置', 'netflow-export', netflowSupported())}`, { detail: `<p class="aegisx-explanation">${netflowExplanation()}</p>` })}
         ${row('流量日志', '选择记录所有安全流量或仅记录被阻止流量，并可附加 DNS、服务和设备管理事件。', `${radio('traffic-logging', 'all', true, '所有流量', trafficLogScopeSupported(), '后端缺少独立采集范围合同')}${radio('traffic-logging', 'blocked', false, '仅阻止的流量', trafficLogScopeSupported(), '后端缺少独立采集范围合同')}${capabilityBadge(trafficLogScopeSupported(), '可配置')}`, { detail: '<p class="aegisx-explanation">Gateway DNS、Aegisx 服务和设备管理三类额外流量仍缺独立设置与回读。</p>' })}
         ${row('活动日志 (Syslog)', '将活动日志保存在本机，或使用日志中心转发到 SIEM / Syslog 服务器。', `${radio('syslog', 'off', false, '关', false)}${radio('syslog', 'internal', syslogLoaded && !bool(syslog.enabled), '内部存储', false)}${radio('syslog', 'siem', bool(syslog.enabled), 'SIEM 服务器', false)}${stateBadge(syslogLoaded ? bool(syslog.enabled) ? '转发已启用' : '内部存储' : '状态不可用', syslogLoaded ? bool(syslog.enabled) ? 'ok' : 'info' : 'warn')}${actionButton('管理', 'log-center', syslogLoaded)}`, { detail: `<p class="aegisx-explanation">${bool(syslog.enabled) ? `${escapeHtml(firstText(syslog.server, '--'))}:${escapeHtml(firstText(syslog.port, 514))} · ${escapeHtml(firstText(syslog.protocol, 'udp').toUpperCase())}` : '日志保留、转发协议、TLS/mTLS、队列和测试统一由日志中心管理。'}</p>` })}
         ${row('数据保留', '控制本机日志保留，并清除设备与流量识别产生的历史数据。', `${stateBadge(logRetentionDays() ? `保留 ${logRetentionDays()} 天` : '自动', 'info')}${actionButton('保留设置', 'log-center', syslogLoaded)}${actionButton('清除流量历史', 'traffic-clear', clearSupported, { icon: 'trash' })}`)}
@@ -701,6 +929,88 @@ export function mount(context = {}) {
       <header class="dwrt-kit-sheet-header"><div><span>REGION BLOCKING</span><strong>选择国家或地区</strong></div><button class="dwrt-kit-sheet-close" type="button" data-aegis-close>×</button></header>
       <div class="dwrt-kit-sheet-body aegisx-drawer-body"><div class="aegisx-drawer-intro">所选国家或地区将使用保护页设置的动作和流量方向。后端已提供 nftables preview、apply、disable 与 rollback；当前仍缺逐国家、逐规则命中计数和事件回读。</div><div class="aegisx-drawer-toolbar"><label class="aegisx-inline-search" data-dwrt-component="field">${icon('search')}<input type="search" data-geo-search value="${escapeHtml(state.geoQuery)}" placeholder="搜索国家或地区" aria-label="搜索国家或地区"></label><span>已选 ${selected} / 可配置 ${geoCountries().length}</span></div><div class="aegisx-country-list">${countries.map((country) => `<label><input type="checkbox" data-geo-country="${escapeHtml(country.id || country.code)}" ${country.enabled ? 'checked' : ''}><span class="aegisx-checkmark"></span>${countryFlag(country)}<b>${escapeHtml(COUNTRY_NAMES[country.code || country.id] || country.name || country.id)}</b><small>${escapeHtml(country.code || country.id)} · ${escapeHtml(country.continent || '')}</small></label>`).join('')}</div></div>
       <footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-aegis-close>取消</button><button class="policy-primary" type="button" data-geo-save ${state.saving || !selected ? 'disabled' : ''}>${state.saving ? '正在保存' : selected ? '保存配置' : '请先选择国家或地区'}</button></footer>
+    </aside>`;
+  }
+  /*
+   * 导出配置草稿。字段与取值范围逐条对齐后端 flowd_export_settings_set
+   * （jmxd/src/flowd/flowd_db.c:1174-1219），不多送后端不接受的字段
+   * （design.md「Capability truth」第 10 条）。observation_domain 后端接受但
+   * 属于协议标识而非用户可理解的选项，这里按读回值原样回送，不做成输入框。
+   */
+  function defaultNetflowDraft() {
+    const settings = netflowExportSettings();
+    return {
+      enabled: bool(settings.enabled),
+      protocol: firstText(settings.protocol) === 'netflow9' ? 'netflow9' : 'ipfix',
+      collector_host: firstText(settings.collector_host),
+      collector_port: String(Number(settings.collector_port) || 4739),
+      active_timeout_seconds: String(Number(settings.active_timeout_seconds) || 60),
+      inactive_timeout_seconds: String(Number(settings.inactive_timeout_seconds) || 15),
+      template_refresh_seconds: String(Number(settings.template_refresh_seconds) || 600),
+      sampling_rate: String(Number(settings.sampling_rate) || 1)
+    };
+  }
+  /* 开启必须有收集器地址，否则后端会回 collector_host_required —— 前端先挡住。 */
+  function netflowDraftReady() {
+    const draft = state.netflowExportDraft;
+    if (!draft) return false;
+    if (draft.enabled && !firstText(draft.collector_host)) return false;
+    return true;
+  }
+  /*
+   * 草稿 → 提交载荷。数值字段在草稿里是字符串（输入框的原始值），后端要数字，
+   * 转换只在这一处做，避免各调用点各转一遍再漏掉一个。
+   */
+  function netflowPayload(draft) {
+    return {
+      enabled: Boolean(draft.enabled),
+      protocol: draft.protocol === 'netflow9' ? 'netflow9' : 'ipfix',
+      collector_host: firstText(draft.collector_host),
+      collector_port: Number(draft.collector_port),
+      active_timeout_seconds: Number(draft.active_timeout_seconds),
+      inactive_timeout_seconds: Number(draft.inactive_timeout_seconds),
+      template_refresh_seconds: Number(draft.template_refresh_seconds),
+      sampling_rate: Number(draft.sampling_rate)
+    };
+  }
+  /*
+   * 导出设置抽屉。运行计数与配置分成两块呈现：上半是可写配置，下半是只读运行证据。
+   * 运行块的存在理由是「已配置」与「真的在工作」在界面上必须能区分 —— collector
+   * 拒收时 enabled 仍是 true，只有 send_errors 会涨。
+   */
+  function renderNetflowDrawer() {
+    const draft = state.netflowExportDraft;
+    if (!draft) return '';
+    const runtime = netflowExportRuntime();
+    const numberField = (key, label, hint) => `<label><span>${escapeHtml(label)}</span><input type="number" data-netflow-field="${key}" value="${escapeHtml(draft[key])}" inputmode="numeric"><small>${escapeHtml(hint)}</small></label>`;
+    const counter = (label, value) => `<div><span>${escapeHtml(label)}</span><strong>${formatNumber(value)}</strong></div>`;
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-aegis-close aria-label="关闭流量导出设置"></button><aside class="aegisx-drawer aegisx-netflow-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot">
+      <header class="dwrt-kit-sheet-header"><div><span>FLOW EXPORT</span><strong>NetFlow / IPFIX 导出设置</strong></div><button class="dwrt-kit-sheet-close" type="button" data-aegis-close>×</button></header>
+      <div class="dwrt-kit-sheet-body aegisx-drawer-body">
+        <div class="aegisx-drawer-field"><span>启用导出</span>${switchControl('netflow-draft-enabled', draft.enabled, true, '启用流量导出')}<small>开启后本网络的流量元数据（五元组、字节数、时间戳）会持续发送到下面填写的收集器。</small></div>
+        <div class="aegisx-drawer-field"><span>导出协议</span><div class="aegisx-choice-row">${radio('netflow-protocol', 'ipfix', draft.protocol === 'ipfix', 'IPFIX', true)}${radio('netflow-protocol', 'netflow9', draft.protocol === 'netflow9', 'NetFlow v9', true)}</div></div>
+        <label><span>收集器地址</span><input type="text" data-netflow-field="collector_host" value="${escapeHtml(draft.collector_host)}" placeholder="192.168.30.50"><small>${draft.enabled && !firstText(draft.collector_host) ? '启用导出必须填写收集器地址。' : '收集器的 IP 地址或主机名。修改后会重新解析。'}</small></label>
+        ${numberField('collector_port', '收集器端口', '1-65535，IPFIX 常用 4739')}
+        ${numberField('active_timeout_seconds', '活动流超时（秒）', '10-1800，长连接每隔这么久导出一次')}
+        ${numberField('inactive_timeout_seconds', '非活动流超时（秒）', '5-600，静默超过这个时间的流被视为结束')}
+        ${numberField('template_refresh_seconds', '模板刷新间隔（秒）', '30-3600，收集器重启后靠它重新拿到模板')}
+        ${numberField('sampling_rate', '采样率', '1-65535，1 表示全部采集；实测 8192 并发流下开销低于单核 0.15%，通常不需要采样')}
+        <div class="aegisx-drawer-field aegisx-netflow-runtime"><span>运行态</span>
+          <small>${netflowCollecting() ? '正在采集并导出。' : netflowEnabled() ? '配置已启用，采集尚未开始（配置在下一个周期生效，最长 5 秒）。' : '未启用，当前不会向外发送数据。'}</small>
+          <div class="aegisx-netflow-counters">
+            ${counter('已导出记录', runtime.records_exported)}
+            ${counter('已发送数据包', runtime.datagrams_sent)}
+            ${counter('发送失败', runtime.send_errors)}
+            ${counter('跟踪中的流', runtime.flows_tracked)}
+            ${counter('轮询次数', runtime.polls)}
+            ${counter('轮询失败', runtime.poll_errors)}
+          </div>
+          <small>流量来源：${escapeHtml(firstText(runtime.flow_source, 'nf_conntrack'))}${runtime.last_export_at ? ` · 最近导出 ${escapeHtml(formatTime(runtime.last_export_at))}` : ''}</small>
+          ${netflowSendErrors() ? `<small class="aegisx-netflow-warn">发送失败 ${formatNumber(netflowSendErrors())} 次，收集器可能拒收或地址不可达。</small>` : ''}
+          ${netflowLastError() ? `<small class="aegisx-netflow-warn">最近错误：${escapeHtml(netflowLastError())}</small>` : ''}
+        </div>
+      </div>
+      <footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-aegis-close>取消</button><button class="policy-primary" type="button" data-netflow-save ${state.saving || !netflowDraftReady() ? 'disabled' : ''}>${state.saving ? '正在保存' : draft.enabled && !firstText(draft.collector_host) ? '请先填写收集器地址' : '保存设置'}</button></footer>
     </aside>`;
   }
   function defaultHoneypotDraft(item = null) {
@@ -809,6 +1119,12 @@ export function mount(context = {}) {
     if (!button) return;
     button.disabled = honeypotSaveBlocked(state.honeypotDraft);
   }
+  /* 同上：文本框不重绘，保存按钮的可用性单独同步。 */
+  function syncNetflowSaveState() {
+    const button = query('[data-netflow-save]');
+    if (!button) return;
+    button.disabled = state.saving || !netflowDraftReady();
+  }
   function renderHoneypotModal() {
     /*
      * 服务多选。逐项由后端 capabilities 决定是否可选，不支持的置灰并说明原因 ——
@@ -850,10 +1166,10 @@ export function mount(context = {}) {
     if (draft) {
       const editing = items.some((item) => item.id === draft.id);
       return `<div class="dwrt-kit-modal-layer aegisx-honeypot-modal-layer is-open" data-dwrt-component="modal"><button class="dwrt-kit-modal-backdrop" type="button" data-aegis-close aria-label="关闭蜜罐配置"></button><section class="dwrt-kit-modal aegisx-honeypot-modal dwrt-kit-glass-surface" data-dwrt-modal-variant="copilot" data-adaptive-sample role="dialog" aria-modal="true" aria-labelledby="aegisx-honeypot-title"><header class="dwrt-kit-modal-header"><div><h2 id="aegisx-honeypot-title">${editing ? '编辑蜜罐' : '创建蜜罐'}</h2></div><button class="dwrt-kit-modal-close" type="button" data-aegis-close aria-label="关闭">${icon('close')}</button></header><div class="dwrt-kit-modal-body aegisx-drawer-body aegisx-honeypot-modal-body">
-        <label><span>网络</span><select data-honeypot-field="network_id">${state.lans.map((lan) => `<option value="${escapeHtml(firstText(lan.id, lan.name))}" ${firstText(lan.id, lan.name) === draft.network_id ? 'selected' : ''}>${escapeHtml(firstText(lan.name, lan.id))} · ${escapeHtml(lanSubnet(lan))}</option>`).join('')}</select></label>
+        <label class="dwrt-kit-field" data-dwrt-component="field"><span>网络</span><select data-honeypot-field="network_id">${state.lans.map((lan) => `<option value="${escapeHtml(firstText(lan.id, lan.name))}" ${firstText(lan.id, lan.name) === draft.network_id ? 'selected' : ''}>${escapeHtml(firstText(lan.name, lan.id))} · ${escapeHtml(lanSubnet(lan))}</option>`).join('')}</select></label>
         <label><span>蜜罐 IPv4 地址</span><input type="text" inputmode="decimal" data-honeypot-field="address" value="${escapeHtml(draft.address)}" placeholder="192.168.30.250"></label>
         ${honeypotAddressLimitHint(draft)}
-        <label><span>画像</span><select data-honeypot-field="profile">${honeypotProfileOptions().map(([key, label]) => `<option value="${escapeHtml(key)}" ${key === draft.profile ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label>
+        <label class="dwrt-kit-field" data-dwrt-component="field"><span>画像</span><select data-honeypot-field="profile">${honeypotProfileOptions().map(([key, label]) => `<option value="${escapeHtml(key)}" ${key === draft.profile ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label>
         ${honeypotServicesField(draft)}
       </div><footer class="dwrt-kit-modal-footer"><button class="policy-secondary" type="button" data-aegis-close>取消</button><button class="policy-primary" type="button" data-honeypot-save ${honeypotSaveBlocked(draft) ? 'disabled' : ''}>${state.saving ? '正在创建' : editing ? '保存' : '创建'}</button></footer></section></div>`;
     }
@@ -912,7 +1228,7 @@ export function mount(context = {}) {
     const items = appBlocks();
     const draft = state.appBlockDraft;
     if (!draft) {
-      return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-aegis-close aria-label="关闭应用阻止管理"></button><aside class="aegisx-drawer aegisx-app-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot"><header class="dwrt-kit-sheet-header"><div><span>APP BLOCKING</span><strong>应用阻止</strong></div><button class="dwrt-kit-sheet-close" type="button" data-aegis-close>×</button></header><div class="dwrt-kit-sheet-body aegisx-drawer-body"><div class="aegisx-app-rule-list">${items.length ? items.map((item) => `<article><div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.source === 'any' ? '全部设备' : clientLabel(clientByMac(item.source)) || item.source)} · ${escapeHtml(appNames(item.app_ids) || `${asArray(item.app_ids).length} 个应用`)}</span><small>${formatNumber(item.hits)} 次命中${item.last_hit_s ? ` · ${escapeHtml(formatTime(item.last_hit_s))}` : ''}</small></div>${stateBadge(bool(item.applied) ? bool(item.active) ? '运行中' : '已同步' : '待同步', bool(item.applied) ? 'ok' : 'warn')}<div><button type="button" data-app-block-edit="${escapeHtml(item.id)}">编辑</button><button type="button" class="is-danger" data-app-block-delete="${escapeHtml(item.id)}">删除</button></div></article>`).join('') : '<div class="aegisx-drawer-empty">尚未创建应用阻止规则</div>'}</div></div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-aegis-close>关闭</button><button class="policy-primary" type="button" data-app-block-new>新建</button></footer></aside>`;
+      return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-aegis-close aria-label="关闭应用阻止管理"></button><aside class="aegisx-drawer aegisx-app-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot"><header class="dwrt-kit-sheet-header"><div><span>APP BLOCKING</span><strong>应用阻止</strong></div><button class="dwrt-kit-sheet-close" type="button" data-aegis-close>×</button></header><div class="dwrt-kit-sheet-body aegisx-drawer-body"><div class="aegisx-app-rule-list">${items.length ? items.map((item) => `<article><div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.source === 'any' ? '全部设备' : clientLabel(clientByMac(item.source)) || item.source)} · ${escapeHtml(appNames(item.app_ids) || `${asArray(item.app_ids).length} 个应用`)}</span><small>${formatNumber(item.hits)} 次命中${item.last_hit_s ? ` · ${escapeHtml(formatTime(item.last_hit_s))}` : ''}</small></div>${stateBadge(bool(item.applied) ? bool(item.active) ? '运行中' : '已同步' : '待同步', bool(item.applied) ? 'ok' : 'warn')}<div><button type="button" data-app-block-edit="${escapeHtml(item.id)}">编辑</button><button type="button" class="is-danger" data-app-block-delete="${escapeHtml(item.id)}">删除</button></div></article>`).join('') : '<div class="aegisx-drawer-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="dense-surface">尚未创建应用阻止规则</div>'}</div></div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-aegis-close>关闭</button><button class="policy-primary" type="button" data-app-block-new>新建</button></footer></aside>`;
     }
     const query = state.appQuery.trim().toLowerCase();
     const catalog = state.appCatalog.filter((app) => !query || [app.label, app.category, app.family, app.app_id].join(' ').toLowerCase().includes(query));
@@ -925,8 +1241,8 @@ export function mount(context = {}) {
     return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-aegis-close aria-label="关闭应用阻止编辑器"></button><aside class="aegisx-drawer aegisx-app-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot"><header class="dwrt-kit-sheet-header"><div><span>APP BLOCKING</span><strong>${editing ? '编辑应用阻止' : '新建应用阻止'}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-aegis-close>×</button></header><div class="dwrt-kit-sheet-body aegisx-drawer-body">
       <label><span>名称</span><input type="text" data-app-block-field="name" value="${escapeHtml(draft.name)}" placeholder="访客网络应用限制"></label>
       <div class="aegisx-drawer-field"><span>启用</span>${switchControl('app-block-enabled', draft.enabled, true, '启用应用阻止规则')}</div>
-      <div class="aegisx-drawer-field"><span>应用对象</span><div class="aegisx-choice-row">${radio('app-block-source-mode', 'any', draft.source_mode === 'any', '全部设备', true)}${radio('app-block-source-mode', 'specific', draft.source_mode !== 'any', '指定设备', true)}</div>${draft.source_mode === 'any' ? '' : `<select data-app-device-select><option value="">选择设备</option>${deviceOptions}<option value="manual" ${draft.source_mode === 'manual' ? 'selected' : ''}>手动输入 MAC 地址</option></select>${draft.source_mode === 'manual' ? `<input type="text" data-app-block-field="source" value="${escapeHtml(draft.source)}" placeholder="AA:BB:CC:DD:EE:FF">` : ''}`}</div>
-      <div class="aegisx-drawer-field"><span>应用</span><small>当前后端支持按具体应用阻止；分类阻止尚未开放。</small><label class="aegisx-inline-search" data-dwrt-component="field">${icon('search')}<input type="search" data-app-search value="${escapeHtml(state.appQuery)}" placeholder="搜索应用、分类或 App ID" aria-label="搜索应用"></label><div class="aegisx-app-catalog">${catalog.length ? catalog.map((app) => { const id = Number(app.app_id ?? app.value); return `<label><input type="checkbox" data-app-id="${id}" ${draft.app_ids.includes(id) ? 'checked' : ''}><span class="aegisx-checkmark"></span>${app.icon ? `<img src="${escapeHtml(app.icon)}" alt="" loading="lazy" onerror="this.hidden=true">` : ''}<b>${escapeHtml(app.label || id)}</b><small>${escapeHtml([app.category, app.family].filter(Boolean).join(' · '))}</small></label>`; }).join('') : '<div class="aegisx-drawer-empty">没有匹配的应用</div>'}</div><small data-app-selected-count>已选 ${draft.app_ids.length} 个应用</small></div>
+      <div class="aegisx-drawer-field"><span>应用对象</span><div class="aegisx-choice-row">${radio('app-block-source-mode', 'any', draft.source_mode === 'any', '全部设备', true)}${radio('app-block-source-mode', 'specific', draft.source_mode !== 'any', '指定设备', true)}</div>${draft.source_mode === 'any' ? '' : `<label class="dwrt-kit-field" data-dwrt-component="field"><select data-app-device-select aria-label="选择设备"><option value="">选择设备</option>${deviceOptions}<option value="manual" ${draft.source_mode === 'manual' ? 'selected' : ''}>手动输入 MAC 地址</option></select></label>${draft.source_mode === 'manual' ? `<input type="text" data-app-block-field="source" value="${escapeHtml(draft.source)}" placeholder="AA:BB:CC:DD:EE:FF">` : ''}`}</div>
+      <div class="aegisx-drawer-field"><span>应用</span><small>当前后端支持按具体应用阻止；分类阻止尚未开放。</small><label class="aegisx-inline-search" data-dwrt-component="field">${icon('search')}<input type="search" data-app-search value="${escapeHtml(state.appQuery)}" placeholder="搜索应用、分类或 App ID" aria-label="搜索应用"></label><div class="aegisx-app-catalog">${catalog.length ? catalog.map((app) => { const id = Number(app.app_id ?? app.value); return `<label><input type="checkbox" data-app-id="${id}" ${draft.app_ids.includes(id) ? 'checked' : ''}><span class="aegisx-checkmark"></span>${app.icon ? `<img src="${escapeHtml(app.icon)}" alt="" loading="lazy" onerror="this.hidden=true">` : ''}<b>${escapeHtml(app.label || id)}</b><small>${escapeHtml([app.category, app.family].filter(Boolean).join(' · '))}</small></label>`; }).join('') : '<div class="aegisx-drawer-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="dense-surface">没有匹配的应用</div>'}</div><small data-app-selected-count>已选 ${draft.app_ids.length} 个应用</small></div>
       <div class="aegisx-drawer-field"><span>计划</span><div class="aegisx-choice-row aegisx-schedule-modes">${radio('app-block-schedule', 'always', draft.schedule_mode === 'always', '始终', true)}${radio('app-block-schedule', 'daily', draft.schedule_mode === 'daily', '每天', true)}${radio('app-block-schedule', 'weekly', draft.schedule_mode === 'weekly', '每周', true)}${radio('app-block-schedule', 'custom', draft.schedule_mode === 'custom', '自定义', true)}</div>${draft.schedule_mode === 'daily' ? rangeFields(ranges[0], 0, { showDays: false }) : draft.schedule_mode === 'weekly' ? rangeFields(ranges[0], 0) : draft.schedule_mode === 'custom' ? `<div class="aegisx-schedule-ranges">${ranges.map((range, index) => rangeFields(range, index, { removable: ranges.length > 1 })).join('')}</div><button class="aegisx-link-button aegisx-add-range" type="button" data-app-range-add>添加时间段</button>` : ''}</div>
     </div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-aegis-close>取消</button><button class="policy-primary" type="button" data-app-block-save ${state.saving || !appBlockDraftReady() ? 'disabled' : ''}>${state.saving ? '正在校验' : '校验并保存'}</button></footer></aside>`;
   }
@@ -944,16 +1260,16 @@ export function mount(context = {}) {
     const draft = state.signatureDraft;
     return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-aegis-close aria-label="关闭入侵防御规则管理"></button><aside class="aegisx-drawer aegisx-intrusion-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open"><header class="dwrt-kit-sheet-header"><div><span>INTRUSION PREVENTION</span><strong>规则管理</strong></div><button class="dwrt-kit-sheet-close" type="button" data-aegis-close>×</button></header><div class="dwrt-kit-sheet-body aegisx-drawer-body">
       <div class="aegisx-drawer-intro">规则源、分类和签名策略均来自 Aegisx 后端。${runtimeReady ? 'Suricata 运行组件可用，生产状态仍以后端读回为准。' : '当前 Suricata 生产运行组件不可用；策略修改只会持久化为等待应用，不会显示为已生效。'}</div>
-      ${draft ? `<section class="aegisx-intrusion-section aegisx-signature-editor"><header><div><strong>编辑 SID ${escapeHtml(draft.sid)}</strong><span>${escapeHtml(draft.msg || '')} · 目标规则 rev ${escapeHtml(draft.target_rev)}</span></div><button type="button" class="aegisx-link-button" data-signature-edit-cancel>取消</button></header><div class="aegisx-signature-editor-grid"><label><span>启用覆盖</span><select data-signature-field="enabled_override"><option value="-1" ${draft.enabled_override === -1 ? 'selected' : ''}>继承规则默认值</option><option value="1" ${draft.enabled_override === 1 ? 'selected' : ''}>强制启用</option><option value="0" ${draft.enabled_override === 0 ? 'selected' : ''}>强制停用</option></select></label><label><span>动作覆盖</span><select data-signature-field="action">${['inherit', 'alert', 'drop', 'reject', 'pass'].map((value) => `<option value="${value}" ${draft.action === value ? 'selected' : ''}>${{ inherit: '继承', alert: '告警', drop: '丢弃', reject: '拒绝', pass: '放行' }[value]}</option>`).join('')}</select></label></div><label><span>变更备注</span><input type="text" maxlength="480" data-signature-field="reason" value="${escapeHtml(draft.reason)}" placeholder="记录调整原因"></label><div class="aegisx-signature-editor-actions"><button type="button" class="policy-primary" data-signature-save ${state.saving ? 'disabled' : ''}>保存控制面策略</button></div></section>` : ''}
-      <section class="aegisx-intrusion-section"><header><div><strong>规则源</strong><span>${formatNumber(feedItems().length)} 个内置源 · 最近成功 ${escapeHtml(formatTime(feedStatus.last_success_at))}</span></div><div>${actionButton(running ? '任务运行中' : '更新全部', 'feed-update', !state.saving && !running)}${actionButton('刷新', 'intrusion-refresh', !state.saving)}</div></header>
+      ${draft ? `<section class="aegisx-intrusion-section aegisx-signature-editor"><header><div><strong>编辑 SID ${escapeHtml(draft.sid)}</strong><span>${escapeHtml(draft.msg || '')} · 目标规则 rev ${escapeHtml(draft.target_rev)}</span></div><button type="button" class="aegisx-link-button" data-signature-edit-cancel>取消</button></header><div class="aegisx-signature-editor-grid"><label class="dwrt-kit-field" data-dwrt-component="field"><span>启用覆盖</span><select data-signature-field="enabled_override"><option value="-1" ${draft.enabled_override === -1 ? 'selected' : ''}>继承规则默认值</option><option value="1" ${draft.enabled_override === 1 ? 'selected' : ''}>强制启用</option><option value="0" ${draft.enabled_override === 0 ? 'selected' : ''}>强制停用</option></select></label><label class="dwrt-kit-field" data-dwrt-component="field"><span>动作覆盖</span><select data-signature-field="action">${['inherit', 'alert', 'drop', 'reject', 'pass'].map((value) => `<option value="${value}" ${draft.action === value ? 'selected' : ''}>${{ inherit: '继承', alert: '告警', drop: '丢弃', reject: '拒绝', pass: '放行' }[value]}</option>`).join('')}</select></label></div><label><span>变更备注</span><input type="text" maxlength="480" data-signature-field="reason" value="${escapeHtml(draft.reason)}" placeholder="记录调整原因"></label><div class="aegisx-signature-editor-actions"><button type="button" class="policy-primary" data-signature-save ${state.saving ? 'disabled' : ''}>保存控制面策略</button></div></section>` : ''}
+      <section class="aegisx-intrusion-section"><header><div><strong>规则源</strong><span>${formatNumber(feedItems().length)} 个内置源 · 最近成功 ${escapeHtml(formatTime(feedStatus.last_success_at))}${feedNeverSucceededText()}</span></div><div>${feedHealthBadge()}${actionButton(running ? '任务运行中' : '更新全部', 'feed-update', !state.saving && !running)}${actionButton('刷新', 'intrusion-refresh', !state.saving)}</div></header>
         ${state.feedPreview ? `<div class="aegisx-feed-preview"><strong>将更新 ${escapeHtml(state.feedPreview.name || state.feedPreview.feed_id || '全部规则源')}</strong><span>${escapeHtml(state.feedPreview.url || '由后端内置清单提供来源')} · ${escapeHtml(state.feedPreview.format || '多种格式')}</span><div><button type="button" class="policy-secondary" data-feed-preview-cancel>取消</button><button type="button" class="policy-primary" data-feed-preview-confirm>确认更新</button></div></div>` : ''}
-        <div class="aegisx-feed-list">${feedItems().length ? feedItems().map((feed) => `<article><div><strong>${escapeHtml(feed.name || feed.feed_id)}</strong><span>${escapeHtml(feed.kind || feed.format || '')}</span><small>${formatNumber(feed.item_count)} 条 · ${escapeHtml(formatTime(feed.last_success_at))}${feed.last_error ? ` · ${escapeHtml(feed.last_error)}` : ''}</small></div>${stateBadge(feed.last_error ? '异常' : feed.last_success_at ? '已同步' : '未同步', feed.last_error ? 'warn' : feed.last_success_at ? 'ok' : 'neutral')}<button type="button" data-feed-update="${escapeHtml(feed.feed_id)}" ${state.saving || running ? 'disabled' : ''}>更新</button></article>`).join('') : '<div class="aegisx-drawer-empty">当前设备未返回规则源</div>'}</div>
+        <div class="aegisx-feed-list">${feedItems().length ? feedItems().map((feed) => `<article><div><strong>${escapeHtml(feed.name || feed.feed_id)}</strong><span>${escapeHtml(feed.kind || feed.format || '')}</span><small>${formatNumber(feed.item_count)} 条 · ${escapeHtml(formatTime(feed.last_success_at))}${feed.last_error ? ` · ${escapeHtml(feed.last_error)}` : ''}</small></div>${stateBadge(feed.last_error ? '异常' : feed.last_success_at ? '已同步' : '未同步', feed.last_error ? 'warn' : feed.last_success_at ? 'ok' : 'neutral')}<button type="button" data-feed-update="${escapeHtml(feed.feed_id)}" ${state.saving || running ? 'disabled' : ''}>更新</button></article>`).join('') : '<div class="aegisx-drawer-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="dense-surface">当前设备未返回规则源</div>'}</div>
         ${running ? `<div class="aegisx-job-state">${stateBadge('后台任务运行中', 'info')}<span>${escapeHtml(running.op || 'feed job')} · ${escapeHtml(running.feed_id || '全部规则源')}</span></div>` : ''}
       </section>
       <section class="aegisx-intrusion-section"><header><div><strong>导入状态</strong><span>规则源更新成功后会自动导入；也可从已校验 artifact 手动重建数据库。导入不会自动启用生产 IDS/IPS。</span></div><div>${actionButton('重新导入', 'feed-import', !state.saving && !running && feedItems().length > 0)}</div></header><div class="aegisx-import-counts"><span>Suricata 规则<b>${formatNumber(importCounts.suricata_rules)}</b></span><span>签名元数据<b>${formatNumber(importCounts.signature_metadata)}</b></span><span>域名分类<b>${formatNumber(importCounts.domain_categories)}</b></span><span>信誉项<b>${formatNumber(importCounts.reputation_items)}</b></span></div></section>
-      <section class="aegisx-intrusion-section"><header><div><strong>签名分类</strong><span>${formatNumber(state.signatureCategories?.total)} 条已导入签名</span></div></header><div class="aegisx-signature-categories">${categories.length ? categories.slice(0, 18).map((item) => `<span><b>${escapeHtml(item.category || '未分类')}</b><small>${formatNumber(item.count)}</small></span>`).join('') : '<div class="aegisx-drawer-empty">尚未导入 Suricata 规则</div>'}</div></section>
+      <section class="aegisx-intrusion-section"><header><div><strong>签名分类</strong><span>${formatNumber(state.signatureCategories?.total)} 条已导入签名</span></div></header><div class="aegisx-signature-categories">${categories.length ? categories.slice(0, 18).map((item) => `<span><b>${escapeHtml(item.category || '未分类')}</b><small>${formatNumber(item.count)}</small></span>`).join('') : '<div class="aegisx-drawer-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="dense-surface">尚未导入 Suricata 规则</div>'}</div></section>
       <section class="aegisx-intrusion-section"><header><div><strong>签名策略</strong><span>${formatNumber(total)} 条 · ${formatNumber(counts.suppressed)} 条已抑制 · ${formatNumber(counts.apply_required)} 条等待应用</span></div></header><label class="aegisx-inline-search" data-dwrt-component="field"><span class="sr-only">按 SID 查找签名</span>${icon('search')}<input type="search" inputmode="numeric" data-signature-search value="${escapeHtml(state.signatureQuery)}" placeholder="输入完整 SID 查找" aria-label="按 SID 查找签名"></label>
-        <div class="aegisx-signature-list">${signatures.length ? signatures.map((item) => { const override = item.override || {}; const suppressed = bool(override.suppressed); const revision = Number(override.revision) || 0; return `<article><div><strong>${escapeHtml(item.msg || `SID ${item.sid}`)}</strong><span>SID ${escapeHtml(item.sid)} · rev ${escapeHtml(item.rev)} · ${escapeHtml(item.category || '未分类')}</span><small>${escapeHtml(item.protocol || '')} · 严重度 ${escapeHtml(item.severity ?? '--')} · ${escapeHtml(item.effective_action || item.default_action || 'alert')}</small></div>${stateBadge(item.stale ? '规则已更新' : suppressed ? '已抑制' : bool(item.effective_enabled) ? runtimeReady ? '已启用' : '待数据面' : '已停用', item.stale ? 'warn' : suppressed ? 'neutral' : bool(item.effective_enabled) && runtimeReady ? 'ok' : 'warn')}<div><button type="button" data-signature-edit="${escapeHtml(item.sid)}" ${state.saving || item.stale ? 'disabled' : ''}>编辑</button><button type="button" data-signature-suppress="${escapeHtml(item.sid)}" data-signature-rev="${escapeHtml(item.rev)}" data-signature-revision="${revision}" data-signature-suppressed="${suppressed ? '1' : '0'}" ${state.saving || item.stale ? 'disabled' : ''}>${suppressed ? '取消抑制' : '抑制'}</button></div></article>`; }).join('') : '<div class="aegisx-drawer-empty">没有匹配的签名</div>'}</div>
+        <div class="aegisx-signature-list">${signatures.length ? signatures.map((item) => { const override = item.override || {}; const suppressed = bool(override.suppressed); const revision = Number(override.revision) || 0; return `<article><div><strong>${escapeHtml(item.msg || `SID ${item.sid}`)}</strong><span>SID ${escapeHtml(item.sid)} · rev ${escapeHtml(item.rev)} · ${escapeHtml(item.category || '未分类')}</span><small>${escapeHtml(item.protocol || '')} · 严重度 ${escapeHtml(item.severity ?? '--')} · ${escapeHtml(item.effective_action || item.default_action || 'alert')}</small></div>${stateBadge(item.stale ? '规则已更新' : suppressed ? '已抑制' : bool(item.effective_enabled) ? runtimeReady ? '已启用' : '待数据面' : '已停用', item.stale ? 'warn' : suppressed ? 'neutral' : bool(item.effective_enabled) && runtimeReady ? 'ok' : 'warn')}<div><button type="button" data-signature-edit="${escapeHtml(item.sid)}" ${state.saving || item.stale ? 'disabled' : ''}>编辑</button><button type="button" data-signature-suppress="${escapeHtml(item.sid)}" data-signature-rev="${escapeHtml(item.rev)}" data-signature-revision="${revision}" data-signature-suppressed="${suppressed ? '1' : '0'}" ${state.saving || item.stale ? 'disabled' : ''}>${suppressed ? '取消抑制' : '抑制'}</button></div></article>`; }).join('') : '<div class="aegisx-drawer-empty" data-dwrt-component="state-panel" data-dwrt-state="empty" data-dwrt-surface="dense-surface">没有匹配的签名</div>'}</div>
         <div class="aegisx-pagination"><button type="button" data-signature-page="prev" ${state.signaturePage <= 0 || state.saving || state.signatureQuery ? 'disabled' : ''}>上一页</button><span>第 ${Math.min(state.signaturePage + 1, pages)} / ${pages} 页</span><button type="button" data-signature-page="next" ${(state.signaturePage + 1) >= pages || state.saving || state.signatureQuery ? 'disabled' : ''}>下一页</button></div>
       </section>
     </div><footer class="dwrt-kit-sheet-footer"><span class="aegisx-sheet-footnote">${runtimeReady ? '生产状态以后端运行态回读为准' : '控制面可写，生产 Suricata 数据面尚未就绪'}</span><button class="policy-secondary" type="button" data-aegis-close>关闭</button></footer></aside>`;
@@ -983,6 +1299,7 @@ export function mount(context = {}) {
     if (state.drawer === 'intrusion') return renderIntrusionDrawer();
     if (state.drawer === 'content') return renderContentDrawer();
     if (state.drawer === 'certificate-distribute') return renderCertificateDistributeModal();
+    if (state.drawer === 'netflow-export') return renderNetflowDrawer();
     return '';
   }
   function renderConfirmation() {
@@ -1039,10 +1356,28 @@ export function mount(context = {}) {
     portal.innerHTML = markup;
   }
 
-  /* 确认框的增删不影响抽屉外壳，所以单独处理而不是整块重写 portal。 */
+  /*
+   * 确认框的增删不影响抽屉外壳，所以单独处理而不是整块重写 portal。
+   *
+   * 选择器必须与 kit 的 confirmationMarkup() 下发的根节点一致
+   * （`static/ui-kit/dwrt-ui-kit.js`）：
+   *
+   *   <div class="dwrt-kit-modal-layer dwrt-kit-confirmation-layer is-<tone> is-open"
+   *        data-dwrt-confirmation="<action>">
+   *
+   * 这里原先查的是 `[data-dwrt-confirm]` / `.dwrt-kit-confirm`，两者都比真实名字短一截。
+   * 属性名与类名都是精确匹配，所以 next 恒为 null，确认框永远不会被插入 —— 抽屉开着时
+   * 的二次确认（content-save / app-block-save / signature-suppress 等）就此全部失效，
+   * 而写操作正是靠这个闸门拦一道。注意 `[data-dwrt-confirm]` 也匹配不到
+   * `data-dwrt-confirm-accept` 那个按钮，所以旧写法连"误命中子节点"都不会发生，
+   * 是彻底的空操作。
+   *
+   * 用一个常量收口，避免下次再抄错其中一处。
+   */
+  const CONFIRMATION_SELECTOR = '[data-dwrt-confirmation], .dwrt-kit-confirmation-layer';
   function syncConfirmation(template) {
-    const current = portal.querySelector('[data-dwrt-confirm]') || portal.querySelector('.dwrt-kit-confirm');
-    const next = template.querySelector('[data-dwrt-confirm]') || template.querySelector('.dwrt-kit-confirm');
+    const current = portal.querySelector(CONFIRMATION_SELECTOR);
+    const next = template.querySelector(CONFIRMATION_SELECTOR);
     if (!current && next) portal.append(next);
     else if (current && !next) current.remove();
     else if (current && next && current.innerHTML !== next.innerHTML) current.replaceWith(next);
@@ -1259,7 +1594,15 @@ export function mount(context = {}) {
     try {
       await requestJson(ENDPOINTS.content, { method: 'PUT', body: JSON.stringify({ ...payload, confirm: true, apply: true }) });
       state.notice = '内容过滤策略已保存并完成运行态回读。'; state.drawer = ''; state.contentDraft = null; state.saving = false; await load({ silent: true });
-    } catch (error) { state.error = message(error, '内容策略应用失败'); state.saving = false; render(); }
+    } catch (error) {
+      if (isDependencyTimeout(error)) {
+        state.drawer = ''; state.contentDraft = null; state.saving = false;
+        await noteApplyingAndReread(() => load({ silent: true }));
+        render();
+        return;
+      }
+      state.error = message(error, '内容策略应用失败'); state.saving = false; render();
+    }
   }
   function appBlockPayload() {
     const draft = state.appBlockDraft || defaultAppBlockDraft();
@@ -1358,7 +1701,10 @@ export function mount(context = {}) {
         : !bool(applied.effective_blocking) && applied.apply_state === 'disabled' ? 'PCDN 域名阻止已停用。' : 'PCDN 停用请求已保存，等待数据面回读。';
       state.saving = false; render();
     } catch (error) {
-      if (error.code === 'pcdn_revision_conflict') {
+      if (isDependencyTimeout(error)) {
+        state.pcdnPendingIntent = null;
+        await noteApplyingAndReread(async () => { state.pcdn = await requestJson(ENDPOINTS.pcdn); });
+      } else if (error.code === 'pcdn_revision_conflict') {
         state.pcdnPendingIntent = enabled;
         try { state.pcdn = await requestJson(ENDPOINTS.pcdn); } catch (_) {}
         state.error = 'PCDN 配置已被其他会话修改，已重新读取最新状态；请核对后再次校验。';
@@ -1380,6 +1726,54 @@ export function mount(context = {}) {
       state.notice = feedId ? '规则源后台更新已启动。' : '全部规则源后台更新已启动。';
       state.saving = false; await loadIntrusion({ silent: true });
     } catch (error) { state.error = message(error, '规则源更新失败'); state.saving = false; render(); }
+  }
+  /*
+   * 导出配置提交。开启导出是一次「把内网流量元数据发到外部主机」的动作，
+   * 所以走二次确认而不是随手一点（本交接单风险一节的要求）。关闭与纯参数调整
+   * 不需要确认 —— 关掉导出没有外发风险。
+   */
+  function validateNetflowExport() {
+    const draft = state.netflowExportDraft;
+    if (!draft) return;
+    if (draft.enabled && !firstText(draft.collector_host)) {
+      state.error = ERROR_TEXT.collector_host_required;
+      render();
+      return;
+    }
+    const payload = netflowPayload(draft);
+    const turningOn = draft.enabled && !netflowEnabled();
+    if (turningOn) {
+      /*
+       * 抽屉保持打开，确认框叠在它上面（z-index 76 > 抽屉 70）。
+       *
+       * 早先这里为了绕开 syncConfirmation() 的选择器缺陷会先把抽屉收起来；那个缺陷已在
+       * 本文件修好（见 CONFIRMATION_SELECTOR 处注释），绕行随之撤掉 —— 留着的话用户会
+       * 看到抽屉莫名闪一下，且与本页其他确认路径的行为不一致。
+       */
+      state.confirm = {
+        action: 'netflow-save', tone: 'warning', title: '开启流量导出？',
+        description: `将把本网络的流量元数据（五元组、字节数、时间戳）持续发送到 ${payload.collector_host}:${payload.collector_port}，协议 ${payload.protocol === 'netflow9' ? 'NetFlow v9' : 'IPFIX'}。数据离开本机后不受网关控制，请确认该收集器可信。`,
+        confirmLabel: '开启并导出', payload
+      };
+      render();
+      return;
+    }
+    commitNetflowExport(payload);
+  }
+  async function commitNetflowExport(payload) {
+    state.confirm = null; state.saving = true; state.error = ''; render();
+    try {
+      await requestJson(ENDPOINTS.flowdExportSettings, { method: 'POST', body: JSON.stringify(payload) });
+      state.notice = payload.enabled
+        ? '导出配置已保存，最长 5 秒后开始生效。'
+        : '导出已关闭，不再向收集器发送数据。';
+      state.drawer = ''; state.netflowExportDraft = null; state.saving = false;
+      await loadNetflowExport();
+    } catch (error) {
+      state.error = message(error, '导出配置保存失败');
+      state.saving = false;
+      render();
+    }
   }
   async function startFeedImport() {
     state.confirm = null; state.saving = true; state.error = ''; render();
@@ -1457,7 +1851,15 @@ export function mount(context = {}) {
     try {
       await requestJson(ENDPOINTS.overrides, { method: 'POST', body: JSON.stringify(payload) });
       state.notice = `${action === 'allow' ? '允许' : '阻止'}域名已添加并应用。`; state.saving = false; await load({ silent: true });
-    } catch (error) { state.error = message(error, '域名规则添加失败'); state.saving = false; render(); }
+    } catch (error) {
+      if (isDependencyTimeout(error)) {
+        state.saving = false;
+        await noteApplyingAndReread(() => load({ silent: true }));
+        render();
+        return;
+      }
+      state.error = message(error, '域名规则添加失败'); state.saving = false; render();
+    }
   }
   async function deleteResource(kind, id) {
     state.confirm = null; state.saving = true; render();
@@ -1537,7 +1939,7 @@ export function mount(context = {}) {
   }
   function bindEvents() {
     queryAll('[data-aegis-tab]').forEach((button) => button.addEventListener('click', () => { state.tab = button.dataset.aegisTab; rememberTab(state.tab); state.drawer = ''; state.notice = ''; render(); }));
-    queryAll('[data-aegis-close], [data-dwrt-confirm-cancel]').forEach((button) => button.addEventListener('click', () => { if (button.closest('[data-dwrt-confirmation]')) state.confirm = null; else { state.drawer = ''; state.contentDraft = null; state.appBlockDraft = null; state.honeypotDraft = null; state.signatureDraft = null; state.feedPreview = null; state.certificateTarget = ''; window.clearTimeout(jobPollTimer); } render(); }));
+    queryAll('[data-aegis-close], [data-dwrt-confirm-cancel]').forEach((button) => button.addEventListener('click', () => { if (button.closest('[data-dwrt-confirmation]')) state.confirm = null; else { state.drawer = ''; state.contentDraft = null; state.appBlockDraft = null; state.honeypotDraft = null; state.signatureDraft = null; state.feedPreview = null; state.certificateTarget = ''; state.netflowExportDraft = null; window.clearTimeout(jobPollTimer); } render(); }));
     queryAll('[data-aegis-action]').forEach((button) => button.addEventListener('click', () => {
       if (button.disabled) return;
       const action = button.dataset.aegisAction;
@@ -1560,6 +1962,7 @@ export function mount(context = {}) {
       else if (action === 'certificate-download') { downloadCertificate(); return; }
       else if (action === 'certificate-distribute') { state.certificateTarget = ''; state.drawer = 'certificate-distribute'; render(); return; }
       else if (action === 'traffic-clear') { state.confirm = { action: 'traffic-clear', tone: 'danger', title: '清除流量历史？', description: '将永久清除设备与流量识别产生的日汇总、明细和客户端快照。安全事件日志不受影响。', confirmLabel: '清除历史' }; render(); return; }
+      else if (action === 'netflow-export') { state.netflowExportDraft = defaultNetflowDraft(); state.drawer = 'netflow-export'; render(); return; }
       else state.drawer = action;
       render();
     }));
@@ -1587,6 +1990,25 @@ export function mount(context = {}) {
     query('[data-event-search]')?.addEventListener('input', (event) => { state.eventQuery = event.target.value; rerenderWithFocus('[data-event-search]', state.eventQuery); });
     queryAll('[data-content-field]').forEach((input) => input.addEventListener('input', () => { state.contentDraft[input.dataset.contentField] = input.value; }));
     query('[data-aegis-toggle="content-enabled"]')?.addEventListener('change', (event) => { state.contentDraft.enabled = event.target.checked; });
+    /*
+     * 设置行上的导出开关。
+     *
+     * 打开时**不直接写**：导出需要收集器地址，而这一行没有地方填。直接提交只会拿到
+     * collector_host_required，用户看到的是"点了就报错"。所以开的动作转成打开设置抽屉，
+     * 开关先弹回原位，真正的开启在抽屉里连同地址一起提交（并有二次确认）。
+     * 关闭没有这个问题，也没有外发风险，就地提交。
+     */
+    query('[data-aegis-toggle="netflow"]')?.addEventListener('change', (event) => {
+      const wanted = event.target.checked;
+      if (wanted) {
+        event.target.checked = netflowEnabled();
+        state.netflowExportDraft = { ...defaultNetflowDraft(), enabled: true };
+        state.drawer = 'netflow-export';
+        render();
+        return;
+      }
+      commitNetflowExport(netflowPayload({ ...defaultNetflowDraft(), enabled: false }));
+    });
     query('[data-aegis-toggle="content-ad-block"]')?.addEventListener('change', (event) => { state.contentDraft.ad_block = event.target.checked; });
     queryAll('[data-content-safe-search]').forEach((input) => input.addEventListener('change', () => { state.contentDraft.safe_search[input.dataset.contentSafeSearch] = input.checked; }));
     queryAll('input[name="content-mode"]').forEach((input) => input.addEventListener('change', () => { state.contentDraft.mode = input.value; }));
@@ -1658,11 +2080,33 @@ export function mount(context = {}) {
       render();
     }));
     query('[data-honeypot-save]')?.addEventListener('click', validateHoneypot);
-    query('[data-dwrt-confirm-accept]')?.addEventListener('click', () => { const confirm = state.confirm; if (!confirm) return; if (confirm.action === 'content-save') commitContent(confirm.payload); else if (confirm.action === 'app-block-save') commitAppBlock(confirm.payload, confirm.revision); else if (confirm.action === 'pcdn-save') commitPcdn(confirm.enabled); else if (confirm.action === 'pcdn-sync') commitPcdnSync(); else if (confirm.action === 'feed-import') startFeedImport(); else if (confirm.action === 'signature-suppress') setSignatureSuppressed(confirm.signature); else if (confirm.action === 'traffic-clear') clearTrafficHistory(); else if (confirm.action === 'honeypot-save') commitHoneypot(confirm.payload); else if (confirm.action === 'certificate-generate') commitCertificate('generate'); else if (confirm.action === 'certificate-rotate') commitCertificate('rotate'); else if (confirm.action === 'certificate-revoke') commitCertificate('revoke'); else deleteResource(confirm.resourceKind, confirm.resourceId); });
+    /*
+     * 抽屉里的输入。文本/数字框用 input 且**不重绘**（重绘会丢焦点），只同步保存按钮的
+     * 可用性——「填好地址」是开启导出的唯一正常路径，若保存按钮的 disabled 只在渲染时
+     * 算过一次，填完地址按钮仍然点不动（蜜罐表单踩过同一个坑）。
+     */
+    queryAll('[data-netflow-field]').forEach((input) => input.addEventListener('input', () => {
+      if (!state.netflowExportDraft) return;
+      state.netflowExportDraft[input.dataset.netflowField] = input.value;
+      syncNetflowSaveState();
+    }));
+    query('[data-aegis-toggle="netflow-draft-enabled"]')?.addEventListener('change', (event) => {
+      if (!state.netflowExportDraft) return;
+      state.netflowExportDraft.enabled = event.target.checked;
+      render();
+    });
+    queryAll('input[name="netflow-protocol"]').forEach((input) => input.addEventListener('change', () => {
+      if (!state.netflowExportDraft || !input.checked) return;
+      state.netflowExportDraft.protocol = input.value;
+    }));
+    query('[data-netflow-save]')?.addEventListener('click', validateNetflowExport);
+    query('[data-dwrt-confirm-accept]')?.addEventListener('click', () => { const confirm = state.confirm; if (!confirm) return; if (confirm.action === 'content-save') commitContent(confirm.payload); else if (confirm.action === 'app-block-save') commitAppBlock(confirm.payload, confirm.revision); else if (confirm.action === 'pcdn-save') commitPcdn(confirm.enabled); else if (confirm.action === 'pcdn-sync') commitPcdnSync(); else if (confirm.action === 'feed-import') startFeedImport(); else if (confirm.action === 'signature-suppress') setSignatureSuppressed(confirm.signature); else if (confirm.action === 'traffic-clear') clearTrafficHistory(); else if (confirm.action === 'honeypot-save') commitHoneypot(confirm.payload); else if (confirm.action === 'netflow-save') commitNetflowExport(confirm.payload); else if (confirm.action === 'certificate-generate') commitCertificate('generate'); else if (confirm.action === 'certificate-rotate') commitCertificate('rotate'); else if (confirm.action === 'certificate-revoke') commitCertificate('revoke'); else deleteResource(confirm.resourceKind, confirm.resourceId); });
   }
 
   stage?.classList.add('is-aegisx');
   render();
   load();
+  /* 导出配置独立一条请求，见 loadNetflowExport() 的注释。 */
+  loadNetflowExport();
   return { unmount() { state.mounted = false; state.seq += 1; window.clearTimeout(jobPollTimer); window.clearInterval(deferredRenderTimer); deferredRenderTimer = 0; portal?.remove(); portal = null; stage?.classList.remove('is-aegisx'); root?.replaceChildren(); root?.classList.remove('aegisx-route-host', 'policy-table-route-host', 'route-workspace'); } };
 }

@@ -583,17 +583,10 @@
       const greenScale = displacement * (directionSign - aberration * 0.05);
       const blueScale = displacement * (directionSign - aberration * 0.1);
       const baseBlur = clamp(this.options.baseBlur, 0, 24);
-      const blur = (this.options.overLight ? Math.max(baseBlur, 8) : baseBlur) + clamp(this.options.blurAmount, 0, 1) * 32;
-      /* over-light 是「浅色前景压在明亮壁纸上」的场合。0.35 的上限是按均匀
-         底色定的，遇到亮度跨度接近满量程的照片时压不住：实测默认壁纸下
-         +0.08 只把吸收层带到 0.14，正文最坏对比度仍是 1.02:1。
-         over-light 因此单独放宽上限，普通场合的上限保持不变。 */
-      const neutralCeiling = this.options.overLight ? 0.46 : 0.35;
-      const neutralDensity = clamp(
-        this.options.neutralDensity + (this.options.overLight ? 0.26 : 0),
-        0,
-        neutralCeiling
-      );
+      const blur = baseBlur + clamp(this.options.blurAmount, 0, 1) * 32;
+      // Adaptive foreground may describe the sampled wallpaper, but it must not
+      // create a private material tier. Density and blur come from appearance.
+      const neutralDensity = clamp(this.options.neutralDensity, 0, 0.35);
       const neutralColor = /^\s*\d{1,3}\s+\d{1,3}\s+\d{1,3}\s*$/.test(String(this.options.neutralColor || ''))
         ? String(this.options.neutralColor).trim()
         : DEFAULTS.neutralColor;

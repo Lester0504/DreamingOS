@@ -11,6 +11,16 @@
   const componentState = new WeakMap();
   const virtualTableState = new WeakMap();
   const dataGridState = new WeakMap();
+  /*
+   * `preserveInteractionState()` lets legacy page renderers write into a detached
+   * staging root. Those renderers commonly call `mountAll(target)` themselves.
+   * Mounting a detached staging tree is not harmless: `mountSheet()` elevates its
+   * sheet into the document-level portal and `mountModal()` samples/focuses live
+   * document state before morph has committed anything. Mark only the staging
+   * roots owned by the preserve path, so their `mountAll()` call becomes a no-op;
+   * after morph we mount the real connected root once.
+   */
+  const interactionStagingRoots = new WeakSet();
   let activeDatePicker = null;
   let activeTooltip = null;
   let lastTrigger = null;
@@ -240,6 +250,82 @@
     return null;
   }
 
+  const SHEET_SELECTOR = '.dwrt-kit-sheet, [data-dwrt-component="sheet"], [data-dwrt-component="filter-sheet"]';
+
+  /*
+   * 遮罩守卫。
+   *
+   * `.dwrt-kit-sheet-overlay.is-open` 是一层 `position: fixed; inset: 0` 的全视口
+   * `<button>`。抽屉滑走后它的 opacity 归 0，肉眼看不到任何东西，但 pointer-events
+   * 仍然是 auto，于是整页对一切点击无反应——「页面卡死、刷新才好」正是这个（刷新把
+   * portal 一起清掉了）。
+   *
+   * 规则只有一条：遮罩只有在紧邻的抽屉确实 is-open 时才允许拦事件。原来 `bindOverlay()`
+   * 在 mount 时无条件给遮罩加 is-open 且此后再也不摘，等于把「关了还在拦」当成了默认
+   * 行为，所以下面所有关闭/卸载/回收路径都要经过 neutralizeOverlay()。
+   */
+  function neutralizeOverlay(overlay) {
+    if (!overlay) return;
+    overlay.classList.remove('is-open');
+    overlay.style.pointerEvents = 'none';
+  }
+
+  function overlayOwner(overlay) {
+    const next = overlay.nextElementSibling;
+    return next?.matches?.(SHEET_SELECTOR) ? next : null;
+  }
+
+  /*
+   * 「抽屉此刻真的挡在用户面前吗」。
+   *
+   * 只看 `is-open` 类名不够：关闭的第二拍由页面负责清状态，一旦那一拍丢了（宿主被重绘、
+   * 路由切走），类名会一直留在那里骗人。所以以几何为准 —— 抽屉整幅滑出视口就等于关闭，
+   * 不管类名怎么写。`target` 一并参与判断，用于区分「正在滑进来」（x 还在右侧但目标是 0）
+   * 与「已经滑出去」（x 和目标都在右侧），否则刚打开的抽屉会被误判成已关闭。
+   */
+  function sheetVisiblyOpen(sheet, state = sheetState.get(sheet)) {
+    if (!state || !sheet.classList.contains('is-open')) return false;
+    if (state.dragging) return true;
+    const width = state.width;
+    if (!(width > 0)) return true;
+    return state.x < width * 0.95 || state.target < width * 0.95;
+  }
+
+  /*
+   * portal 中不允许存在「看不见但仍然拦点击」的遮罩：没有配对抽屉的直接摘掉，
+   * 配对抽屉已关闭或已不受 kit 管理的，收回 is-open 并显式压成 pointer-events: none。
+   * 保留节点而不是一律 remove()，是因为页面可以先渲染一个未 is-open 的抽屉、之后再
+   * 切类打开（`syncSheetOpenState()` 支持这种用法），遮罩被摘掉的话再打开就没有背景层了。
+   */
+  function enforceOverlayGuard() {
+    const portal = document.getElementById(SHEET_PORTAL_ID);
+    if (!portal || !portal.firstElementChild) return;
+    const children = Array.from(portal.children);
+    /*
+     * 先算出「还开着的抽屉各自认领的那层遮罩」。配对靠 sheetOverlay()（紧邻的前一个兄弟），
+     * 与 kit 其它地方保持同一口径；页面把多个背景板和多个抽屉渲染在一起时（policy-table
+     * 的 filter/side 两块）这个配对不一定符合页面的本意，所以下面对认领不到的节点取保守
+     * 态度：只要还有抽屉真的开着，就不动它，避免摘掉页面自己在用的背景板。
+     */
+    const claimed = new Set();
+    let anyOpen = false;
+    children.forEach((node) => {
+      if (!node.matches?.(SHEET_SELECTOR)) return;
+      if (!sheetVisiblyOpen(node)) return;
+      anyOpen = true;
+      const overlay = sheetOverlay(node);
+      if (overlay) claimed.add(overlay);
+    });
+    children.forEach((node) => {
+      if (!node.classList?.contains('dwrt-kit-sheet-overlay')) return;
+      if (claimed.has(node)) return;
+      // 配对得到抽屉却没开：确定是残留，收掉
+      if (overlayOwner(node)) { neutralizeOverlay(node); return; }
+      // 认领不到归属：portal 里一个开着的抽屉都没有时才敢判定它是孤儿
+      if (!anyOpen) neutralizeOverlay(node);
+    });
+  }
+
   /*
    * 抽屉传送门。
    *
@@ -311,8 +397,13 @@
   function pruneSheetPortal() {
     const portal = document.getElementById(SHEET_PORTAL_ID);
     if (!portal) return;
+    /*
+     * 守卫先跑：它与作用域清理无关，且必须在 portal 里还留着别的抽屉时也生效，
+     * 不能被下面那两个 early return 挡掉（这正是遮罩能一直拦着点击的原因之一）。
+     */
+    enforceOverlayGuard();
     if (!portal.dataset.dwrtPortalScope) return;
-    if (portal.querySelector('.dwrt-kit-sheet, [data-dwrt-component="sheet"], [data-dwrt-component="filter-sheet"]')) return;
+    if (portal.querySelector(SHEET_SELECTOR)) return;
     portal.querySelectorAll('.dwrt-kit-sheet-overlay').forEach((node) => node.remove());
     applyPortalScope(portal, []);
   }
@@ -433,7 +524,7 @@
     if (!portal || !portal.firstElementChild) return;
     const host = context?.nodeType === 1 ? context : null;
     Array.from(portal.children).forEach((node) => {
-      if (!node.matches?.('.dwrt-kit-sheet, [data-dwrt-component="sheet"], [data-dwrt-component="filter-sheet"]')) return;
+      if (!node.matches?.(SHEET_SELECTOR)) return;
       const state = sheetState.get(node);
       const home = state?.portalHome?.parent;
       // 宿主已脱离文档：这份抽屉确实和页面失联了
@@ -462,6 +553,14 @@
        * 功能整个不可用（这正是本次修的缺陷）。宿主若真的脱离文档，上面第一条
        * 判据已经回收过了。
        */
+      /*
+       * 但**遮罩不该跟着留下**。留住抽屉是为了不误杀功能，用户还能自己点关闭；
+       * 而一层看不见的全屏遮罩没有任何挽回手段，只能刷新。多个页面正是把抽屉渲染进
+       * 一个专用的空宿主（`data-web-access-overlays`、`policy-entity-overlay-host`、
+       * `data-terminal-group-overlay`），恰好命中这个空档，所以这里补一次守卫：
+       * 抽屉没真的开着，就把它的遮罩收掉。
+       */
+      if (!sheetVisiblyOpen(node, state)) neutralizeOverlay(sheetOverlay(node));
     });
     pruneSheetPortal();
   }
@@ -597,9 +696,32 @@
     const state = sheetState.get(sheet);
     if (!state || state.closing) return;
     state.closing = true;
+    /*
+     * 遮罩在关闭流程一开始就交出 pointer-events，不等动画结束、也不依赖第二拍能不能跑。
+     * 滑出期间遮罩本来就在淡出（paintSheet 里 opacity → 0），此时它已不该再拦点击；
+     * 而把摘除放在动画回调里，一旦回调走了下面那条 early return 就永远摘不掉。
+     */
+    neutralizeOverlay(sheetOverlay(sheet));
     const width = Math.max(1, sheet.getBoundingClientRect().width);
     animateSheet(sheet, width, state.v, () => {
-      if (!target?.isConnected) return;
+      /*
+       * 第二拍要靠 `target` 还在文档里才能重放点击，让页面自己清 state.drawer。
+       * 但 480ms 动画期间任何一次轮询/实时推送触发的重绘都会换掉关闭按钮，原来这里
+       * 直接 return，遮罩和 sheetState 双双留在 portal 里 —— 这就是页面「卡死」的竞态。
+       * 目标失联时页面那边已经没人再清了，改为由 kit 自己收尾：摘掉遮罩并回收抽屉。
+       */
+      if (!target?.isConnected) {
+        state.closing = false;
+        state.x = width;
+        state.v = 0;
+        neutralizeOverlay(sheetOverlay(sheet));
+        sheet.classList.remove('is-open');
+        sheet.setAttribute('aria-hidden', 'true');
+        if (sheet.parentElement?.id === SHEET_PORTAL_ID) disposeSheet(sheet);
+        pruneSheetPortal();
+        restoreSheetFocus(state);
+        return;
+      }
       target.dataset.dwrtSheetBypass = 'true';
       target.click();
       delete target.dataset.dwrtSheetBypass;
@@ -607,6 +729,13 @@
         state.closing = false;
         state.x = width;
         state.v = 0;
+        /*
+         * 页面的第二拍处理器可能只清了自己的 state 而没有动 portal（关抽屉的惯用手法是
+         * 重绘宿主 innerHTML，那影响不到 portal 里的节点）。这里补一次守卫，保证不会
+         * 留下「opacity: 0 且 pointer-events: auto」的遮罩。
+         */
+        if (!sheet.classList.contains('is-open')) neutralizeOverlay(sheetOverlay(sheet));
+        pruneSheetPortal();
         restoreSheetFocus(state);
       });
     });
@@ -732,12 +861,24 @@
     state.onDocumentKeydown = onDocumentKeydown;
     const bindOverlay = () => {
       const overlay = sheetOverlay(sheet);
-      if (!overlay || overlay.dataset.dwrtSheetBound === 'true') return overlay;
-      overlay.dataset.dwrtSheetBound = 'true';
-      overlay.classList.add('is-open');
-      requestAnimationFrame(() => {
-        if (overlay.isConnected) overlay.addEventListener('click', interceptClose, true);
-      });
+      if (!overlay) return overlay;
+      /*
+       * 监听只绑一次，但 is-open 每次都按抽屉的真实状态同步。原来这里在 mount 时无条件
+       * 加上 is-open 且此后从不摘除，抽屉关掉后遮罩照样 pointer-events: auto，全视口
+       * 吃点击。抽屉尚未 is-open（页面先渲染再切类打开的用法）时遮罩也不该拦事件。
+       */
+      if (sheet.classList.contains('is-open')) {
+        overlay.classList.add('is-open');
+        overlay.style.removeProperty('pointer-events');
+      } else {
+        neutralizeOverlay(overlay);
+      }
+      if (overlay.dataset.dwrtSheetBound !== 'true') {
+        overlay.dataset.dwrtSheetBound = 'true';
+        requestAnimationFrame(() => {
+          if (overlay.isConnected) overlay.addEventListener('click', interceptClose, true);
+        });
+      }
       return overlay;
     };
     state.bindOverlay = bindOverlay;
@@ -836,10 +977,22 @@
     document.removeEventListener('keydown', state.onDocumentKeydown, true);
     restoreSheetHome(sheet, state);
     sheetState.delete(sheet);
+    /*
+     * 卸载之后 kit 不再托管这份抽屉：遮罩上的 interceptClose 拿不到 state，
+     * commitSheetClose() 会直接 return，于是遮罩变成一层谁也关不掉的透明拦截层。
+     * 归位失败（原宿主已脱离文档）时连节点一起回收，别把孤儿留在 portal 里。
+     */
+    if (sheet.parentElement?.id === SHEET_PORTAL_ID) {
+      sheetOverlay(sheet)?.remove();
+      sheet.remove();
+    } else if (!sheet.classList.contains('is-open')) {
+      neutralizeOverlay(sheetOverlay(sheet));
+    }
+    pruneSheetPortal();
   }
 
   function syncMountedSheetGeometry() {
-    document.querySelectorAll('.dwrt-kit-sheet, [data-dwrt-component="sheet"], [data-dwrt-component="filter-sheet"]').forEach((sheet) => {
+    document.querySelectorAll(SHEET_SELECTOR).forEach((sheet) => {
       const state = sheetState.get(sheet);
       if (!state || state.dragging) return;
       const width = Math.max(1, sheet.offsetWidth || Number.parseFloat(getComputedStyle(sheet).width) || state.width || 1);
@@ -860,6 +1013,8 @@
       }
       paintSheet(sheet, state);
     });
+    // 几何刚被重算，顺手校一遍遮罩：尺寸变化会改变「是否整幅滑出」的判定
+    enforceOverlayGuard();
   }
 
   function componentRoots(context, name) {
@@ -875,11 +1030,12 @@
 
   function collectComponentRoots(context) {
     const buckets = new Map();
-    matchingRoots(context, '[data-dwrt-component], .dwrt-kit-tabs, .dwrt-kit-sheet, .dwrt-kit-modal-layer').forEach((root) => {
+    matchingRoots(context, '[data-dwrt-component], .dwrt-kit-tabs, .dwrt-kit-sheet, .dwrt-kit-modal-layer, select').forEach((root) => {
       let name = root.dataset.dwrtComponent || '';
       if (!name && root.classList.contains('dwrt-kit-tabs')) name = 'tabs';
       else if (!name && root.classList.contains('dwrt-kit-sheet')) name = 'sheet';
       else if (!name && root.classList.contains('dwrt-kit-modal-layer')) name = 'modal';
+      else if (!name && root instanceof HTMLSelectElement) name = 'select';
       if (!name) return;
       root.dataset.dwrtComponent = name;
       if (!buckets.has(name)) buckets.set(name, []);
@@ -923,6 +1079,17 @@
 
   function mountSelect(select) {
     if (!(select instanceof HTMLSelectElement) || componentState.has(select)) return;
+    let field = select.closest('[data-dwrt-component="field"], .dwrt-kit-field');
+    if (!field) {
+      /* Adopt the existing node so page listeners, value and selection survive.
+         The generated field uses display: contents and does not add a layout box. */
+      field = document.createElement('span');
+      field.className = 'dwrt-kit-field dwrt-kit-adopted-field';
+      field.dataset.dwrtComponent = 'field';
+      select.before(field);
+      field.appendChild(select);
+      mountField(field);
+    }
     select.classList.add('dwrt-kit-select');
     select.dataset.dwrtEnhanced = 'true';
     componentState.set(select, {});
@@ -1057,6 +1224,13 @@
     input.addEventListener('change', sync);
     sync();
     componentState.set(root, { input, sync });
+  }
+
+  function syncMountedSwitch(input) {
+    if (!(input instanceof HTMLInputElement) || input.type !== 'checkbox') return;
+    const root = input.closest('[data-dwrt-component="switch"], .dwrt-kit-switch');
+    const state = root ? componentState.get(root) : null;
+    if (state?.input === input) state.sync?.();
   }
 
   function mountSegmented(root) {
@@ -1363,7 +1537,423 @@
     componentState.set(root, {});
   }
 
+  /*
+   * `preserveInteractionState(root, render, options)` —— 轮询刷新的统一入口。
+   *
+   * 由 Acceptance P0 单收编（30.1 实机 45 路由巡检，20 条路由在一个轮询周期里丢滚动 /
+   * 焦点 / 选区，13 个模块里 `scrollTop`、`activeElement`、`getSelection` 一次都没出现）。
+   * design.md 的 Scroll stability 与 Interaction 第 5 条早就写明了要求，缺的是共享实现，
+   * 于是 30 个页面各写一份、或者干脆不写。
+   *
+   * 三件事，缺一件都还会被用户看出来：
+   *
+   * 1. **按语义 key 复用节点**（`morph()`）。这是根因所在。页面惯用
+   *    `root.innerHTML = ...` 整树重绘，`.route-workspace` 的首个子节点在轮询前后已不是
+   *    同一个节点，于是滚动、选区、焦点、hover 过渡全部一起丢。只存取 scrollTop 是治不好
+   *    的：节点换了，恢复上去的滚动值也落在新节点上，hover 与 CSS 过渡仍然从头开始。
+   * 2. **保存/恢复交互状态**。morph 之后绝大多数节点身份不变，浏览器自己就把滚动和焦点
+   *    留住了；但结构确实变化的分支（行数增减、分组展开）仍需兜底，所以照样抓一遍快照。
+   * 3. **正在交互时直接跳过**。用户按着鼠标拖滚动条、或正在输入法组合中途，任何 DOM 改动
+   *    都是打扰。这类时刻宁可少刷一帧。
+   *
+   * 用法就是把原来的整树重绘包起来，渲染函数本身不用改：
+   *
+   *   function render() { root.innerHTML = markup(); ui.mountAll?.(root); }
+   *   function pollRender() { ui.preserveInteractionState?.(root, render) ?? render(); }
+   *
+   * 首次渲染不要走这里（走了也只是白算一遍快照）；它是给「已经有内容、现在要刷新」用的。
+   *
+   * options:
+   *   - `skipWhileInteracting`（默认 true）：拖拽滚动条 / 输入法组合中途时跳过本次刷新。
+   *   - `mount`（默认 true）：morph 后对变化的子树调 `mountAll()`，让新节点拿到 kit 行为。
+   *   - `onSkip`：被跳过时的回调，页面可以据此把这一帧的数据标记为待重放。
+   */
+
+  // 输入法组合期间不要动 DOM：morph 掉正在组合的那个 input 会把候选词打断。
+  let composing = false;
+  document.addEventListener('compositionstart', () => { composing = true; }, true);
+  document.addEventListener('compositionend', () => { composing = false; }, true);
+  // 拖动滚动条时指针按下但 target 往往就是滚动容器本身，用全局标记比逐元素判定可靠。
+  let pointerHeld = false;
+  document.addEventListener('pointerdown', () => { pointerHeld = true; }, true);
+  document.addEventListener('pointerup', () => { pointerHeld = false; }, true);
+  document.addEventListener('pointercancel', () => { pointerHeld = false; }, true);
+
+  function interactionKey(el) {
+    if (!(el instanceof Element)) return '';
+    const data = el.dataset || {};
+    // 页面显式给的语义 key 优先；其次是各页早已在用的行标识（这些属性本来就是稳定身份），
+    // 最后退回 id。都没有时返回空串，morph 按同类同序配对。
+    const explicit = data.dwrtKey || data.dwrtPatchKey || data.key || '';
+    if (explicit) return `k:${explicit}`;
+    if (el.id) return `i:${el.id}`;
+    for (const name of Object.keys(data)) {
+      if (/^(dwrtRow|row)?(Id|Key|Mac|Ip|Name)$/i.test(name) || /(RowId|RowKey|ItemId|EntryId|PortId|GroupId|RuleId|ClientMac)$/.test(name)) {
+        const value = data[name];
+        if (value) return `d:${name}=${value}`;
+      }
+    }
+    return '';
+  }
+
+  function scrollableWithin(root) {
+    const nodes = [];
+    if (!(root instanceof Element)) return nodes;
+    const walk = (el) => {
+      if (el.scrollHeight > el.clientHeight + 1 || el.scrollWidth > el.clientWidth + 1) nodes.push(el);
+      Array.from(el.children).forEach(walk);
+    };
+    walk(root);
+    return nodes;
+  }
+
+  function captureInteractionState(root) {
+    const snapshot = { scrolls: [], focus: null, selection: null, hostScrollTop: 0, hostScrollLeft: 0 };
+    if (!(root instanceof Element)) return snapshot;
+
+    snapshot.hostScrollTop = root.scrollTop || 0;
+    snapshot.hostScrollLeft = root.scrollLeft || 0;
+    // 路由外层的滚动容器也要记：多数页面滚的是 `.console-stage`，不是页面根。
+    const stage = root.closest('.console-stage, .route-scroll, [data-dwrt-scroll-host]');
+    if (stage) snapshot.stage = { el: stage, top: stage.scrollTop || 0, left: stage.scrollLeft || 0 };
+    snapshot.pageTop = window.scrollY || document.documentElement.scrollTop || 0;
+
+    scrollableWithin(root).forEach((el) => {
+      if (!el.scrollTop && !el.scrollLeft) return;
+      snapshot.scrolls.push({ key: interactionKey(el), path: nodePath(root, el), top: el.scrollTop, left: el.scrollLeft });
+    });
+
+    const active = document.activeElement;
+    if (active && active !== document.body && root.contains(active)) {
+      const entry = { key: interactionKey(active), path: nodePath(root, active) };
+      // selectionStart 在 email / number 这些类型上取值会抛，包一层。
+      try {
+        if ('selectionStart' in active && active.selectionStart !== null) {
+          entry.selectionStart = active.selectionStart;
+          entry.selectionEnd = active.selectionEnd;
+          entry.selectionDirection = active.selectionDirection || 'none';
+        }
+      } catch (_) { /* 该 input 类型不支持选区，忽略 */ }
+      snapshot.focus = entry;
+    }
+
+    const selection = window.getSelection?.();
+    if (selection && !selection.isCollapsed && selection.rangeCount) {
+      const range = selection.getRangeAt(0);
+      const anchor = range.commonAncestorContainer;
+      const anchorEl = anchor?.nodeType === 1 ? anchor : anchor?.parentElement;
+      if (anchorEl && root.contains(anchorEl)) {
+        snapshot.selection = {
+          text: selection.toString(),
+          startPath: nodePath(root, range.startContainer),
+          startOffset: range.startOffset,
+          endPath: nodePath(root, range.endContainer),
+          endOffset: range.endOffset
+        };
+      }
+    }
+    return snapshot;
+  }
+
+  // 结构路径：morph 保住身份时用不到，但结构真的变了要靠它把滚动/选区放回近似位置。
+  function nodePath(root, node) {
+    const path = [];
+    let cursor = node;
+    while (cursor && cursor !== root) {
+      const parent = cursor.parentNode;
+      if (!parent) return null;
+      path.unshift(Array.prototype.indexOf.call(parent.childNodes, cursor));
+      cursor = parent;
+    }
+    return cursor === root ? path : null;
+  }
+
+  function nodeAtPath(root, path) {
+    if (!Array.isArray(path)) return null;
+    let cursor = root;
+    for (const index of path) {
+      if (!cursor?.childNodes || index >= cursor.childNodes.length) return null;
+      cursor = cursor.childNodes[index];
+    }
+    return cursor;
+  }
+
+  function restoreInteractionState(root, snapshot) {
+    if (!snapshot || !(root instanceof Element)) return;
+    const byKey = new Map();
+    scrollableWithin(root).forEach((el) => {
+      const key = interactionKey(el);
+      if (key && !byKey.has(key)) byKey.set(key, el);
+    });
+
+    snapshot.scrolls.forEach((item) => {
+      const target = (item.key && byKey.get(item.key)) || nodeAtPath(root, item.path);
+      if (!(target instanceof Element)) return;
+      if (target.scrollTop !== item.top) target.scrollTop = item.top;
+      if (target.scrollLeft !== item.left) target.scrollLeft = item.left;
+    });
+
+    root.scrollTop = snapshot.hostScrollTop;
+    root.scrollLeft = snapshot.hostScrollLeft;
+    if (snapshot.stage?.el?.isConnected) {
+      snapshot.stage.el.scrollTop = snapshot.stage.top;
+      snapshot.stage.el.scrollLeft = snapshot.stage.left;
+    }
+    if (snapshot.pageTop && Math.abs((window.scrollY || 0) - snapshot.pageTop) > 1) window.scrollTo({ top: snapshot.pageTop });
+
+    if (snapshot.focus && document.activeElement !== nodeAtPath(root, snapshot.focus.path)) {
+      let target = null;
+      if (snapshot.focus.key) {
+        target = Array.from(root.querySelectorAll('*')).find((el) => interactionKey(el) === snapshot.focus.key) || null;
+      }
+      if (!target) target = nodeAtPath(root, snapshot.focus.path);
+      if (target instanceof HTMLElement && typeof target.focus === 'function' && target !== document.activeElement) {
+        target.focus({ preventScroll: true });
+        if (snapshot.focus.selectionStart != null && 'setSelectionRange' in target) {
+          try {
+            target.setSelectionRange(snapshot.focus.selectionStart, snapshot.focus.selectionEnd, snapshot.focus.selectionDirection);
+          } catch (_) { /* 类型不支持，忽略 */ }
+        }
+      }
+    }
+
+    if (snapshot.selection) {
+      const selection = window.getSelection?.();
+      if (selection && selection.isCollapsed) {
+        const start = nodeAtPath(root, snapshot.selection.startPath);
+        const end = nodeAtPath(root, snapshot.selection.endPath);
+        if (start && end) {
+          try {
+            const range = document.createRange();
+            range.setStart(start, Math.min(snapshot.selection.startOffset, start.length ?? start.childNodes.length));
+            range.setEnd(end, Math.min(snapshot.selection.endOffset, end.length ?? end.childNodes.length));
+            selection.removeAllRanges();
+            selection.addRange(range);
+          } catch (_) { /* 结构变化导致偏移越界，放弃恢复选区而不是抛错 */ }
+        }
+      }
+    }
+  }
+
+  // 被 kit 传送到 portal 的抽屉不在原宿主子树里，morph 不能把它们当作「新节点里没有所以删掉」。
+  function isPortaled(el) {
+    return el instanceof Element && el.closest?.(`#${SHEET_PORTAL_ID}`) != null;
+  }
+
+  function sameIdentity(a, b) {
+    if (a.nodeType !== b.nodeType) return false;
+    if (a.nodeType !== 1) return true;
+    if (a.tagName !== b.tagName) return false;
+    const ka = interactionKey(a);
+    const kb = interactionKey(b);
+    if (ka || kb) return ka === kb;
+    return true;
+  }
+
+  /*
+   * class 要合并而不是覆盖。页面的 markup 里没有 `dwrt-kit-table-wrap` 这类类名——它们是
+   * `mountDataTable()` 等挂上去的，而离屏 staging 树不跑 mount（跑了会把抽屉误传送进
+   * portal）。直接照抄 staging 的 class 会在每个轮询周期把 kit 加的类剥掉一次，表格材质
+   * 随之闪一下，正是本单要消除的「动作特别大」。
+   */
+  function mergedClassValue(from, to) {
+    const wanted = new Set(Array.from(to.classList));
+    Array.from(from.classList).forEach((name) => {
+      if (name.startsWith('dwrt-kit-')) wanted.add(name);
+    });
+    return Array.from(wanted).join(' ');
+  }
+
+  function morphAttributes(from, to) {
+    const changed = [];
+    Array.from(to.attributes).forEach((attr) => {
+      const value = attr.name === 'class' ? mergedClassValue(from, to) : attr.value;
+      if (from.getAttribute(attr.name) !== value) {
+        from.setAttribute(attr.name, value);
+        changed.push(attr.name);
+      }
+    });
+    Array.from(from.attributes).forEach((attr) => {
+      // kit 自己挂上去的属性不能摘：新 markup 里没有 data-dwrt-surface 是因为它由
+      // mountDataTable() 补的，按「新节点没有就删」处理会把材质连带 8px/24px 一起抖掉。
+      if (attr.name.startsWith('data-dwrt-') || attr.name === 'aria-sort') return;
+      if (!to.hasAttribute(attr.name)) {
+        from.removeAttribute(attr.name);
+        changed.push(attr.name);
+      }
+    });
+    return changed;
+  }
+
+  /*
+   * morph：把 `next` 的内容套到 `current` 上，同身份的节点原地改，不重建。
+   *
+   * 有意保持简单，不做通用 vdom：只按 `interactionKey()` 配对同类子节点，
+   * key 缺失时按同标签同序配对。返回是否发生过结构改动，调用方据此决定要不要重挂 kit。
+   */
+  function morph(current, next) {
+    let structural = false;
+    if (current.nodeType === 3) {
+      if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
+      return false;
+    }
+    if (current.nodeType !== 1) return false;
+
+    if (morphAttributes(current, next).length) structural = true;
+
+    // 用户正在这个输入框里打字：值与选区归用户，不归轮询数据。
+    if (current instanceof HTMLInputElement || current instanceof HTMLTextAreaElement) {
+      if (document.activeElement !== current && current.value !== next.value) current.value = next.value;
+      if (next instanceof HTMLInputElement && current instanceof HTMLInputElement) {
+        if (document.activeElement !== current) {
+          current.checked = next.checked;
+          syncMountedSwitch(current);
+        }
+      }
+      return structural;
+    }
+    if (current instanceof HTMLSelectElement) {
+      if (document.activeElement !== current) {
+        const keep = current.value;
+        current.innerHTML = next.innerHTML;
+        if (Array.from(current.options).some((option) => option.value === keep)) current.value = keep;
+        else current.value = next.value;
+      }
+      return true;
+    }
+
+    const oldNodes = Array.from(current.childNodes).filter((node) => !isPortaled(node));
+    const newNodes = Array.from(next.childNodes);
+    const keyed = new Map();
+    oldNodes.forEach((node) => {
+      if (node.nodeType !== 1) return;
+      const key = interactionKey(node);
+      if (key && !keyed.has(key)) keyed.set(key, node);
+    });
+
+    const used = new Set();
+    const order = [];
+    let cursor = 0;
+    newNodes.forEach((wanted) => {
+      const wantedKey = wanted.nodeType === 1 ? interactionKey(wanted) : '';
+      let match = null;
+      if (wantedKey && keyed.has(wantedKey)) {
+        match = keyed.get(wantedKey);
+      } else {
+        // 无 key：从当前游标往后找第一个同身份且未被占用的节点，避免把整段往前错位。
+        for (let i = cursor; i < oldNodes.length; i += 1) {
+          const candidate = oldNodes[i];
+          if (used.has(candidate)) continue;
+          if (sameIdentity(candidate, wanted)) { match = candidate; break; }
+          break;
+        }
+      }
+      if (match) {
+        used.add(match);
+        cursor = Math.max(cursor, oldNodes.indexOf(match) + 1);
+        if (morph(match, wanted)) structural = true;
+        order.push(match);
+      } else {
+        /*
+         * Move the staging node itself. Legacy renderers bind page-owned click /
+         * change handlers to the staging target before morph; `cloneNode(true)`
+         * copies markup but silently drops those listeners, so a row added by a
+         * poll looks correct and is dead on first click. Moving a detached node
+         * preserves its listener identity and is safe because the staging tree is
+         * discarded after this commit.
+         */
+        const fresh = wanted;
+        order.push(fresh);
+        structural = true;
+      }
+    });
+
+    /*
+     * 按新顺序重排。`insertBefore` 作用在已存在的节点上只是移动，不会重建它，
+     * 所以滚动位置、焦点与 CSS 过渡都留着——这正是本单要的「结构与身份未变时不换节点」。
+     */
+    let anchor = null;
+    order.forEach((node) => {
+      const expected = anchor ? anchor.nextSibling : current.firstChild;
+      if (node !== expected) {
+        current.insertBefore(node, expected);
+        if (!used.has(node)) structural = true;
+      }
+      anchor = node;
+    });
+
+    oldNodes.forEach((node) => {
+      if (used.has(node)) return;
+      node.remove();
+      structural = true;
+    });
+
+    return structural;
+  }
+
+  function preserveInteractionState(root, render, options = {}) {
+    if (!(root instanceof HTMLElement) || typeof render !== 'function') return false;
+    const { skipWhileInteracting = true, mount = true, onSkip = null } = options;
+
+    if (skipWhileInteracting && (composing || pointerHeld)) {
+      onSkip?.('interacting');
+      return false;
+    }
+
+    // 首次渲染没有可保的状态，直接走原路径。
+    if (!root.firstElementChild) {
+      render(root);
+      return true;
+    }
+
+    /*
+     * A mounted sheet lives in the document-level portal, outside `root`. If we
+     * morph while it stays there, the staging markup's copy has nothing to match
+     * and becomes a second sheet; mounting the committed root then leaves both in
+     * the portal. Bring sheets owned by this route back through the normal Kit
+     * unmount path before snapshot/morph. Their DOM identity can now be reused, and
+     * the final `mountAll(root)` elevates exactly one copy again.
+     */
+    portaledSheetsFor(root).forEach(unmountSheet);
+
+    const snapshot = captureInteractionState(root);
+
+    /*
+     * 渲染函数必须能接收目标容器（`render(target = root)`）。页面里的 `root` 通常是
+     * `const`，没法在外面替换，所以由渲染函数自己接参数是唯一干净的接法。
+     *
+     * 不接参数的旧写法在这里降级成「照原样重绘 + 恢复交互状态」：滚动和焦点还能救回来，
+     * 但节点身份保不住（`domReplaced` 仍会发生）。这是有意的过渡档位，比让它写进一棵空的
+     * staging 树、把页面清空要好得多。
+     */
+    if (render.length === 0) {
+      render();
+      restoreInteractionState(root, snapshot);
+      return true;
+    }
+
+    // 让页面的 render() 往离屏容器里写，再 morph 回真实 DOM。
+    const staging = root.cloneNode(false);
+    interactionStagingRoots.add(staging);
+    let structural = false;
+    try {
+      render(staging);
+      structural = morph(root, staging);
+    } catch (error) {
+      // 渲染函数抛错时不要留下半棵树：让调用方自己按原路径重绘。
+      console.error('[dwrt-kit] preserveInteractionState render failed', error);
+      throw error;
+    } finally {
+      interactionStagingRoots.delete(staging);
+    }
+
+    if (mount && structural) mountAll(root);
+    restoreInteractionState(root, snapshot);
+    return true;
+  }
+
   function mountAll(context = document) {
+    if (interactionStagingRoots.has(context)) return;
     mountLucide(context);
     reclaimStaleSheets(context);
     const components = collectComponentRoots(context);
@@ -1403,16 +1993,41 @@
     return () => unmount(context);
   }
 
+  /*
+   * `unmount(context)` 只在 context 子树里找抽屉，而 `elevateSheet()` 早已把抽屉和遮罩搬进
+   * `#dwrtKitSheetPortal`。页面惯用的 `unmount(host)` → 重写 `host.innerHTML` 因此对 portal
+   * 里那份完全无效，遮罩带着 is-open 留下来吞掉全部点击。这已经被 5 个页面各自用私有代码
+   * 绕过（`reclaimPortaledSheets()` / `releasePortaledOverlays()` / `clearPortaledOverlays()`），
+   * 属于 kit 的责任。按 `state.portalHome.parent` 反查归属，把本 context 传送出去的那些
+   * 一并交给 unmountSheet()。
+   */
+  function portaledSheetsFor(context) {
+    const portal = document.getElementById(SHEET_PORTAL_ID);
+    if (!portal || !portal.firstElementChild) return [];
+    const host = context?.nodeType === 1 ? context : null;
+    return Array.from(portal.children).filter((node) => {
+      if (!node.matches?.(SHEET_SELECTOR)) return false;
+      const home = sheetState.get(node)?.portalHome?.parent;
+      if (!home) return false;
+      // context 是 document 时清全部；否则只认原宿主落在 context 子树里的
+      if (!host) return true;
+      return home === host || host.contains(home);
+    });
+  }
+
   function unmount(context) {
     if (!context?.querySelectorAll) return;
     componentRoots(context, 'segmented').forEach(unmountSegmented);
     componentRoots(context, 'slider').forEach(unmountSlider);
-    matchingRoots(context, '.dwrt-kit-sheet, [data-dwrt-component="sheet"], [data-dwrt-component="filter-sheet"]').forEach(unmountSheet);
+    const sheets = matchingRoots(context, SHEET_SELECTOR);
+    portaledSheetsFor(context).forEach((node) => { if (!sheets.includes(node)) sheets.push(node); });
+    sheets.forEach(unmountSheet);
     componentRoots(context, 'virtual-data-table').forEach(unmountVirtualDataTable);
     componentRoots(context, 'data-grid').forEach(unmountDataGrid);
     matchingRoots(context, '.dwrt-kit-modal-layer, [data-dwrt-component="modal"]').forEach(unmountModal);
     if (activeTooltip && context.contains?.(activeTooltip)) closeTooltip(activeTooltip);
     matchingRoots(context, '[data-dwrt-tooltip], .dwrt-kit-tooltip-trigger').forEach(unmountTooltip);
+    enforceOverlayGuard();
   }
 
   function modalFocusable(dialog) {
@@ -1426,12 +2041,14 @@
     if (!(dialog instanceof HTMLElement)) return;
     if (dialog.dataset.dwrtModalVariant === 'copilot') ensureSheetMaterial(dialog);
     const recentTrigger = lastTrigger && performance.now() - lastTrigger.at < 1600 ? lastTrigger : null;
+    const initiallyOpen = !layer.hidden;
     const state = {
-      trigger: recentTrigger?.element || (document.activeElement instanceof HTMLElement ? document.activeElement : null),
-      triggerSelector: recentTrigger?.selector || triggerSelector(document.activeElement),
+      trigger: initiallyOpen ? recentTrigger?.element || (document.activeElement instanceof HTMLElement ? document.activeElement : null) : null,
+      triggerSelector: initiallyOpen ? recentTrigger?.selector || triggerSelector(document.activeElement) : '',
       dialog,
       keydown: null,
-      transitionend: null
+      transitionend: null,
+      hiddenObserver: null
     };
     if (state.triggerSelector) layer.dataset.dwrtReturnFocus = state.triggerSelector;
     dialog.setAttribute('role', dialog.getAttribute('role') || 'dialog');
@@ -1468,12 +2085,54 @@
     };
     dialog.addEventListener('transitionend', state.transitionend);
     modalState.set(layer, state);
+    watchModalHidden(layer, state);
+    if (initiallyOpen) activateModal(layer, state);
+  }
+
+  /*
+   * 模态关闭后把焦点还给触发按钮。
+   *
+   * 抽屉早就有 `restoreSheetFocus()`，模态这边只在 mount 时记下了 `dwrtReturnFocus`，
+   * 却从没有人用它——Escape 能关，但焦点落回 body，键盘用户关掉「自定义列」后就迷路了
+   * （Acceptance-to-Front P1 单第 B 节）。
+   *
+   * 有意做得比抽屉那份保守：只在焦点仍留在模态内（或已掉到 body）时才抢回来。用户在关闭
+   * 的同一帧里点了别处，那个别处才是他想去的地方。
+   */
+  function captureModalTrigger(layer, state) {
+    const recentTrigger = lastTrigger && performance.now() - lastTrigger.at < 1600 ? lastTrigger : null;
+    const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const trigger = recentTrigger?.element?.isConnected ? recentTrigger.element : active && !layer.contains(active) ? active : null;
+    const selector = recentTrigger?.selector || triggerSelector(trigger);
+    state.trigger = trigger;
+    state.triggerSelector = selector;
+    if (selector) layer.dataset.dwrtReturnFocus = selector;
+    else delete layer.dataset.dwrtReturnFocus;
+  }
+
+  function activateModal(layer, state) {
+    captureModalTrigger(layer, state);
     requestAnimationFrame(() => requestAnimationFrame(() => {
-      if (!layer.isConnected) return;
+      if (!layer.isConnected || layer.hidden) return;
       state.transitionend();
-      const target = dialog.querySelector('[autofocus], input:not(:disabled), select:not(:disabled), textarea:not(:disabled)') || modalFocusable(dialog)[0];
+      const target = state.dialog.querySelector('[autofocus], input:not(:disabled), select:not(:disabled), textarea:not(:disabled)') || modalFocusable(state.dialog)[0];
       if (target instanceof HTMLElement) target.focus({ preventScroll: true });
+      else {
+        state.dialog.tabIndex = state.dialog.tabIndex >= 0 ? state.dialog.tabIndex : -1;
+        state.dialog.focus({ preventScroll: true });
+      }
     }));
+  }
+
+  function restoreModalFocus(layer, state) {
+    const selector = layer.dataset.dwrtReturnFocus || state.triggerSelector || '';
+    const selected = selector ? document.querySelector(selector) : null;
+    const target = selected instanceof HTMLElement ? selected : state.trigger?.isConnected ? state.trigger : null;
+    if (!(target instanceof HTMLElement)) return;
+    const active = document.activeElement;
+    const drifted = active instanceof HTMLElement && active !== document.body && !layer.contains(active);
+    if (drifted) return;
+    target.focus({ preventScroll: true });
   }
 
   function unmountModal(layer) {
@@ -1481,7 +2140,26 @@
     if (!state) return;
     layer.removeEventListener('keydown', state.keydown);
     state.dialog.removeEventListener('transitionend', state.transitionend);
+    state.hiddenObserver?.disconnect();
     modalState.delete(layer);
+    restoreModalFocus(layer, state);
+  }
+
+  /*
+   * 页面用 `hidden` 开合模态时也要还焦点。
+   *
+   * kit 自己的关闭路径会走 unmountModal()，但相当多页面（insights 的「自定义列」就是）
+   * 只是把层 `hidden = true`，节点留在原处、从不卸载。那条路径下没人还焦点，所以这里盯着
+   * hidden 的变化补上。
+   */
+  function watchModalHidden(layer, state) {
+    state.hiddenObserver?.disconnect();
+    state.hiddenObserver = new MutationObserver(() => {
+      if (!modalState.has(layer)) return;
+      if (layer.hidden) restoreModalFocus(layer, state);
+      else activateModal(layer, state);
+    });
+    state.hiddenObserver.observe(layer, { attributes: true, attributeFilter: ['hidden'] });
   }
 
   function tooltipPortal() {
@@ -2079,6 +2757,13 @@
   window.DWRT_UI_KIT = {
     mount,
     unmount,
+    /*
+     * 页面私有的 portal 清理代码（`releasePortaledOverlays()` / `reclaimPortaledSheets()` /
+     * `clearPortaledOverlays()`）现在不需要了：`unmount(host)` 会按 portalHome 反查回收本
+     * 宿主传送出去的抽屉与遮罩。这个导出给「我只想确认没有残留遮罩」的场合用，比如页面自己
+     * remove() 掉节点、绕过了 kit 的卸载路径时。
+     */
+    enforceSheetOverlayGuard: enforceOverlayGuard,
     mountTabs,
     mountAll,
     updateTabs,
@@ -2098,6 +2783,13 @@
     mountSlider,
     mountExpandSearch,
     mountTooltip,
+    /*
+     * 轮询刷新的统一入口（Acceptance P0 单第 4 条：一个共享工具，不要 30 个页面各写一份）。
+     * 另外导出 capture/restore，给「必须自己重绘、只想保住交互状态」的页面兜底。
+     */
+    preserveInteractionState,
+    captureInteractionState,
+    restoreInteractionState,
     lucideIcon,
     mountLucide
   };
@@ -2130,5 +2822,18 @@
   window.addEventListener('pagehide', () => closeTooltip());
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) closeTooltip();
+  });
+
+  /*
+   * 遮罩守卫的兜底触发点。
+   *
+   * 关闭流程里已经逐条摘除，这里只负责收拾「没有走任何关闭路径」的残留：路由直接切走、
+   * 标签页切回来发现状态已经不对、窗口尺寸变化时重新量过几何。守卫只会收回
+   * pointer-events，不会把还开着的抽屉关掉，所以多跑几次是安全的。
+   */
+  window.addEventListener('hashchange', () => enforceOverlayGuard());
+  window.addEventListener('popstate', () => enforceOverlayGuard());
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) enforceOverlayGuard();
   });
 })();

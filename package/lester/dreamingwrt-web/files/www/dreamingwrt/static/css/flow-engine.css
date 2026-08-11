@@ -250,9 +250,11 @@ html[data-theme-resolved="dark"] .flow-engine-page {
   font: inherit; text-align: start; cursor: pointer;
   transition: background .18s ease, border-color .18s ease, transform .18s cubic-bezier(.25, 1, .5, 1);
 }
+/* design.md 交互契约第 2 条：数据块 hover 不得位移，改用共享 hover 令牌。 */
 .flow-balance-algorithm:not(:disabled):hover {
-  border-color: color-mix(in srgb, var(--app-text) 22%, transparent);
-  transform: translateY(-2px);
+  border-color: var(--dwrt-interactive-hover-border, color-mix(in srgb, var(--app-text) 22%, transparent));
+  background: var(--dwrt-interactive-hover-bg);
+  box-shadow: var(--dwrt-interactive-hover-shadow);
 }
 .flow-balance-algorithm:disabled { opacity: .62; cursor: not-allowed; }
 .flow-balance-algorithm.is-active {
@@ -282,6 +284,12 @@ html[data-theme-resolved="dark"] .flow-engine-page {
 .flow-balance-algorithm-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .flow-balance-algorithm-head > strong { font-size: 14px; font-weight: 700; }
 .flow-balance-algorithm-desc { color: var(--app-text-secondary, var(--app-text-muted)); font-size: 12px; line-height: 1.5; }
+.flow-balance-algorithm-unavailable {
+  display: block;
+  margin-block-start: 5px;
+  color: var(--app-warning, #d08700);
+  overflow-wrap: anywhere;
+}
 .flow-balance-algorithm-value {
   justify-self: start;
   border-radius: var(--app-radius-compact, 8px);

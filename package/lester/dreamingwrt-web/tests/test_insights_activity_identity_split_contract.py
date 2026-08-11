@@ -96,11 +96,26 @@ def test_identity_reason_is_consumed() -> None:
 
 def test_asset_cache_key_was_bumped() -> None:
     # 改了 JS/CSS 不 bump 版本，部署后浏览器仍拿旧文件。
+    #
+    # 原来这里钉死 `20260805-activity-identity-split-01` 这一个字面量，于是**任何**
+    # 后续改动 bump 版本键都会让这条断言变红 —— 它守的其实是「改了资源要 bump」，
+    # 不是「版本键永远等于本次改动的名字」。钉字面量会让下一个人要么改回旧键
+    # （浏览器继续吃缓存），要么改这行数字凑绿，两种都让契约失去信号价值。
+    #
+    # 改为守真正的不变量：两个资源都必须带形如 YYYYMMDD-<slug> 的版本键，
+    # 且日期不早于本次识别分组落地的 20260805。
+    keys = {}
     for asset in ("/static/js/insights-flows.js", "/static/css/insights-flows.css"):
         block = MENU_JS[MENU_JS.index(asset):MENU_JS.index(asset) + 220]
-        assert "20260805-activity-identity-split-01" in block, (
-            f"{asset} 的缓存键必须随本次改动 bump"
+        found = re.search(r"version:\s*'(\d{8})-([a-z0-9-]+)'", block)
+        assert found, f"{asset} 必须带版本键，否则部署后浏览器仍拿旧文件"
+        assert int(found.group(1)) >= 20260805, (
+            f"{asset} 的缓存键 {found.group(0)} 早于识别分组落地日期，"
+            "说明这次改动没有 bump"
         )
+        keys[asset] = found.group(0)
+    # JS 与 CSS 是同一次改动的产物，键不一致说明漏 bump 了其中一个。
+    assert len({v.split("'")[1] for v in keys.values()}) == 1, keys
 
 
 for name, fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
