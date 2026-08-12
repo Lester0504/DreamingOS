@@ -402,7 +402,8 @@ static int jmx_rule_match_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 
 	/* Length query first, then one allocation sized to it. */
-	need = jmx_v3_rule_match_snapshot(NULL, 0, NULL);
+	/* Capture generation even when the committed set contains zero rules. */
+	need = jmx_v3_rule_match_snapshot(NULL, 0, &it->generation);
 	if (need < 0) {
 		kfree(it);
 		return need;
