@@ -70,7 +70,10 @@ enum jmx_sticky_mode {
 	JMX_STICKY_PRIMARY_BACKUP = 6,
 	JMX_STICKY_DOWNLOAD    = 7,
 	JMX_STICKY_CONN_CNT    = 8,
+	JMX_STICKY_ADAPTIVE_PENALTY = 9,
 };
+
+#define JMX_STICKY_MAX JMX_STICKY_ADAPTIVE_PENALTY
 
 #define JMX_MAX_WAN_IFACES   8
 #define JMX_MAX_ROUTE_RULES  256
@@ -105,6 +108,18 @@ enum jmx_carrier_id {
 #define JMX_APP_CAT_SLOTS       18
 #define JMX_APP_CAT_DB_UNKNOWN  99
 
+#define JMX_WAN_REBIND_SELECTIVE 2
+#define JMX_WAN_REBIND_ALL       3
+
+struct jmx_wan_rebind_stats {
+	u64 requested;
+	u64 killed;
+	u64 skipped_sensitive;
+	u64 last_at;
+	u8  last_mode;
+	u8  pending_mode;
+};
+
 typedef struct jmx_wan_cat_stat {
 	atomic64_t active_conn;
 	atomic64_t tx_packets;
@@ -121,6 +136,7 @@ typedef struct jmx_wan_iface {
 	u32  gateway;
 	u8   health;
 	u32  weight;
+	u32  adaptive_weight;
 	atomic64_t rx_bytes;
 	atomic64_t active_conn;
 	u32  generation;
@@ -150,6 +166,11 @@ int  jmx_wan_register(u8 wan_id, const char *name, u32 fwmark, u32 table_id,
 		      u32 gateway, u32 weight);
 void jmx_wan_unregister(u8 wan_id);
 void jmx_wan_set_health(u8 wan_id, u8 health);
+int  jmx_wan_set_weight(u8 wan_id, u32 weight);
+int  jmx_wan_set_adaptive_weight(u8 wan_id, u32 weight);
+int  jmx_wan_rebind_request(u8 wan_id, u8 mode);
+void jmx_wan_rebind_stats_snapshot(u8 wan_id,
+					 struct jmx_wan_rebind_stats *out);
 jmx_wan_iface_t *jmx_wan_find(u8 wan_id);
 int  jmx_wan_get_count(void);
 void jmx_wan_flow_account_rx(u8 wan_id, u32 generation, u64 bytes);

@@ -35,6 +35,9 @@
 #define JMX_NL_ACT_ROUTE_DEL       34
 #define JMX_NL_ACT_ROUTE_FLUSH     35
 #define JMX_NL_ACT_ROUTE_CLEAR_HITS 36
+#define JMX_NL_ACT_WAN_WEIGHT      37
+#define JMX_NL_ACT_WAN_REBIND      38
+#define JMX_NL_ACT_WAN_ADAPTIVE_WEIGHT 39
 #define JMX_NL_ACT_CARRIER_FLUSH    40
 #define JMX_NL_ACT_CARRIER_ADD      41
 #define JMX_NL_ACT_APPCAT_FLUSH     42
@@ -478,6 +481,48 @@ int jmx_v2_nl_handle(const char *data, int len, u32 portid,
 		if (len < (int)sizeof(*m)) return 1;
 		m = (void *)data;
 		jmx_wan_set_health(m->wan_id, m->health);
+		return 1;
+	}
+
+	case JMX_NL_ACT_WAN_WEIGHT: {
+		struct { int32_t action; u8 wan_id; u32 weight; } __packed *m;
+		int rc;
+
+		if (len < (int)sizeof(*m))
+			return 1;
+		m = (void *)data;
+		rc = jmx_wan_set_weight(m->wan_id, m->weight);
+		if (rc)
+			pr_warn_ratelimited("jmx_route: wan weight rejected id=%u weight=%u rc=%d\n",
+				m->wan_id, m->weight, rc);
+		return 1;
+	}
+
+	case JMX_NL_ACT_WAN_ADAPTIVE_WEIGHT: {
+		struct { int32_t action; u8 wan_id; u32 weight; } __packed *m;
+		int rc;
+
+		if (len < (int)sizeof(*m))
+			return 1;
+		m = (void *)data;
+		rc = jmx_wan_set_adaptive_weight(m->wan_id, m->weight);
+		if (rc)
+			pr_warn_ratelimited("jmx_route: adaptive weight rejected id=%u weight=%u rc=%d\n",
+				m->wan_id, m->weight, rc);
+		return 1;
+	}
+
+	case JMX_NL_ACT_WAN_REBIND: {
+		struct { int32_t action; u8 wan_id; u8 mode; } __packed *m;
+		int rc;
+
+		if (len < (int)sizeof(*m))
+			return 1;
+		m = (void *)data;
+		rc = jmx_wan_rebind_request(m->wan_id, m->mode);
+		if (rc)
+			pr_warn_ratelimited("jmx_route: WAN rebind rejected id=%u mode=%u rc=%d\n",
+				m->wan_id, m->mode, rc);
 		return 1;
 	}
 

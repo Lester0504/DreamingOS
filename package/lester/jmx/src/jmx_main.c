@@ -15,6 +15,7 @@
 #include <net/netfilter/nf_conntrack_acct.h>
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_ecache.h>
+#include <linux/netfilter/nf_conntrack_tcp.h>
 #include <linux/notifier.h>
 #include <linux/workqueue.h>
 #include <linux/slab.h>
@@ -3543,6 +3544,182 @@ static void jmx_active_conn_reconcile_exit(void)
 }
 #endif
 
+/*
+ * WAN quality rebinds are intentionally deferred out of the netlink receive
+ * path.  A conntrack table walk may take milliseconds on a busy router, while
+ * the control-plane caller only needs an acknowledgement that the strongest
+ * pending request was queued.
+ */
+struct jmx_wan_rebind_runtime {
+	spinlock_t lock;
+	struct work_struct work;
+	bool running;
+	bool worker_active;
+	u8 pending[JMX_MAX_WAN_IFACES];
+	atomic64_t requested[JMX_MAX_WAN_IFACES];
+	atomic64_t killed[JMX_MAX_WAN_IFACES];
+	atomic64_t skipped_sensitive[JMX_MAX_WAN_IFACES];
+	u8 last_mode[JMX_MAX_WAN_IFACES];
+	u64 last_at[JMX_MAX_WAN_IFACES];
+};
+
+struct jmx_wan_rebind_pass {
+	u8 wan_id;
+	u8 mode;
+	u64 killed;
+	u64 skipped_sensitive;
+};
+
+static struct jmx_wan_rebind_runtime jmx_wan_rebind;
+
+static int jmx_wan_rebind_one(struct nf_conn *ct, void *data)
+{
+	struct jmx_wan_rebind_pass *pass = data;
+	u8 proto;
+	u8 rc;
+
+	if (!ct || !pass || READ_ONCE(ct->jmx_data.route_wan_id) != pass->wan_id)
+		return 0;
+	if (pass->mode == JMX_WAN_REBIND_ALL) {
+		pass->killed++;
+		return 1;
+	}
+
+	rc = smp_load_acquire(&ct->jmx_data.route_counted);
+	if ((rc ? jmx_rc_cat(rc) :
+	     jmx_app_cat_slot(READ_ONCE(ct->jmx_data.app_id))) == 14) {
+		pass->skipped_sensitive++;
+		return 0;
+	}
+
+	proto = nf_ct_protonum(ct);
+	if (proto == IPPROTO_UDP) {
+		pass->killed++;
+		return 1;
+	}
+	if (proto == IPPROTO_TCP &&
+	    READ_ONCE(ct->proto.tcp.state) != TCP_CONNTRACK_ESTABLISHED) {
+		pass->killed++;
+		return 1;
+	}
+	return 0;
+}
+
+static void jmx_wan_rebind_workfn(struct work_struct *work)
+{
+	(void)work;
+	for (;;) {
+		u8 modes[JMX_MAX_WAN_IFACES];
+		unsigned long flags;
+		bool have_work = false;
+		int i;
+
+		spin_lock_irqsave(&jmx_wan_rebind.lock, flags);
+		for (i = 0; i < JMX_MAX_WAN_IFACES; i++) {
+			modes[i] = jmx_wan_rebind.pending[i];
+			jmx_wan_rebind.pending[i] = 0;
+			have_work |= modes[i] != 0;
+		}
+		if (!have_work)
+			jmx_wan_rebind.worker_active = false;
+		spin_unlock_irqrestore(&jmx_wan_rebind.lock, flags);
+		if (!have_work)
+			break;
+
+		for (i = 0; i < JMX_MAX_WAN_IFACES; i++) {
+			struct jmx_wan_rebind_pass pass = {
+				.wan_id = (u8)(i + 1),
+				.mode = modes[i],
+			};
+			struct nf_ct_iter_data iter_data;
+
+			if (!pass.mode)
+				continue;
+			memset(&iter_data, 0, sizeof(iter_data));
+			iter_data.net = &init_net;
+			iter_data.data = &pass;
+			nf_ct_iterate_cleanup_net(jmx_wan_rebind_one, &iter_data);
+			atomic64_add(pass.killed, &jmx_wan_rebind.killed[i]);
+			atomic64_add(pass.skipped_sensitive,
+				     &jmx_wan_rebind.skipped_sensitive[i]);
+			WRITE_ONCE(jmx_wan_rebind.last_mode[i], pass.mode);
+			WRITE_ONCE(jmx_wan_rebind.last_at[i], ktime_get_real_seconds());
+			JMX_DEBUG_RATELIMITED(1,
+				"jmx_route: WAN rebind complete id=%u mode=%u killed=%llu sensitive=%llu\n",
+				pass.wan_id, pass.mode, pass.killed, pass.skipped_sensitive);
+		}
+	}
+}
+
+int jmx_wan_rebind_request(u8 wan_id, u8 mode)
+{
+	unsigned long flags;
+	u8 *pending;
+	bool schedule = false;
+
+	if (!wan_id || wan_id > JMX_MAX_WAN_IFACES ||
+	    (mode != JMX_WAN_REBIND_SELECTIVE && mode != JMX_WAN_REBIND_ALL))
+		return -EINVAL;
+	if (!READ_ONCE(jmx_wan_rebind.running))
+		return -ESHUTDOWN;
+
+	atomic64_inc(&jmx_wan_rebind.requested[wan_id - 1]);
+	spin_lock_irqsave(&jmx_wan_rebind.lock, flags);
+	pending = &jmx_wan_rebind.pending[wan_id - 1];
+	if (mode > *pending)
+		*pending = mode;
+	if (!jmx_wan_rebind.worker_active) {
+		jmx_wan_rebind.worker_active = true;
+		schedule = true;
+	}
+	spin_unlock_irqrestore(&jmx_wan_rebind.lock, flags);
+	if (schedule)
+		schedule_work(&jmx_wan_rebind.work);
+	return 0;
+}
+
+void jmx_wan_rebind_stats_snapshot(u8 wan_id,
+					 struct jmx_wan_rebind_stats *out)
+{
+	unsigned long flags;
+
+	if (!out)
+		return;
+	memset(out, 0, sizeof(*out));
+	if (!wan_id || wan_id > JMX_MAX_WAN_IFACES)
+		return;
+	out->requested = atomic64_read(&jmx_wan_rebind.requested[wan_id - 1]);
+	out->killed = atomic64_read(&jmx_wan_rebind.killed[wan_id - 1]);
+	out->skipped_sensitive =
+		atomic64_read(&jmx_wan_rebind.skipped_sensitive[wan_id - 1]);
+	out->last_mode = READ_ONCE(jmx_wan_rebind.last_mode[wan_id - 1]);
+	out->last_at = READ_ONCE(jmx_wan_rebind.last_at[wan_id - 1]);
+	spin_lock_irqsave(&jmx_wan_rebind.lock, flags);
+	out->pending_mode = jmx_wan_rebind.pending[wan_id - 1];
+	spin_unlock_irqrestore(&jmx_wan_rebind.lock, flags);
+}
+
+static void jmx_wan_rebind_init(void)
+{
+	int i;
+
+	memset(&jmx_wan_rebind, 0, sizeof(jmx_wan_rebind));
+	spin_lock_init(&jmx_wan_rebind.lock);
+	INIT_WORK(&jmx_wan_rebind.work, jmx_wan_rebind_workfn);
+	for (i = 0; i < JMX_MAX_WAN_IFACES; i++) {
+		atomic64_set(&jmx_wan_rebind.requested[i], 0);
+		atomic64_set(&jmx_wan_rebind.killed[i], 0);
+		atomic64_set(&jmx_wan_rebind.skipped_sensitive[i], 0);
+	}
+	WRITE_ONCE(jmx_wan_rebind.running, true);
+}
+
+static void jmx_wan_rebind_exit(void)
+{
+	WRITE_ONCE(jmx_wan_rebind.running, false);
+	cancel_work_sync(&jmx_wan_rebind.work);
+}
+
 enum jmx_init_stage {
 	JMX_INIT_PROC_DIRS       = BIT(0),
 	JMX_INIT_CONN            = BIT(1),
@@ -3565,6 +3742,7 @@ enum jmx_init_stage {
 	JMX_INIT_FEATURES_PROC   = BIT(18),
 	JMX_INIT_STATS_PROC      = BIT(19),
 	JMX_INIT_ACTIVE_CONN_RECONCILE = BIT(20),
+	JMX_INIT_WAN_REBIND       = BIT(21),
 };
 
 static int jmx_v3_reply_to_portid(u32 portid, u32 nlmsg_seq,
@@ -3772,6 +3950,8 @@ static void jmx_cleanup(void)
 		af_client_exit();
 	if (state & JMX_INIT_NETLINK)
 		netlink_jmx_exit();
+	if (state & JMX_INIT_WAN_REBIND)
+		jmx_wan_rebind_exit();
 
 #if IS_ENABLED(CONFIG_NF_CONNTRACK_CHAIN_EVENTS)
 	/* Stop the walker before the WAN table it reconciles can go away. */
@@ -3896,6 +4076,8 @@ static int __init jmx_init(void)
 	if (err)
 		goto fail;
 	jmx_init_state |= JMX_INIT_ROUTE_PROC;
+	jmx_wan_rebind_init();
+	jmx_init_state |= JMX_INIT_WAN_REBIND;
 #if IS_ENABLED(CONFIG_NF_CONNTRACK_CHAIN_EVENTS)
 	err = nf_conntrack_register_notifier(&init_net, &jmx_route_ct_notifier);
 	if (err)
