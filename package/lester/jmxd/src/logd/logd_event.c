@@ -414,6 +414,16 @@ static const struct logd_notify_event_contract logd_notify_event_contracts[] = {
       "dreamingwrt.routed.health", "warning", "WAN_FAILBACK", "" },
     { "network.wan", "wan.failover.recovered", "WAN_FAILBACK", "INTERNET_AND_WAN",
       "dreamingwrt.routed.health", "notice", "WAN_FAILOVER_ACTIVE", "WAN_FAILOVER_ACTIVE" },
+    { "network.wan", "wan.quality.degraded", "WAN_QUALITY_DEGRADED", "INTERNET_AND_WAN",
+      "dreamingwrt.routed.health", "warning", "WAN_QUALITY_RECOVERED", "" },
+    { "network.wan", "wan.quality.critical", "WAN_QUALITY_CRITICAL", "INTERNET_AND_WAN",
+      "dreamingwrt.routed.health", "critical", "WAN_QUALITY_RECOVERED", "" },
+    { "network.wan", "wan.penalty.recovering", "WAN_PENALTY_RECOVERING", "INTERNET_AND_WAN",
+      "dreamingwrt.routed.health", "notice", "WAN_QUALITY_RECOVERED", "" },
+    { "network.wan", "wan.quality.recovered", "WAN_QUALITY_RECOVERED", "INTERNET_AND_WAN",
+      "dreamingwrt.routed.health", "notice", "WAN_QUALITY_DEGRADED", "WAN_QUALITY_DEGRADED" },
+    { "network.wan", "wan.quality.critical_recovered", "WAN_QUALITY_RECOVERED", "INTERNET_AND_WAN",
+      "dreamingwrt.routed.health", "notice", "WAN_QUALITY_CRITICAL", "WAN_QUALITY_CRITICAL" },
 };
 
 static const struct logd_notify_event_contract *
@@ -471,7 +481,11 @@ static void logd_notify_dedupe_from_contract(const struct logd_notify_event_cont
     if (!c)
         return;
     if (!strcmp(c->event_code, "WAN_FAILOVER_ACTIVE") ||
-        !strcmp(c->event_code, "WAN_FAILBACK")) {
+        !strcmp(c->event_code, "WAN_FAILBACK") ||
+        !strcmp(c->event_code, "WAN_QUALITY_DEGRADED") ||
+        !strcmp(c->event_code, "WAN_QUALITY_CRITICAL") ||
+        !strcmp(c->event_code, "WAN_PENALTY_RECOVERING") ||
+        !strcmp(c->event_code, "WAN_QUALITY_RECOVERED")) {
         value = wan_id && wan_id[0] ? wan_id : "";
         if (!value[0]) value = logd_detail_str(detail, "wan_id");
         if (!value[0]) value = logd_detail_str(detail, "wan");
@@ -480,7 +494,11 @@ static void logd_notify_dedupe_from_contract(const struct logd_notify_event_cont
         if (!value[0]) value = logd_detail_str(detail, "iface");
         if (!value[0]) value = logd_detail_str(detail, "ifname");
         if (!value[0]) value = logd_detail_str(detail, "target");
-        snprintf(out, out_len, "wan_failover:%s", value[0] ? value : "unknown");
+        snprintf(out, out_len, "%s:%s",
+                 !strncmp(c->event_code, "WAN_QUALITY", 11) ||
+                 !strcmp(c->event_code, "WAN_PENALTY_RECOVERING") ?
+                    "wan_quality" : "wan_failover",
+                 value[0] ? value : "unknown");
     } else if (!strcmp(c->event_code, "PORT_LINK_DOWN") ||
                !strcmp(c->event_code, "PORT_LINK_UP")) {
         value = iface && iface[0] ? iface : "";
