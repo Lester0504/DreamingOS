@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 #include <json-c/json.h>
 #include "jmx_app_cache.h"
 
@@ -26,6 +27,7 @@ struct cache_entry {
 
 static struct cache_entry *g_buckets[CACHE_BUCKETS];
 static int g_entry_count = 0;
+static pthread_mutex_t g_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int64_t now_ms(void)
 {
@@ -64,10 +66,14 @@ static void free_entry(struct cache_entry *e)
 
 struct json_object *jmx_cache_get(const char *key)
 {
+    struct json_object *result = NULL;
+
     if (!key)
         return NULL;
+    pthread_mutex_lock(&g_cache_lock);
     struct cache_entry *e = find_entry(key);
-    if (!e) return NULL;
+    if (!e)
+        goto out;
     if (now_ms() >= e->expires_at) {
         /* expired — remove */
         unsigned int b = hash_key(key);
@@ -80,10 +86,12 @@ struct json_object *jmx_cache_get(const char *key)
         }
         g_entry_count--;
         free_entry(e);
-        return NULL;
+        goto out;
     }
-    /* Return a reference (increment refcount) */
-    return json_object_get(e->val);
+    result = json_object_get(e->val);
+out:
+    pthread_mutex_unlock(&g_cache_lock);
+    return result;
 }
 
 struct json_object *jmx_cache_get_allow_stale(const char *key,
@@ -101,14 +109,33 @@ struct json_object *jmx_cache_get_allow_stale(const char *key,
     if (!key || max_age_seconds <= 0)
         return NULL;
 
+    pthread_mutex_lock(&g_cache_lock);
     e = find_entry(key);
-    if (!e)
+    if (!e) {
+        pthread_mutex_unlock(&g_cache_lock);
         return NULL;
+    }
 
     now = now_ms();
     if (now - e->created_at > (int64_t)max_age_seconds * 1000 ||
         now >= e->stale_until) {
-        jmx_cache_invalidate(key);
+        unsigned int b = hash_key(key);
+        struct cache_entry *cur = g_buckets[b];
+        struct cache_entry *prev = NULL;
+
+        while (cur && cur != e) {
+            prev = cur;
+            cur = cur->next;
+        }
+        if (cur) {
+            if (prev)
+                prev->next = cur->next;
+            else
+                g_buckets[b] = cur->next;
+            g_entry_count--;
+            free_entry(cur);
+        }
+        pthread_mutex_unlock(&g_cache_lock);
         return NULL;
     }
 
@@ -116,7 +143,11 @@ struct json_object *jmx_cache_get_allow_stale(const char *key,
         *age_ms = (int)(now - e->created_at);
     if (is_stale)
         *is_stale = now >= e->expires_at;
-    return json_object_get(e->val);
+    {
+        struct json_object *result = json_object_get(e->val);
+        pthread_mutex_unlock(&g_cache_lock);
+        return result;
+    }
 }
 
 void jmx_cache_put(const char *key, struct json_object *val, int ttl_seconds)
@@ -130,6 +161,7 @@ void jmx_cache_put_with_stale(const char *key, struct json_object *val,
     if (!key || !val || ttl_seconds <= 0) return;
     if (stale_seconds < ttl_seconds)
         stale_seconds = ttl_seconds;
+    pthread_mutex_lock(&g_cache_lock);
 
     /* Evict if at capacity */
     if (g_entry_count >= CACHE_MAX_ENTRIES) {
@@ -162,8 +194,16 @@ void jmx_cache_put_with_stale(const char *key, struct json_object *val,
     }
 
     struct cache_entry *e = calloc(1, sizeof(*e));
-    if (!e) return;
+    if (!e) {
+        pthread_mutex_unlock(&g_cache_lock);
+        return;
+    }
     e->key = strdup(key);
+    if (!e->key) {
+        free(e);
+        pthread_mutex_unlock(&g_cache_lock);
+        return;
+    }
     e->val = json_object_get(val);
     e->created_at = now_ms();
     e->expires_at = e->created_at + (int64_t)ttl_seconds * 1000;
@@ -173,12 +213,14 @@ void jmx_cache_put_with_stale(const char *key, struct json_object *val,
     e->next = g_buckets[b];
     g_buckets[b] = e;
     g_entry_count++;
+    pthread_mutex_unlock(&g_cache_lock);
 }
 
 void jmx_cache_invalidate(const char *key)
 {
     if (!key)
         return;
+    pthread_mutex_lock(&g_cache_lock);
     unsigned int b = hash_key(key);
     struct cache_entry *e = g_buckets[b];
     struct cache_entry *prev = NULL;
@@ -188,17 +230,20 @@ void jmx_cache_invalidate(const char *key)
             else g_buckets[b] = e->next;
             g_entry_count--;
             free_entry(e);
+            pthread_mutex_unlock(&g_cache_lock);
             return;
         }
         prev = e;
         e = e->next;
     }
+    pthread_mutex_unlock(&g_cache_lock);
 }
 
 void jmx_cache_invalidate_prefix(const char *prefix)
 {
     if (!prefix)
         return;
+    pthread_mutex_lock(&g_cache_lock);
     int plen = (int)strlen(prefix);
     int i;
     for (i = 0; i < CACHE_BUCKETS; i++) {
@@ -218,12 +263,14 @@ void jmx_cache_invalidate_prefix(const char *prefix)
             e = e->next;
         }
     }
+    pthread_mutex_unlock(&g_cache_lock);
 }
 
 void jmx_cache_gc(void)
 {
     int64_t now = now_ms();
     int i;
+    pthread_mutex_lock(&g_cache_lock);
     for (i = 0; i < CACHE_BUCKETS; i++) {
         struct cache_entry *e = g_buckets[i];
         struct cache_entry *prev = NULL;
@@ -241,11 +288,13 @@ void jmx_cache_gc(void)
             e = e->next;
         }
     }
+    pthread_mutex_unlock(&g_cache_lock);
 }
 
 void jmx_cache_done(void)
 {
     int i;
+    pthread_mutex_lock(&g_cache_lock);
     for (i = 0; i < CACHE_BUCKETS; i++) {
         struct cache_entry *e = g_buckets[i];
         while (e) {
@@ -256,4 +305,5 @@ void jmx_cache_done(void)
         g_buckets[i] = NULL;
     }
     g_entry_count = 0;
+    pthread_mutex_unlock(&g_cache_lock);
 }
