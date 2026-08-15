@@ -10,7 +10,7 @@ export function mount(context = {}) {
     return { name, ok: response.ok && json?.ok !== false, data: json?.data ?? json, raw: json };
   });
 
-  const VERSION = '20260809-policy-table-acl-pending-reasons-01';
+  const VERSION = '20260814-policy-table-kit-fields-01';
   const ENDPOINT = '/api/v1/policy-engine/policy-table';
   const CATALOG_ENDPOINT = '/api/v1/policy-engine/catalog';
   /*
@@ -1086,7 +1086,7 @@ export function mount(context = {}) {
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
   }
   function formField(label, control, wide = false) {
-    return `<label class="policy-form-field${wide ? ' is-wide' : ''}"><span>${escapeHtml(label)}</span>${control}</label>`;
+    return `<label class="policy-form-field dwrt-kit-field${wide ? ' is-wide' : ''}" data-dwrt-component="field"><span>${escapeHtml(label)}</span>${control}</label>`;
   }
   function formInput(name, value, placeholder = '', type = 'text', list = '') {
     return `<input type="${type}" data-policy-draft="${name}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(placeholder)}"${list ? ` list="${escapeHtml(list)}"` : ''}>`;
@@ -1109,7 +1109,7 @@ export function mount(context = {}) {
     return `<section class="policy-editor-section ${className}">${title ? `<h3>${escapeHtml(title)}</h3>` : ''}<div class="policy-editor-section-body">${body}</div></section>`;
   }
   function editorField(label, control, hint = '') {
-    return `<label class="policy-editor-field"><span>${escapeHtml(label)}</span>${control}${hint ? `<small>${escapeHtml(hint)}</small>` : ''}</label>`;
+    return `<label class="policy-editor-field dwrt-kit-field" data-dwrt-component="field"><span>${escapeHtml(label)}</span>${control}${hint ? `<small>${escapeHtml(hint)}</small>` : ''}</label>`;
   }
   function radioGroup(field, value, options, label = field) {
     return `<div class="policy-choice-row" role="radiogroup" aria-label="${escapeHtml(label)}">${options.map(([key, text, disabled]) => `<label class="policy-choice${disabled ? ' is-disabled' : ''}"><input type="radio" name="policy-${escapeHtml(field)}" data-policy-radio="${escapeHtml(field)}" value="${escapeHtml(key)}" ${String(value) === String(key) ? 'checked' : ''} ${disabled ? 'disabled' : ''}><i></i><span>${escapeHtml(text)}</span></label>`).join('')}</div>`;

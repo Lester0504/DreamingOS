@@ -779,8 +779,11 @@
   display: flex;
   flex-wrap: wrap;
   flex: 0 0 auto;
-  min-height: 66px;
+  /* 换行后高度必须跟着行数长：写死 min-height 时第二行会溢出容器盒并压住下方
+     「名称」字段（实测 scrollHeight 102 / clientHeight 81，溢出 16px）。
+     用 align-content 排列多行，高度交给内容决定。 */
   align-items: center;
+  align-content: center;
   column-gap: 0;
   row-gap: 10px;
   padding: 4px 0 11px;
@@ -1130,7 +1133,43 @@
 }
 
 .policy-object-search svg { width: 16px; color: var(--app-text-muted); }
-.policy-object-search input { box-shadow: none !important; background: transparent !important; padding: 0 !important; }
+/*
+ * 搜索框必须显式夺回 position / opacity / pointer-events。
+ * `.policy-object-menu input` 那条规则把菜单内所有 input 设成
+ * `position:absolute; opacity:0; pointer-events:none` —— 它的目标是复选框的
+ * 原生方框（外观由相邻的 <i> 画），但选择器也命中了这个搜索框，于是搜索框
+ * 一直是隐形且点不中的：能聚焦、能收到键盘输入，但用户看不见自己打的字。
+ * 之前没暴露是因为它只做本地过滤；应用候选改成服务端搜索后这里是主路径。
+ */
+.policy-object-menu .policy-object-search input {
+  position: static;
+  opacity: 1;
+  pointer-events: auto;
+  min-width: 0;
+  border: 0;
+  color: var(--app-text);
+  font: inherit;
+  font-size: 12px;
+  /* 夺回 position 会让原生 search 外观一并回来（macOS/Chrome 的圆角框和 ✕
+     清除按钮），与本页其他无边框字段不一致，所以显式关掉。 */
+  appearance: none;
+  -webkit-appearance: none;
+  box-shadow: none !important;
+  background: transparent !important;
+  padding: 0 !important;
+}
+
+.policy-object-menu .policy-object-search input::placeholder { color: var(--app-text-muted); }
+.policy-object-menu .policy-object-search input::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+/*
+ * 默认聚焦环是方角实线，套在这个无边框输入框上显得比本页其他控件重得多。
+ * 换成同色细描边，仍然明确指示焦点位置（键盘操作要看得见），但收在容器风格里。
+ */
+.policy-object-menu .policy-object-search input:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--app-accent, #438bff) 60%, transparent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
 
 .policy-object-menu > div {
   max-height: 230px;
@@ -1157,11 +1196,100 @@
 .policy-object-menu label small { color: var(--app-text-muted); font-size: 10px; }
 .policy-object-menu p { margin: 18px 10px; color: var(--app-text-muted); font-size: 12px; text-align: center; }
 
+/*
+ * 空态里的下一步动作。放在 <p> 内联流里（父级已 text-align:center），
+ * 但必须自己占一行：作为 inline-block 跟在文案后面时，两者会在窄抽屉里挤成
+ * 一行且几乎相贴（实测 460px 抽屉下按钮左边缘紧贴「对象」二字）。
+ * 用 margin-inline: auto + display: block 居中独占一行，而不是在文案里插 <br>。
+ */
+.policy-picker-empty-action {
+  display: block;
+  width: fit-content;
+  margin-inline: auto;
+  margin-top: 8px;
+  padding: 5px 12px;
+  border: 1px solid color-mix(in srgb, var(--app-accent, var(--app-text)) 45%, transparent);
+  border-radius: 6px;
+  color: var(--app-accent, var(--app-text));
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.policy-picker-empty-action:hover {
+  background: color-mix(in srgb, var(--app-accent, var(--app-text)) 14%, transparent);
+}
+
+.policy-picker-empty-action:focus-visible {
+  outline: 2px solid var(--app-accent, var(--app-text));
+  outline-offset: 2px;
+}
+
+/*
+ * 应用候选的页脚：左侧写清"共 5873 个，已加载 500 个"这类截断状态，右侧是
+ * 加载更多 / 全选。只有服务端分页的候选源（applications）会渲染它。
+ * 计数文本可能长到换行，所以按 auto auto 放右侧两个按钮、左列自适应，
+ * 不给固定宽度，避免中文长句把按钮挤出容器。
+ */
+.policy-picker-foot {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 0 4px 0 11px;
+  border-top: 1px solid color-mix(in srgb, var(--app-text) 9%, transparent);
+}
+
+.policy-picker-foot > small {
+  min-width: 0;
+  padding: 8px 0;
+  color: var(--app-text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.policy-picker-foot > button {
+  min-height: 36px;
+  border: 0;
+  padding: 0 8px;
+  color: color-mix(in srgb, var(--app-accent, #438bff) 76%, var(--app-text) 24%);
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 680;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
 .policy-field-description {
   margin: 0;
   color: var(--app-text-muted);
   font-size: 12px;
   line-height: 1.55;
+}
+
+/* 说明文字里的旁路入口：是链接语义而不是主操作，所以不套 .policy-secondary
+   的按钮材质，只借用现有强调色与文字变量。 */
+.policy-inline-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--app-accent, #4c9dff);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.policy-inline-link:hover {
+  color: color-mix(in srgb, var(--app-accent, #4c9dff) 76%, var(--app-text) 24%);
+}
+
+.policy-inline-link:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--app-accent, #4c9dff) 60%, transparent);
+  outline-offset: 2px;
+  border-radius: 3px;
 }
 
 .policy-contract-gap {
