@@ -1630,26 +1630,34 @@ static void logd_unifi_bind_array(sqlite3_stmt *st, int *b, struct json_object *
 /*
  * Web operation audit predicate.
  *
- * A row belongs to the AUDIT ledger only when it is a real Web/user operation
- * record: the dedicated audit source, or the web audit event family written by
- * logd_add_audit_event(). System authentication noise (sshd/dropbear denials,
- * category='auth') is deliberately NOT audit: it is device-side security logging
- * and stays in GENERAL.
+ * A row belongs to the admin operation audit ledger only when webd explicitly
+ * marked it as one, i.e. detail_json.web_audit=1. That flag is set solely by the
+ * webd audit publisher for real management operations.
+ *
+ * The old predicate also accepted source='audit', category='audit', or
+ * source_id='audit'. Those are ambiguous: the retired logd collector path set
+ * category='audit' (and, downstream, source_id='audit') on any raw log line that
+ * merely contained "auth"/"login"/"dropbear"/"sudo", so an nginx 404 or an sshd
+ * probe landed in the ledger looking like an administrator action. Requiring the
+ * explicit flag is what the handoff means by "only an explicit admin audit
+ * domain/flag": system authentication noise now stays in GENERAL/SECURITY, and
+ * legacy misclassified rows drop out of the default AUDIT view by construction.
  */
 #define LOGD_IS_AUDIT_SQL \
-    "COALESCE(NULLIF(json_extract(detail_json,'$.source_id'),''),'')='audit' " \
-    "OR source='audit' OR category='audit' " \
-    "OR COALESCE(json_extract(detail_json,'$.web_audit'),0)=1"
+    "COALESCE(json_extract(detail_json,'$.web_audit'),0)=1"
 
 static int logd_unifi_is_web_audit(struct json_object *detail,
                                    const char *source, const char *category)
 {
-    const char *source_id = logd_json_obj_str(detail, "source_id");
-
-    return !strcmp(source_id, "audit") ||
-           (source && !strcmp(source, "audit")) ||
-           (category && !strcmp(category, "audit")) ||
-           logd_json_obj_i64(detail, "web_audit", 0) == 1;
+    /*
+     * Kept in lockstep with LOGD_IS_AUDIT_SQL: the explicit web_audit flag is the
+     * only admin-audit signal. source/category are intentionally unused now; they
+     * remain parameters so call sites need no churn and so the intent (they must
+     * not re-open the string-inferred path) is documented at the boundary.
+     */
+    (void)source;
+    (void)category;
+    return logd_json_obj_i64(detail, "web_audit", 0) == 1;
 }
 
 static void logd_unifi_append_in_clause(char *sql, size_t sql_len, const char *column,

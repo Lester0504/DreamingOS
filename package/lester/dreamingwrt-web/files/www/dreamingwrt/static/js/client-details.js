@@ -12,6 +12,10 @@
   const CONNECTION_COLUMN_KEY = 'dreamingwrt.web.clientDetails.connectionColumns';
   const CONNECTION_OPTION_TAB_KEY = 'dreamingwrt.web.clientDetails.connectionOptionTab';
   const CONNECTION_AUTO_KEY = 'dreamingwrt.web.clientDetails.connectionAutoRefresh';
+  const CONNECTION_VIRTUAL_THRESHOLD = 160;
+  const CONNECTION_VIRTUAL_ROW_HEIGHT = 54;
+  const CONNECTION_VIRTUAL_OVERSCAN = 10;
+  const CONNECTION_VIRTUAL_DEFAULT_VIEWPORT = 560;
   const RATE_HOLD_MS = 9000;
   const PROTOCOL_CHART_MODE_KEY = 'dreamingwrt.web.clientDetails.protocolChartMode';
   const PROTOCOL_LEGEND_KEY = 'dreamingwrt.web.clientDetails.protocolLegend';
@@ -354,6 +358,7 @@
           const maxLeft = Math.max(0, node.scrollWidth - node.clientWidth);
           node.scrollTop = Math.min(maxTop, Math.max(0, value.top || 0));
           node.scrollLeft = Math.min(maxLeft, Math.max(0, value.left || 0));
+          if (key === 'connectionTable') scheduleConnectionVirtualWindow(node);
         });
       };
       window.requestAnimationFrame(() => {
@@ -2359,12 +2364,12 @@
       const scrollTop = scroll ? scroll.scrollTop : 0;
       const scrollLeft = scroll ? scroll.scrollLeft : 0;
       const nextMarkup = state.filtered.length
-        ? connectionTableMarkup(state.filtered, state.columns)
+        ? connectionTableMarkup(state.filtered, state.columns, scrollTop, scroll && scroll.clientHeight)
         : detailEmpty(state.rows.length ? '当前筛选条件下没有连接。' : '后端暂未返回该终端的连接明细。');
       const nextSignature = connectionStructureSignature(state.filtered, state.columns);
       const nextColumnsSignature = connectionColumnsSignature(state.columns);
       if (state.filtered.length && host.querySelector('.client-connection-table') && host.dataset.clientConnectionColumns === nextColumnsSignature) {
-        patchConnectionTableRows(host, state.filtered, state.columns);
+        patchConnectionTableRows(host, state.filtered, state.columns, scroll);
         host.dataset.clientConnectionSignature = nextSignature;
       } else if (host.dataset.clientConnectionSignature !== nextSignature || host.dataset.clientConnectionColumns !== nextColumnsSignature) {
         host.innerHTML = nextMarkup;
@@ -3136,14 +3141,107 @@
       return { label: '--', connected: false };
     }
 
+    function compactCategoryLabel(key) {
+      const normalized = firstText(key).toLowerCase();
+      if (!normalized || normalized === 'unknown_application' || normalized === 'unknown') return '未知应用';
+      const category = PROTOCOL_CATEGORIES.find((item) => item.key === normalized);
+      return category ? category.label : normalized;
+    }
+
+    function compactRowToItem(row, columns) {
+      if (Array.isArray(row)) {
+        const item = {};
+        (columns || []).forEach((key, index) => { item[key] = row[index]; });
+        row = item;
+      }
+      if (!row || typeof row !== 'object') return {};
+      return { ...row, __compact: true, id: firstText(row.id), category_key: firstText(row.category_key, 'unknown_application') };
+    }
+
+    function compactSnapshotRows(snapshot) {
+      const columns = Array.isArray(snapshot && snapshot.columns) ? snapshot.columns : [];
+      return (Array.isArray(snapshot && snapshot.rows) ? snapshot.rows : []).map((row) => compactRowToItem(row, columns));
+    }
+
+    function compactSnapshotState(mac) {
+      const state = page && page.detail && page.detail.connectionSnapshot;
+      return state && String(state.mac || '').toLowerCase() === String(mac || '').toLowerCase() ? state : null;
+    }
+
+    function compactSnapshotMap(snapshot, mac) {
+      const rows = compactSnapshotRows(snapshot);
+      const map = new Map();
+      rows.forEach((row) => { if (row.id) map.set(row.id, row); });
+      return {
+        mac, map, columns: Array.isArray(snapshot && snapshot.columns) ? snapshot.columns : [],
+        snapshotId: firstText(snapshot && snapshot.snapshot_id), revision: Number(snapshot && snapshot.revision) || 0,
+        total: Number(snapshot && snapshot.total) || rows.length, observedAt: Number(snapshot && snapshot.observed_at) || 0,
+        stale: Boolean(snapshot && snapshot.stale), degraded: Boolean(snapshot && snapshot.degraded),
+        degradedReasons: Array.isArray(snapshot && snapshot.degraded_reasons) ? snapshot.degraded_reasons : [], ready: true
+      };
+    }
+
+    function compactRowsForRendering(state) { return state && state.map ? Array.from(state.map.values()) : []; }
+
+    async function loadCompactConnections(mac, options = {}) {
+      if (!page || !page.active || !mac) return false;
+      const preserve = Boolean(options && options.preserve);
+      const result = await fetchApiResource('client_connections_snapshot', `/api/v1/clients/${encodeURIComponent(mac)}/connections/snapshot`);
+      if (!page || !page.active || String(page.detail.mac).toLowerCase() !== String(mac).toLowerCase()) return false;
+      if (!result.ok) { page.connectionNotice = '连接快照暂不可用，将保留当前数据。'; return false; }
+      const snapshot = result.data || {};
+      page.detail.connectionSnapshot = compactSnapshotMap(snapshot, mac);
+      page.detail.profile = { ...(page.detail.profile || {}), connections: compactSnapshotRows(snapshot) };
+      page.connectionNotice = page.detail.connectionSnapshot.degraded ? '应用识别覆盖有限' : '';
+      page.detailRealtimeDataLastAt = Date.now();
+      if (!(preserve && patchConnectionDetailPanel())) renderOrDefer('connection-snapshot-loaded');
+      subscribeCompactConnections(mac);
+      return true;
+    }
+
+    function applyCompactDelta(payload = {}) {
+      if (!page || !page.detail || !page.detail.open || page.detail.tab !== 'connection') return false;
+      const state = compactSnapshotState(page.detail.mac);
+      if (!state || !state.ready) return false;
+      const data = payload && payload.data && typeof payload.data === 'object' ? payload.data : payload;
+      if (firstText(data.type) === 'resync_required') { loadCompactConnections(page.detail.mac, { preserve: true }); return true; }
+      const baseRevision = Number(data.base_revision), revision = Number(data.revision);
+      if (firstText(data.snapshot_id) !== state.snapshotId || baseRevision !== state.revision || !Number.isFinite(revision) || revision < baseRevision) {
+        loadCompactConnections(page.detail.mac, { preserve: true }); return true;
+      }
+      const columns = Array.isArray(data.columns) && data.columns.length ? data.columns : state.columns;
+      const next = new Map(state.map);
+      (Array.isArray(data.upserts) ? data.upserts : []).forEach((row) => { const item = compactRowToItem(row, columns); if (item.id) next.set(item.id, item); });
+      (Array.isArray(data.removed) ? data.removed : []).forEach((id) => next.delete(String(id)));
+      state.map = next; state.columns = columns; state.revision = revision; state.observedAt = Number(data.observed_at) || state.observedAt;
+      page.detail.profile = { ...(page.detail.profile || {}), connections: compactRowsForRendering(state) };
+      page.detailRealtimeDataLastAt = Date.now(); scheduleDetailRealtimeRender();
+      return true;
+    }
+
+    function subscribeCompactConnections(mac) {
+      if (!page || !page.active || !realtime || typeof realtime.subscribeParameterized !== 'function' || !mac) return;
+      unsubscribeCompactConnections();
+      const state = compactSnapshotState(mac);
+      if (!state || !state.ready) return;
+      page.compactConnectionUnsubscribe = realtime.subscribeParameterized('client.connections.v2', { mac, snapshot_id: state.snapshotId, since_revision: state.revision }, applyCompactDelta);
+    }
+
+    function unsubscribeCompactConnections() {
+      if (page && page.compactConnectionUnsubscribe) page.compactConnectionUnsubscribe();
+      if (page) page.compactConnectionUnsubscribe = null;
+    }
+
     function normalizeConnection(item = {}, index = 0, client = {}) {
       const proto = normalizeProtocolKey(firstText(item.proto, item.protocol, item.l4_proto, item.ip_proto, item.transport, item.type));
       const status = statusInfo(item);
-      const externalIp = firstText(
-        item.external_ip, item.wan_ip, item.src_nat_ip, item.snat_ip, item.public_ip,
-        item.nat_ip, item.outer_ip, item.src_ip, item.source_ip, item.local_ip, item.client_ip,
-        client.ip
-      );
+      const externalIp = item.__compact
+        ? firstText(item.external_ip)
+        : firstText(
+          item.external_ip, item.wan_ip, item.src_nat_ip, item.snat_ip, item.public_ip,
+          item.nat_ip, item.outer_ip, item.src_ip, item.source_ip, item.local_ip, item.client_ip,
+          client.ip
+        );
       const line = firstText(
         item.line_label, item.line_name, item.wan_label, item.wan_name, item.line, item.wan,
         item.iface_name, item.ifname, item.interface, item.out_iface, item.egress_if,
@@ -3154,11 +3252,11 @@
         index,
         raw: item,
         id: firstText(item.id, item.conn_id, item.connection_id, item.flow_id, item.uuid, item.ct_id, item.handle, item.key),
-        app: guessAppName(item, proto),
+        app: item.__compact ? (normalizeAppLabel(item.app_name, proto) || compactCategoryLabel(item.category_key)) : guessAppName(item, proto),
         proto: proto || '--',
         protoKey: proto || 'other',
-        line,
-        lineKey: line,
+        line: firstText(item.wan_id, line),
+        lineKey: firstText(item.wan_id, line),
         externalIp: externalIp || '--',
         domain: firstText(item.domain, item.host, item.hostname, item.sni, item.server_name, item.fqdn, item.url, '--'),
         srcPort: firstText(item.src_port, item.sport, item.source_port, item.local_port, item.orig_sport, '--'),
@@ -3192,6 +3290,16 @@
     }
 
     function connectionRows(profile, client = {}) {
+      /* The v2 snapshot is the sole connection source once it is ready.  A
+       * legacy client_profile can still carry connection_rows/sessions/flows
+       * from the old 200-row path; appending those arrays reintroduces stale
+       * "unknown protocol" rows after the compact Map has loaded. */
+      const compact = compactSnapshotState(page && page.detail && page.detail.mac);
+      if (compact && compact.ready) {
+        return compactRowsForRendering(compact)
+          .map((item, index) => normalizeConnection(item, index, client))
+          .filter((row) => row && row.id);
+      }
       const rows = [];
       const sources = [
         profile.connections, profile.connection_rows, profile.connection_details,
@@ -3333,21 +3441,51 @@
       return template.content.firstElementChild;
     }
 
-    function connectionTableMarkup(filtered, columns) {
+    function connectionVirtualWindow(filtered, scrollTop = 0, viewportHeight = CONNECTION_VIRTUAL_DEFAULT_VIEWPORT) {
+      const total = filtered.length;
+      if (total <= CONNECTION_VIRTUAL_THRESHOLD) {
+        return { virtual: false, start: 0, end: total, top: 0, bottom: 0, rows: filtered };
+      }
+      const visible = Math.max(1, Math.ceil((Number(viewportHeight) || CONNECTION_VIRTUAL_DEFAULT_VIEWPORT) / CONNECTION_VIRTUAL_ROW_HEIGHT));
+      const first = Math.max(0, Math.floor(Math.max(0, Number(scrollTop) || 0) / CONNECTION_VIRTUAL_ROW_HEIGHT));
+      const start = Math.max(0, first - CONNECTION_VIRTUAL_OVERSCAN);
+      const end = Math.min(total, first + visible + CONNECTION_VIRTUAL_OVERSCAN);
+      return {
+        virtual: true, start, end,
+        top: start * CONNECTION_VIRTUAL_ROW_HEIGHT,
+        bottom: Math.max(0, (total - end) * CONNECTION_VIRTUAL_ROW_HEIGHT),
+        rows: filtered.slice(start, end)
+      };
+    }
+
+    function connectionVirtualSpacerMarkup(height, columns, edge) {
+      if (!(height > 0)) return '';
+      return `<tr class="client-connection-virtual-spacer is-${edge}" aria-hidden="true"><td colspan="${columns.length}" style="height:${height}px"></td></tr>`;
+    }
+
+    function connectionVirtualBodyMarkup(view, columns) {
+      return `${connectionVirtualSpacerMarkup(view.top, columns, 'top')}${view.rows.map((row) => connectionRowMarkup(row, columns)).join('')}${connectionVirtualSpacerMarkup(view.bottom, columns, 'bottom')}`;
+    }
+
+    function connectionTableMarkup(filtered, columns, scrollTop = 0, viewportHeight = CONNECTION_VIRTUAL_DEFAULT_VIEWPORT) {
       const minWidth = Math.max(1120, columns.length * 142);
-      return `<div class="client-connection-table-scroll">
+      const view = connectionVirtualWindow(filtered, scrollTop, viewportHeight);
+      return `<div class="client-connection-table-scroll" data-client-connection-virtual="${view.virtual ? 'true' : 'false'}">
         <table class="client-connection-table" style="min-width:${minWidth}px">
           <thead><tr>${columns.map((column) => `<th data-column="${escapeHtml(column.key)}">${escapeHtml(column.label)}</th>`).join('')}</tr></thead>
-          <tbody>${filtered.map((row) => connectionRowMarkup(row, columns)).join('')}</tbody>
+          <tbody data-client-virtual-start="${view.start}" data-client-virtual-end="${view.end}" data-client-virtual-total="${filtered.length}">${connectionVirtualBodyMarkup(view, columns)}</tbody>
         </table>
       </div>`;
     }
 
     function connectionStructureSignature(filtered, columns) {
-      return JSON.stringify({
-        columns: columns.map((column) => column.key),
-        rows: filtered.map((row) => row.signature || connectionSignature(row))
-      });
+      const first = filtered[0];
+      const last = filtered[filtered.length - 1];
+      return [
+        connectionColumnsSignature(columns), filtered.length,
+        first ? first.signature || connectionSignature(first) : '',
+        last ? last.signature || connectionSignature(last) : ''
+      ].join('|');
     }
 
     function patchConnectionTableCells(host, filtered, columns) {
@@ -3408,12 +3546,15 @@
       return false;
     }
 
-    function patchConnectionTableRows(host, filtered, columns) {
+    function patchConnectionTableRows(host, filtered, columns, scrollNode = null) {
       const table = host && host.querySelector('.client-connection-table');
       const tbody = table && table.querySelector('tbody');
       if (!table || !tbody) return false;
       table.style.minWidth = `${Math.max(1120, columns.length * 142)}px`;
-      const desiredKeys = new Set(filtered.map((row) => row.signature || connectionSignature(row)));
+      const scroll = scrollNode || host.querySelector('.client-connection-table-scroll');
+      const view = connectionVirtualWindow(filtered, scroll && scroll.scrollTop, scroll && scroll.clientHeight);
+      if (scroll) scroll.dataset.clientConnectionVirtual = view.virtual ? 'true' : 'false';
+      const desiredKeys = new Set(view.rows.map((row) => row.signature || connectionSignature(row)));
       Array.from(tbody.querySelectorAll('[data-client-connection-row]')).forEach((rowNode) => {
         if (!desiredKeys.has(rowNode.dataset.clientConnectionRow || '')) rowNode.remove();
       });
@@ -3421,20 +3562,58 @@
       tbody.querySelectorAll('[data-client-connection-row]').forEach((rowNode) => {
         existing.set(rowNode.dataset.clientConnectionRow || '', rowNode);
       });
-      filtered.forEach((row) => {
+      const fragment = document.createDocumentFragment();
+      view.rows.forEach((row) => {
         const key = row.signature || connectionSignature(row);
         let rowNode = existing.get(key);
         if (!rowNode) {
           rowNode = createConnectionRowNode(row, columns);
-          tbody.appendChild(rowNode);
           existing.set(key, rowNode);
         }
         columns.forEach((column) => {
           const cell = rowNode.querySelector(`td[data-column="${column.key}"]`);
           patchConnectionTableCell(cell, row, column.key);
         });
+        fragment.appendChild(rowNode);
       });
+      tbody.replaceChildren();
+      if (view.top > 0) {
+        const template = document.createElement('template');
+        template.innerHTML = connectionVirtualSpacerMarkup(view.top, columns, 'top');
+        tbody.appendChild(template.content);
+      }
+      tbody.appendChild(fragment);
+      if (view.bottom > 0) {
+        const template = document.createElement('template');
+        template.innerHTML = connectionVirtualSpacerMarkup(view.bottom, columns, 'bottom');
+        tbody.appendChild(template.content);
+      }
+      tbody.dataset.clientVirtualStart = String(view.start);
+      tbody.dataset.clientVirtualEnd = String(view.end);
+      tbody.dataset.clientVirtualTotal = String(filtered.length);
       return true;
+    }
+
+    function patchConnectionVirtualWindow(scroll) {
+      if (!scroll || !page || !page.active || page.detail.tab !== 'connection') return false;
+      const context = currentDetailContext();
+      if (!context) return false;
+      const state = connectionPanelState(context.client, context.profile, context.merged);
+      const host = scroll.closest('.client-connection-table-host');
+      return patchConnectionTableRows(host, state.filtered, state.columns, scroll);
+    }
+
+    function scheduleConnectionVirtualWindow(scroll) {
+      if (!page || !scroll) return;
+      page.connectionVirtualScroll = scroll;
+      if (page.connectionVirtualRaf) return;
+      page.connectionVirtualRaf = window.requestAnimationFrame(() => {
+        if (!page) return;
+        page.connectionVirtualRaf = 0;
+        const target = page.connectionVirtualScroll;
+        page.connectionVirtualScroll = null;
+        patchConnectionVirtualWindow(target);
+      });
     }
 
     function connectionPanelState(client, profile, merged) {
@@ -3654,20 +3833,20 @@
             <input type="hidden" name="mac" value="${escapeHtml(firstText(client.mac, page.detail && page.detail.mac))}">
             ${editing ? `<input type="hidden" name="id" value="${escapeHtml(draft.id)}">` : ''}
             <section class="client-control-form-card">
-              <label class="client-control-field"><span>管控类型 <em>*</em></span><select name="control_type" data-client-control-type>${CONTROL_TYPES.map((item) => {
+              <label class="client-control-field dwrt-kit-field" data-dwrt-component="field"><span>管控类型 <em>*</em></span><select name="control_type" data-client-control-type>${CONTROL_TYPES.map((item) => {
                 const available = controlCapability(item.capability);
                 return `<option value="${escapeHtml(item.value)}" ${activeType === item.value ? 'selected' : ''} ${available ? '' : 'disabled'}>${escapeHtml(item.label)}${available ? '' : '（未开放）'}</option>`;
               }).join('')}</select></label>
               <p class="client-control-hint">${escapeHtml(firstText((CONTROL_TYPES.find((item) => item.value === activeType) || {}).detail))}</p>
               ${CONTROL_TYPES.filter((item) => !controlCapability(item.capability)).length ? `<p class="client-control-hint is-muted">${escapeHtml(CONTROL_TYPES.filter((item) => !controlCapability(item.capability)).map((item) => item.label).join('、'))} 暂无数据面支持，保存会被后端拒绝，因此这里不可选。</p>` : ''}
               <label class="client-control-field"><span>名称 <em>*</em></span><input name="name" value="${escapeHtml(firstText(draft.name))}" placeholder="请输入名称" maxlength="128" required></label>
-              <label class="client-control-field"><span>生效时间 <em>*</em></span><select name="schedule_mode" data-client-control-schedule>${CONTROL_SCHEDULE_MODES.map((mode) => `<option value="${mode.value}" ${scheduleMode === mode.value ? 'selected' : ''}>${escapeHtml(mode.label)}</option>`).join('')}</select></label>
+              <label class="client-control-field dwrt-kit-field" data-dwrt-component="field"><span>生效时间 <em>*</em></span><select name="schedule_mode" data-client-control-schedule>${CONTROL_SCHEDULE_MODES.map((mode) => `<option value="${mode.value}" ${scheduleMode === mode.value ? 'selected' : ''}>${escapeHtml(mode.label)}</option>`).join('')}</select></label>
               ${showDays ? `<div class="client-control-field"><span>周期</span><div class="client-control-weekdays">${weekdays.map((day) => `<label class="${selectedDays.has(day) ? 'is-active' : ''}"><input type="checkbox" name="days" value="${day}" ${selectedDays.has(day) ? 'checked' : ''}>${day}</label>`).join('')}</div></div>` : ''}
               ${showTimes ? `<div class="client-control-field"><span>时间范围</span><div class="client-control-time-range"><input name="start_time" value="${escapeHtml(firstText(draft.start_time, '00:00'))}" placeholder="00:00" pattern="[0-9]{1,2}:[0-9]{2}"><span>→</span><input name="end_time" value="${escapeHtml(firstText(draft.end_time, '23:59'))}" placeholder="23:59" pattern="[0-9]{1,2}:[0-9]{2}"></div></div>` : ''}
-              <label class="client-control-field"><span>上行限速 <em>*</em></span><div class="client-control-input-unit"><input name="up_limit" inputmode="decimal" value="${escapeHtml(firstText(draft.up_limit, '0'))}"><select name="up_unit">${unit('up_unit', draft.up_unit)}</select></div></label>
-              <label class="client-control-field"><span>下行限速 <em>*</em></span><div class="client-control-input-unit"><input name="down_limit" inputmode="decimal" value="${escapeHtml(firstText(draft.down_limit, '0'))}"><select name="down_unit">${unit('down_unit', draft.down_unit)}</select></div></label>
+              <label class="client-control-field dwrt-kit-field" data-dwrt-component="field"><span>上行限速 <em>*</em></span><div class="client-control-input-unit"><input name="up_limit" inputmode="decimal" value="${escapeHtml(firstText(draft.up_limit, '0'))}"><select name="up_unit">${unit('up_unit', draft.up_unit)}</select></div></label>
+              <label class="client-control-field dwrt-kit-field" data-dwrt-component="field"><span>下行限速 <em>*</em></span><div class="client-control-input-unit"><input name="down_limit" inputmode="decimal" value="${escapeHtml(firstText(draft.down_limit, '0'))}"><select name="down_unit">${unit('down_unit', draft.down_unit)}</select></div></label>
               <p class="client-control-hint">0 表示不限制（后端记为 <code>zero_limit_means_unlimited</code>）。</p>
-              <label class="client-control-field"><span>协议</span><select name="protocol">${CONTROL_PROTOCOLS.map((item) => `<option value="${item}" ${firstText(draft.protocol, '任意') === item ? 'selected' : ''}>${item}</option>`).join('')}</select></label>
+              <label class="client-control-field dwrt-kit-field" data-dwrt-component="field"><span>协议</span><select name="protocol">${CONTROL_PROTOCOLS.map((item) => `<option value="${item}" ${firstText(draft.protocol, '任意') === item ? 'selected' : ''}>${item}</option>`).join('')}</select></label>
               <label class="client-control-field"><span>备注</span><textarea name="note" rows="4" maxlength="1024">${escapeHtml(firstText(draft.note))}</textarea></label>
               <input type="hidden" name="limit_mode" value="独立限速">
               <input type="hidden" name="line" value="">
@@ -3771,7 +3950,7 @@
               <em>从图库选择</em>
             </button>
             <div class="client-custom-fields">
-              <label><span>设备类型</span><select name="device_type">
+              <label class="dwrt-kit-field" data-dwrt-component="field"><span>设备类型</span><select name="device_type">
                 ${[
                   ['unknown', '未知'], ['smartphone', '手机'], ['tablet', '平板'], ['computer', '电脑'], ['router', '路由器'],
                   ['nas', 'NAS'], ['iot', 'IoT'], ['speaker', '音箱'], ['tv', '电视'], ['printer', '打印机'],
@@ -3863,7 +4042,7 @@
             <label><input type="radio" name="client-column-filter-mode" value="include" ${mode === 'include' ? 'checked' : ''}> <span>包含</span></label>
             <label><input type="radio" name="client-column-filter-mode" value="exclude" ${mode === 'exclude' ? 'checked' : ''}> <span>排除</span></label>
           </div>
-          <div class="client-column-filter-value">
+          <div class="client-column-filter-value dwrt-kit-field" data-dwrt-component="field-group">
             <input type="number" min="0" step="any" value="${escapeHtml(filter.value ?? '')}" placeholder="请输入数值" data-client-column-filter-value>
             <select data-client-column-filter-unit>
               ${units.map((item) => `<option value="${escapeHtml(item)}" ${item === unit ? 'selected' : ''}>${escapeHtml(item)}</option>`).join('')}
@@ -3924,7 +4103,7 @@
               <label><span>VLAN</span><input data-client-filter-vlan value="${escapeHtml(page.filters.vlan || '')}" placeholder="VLAN ID"></label>
               <label><span>今日上行 GB</span><input type="number" min="0" data-client-filter-min-up value="${escapeHtml(page.filters.minUpGb || '')}" placeholder="大于等于"></label>
               <label><span>今日下行 GB</span><input type="number" min="0" data-client-filter-min-down value="${escapeHtml(page.filters.minDownGb || '')}" placeholder="大于等于"></label>
-              <label><span>协议版本</span><select data-client-filter-ip-version>
+              <label class="dwrt-kit-field" data-dwrt-component="field"><span>协议版本</span><select data-client-filter-ip-version>
                 <option value="" ${!page.filters.ipVersion ? 'selected' : ''}>全部</option>
                 <option value="ipv4" ${page.filters.ipVersion === 'ipv4' ? 'selected' : ''}>仅 IPv4</option>
                 <option value="ipv6" ${page.filters.ipVersion === 'ipv6' ? 'selected' : ''}>有 IPv6</option>
@@ -4395,7 +4574,16 @@
         if (patch.protocol_summary.rate_history) merged.protocol_summary.rate_history = trimRealtimeList(mergeListUniqueBySignature(prev.rate_history, patch.protocol_summary.rate_history, 96), 96);
         if (patch.protocol_summary.history) merged.protocol_summary.history = trimRealtimeList(mergeListUniqueBySignature(prev.history, patch.protocol_summary.history, 96), 96);
       }
-      if (patch.connections) merged.connections = patch.connections;
+      if (patch.connections) {
+        /* Once the compact v2 snapshot exists it is the sole source of truth
+         * for the connection tab.  The legacy client.detail/profile topics can
+         * arrive later (or finish a racing request later) and must not replace
+         * the Map-backed snapshot with the old rich connection array. */
+        const compact = compactSnapshotState(page.detail.mac);
+        merged.connections = compact && compact.ready
+          ? compactRowsForRendering(compact)
+          : patch.connections;
+      }
       ['visits', 'visit_list', 'app_history', 'records', 'online_history', 'lines', 'policies'].forEach((key) => {
         if (patch[key] !== undefined) merged[key] = Array.isArray(patch[key]) ? patch[key] : patch[key];
       });
@@ -4492,9 +4680,7 @@
         'topology.flow',
         'client.detail',
         'client.overview',
-        'client.protocols',
-        'client.connections',
-        'client.conntrack'
+        'client.protocols'
       ];
       page.realtimeUnsubscribers = topics.map((topic) => realtime.subscribe(topic, (data) => applyClientRealtime(topic, data)));
     }
@@ -4581,7 +4767,9 @@
       if (result.ok && root.querySelector('.client-table-panel')) refreshTableFromData();
       else renderOrDefer('load-clients');
       const detailWsFresh = page.detailRealtimeDataLastAt && Date.now() - page.detailRealtimeDataLastAt < 12000;
-      if (page.detail && page.detail.open && ['connection', 'protocol'].includes(page.detail.tab) && page.connectionAutoRefresh !== false && !detailWsFresh) {
+      if (page.detail && page.detail.open && page.detail.tab === 'connection' && page.connectionAutoRefresh !== false && !detailWsFresh) {
+        loadCompactConnections(page.detail.mac, { preserve: true });
+      } else if (page.detail && page.detail.open && page.detail.tab === 'protocol' && page.connectionAutoRefresh !== false && !detailWsFresh) {
         loadProfile(page.detail.mac, { preserve: true });
       }
     }
@@ -4589,6 +4777,9 @@
     async function loadProfile(mac, options = {}) {
       if (!page || !page.active || !mac) return;
       const preserve = Boolean(options && options.preserve);
+      const includeConnections = options && options.includeConnections !== undefined
+        ? Boolean(options.includeConnections)
+        : true;
       if (preserve && page.detail.profileRefreshing) return;
       page.detail.profileRefreshing = true;
       if (!preserve) {
@@ -4596,12 +4787,18 @@
         page.detail.profile = {};
         renderOrDefer('profile-loading');
       }
-      const result = await fetchApiResource('client_profile', `/api/v1/client_profile?mac=${encodeURIComponent(mac)}`);
+      const profileQuery = `mac=${encodeURIComponent(mac)}&include_connections=${includeConnections ? '1' : '0'}`;
+      const result = await fetchApiResource('client_profile', `/api/v1/client_profile?${profileQuery}`);
       if (!page || !page.active || String(page.detail.mac).toLowerCase() !== String(mac).toLowerCase()) return;
       page.detail.loading = false;
       page.detail.profileRefreshing = false;
       const profileData = result.ok ? result.data || {} : { error: result.error && result.error.message };
-      page.detail.profile = profileData;
+      const compact = compactSnapshotState(mac);
+      /* client_profile is still used by overview/protocol tabs, but its legacy
+       * connections array is not allowed to win a race against v2 snapshot. */
+      page.detail.profile = compact && compact.ready
+        ? { ...profileData, connections: compactRowsForRendering(compact) }
+        : profileData;
       if (result.ok) {
         const target = String(mac || '').toLowerCase();
         page.clients = page.clients.map((client) => String(client.mac || '').toLowerCase() === target ? profileClient(client, profileData) : client);
@@ -5134,6 +5331,7 @@
       const close = event.target.closest('[data-client-detail-close]');
       if (close) {
         page.detail.open = false;
+        unsubscribeCompactConnections();
         render();
         return;
       }
@@ -5382,14 +5580,17 @@
         page.detail.tab = detailTab.dataset.value || 'overview';
         page.connectionOptionsOpen = false;
         render();
-        if (['connection', 'protocol'].includes(page.detail.tab) && page.detail.mac) loadProfile(page.detail.mac, { preserve: true });
+        if (page.detail.tab === 'connection' && page.detail.mac) loadCompactConnections(page.detail.mac, { preserve: true });
+        else if (page.detail.tab === 'protocol' && page.detail.mac) loadProfile(page.detail.mac, { preserve: true });
+        else unsubscribeCompactConnections();
         return;
       }
       if (event.target.closest('button, input, label, a, select')) return;
       const row = event.target.closest('[data-client-mac]');
       if (row && row.dataset.clientMac) {
+        unsubscribeCompactConnections();
         page.detail = { open: true, mac: row.dataset.clientMac, tab: 'overview', loading: false, profile: {} };
-        loadProfile(row.dataset.clientMac);
+        loadProfile(row.dataset.clientMac, { includeConnections: false });
       }
     }
 
@@ -5450,6 +5651,7 @@
       if (!page || !page.active || !root || !root.contains(event.target)) return;
       const target = event.target;
       if (!SCROLL_SELECTORS.some(([, selector]) => target.matches && target.matches(selector))) return;
+      if (target.matches('.client-connection-table-scroll')) scheduleConnectionVirtualWindow(target);
       page.scrollRestoreToken = (page.scrollRestoreToken || 0) + 1;
       rememberScrollState();
     }
@@ -5694,6 +5896,8 @@
         connectionColumns: parseConnectionColumns(),
         connectionAutoRefresh: readStored(CONNECTION_AUTO_KEY, '1') !== '0',
         connectionNotice: '',
+        connectionVirtualRaf: 0,
+        connectionVirtualScroll: null,
         controlEditorOpen: false,
         controlDraft: null,
         controlNotice: '',
@@ -5715,6 +5919,7 @@
         error: '',
         loading: false,
         detail: { open: false, mac: '', tab: 'overview', loading: false, profile: {}, profileRefreshing: false },
+        compactConnectionUnsubscribe: null,
         realtimeUnsubscribers: null,
         timer: window.setInterval(loadClients, REFRESH_MS),
         flowTimer: window.setInterval(loadTopologyFlowRuntime, 2000),
@@ -5736,10 +5941,11 @@
       page.onOpenClientDetail = (event) => {
         const mac = firstText(event?.detail?.mac);
         if (!page || !page.active || !mac) return;
+        unsubscribeCompactConnections();
         try { sessionStorage.removeItem('dreamingwrt.clientDetails.initialMac'); } catch (_) {}
         page.detail = { open: true, mac, tab: 'overview', loading: false, profile: {} };
         render();
-        loadProfile(mac);
+        loadProfile(mac, { includeConnections: false });
       };
       window.addEventListener('dwrt:open-client-detail', page.onOpenClientDetail);
       root.addEventListener('click', handleClick);
@@ -5757,7 +5963,7 @@
       render();
       subscribeClientRealtime();
       if (!(page.detail && page.detail.open && page.detail.mac === 'demo-mac')) loadClients();
-      if (initialDetailMac) loadProfile(initialDetailMac);
+      if (initialDetailMac) loadProfile(initialDetailMac, { includeConnections: false });
       loadTopologyFlowRuntime();
       loadIpv6Context();
       loadIpv6Neighbors();
@@ -5770,6 +5976,7 @@
           window.clearInterval(page.flowTimer);
           window.clearInterval(page.ipv6Timer);
           unsubscribeClientRealtime();
+          unsubscribeCompactConnections();
           disposeOverviewCharts();
           disposeProtocolCharts();
           window.clearTimeout(page.overviewChartTimer);
@@ -5780,6 +5987,7 @@
           window.clearTimeout(page.protocolControlNoticeTimer);
           window.clearTimeout(page.detailRealtimeTimer);
           window.clearTimeout(page.tableRenderTimer);
+          if (page.connectionVirtualRaf) window.cancelAnimationFrame(page.connectionVirtualRaf);
           page.foregroundObserver?.disconnect();
           root.removeEventListener('click', handleClick);
           root.removeEventListener('input', handleInput);

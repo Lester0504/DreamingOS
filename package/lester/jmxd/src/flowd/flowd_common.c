@@ -154,6 +154,60 @@ int flowd_token_ok(const char *s, size_t max_len)
     return 1;
 }
 
+static int flowd_port_number(const char **cursor, unsigned long *out)
+{
+    const char *p = cursor ? *cursor : NULL;
+    unsigned long value = 0;
+    int digits = 0;
+
+    if (!p || !out)
+        return 0;
+    while (*p >= '0' && *p <= '9') {
+        if (value > 65535UL / 10UL ||
+            (value == 65535UL / 10UL && (unsigned long)(*p - '0') > 65535UL % 10UL))
+            return 0;
+        value = value * 10UL + (unsigned long)(*p - '0');
+        p++;
+        digits = 1;
+    }
+    if (!digits || value < 1UL || value > 65535UL)
+        return 0;
+    *cursor = p;
+    *out = value;
+    return 1;
+}
+
+int flowd_port_expr_ok(const char *s)
+{
+    const char *p;
+
+    if (!s || !s[0] || !strcmp(s, "any"))
+        return 1;
+    if (strlen(s) >= 64)
+        return 0;
+    p = s;
+    for (;;) {
+        unsigned long start = 0;
+        unsigned long end = 0;
+
+        if (!flowd_port_number(&p, &start))
+            return 0;
+        end = start;
+        if (*p == '-') {
+            p++;
+            if (!flowd_port_number(&p, &end) || end < start)
+                return 0;
+        }
+        if (*p == '\0')
+            return 1;
+        if (*p != ',')
+            return 0;
+        p++;
+        if (*p == '\0')
+            return 0;
+    }
+}
+
 int flowd_id_ok(const char *s)
 {
     return flowd_token_ok(s, FLOWD_MAX_ID - 1);

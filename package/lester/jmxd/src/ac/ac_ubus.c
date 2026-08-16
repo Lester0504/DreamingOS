@@ -59,6 +59,25 @@ enum {
     __AC_RADIO_JOB_ID_MAX,
 };
 
+enum {
+    AC_SURVEY_SCHEDULE_ENABLED,
+    AC_SURVEY_SCHEDULE_INTERVAL,
+    __AC_SURVEY_SCHEDULE_MAX,
+};
+
+/*
+ * No `mode` field on purpose: only survey is schedulable, so accepting a mode
+ * would imply neighbour scans can be scheduled too. They cannot -- they leave
+ * the working channel and would interrupt associated clients.
+ */
+static const struct blobmsg_policy ac_survey_schedule_policy[
+    __AC_SURVEY_SCHEDULE_MAX] = {
+    [AC_SURVEY_SCHEDULE_ENABLED] = { .name = "enabled", .type = BLOBMSG_TYPE_BOOL },
+    [AC_SURVEY_SCHEDULE_INTERVAL] = {
+        .name = "interval_seconds", .type = BLOBMSG_TYPE_INT32
+    },
+};
+
 static const struct blobmsg_policy ac_radio_job_id_policy[__AC_RADIO_JOB_ID_MAX] = {
     [AC_RADIO_JOB_ID] = { .name = "job_id", .type = BLOBMSG_TYPE_STRING },
 };
@@ -610,6 +629,116 @@ static int ac_handle_radio_job_latest_results(
     return ac_reply_json(ctx, req, response);
 }
 
+/*
+ * Report the periodic survey schedule.
+ *
+ * `mode` is reported as a fixed "survey" so a caller can see that neighbour
+ * scans are not part of this, and `interrupts_clients` says plainly that they
+ * are not interrupted: a survey job only reads the driver's airtime counters on
+ * the channel already in use.
+ */
+static struct json_object *ac_survey_schedule_json(void)
+{
+    struct ac_survey_schedule schedule;
+    struct json_object *root = json_object_new_object();
+    struct json_object *data = json_object_new_object();
+    int loaded = ac_db_survey_schedule_load(&schedule) == 0;
+
+    json_object_object_add(root, "ok", json_object_new_boolean(loaded));
+    json_object_object_add(data, "enabled",
+                           json_object_new_boolean(loaded && schedule.enabled));
+    json_object_object_add(data, "mode", json_object_new_string("survey"));
+    json_object_object_add(data, "interval_seconds",
+                           json_object_new_int(schedule.interval_seconds));
+    json_object_object_add(data, "interval_seconds_min",
+                           json_object_new_int(AC_SURVEY_SCHEDULE_MIN_INTERVAL));
+    json_object_object_add(data, "interval_seconds_max",
+                           json_object_new_int(AC_SURVEY_SCHEDULE_MAX_INTERVAL));
+    json_object_object_add(data, "last_run_at",
+                           json_object_new_int64(schedule.last_run_at));
+    json_object_object_add(data, "last_dispatched",
+                           json_object_new_int(schedule.last_dispatched));
+    json_object_object_add(data, "last_error",
+                           json_object_new_string(schedule.last_error));
+    /*
+     * Survey dwells on the in-use channel, so there is no client interruption
+     * to warn about. Saying so in the payload keeps the UI from inventing a
+     * warning that would be false for this mode.
+     */
+    json_object_object_add(data, "expected_impact",
+                           json_object_new_string("survey_channel_dwell_only"));
+    json_object_object_add(data, "interrupts_clients",
+                           json_object_new_boolean(0));
+    json_object_object_add(data, "neighbor_scan_schedulable",
+                           json_object_new_boolean(0));
+    json_object_object_add(data, "neighbor_scan_reason",
+                           json_object_new_string("radio_may_leave_working_channel"));
+    json_object_object_add(root, "schedule", data);
+    if (!loaded)
+        json_object_object_add(root, "error",
+                               json_object_new_string("schedule_unavailable"));
+    return root;
+}
+
+static int ac_handle_survey_schedule_get(
+    struct ubus_context *ctx, struct ubus_object *obj,
+    struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    (void)obj;
+    (void)method;
+    if (msg && blob_len(msg) != 0)
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    return ac_reply_json(ctx, req, ac_survey_schedule_json());
+}
+
+static int ac_handle_survey_schedule_set(
+    struct ubus_context *ctx, struct ubus_object *obj,
+    struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    struct blob_attr *tb[__AC_SURVEY_SCHEDULE_MAX] = {0};
+    int enabled = -1;
+    int interval = 0;
+    int rc;
+
+    (void)obj;
+    (void)method;
+    if (!msg || blob_len(msg) == 0 ||
+        !ac_message_is_strict(msg, ac_survey_schedule_policy,
+                              __AC_SURVEY_SCHEDULE_MAX, 0) ||
+        blobmsg_parse(ac_survey_schedule_policy, __AC_SURVEY_SCHEDULE_MAX, tb,
+                      blob_data(msg), blob_len(msg)) != 0)
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    if (tb[AC_SURVEY_SCHEDULE_ENABLED])
+        enabled = blobmsg_get_bool(tb[AC_SURVEY_SCHEDULE_ENABLED]) ? 1 : 0;
+    if (tb[AC_SURVEY_SCHEDULE_INTERVAL])
+        interval = blobmsg_get_u32(tb[AC_SURVEY_SCHEDULE_INTERVAL]);
+    if (enabled < 0 && interval <= 0)
+        return UBUS_STATUS_INVALID_ARGUMENT;
+
+    rc = ac_db_survey_schedule_save(enabled, interval);
+    if (rc == AC_SURVEY_SCHEDULE_INVALID_INTERVAL) {
+        struct json_object *error = json_object_new_object();
+
+        json_object_object_add(error, "ok", json_object_new_boolean(0));
+        json_object_object_add(error, "error",
+                               json_object_new_string("invalid_interval_seconds"));
+        json_object_object_add(error, "interval_seconds_min",
+                               json_object_new_int(AC_SURVEY_SCHEDULE_MIN_INTERVAL));
+        json_object_object_add(error, "interval_seconds_max",
+                               json_object_new_int(AC_SURVEY_SCHEDULE_MAX_INTERVAL));
+        return ac_reply_json(ctx, req, error);
+    }
+    if (rc != 0) {
+        struct json_object *error = json_object_new_object();
+
+        json_object_object_add(error, "ok", json_object_new_boolean(0));
+        json_object_object_add(error, "error",
+                               json_object_new_string("schedule_update_failed"));
+        return ac_reply_json(ctx, req, error);
+    }
+    return ac_reply_json(ctx, req, ac_survey_schedule_json());
+}
+
 static int ac_handle_survey_history(
     struct ubus_context *ctx, struct ubus_object *obj,
     struct ubus_request_data *req, const char *method, struct blob_attr *msg)
@@ -839,6 +968,9 @@ static const struct ubus_method ac_methods[] = {
                       ac_handle_radio_job_latest_results),
     UBUS_METHOD("survey_history", ac_handle_survey_history,
                 ac_survey_history_policy),
+    UBUS_METHOD_NOARG("survey_schedule_get", ac_handle_survey_schedule_get),
+    UBUS_METHOD("survey_schedule_set", ac_handle_survey_schedule_set,
+                ac_survey_schedule_policy),
     UBUS_METHOD("station_events", ac_handle_station_events,
                 ac_station_events_policy),
     UBUS_METHOD("wifi_transaction_validate",

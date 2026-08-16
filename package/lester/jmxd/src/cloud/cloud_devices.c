@@ -16,6 +16,12 @@
  *
  * Only devices that completed pairing (paired_at > 0) and are still enabled can
  * authorize a relay frame; a pending or revoked device is refused.
+ *
+ * relay_access is a per-device link-layer switch: 0 means this App may still
+ * reach the router over the LAN but must not be carried by the relay. It gates
+ * both the authorized_apps declaration and the router-side frame check, so a
+ * relay that keeps forwarding for a withdrawn App is still refused here. webd
+ * owns the column; this daemon only reads it.
  */
 #include "cloud_internal.h"
 
@@ -38,6 +44,64 @@ static sqlite3 *cloud_devices_db(void)
     }
     sqlite3_busy_timeout(g_cloud_app_db, 3000);
     return g_cloud_app_db;
+}
+
+/*
+ * Reports whether app_devices has the relay_access column.
+ *
+ * It is added by webd's schema migration, so a router running a newer
+ * dreamingos-cloud against an older webd will not have it. That case must
+ * behave exactly as before rather than fail: folding "AND relay_access=1" into
+ * the queries unconditionally would make every statement fail to prepare where
+ * the column is absent, which reads as "no App is authorized" and would revoke
+ * remote access for all of them at once. Absent column therefore means "no
+ * device is suspended", which is the pre-feature behaviour.
+ *
+ * Only a positive result is cached. A column cannot disappear, so caching
+ * "present" is safe; caching "absent" would pin this daemon to the pre-feature
+ * behaviour for its whole lifetime if webd ran its migration afterwards, and the
+ * switch would then silently do nothing until the next restart. The absent path
+ * costs one PRAGMA per call, which only happens where the feature is not
+ * deployed yet.
+ */
+static int cloud_devices_relay_access_column(void)
+{
+    static int cached_present;
+    sqlite3 *db = cloud_devices_db();
+    sqlite3_stmt *st = NULL;
+    int present = 0;
+
+    if (cached_present)
+        return 1;
+    if (!db)
+        return 0;
+    if (sqlite3_prepare_v2(db, "PRAGMA table_info(app_devices)", -1, &st,
+                           NULL) != SQLITE_OK)
+        return 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(st, 1);
+
+        if (name && !strcmp((const char *)name, "relay_access")) {
+            present = 1;
+            break;
+        }
+    }
+    sqlite3_finalize(st);
+    cached_present = present;
+    return present;
+}
+
+/*
+ * The row filter shared by every relay authorization decision, so the
+ * declaration and the frame check cannot drift apart and leave an App that the
+ * relay still believes in.
+ */
+static const char *cloud_devices_relay_filter(void)
+{
+    if (cloud_devices_relay_access_column())
+        return " WHERE enabled=1 AND paired_at>0 AND public_key<>''"
+               " AND relay_access=1";
+    return " WHERE enabled=1 AND paired_at>0 AND public_key<>''";
 }
 
 /*
@@ -81,13 +145,16 @@ int cloud_devices_signing_key_known(const unsigned char *signing_key,
     sqlite3 *db = cloud_devices_db();
     sqlite3_stmt *st = NULL;
     int found = 0;
+    char sql[256];
 
     if (!db || !signing_key)
         return 0;
-    if (sqlite3_prepare_v2(db,
-            "SELECT id,public_key FROM app_devices "
-            "WHERE enabled=1 AND paired_at>0 AND public_key<>''",
-            -1, &st, NULL) != SQLITE_OK)
+    /* A suspended device is filtered out here too, not only in the declaration:
+     * the relay could still be forwarding for it between two declarations, and
+     * the router must be the one that refuses. */
+    snprintf(sql, sizeof(sql), "SELECT id,public_key FROM app_devices%s",
+             cloud_devices_relay_filter());
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
         return 0;
 
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -121,6 +188,9 @@ int cloud_devices_signing_key_known(const unsigned char *signing_key,
  * The keys are re-encoded from the parsed 32 raw bytes rather than passed
  * through from the stored JSON, so a row with odd padding or whitespace cannot
  * produce a string the relay decodes differently than this daemon validated.
+ *
+ * A device with relay_access=0 is omitted, which is what withdraws its remote
+ * access: the relay replaces its stored set with whatever this returns.
  */
 struct json_object *cloud_devices_signing_keys(void)
 {
@@ -128,16 +198,16 @@ struct json_object *cloud_devices_signing_keys(void)
     struct json_object *array;
     sqlite3_stmt *st = NULL;
     int emitted = 0;
+    char sql[256];
 
     array = json_object_new_array();
     if (!array)
         return NULL;
     if (!db)
         return array;
-    if (sqlite3_prepare_v2(db,
-            "SELECT public_key FROM app_devices "
-            "WHERE enabled=1 AND paired_at>0 AND public_key<>''",
-            -1, &st, NULL) != SQLITE_OK)
+    snprintf(sql, sizeof(sql), "SELECT public_key FROM app_devices%s",
+             cloud_devices_relay_filter());
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
         return array;
 
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -164,18 +234,23 @@ struct json_object *cloud_devices_signing_keys(void)
     return array;
 }
 
+/*
+ * Counts the devices that may currently use the relay, which is what
+ * registered_app_devices reports. A suspended device is excluded so the number
+ * matches the set actually declared to the relay rather than the pairing table.
+ */
 int cloud_devices_count(int *out)
 {
     sqlite3 *db = cloud_devices_db();
     sqlite3_stmt *st = NULL;
     int rc = -1;
+    char sql[256];
 
     if (!db || !out)
         return -1;
-    if (sqlite3_prepare_v2(db,
-            "SELECT COUNT(*) FROM app_devices "
-            "WHERE enabled=1 AND paired_at>0 AND public_key<>''",
-            -1, &st, NULL) != SQLITE_OK)
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM app_devices%s",
+             cloud_devices_relay_filter());
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
         return -1;
     if (sqlite3_step(st) == SQLITE_ROW) {
         *out = sqlite3_column_int(st, 0);

@@ -13,27 +13,10 @@
   const TAB_STORAGE_KEY = 'dreamingwrt.web.lineStatus.tab';
   const LINE_STATUS_HASH = '#/monitor/line-status';
   const VPN_PROTOCOLS = ['PPTP', 'L2TP', 'OpenVPN', 'IPSec VPN', 'IKEv2/IPSec', 'WireGuard'];
-  /*
-   * Kernel runtime fields, listed once so the realtime merge can preserve them.
-   * They only exist on the REST line-load projection.
-   */
-  const KERNEL_FIELDS = Object.freeze([
-    'kernel_active_conn',
-    'kernel_active_conn_valid',
-    'kernel_active_conn_semantics',
-    'kernel_active_conn_source',
-    'kernel_active_conn_stale_possible',
-    'kernel_tx_packets',
-    'kernel_rx_packets',
-    'kernel_tx_bytes',
-    'kernel_rx_bytes',
-    'kernel_stats_observed_at',
-    'kernel_stats_reason',
-    'kernel_proc_id',
-    'kernel_categories',
-    'kernel_categories_source',
-    'kernel_categories_reason'
-  ]);
+  /* The backend's liveness fact is a boolean: a WAN is present in kernel if_stats.
+   * The old route-bound gauge was deliberately removed from this contract and
+   * must not be used as a connection count or a presence heuristic. */
+  const KERNEL_LIVENESS_FIELDS = Object.freeze(['kernel_stats_valid']);
 
   function fallbackEscape(value) {
     return String(value === undefined || value === null ? '' : value)
@@ -100,10 +83,9 @@
     const mountUiKit = context.mountUiKit || ((target) => window.DWRT_UI_KIT?.mountAll(target));
     const realtime = context.realtime || window.DWRTRealtime;
     /*
-     * Shared normalizer for the two different connection numbers. It is required
-     * rather than reimplemented locally, because the whole point of this page's
-     * connection columns is that conntrack attribution and the JMX kernel gauge
-     * stay distinguishable.
+     * Shared connection-count normalizer, required rather than reimplemented
+     * locally so this page cannot grow its own guess chain back. There is one
+     * connection number on screen: conntrack public-address attribution.
      */
     const connTruth = context.connTruth || window.DWRTConnTruth || null;
 
@@ -128,7 +110,7 @@
        * `nf_conntrack_count` (a global total) and `flows`, so a WAN row could end
        * up showing a number that was never per-WAN. The shared normalizer keeps
        * the field set to names that actually mean per-WAN conntrack attribution;
-       * `kernel_active_conn` is deliberately not among them.
+       * route-bound kernel gauges are deliberately not among them.
        */
       const count = connTruth
         ? connTruth.conntrackCount(source)
@@ -154,6 +136,20 @@
       const num = Number(value);
       if (!Number.isFinite(num)) return '--';
       return `${num.toFixed(digits).replace(/\.0+$/, '')}%`;
+    }
+
+    /*
+     * 丢包读数：缺失必须保持 null，不能落成 0。
+     * `firstNumber()` 对缺字段返回 0，用在丢包上会把"后端没给"画成"线路很好"，
+     * 这是两个完全不同的事实。
+     */
+    function lossValue(...values) {
+      for (const value of values) {
+        if (value === undefined || value === null || value === '') continue;
+        const num = Number(value);
+        if (Number.isFinite(num)) return num;
+      }
+      return null;
     }
 
     function formatUptime(seconds) {
@@ -337,13 +333,11 @@
          * instead of leaving "连接数" ambiguous.
          */
         conntrack: connTruth ? connTruth.conntrackTruth(line) : null,
-        /*
-         * Kernel forwarding stats stay in their own field. IPv6 mode gets no
-         * kernel projection at all: /monitor/ipv6-load carries no kernel_* nodes,
-         * and borrowing the IPv4 gauge would be the exact cross-plane mixing this
-         * page must avoid.
-         */
-        kernel: ipv6Mode || !connTruth ? null : connTruth.kernelRuntime(line),
+        /* Liveness only, never rendered. IPv6 mode gets nothing because
+         * /monitor/ipv6-load carries no kernel_* nodes. */
+        kernelCounted: ipv6Mode
+          ? false
+          : line.kernel_stats_valid === true,
         uptime: firstNumber(line.uptime, line.online_seconds),
         ipv6Only: Boolean(line.ipv6_only || line.ipv6Only || line.family === 'ipv6' || line.address_family === 'ipv6')
       };
@@ -417,9 +411,11 @@
        * A WAN the kernel is actively counting is real, even when the config
        * ledger has not caught up. wan3/wan4 were dropped this way: no rate rows
        * yet, generic name, so the placeholder filter removed them while
-       * /proc/dreamingwrt/jmx was reporting thousands of flows for them.
+       * /proc/dreamingwrt/jmx was reporting thousands of flows for them. This is
+       * the only remaining use of the kernel gauge, and it decides visibility
+       * rather than putting a number on screen.
        */
-      if (line.kernel && line.kernel.valid) return true;
+      if (line.kernelCounted) return true;
       if (!isGenericWanName(line.name) || !isGenericWanName(line.id)) return true;
       if (firstText(line.carrier_key, line.carrier_name, line.carrier, line.carrier_logo, line.ip, line.ipv6, line.linkSpeed)) return true;
       if (firstText(line.note) && firstText(line.note) !== firstText(line.ifname)) return true;
@@ -496,100 +492,17 @@
       return `<span class="line-connections" data-line-tooltip="${escapeHtml(tip)}" tabindex="0">${escapeHtml(Number(count || 0).toLocaleString('en-US'))}</span>`;
     }
 
-    /*
-     * Kernel gauge cell. A missing proc row renders as 不可用 and an unconfirmed
-     * semantics renders the number with its caveat attached; neither falls back to
-     * the conntrack column and neither prints 0.
-     */
-    function kernelCellMarkup(line, rowKey) {
-      const runtime = line.kernel;
-      if (!runtime || !runtime.valid) {
-        const reason = runtime && runtime.reason ? `：${runtime.reason}` : '';
-        return `<span class="line-kernel-unavailable" data-line-tooltip="${escapeHtml(`内核转发统计不可用${reason}`)}" tabindex="0">${escapeHtml(connTruth ? connTruth.UNAVAILABLE_TEXT : '不可用')}</span>`;
-      }
-      const tipParts = [`语义 ${runtime.semanticsLabel}`];
-      if (runtime.source) tipParts.push(`来源 ${runtime.source}`);
-      if (runtime.procId) tipParts.push(`proc ${runtime.procId}`);
-      if (runtime.stalePossible) tipParts.push('合计超过全局 conntrack，可能存在残留');
-      const value = connTruth.formatInteger(runtime.activeConn);
-      const flag = runtime.confirmed ? '' : '<em class="line-kernel-flag">语义未确认</em>';
-      const hasDetail = runtime.categories.length > 0;
-      return `<span class="line-kernel-cell">
-        <span class="line-kernel-value" data-line-tooltip="${escapeHtml(tipParts.join(' · '))}" tabindex="0">${escapeHtml(value)}</span>
-        ${flag}
-        ${hasDetail ? `<button type="button" class="line-kernel-toggle" data-kernel-toggle="${escapeHtml(rowKey)}" aria-expanded="false">类别明细</button>` : ''}
-      </span>`;
-    }
-
-    /*
-     * Category detail row. Rows pass through exactly as the kernel reported them,
-     * Unknown included, and the Total line is the sum of those rows so it can be
-     * compared against the backend rather than recomputed from a reclassification.
-     */
-    function kernelDetailRow(line, rowKey) {
-      const runtime = line.kernel;
-      if (!runtime || !runtime.valid || !runtime.categories.length) return '';
-      const open = page?.expandedKernelRows?.has(rowKey);
-      const total = connTruth.categoryTotal(runtime.categories);
-      const rows = runtime.categories.map((row) => `
-        <tr>
-          <td>${escapeHtml(row.category)}</td>
-          <td>${escapeHtml(connTruth.formatInteger(row.activeConn))}</td>
-          <td>${escapeHtml(connTruth.formatInteger(row.txPackets))}</td>
-          <td>${escapeHtml(connTruth.formatInteger(row.rxPackets))}</td>
-          <td>${escapeHtml(connTruth.formatBytes(row.txBytes))}</td>
-          <td>${escapeHtml(connTruth.formatBytes(row.rxBytes))}</td>
-        </tr>`).join('');
-      const meta = [
-        `内核连接 ${connTruth.formatInteger(runtime.activeConn)}`,
-        runtime.confirmed ? `语义 ${runtime.semanticsLabel}` : runtime.semanticsLabel,
-        `发包 ${connTruth.formatInteger(runtime.txPackets)}`,
-        `收包 ${connTruth.formatInteger(runtime.rxPackets)}`,
-        `发送 ${connTruth.formatBytes(runtime.txBytes)}`,
-        `接收 ${connTruth.formatBytes(runtime.rxBytes)}`
-      ].join(' · ');
-      const notice = connTruth.kernelNotice(runtime);
-      return `
-        <tr class="line-kernel-detail-row" data-kernel-detail="${escapeHtml(rowKey)}" ${open ? '' : 'hidden'}>
-          <td colspan="7">
-            <div class="line-kernel-detail">
-              <div class="line-kernel-detail-meta">${escapeHtml(meta)}</div>
-              ${notice ? `<div class="line-kernel-detail-notice">${escapeHtml(notice)}</div>` : ''}
-              <div class="line-kernel-detail-source">${escapeHtml(runtime.categoriesSource || '')}</div>
-              <table class="line-kernel-category-table">
-                <thead><tr><th>类别</th><th>连接</th><th>发包</th><th>收包</th><th>发送</th><th>接收</th></tr></thead>
-                <tbody>${rows}</tbody>
-                <tfoot><tr>
-                  <td>Total</td>
-                  <td>${escapeHtml(connTruth.formatInteger(total.activeConn))}</td>
-                  <td>${escapeHtml(connTruth.formatInteger(total.txPackets))}</td>
-                  <td>${escapeHtml(connTruth.formatInteger(total.rxPackets))}</td>
-                  <td>${escapeHtml(connTruth.formatBytes(total.txBytes))}</td>
-                  <td>${escapeHtml(connTruth.formatBytes(total.rxBytes))}</td>
-                </tr></tfoot>
-              </table>
-            </div>
-          </td>
-        </tr>`;
-    }
-
     function lineLoadRows(lines, options = {}) {
-      const withKernel = Boolean(options.showKernel);
-      return groupTraffic(lines).flatMap((group) => group.lines).map((line) => {
-        const rowKey = firstText(line.id, line.ifname, line.name) || 'line';
-        return `
+      return groupTraffic(lines).flatMap((group) => group.lines).map((line) => `
         <tr class="line-load-data-row ${escapeHtml(line.type || 'line')}">
           <td data-label="线路">${lineName(line, Boolean(options.showIpv6))}</td>
           <td data-label="上行速率" class="rate-up">${escapeHtml(formatRate(line.upRate))}</td>
           <td data-label="累计上行" class="rate-up total-up">${escapeHtml(formatBytes(line.upBytes))}</td>
           <td data-label="下行速率" class="rate-down">${escapeHtml(formatRate(line.downRate))}</td>
           <td data-label="累计下行" class="rate-down total-down">${escapeHtml(formatBytes(line.downBytes))}</td>
-          <td data-label="conntrack 连接">${conntrackCellMarkup(line)}</td>
-          ${withKernel ? `<td data-label="内核连接">${kernelCellMarkup(line, rowKey)}</td>` : ''}
+          <td data-label="连接数">${conntrackCellMarkup(line)}</td>
         </tr>
-        ${withKernel ? kernelDetailRow(line, rowKey) : ''}
-      `;
-      }).join('');
+      `).join('');
     }
 
     function normalizeLineLoad(data) {
@@ -637,6 +550,19 @@
           uptime: trustedConnectionSeconds(wan),
           upLoss24h: firstNumber(wan.up_loss_24h, wan.loss_up_24h, wan.loss_up, wan.packet_loss_up, wan.packet_loss),
           downLoss24h: firstNumber(wan.down_loss_24h, wan.loss_down_24h, wan.loss_down, wan.packet_loss_down, wan.packet_loss),
+          /*
+           * 单一丢包读数：上下行同源于一次 ping，取二者中有值的较大者即可，
+           * 全缺时保持 null 以便渲染成「不可用」而不是 0%。
+           */
+          loss24h: (() => {
+            const up = lossValue(wan.up_loss_24h, wan.loss_up_24h, wan.loss_up, wan.packet_loss_up, wan.packet_loss);
+            const down = lossValue(wan.down_loss_24h, wan.loss_down_24h, wan.loss_down, wan.packet_loss_down, wan.packet_loss);
+            if (up === null) return down;
+            if (down === null) return up;
+            return Math.max(up, down);
+          })(),
+          lossSource: firstText(wan.loss_source),
+          lossSamples: lossValue(wan.loss_sample_count),
           latencyAvg: firstNumber(wan.latency_avg, wan.avg_latency, wan.latency),
           avgUpRate: avgUp,
           avgDownRate: avgDown,
@@ -691,13 +617,11 @@
     function formatHealthBucketTime(value) {
       const timestamp = Number(value);
       if (!Number.isFinite(timestamp) || timestamp <= 0) return '';
-      return new Date(timestamp * 1000).toLocaleString('zh-CN', {
-        month: 'numeric',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false
-      });
+      const date = new Date(timestamp * 1000);
+      if (Number.isNaN(date.getTime())) return '';
+      const hour = String(date.getHours()).padStart(2, '0');
+      const minute = String(date.getMinutes()).padStart(2, '0');
+      return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日${hour}:${minute}`;
     }
 
     function healthBucketTooltip(wan = {}, bucket = {}) {
@@ -706,17 +630,26 @@
       }
       const status = String(firstText(bucket.status, bucket.state, bucket.health, 'unknown')).toLowerCase();
       const latency = firstNumber(bucket.latency_avg, bucket.latency, bucket.avg_latency, bucket.avg, bucket.ms);
-      const lossUp = firstNumber(bucket.loss_up, bucket.up_loss, bucket.packet_loss_up, bucket.loss, bucket.packet_loss);
-      const lossDown = firstNumber(bucket.loss_down, bucket.down_loss, bucket.packet_loss_down, bucket.loss, bucket.packet_loss);
+      /*
+       * 同一个 ping 的单一 loss 值，分不出方向，所以这里也只报一个数字。
+       */
+      const lossUp = lossValue(bucket.loss_up, bucket.up_loss, bucket.packet_loss_up, bucket.loss, bucket.packet_loss);
+      const lossDown = lossValue(bucket.loss_down, bucket.down_loss, bucket.packet_loss_down, bucket.loss, bucket.packet_loss);
+      const lossMerged = lossUp === null ? lossDown : lossDown === null ? lossUp : Math.max(lossUp, lossDown);
       const samples = firstNumber(bucket.samples);
+      /*
+       * 每行一个语义，顺序固定：时间 / 状态 / 平均延迟 / 丢包 / 采样次数。
+       * 运营商名不再占一行——同一行健康条本来就属于那条线路，重复它只是挤掉真信息。
+       */
       return [
-        firstText(carrierLabel(wan), displayLineName(wan), wan.ifname, wan.id, 'WAN'),
         formatHealthBucketTime(bucket.ts || bucket.timestamp || bucket.time),
         `状态：${status || 'unknown'}`,
-        Number.isFinite(latency) && latency > 0 ? `平均延迟：${Math.round(latency)} ms` : '',
-        Number.isFinite(lossUp) || Number.isFinite(lossDown) ? `丢包：上行 ${formatPercent(lossUp, 2)} · 下行 ${formatPercent(lossDown, 2)}` : '',
-        samples > 0 ? `采样：${Math.round(samples)} 次` : ''
-      ].filter(Boolean).join(' · ');
+        Number.isFinite(latency) && latency > 0 ? `平均延迟：${Math.round(latency)} ms` : '平均延迟：--',
+        lossMerged === null
+          ? '丢包：--'
+          : `丢包（探测口径）：${formatPercent(lossMerged, 2)}`,
+        samples > 0 ? `采样：${Math.round(samples)} 次` : '采样：--'
+      ].filter(Boolean).join('\n');
     }
 
     function healthAvailability(wan = {}) {
@@ -774,6 +707,31 @@
       </button>`;
     }
 
+    /*
+     * 24H 丢包单元格。
+     *
+     * 当前数值来自主动探测：healthd 每轮 `ping -c 3`（check_main.c:671）写入
+     * wan_health_bucket，jmx_db.c:6500 再按 samples 加权出 24h 均值。因此
+     * `up_loss_24h` 与 `down_loss_24h` **是同一个 ping 的同一个 loss 值**，
+     * 后端从未分方向测量过。之前这里画成 ↓x% / ↑y% 两个数字，等于凭空造出
+     * 方向信息，所以合并为单值展示；等后端给出真实转发口径的分方向数据
+     * （见 Acceptance-to-Backend-wan-packet-loss-must-count-real-traffic-not-probes）
+     * 再恢复上下行两列。
+     */
+    const LOSS_PROBE_TIP = '主动探测口径：每 ~13 秒 ping 3 包（223.5.5.5 / 119.29.29.29）的 24 小时加权均值，非真实转发流量丢包率';
+
+    function healthLossCellMarkup(wan = {}) {
+      const loss = lossValue(wan.loss24h);
+      const parts = [LOSS_PROBE_TIP];
+      if (wan.lossSource) parts.push(`来源 ${wan.lossSource}`);
+      if (Number.isFinite(wan.lossSamples) && wan.lossSamples > 0) parts.push(`采样 ${Math.round(wan.lossSamples)} 次`);
+      const tip = parts.join(' · ');
+      if (loss === null) {
+        return `<span class="line-loss-unavailable" data-line-tooltip="${escapeHtml(`${tip}；当前无采样数据`)}" tabindex="0">不可用</span>`;
+      }
+      return `<span class="line-loss-value" data-line-tooltip="${escapeHtml(tip)}" tabindex="0">${escapeHtml(formatPercent(loss, 2))}</span>`;
+    }
+
     function healthRows(lines) {
       return lines.map((wan) => `
         <tr class="line-health-data-row">
@@ -794,7 +752,7 @@
           <td data-label="IP地址">${escapeHtml(wan.ip || '--')}</td>
           <td data-label="网关">${escapeHtml(wan.gateway || '--')}</td>
           <td data-label="连接时间">${escapeHtml(formatUptime(wan.uptime))}</td>
-          <td data-label="24H丢包"><span class="rate-text tiny"><span class="rate-down">↓ ${escapeHtml(formatPercent(wan.downLoss24h, 2))}</span><span class="rate-up">↑ ${escapeHtml(formatPercent(wan.upLoss24h, 2))}</span></span></td>
+          <td data-label="探测丢包">${healthLossCellMarkup(wan)}</td>
           <td data-label="平均延迟" class="${healthClass(wan)}">${escapeHtml(formatLatency(wan.latencyAvg))}</td>
           <td data-label="平均带宽"><span class="rate-text"><span class="rate-down">↓ ${escapeHtml(formatRate(wan.avgDownRate))}</span><span class="rate-up">↑ ${escapeHtml(formatRate(wan.avgUpRate))}</span></span></td>
           <td data-label="繁忙度"><span class="busy-meter" style="--busy:${Math.max(0, Math.min(100, Number(wan.busy) || 0))}%"><em></em><strong>${escapeHtml(formatPercent(wan.busy, 0))}</strong></span></td>
@@ -871,7 +829,7 @@
         return {
           count: rows.length,
           html: `<table class="dwrt-kit-table line-health-core">
-            <thead><tr><th>线路</th><th>接入方式</th><th>IP地址</th><th>网关</th><th>连接时间</th><th>24H丢包</th><th>平均延迟</th><th>平均带宽</th><th>繁忙度</th></tr></thead>
+            <thead><tr><th>线路</th><th>接入方式</th><th>IP地址</th><th>网关</th><th>连接时间</th><th data-line-tooltip="${escapeHtml(LOSS_PROBE_TIP)}" tabindex="0">探测丢包</th><th>平均延迟</th><th>平均带宽</th><th>繁忙度</th></tr></thead>
             <tbody>${rows.length ? healthRows(rows) : '<tr><td colspan="9">后端暂未返回线路健康数据。</td></tr>'}</tbody>
           </table>`
         };
@@ -882,7 +840,7 @@
         return {
           count: rows.length,
           html: `${warning}<table class="dwrt-kit-table line-load-core ipv6-load-core">
-            <thead><tr><th>线路</th><th>上行速率</th><th>累计上行</th><th>下行速率</th><th>累计下行</th><th>conntrack 连接</th></tr></thead>
+            <thead><tr><th>线路</th><th>上行速率</th><th>累计上行</th><th>下行速率</th><th>累计下行</th><th data-line-tooltip="conntrack 公网地址归属统计" tabindex="0">连接数</th></tr></thead>
             <tbody>${rows.length ? lineLoadRows(rows, { showIpv6: true }) : '<tr><td colspan="6">后端暂未返回 IPv6 负载数据。</td></tr>'}</tbody>
           </table>`
         };
@@ -900,25 +858,19 @@
         };
       }
       const rows = normalizeLineLoad(data);
-      const aggregate = connTruth ? connTruth.kernelAggregate(data) : null;
       /*
-       * The kernel column only appears when the snapshot is actually available.
-       * An unavailable snapshot gets one honest page-level notice instead of four
-       * rows of 不可用.
+       * One connection number, one source note. The kernel forwarding column and
+       * its two caveat notices were removed on 2026-08-09 by user instruction;
+       * the conntrack source is still named because "连接数" alone does not say
+       * what was counted.
        */
-      const showKernel = Boolean(aggregate && aggregate.available === true);
-      const kernelNotice = aggregate && aggregate.available === false
-        ? `<div class="line-load-warning">内核转发统计不可用${aggregate.reason ? `：${escapeHtml(aggregate.reason)}` : ''}</div>`
-        : '';
-      const semanticsNotice = showKernel && (aggregate.stalePossible || aggregate.semantics === 'unknown')
-        ? `<div class="line-load-warning">内核连接语义未确认（${escapeHtml(aggregate.semantics)}${aggregate.stalePossible ? '，各 WAN 合计超过全局 conntrack，可能存在残留' : ''}）。该列不能当作实时 conntrack 连接数。</div>`
-        : '';
-      const sourceNote = `<div class="line-load-source-note">连接数分两套口径：<strong>conntrack 归属</strong>${aggregate && aggregate.conntrackSource ? `（${escapeHtml(aggregate.conntrackSource)}）` : ''}统计公网地址归属；<strong>内核转发</strong>来自 JMX proc 计数，两者不可互换。</div>`;
+      const conntrackSource = firstText(data && data.conntrack_source);
+      const sourceNote = `<div class="line-load-source-note">连接数为 <strong>conntrack 归属</strong>${conntrackSource ? `（${escapeHtml(conntrackSource)}）` : ''}口径，按公网地址归属统计。</div>`;
       return {
         count: rows.length,
-        html: `${kernelNotice}${semanticsNotice}${sourceNote}<table class="dwrt-kit-table line-load-core${showKernel ? ' has-kernel-column' : ''}">
-          <thead><tr><th>线路</th><th>上行速率</th><th>累计上行</th><th>下行速率</th><th>累计下行</th><th title="conntrack 公网地址归属统计">conntrack 连接</th>${showKernel ? '<th title="JMX 内核转发计数">内核连接</th>' : ''}</tr></thead>
-          <tbody>${rows.length ? lineLoadRows(rows, { showKernel }) : `<tr><td colspan="${showKernel ? 7 : 6}">后端暂未返回线路负载数据。</td></tr>`}</tbody>
+        html: `${sourceNote}<table class="dwrt-kit-table line-load-core">
+          <thead><tr><th>线路</th><th>上行速率</th><th>累计上行</th><th>下行速率</th><th>累计下行</th><th data-line-tooltip="conntrack 公网地址归属统计" tabindex="0">连接数</th></tr></thead>
+          <tbody>${rows.length ? lineLoadRows(rows) : '<tr><td colspan="6">后端暂未返回线路负载数据。</td></tr>'}</tbody>
         </table>`
       };
     }
@@ -1038,16 +990,10 @@
           order: wan.order || current.order || index + 1,
           connections: preferredConnectionCount(wan, current)
         };
-        /*
-         * wan.metrics is the conntrack/rate plane; dw_apply_wan_kernel_runtime()
-         * only runs on the REST line-load path, so WS frames carry no kernel_*
-         * fields at all. Spreading the frame over the REST row would therefore
-         * blank the kernel column every time a frame arrived, and the column
-         * would read as "unavailable" while the proc nodes were perfectly fine.
-         * Retain the REST kernel projection unless the frame actually carries one.
-         */
-        if (!Object.prototype.hasOwnProperty.call(wan, 'kernel_active_conn')) {
-          KERNEL_FIELDS.forEach((field) => {
+        /* wan.metrics is the conntrack/rate plane; retain the REST liveness fact
+         * when a frame omits it so a partial WS update cannot hide a WAN. */
+        if (!Object.prototype.hasOwnProperty.call(wan, 'kernel_stats_valid')) {
+          KERNEL_LIVENESS_FIELDS.forEach((field) => {
             if (Object.prototype.hasOwnProperty.call(current, field)) merged[field] = current[field];
             else delete merged[field];
           });
@@ -1239,12 +1185,6 @@
         lastWsAt: 0,
         healthContractReady: false,
         configuredWanKeys: new Set(),
-        /*
-         * Expanded category rows are page state, not markup state: the panel
-         * re-renders every 5 seconds and an expansion stored only in the DOM
-         * would collapse under the user.
-         */
-        expandedKernelRows: new Set(),
         systemUptime: 0,
         systemUptimeAt: 0,
         lastHealthContractAt: 0,
@@ -1254,23 +1194,6 @@
       root.querySelectorAll('.line-status-tabs .dwrt-kit-tab').forEach((button) => {
         button.addEventListener('click', () => selectPanel(button.dataset.value || PANELS[0].id));
       });
-      /*
-       * Delegated so it survives the periodic innerHTML rewrite of the table.
-       * Toggling only flips page state plus the matching row, so it does not
-       * trigger a full re-render or disturb scroll position.
-       */
-      page.onKernelToggle = (event) => {
-        const button = event.target.closest('[data-kernel-toggle]');
-        if (!button || !page) return;
-        const key = button.getAttribute('data-kernel-toggle') || '';
-        const detail = page.table && page.table.querySelector(`[data-kernel-detail="${CSS.escape(key)}"]`);
-        const open = page.expandedKernelRows.has(key);
-        if (open) page.expandedKernelRows.delete(key);
-        else page.expandedKernelRows.add(key);
-        button.setAttribute('aria-expanded', open ? 'false' : 'true');
-        if (detail) detail.hidden = open;
-      };
-      root.addEventListener('click', page.onKernelToggle);
       mountUiKit(root);
       bindLineTooltips();
       subscribeRealtime();
@@ -1284,7 +1207,6 @@
       if (!page) return;
       page.active = false;
       unsubscribeRealtime();
-      if (page.onKernelToggle) root.removeEventListener('click', page.onKernelToggle);
       root.removeEventListener('pointerover', page.onTooltipOver);
       root.removeEventListener('pointermove', page.onTooltipMove);
       root.removeEventListener('pointerout', page.onTooltipOut);

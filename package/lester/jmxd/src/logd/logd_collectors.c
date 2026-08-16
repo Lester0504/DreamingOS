@@ -745,9 +745,23 @@ static void logd_line_classify(const char *line, int kernel, const char **catego
         *category = "port";
         *event = "port_log";
     } else if (logd_contains_ci(line, "auth") || logd_contains_ci(line, "login") ||
-               logd_contains_ci(line, "dropbear") || logd_contains_ci(line, "sudo")) {
-        *category = "audit";
-        *event = "auth_log";
+               logd_contains_ci(line, "dropbear") || logd_contains_ci(line, "sshd") ||
+               logd_contains_ci(line, "sudo")) {
+        /*
+         * Daemon authentication text (dropbear/sshd/sudo/nginx login lines) is
+         * device-side SECURITY logging, not the admin operation audit ledger.
+         *
+         * This branch used to set category="audit"/event="auth_log", which the
+         * classifier then promoted to ADMIN_AUTH_EVENT and the log center showed
+         * under AUDIT. That let an nginx 404 or a dropbear probe masquerade as an
+         * administrator action inferred purely from the substring "login". The
+         * real admin operation audit is written by webd with an explicit
+         * web_audit flag; a raw log line is never that. Route these to SECURITY
+         * with a non-admin event name so they stay searchable but out of the
+         * ledger.
+         */
+        *category = "security";
+        *event = "security_auth_log";
     }
 }
 
