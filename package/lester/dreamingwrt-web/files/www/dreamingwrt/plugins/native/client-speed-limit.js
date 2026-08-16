@@ -4,7 +4,8 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260810-front-release-01';
+  const VERSION = '20260815-terminal-policy-kit-layout-11';
+  const embedded = context.embedded === true;
   const stage = root?.closest('.console-stage');
   const WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日'];
 
@@ -265,6 +266,7 @@ export function mount(context = {}) {
    * 用兄弟页（网址浏览控制）同一套 `.user-auth-segmented`，不引入第二种分段控件。
    */
   function tabsMarkup() {
+    if (embedded) return '';
     const tabs = [['mac', 'MAC 限速'], ['ip', 'IP 限速']];
     return `<nav class="dwrt-kit-tabs dwrt-kit-page-tabs client-speed-tabs" data-dwrt-component="tabs" role="tablist" aria-label="终端限速">`
       + `<span class="dwrt-kit-tab-pill" aria-hidden="true"></span>`
@@ -390,7 +392,7 @@ export function mount(context = {}) {
      * 重绘换掉 `<main>` 都会让探针失效，抽屉被当成孤儿销毁。给它一个专属
      * 容器，探针就落在容器内部，不受页面重绘影响。
      */
-    root.innerHTML = `<section class="user-auth-shell client-speed-shell" data-client-speed-version="${VERSION}"><header class="user-auth-header client-speed-header">${tabsMarkup()}</header><main class="user-auth-workbench">${noticeMarkup()}${bodyMarkup()}</main><div class="client-speed-overlay-host" data-client-speed-overlays></div></section>`;
+    root.innerHTML = `<section class="user-auth-shell client-speed-shell" data-client-speed-version="${VERSION}">${embedded ? '' : `<header class="user-auth-header client-speed-header">${tabsMarkup()}</header>`}<main class="user-auth-workbench">${noticeMarkup()}${bodyMarkup()}</main><div class="client-speed-overlay-host" data-client-speed-overlays></div></section>`;
     renderOverlays();
     ui.mountAll?.(root);
   }
