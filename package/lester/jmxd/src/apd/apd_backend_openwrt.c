@@ -5383,15 +5383,6 @@ static int apd_openwrt_probe(struct json_object **out)
     return 0;
 }
 
-static int apd_openwrt_disabled(const char *operation, struct json_object **out,
-                                const char *reason)
-{
-    if (!out)
-        return -1;
-    *out = apd_backend_disabled(operation, reason);
-    return -1;
-}
-
 int apd_backend_neighbor_scan(const char *radio_id, struct json_object **out)
 {
     return apd_neighbor_scan_collect(apd_find_iw(), radio_id, out);
@@ -5731,39 +5722,43 @@ static int apd_openwrt_snapshot(struct json_object **out)
 static int apd_openwrt_validate(struct json_object *candidate,
                                 struct json_object **out)
 {
-    (void)candidate;
-    return apd_openwrt_disabled("validate", out,
-        "phase2_candidate_validation_pending");
+    return apd_config_candidate_validate(candidate, out);
 }
 
 static int apd_openwrt_stage(struct json_object *candidate,
                              struct json_object **out)
 {
-    (void)candidate;
-    return apd_openwrt_disabled("stage", out,
-        "phase2_atomic_staging_pending");
+    struct apd_config_paths paths = { "/sbin/uci", "/sbin/wifi",
+                                      "/etc/config",
+                                      "/tmp/dreamingwrt-apd-config-candidate" };
+    return apd_config_stage(&paths, candidate, out);
 }
 
 static int apd_openwrt_apply(struct json_object *candidate,
                              struct json_object **out)
 {
-    (void)candidate;
-    return apd_openwrt_disabled("apply", out,
-        "phase2_transactional_apply_pending");
+    struct apd_config_paths paths = { "/sbin/uci", "/sbin/wifi",
+                                      "/etc/config",
+                                      "/tmp/dreamingwrt-apd-config-candidate" };
+    return apd_config_apply(&paths, candidate, out);
 }
 
-static int apd_openwrt_readback(struct json_object **out)
+static int apd_openwrt_readback(struct json_object *candidate,
+                                struct json_object **out)
 {
-    return apd_openwrt_disabled("readback", out,
-        "phase2_canonical_readback_pending");
+    struct apd_config_paths paths = { "/sbin/uci", "/sbin/wifi",
+                                      "/etc/config",
+                                      "/tmp/dreamingwrt-apd-config-candidate" };
+    return apd_config_readback(&paths, candidate, out);
 }
 
 static int apd_openwrt_rollback(struct json_object *rollback_ref,
                                 struct json_object **out)
 {
-    (void)rollback_ref;
-    return apd_openwrt_disabled("rollback", out,
-        "phase2_rollback_readback_pending");
+    struct apd_config_paths paths = { "/sbin/uci", "/sbin/wifi",
+                                      "/etc/config",
+                                      "/tmp/dreamingwrt-apd-config-candidate" };
+    return apd_config_rollback(&paths, rollback_ref, out);
 }
 
 static const struct apd_backend_ops openwrt_backend = {

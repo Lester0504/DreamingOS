@@ -2,17 +2,13 @@
 #ifndef DREAMINGWRT_APD_CONFIG_EXECUTOR_H
 #define DREAMINGWRT_APD_CONFIG_EXECUTOR_H
 
-/* Phase W2a: the config job executor core.  These functions implement the
+/* The config job executor core.  These functions implement the
  * stage / apply / readback / rollback primitives over an injectable uci
  * binary, config directory and staging directory so the whole state
  * machine is testable without touching a live system.
  *
- * Production reachability: NONE.  The backend ops table keeps returning
- * phase2_*_pending, apd_protocol keeps validate/stage/apply/readback/
- * rollback capabilities false, and no wire message invokes this code
- * until the W2b config_job family lands behind those gates.  apply() and
- * rollback() mutate the supplied config_dir; every caller must hold the
- * capability gate and a journaled rollback reference first. */
+ * apply() and rollback() mutate the supplied config_dir; every caller must
+ * hold the capability gate and a journaled rollback reference first. */
 
 #include <json-c/json.h>
 
@@ -59,5 +55,9 @@ int apd_config_apply(const struct apd_config_paths *paths,
 int apd_config_rollback(const struct apd_config_paths *paths,
                         struct json_object *previous,
                         struct json_object **out);
+
+/* Runtime availability is shared by the capability surface and transport. */
+int apd_config_executor_available(const struct apd_config_paths *paths);
+int apd_config_executor_available_default(void);
 
 #endif

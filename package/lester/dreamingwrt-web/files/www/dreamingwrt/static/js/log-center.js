@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '20260810-front-release-01';
+  const VERSION = '20260817-audit-log-localization-03';
   const REFRESH_MS = 30000;
   const SEARCH_DEBOUNCE_MS = 650;
   const DEFAULT_PAGE_SIZE = 25;
@@ -69,6 +69,60 @@
     ['CONFIG_RESUMED', '恢复配置'],
     ['CONFIG_PAUSED', '暂停配置']
   ];
+  const AUDIT_EVENT_LABELS = {
+    'auth.login.success': 'Web 登录成功',
+    'auth.login.failed': 'Web 登录失败',
+    'auth.logout': '退出登录',
+    'network.dhcp.reservation.create': '添加 DHCP 静态分配',
+    'network.dhcp.reservation.update': '修改 DHCP 静态分配',
+    'network.dhcp.reservation.delete': '删除 DHCP 静态分配',
+    'network.dhcp.apply.failed': '应用 DHCP 配置失败',
+    'network.dhcp.apply': '应用 DHCP 配置',
+    'system.users.create': '创建用户',
+    'system.users.update': '修改用户',
+    'system.users.delete': '删除用户',
+    'network.wan.update': '修改 WAN 配置',
+    'system.ota.apply': '安装系统更新',
+    'client.block': '阻止终端联网'
+  };
+  const AUDIT_RESULT_LABELS = {
+    success: '成功',
+    applied: '已应用',
+    denied: '被拒绝',
+    failed: '失败',
+    cancelled: '已取消',
+    dry_run: '仅演练',
+    accepted: '已接受',
+    rolled_back: '已回滚'
+  };
+  const AUDIT_CHANNEL_LABELS = {
+    web: 'Web',
+    app: 'App',
+    api_key: 'API Key',
+    cloud: 'Cloud',
+    setup: 'Setup',
+    system: 'System',
+    automation: 'Automation',
+    control: 'Control',
+    unknown: '未提供'
+  };
+  const AUDIT_RISK_LABELS = {
+    low: '低',
+    medium: '中',
+    high: '高',
+    critical: '严重',
+    blocked: '禁止'
+  };
+  const AUDIT_FAILURE_LABELS = {
+    dhcp_apply_failed_rolled_back: '应用失败，已回滚',
+    dhcp_apply_failed_rollback_failed: '应用失败，回滚也失败',
+    dnsmasq_reload_failed: 'dnsmasq 重载失败',
+    dhcp_access_readback_failed: 'DHCP 准入回读失败',
+    odhcpd_reload_failed: 'odhcpd 重载失败',
+    dhcpv6_readback_failed: 'DHCPv6 回读失败',
+    invalid_credentials: '用户名或密码错误',
+    login_backend_unavailable: '登录服务不可用'
+  };
   const LOG_SOURCE_FILTERS = [
     { id: 'general', label: '常规', sections: ['function', 'system', 'syslog'], modes: ['GENERAL'] },
     { id: 'audit', label: '审计 / 用户', sections: ['user'], modes: ['AUDIT'] },
@@ -83,12 +137,8 @@
     AUDIT: LOG_SOURCE_FILTERS.filter((item) => item.modes.includes('AUDIT')).map((item) => item.id)
   };
   const DEFAULT_SOURCE_BY_MODE = { GENERAL: 'general', AUDIT: 'audit' };
-  // 30.1 实测：后端 logs/search 只认 severities / categories / events，
-  // 完全忽略 type 与 sources。审计日志实际落在 ADMIN 分类与
-  // ADMIN_AUTH_EVENT 事件里，因此「审计」tab 必须靠分类维度取数，
-  // 否则两个 tab 会拿回同一批系统日志。
-  const AUDIT_CATEGORY_IDS = ['ADMIN', 'AUDIT'];
-  const AUDIT_EVENT_IDS = ['ADMIN_AUTH_EVENT'];
+  // 来源仍用于后端查询；审计归属以响应中的显式 AUDIT/source_id 契约为准，
+  // 不再用 ADMIN 分类或 auth/login 文本猜测程序日志的语义。
   const SOURCE_BY_SECTION = {
     user: 'audit',
     audit: 'audit',
@@ -393,21 +443,16 @@
       return sourcesForMode(mode).includes(sourceId);
     }
 
-    // 判定一行是否属于「审计」语义：后端 source_id 恒为 general，
-    // 只能靠分类/事件识别管理员与用户操作。
+    // 管理审计只认后端的显式类型或结构化 web_audit 标记；程序名和分类文本
+    // 不再参与猜测，避免 nginx/dropbear 等常规日志混进操作账本。
     function isAuditRow(row) {
-      const category = String(row.category || '').toUpperCase();
-      const event = String(row.event || '').toUpperCase();
-      if (AUDIT_CATEGORY_IDS.includes(category)) return true;
-      if (AUDIT_EVENT_IDS.includes(event)) return true;
-      if (row.sourceId === 'audit') return true;
-      if (AUDIT_EVENTS.some(([id]) => id === event)) return true;
-      return Boolean(row.admin && (row.admin.id || row.admin.name));
+      return String(row.type || '').toUpperCase() === 'AUDIT'
+        || row.audit && row.audit.structured === true;
     }
 
     // tab 归属判定：审计 tab 只显示审计行，常规 tab 排除审计行。
     function modeAllowsRow(row, mode = state.mode) {
-      return mode === 'AUDIT' ? isAuditRow(row) : !isAuditRow(row);
+      return mode === 'AUDIT' ? isAuditRow(row) && !isAuditReadNoise(row) : !isAuditRow(row);
     }
 
     function currentRange() {
@@ -428,12 +473,7 @@
       const sourceIds = Array.from(state.sources).filter((id) => modeAllowsSource(id));
       const effectiveSources = sourceIds.length ? sourceIds : [defaultSourceForMode()];
       const sourceSections = sourceIds.flatMap((id) => sourceMeta(id)?.sections || []);
-      // 审计模式下若用户没有手选分类，则用后端真正认的 ADMIN 分类兜底，
-      // 让「审计」tab 拿到的是用户/管理员操作日志而不是系统日志。
       const categories = Array.from(state.categories);
-      const effectiveCategories = categories.length
-        ? categories
-        : (state.mode === 'AUDIT' ? AUDIT_CATEGORY_IDS.slice() : []);
       return {
         type: state.mode,
         searchText: state.search,
@@ -445,7 +485,7 @@
         timestampTo: range.timestampTo,
         pageNumber: state.pageNumber,
         pageSize: state.pageSize,
-        categories: effectiveCategories,
+        categories,
         events: Array.from(state.events),
         deviceMacs: Array.from(state.deviceMacs),
         clientDeviceMacs: Array.from(state.clientDeviceMacs),
@@ -546,13 +586,105 @@
       return firstText(key).replace(/_/g, ' ') || '--';
     }
 
+    function auditEventLabel(key) {
+      const code = firstText(key);
+      if (!code) return '未提供';
+      return AUDIT_EVENT_LABELS[code] || `${code}（未翻译事件）`;
+    }
+
     function eventLabel(key) {
+      if (state.mode === 'AUDIT') return auditEventLabel(key);
       const normalizedKey = String(key || '').toUpperCase();
       if (EVENT_LABELS[normalizedKey]) return EVENT_LABELS[normalizedKey];
       const source = state.mode === 'AUDIT' ? AUDIT_EVENTS : GENERAL_EVENTS;
       const direct = source.find(([id]) => id === key);
       if (direct) return direct[1];
       return firstText(key).replace(/_/g, ' ') || '--';
+    }
+
+    function objectValue(...values) {
+      for (const value of values) {
+        if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+        if (typeof value !== 'string' || !value.trim().startsWith('{')) continue;
+        try {
+          const parsed = JSON.parse(value);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+        } catch (_) {}
+      }
+      return {};
+    }
+
+    function booleanValue(...values) {
+      for (const value of values) {
+        if (typeof value === 'boolean') return value;
+        if (value === 1 || value === '1' || value === 'true') return true;
+        if (value === 0 || value === '0' || value === 'false') return false;
+      }
+      return null;
+    }
+
+    function auditChannelLabel(value) {
+      const channel = firstText(value).toLowerCase();
+      return AUDIT_CHANNEL_LABELS[channel] || (channel ? channel : '未提供');
+    }
+
+    function auditResultLabel(value) {
+      const result = firstText(value).toLowerCase();
+      return AUDIT_RESULT_LABELS[result] || (result ? result : '未提供');
+    }
+
+    function auditRiskLabel(value) {
+      const risk = firstText(value).toLowerCase();
+      return AUDIT_RISK_LABELS[risk] || (risk ? risk : '未提供');
+    }
+
+    function auditFailureLabel(value) {
+      const reason = firstText(value);
+      return AUDIT_FAILURE_LABELS[reason] || reason;
+    }
+
+    function actorNameFromRaw(value) {
+      const actor = firstText(value);
+      return /^(?:web|app):/i.test(actor) ? actor.slice(actor.indexOf(':') + 1) : actor;
+    }
+
+    function auditDetailText(row) {
+      const admin = firstText(row.admin && row.admin.name, row.admin && row.admin.id, '未知管理员');
+      const channel = firstText(row.audit && row.audit.channelLabel, '未提供');
+      const clientIp = firstText(row.client && row.client.ip, '未提供');
+      const deviceName = firstText(row.device && row.device.name, '本机');
+      if (row.event === 'auth.login.success') {
+        return `${admin} 使用 ${channel} 登录了 DreamingOS（${deviceName}）。源 IP：${clientIp}`;
+      }
+      if (row.event === 'auth.login.failed') {
+        const reason = firstText(row.audit && row.audit.failureLabel, '未提供原因');
+        return `${admin} 使用 ${channel} 登录 DreamingOS（${deviceName}）失败。源 IP：${clientIp}。原因：${reason}`;
+      }
+      if (row.event === 'auth.logout') {
+        return `${admin} 通过 ${channel} 退出了 DreamingOS（${deviceName}）。源 IP：${clientIp}`;
+      }
+      const object = firstText(row.audit && row.audit.objectName, row.target);
+      const result = firstText(row.audit && row.audit.resultLabel);
+      const risk = firstText(row.audit && row.audit.riskLabel);
+      const failure = firstText(row.audit && row.audit.failureLabel);
+      const rollback = row.audit && row.audit.runtimeRolledBack === true ? '，运行态已回滚' : '';
+      const stage = firstText(row.audit && row.audit.failureStage);
+      const parts = [`${admin} 通过 ${channel} 执行“${row.eventLabel}”`];
+      if (object) parts.push(`对象：${object}`);
+      if (result) parts.push(`结果：${result}${rollback}`);
+      if (risk) parts.push(`风险：${risk}`);
+      if (stage) parts.push(`阶段：${stage}`);
+      if (failure) parts.push(`原因：${failure}`);
+      if (clientIp) parts.push(`源 IP：${clientIp}`);
+      return `${parts.shift()}。${parts.join('；')}${parts.length ? '。' : ''}`;
+    }
+
+    function isAuditReadNoise(row) {
+      const operation = firstText(row.audit && row.audit.operationType).toLowerCase();
+      const code = firstText(row.event, row.audit && row.audit.action).toLowerCase();
+      if (['read', 'get', 'list', 'search', 'count', 'filter_data', 'filter-data', 'poll', 'query'].includes(operation)) return true;
+      return /^\/api\/v1\/logs\/(?:search|query|count|filter-data)(?:$|[/?])/.test(code)
+        || /(?:^|\.)(?:search|count|filter_data|poll|query)$/.test(code);
     }
 
     function legacyCategoryFor(item = {}, sourceHint = '') {
@@ -644,13 +776,17 @@
     function normalizeLogItem(item = {}, index = 0, sourceHint = '') {
       const params = item.parameters && typeof item.parameters === 'object' ? item.parameters : {};
       const rawParams = params.RAW && typeof params.RAW === 'object' ? params.RAW : {};
-      const rawDetail = rawParams.detail_json && typeof rawParams.detail_json === 'object' ? rawParams.detail_json : {};
+      const rawDetail = objectValue(rawParams.detail_json, item.detail_json);
+      const auditParams = params.AUDIT && typeof params.AUDIT === 'object' ? params.AUDIT : {};
       const device = params.DEVICE || params.device || item.device || {};
       const client = params.CLIENT || params.client || item.client || {};
       const admin = params.ADMIN || params.admin || item.admin || {};
+      const actor = objectValue(item.actor_detail, item.actor_identity, item.actor);
+      const sourceContext = objectValue(item.source_context, item.source_detail);
+      const auditObject = objectValue(item.object, item.target_object, rawDetail.object_detail);
       const severity = severityKey(item.severity, item.level, item.priority, item.status, item.type);
       const category = firstText(item.category, item.category_key, item.type === 'audit' ? 'AUDIT' : '', sourceHint);
-      const event = firstText(item.event, item.key, item.event_key, item.action, item.title_raw, item.title, item.message_type);
+      const event = firstText(item.event_code, item.event, item.action, auditParams.action, rawDetail.action, item.key, item.event_key, item.message_type);
       const message = firstText(item.message, item.message_raw, item.description, item.detail, item.title, item.title_raw, item.event, item.action);
       const timestamp = timeMs(firstNumber(item.timestamp, item.ts, item.time, item.created_at, item.date));
       const sourceEvidence = {
@@ -671,13 +807,28 @@
         ? { id: 'kernel', label: '内核' }
         : programIdentity(sourceEvidence, parsed, rawText);
       const sourceLabel = program.label || sourceLabelFor(sourceId);
-      return {
+      const actorRaw = firstText(actor.id, admin.actor, rawDetail.actor, item.actor);
+      const adminName = firstText(admin.name, rawDetail.admin_name, actor.name, item.admin_name, actorNameFromRaw(actorRaw), item.username, item.user);
+      const adminId = firstText(actor.id, admin.id, rawDetail.admin_id, item.admin_id, item.actor_id, adminName);
+      const channel = firstText(actor.channel, rawDetail.actor_channel, auditParams.channel, item.actor_channel, item.channel);
+      const clientIp = firstText(sourceContext.client_ip, item.client_ip, auditParams.client_ip, rawDetail.client_ip, client.ip, item.auth_ip);
+      const objectName = firstText(auditObject.name, item.object_name, auditParams.object, rawDetail.object, item.object, item.target, device.name);
+      const objectId = firstText(auditObject.id, item.object_id, rawDetail.object_id);
+      const objectType = firstText(auditObject.type, item.object_type, rawDetail.object_type, item.target_type);
+      const result = firstText(item.result, auditParams.result, rawDetail.result);
+      const failureReason = firstText(item.failure_reason, auditParams.failure_reason, rawDetail.failure_reason);
+      const risk = firstText(item.risk, auditParams.risk, rawDetail.risk);
+      const changes = Array.isArray(item.changes) ? item.changes
+        : (Array.isArray(rawDetail.changes) ? rawDetail.changes : []);
+      const row = {
         id: firstText(item.id, item.external_id, item.uuid, `${sourceHint || 'log'}-${timestamp || Date.now()}-${index}`),
         externalId: firstText(item.external_id, item.uuid),
         category: category || (state.mode === 'AUDIT' ? 'AUDIT' : 'HOST'),
         categoryLabel: categoryLabel(category || (state.mode === 'AUDIT' ? 'AUDIT' : 'HOST')),
         event: event || 'LOG_EVENT',
-        eventLabel: firstText(item.title, item.title_raw, eventLabel(event), event, '日志事件'),
+        eventLabel: state.mode === 'AUDIT'
+          ? auditEventLabel(event)
+          : firstText(item.title, item.title_raw, eventLabel(event), event, '日志事件'),
         message,
         severity,
         severityLabel: severityLabel(severity),
@@ -699,16 +850,49 @@
         },
         client: {
           name: firstText(client.name, client.hostname, item.client_name, item.username, ''),
-          ip: firstText(client.ip, item.client_ip, item.auth_ip, ''),
+          ip: clientIp,
           mac: firstText(client.mac, item.client_mac, item.identity, '')
         },
         admin: {
-          id: firstText(admin.id, item.admin_id, item.actor_id, item.username, ''),
-          name: firstText(admin.name, item.admin_name, item.actor, item.username, item.user, '')
+          id: adminId,
+          name: adminName,
+          type: firstText(actor.type, rawDetail.actor_type, item.actor_type)
+        },
+        audit: {
+          structured: String(item.type || '').toUpperCase() === 'AUDIT'
+            || rawDetail.web_audit === true
+            || firstText(item.source_id, rawParams.source).toLowerCase() === 'audit',
+          action: event,
+          operationType: firstText(item.operation_type, auditParams.operation_type, rawDetail.operation_type),
+          channel,
+          channelLabel: auditChannelLabel(channel),
+          clientIp,
+          peerIp: firstText(sourceContext.peer_ip, rawDetail.peer_ip, item.peer_ip),
+          ipSource: firstText(sourceContext.ip_source, rawDetail.ip_source, item.ip_source),
+          userAgent: firstText(sourceContext.user_agent, rawDetail.user_agent, item.user_agent),
+          objectName,
+          objectId,
+          objectType,
+          result,
+          resultLabel: auditResultLabel(result),
+          risk,
+          riskLabel: auditRiskLabel(risk),
+          failureReason,
+          failureLabel: auditFailureLabel(failureReason),
+          failureStage: firstText(item.failure_stage, auditParams.failure_stage, rawDetail.failure_stage),
+          applyState: firstText(item.apply_state, auditParams.apply_state, rawDetail.apply_state),
+          runtimeRolledBack: booleanValue(item.runtime_rolled_back, auditParams.runtime_rolled_back, rawDetail.runtime_rolled_back),
+          scope: firstText(item.scope, auditParams.scope, rawDetail.scope),
+          beforeValue: firstText(item.before_value, auditParams.before_value, rawDetail.before_value),
+          afterValue: firstText(item.after_value, auditParams.after_value, rawDetail.after_value),
+          readback: item.readback || auditParams.readback || rawDetail.readback || null,
+          changes
         },
         raw: item,
         cef: firstText(item.cef, item.syslog, item.raw_log, item.raw)
       };
+      if (isAuditRow(row)) row.message = auditDetailText(row);
+      return row;
     }
 
     function normalizeLegacyLogItem(item = {}, index = 0, sourceHint = '', sourceId = '') {
@@ -721,7 +905,7 @@
         ? inferSourceId({ ...item, message: raw, source: parsed.facility, module: parsed.module }, sourceId)
         : sourceId;
       const program = programIdentity(item, parsed, raw);
-      return {
+      const normalized = {
         ...row,
         category,
         categoryLabel: program.label || sourceLabelFor(inferredSourceId) || sourceHint || categoryLabel(category),
@@ -740,6 +924,12 @@
         },
         cef: firstText(row.cef, raw)
       };
+      if (sourceId === 'audit') normalized.audit.structured = true;
+      if (state.mode === 'AUDIT' && isAuditRow(normalized)) {
+        normalized.eventLabel = auditEventLabel(normalized.event);
+        normalized.message = auditDetailText(normalized);
+      }
+      return normalized;
     }
 
     function normalizeSearchPayload(payload) {
@@ -794,7 +984,14 @@
         row.client.ip,
         row.client.mac,
         row.admin.name,
-        row.admin.id
+        row.admin.id,
+        row.audit && row.audit.channelLabel,
+        row.audit && row.audit.objectName,
+        row.audit && row.audit.objectId,
+        row.audit && row.audit.resultLabel,
+        row.audit && row.audit.riskLabel,
+        row.audit && row.audit.failureLabel,
+        row.audit && row.audit.scope
       ].join(' ').toLowerCase();
     }
 
@@ -869,7 +1066,7 @@
         item.label = label;
         categories.set(id, item);
       });
-      (state.mode === 'AUDIT' ? AUDIT_EVENTS : GENERAL_EVENTS).forEach(([id, label]) => {
+      (state.mode === 'AUDIT' ? Object.entries(AUDIT_EVENT_LABELS) : GENERAL_EVENTS).forEach(([id, label]) => {
         const item = events.get(id) || { id, label, count: 0 };
         item.label = label;
         events.set(id, item);
@@ -915,7 +1112,7 @@
     }
 
     function normalizeFilterData(payload) {
-      const fallbackEvents = state.mode === 'AUDIT' ? AUDIT_EVENTS : GENERAL_EVENTS;
+      const fallbackEvents = state.mode === 'AUDIT' ? Object.entries(AUDIT_EVENT_LABELS) : GENERAL_EVENTS;
       return {
         sources: normalizeFilterList(payload, 'sources', LOG_SOURCE_FILTERS).filter((item) => !/^unifi/i.test(item.id)),
         categories: normalizeFilterList(payload, 'categories', GENERAL_CATEGORIES).filter((item) => !/^UNIFI_/i.test(item.id)).map((item) => ({ ...item, label: categoryLabel(item.id) })),
@@ -1275,7 +1472,7 @@
       const filterData = state.filterData || filterDataFromRows(state.allRows);
       const sourceCounts = countMap(state.allRows, (row) => row.sourceId || '');
       const categories = normalizeFilterList(filterData, 'categories', GENERAL_CATEGORIES);
-      const eventsBase = normalizeFilterList(filterData, 'events', state.mode === 'AUDIT' ? AUDIT_EVENTS : GENERAL_EVENTS);
+      const eventsBase = normalizeFilterList(filterData, 'events', state.mode === 'AUDIT' ? Object.entries(AUDIT_EVENT_LABELS) : GENERAL_EVENTS);
       const eventQuery = state.eventSearch.trim().toLowerCase();
       const events = eventQuery
         ? eventsBase.filter((item) => [item.label, item.id].join(' ').toLowerCase().includes(eventQuery))
@@ -1294,7 +1491,6 @@
         return `<div class="log-filter-scroll">
           ${severityMarkup()}
           ${periodMarkup()}
-          ${filterGroup('sources', '日志来源', modeSourceFilters().map((item) => sourceRow(item, sourceCounts)).join(''), { count: modeSourceFilters().length })}
           ${filterGroup('admins', '管理员', admins.map((item) => identityRow('adminIds', item, state.adminIds, 'id')).join('') || '<p class="log-filter-empty">暂无管理员筛选项</p>', { count: admins.length })}
           ${filterGroup('events', '事件', `
             <label class="log-filter-local-search">
@@ -1419,6 +1615,7 @@
     }
 
     function rowMarkup(row) {
+      if (state.mode === 'AUDIT') return auditRowMarkup(row);
       const selected = state.selectedId && row.id === state.selectedId;
       const checked = state.selectedRows.has(row.id);
       const message = row.message || '--';
@@ -1437,6 +1634,25 @@
       </tr>`;
     }
 
+    function auditRowMarkup(row) {
+      const selected = state.selectedId && row.id === state.selectedId;
+      const checked = state.selectedRows.has(row.id);
+      const message = row.message || '未提供';
+      const expanded = state.expandedMessages.has(row.id);
+      const truncatable = message.length > MESSAGE_CLAMP_CHARS;
+      return `<tr class="log-audit-row ${selected ? 'is-selected' : ''} ${checked ? 'is-ai-selected' : ''}" data-log-row="${html(row.id)}">
+        <td class="log-table-select-cell"><label class="log-table-select" title="选择此日志"><input type="checkbox" data-log-row-select="${html(row.id)}" ${checked ? 'checked' : ''}><span aria-hidden="true"></span></label></td>
+        <td data-log-label="类别"><span class="log-audit-category">审计</span></td>
+        <td data-log-label="事件"><strong class="log-audit-event">${html(row.eventLabel)}</strong></td>
+        <td class="log-table-desc-cell log-audit-detail-cell" data-log-label="详情">
+          <span class="log-table-desc ${expanded ? 'is-expanded' : ''}" title="${html(message)}">${html(expanded || !truncatable ? message : `${message.slice(0, MESSAGE_CLAMP_CHARS).trimEnd()}…`)}</span>
+          ${truncatable ? `<button type="button" class="log-table-desc-toggle" data-log-desc-toggle="${html(row.id)}" aria-expanded="${expanded}" title="${expanded ? '收起完整详情' : '展开完整详情'}">${expanded ? '收起' : '…'}</button>` : ''}
+        </td>
+        <td data-log-label="严重性"><span class="log-table-severity">${severityBarsMarkup(row.severity)}<em>${html(row.severityLabel)}</em></span></td>
+        <td class="num" data-log-label="日期 / 时间">${html(formatTime(row.timestamp))}</td>
+      </tr>`;
+    }
+
     function tableMarkup() {
       const totalPages = Math.max(1, Math.ceil(state.total / state.pageSize));
       const start = state.total ? state.pageNumber * state.pageSize + 1 : 0;
@@ -1448,11 +1664,12 @@
         : state.rows.length
           ? state.rows.map(rowMarkup).join('')
           : `<tr><td colspan="6"><div class="log-table-empty">${html(state.error || '当前筛选条件下没有日志。')}</div></td></tr>`;
-      return `<section class="log-center-table-card dwrt-kit-table-wrap insights-stable-glass ${state.aiResult ? 'has-ai-result' : ''}">
+      const auditMode = state.mode === 'AUDIT';
+      return `<section class="log-center-table-card dwrt-kit-table-wrap insights-stable-glass ${auditMode ? 'is-audit-mode' : ''} ${state.aiResult ? 'has-ai-result' : ''}">
         <div class="dwrt-kit-table-toolbar log-center-toolbar">
           <div class="dwrt-kit-table-title">
-            <strong>日志中心</strong>
-            <span>${html(state.loading ? '正在读取' : '日志列表')}</span>
+            <strong>${auditMode ? '操作审计' : '日志中心'}</strong>
+            <span>${html(state.loading ? '正在读取' : (auditMode ? '管理员与系统管理操作' : '日志列表'))}</span>
           </div>
           <div class="log-center-toolbar-actions">
             ${state.notice ? `<span class="log-center-notice">${html(state.notice)}</span>` : ''}
@@ -1466,8 +1683,8 @@
         </div>
         ${state.aiResult ? `<section class="log-ai-result" aria-live="polite"><strong>AI 分析</strong><p>${html(state.aiResult)}</p><button type="button" data-log-ai-dismiss aria-label="关闭 AI 分析">关闭</button></section>` : ''}
         <div class="dwrt-kit-table-scroll log-center-table-scroll">
-          <table class="dwrt-kit-table log-center-table" aria-label="日志列表">
-            <thead><tr><th class="log-table-select-head"><label class="log-table-select" title="选择本页日志"><input type="checkbox" data-log-select-page ${allVisibleSelected ? 'checked' : ''}><span aria-hidden="true"></span></label></th><th>日志来源</th><th>事件</th><th>描述</th><th>级别</th><th class="num">日期 / 时间</th></tr></thead>
+          <table class="dwrt-kit-table log-center-table" aria-label="${auditMode ? '操作审计列表' : '日志列表'}">
+            <thead><tr><th class="log-table-select-head"><label class="log-table-select" title="选择本页日志"><input type="checkbox" data-log-select-page ${allVisibleSelected ? 'checked' : ''}><span aria-hidden="true"></span></label></th><th>${auditMode ? '类别' : '日志来源'}</th><th>事件</th><th>${auditMode ? '详情' : '描述'}</th><th>${auditMode ? '严重性' : '级别'}</th><th class="num">日期 / 时间</th></tr></thead>
             <tbody>${body}</tbody>
           </table>
         </div>
@@ -1509,13 +1726,81 @@
       try { return JSON.stringify(row.raw || row, null, 2); } catch (_) { return String(row.message || ''); }
     }
 
+    function detailJsonValue(value) {
+      if (value === undefined || value === null || value === '') return '';
+      if (typeof value === 'string') return value;
+      try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); }
+    }
+
+    function auditChangesMarkup(row) {
+      const audit = row.audit || {};
+      if (audit.changes && audit.changes.length) {
+        return audit.changes.map((change) => {
+          const path = firstText(change.path, change.field, change.name, '字段');
+          const hidden = change.redacted === true || change.changed === true && !('old' in change) && !('new' in change);
+          const value = hidden
+            ? '已更改，内容已隐藏'
+            : `${detailJsonValue(change.old ?? change.before ?? '未提供')} → ${detailJsonValue(change.new ?? change.after ?? '未提供')}`;
+          return detailRow(path, value);
+        }).join('');
+      }
+      return `${detailRow('修改前', audit.beforeValue)}${detailRow('修改后', audit.afterValue)}`;
+    }
+
+    function auditDrawerMarkup(row, raw) {
+      const audit = row.audit || {};
+      return `<header class="dwrt-kit-sheet-header log-drawer-head">
+          <div>
+            <span>${html(formatTime(row.timestamp))}</span>
+            <strong>${html(row.eventLabel)}</strong>
+          </div>
+          <button type="button" class="dwrt-kit-sheet-close" data-log-close-drawer aria-label="关闭日志详情">×</button>
+        </header>
+        <div class="dwrt-kit-sheet-body log-drawer-scroll">
+          <section class="log-detail-section log-audit-primary-detail">
+            <h3>操作详情</h3>
+            <dl>
+              ${detailRow('事件', row.eventLabel)}
+              ${detailRow('严重性', row.severityLabel)}
+              ${detailRow('管理员名称', row.admin.name || row.admin.id || '未提供')}
+              ${detailRow('访问方式', audit.channelLabel || '未提供')}
+              ${detailRow('源 IP 地址', audit.clientIp || row.client.ip || '未提供')}
+              ${detailRow('详情', row.message || '未提供')}
+            </dl>
+          </section>
+          <section class="log-detail-section">
+            <h3>结果与对象</h3>
+            <dl>
+              ${detailRow('结果', audit.resultLabel)}
+              ${detailRow('风险', audit.riskLabel)}
+              ${detailRow('失败原因', audit.failureLabel)}
+              ${detailRow('失败阶段', audit.failureStage)}
+              ${detailRow('应用状态', audit.applyState)}
+              ${detailRow('运行态回滚', audit.runtimeRolledBack === null ? '' : (audit.runtimeRolledBack ? '是' : '否'))}
+              ${detailRow('对象', audit.objectName)}
+              ${detailRow('对象类型', audit.objectType)}
+              ${detailRow('对象标识', audit.objectId)}
+              ${detailRow('作用域', audit.scope)}
+            </dl>
+          </section>
+          ${auditChangesMarkup(row) ? `<section class="log-detail-section"><h3>字段变更</h3><dl>${auditChangesMarkup(row)}</dl></section>` : ''}
+          ${audit.readback ? `<section class="log-detail-section"><h3>运行态回读</h3><pre class="log-detail-json">${html(detailJsonValue(audit.readback))}</pre></section>` : ''}
+          <details class="log-detail-section log-detail-raw">
+            <summary>CEF 日志（高级）</summary>
+            <div class="log-detail-title-row">
+              <span>原始安全事件证据</span>
+              <button type="button" data-log-copy="${html(row.id)}">复制</button>
+            </div>
+            <pre>${html(raw)}</pre>
+          </details>
+        </div>`;
+    }
+
     function drawerMarkup() {
       const row = state.selectedRow;
       if (!row) return '';
       const raw = rawLogText(row);
-      // 与 AI 抽屉同一套 kit 组件（copilot 变体），不再手搓玻璃层。
-      return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-log-close-drawer aria-label="关闭日志详情"></button><aside class="log-center-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" aria-label="日志详情">
-        <header class="dwrt-kit-sheet-header log-drawer-head">
+      const content = state.mode === 'AUDIT' ? auditDrawerMarkup(row, raw) : `<header class="dwrt-kit-sheet-header log-drawer-head">
           <div>
             <span>${html(formatTime(row.timestamp))}</span>
             <strong>${html(row.eventLabel)}</strong>
@@ -1557,7 +1842,10 @@
             </div>
             <pre>${html(raw)}</pre>
           </section>
-        </div>
+        </div>`;
+      // 与 AI 抽屉同一套 kit 组件（copilot 变体），不再手搓玻璃层。
+      return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-log-close-drawer aria-label="关闭日志详情"></button><aside class="log-center-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" aria-label="日志详情">
+        ${content}
       </aside>`;
     }
 
@@ -1644,6 +1932,23 @@
       host.setAttribute('data-log-drawer-id', nextId);
       host.innerHTML = shouldOpen ? drawerMarkup() : '';
       if (shouldOpen) {
+        // Sheets move into the Kit portal. Clear the page selection during the
+        // original close click, before the Kit starts its animated replay path.
+        const closeBridge = (event) => {
+          const target = event.target.closest('[data-log-close-drawer]');
+          if (!target || target.dataset.dwrtSheetBypass === 'true') return;
+          const sheet = target.closest('.log-center-drawer')
+            || (target.classList.contains('dwrt-kit-sheet-overlay') ? target.nextElementSibling : null);
+          const overlay = sheet && sheet.previousElementSibling;
+          closeDrawer();
+          window.setTimeout(() => {
+            window.DWRT_UI_KIT?.unmount?.(sheet);
+            overlay?.remove();
+            sheet?.remove();
+          }, 520);
+        };
+        host.querySelector('.log-center-drawer')?.addEventListener('click', closeBridge, true);
+        host.querySelector('.dwrt-kit-sheet-overlay')?.addEventListener('click', closeBridge, true);
         mountUiKit(host);
         scheduleGlassCardsRender(120);
       }
@@ -1750,6 +2055,14 @@
       // 只切换选中高亮 + 抽屉，不整页重绘。
       if (previousId) patchRow(previousId);
       if (state.selectedId) patchRow(state.selectedId);
+      syncDrawer();
+    }
+
+    function closeDrawer() {
+      const previousId = state.selectedId;
+      state.selectedId = '';
+      state.selectedRow = null;
+      if (previousId) patchRow(previousId);
       syncDrawer();
     }
 
@@ -1920,11 +2233,7 @@
         return;
       }
       if (event.target.closest('[data-log-close-drawer]')) {
-        const previousId = state.selectedId;
-        state.selectedId = '';
-        state.selectedRow = null;
-        if (previousId) patchRow(previousId);
-        syncDrawer();
+        closeDrawer();
         return;
       }
       const copyButton = event.target.closest('[data-log-copy]');
@@ -2076,7 +2385,17 @@
       if (root) root.classList.remove('route-log-center-host');
     }
 
-    return { mount, unmount, refresh };
+    return {
+      mount,
+      unmount,
+      refresh,
+      __test: {
+        setMode(mode) { state.mode = mode === 'AUDIT' ? 'AUDIT' : 'GENERAL'; },
+        normalizeLogItem,
+        auditDrawerMarkup(row) { return auditDrawerMarkup(row, rawLogText(row)); },
+        isAuditReadNoise
+      }
+    };
   }
 
   window.DWRTLogCenter = { create, version: VERSION };

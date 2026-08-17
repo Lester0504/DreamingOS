@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
-  const VERSION = '20260810-front-release-01';
+  const VERSION = '20260817-notification-center-workbench-07';
   const MODULE_CLASS = 'notification-push-route-host';
   const ENDPOINTS = {
     status: '/api/v1/notifyd/status',
@@ -16,13 +16,6 @@ export function mount(context = {}) {
     test: '/api/v1/notifyd/test-send',
     events: '/api/v1/notifyd/events'
   };
-  const TABS = [
-    { id: 'overview', label: '概览' },
-    { id: 'channels', label: '推送通道' },
-    { id: 'routes', label: '路由规则' },
-    { id: 'outbox', label: '投递记录' },
-    { id: 'settings', label: '基本设置' }
-  ];
   const SEVERITY_OPTIONS = [
     { id: 'debug', label: '调试' },
     { id: 'info', label: '信息' },
@@ -106,11 +99,18 @@ export function mount(context = {}) {
     routes: [],
     outbox: [],
     events: null,
-    tab: tabFromLocation(),
     query: '',
     outboxState: 'all',
+    ruleFilters: { search: '', categories: [], severities: [], channels: [], events: [], actions: [], enabled: 'all', triggered: 'all' },
+    selectedRouteIds: [],
     drawer: '',
+    drawerRouteId: '',
+    columnMenuOpen: false,
+    ruleColumns: ['rule', 'category', 'action', 'hits', 'latest', 'createdBy', 'method', 'timing', 'status'],
+    confirmation: null,
     draft: {},
+    utilityReturnDrawer: '',
+    utilityReturnDraft: null,
     saving: false,
     workingId: '',
     notice: '',
@@ -196,16 +196,10 @@ export function mount(context = {}) {
     return unwrap(json);
   }
 
-  function tabFromLocation() {
-    try {
-      const fromHash = (window.location.hash.match(/[?&]notifytab=([^&]+)/) || [])[1];
-      const value = decodeURIComponent(fromHash || 'overview');
-      return TABS.some((tab) => tab.id === value) ? value : 'overview';
-    } catch (_) { return 'overview'; }
-  }
-
-  function setTab(value) {
-    state.tab = TABS.some((tab) => tab.id === value) ? value : 'overview';
+  function currentTableKind() {
+    if (state.drawer === 'channel-manager') return 'channels';
+    if (state.drawer === 'outbox') return 'outbox';
+    return 'rules';
   }
 
   function normalizeChannel(value = {}, index = 0) {
@@ -233,6 +227,10 @@ export function mount(context = {}) {
       event: firstText(value.event),
       source: firstText(value.source),
       options: value.options && typeof value.options === 'object' ? value.options : {},
+      action: firstText(value.action, value.action_type, value.options?.action),
+      notificationMethod: firstText(value.notification_method, value.notificationMethod, value.options?.notification_method, value.options?.delivery_mode),
+      createdBy: firstText(value.created_by, value.owner, value.author),
+      sendWindow: firstText(value.when_to_send, value.send_window, value.options?.when_to_send, value.options?.schedule),
       updatedAt: firstNumber(value.updated_at),
       raw: value
     };
@@ -336,6 +334,10 @@ export function mount(context = {}) {
       send: '<path d="m22 2-7 20-4-9-9-4 20-7Z"></path><path d="M22 2 11 13"></path>',
       edit: '<path d="m4 20 4.3-1 10.8-10.8a2 2 0 0 0-2.8-2.8L5.5 16.2 4 20Z"></path>',
       retry: '<path d="M20 11a8 8 0 1 0 1 4"></path><path d="M20 4v7h-7"></path>',
+      pause: '<path d="M8 5v14M16 5v14"></path>',
+      play: '<path d="m8 5 10 7-10 7V5Z"></path>',
+      more: '<circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle>',
+      chevron: '<path d="m6 9 6 6 6-6"></path>',
       service: '<path d="M12 3v9"></path><path d="M7.1 5.7a8 8 0 1 0 9.8 0"></path>',
       channels: '<path d="M4 7a3 3 0 1 1 3 3H4V7Z"></path><path d="M20 17a3 3 0 1 0-3-3h3v3Z"></path><path d="M7 7h10v7"></path>',
       delivered: '<path d="M4 12.5 9 17l11-12"></path>',
@@ -345,6 +347,10 @@ export function mount(context = {}) {
       bell: '<path d="M18 9a6 6 0 1 0-12 0c0 5-2 6-2 6h16s-2-1-2-6"></path><path d="M10.3 20a2 2 0 0 0 3.4 0"></path>'
     };
     return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.bell}</svg>`;
+  }
+
+  function alarmBellIcon() {
+    return `<svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M10 2a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 1 0v-1A.5.5 0 0 0 10 2Z"></path><path fill-rule="evenodd" clip-rule="evenodd" d="M10 5a5 5 0 0 0-5 5v4.09c0 .503.407.91.91.91h8.181a.91.91 0 0 0 .91-.91V10a5 5 0 0 0-5-5Zm4 9v-4a4 4 0 0 0-8 0v4h8Z"></path><path d="M3 17.5a.5.5 0 0 1 .5-.5h13a.5.5 0 0 1 0 1h-13a.5.5 0 0 1 0-1Zm14.5-8a.5.5 0 0 1 0 1h-1a.5.5 0 0 1 0-1h1ZM2 10a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 0-1h-1a.5.5 0 0 0-.5-.5Zm12.951-5.656a.5.5 0 0 1 .707.707l-.707.707a.5.5 0 1 1-.707-.707l.707-.707Zm-10.608 0a.5.5 0 0 0 0 .707l.707.707a.5.5 0 1 0 .707-.707l-.707-.707a.5.5 0 0 0-.707 0Z"></path></svg>`;
   }
 
   function formatTime(value) {
@@ -384,7 +390,65 @@ export function mount(context = {}) {
 
   function filteredRoutes() {
     const query = state.query.trim().toLowerCase();
-    return state.routes.filter((item) => !query || [item.name, item.id, item.channelId, item.minSeverity, item.category, item.event, item.source].join(' ').toLowerCase().includes(query));
+    const filters = state.ruleFilters || {};
+    const categories = Array.isArray(filters.categories) ? filters.categories : [];
+    const severities = Array.isArray(filters.severities) ? filters.severities : [];
+    const channels = Array.isArray(filters.channels) ? filters.channels : [];
+    const events = Array.isArray(filters.events) ? filters.events : [];
+    const actions = Array.isArray(filters.actions) ? filters.actions : [];
+    return state.routes.filter((item) => {
+      const matchesQuery = !query || [item.name, item.id, item.channelId, item.minSeverity, item.category, item.event, item.source].join(' ').toLowerCase().includes(query);
+      const matchesCategory = !categories.length || categories.includes(item.category || 'uncategorized');
+      const matchesSeverity = !severities.length || severities.includes(item.minSeverity);
+      const matchesChannel = !channels.length || channels.includes(item.channelId);
+      const matchesEvent = !events.length || events.includes(item.event || 'all');
+      const matchesAction = !actions.length || actions.includes(item.action || 'notify');
+      const latest = routeDeliveryStats(item.id).latest;
+      const age = latest ? Date.now() - (latest < 100000000000 ? latest * 1000 : latest) : Infinity;
+      const triggeredWindow = ({ '5m': 5, '30m': 30, '1h': 60, '1d': 1440, '1w': 10080, '1m': 43200 })[filters.triggered];
+      const matchesTriggered = filters.triggered === 'all' || (Number.isFinite(age) && age <= triggeredWindow * 60 * 1000);
+      const matchesEnabled = filters.enabled === 'all' || (filters.enabled === 'enabled' ? item.enabled : !item.enabled);
+      return matchesQuery && matchesCategory && matchesSeverity && matchesChannel && matchesEvent && matchesAction && matchesTriggered && matchesEnabled;
+    });
+  }
+
+  function routeDeliveryStats(routeId) {
+    const rows = state.outbox.filter((item) => item.routeId === routeId);
+    return { count: rows.reduce((total, item) => total + Math.max(1, item.count || 1), 0), latest: rows.reduce((latest, item) => Math.max(latest, item.createdAt || 0), 0) };
+  }
+
+  function routeFilterValues() {
+    const categories = new Map();
+    const events = new Map();
+    state.routes.forEach((route) => {
+      const key = route.category || 'uncategorized';
+      categories.set(key, (categories.get(key) || 0) + 1);
+      const eventKey = route.event || 'all';
+      events.set(eventKey, (events.get(eventKey) || 0) + 1);
+    });
+    return {
+      categories: [...categories.entries()].map(([id, count]) => ({ id, label: id === 'uncategorized' ? '未分类' : categoryLabel(id), count })),
+      events: [...events.entries()].map(([id, count]) => ({ id, label: id === 'all' ? '全部事件' : eventLabel(id), count })),
+      severities: SEVERITY_OPTIONS.filter((option) => state.routes.some((route) => route.minSeverity === option.id)),
+      channels: state.channels.map((channel) => ({ id: channel.id, label: channel.name, count: state.routes.filter((route) => route.channelId === channel.id).length })),
+      actions: [{ id: 'notify', label: '通知', count: state.routes.length }]
+    };
+  }
+
+  const RULE_COLUMN_DEFS = [
+    { id: 'rule', label: '规则 / 触发器' },
+    { id: 'category', label: '分类' },
+    { id: 'action', label: '动作与通道' },
+    { id: 'hits', label: '命中' },
+    { id: 'latest', label: '最近触发' },
+    { id: 'createdBy', label: '创建者' },
+    { id: 'method', label: '通知方式' },
+    { id: 'timing', label: '发送时机' },
+    { id: 'status', label: '状态 / 操作' }
+  ];
+
+  function ruleColumnVisible(id) {
+    return state.ruleColumns.includes(id);
   }
 
   function filteredOutbox() {
@@ -423,16 +487,21 @@ export function mount(context = {}) {
    * 表格控件全部收进 dwrt-kit-table-toolbar（用户第 9 条）：页头不再摆散落的搜索框与
    * 按钮，手动刷新按钮删除，数据由 10 秒轮询（见 mount 里的 state.timer）维持。
    */
-  function tableToolbarActions() {
-    const createLabel = state.tab === 'channels' ? '新建通道' : state.tab === 'routes' ? '新建规则' : '';
-    const stateFilter = state.tab === 'outbox'
+  function tableToolbarActions(view = 'rules') {
+    const createLabel = view === 'channels' ? '新建通道' : view === 'rules' ? '新建规则' : '';
+    const stateFilter = view === 'outbox'
       ? `<label class="notification-push-filter" data-dwrt-component="field"><select class="dwrt-kit-select" data-dwrt-component="select" data-notify-state aria-label="筛选投递状态"><option value="all">全部状态</option>${['pending','retry','failed','delivered'].map((value) => `<option value="${value}" ${state.outboxState === value ? 'selected' : ''}>${stateLabel(value)}</option>`).join('')}</select></label>`
       : '';
-    return `<div class="notification-toolbar-actions">${stateFilter}<label class="dwrt-kit-expand-search notification-push-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-notify-search placeholder="搜索当前视图" value="${escapeHtml(state.query)}" aria-label="搜索当前视图"></label>${createLabel ? `<button class="dwrt-kit-button is-primary notification-create-button" type="button" data-notify-create="${escapeHtml(state.tab)}">${icon('plus')}<span>${escapeHtml(createLabel)}</span></button>` : ''}</div>`;
+    const bulk = view === 'rules' && state.selectedRouteIds.length
+      ? `<span class="notification-selection-count">已选 ${state.selectedRouteIds.length} 条</span><button class="dwrt-kit-button notification-bulk-button" type="button" data-notify-bulk="enable">启用</button><button class="dwrt-kit-button notification-bulk-button" type="button" data-notify-bulk="disable">暂停</button>`
+      : '';
+    const columns = '';
+    const searchCreate = view === 'rules' ? '' : `<label class="dwrt-kit-expand-search notification-push-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-notify-search placeholder="搜索当前视图" value="${escapeHtml(state.query)}" aria-label="搜索当前视图"></label>${createLabel ? `<button class="dwrt-kit-button is-primary notification-create-button" type="button" data-notify-create="${escapeHtml(view)}">${icon('plus')}<span>${escapeHtml(createLabel)}</span></button>` : ''}`;
+    return `<div class="notification-toolbar-actions">${bulk}${stateFilter}${columns}${searchCreate}</div>`;
   }
 
-  function tableCountText(count) {
-    const unit = state.tab === 'channels' ? '个通道' : state.tab === 'routes' ? '条规则' : '条记录';
+  function tableCountText(count, view = 'rules') {
+    const unit = view === 'channels' ? '个通道' : view === 'rules' ? '条规则' : '条记录';
     return `${count} ${unit}`;
   }
 
@@ -441,7 +510,7 @@ export function mount(context = {}) {
   }
 
   function routeRowsMarkup(rows) {
-    return `${rows.length ? rows.map((item) => `<tr><td><button class="notification-name-button" type="button" data-notify-edit-route="${escapeHtml(item.id)}"><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.id)}</small></button></td><td>${ui.statusBadgeMarkup?.(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'error') || ''}</td><td>${escapeHtml(channelLabel(item.channelId))}</td><td><span class="notification-severity is-${escapeHtml(item.minSeverity)}">${escapeHtml(severityLabel(item.minSeverity))}</span></td><td>${escapeHtml(categoryLabel(item.category))}</td><td>${escapeHtml(eventLabel(item.event))}</td><td>${escapeHtml(item.source || '全部来源')}</td><td><div class="notification-row-actions"><button type="button" data-notify-edit-route="${escapeHtml(item.id)}" aria-label="编辑">${icon('edit')}</button></div></td></tr>`).join('') : '<tr><td colspan="8" class="dwrt-kit-table-empty">暂无路由规则</td></tr>'}`;
+    return `${rows.length ? rows.map((item) => { const stats = routeDeliveryStats(item.id); const selected = state.selectedRouteIds.includes(item.id); const cells = { rule: `<td><button class="notification-name-button" type="button" data-notify-route-detail="${escapeHtml(item.id)}"><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.event ? eventLabel(item.event) : '全部事件')} · ${escapeHtml(item.source || '全部来源')}</small></button></td>`, category: `<td><span class="notification-category-label">${escapeHtml(categoryLabel(item.category))}</span></td>`, action: `<td><span class="notification-action-label">${icon('bell')} ${escapeHtml(channelLabel(item.channelId))}</span><small class="notification-rule-subline">${escapeHtml(severityLabel(item.minSeverity))} 起通知</small></td>`, hits: `<td><strong class="notification-hit-count">${escapeHtml(stats.count)}</strong></td>`, latest: `<td><time>${escapeHtml(formatTime(stats.latest))}</time></td>`, createdBy: `<td><span class="notification-route-meta">${escapeHtml(item.createdBy || '--')}</span></td>`, method: `<td><span class="notification-route-meta">${escapeHtml(item.notificationMethod || channelTypeLabel(state.channels.find((channel) => channel.id === item.channelId)?.type) || '--')}</span></td>`, timing: `<td><span class="notification-route-meta">${escapeHtml(item.sendWindow || '--')}</span></td>`, status: `<td>${ui.statusBadgeMarkup?.(item.enabled ? '启用' : '已暂停', item.enabled ? 'success' : 'neutral') || ''}<div class="notification-row-actions"><button type="button" data-notify-toggle-route="${escapeHtml(item.id)}" aria-label="${item.enabled ? '暂停' : '启用'}">${icon(item.enabled ? 'pause' : 'play')}</button><button type="button" data-notify-edit-route="${escapeHtml(item.id)}" aria-label="编辑">${icon('edit')}</button><button type="button" data-notify-route-menu="${escapeHtml(item.id)}" aria-label="更多操作">${icon('more')}</button></div></td>` }; return `<tr class="notification-rule-row ${selected ? 'is-selected' : ''}" data-notify-route-row="${escapeHtml(item.id)}"><td class="notification-rule-check"><input type="checkbox" data-notify-select-route="${escapeHtml(item.id)}" ${selected ? 'checked' : ''} aria-label="选择 ${escapeHtml(item.name)}"></td>${RULE_COLUMN_DEFS.filter((column) => ruleColumnVisible(column.id)).map((column) => cells[column.id]).join('')}</tr>`; }).join('') : `<tr><td colspan="${1 + state.ruleColumns.length}" class="dwrt-kit-table-empty">暂无通知规则</td></tr>`}`;
   }
 
   function outboxRowsMarkup(rows) {
@@ -450,17 +519,30 @@ export function mount(context = {}) {
 
   function channelTable() {
     const rows = filteredChannels();
-    return `<section class="notification-push-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar notification-push-table-toolbar" data-dwrt-component="toolbar"><div class="dwrt-kit-table-title"><strong>推送通道</strong><span>本地队列、Webhook 与邮件投递 · <em data-notify-table-count>${tableCountText(rows.length)}</em></span></div>${tableToolbarActions()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table notification-channel-table"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>目标</th><th>更新时间</th><th>操作</th></tr></thead><tbody data-notify-rows>${channelRowsMarkup(rows)}</tbody></table></div></section>`;
+    return `<section class="notification-push-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar notification-push-table-toolbar" data-dwrt-component="toolbar"><div class="dwrt-kit-table-title"><strong>推送通道</strong><span>本地队列、Webhook 与邮件投递 · <em data-notify-table-count>${tableCountText(rows.length, 'channels')}</em></span></div>${tableToolbarActions('channels')}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table notification-channel-table"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>目标</th><th>更新时间</th><th>操作</th></tr></thead><tbody data-notify-rows>${channelRowsMarkup(rows)}</tbody></table></div></section>`;
+  }
+
+  function routeFilterSidebar() {
+    const filters = state.ruleFilters || {};
+    const values = routeFilterValues();
+    const checked = (key, id) => Array.isArray(filters[key]) && filters[key].includes(id) ? 'checked' : '';
+    const checkboxList = (name, items) => items.length ? items.map((item) => `<label class="notification-filter-option"><input type="checkbox" data-notify-filter="${name}" value="${escapeHtml(item.id)}" ${checked(name, item.id)}><span>${escapeHtml(item.label)}</span><em>${escapeHtml(item.count ?? '')}</em></label>`).join('') : '<span class="notification-filter-empty">暂无选项</span>';
+    const hasFilters = state.query || state.ruleFilters.categories.length || state.ruleFilters.severities.length || state.ruleFilters.channels.length || state.ruleFilters.events.length || state.ruleFilters.actions.length || state.ruleFilters.enabled !== 'all' || state.ruleFilters.triggered !== 'all';
+    const search = `<label class="dwrt-kit-expand-search notification-filter-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-notify-search placeholder="搜索规则" value="${escapeHtml(state.query)}" aria-label="搜索规则"></label>`;
+    const create = `<button class="dwrt-kit-button notification-filter-create" type="button" data-notify-create="rules">${alarmBellIcon()}<span>新建规则</span></button>`;
+    return `<aside class="notification-rule-filters" aria-label="通知规则筛选"><div class="notification-filter-tools">${search}${create}</div><section class="notification-filter-section"><button type="button" class="notification-filter-section-title" data-notify-filter-fold="enabled"><span>触发活动</span>${icon('chevron')}</button><div class="notification-filter-options"><label class="notification-filter-option is-radio"><input type="radio" name="notify-enabled" data-notify-enabled="all" ${filters.enabled === 'all' ? 'checked' : ''}><span>全部规则</span></label><label class="notification-filter-option is-radio"><input type="radio" name="notify-enabled" data-notify-enabled="enabled" ${filters.enabled === 'enabled' ? 'checked' : ''}><span>仅启用</span></label><label class="notification-filter-option is-radio"><input type="radio" name="notify-enabled" data-notify-enabled="disabled" ${filters.enabled === 'disabled' ? 'checked' : ''}><span>已暂停</span></label></div></section><section class="notification-filter-section"><button type="button" class="notification-filter-section-title" data-notify-filter-fold="channels"><span>通知</span>${icon('chevron')}</button><div class="notification-filter-options">${checkboxList('channels', values.channels)}</div></section><section class="notification-filter-section"><button type="button" class="notification-filter-section-title" data-notify-filter-fold="triggered"><span>最近触发</span>${icon('chevron')}</button><div class="notification-filter-options notification-filter-segments">${[['all','全部时间'],['5m','5 分钟'],['30m','30 分钟'],['1h','1 小时'],['1d','1 天'],['1w','1 周'],['1m','1 个月']].map(([id,label]) => `<label class="notification-filter-option is-radio"><input type="radio" name="notify-triggered" data-notify-triggered="${id}" ${filters.triggered === id ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div></section><section class="notification-filter-section"><button type="button" class="notification-filter-section-title" data-notify-filter-fold="events"><span>触发器</span>${icon('chevron')}</button><div class="notification-filter-options">${checkboxList('events', values.events)}</div></section><section class="notification-filter-section"><button type="button" class="notification-filter-section-title" data-notify-filter-fold="categories"><span>分类</span>${icon('chevron')}</button><div class="notification-filter-options">${checkboxList('categories', values.categories)}</div></section><section class="notification-filter-section"><button type="button" class="notification-filter-section-title" data-notify-filter-fold="actions"><span>动作</span>${icon('chevron')}</button><div class="notification-filter-options">${checkboxList('actions', values.actions)}</div></section><section class="notification-filter-section"><button type="button" class="notification-filter-section-title" data-notify-filter-fold="severities"><span>最低级别</span>${icon('chevron')}</button><div class="notification-filter-options">${checkboxList('severities', values.severities)}</div></section><footer class="notification-filter-footer"><button type="button" class="notification-filter-link" data-notify-filter-reset ${hasFilters ? '' : 'disabled'}>${icon('retry')}<span>重置</span></button><button type="button" class="notification-filter-link" data-notify-clear-filters ${hasFilters ? '' : 'disabled'}>${icon('retry')}<span>清除筛选条件</span></button><button type="button" class="notification-filter-link" data-notify-columns-toggle aria-expanded="${state.columnMenuOpen ? 'true' : 'false'}">${icon('more')}<span>自定义列</span></button>${state.columnMenuOpen ? `<div class="notification-column-menu is-rail" role="menu" aria-label="自定义列">${RULE_COLUMN_DEFS.map((column) => `<label><input type="checkbox" data-notify-column-toggle="${column.id}" ${ruleColumnVisible(column.id) ? 'checked' : ''} ${state.ruleColumns.length <= 1 && ruleColumnVisible(column.id) ? 'disabled' : ''}><span>${escapeHtml(column.label)}</span></label>`).join('')}</div>` : ''}</footer></aside>`;
   }
 
   function routeTable() {
     const rows = filteredRoutes();
-    return `<section class="notification-push-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar notification-push-table-toolbar" data-dwrt-component="toolbar"><div class="dwrt-kit-table-title"><strong>路由规则</strong><span>按事件类型和严重级别将通知送往指定通道 · <em data-notify-table-count>${tableCountText(rows.length)}</em></span></div>${tableToolbarActions()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table notification-route-table"><thead><tr><th>名称</th><th>状态</th><th>通道</th><th>最低级别</th><th>分类</th><th>事件</th><th>来源</th><th>操作</th></tr></thead><tbody data-notify-rows>${routeRowsMarkup(rows)}</tbody></table></div></section>`;
+    const visibleColumns = RULE_COLUMN_DEFS.filter((column) => ruleColumnVisible(column.id));
+    const headers = visibleColumns.map((column) => `<th>${escapeHtml(column.label)}</th>`).join('');
+    return `<div class="notification-rule-workbench">${routeFilterSidebar()}<section class="notification-push-table-card notification-rule-table-card"><div class="dwrt-kit-table-toolbar notification-push-table-toolbar" data-dwrt-component="toolbar"><div class="dwrt-kit-table-title"><strong>通知规则</strong><span>事件 → 动作 → 通道 · <em data-notify-table-count>${tableCountText(rows.length, 'rules')}</em></span></div><div class="notification-toolbar-actions"><button class="dwrt-kit-button notification-utility-button" type="button" data-notify-open-utility="channels">${icon('channels')}<span>通道</span></button><button class="dwrt-kit-button notification-utility-button" type="button" data-notify-open-utility="outbox">${icon('delivered')}<span>投递记录</span></button><button class="dwrt-kit-button notification-utility-button" type="button" data-notify-open-utility="settings">${icon('service')}<span>设置</span></button>${tableToolbarActions('rules')}</div></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table notification-route-table"><thead><tr><th class="notification-rule-check"><input type="checkbox" data-notify-select-all aria-label="选择全部规则" ${rows.length && rows.every((item) => state.selectedRouteIds.includes(item.id)) ? 'checked' : ''}></th>${headers}</tr></thead><tbody data-notify-rows>${routeRowsMarkup(rows)}</tbody></table></div></section></div>`;
   }
 
   function outboxTable() {
     const rows = filteredOutbox();
-    return `<section class="notification-push-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar notification-push-table-toolbar" data-dwrt-component="toolbar"><div class="dwrt-kit-table-title"><strong>投递记录</strong><span>失败记录可重新进入投递队列 · <em data-notify-table-count>${tableCountText(rows.length)}</em></span></div>${tableToolbarActions()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table notification-outbox-table"><thead><tr><th>时间</th><th>通知</th><th>状态</th><th>通道 / 规则</th><th>尝试</th><th>HTTP</th><th>错误</th><th>操作</th></tr></thead><tbody data-notify-rows>${outboxRowsMarkup(rows)}</tbody></table></div></section>`;
+    return `<section class="notification-push-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar notification-push-table-toolbar" data-dwrt-component="toolbar"><div class="dwrt-kit-table-title"><strong>投递记录</strong><span>失败记录可重新进入投递队列 · <em data-notify-table-count>${tableCountText(rows.length, 'outbox')}</em></span></div>${tableToolbarActions('outbox')}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table notification-outbox-table"><thead><tr><th>时间</th><th>通知</th><th>状态</th><th>通道 / 规则</th><th>尝试</th><th>HTTP</th><th>错误</th><th>操作</th></tr></thead><tbody data-notify-rows>${outboxRowsMarkup(rows)}</tbody></table></div></section>`;
   }
 
   function settingsPanel() {
@@ -474,46 +556,17 @@ export function mount(context = {}) {
     </form>`;
   }
 
-  function overviewPanel() {
-    const status = state.status || {};
-    const recent = state.outbox.slice().sort((left, right) => right.createdAt - left.createdAt).slice(0, 6);
-    const defaultChannel = state.channels.find((item) => item.id === state.settings.default_channel_id);
-    /*
-     * 「最近投递」与「当前策略」合并为单张卡：两者都是同一件事的两端（队列里发生了什么、
-     * 队列按什么规则运转），分成两张并排面板会让同一主题被卡片边界割开（用户第 7 条）。
-     * 上方四张状态卡不变。
-     */
-    return `<div class="notification-overview">${renderSummary(true)}<div class="notification-overview-lower">
-      <section class="notification-overview-panel notification-overview-combined dwrt-kit-glass-surface">
-        <header><div><strong>投递概览</strong><span>最近的队列动态与当前生效的分发规则</span></div><button type="button" data-notify-jump="settings">管理</button></header>
-        <div class="notification-overview-split">
-          <div class="notification-overview-column">
-            <div class="notification-overview-column-head"><span>最近投递</span><button type="button" data-notify-jump="outbox">查看全部</button></div>
-            <div class="notification-recent-list" data-notify-recent-signature="${escapeHtml(recent.map((item) => `${item.id}:${item.state}:${item.updatedAt}`).join('|'))}">${recentMarkup(recent)}</div>
-          </div>
-          <div class="notification-overview-column">
-            <div class="notification-overview-column-head"><span>当前策略</span></div>
-            <dl class="notification-policy-summary"><div><dt>默认通道</dt><dd>${escapeHtml(firstText(defaultChannel?.name, state.settings.default_channel_id, '--'))}</dd></div><div><dt>有效规则</dt><dd>${escapeHtml(firstNumber(status.active_routes, state.routes.filter((item) => item.enabled).length))} 条</dd></div><div><dt>最大尝试</dt><dd>${escapeHtml(firstNumber(state.settings.max_attempts, 3))} 次</dd></div><div><dt>重试间隔</dt><dd>${escapeHtml(firstNumber(state.settings.retry_base_s, 60))} - ${escapeHtml(firstNumber(state.settings.retry_max_s, 3600))} 秒</dd></div><div><dt>邮件投递</dt><dd>${emailSupported() ? '可用' : '后端待接入'}</dd></div></dl>
-          </div>
-        </div>
-      </section>
-    </div></div>`;
-  }
-
-  function recentMarkup(items) {
-    return items.length ? items.map((item) => {
-      const tone = item.state === 'delivered' ? 'success' : item.state === 'failed' ? 'error' : ['pending', 'retry'].includes(item.state) ? 'warning' : 'info';
-      return `<div><span><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml([formatTime(item.createdAt), channelTypeLabel(state.channels.find((channel) => channel.id === item.channelId)?.type), item.channelId].filter(Boolean).join(' · '))}</small></span>${ui.statusBadgeMarkup?.(stateLabel(item.state), tone) || `<span>${escapeHtml(stateLabel(item.state))}</span>`}</div>`;
-    }).join('') : '<div class="notification-overview-empty">暂无投递记录</div>';
-  }
-
   function contentMarkup() {
     if (state.loading) return '<section class="notification-push-table-card dwrt-kit-table-wrap dwrt-kit-glass-surface"><div class="notification-loading">正在读取通知推送配置</div></section>';
-    if (state.tab === 'overview') return overviewPanel();
-    if (state.tab === 'routes') return routeTable();
-    if (state.tab === 'outbox') return outboxTable();
-    if (state.tab === 'settings') return settingsPanel();
-    return channelTable();
+    return routeTable();
+  }
+
+  function routeDetailDrawer() {
+    const route = state.routes.find((item) => item.id === state.drawerRouteId);
+    if (!route) return '';
+    const stats = routeDeliveryStats(route.id);
+    const event = route.event ? eventLabel(route.event) : '全部事件';
+    return `<button class="policy-drawer-backdrop dwrt-kit-sheet-overlay is-open" type="button" data-notify-close aria-label="关闭规则详情"></button><aside class="notification-push-drawer notification-route-detail-drawer dwrt-kit-sheet policy-stable-glass is-open" aria-label="通知规则详情"><header class="dwrt-kit-sheet-header"><div><span>通知规则</span><strong>${escapeHtml(route.name)}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-notify-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body notification-detail-body"><div class="notification-detail-flow"><div><span class="notification-detail-icon">${icon('service')}</span><strong>${escapeHtml(categoryLabel(route.category))}</strong><small>${escapeHtml(event)}</small></div><span class="notification-detail-arrow">→</span><div><span class="notification-detail-icon is-accent">${icon('bell')}</span><strong>${escapeHtml(channelLabel(route.channelId))}</strong><small>${escapeHtml(severityLabel(route.minSeverity))} 起通知</small></div></div><dl class="notification-detail-list"><div><dt>状态</dt><dd>${ui.statusBadgeMarkup?.(route.enabled ? '启用' : '已暂停', route.enabled ? 'success' : 'neutral') || escapeHtml(route.enabled ? '启用' : '已暂停')}</dd></div><div><dt>事件来源</dt><dd>${escapeHtml(route.source || '全部来源')}</dd></div><div><dt>命中次数</dt><dd>${escapeHtml(stats.count)}</dd></div><div><dt>最近触发</dt><dd>${escapeHtml(formatTime(stats.latest))}</dd></div><div><dt>规则 ID</dt><dd><code>${escapeHtml(route.id)}</code></dd></div></dl>${state.notice ? `<div class="notification-form-notice ${state.notice.startsWith('操作失败') ? 'is-error' : 'is-ready'}">${escapeHtml(state.notice)}</div>` : ''}</div><footer class="notification-detail-actions"><button type="button" class="notification-detail-action" data-notify-toggle-detail>${icon(route.enabled ? 'pause' : 'play')}<span>${route.enabled ? '暂停规则' : '启用规则'}</span></button><button type="button" class="notification-detail-action" data-notify-duplicate-route>${icon('plus')}<span>复制规则</span></button><button type="button" class="notification-detail-action is-danger" data-notify-delete-route>${icon('failed')}<span>删除规则</span></button><button type="button" class="policy-primary notification-detail-edit" data-notify-detail-edit>编辑规则</button></footer></aside>`;
   }
 
   function channelDrawer() {
@@ -531,13 +584,24 @@ export function mount(context = {}) {
     const eventOptions = selectedCategory ? routeCategoriesMap().get(selectedCategory)?.events || [] : [];
     const customEvent = Boolean(draft.event && !routeEventsMap().has(draft.event));
     const advanced = draft.advanced || customEvent || Boolean(draft.source);
-    return `<button class="policy-drawer-backdrop dwrt-kit-sheet-overlay is-open" type="button" data-notify-close aria-label="关闭规则面板"></button><aside class="notification-push-drawer notification-route-drawer dwrt-kit-sheet policy-stable-glass is-open" aria-label="路由规则"><header class="dwrt-kit-sheet-header"><div><span>路由规则</span><strong>${draft.editing ? '编辑路由规则' : '新建路由规则'}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-notify-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body notification-push-drawer-body"><div class="notification-route-intro"><strong>选择需要通知的事件</strong><span>按照 UniFi 的事件分类方式配置。每条规则可发送到本地队列、Webhook 或邮件通道。</span></div><div class="notification-form"><label><span>规则 ID</span><input data-notify-draft="id" value="${escapeHtml(draft.id || '')}" ${draft.editing ? 'disabled' : ''} placeholder="例如 wan-status-email"></label><label><span>名称</span><input data-notify-draft="name" value="${escapeHtml(draft.name || '')}" placeholder="例如 WAN 状态邮件提醒"></label><label><span>事件分类</span><select data-notify-draft="category"><option value="">全部分类</option>${routeGroups().map((group) => `<option value="${group.id}" ${selectedCategory === group.id ? 'selected' : ''}>${escapeHtml(group.label)}</option>`).join('')}</select></label><label><span>事件</span><select data-notify-draft="event" ${selectedCategory ? '' : 'disabled'}><option value="">${selectedCategory ? '该分类的全部事件' : '请先选择事件分类'}</option>${eventOptions.map((event) => `<option value="${event.id}" ${event.available === false ? 'disabled' : ''} ${draft.event === event.id ? 'selected' : ''}>${escapeHtml(event.label)}${event.available === false ? '（后端待接入）' : ''}</option>`).join('')}${customEvent ? `<option value="${escapeHtml(draft.event)}" selected>${escapeHtml(draft.event)}（自定义）</option>` : ''}</select></label><label><span>投递通道</span><select data-notify-draft="channelId">${state.channels.map((channel) => `<option value="${escapeHtml(channel.id)}" ${(draft.channelId || state.settings.default_channel_id || 'local') === channel.id ? 'selected' : ''}>${escapeHtml(channel.name)} · ${escapeHtml(channelTypeLabel(channel.type))}</option>`).join('')}</select></label><label><span>最低严重级别</span><select data-notify-draft="minSeverity">${SEVERITY_OPTIONS.map((level) => `<option value="${level.id}" ${(draft.minSeverity || 'warning') === level.id ? 'selected' : ''}>${escapeHtml(level.label)}</option>`).join('')}</select></label><label class="notification-switch-field is-compact dwrt-kit-switch" data-dwrt-component="switch"><span><strong>启用规则</strong><small>停用后保留配置，但不再匹配新事件</small></span><input type="checkbox" data-notify-draft="enabled" ${draft.enabled !== false ? 'checked' : ''}></label><label class="notification-switch-field is-compact dwrt-kit-switch" data-dwrt-component="switch"><span><strong>高级匹配</strong><small>按底层来源进一步限制规则</small></span><input type="checkbox" data-notify-draft="advanced" ${advanced ? 'checked' : ''}></label>${advanced ? `<label class="is-wide"><span>事件来源</span><input data-notify-draft="source" value="${escapeHtml(draft.source || '')}" placeholder="留空匹配全部来源"><small>仅在需要匹配特定组件或接口时填写。</small></label>${customEvent ? `<label class="is-wide"><span>自定义事件标识</span><input data-notify-draft="event" value="${escapeHtml(draft.event)}"><small>该事件不在当前预设中，保留原始标识以兼容已有规则。</small></label>` : ''}` : ''}</div>${state.notice ? `<div class="notification-form-notice">${escapeHtml(state.notice)}</div>` : ''}</div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-notify-close>取消</button><button class="policy-primary" type="button" data-notify-save-route ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存规则'}</button></footer></aside>`;
+    const selectedChannels = Array.isArray(draft.channelIds) && draft.channelIds.length ? draft.channelIds : [draft.channelId || state.settings.default_channel_id || state.channels[0]?.id || 'local'];
+    const unsupportedNote = 'Schedule、多个动作、收件人、内容模板和重复抑制尚未有 notifyd 正式字段；当前不写入浏览器或伪造保存状态。';
+    return `<button class="policy-drawer-backdrop dwrt-kit-sheet-overlay is-open" type="button" data-notify-close aria-label="关闭规则面板"></button><aside class="notification-push-drawer notification-route-drawer dwrt-kit-sheet policy-stable-glass is-open" aria-label="${draft.editing ? '编辑通知规则' : '新建通知规则'}"><header class="dwrt-kit-sheet-header"><div><span>通知规则</span><strong>${draft.editing ? '编辑通知规则' : '新建通知规则'}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-notify-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body notification-push-drawer-body notification-rule-create-body"><div class="notification-route-intro"><strong>按 Scope → Schedule → Action 配置</strong><span>参考 UniFi 的新建 Alarm 流程；保存只提交当前 notifyd 合同中的真实字段。</span></div><section class="notification-create-section"><header><strong>Scope</strong><span>选择事件分类与触发器</span></header><div class="notification-form"><label><span>规则 ID</span><input data-notify-draft="id" value="${escapeHtml(draft.id || '')}" ${draft.editing ? 'disabled' : ''} placeholder="例如 wan-status-email"></label><label><span>名称</span><input data-notify-draft="name" value="${escapeHtml(draft.name || '')}" placeholder="例如 WAN 状态邮件提醒"></label><label><span>事件分类</span><select data-notify-draft="category"><option value="">全部分类</option>${routeGroups().map((group) => `<option value="${group.id}" ${selectedCategory === group.id ? 'selected' : ''}>${escapeHtml(group.label)}</option>`).join('')}</select></label><label><span>事件</span><select data-notify-draft="event" ${selectedCategory ? '' : 'disabled'}><option value="">${selectedCategory ? '该分类的全部事件' : '请先选择事件分类'}</option>${eventOptions.map((event) => `<option value="${event.id}" ${event.available === false ? 'disabled' : ''} ${draft.event === event.id ? 'selected' : ''}>${escapeHtml(event.label)}${event.available === false ? '（后端待接入）' : ''}</option>`).join('')}${customEvent ? `<option value="${escapeHtml(draft.event)}" selected>${escapeHtml(draft.event)}（自定义）</option>` : ''}</select></label><label class="notification-switch-field is-compact dwrt-kit-switch" data-dwrt-component="switch"><span><strong>高级匹配</strong><small>按事件来源进一步限制规则</small></span><input type="checkbox" data-notify-draft="advanced" ${advanced ? 'checked' : ''}></label>${advanced ? `<label class="is-wide"><span>事件来源</span><input data-notify-draft="source" value="${escapeHtml(draft.source || '')}" placeholder="留空匹配全部来源"></label>` : ''}</div></section><section class="notification-create-section"><header><strong>Schedule</strong><span>UniFi 交互保留，当前后端合同待补</span></header><div class="notification-choice-row"><label class="notification-choice is-selected"><input type="radio" name="notify-schedule" checked disabled><span>Always</span></label><label class="notification-choice"><input type="radio" name="notify-schedule" disabled><span>Custom</span></label></div><div class="notification-capability-note">${unsupportedNote}</div></section><section class="notification-create-section"><header><strong>Action</strong><span>当前真实动作是 notify</span></header><div class="notification-action-grid"><label class="notification-choice is-selected"><input type="checkbox" checked disabled><span>Notify</span></label><label class="notification-choice"><input type="checkbox" disabled><span>Webhook</span><small>请先创建 Webhook 通道</small></label><label class="notification-choice is-disabled"><input type="checkbox" disabled><span>Power</span><small>后端未提供动作合同</small></label></div><div class="notification-form"><label><span>通知通道</span><select data-notify-draft="channelId">${state.channels.map((channel) => `<option value="${escapeHtml(channel.id)}" ${selectedChannels[0] === channel.id ? 'selected' : ''}>${escapeHtml(channel.name)} · ${escapeHtml(channelTypeLabel(channel.type))}</option>`).join('')}</select><small>当前 notifyd route 只接受一个 channel_id；多通道需后端扩展。</small></label><label><span>最低严重级别</span><select data-notify-draft="minSeverity">${SEVERITY_OPTIONS.map((level) => `<option value="${level.id}" ${(draft.minSeverity || 'warning') === level.id ? 'selected' : ''}>${escapeHtml(level.label)}</option>`).join('')}</select></label></div></section><section class="notification-create-section"><header><strong>Notification Channels & Receivers</strong><span>通道配置在同一工作台工具 Sheet 中维护</span></header><div class="notification-channel-summary">${selectedChannels.map((id) => `<span>${icon('bell')}<strong>${escapeHtml(channelLabel(id))}</strong><small>${escapeHtml(channelTypeLabel(state.channels.find((channel) => channel.id === id)?.type || 'noop'))}</small></span>`).join('')}<button class="dwrt-kit-button" type="button" data-notify-open-utility="channels">${icon('channels')}<span>管理通道</span></button></div><div class="notification-form-notice">Receivers 当前由所选通道的 options 管理；notifyd 没有规则级 recipients 字段。</div></section><section class="notification-create-section"><header><strong>Content</strong><span>默认内容由事件与 notifyd 生成</span></header><div class="notification-choice-row"><label class="notification-choice is-selected"><input type="radio" name="notify-content" checked disabled><span>Default Content</span></label><label class="notification-choice"><input type="radio" name="notify-content" disabled><span>Custom Content</span></label></div><div class="notification-capability-note">自定义标题/正文目前没有规则字段，避免本地保存或发送与后端不一致的数据。</div></section><section class="notification-create-section"><header><strong>Rule State</strong><span>保存后可在详情抽屉中启停</span></header><label class="notification-switch-field is-compact dwrt-kit-switch" data-dwrt-component="switch"><span><strong>启用规则</strong><small>停用后保留配置，但不再匹配新事件</small></span><input type="checkbox" data-notify-draft="enabled" ${draft.enabled !== false ? 'checked' : ''}></label><div class="notification-capability-note">Ignore Repeated Alarms 的 dedupe 窗口目前由事件生产者提供，不是 rule 合同字段。</div></section>${state.notice ? `<div class="notification-form-notice">${escapeHtml(state.notice)}</div>` : ''}</div><footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-notify-close>取消</button><button class="policy-primary" type="button" data-notify-save-route ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存规则'}</button></footer></aside>`;
   }
 
   function renderDrawer() {
     if (state.drawer === 'channel') return channelDrawer();
     if (state.drawer === 'route') return routeDrawer();
+    if (state.drawer === 'route-detail') return routeDetailDrawer();
+    if (state.drawer === 'channel-manager') return utilityDrawer('channels', channelTable());
+    if (state.drawer === 'outbox') return utilityDrawer('outbox', outboxTable());
+    if (state.drawer === 'settings') return utilityDrawer('settings', settingsPanel());
     return '';
+  }
+
+  function utilityDrawer(kind, content) {
+    const labels = { channels: '推送通道', outbox: '投递记录', settings: '通知设置' };
+    return `<button class="policy-drawer-backdrop dwrt-kit-sheet-overlay is-open" type="button" data-notify-utility-close aria-label="关闭${labels[kind]}"></button><aside class="notification-push-utility-drawer dwrt-kit-sheet policy-stable-glass is-open" aria-label="${labels[kind]}"><header class="dwrt-kit-sheet-header"><div><span>通知中心</span><strong>${labels[kind]}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-notify-utility-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body notification-utility-drawer-body">${content}</div></aside>`;
   }
 
   function emailChannelFields() {
@@ -579,7 +643,8 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', MODULE_CLASS);
-    root.innerHTML = `<section class="policy-table-shell notification-push-shell"><header class="notification-push-page-header"><nav class="dwrt-kit-tabs dwrt-kit-page-tabs notification-push-tabs" role="tablist" aria-label="通知推送视图"><span class="dwrt-kit-tab-pill" aria-hidden="true"></span>${TABS.map((tab) => `<button class="dwrt-kit-tab ${state.tab === tab.id ? 'is-active' : ''}" type="button" role="tab" data-value="${tab.id}" data-notify-tab="${tab.id}" aria-selected="${state.tab === tab.id ? 'true' : 'false'}">${escapeHtml(tab.label)}</button>`).join('')}</nav></header><div class="notification-push-view">${state.error ? `<div class="notification-form-notice is-error">${escapeHtml(state.error)}</div>` : ''}${contentMarkup()}</div>${renderDrawer()}</section>`;
+
+    root.innerHTML = `<section class="policy-table-shell notification-push-shell notification-center-shell"><div class="notification-center-surface dwrt-kit-glass-surface"><div class="notification-push-view">${state.error ? `<div class="notification-form-notice is-error">${escapeHtml(state.error)}</div>` : ''}${contentMarkup()}</div></div>${renderDrawer()}${confirmationMarkup()}</section>`;
     enhanceChannelDrawer();
     enhanceRouteDrawer();
     bindEvents();
@@ -588,70 +653,121 @@ export function mount(context = {}) {
   }
 
   function patchLiveSummary() {
-    const summary = root.querySelector('.notification-push-summary');
-    if (summary) {
-      overviewCards().forEach((item) => {
-        const key = String(item.key || '').replace(/[^A-Za-z0-9_-]/g, '');
-        const card = summary.querySelector(`[data-dwrt-overview-card="${key}"]`);
-        const value = summary.querySelector(`[data-dwrt-overview-value="${key}"]`);
-        const detail = summary.querySelector(`[data-dwrt-overview-detail="${key}"]`);
-        if (value && value.textContent !== String(item.value)) value.textContent = item.value;
-        if (detail && detail.textContent !== String(item.detail)) detail.textContent = item.detail;
-        if (card) {
-          ['neutral','info','ok','warn','bad'].forEach((tone) => card.classList.toggle(`is-${tone}`, tone === item.tone));
-        }
-      });
-      const recent = state.outbox.slice().sort((left, right) => right.createdAt - left.createdAt).slice(0, 6);
-      const list = root.querySelector('.notification-recent-list');
-      const signature = recent.map((item) => `${item.id}:${item.state}:${item.updatedAt}`).join('|');
-      if (list && list.dataset.notifyRecentSignature !== signature) {
-        list.dataset.notifyRecentSignature = signature;
-        list.innerHTML = recentMarkup(recent);
-      }
-    }
-    if (state.tab === 'outbox' && !state.drawer) {
-      const scroll = root.querySelector('.notification-push-table-card .dwrt-kit-table-scroll');
-      const keep = { top: scroll?.scrollTop || 0, left: scroll?.scrollLeft || 0 };
-      const card = root.querySelector('.notification-push-table-card');
-      if (card) card.outerHTML = outboxTable();
-      const next = root.querySelector('.notification-push-table-card .dwrt-kit-table-scroll');
-      if (next) { next.scrollTop = keep.top; next.scrollLeft = keep.left; }
-      bindRowActions();
-    }
+    if (!state.drawer) syncTableRows();
   }
 
-  function closeDrawer() { state.drawer = ''; state.draft = {}; state.notice = ''; state.saving = false; render(); }
+  function closeDrawer() {
+    if (state.utilityReturnDrawer) {
+      state.drawer = state.utilityReturnDrawer;
+      state.draft = state.utilityReturnDraft || state.draft || {};
+      state.utilityReturnDrawer = '';
+      state.utilityReturnDraft = null;
+      state.notice = '';
+      state.saving = false;
+      render();
+      return;
+    }
+    state.drawer = '';
+    state.drawerRouteId = '';
+    state.draft = {};
+    state.confirmation = null;
+    state.notice = '';
+    state.saving = false;
+    render();
+  }
+
+  function closeUtilityDrawer() {
+    const returnDrawer = state.utilityReturnDrawer;
+    const returnDraft = state.utilityReturnDraft;
+    state.utilityReturnDrawer = '';
+    state.utilityReturnDraft = null;
+    state.drawer = returnDrawer || '';
+    state.draft = returnDrawer === 'route' && returnDraft ? returnDraft : {};
+    state.notice = '';
+    render();
+  }
+
+  function confirmationMarkup() {
+    if (!state.confirmation) return '';
+    const renderer = ui.confirmationMarkup || window.DWRT_UI_KIT?.confirmationMarkup;
+    if (typeof renderer !== 'function') return '';
+    const route = state.routes.find((item) => item.id === state.confirmation.id);
+    return renderer({
+      id: 'notification-route-delete-confirmation',
+      action: 'delete-notification-route',
+      tone: 'danger',
+      title: `删除规则「${route?.name || state.confirmation.id}」`,
+      description: '删除后这条通知规则及其匹配配置将从 notifyd 配置库移除，且无法撤销。',
+      cancelLabel: '取消',
+      confirmLabel: state.saving ? '正在删除' : '确认删除',
+      disabled: state.saving
+    });
+  }
 
   function openChannel(channel = null) {
     const options = channel?.options || {};
     state.drawer = 'channel';
+    state.confirmation = null;
     state.notice = '';
     state.draft = channel ? { editing: true, id: channel.id, name: channel.name, type: channel.type, enabled: channel.enabled, url: options.url || '', method: options.method || 'POST', timeout_ms: firstNumber(options.timeout_ms, 10000), headers: '', hasStoredHeaders: channel.hasStoredHeaders, user_ids: asArray(options.user_ids || options.users).join(', '), recipients: asArray(options.recipients || options.to).join(', '), subject_prefix: firstText(options.subject_prefix, '[Dreaming OS]'), reply_to: firstText(options.reply_to) } : { editing: false, id: '', name: '', type: 'noop', enabled: true, method: 'POST', timeout_ms: 10000, hasStoredHeaders: false, user_ids: '', recipients: '', subject_prefix: '[Dreaming OS]', reply_to: '' };
     render();
   }
 
   function openRoute(route = null) {
+    state.utilityReturnDrawer = '';
+    state.utilityReturnDraft = null;
     state.drawer = 'route';
+    state.confirmation = null;
     state.notice = '';
     state.draft = route ? { editing: true, advanced: Boolean(route.source || (route.event && !routeEventsMap().has(route.event))), ...route } : { editing: false, id: '', name: '', enabled: true, channelId: state.settings.default_channel_id || state.channels[0]?.id || 'local', minSeverity: 'warning', category: '', event: '', source: '', advanced: false };
+    render();
+  }
+
+  function openRouteDetail(route) {
+    if (!route) return;
+    state.drawer = 'route-detail';
+    state.confirmation = null;
+    state.drawerRouteId = route.id;
+    state.notice = '';
     render();
   }
 
   function bindRowActions() {
     root.querySelectorAll('[data-notify-edit-channel]').forEach((button) => button.addEventListener('click', () => openChannel(state.channels.find((item) => item.id === button.dataset.notifyEditChannel))));
     root.querySelectorAll('[data-notify-edit-route]').forEach((button) => button.addEventListener('click', () => openRoute(state.routes.find((item) => item.id === button.dataset.notifyEditRoute))));
+    root.querySelectorAll('[data-notify-route-detail]').forEach((button) => button.addEventListener('click', () => openRouteDetail(state.routes.find((item) => item.id === button.dataset.notifyRouteDetail))));
+    root.querySelectorAll('[data-notify-route-row]').forEach((row) => row.addEventListener('click', (event) => { if (event.target.closest('button,input,a')) return; openRouteDetail(state.routes.find((item) => item.id === row.dataset.notifyRouteRow)); }));
+    root.querySelectorAll('[data-notify-toggle-route]').forEach((button) => button.addEventListener('click', () => toggleRoute(button.dataset.notifyToggleRoute)));
+    root.querySelectorAll('[data-notify-route-menu]').forEach((button) => button.addEventListener('click', () => openRouteDetail(state.routes.find((item) => item.id === button.dataset.notifyRouteMenu))));
     root.querySelectorAll('[data-notify-test]').forEach((button) => button.addEventListener('click', () => testChannel(button.dataset.notifyTest)));
     root.querySelectorAll('[data-notify-retry]').forEach((button) => button.addEventListener('click', () => retryOutbox(button.dataset.notifyRetry)));
+    root.querySelectorAll('[data-notify-select-route]').forEach((input) => input.addEventListener('change', () => {
+      const id = input.dataset.notifySelectRoute;
+      state.selectedRouteIds = input.checked ? [...new Set([...state.selectedRouteIds, id])] : state.selectedRouteIds.filter((value) => value !== id);
+      render();
+    }));
+    root.querySelector('[data-notify-select-all]')?.addEventListener('change', (event) => {
+      const ids = filteredRoutes().map((route) => route.id);
+      state.selectedRouteIds = event.target.checked ? [...new Set([...state.selectedRouteIds, ...ids])] : state.selectedRouteIds.filter((id) => !ids.includes(id));
+      render();
+    });
+    root.querySelector('[data-notify-toggle-detail]')?.addEventListener('click', () => toggleRoute(state.drawerRouteId));
+    root.querySelector('[data-notify-detail-edit]')?.addEventListener('click', () => openRoute(state.routes.find((item) => item.id === state.drawerRouteId)));
+    root.querySelector('[data-notify-duplicate-route]')?.addEventListener('click', () => duplicateRoute(state.drawerRouteId));
+    root.querySelector('[data-notify-delete-route]')?.addEventListener('click', () => { if (!state.saving) { state.confirmation = { id: state.drawerRouteId }; render(); } });
+    root.querySelectorAll('[data-dwrt-confirm-cancel], [data-dwrt-modal-close]').forEach((button) => button.addEventListener('click', () => { if (!state.saving) { state.confirmation = null; render(); } }));
+    root.querySelectorAll('[data-dwrt-confirm-accept]').forEach((button) => button.addEventListener('click', () => deleteRoute(state.confirmation?.id)));
   }
 
   function patchSearchResults() {
-    const card = root.querySelector('.notification-push-table-card');
+    const card = root.querySelector(state.drawer ? '.notification-push-utility-drawer .notification-push-table-card' : '.notification-rule-table-card');
     if (!card) return render();
     const scroll = card.querySelector('.dwrt-kit-table-scroll');
     const scrollTop = scroll?.scrollTop || 0;
     const scrollLeft = scroll?.scrollLeft || 0;
-    card.outerHTML = state.tab === 'routes' ? routeTable() : state.tab === 'outbox' ? outboxTable() : channelTable();
-    const nextScroll = root.querySelector('.notification-push-table-card .dwrt-kit-table-scroll');
+    const view = currentTableKind();
+    card.outerHTML = view === 'channels' ? channelTable() : view === 'outbox' ? outboxTable() : routeTable();
+    const nextScroll = card.parentElement?.querySelector('.notification-push-table-card .dwrt-kit-table-scroll') || root.querySelector('.notification-push-table-card .dwrt-kit-table-scroll');
     if (nextScroll) {
       nextScroll.scrollTop = scrollTop;
       nextScroll.scrollLeft = scrollLeft;
@@ -664,24 +780,54 @@ export function mount(context = {}) {
    * 正在输入的 input 一起销毁，光标随第一个字符丢失。
    */
   function syncTableRows() {
-    const tbody = root.querySelector('.notification-push-table-card [data-notify-rows]');
+    const tableRoot = state.drawer ? root.querySelector('.notification-push-utility-drawer') : root;
+    const tbody = tableRoot?.querySelector('.notification-push-table-card [data-notify-rows]');
     if (!tbody) return;
-    const rows = state.tab === 'routes' ? filteredRoutes() : state.tab === 'outbox' ? filteredOutbox() : filteredChannels();
-    tbody.innerHTML = state.tab === 'routes' ? routeRowsMarkup(rows) : state.tab === 'outbox' ? outboxRowsMarkup(rows) : channelRowsMarkup(rows);
-    const count = root.querySelector('.notification-push-table-card [data-notify-table-count]');
-    if (count) count.textContent = tableCountText(rows.length);
+    const view = currentTableKind();
+    const rows = view === 'channels' ? filteredChannels() : view === 'outbox' ? filteredOutbox() : filteredRoutes();
+    tbody.innerHTML = view === 'channels' ? channelRowsMarkup(rows) : view === 'outbox' ? outboxRowsMarkup(rows) : routeRowsMarkup(rows);
+    const count = tableRoot.querySelector('.notification-push-table-card [data-notify-table-count]');
+    if (count) count.textContent = tableCountText(rows.length, view);
     bindRowActions();
   }
 
   function bindEvents() {
     root.querySelector('[data-notify-settings-form]')?.addEventListener('submit', (event) => event.preventDefault());
-    root.querySelectorAll('[data-notify-tab]').forEach((button) => button.addEventListener('click', () => { setTab(button.dataset.notifyTab); state.query = ''; render(); }));
-    root.querySelectorAll('[data-notify-jump]').forEach((button) => button.addEventListener('click', () => { setTab(button.dataset.notifyJump); state.query = ''; render(); }));
     root.querySelector('[data-notify-search]')?.addEventListener('input', (event) => { state.query = event.target.value || ''; syncTableRows(); });
     root.querySelector('[data-notify-state]')?.addEventListener('change', (event) => { state.outboxState = event.target.value || 'all'; syncTableRows(); });
     root.querySelector('[data-notify-create="channels"]')?.addEventListener('click', () => openChannel());
-    root.querySelector('[data-notify-create="routes"]')?.addEventListener('click', () => openRoute());
-    root.querySelectorAll('[data-notify-close]').forEach((button) => button.addEventListener('click', closeDrawer));
+    root.querySelectorAll('[data-notify-create="rules"]').forEach((button) => button.addEventListener('click', () => openRoute()));
+    root.querySelectorAll('[data-notify-filter]').forEach((input) => input.addEventListener('change', () => {
+      const key = input.dataset.notifyFilter;
+      const values = Array.isArray(state.ruleFilters[key]) ? state.ruleFilters[key].slice() : [];
+      state.ruleFilters[key] = input.checked ? [...new Set([...values, input.value])] : values.filter((value) => value !== input.value);
+      state.selectedRouteIds = [];
+      render();
+    }));
+    root.querySelectorAll('[data-notify-enabled]').forEach((input) => input.addEventListener('change', () => { state.ruleFilters.enabled = input.dataset.notifyEnabled; state.selectedRouteIds = []; render(); }));
+    root.querySelectorAll('[data-notify-triggered]').forEach((input) => input.addEventListener('change', () => { state.ruleFilters.triggered = input.dataset.notifyTriggered; state.selectedRouteIds = []; render(); }));
+    root.querySelector('[data-notify-filter-reset]')?.addEventListener('click', () => { state.ruleFilters = { search: '', categories: [], severities: [], channels: [], events: [], actions: [], enabled: 'all', triggered: 'all' }; state.query = ''; state.selectedRouteIds = []; render(); });
+    root.querySelector('[data-notify-clear-filters]')?.addEventListener('click', () => { state.ruleFilters = { search: '', categories: [], severities: [], channels: [], events: [], actions: [], enabled: 'all', triggered: 'all' }; state.query = ''; state.selectedRouteIds = []; render(); });
+    root.querySelector('[data-notify-columns-toggle]')?.addEventListener('click', () => { state.columnMenuOpen = !state.columnMenuOpen; render(); });
+    root.querySelectorAll('[data-notify-column-toggle]').forEach((input) => input.addEventListener('change', () => {
+      const id = input.dataset.notifyColumnToggle;
+      if (input.checked) state.ruleColumns = [...new Set([...state.ruleColumns, id])];
+      else if (state.ruleColumns.length > 1) state.ruleColumns = state.ruleColumns.filter((value) => value !== id);
+      render();
+    }));
+    root.querySelectorAll('[data-notify-filter-fold]').forEach((button) => button.addEventListener('click', () => button.closest('.notification-filter-section')?.classList.toggle('is-collapsed')));
+    root.querySelectorAll('[data-notify-bulk]').forEach((button) => button.addEventListener('click', () => bulkToggleRoutes(button.dataset.notifyBulk === 'enable')));
+    root.querySelectorAll('[data-notify-utility-close]').forEach((button) => button.addEventListener('click', () => { state.confirmation = null; closeUtilityDrawer(); }));
+    root.querySelectorAll('[data-notify-close]').forEach((button) => button.addEventListener('click', () => { state.confirmation = null; closeDrawer(); }));
+    root.querySelectorAll('[data-notify-open-utility]').forEach((button) => button.addEventListener('click', () => {
+      if (state.drawer === 'route') {
+        state.utilityReturnDrawer = 'route';
+        state.utilityReturnDraft = { ...state.draft };
+      }
+      state.drawer = button.dataset.notifyOpenUtility === 'channels' ? 'channel-manager' : button.dataset.notifyOpenUtility;
+      state.query = '';
+      render();
+    }));
     root.querySelectorAll('[data-notify-draft]').forEach((input) => {
       const eventName = input.matches('select,input[type="checkbox"]') ? 'change' : 'input';
       input.addEventListener(eventName, (event) => {
@@ -729,7 +875,13 @@ export function mount(context = {}) {
     state.saving = true; render();
     try {
       await requestJson(ENDPOINTS.channels, { method: 'PUT', body: JSON.stringify({ id: draft.id, name: draft.name, type: draft.type || 'noop', enabled: draft.enabled !== false, options }) });
-      state.drawer = ''; state.draft = {}; state.saving = false; await load(); window.DreamingWrtNotify?.success('推送通道已保存');
+      const returnDrawer = state.utilityReturnDrawer;
+      const returnDraft = state.utilityReturnDraft;
+      state.drawer = returnDrawer || '';
+      state.draft = returnDrawer === 'route' && returnDraft ? returnDraft : {};
+      state.utilityReturnDrawer = '';
+      state.utilityReturnDraft = null;
+      state.saving = false; await load(); window.DreamingWrtNotify?.success('推送通道已保存');
     } catch (error) { state.saving = false; state.notice = `保存失败：${firstText(error.message, 'unknown')}`; render(); }
   }
 
@@ -740,8 +892,64 @@ export function mount(context = {}) {
     state.saving = true; render();
     try {
       await requestJson(ENDPOINTS.routes, { method: 'PUT', body: JSON.stringify({ id: draft.id, name: draft.name, enabled: draft.enabled !== false, channel_id: draft.channelId, min_severity: draft.minSeverity || 'warning', category: draft.category || '', event: draft.event || '', source: draft.source || '', options: draft.options || {} }) });
-      state.drawer = ''; state.draft = {}; state.saving = false; await load(); window.DreamingWrtNotify?.success('路由规则已保存');
+      state.drawer = ''; state.drawerRouteId = ''; state.draft = {}; state.confirmation = null; state.saving = false; await load(); window.DreamingWrtNotify?.success('通知规则已保存');
     } catch (error) { state.saving = false; state.notice = `保存失败：${firstText(error.message, 'unknown')}`; render(); }
+  }
+
+  async function updateRoute(route, enabled) {
+    if (!route || state.workingId) return false;
+    state.workingId = route.id;
+    try {
+      await requestJson(ENDPOINTS.routes, { method: 'PUT', body: JSON.stringify({ id: route.id, name: route.name, enabled, channel_id: route.channelId, min_severity: route.minSeverity || 'warning', category: route.category || '', event: route.event || '', source: route.source || '', options: route.options || {}, expected_updated_at: route.updatedAt || undefined }) });
+      return true;
+    } catch (error) {
+      state.notice = `操作失败：${firstText(error.message, 'unknown')}`;
+      window.DreamingWrtNotify?.error('通知规则操作失败', firstText(error.message, 'unknown'));
+      return false;
+    } finally { state.workingId = ''; }
+  }
+
+  async function toggleRoute(id) {
+    const route = state.routes.find((item) => item.id === id);
+    if (!route) return;
+    const ok = await updateRoute(route, !route.enabled);
+    if (ok) { state.notice = ''; await load(); if (state.drawer === 'route-detail') render(); window.DreamingWrtNotify?.success(route.enabled ? '规则已启用' : '规则已暂停'); }
+    else render();
+  }
+
+  async function bulkToggleRoutes(enabled) {
+    const targets = state.routes.filter((route) => state.selectedRouteIds.includes(route.id));
+    if (!targets.length || state.workingId) return;
+    state.saving = true; render();
+    const results = [];
+    for (const route of targets) results.push(await updateRoute(route, enabled));
+    state.saving = false;
+    state.selectedRouteIds = [];
+    if (results.every(Boolean)) { state.notice = ''; await load(); window.DreamingWrtNotify?.success(enabled ? '已启用所选规则' : '已暂停所选规则'); }
+    else render();
+  }
+
+  async function duplicateRoute(id) {
+    const route = state.routes.find((item) => item.id === id);
+    if (!route || state.saving) return;
+    const used = new Set(state.routes.map((item) => item.id));
+    let nextId = `${route.id}-copy`;
+    let suffix = 2;
+    while (used.has(nextId)) nextId = `${route.id}-copy-${suffix++}`;
+    state.saving = true;
+    try {
+      await requestJson(ENDPOINTS.routes, { method: 'PUT', body: JSON.stringify({ id: nextId, name: `${route.name} 副本`, enabled: false, channel_id: route.channelId, min_severity: route.minSeverity || 'warning', category: route.category || '', event: route.event || '', source: route.source || '', options: route.options || {} }) });
+      state.saving = false; state.drawer = ''; state.drawerRouteId = ''; await load(); window.DreamingWrtNotify?.success('规则副本已创建，默认暂停');
+    } catch (error) { state.saving = false; state.notice = `操作失败：${firstText(error.message, 'unknown')}`; render(); }
+  }
+
+  async function deleteRoute(id) {
+    if (!id || state.saving) return;
+    state.saving = true; render();
+    try {
+      await requestJson(`${ENDPOINTS.routes}/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      state.saving = false; state.confirmation = null; state.drawer = ''; state.drawerRouteId = ''; await load(); window.DreamingWrtNotify?.success('规则已删除');
+    } catch (error) { state.saving = false; state.confirmation = null; state.notice = `操作失败：${firstText(error.message, 'unknown')}`; render(); }
   }
 
   async function saveSettings() {

@@ -23,7 +23,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include <openssl/evp.h>
 #include <openssl/sha.h>
 
 #include "apd_readonly_command.h"
@@ -170,6 +173,53 @@ static int apd_config_digest_hex(struct json_object *sections,
     for (j = 0; j < SHA256_DIGEST_LENGTH; j++) {
         out[7 + j * 2] = hex[digest[j] >> 4];
         out[7 + j * 2 + 1] = hex[digest[j] & 15];
+    }
+    out[7 + SHA256_DIGEST_LENGTH * 2] = '\0';
+    return 0;
+}
+
+static int apd_config_readback_digest(struct json_object *sections,
+                                      char out[SHA256_DIGEST_LENGTH * 2 + 8])
+{
+    static const char hex[] = "0123456789abcdef";
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_length = 0;
+    EVP_MD_CTX *context = EVP_MD_CTX_new();
+    size_t i;
+
+    if (!sections || !context || EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1)
+        return -1;
+    for (i = 0; i < json_object_array_length(sections); i++) {
+        struct json_object *section = json_object_array_get_idx(sections, i);
+        struct json_object *name = NULL;
+        struct json_object *options = NULL;
+
+        if (!json_object_object_get_ex(section, "section", &name) ||
+            !json_object_object_get_ex(section, "options", &options))
+            return -1;
+        EVP_DigestUpdate(context, json_object_get_string(name),
+                         strlen(json_object_get_string(name)));
+        EVP_DigestUpdate(context, "\n", 1);
+        json_object_object_foreach(options, option, value) {
+            const char *actual = value &&
+                !json_object_is_type(value, json_type_null) ?
+                json_object_get_string(value) : "<missing>";
+            EVP_DigestUpdate(context, option, strlen(option));
+            EVP_DigestUpdate(context, "=", 1);
+            EVP_DigestUpdate(context, actual, strlen(actual));
+            EVP_DigestUpdate(context, "\n", 1);
+        }
+    }
+    if (EVP_DigestFinal_ex(context, digest, &digest_length) != 1 ||
+        digest_length != SHA256_DIGEST_LENGTH) {
+        EVP_MD_CTX_free(context);
+        return -1;
+    }
+    EVP_MD_CTX_free(context);
+    memcpy(out, "sha256:", 7);
+    for (i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        out[7 + i * 2] = hex[digest[i] >> 4];
+        out[7 + i * 2 + 1] = hex[digest[i] & 15];
     }
     out[7 + SHA256_DIGEST_LENGTH * 2] = '\0';
     return 0;
@@ -338,6 +388,9 @@ int apd_config_stage(const struct apd_config_paths *paths,
         return apd_config_fail(out, "stage", reason, NULL);
     snprintf(source, sizeof(source), "%s/wireless", paths->config_dir);
     snprintf(staged, sizeof(staged), "%s/wireless", paths->staging_dir);
+    if (mkdir(paths->staging_dir, 0700) != 0 && errno != EEXIST)
+        return apd_config_fail(out, "stage", "staging_dir_unavailable",
+                               NULL);
     if (apd_config_copy_file(source, staged) != 0)
         return apd_config_fail(out, "stage", "wireless_config_unreadable",
                                NULL);
@@ -415,7 +468,10 @@ static int apd_config_get(const struct apd_config_paths *paths,
                                       APD_CONFIG_COMMAND_TIMEOUT_MS,
                                       APD_CONFIG_COMMAND_OUTPUT_LIMIT,
                                       &command);
-    if (rc != 0 && command.exit_status <= 0) {
+    /* uci get uses exit 1 for a legitimate missing option. Any other
+     * runner/command failure must remain a readback failure. */
+    if ((rc != 0 && command.exit_status != 1) ||
+        command.exit_status > 1 || command.timed_out) {
         apd_command_result_free(&command);
         return -1;
     }
@@ -439,6 +495,9 @@ int apd_config_readback(const struct apd_config_paths *paths,
     const char *reason;
     struct json_object *result;
     struct json_object *mismatches = json_object_new_array();
+    struct json_object *actual_sections = json_object_new_array();
+    char readback_digest[SHA256_DIGEST_LENGTH * 2 + 8];
+    const char *candidate_digest = NULL;
     size_t i;
 
     if (!out) {
@@ -447,13 +506,17 @@ int apd_config_readback(const struct apd_config_paths *paths,
     }
     if (!paths || !paths->uci || !paths->config_dir) {
         json_object_put(mismatches);
+        json_object_put(actual_sections);
         return apd_config_fail(out, "readback", "paths_invalid", NULL);
     }
     reason = apd_config_candidate_check(candidate, &sections);
     if (reason) {
         json_object_put(mismatches);
+        json_object_put(actual_sections);
         return apd_config_fail(out, "readback", reason, NULL);
     }
+    json_object_object_get_ex(candidate, "candidate_digest", &result);
+    candidate_digest = result ? json_object_get_string(result) : "";
     for (i = 0; i < json_object_array_length(sections); i++) {
         struct json_object *section = json_object_array_get_idx(sections, i);
         struct json_object *name = NULL;
@@ -461,15 +524,37 @@ int apd_config_readback(const struct apd_config_paths *paths,
 
         json_object_object_get_ex(section, "section", &name);
         json_object_object_get_ex(section, "options", &options);
+        {
+            struct json_object *actual_section = json_object_new_object();
+            struct json_object *actual_options = json_object_new_object();
+
+            json_object_object_add(actual_section, "section",
+                json_object_new_string(json_object_get_string(name)));
+            json_object_object_add(actual_section, "options", actual_options);
+            json_object_array_add(actual_sections, actual_section);
+        }
         json_object_object_foreach(options, option, value) {
             char *actual = NULL;
+            struct json_object *actual_section =
+                json_object_array_get_idx(actual_sections,
+                    json_object_array_length(actual_sections) - 1);
+            struct json_object *actual_options = NULL;
+
+            json_object_object_get_ex(actual_section, "options", &actual_options);
 
             if (apd_config_get(paths, json_object_get_string(name), option,
                                &actual) != 0) {
                 json_object_put(mismatches);
+                json_object_put(actual_sections);
                 return apd_config_fail(out, "readback", "uci_get_failed",
                                        NULL);
             }
+            if (actual)
+                json_object_object_add(actual_options, option,
+                    json_object_new_string(actual));
+            else
+                json_object_object_add(actual_options, option,
+                    json_object_new_null());
             if (!actual ||
                 strcmp(actual, json_object_get_string(value)) != 0) {
                 struct json_object *entry = json_object_new_object();
@@ -488,6 +573,13 @@ int apd_config_readback(const struct apd_config_paths *paths,
         }
     }
     result = apd_config_result_new("readback");
+    if (apd_config_readback_digest(actual_sections, readback_digest) != 0)
+        readback_digest[0] = '\0';
+    json_object_put(actual_sections);
+    json_object_object_add(result, "candidate_digest",
+                           json_object_new_string(candidate_digest));
+    json_object_object_add(result, "readback_digest",
+                           json_object_new_string(readback_digest));
     json_object_object_add(result, "match", json_object_new_boolean(
         json_object_array_length(mismatches) == 0));
     json_object_object_add(result, "mismatches", mismatches);
@@ -587,6 +679,10 @@ static int apd_config_restore(const struct apd_config_paths *paths,
     return failed ? -1 : 0;
 }
 
+int apd_config_rollback(const struct apd_config_paths *paths,
+                        struct json_object *previous,
+                        struct json_object **out);
+
 int apd_config_capture_previous(const struct apd_config_paths *paths,
                                 struct json_object *candidate,
                                 struct json_object **out)
@@ -636,7 +732,7 @@ int apd_config_capture_previous(const struct apd_config_paths *paths,
                                        "previous_capture_failed", NULL);
             }
             json_object_object_add(captured_options, option, current ?
-                json_object_new_string(current) : NULL);
+                json_object_new_string(current) : json_object_new_null());
             free(current);
         }
         json_object_object_add(captured, "options", captured_options);
@@ -685,12 +781,14 @@ int apd_config_apply_prepared(const struct apd_config_paths *paths,
                                     option, json_object_get_string(value),
                                     &command) != 0) {
                 int rc;
+                int rollback_rc = apd_config_restore(paths, previous);
 
-                apd_config_restore(paths, previous);
-                rc = apd_config_fail(out, "apply", "uci_set_failed",
+                rc = apd_config_fail(out, "apply",
+                                     rollback_rc == 0 ? "uci_set_failed" :
+                                     "rollback_failed",
                                      &command);
                 json_object_object_add(*out, "rolled_back",
-                                       json_object_new_boolean(1));
+                                       json_object_new_boolean(rollback_rc == 0));
                 apd_command_result_free(&command);
                 return rc;
             }
@@ -702,12 +800,14 @@ int apd_config_apply_prepared(const struct apd_config_paths *paths,
 
         if (apd_config_commit_live(paths, &command) != 0) {
             int rc;
+            int rollback_rc = apd_config_restore(paths, previous);
 
-            apd_config_restore(paths, previous);
-            rc = apd_config_fail(out, "apply", "uci_commit_failed",
+            rc = apd_config_fail(out, "apply",
+                                 rollback_rc == 0 ? "uci_commit_failed" :
+                                 "rollback_failed",
                                  &command);
             json_object_object_add(*out, "rolled_back",
-                                   json_object_new_boolean(1));
+                                   json_object_new_boolean(rollback_rc == 0));
             apd_command_result_free(&command);
             return rc;
         }
@@ -722,20 +822,64 @@ int apd_config_apply_prepared(const struct apd_config_paths *paths,
         if (apd_config_reload(paths, json_object_get_string(name),
                               &command) != 0) {
             int rc;
+            int rollback_rc = apd_config_restore(paths, previous);
 
-            apd_config_restore(paths, previous);
-            rc = apd_config_fail(out, "apply", "wifi_reload_failed",
+            rc = apd_config_fail(out, "apply",
+                                 rollback_rc == 0 ? "wifi_reload_failed" :
+                                 "rollback_failed",
                                  &command);
             json_object_object_add(*out, "rolled_back",
-                                   json_object_new_boolean(1));
+                                   json_object_new_boolean(rollback_rc == 0));
             apd_command_result_free(&command);
             return rc;
         }
         apd_command_result_free(&command);
     }
-    result = apd_config_result_new("apply");
-    json_object_object_add(result, "applied", json_object_new_boolean(1));
-    return apd_config_ok(out, result);
+    {
+        struct json_object *readback = NULL;
+        struct json_object *match = NULL;
+        int readback_rc = apd_config_readback(paths, candidate, &readback);
+        int matched = readback_rc == 0 && readback &&
+            json_object_object_get_ex(readback, "match", &match) &&
+            json_object_get_boolean(match);
+
+        if (!matched) {
+            struct json_object *rollback = NULL;
+            int rollback_rc = apd_config_rollback(paths, previous, &rollback);
+            struct json_object *rolled_back = rollback ?
+                json_object_object_get(rollback, "rolled_back") : NULL;
+            int rollback_ok = rollback_rc == 0 && rolled_back &&
+                json_object_get_boolean(rolled_back);
+
+            if (!rollback_ok) {
+                int rc = apd_config_fail(out, "apply", "rollback_failed", NULL);
+                json_object_object_add(*out, "rolled_back",
+                                       json_object_new_boolean(0));
+                json_object_object_add(*out, "readback", readback ?
+                                       readback : json_object_new_null());
+                if (readback)
+                    json_object_get(readback);
+                json_object_put(rollback);
+                json_object_put(readback);
+                return rc;
+            }
+            apd_config_fail(out, "apply",
+                readback_rc == 0 ? "readback_mismatch" : "readback_failed", NULL);
+            json_object_object_add(*out, "rolled_back",
+                                   json_object_new_boolean(1));
+            json_object_object_add(*out, "readback", readback ?
+                                   readback : json_object_new_null());
+            if (readback)
+                json_object_get(readback);
+            json_object_put(rollback);
+            json_object_put(readback);
+            return -1;
+        }
+        result = apd_config_result_new("apply");
+        json_object_object_add(result, "applied", json_object_new_boolean(1));
+        json_object_object_add(result, "readback", readback);
+        return apd_config_ok(out, result);
+    }
 }
 
 int apd_config_apply(const struct apd_config_paths *paths,
@@ -808,4 +952,34 @@ int apd_config_rollback(const struct apd_config_paths *paths,
     json_object_object_add(result, "rolled_back",
                            json_object_new_boolean(1));
     return apd_config_ok(out, result);
+}
+
+int apd_config_executor_available(const struct apd_config_paths *paths)
+{
+    char parent[4096];
+    char *slash;
+
+    if (!paths || !paths->uci || !paths->wifi || !paths->config_dir ||
+        !paths->staging_dir)
+        return 0;
+    if (snprintf(parent, sizeof(parent), "%s", paths->staging_dir) >=
+        (int)sizeof(parent))
+        return 0;
+    slash = strrchr(parent, '/');
+    if (!slash)
+        return 0;
+    *slash = '\0';
+    return access(paths->uci, X_OK) == 0 && access(paths->wifi, X_OK) == 0 &&
+           access(paths->config_dir, R_OK | W_OK) == 0 &&
+           access(parent[0] ? parent : "/", R_OK | W_OK | X_OK) == 0;
+}
+
+int apd_config_executor_available_default(void)
+{
+    struct apd_config_paths paths = {
+        "/sbin/uci", "/sbin/wifi", "/etc/config",
+        "/tmp/dreamingwrt-apd-config-candidate"
+    };
+
+    return apd_config_executor_available(&paths);
 }

@@ -34,6 +34,7 @@
 #include <uci.h>
 
 #include "apd_radio_job_journal.h"
+#include "apd_config_executor.h"
 
 #define APD_DB_PATH "/etc/dreamingwrt/apd.db"
 #define APD_CONTRACT_VERSION "ap-control.v1"
@@ -83,7 +84,7 @@ struct apd_backend_ops {
     int (*validate)(struct json_object *candidate, struct json_object **out);
     int (*stage)(struct json_object *candidate, struct json_object **out);
     int (*apply)(struct json_object *candidate, struct json_object **out);
-    int (*readback)(struct json_object **out);
+    int (*readback)(struct json_object *candidate, struct json_object **out);
     int (*rollback)(struct json_object *rollback_ref, struct json_object **out);
 };
 

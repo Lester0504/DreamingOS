@@ -1,4 +1,5 @@
-const LEGACY_CONTROLLER_URL = '/static/js/log-center.js?v=20260810-front-release-01';
+const VERSION = '20260817-audit-log-localization-03';
+const LEGACY_CONTROLLER_URL = '/static/js/log-center.js?v=20260817-audit-log-localization-03';
 
 let controllerPromise = null;
 

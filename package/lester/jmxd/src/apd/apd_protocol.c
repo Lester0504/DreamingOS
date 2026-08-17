@@ -45,6 +45,10 @@ struct json_object *apd_capabilities_json(void)
     const struct apd_backend_ops *backend = apd_backend();
     int snapshot_supported = backend && backend->snapshot_supported &&
                              backend->snapshot;
+    int config_executor = backend && backend->validate && backend->stage &&
+                          backend->apply && backend->readback &&
+                          backend->rollback &&
+                          apd_config_executor_available_default();
 
     if (backend && backend->probe)
         backend->probe(&probe);
@@ -79,16 +83,16 @@ struct json_object *apd_capabilities_json(void)
                    apd_transport_reason());
     apd_capability(cap, reasons, "remote_telemetry", snapshot_supported,
                    "normalized_snapshot_backend_unavailable");
-    apd_capability(cap, reasons, "validate", 0,
-                   "phase2_candidate_validation_pending");
-    apd_capability(cap, reasons, "stage", 0,
-                   "phase2_atomic_staging_pending");
-    apd_capability(cap, reasons, "apply", 0,
-                   "phase2_transactional_apply_pending");
-    apd_capability(cap, reasons, "readback", 0,
-                   "phase2_canonical_readback_pending");
-    apd_capability(cap, reasons, "rollback", 0,
-                   "phase2_rollback_readback_pending");
+    apd_capability(cap, reasons, "validate", config_executor,
+                   config_executor ? NULL : "config_executor_unavailable");
+    apd_capability(cap, reasons, "stage", config_executor,
+                   config_executor ? NULL : "config_executor_unavailable");
+    apd_capability(cap, reasons, "apply", config_executor,
+                   config_executor ? NULL : "config_executor_unavailable");
+    apd_capability(cap, reasons, "readback", config_executor,
+                   config_executor ? NULL : "config_executor_unavailable");
+    apd_capability(cap, reasons, "rollback", config_executor,
+                   config_executor ? NULL : "config_executor_unavailable");
     json_object_object_add(cap, "reasons", reasons);
     json_object_object_add(root, "capabilities", cap);
     return root;
