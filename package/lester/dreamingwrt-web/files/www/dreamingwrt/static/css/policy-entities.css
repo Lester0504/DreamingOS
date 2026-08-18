@@ -773,6 +773,24 @@
   gap: 12px;
 }
 
+.policy-protocol-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.policy-protocol-grid > .dwrt-kit-field {
+  min-width: 0;
+}
+
+.policy-protocol-json {
+  min-height: 132px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  line-height: 1.5;
+}
+
 /* 七个固定格：用等宽轨道而不是 auto-fit，否则勾选态会让格子宽度跳变。 */
 .policy-object-weekdays {
   min-width: 0;
@@ -1306,6 +1324,11 @@
   .policy-object-toolbar [data-object-refresh] span { display: none; }
 
   .policy-entity-summary {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .policy-object-time-grid,
+  .policy-protocol-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 

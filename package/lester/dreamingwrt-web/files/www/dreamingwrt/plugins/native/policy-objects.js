@@ -1,3 +1,5 @@
+const VERSION = '20260814-policy-custom-protocol-crud-01';
+
 const SOURCE_TABS = [
   ['overview', '概览'],
   ['composite', '复合策略对象'],
@@ -279,10 +281,13 @@ export function mount(context = {}) {
     detail: null,
     /* country / time 的编辑抽屉：null 表示未打开。 */
     editor: null,
+    /* 自定义协议使用独立草稿，避免与 country / time 的字段语义互相污染。 */
+    protocolEditor: null,
     /* 删除确认，走 kit 的 confirmationMarkup（design.md 规则 17）。 */
     removing: null,
     saving: false,
     notice: '',
+    protocolNotice: '',
     countries: { status: 'idle', items: [], error: '' },
     source: {
       routing: { status: 'loading', data: null, error: null },
@@ -352,7 +357,7 @@ export function mount(context = {}) {
   function flowdCardWritability() {
     const data = state.source.flowd.data;
     if (!data) return '读取中';
-    if (!data.readOnly) return '可写 · 表单待建';
+    if (!data.readOnly) return '可新增、编辑与删除';
     return data.capabilityKnown ? '只读' : '可写性未确认';
   }
 
@@ -364,7 +369,11 @@ export function mount(context = {}) {
     const detail = `<td><button type="button" data-dwrt-component="icon-button" data-object-detail="${escapeHtml(`${kind}:${item.id}`)}" aria-label="查看 ${escapeHtml(item.name)}">${icon('chevron-right')}</button></td>`;
     if (kind === 'flowd') {
       const ports = [item.srcPort && `源 ${item.srcPort}`, item.dstPort && `目标 ${item.dstPort}`].filter(Boolean).join(' · ') || '任意';
-      return `<tr><td><strong>${escapeHtml(item.name)}</strong>${item.remark ? `<small>${escapeHtml(item.remark)}</small>` : ''}</td><td>${escapeHtml(item.kind.toUpperCase())}</td><td>${escapeHtml(item.proto.toUpperCase())}</td><td>${escapeHtml(ports)}</td><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td>${detail}</tr>`;
+      const writable = state.source.flowd.data?.readOnly === false;
+      const actions = writable
+        ? `<div class="policy-object-row-actions"><button type="button" data-dwrt-component="icon-button" data-protocol-edit="${escapeHtml(item.id)}" aria-label="编辑 ${escapeHtml(item.name)}" title="编辑">${icon('pencil')}</button><button type="button" data-dwrt-component="icon-button" data-protocol-remove="${escapeHtml(item.id)}" aria-label="删除 ${escapeHtml(item.name)}" title="删除">${icon('trash-2')}</button><button type="button" data-dwrt-component="icon-button" data-object-detail="${escapeHtml(`${kind}:${item.id}`)}" aria-label="查看 ${escapeHtml(item.name)}" title="详情">${icon('chevron-right')}</button></div>`
+        : `<div class="policy-object-row-actions"><button type="button" data-dwrt-component="icon-button" data-object-detail="${escapeHtml(`${kind}:${item.id}`)}" aria-label="查看 ${escapeHtml(item.name)}" title="详情">${icon('chevron-right')}</button></div>`;
+      return `<tr><td><strong>${escapeHtml(item.name)}</strong>${item.remark ? `<small>${escapeHtml(item.remark)}</small>` : ''}</td><td>${escapeHtml(item.kind.toUpperCase())}</td><td>${escapeHtml(item.proto.toUpperCase())}</td><td>${escapeHtml(ports)}</td><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td>${actions}</td></tr>`;
     }
     if (kind === 'flowObjects') {
       const reference = item.refCount ? `${item.refCount} 条引用` : '未引用';
@@ -442,18 +451,16 @@ export function mount(context = {}) {
     if (terminal) return statePanel(terminal.name, terminal.title, terminal.detail);
     const data = state.source.flowd.data;
     const stale = state.source.flowd.status === 'ready' ? '' : `<div class="policy-entity-alert is-warning" role="status"><strong>正在显示上次可用快照</strong><span>${escapeHtml(state.source.flowd.error || '自定义协议刷新失败。')}</span></div>`;
-    /*
-     * 三态分述，判据是 custom_protocol_crud 这个布尔位本身，不靠「有没有 reason」推断
-     * （design.md「Capability truth」第 14 条：那种写法会在后端就绪时反着说"尚未提供"）。
-     * 能力为真时不再挂只读提示；本页仍不放编辑表单，原因是入参 schema 未核，
-     * 这一点必须说成「表单待建」而不是「后端不支持」。
-     */
+    const notice = state.protocolNotice
+      ? `<div class="policy-entity-alert ${data.runtimeApplyKnown && !data.runtimeApply ? 'is-warning' : 'is-success'}" role="status"><strong>${data.runtimeApplyKnown && !data.runtimeApply ? '配置已保存，运行态未应用' : '已保存'}</strong><span>${escapeHtml(state.protocolNotice)}</span></div>`
+      : '';
     const capability = !data.readOnly
-      ? `<div class="policy-entity-alert" role="status"><strong>写入通道已开放，本页尚未提供表单</strong><span>flowd 已声明 <code>custom_protocol_crud=true</code>，写入端点 <code>${escapeHtml(data.writeEndpoint)}</code>、删除端点 <code>${escapeHtml(data.deleteEndpoint)}</code>。本页暂不放出编辑入口的原因只有一个：<code>custom_protocol_set</code> 的入参 schema 与必填字段尚未确认，建表单前先要拿到它。这不是后端不支持。</span></div>`
+      ? `<div class="policy-entity-alert" role="status"><strong>自定义协议可写</strong><span>flowd 已声明 <code>custom_protocol_crud=true</code>。新增与编辑使用 <code>${escapeHtml(data.writeEndpoint)}</code>，删除使用 <code>${escapeHtml(data.deleteEndpoint)}</code>；运行态是否应用仍以独立能力位为准。</span></div>`
       : data.capabilityKnown
         ? `<div class="policy-entity-alert is-warning" role="status"><strong>写入能力为否</strong><span>flowd 声明 <code>custom_protocol_crud=false</code>，本页保持只读。</span></div>`
         : `<div class="policy-entity-alert is-warning" role="status"><strong>写入能力未确认，本页暂不提供编辑</strong><span>本次 <code>custom_protocols</code> 载荷里没有可写能力位，因此本页不放出编辑入口；这不等于后端没有实现 —— 写入端点 <code>/api/v1/flowd/custom-protocols</code> 已注册。能力位到位后本页会自动解开。</span></div>`;
-    return `${stale}<div class="policy-entity-alert" role="status"><strong>独立协议资源</strong><span>本表只列 flowd 用户自定义协议，不含系统内置应用签名与协议目录；那两类属于 <code>/api/v1/policy-engine/catalog</code>，由策略表的匹配条件直接引用。</span></div>${capability}${runtimeApplyMarkup(data)}${tableMarkup({ title: 'flowd 自定义协议', description: `权威来源：${escapeHtml(data.writeEndpoint)} · ${data.source}`, rows: data.items, columns: ['名称', '层级', '协议', '端口', '状态'], empty: 'flowd 尚未配置自定义协议', kind: 'flowd' })}`;
+    const actions = data.readOnly ? '' : `<div class="policy-object-table-actions">${button('新建自定义协议', 'data-protocol-create', 'primary', 'plus')}</div>`;
+    return `${stale}${notice}<div class="policy-entity-alert" role="status"><strong>独立协议资源</strong><span>本表只列 flowd 用户自定义协议，不含系统内置应用签名与协议目录；那两类属于 <code>/api/v1/policy-engine/catalog</code>，由策略表的匹配条件直接引用。</span></div>${capability}${runtimeApplyMarkup(data)}${tableMarkup({ title: 'flowd 自定义协议', description: `权威来源：${escapeHtml(data.writeEndpoint)} · ${data.source}`, rows: data.items, columns: ['名称', '层级', '协议', '端口', '状态'], empty: data.readOnly ? 'flowd 尚未配置自定义协议' : 'flowd 尚未配置自定义协议，可以新建第一条', kind: 'flowd', actions })}`;
   }
 
   function flowObjectsMarkup() {
@@ -509,7 +516,7 @@ export function mount(context = {}) {
       const flowd = state.source.flowd.data;
       if (!flowd) return statusBadge('读取中', 'muted');
       /* 能力位为真时不得再挂只读徽章 —— 页面同时说着「已开放」和「只读」会自相矛盾。 */
-      if (!flowd.readOnly) return statusBadge('可写 · 表单待建', 'info');
+      if (!flowd.readOnly) return statusBadge('可写', 'success');
       return statusBadge(flowd.capabilityKnown ? '只读分类' : '可写性未确认', 'warning');
     }
     return statusBadge('多来源混合', 'muted');
@@ -526,7 +533,7 @@ export function mount(context = {}) {
     if (key === 'flowObjects') return '地区 / 计划可写，其余类型只读';
     const flowd = state.source.flowd.data;
     if (!flowd) return '只读快照';
-    if (!flowd.readOnly) return '可写通道已开放 · 表单待建（缺入参 schema）';
+    if (!flowd.readOnly) return '可新增、编辑与删除';
     return flowd.capabilityKnown ? '只读 · flowd 声明不可写' : '可写性未确认 · 当前只读';
   }
 
@@ -632,7 +639,7 @@ export function mount(context = {}) {
     }
     if (kind === 'flowd') {
       const data = state.source.flowd.data;
-      if (data && !data.readOnly) return statePanel('unavailable', '写入通道已开放，本页尚未提供表单', `flowd 已声明 custom_protocol_crud=true，写入端点 ${data.writeEndpoint}。本页暂不放出编辑入口是因为 custom_protocol_set 的入参 schema 尚未确认，不是后端不支持。${runtimeNote(data)}`);
+      if (data && !data.readOnly) return statePanel('empty', '此协议可在本页编辑', `配置写入 flowd 配置库。${runtimeNote(data) || '运行态是否应用以 flowd 返回的能力位为准。'}`);
       if (data?.capabilityKnown) return statePanel('unavailable', '此来源在对象页只读', 'flowd 声明 custom_protocol_crud=false，写入通道未开放。');
       return statePanel('unavailable', '写入能力未确认', '自定义协议的写入端点已在后端注册，但本次载荷未声明可写能力位，因此本页暂不放出编辑入口；这不等于后端不支持。');
     }
@@ -721,6 +728,158 @@ export function mount(context = {}) {
     renderOverlay();
   }
 
+  const PROTOCOL_KIND_OPTIONS = [['l3', 'L3'], ['l4', 'L4'], ['l7', 'L7'], ['dpi', 'DPI']];
+  const PROTOCOL_OPTIONS = [
+    ['any', '任意'], ['all', '全部'], ['tcp', 'TCP'], ['udp', 'UDP'],
+    ['icmp', 'ICMP'], ['icmpv6', 'ICMPv6'], ['gre', 'GRE'], ['esp', 'ESP'], ['ah', 'AH']
+  ];
+
+  function utf8Size(value) {
+    const text = String(value ?? '');
+    if (typeof TextEncoder === 'function') return new TextEncoder().encode(text).length;
+    return encodeURIComponent(text).replace(/%[0-9A-F]{2}|./gi, 'x').length;
+  }
+
+  function protocolDraftFromItem(item = null) {
+    const protoText = sourceText(item?.proto, 'tcp').toLowerCase();
+    const knownProto = PROTOCOL_OPTIONS.some(([value]) => value === protoText);
+    return {
+      mode: item ? 'edit' : 'create',
+      id: sourceText(item?.id),
+      name: sourceText(item?.name),
+      enabled: item?.enabled !== false,
+      priority: String(Number.isInteger(item?.priority) ? item.priority : 1000),
+      kind: PROTOCOL_KIND_OPTIONS.some(([value]) => value === item?.kind) ? item.kind : 'l4',
+      protoMode: knownProto ? protoText : 'number',
+      protoNumber: knownProto ? '' : protoText,
+      srcPort: sourceText(item?.srcPort),
+      dstPort: sourceText(item?.dstPort),
+      matchJson: JSON.stringify(item?.match && typeof item.match === 'object' && !Array.isArray(item.match) ? item.match : {}, null, 2),
+      tagsText: Array.isArray(item?.tags) ? item.tags.join(', ') : '',
+      remark: sourceText(item?.remark),
+      error: ''
+    };
+  }
+
+  function openProtocolEditor(item = null) {
+    const data = state.source.flowd.data;
+    if (!data || data.readOnly) return;
+    state.detail = null;
+    state.editor = null;
+    state.protocolNotice = '';
+    state.protocolEditor = protocolDraftFromItem(item);
+    renderPage();
+    renderOverlay();
+  }
+
+  function closeProtocolEditor() {
+    state.protocolEditor = null;
+    renderPage();
+    renderOverlay();
+  }
+
+  function protocolPortError(label, value) {
+    const text = sourceText(value).toLowerCase();
+    if (!text || text === 'any') return '';
+    if (text.includes(',')) return `${label}不支持逗号列表；多个端口请拆成多条协议。`;
+    const match = /^(\d{1,5})(?:-(\d{1,5}))?$/.exec(text);
+    if (!match) return `${label}只支持单端口、起止范围或 any。`;
+    const start = Number(match[1]);
+    const end = Number(match[2] || match[1]);
+    if (start < 1 || start > 65535 || end < 1 || end > 65535) return `${label}必须在 1 到 65535 之间。`;
+    if (start > end) return `${label}的起始端口不能大于结束端口。`;
+    return '';
+  }
+
+  function protocolEditorPayload() {
+    const draft = state.protocolEditor;
+    if (!draft) return { error: '编辑状态已丢失。' };
+    const name = sourceText(draft.name);
+    if (!name) return { error: '请填写名称。' };
+    if (utf8Size(name) > 128) return { error: '名称不能超过 128 字节。' };
+    const remark = sourceText(draft.remark);
+    if (utf8Size(remark) > 256) return { error: '备注不能超过 256 字节。' };
+    const priority = Number(draft.priority);
+    if (!Number.isInteger(priority) || priority < 0 || priority > 1000000) return { error: '优先级必须是 0 到 1000000 之间的整数。' };
+    if (!PROTOCOL_KIND_OPTIONS.some(([value]) => value === draft.kind)) return { error: '请选择有效的协议层级。' };
+    let proto = draft.protoMode;
+    if (draft.protoMode === 'number') {
+      const protocolNumber = Number(draft.protoNumber);
+      if (!Number.isInteger(protocolNumber) || protocolNumber < 0 || protocolNumber > 255) return { error: '协议号必须是 0 到 255 之间的整数。' };
+      proto = protocolNumber;
+    } else if (!PROTOCOL_OPTIONS.some(([value]) => value === draft.protoMode)) {
+      return { error: '请选择有效的协议。' };
+    }
+    const srcPortError = protocolPortError('源端口', draft.srcPort);
+    if (srcPortError) return { error: srcPortError };
+    const dstPortError = protocolPortError('目标端口', draft.dstPort);
+    if (dstPortError) return { error: dstPortError };
+    let match;
+    try {
+      match = JSON.parse(sourceText(draft.matchJson, '{}'));
+    } catch {
+      return { error: '匹配条件必须是有效的 JSON 对象。' };
+    }
+    if (!match || typeof match !== 'object' || Array.isArray(match)) return { error: '匹配条件必须是 JSON 对象，不能是数组或基础值。' };
+    if (utf8Size(JSON.stringify(match)) > 8192) return { error: '匹配条件不能超过 8192 字节。' };
+    const tags = String(draft.tagsText || '').split(/[\n,]/).map((tag) => tag.trim()).filter(Boolean);
+    if (utf8Size(JSON.stringify(tags)) > 8192) return { error: '标签列表不能超过 8192 字节。' };
+    const body = {
+      name,
+      enabled: draft.enabled !== false,
+      priority,
+      kind: draft.kind,
+      proto,
+      src_port: sourceText(draft.srcPort).toLowerCase(),
+      dst_port: sourceText(draft.dstPort).toLowerCase(),
+      match,
+      tags: [...new Set(tags)],
+      remark
+    };
+    if (draft.mode === 'edit') body.id = draft.id;
+    return { body };
+  }
+
+  async function submitProtocolEditor() {
+    if (state.saving || !state.protocolEditor) return;
+    const data = state.source.flowd.data;
+    if (!data || data.readOnly) {
+      state.protocolEditor.error = 'flowd 未声明自定义协议写入能力。';
+      renderOverlay();
+      return;
+    }
+    const prepared = protocolEditorPayload();
+    if (prepared.error) {
+      state.protocolEditor.error = prepared.error;
+      renderOverlay();
+      return;
+    }
+    if (typeof api.request !== 'function') {
+      state.protocolEditor.error = '页面没有获得 API 请求能力。';
+      renderOverlay();
+      return;
+    }
+    const creating = state.protocolEditor.mode === 'create';
+    state.saving = true;
+    state.protocolEditor.error = '';
+    renderOverlay();
+    try {
+      await api.request('policy-object-custom-protocol-save', '/api/v1/flowd/custom-protocols', { method: 'POST', body: prepared.body });
+      if (!state.mounted) return;
+      state.saving = false;
+      state.protocolEditor = null;
+      state.protocolNotice = `${creating ? '已创建' : '已保存'}自定义协议「${prepared.body.name}」${data.runtimeApplyKnown && !data.runtimeApply ? '，配置已落库，数据面尚未应用。' : '。'}`;
+      renderPage();
+      renderOverlay();
+      await refresh();
+    } catch (error) {
+      if (!state.mounted || signal?.aborted) return;
+      state.saving = false;
+      if (state.protocolEditor) state.protocolEditor.error = protocolWriteErrorText(error);
+      renderOverlay();
+    }
+  }
+
   function editorPayload() {
     const draft = state.editor;
     if (!draft) return { error: '编辑状态已丢失。' };
@@ -805,18 +964,27 @@ export function mount(context = {}) {
     state.saving = true;
     renderOverlay();
     try {
-      await api.request('policy-object-flow-delete', '/api/v1/flowd/objects/delete', { method: 'POST', body: { id: target.id } });
+      if (target.resource === 'protocol') {
+        await api.request('policy-object-custom-protocol-delete', '/api/v1/flowd/custom-protocols/delete', { method: 'POST', body: { id: target.id } });
+      } else {
+        await api.request('policy-object-flow-delete', '/api/v1/flowd/objects/delete', { method: 'POST', body: { id: target.id } });
+      }
       if (!state.mounted) return;
       state.saving = false;
       state.removing = null;
-      state.notice = `已删除对象「${target.name}」。`;
+      if (target.resource === 'protocol') {
+        const data = state.source.flowd.data;
+        state.protocolNotice = `已删除自定义协议「${target.name}」${data?.runtimeApplyKnown && !data.runtimeApply ? '，配置已更新，数据面尚未应用。' : '。'}`;
+      } else {
+        state.notice = `已删除对象「${target.name}」。`;
+      }
       renderPage();
       renderOverlay();
       await refresh();
     } catch (error) {
       if (!state.mounted || signal?.aborted) return;
       state.saving = false;
-      state.removing = { ...target, error: flowWriteErrorText(error) };
+      state.removing = { ...target, error: target.resource === 'protocol' ? protocolWriteErrorText(error) : flowWriteErrorText(error) };
       renderOverlay();
     }
   }
@@ -839,6 +1007,20 @@ export function mount(context = {}) {
     if (known[code]) return known[code];
     if (error?.status === 403) return '当前账号没有写入 flowd 流量对象的权限。';
     return error?.message || '写入失败。';
+  }
+
+  function protocolWriteErrorText(error) {
+    const code = sourceText(error?.payload?.error?.code, error?.payload?.error, error?.payload?.code);
+    const known = {
+      invalid_id: '协议标识不合法。',
+      not_found: '该自定义协议已不存在，请刷新列表。',
+      invalid_request: '请求体不合法，后端拒绝了本次写入。',
+      partial_or_failed_save: 'flowd 未能保存该协议。请检查名称、优先级、层级、协议号、端口、匹配条件和标签。',
+      storage_error: 'flowd 配置库当前不可写。'
+    };
+    if (known[code]) return known[code];
+    if (error?.status === 403) return '当前账号没有写入自定义协议的权限。';
+    return error?.message || '自定义协议写入失败。';
   }
 
   function flowObjectReferencesMarkup(item) {
@@ -876,6 +1058,21 @@ export function mount(context = {}) {
     return `<div class="policy-object-time-grid">${editorField('开始时间', `<input type="time" data-object-time="start" value="${escapeHtml(time.start)}">`)}${editorField('结束时间', `<input type="time" data-object-time="end" value="${escapeHtml(time.end)}">`)}</div>${editorField('生效日', `<div class="policy-object-weekdays">${WEEKDAY_LABELS.map(([key, label]) => `<label class="policy-object-weekday"><input type="checkbox" data-object-weekday="${escapeHtml(key)}" ${time.days.includes(key) ? 'checked' : ''}><span>${escapeHtml(label)}</span></label>`).join('')}</div>`, '结束时间早于开始时间表示跨零点的窗口。')}`;
   }
 
+  function protocolEditorMarkup() {
+    const draft = state.protocolEditor;
+    if (!draft) return '';
+    const title = `${draft.mode === 'create' ? '新建' : '编辑'}自定义协议`;
+    const protoOptions = `${PROTOCOL_OPTIONS.map(([value, label]) => `<option value="${escapeHtml(value)}" ${draft.protoMode === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}<option value="number" ${draft.protoMode === 'number' ? 'selected' : ''}>协议号</option>`;
+    const errorMarkup = draft.error ? `<div class="policy-entity-alert is-warning" role="alert"><strong>无法保存</strong><span>${escapeHtml(draft.error)}</span></div>` : '';
+    const idField = draft.mode === 'edit'
+      ? editorField('协议标识', `<input type="text" value="${escapeHtml(draft.id)}" disabled>`, '标识创建后不可更改。')
+      : '';
+    const protoNumberField = draft.protoMode === 'number'
+      ? editorField('协议号', `<input type="number" min="0" max="255" step="1" data-protocol-draft="protoNumber" value="${escapeHtml(draft.protoNumber)}" placeholder="0 - 255">`)
+      : '';
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-protocol-editor-close aria-label="关闭编辑"></button><aside data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" class="dwrt-kit-sheet policy-entity-sheet policy-object-editor-sheet policy-protocol-editor-sheet is-open"><header class="dwrt-kit-sheet-header"><div><span>flowd 自定义协议</span><strong>${escapeHtml(title)}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-protocol-editor-close aria-label="关闭">${icon('x')}</button></header><div class="dwrt-kit-sheet-body policy-entity-sheet-body">${errorMarkup}<div class="policy-entity-alert" role="status"><strong>配置写入 flowd</strong><span>端口只接受单端口、起止范围或 any；多个端口请拆成多条协议。保存成功不代表已经应用到数据面。</span></div>${editorField('名称', `<input type="text" data-protocol-draft="name" value="${escapeHtml(draft.name)}" placeholder="例如 内网 RTSP" maxlength="128">`)}${idField}<div class="policy-protocol-grid">${editorField('层级', `<select class="dwrt-kit-select" data-dwrt-component="select" data-protocol-draft="kind">${PROTOCOL_KIND_OPTIONS.map(([value, label]) => `<option value="${value}" ${draft.kind === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`)}${editorField('协议', `<select class="dwrt-kit-select" data-dwrt-component="select" data-protocol-draft="protoMode">${protoOptions}</select>`)}${protoNumberField}${editorField('优先级', `<input type="number" min="0" max="1000000" step="1" data-protocol-draft="priority" value="${escapeHtml(draft.priority)}">`, '数值越小越先匹配。')}</div><div class="policy-protocol-grid">${editorField('源端口', `<input type="text" inputmode="numeric" data-protocol-draft="srcPort" value="${escapeHtml(draft.srcPort)}" placeholder="any、443 或 1000-2000">`)}${editorField('目标端口', `<input type="text" inputmode="numeric" data-protocol-draft="dstPort" value="${escapeHtml(draft.dstPort)}" placeholder="any、554 或 8000-8999">`)}</div>${editorField('匹配条件', `<textarea class="policy-protocol-json" data-protocol-draft="matchJson" rows="6" spellcheck="false" placeholder="{}">${escapeHtml(draft.matchJson)}</textarea>`, '必须是 JSON 对象，不能是数组。')}${editorField('标签', `<textarea data-protocol-draft="tagsText" rows="2" placeholder="media, camera">${escapeHtml(draft.tagsText)}</textarea>`, '使用逗号或换行分隔，保存时去重。')}${editorField('备注', `<textarea data-protocol-draft="remark" rows="2" maxlength="256" placeholder="可选">${escapeHtml(draft.remark)}</textarea>`)}<label class="policy-object-enable-check"><input type="checkbox" data-protocol-enabled ${draft.enabled ? 'checked' : ''}><span><strong>启用</strong><small>停用后保留配置，但不参与匹配。</small></span></label></div><footer class="dwrt-kit-sheet-footer"><span></span><div>${button('取消', 'data-protocol-editor-close', 'secondary')}${button(state.saving ? '保存中…' : '保存', `data-protocol-editor-submit ${state.saving ? 'disabled' : ''}`, 'primary')}</div></footer></aside>`;
+  }
+
   function editorMarkup() {
     const draft = state.editor;
     if (!draft) return '';
@@ -899,12 +1096,14 @@ export function mount(context = {}) {
     if (!target) return '';
     const description = target.error
       ? target.error
-      : `将从 flowd 配置库删除「${target.name}」。引用它的规则会失去这个匹配条件，删除后不可撤销。`;
+      : target.resource === 'protocol'
+        ? `将从 flowd 配置库删除自定义协议「${target.name}」。后端当前没有引用保护，引用这条协议的规则也不会阻止删除；删除后不可撤销。`
+        : `将从 flowd 配置库删除「${target.name}」。引用它的规则会失去这个匹配条件，删除后不可撤销。`;
     return ui.confirmationMarkup?.({
       id: 'policy-object-remove',
       action: 'policy-object-remove',
       tone: 'danger',
-      title: `删除对象「${target.name}」`,
+      title: `${target.resource === 'protocol' ? '删除自定义协议' : '删除对象'}「${target.name}」`,
       description,
       confirmLabel: state.saving ? '删除中…' : '删除',
       cancelLabel: '取消',
@@ -971,7 +1170,7 @@ export function mount(context = {}) {
      * 三层叠加各自独立：编辑抽屉与删除确认优先于详情抽屉，同一时刻只渲染一个，
      * 否则两张 sheet 会同时被 kit 搬进传送门、抢同一个遮罩。
      */
-    replaceMarkup(overlayHost, state.removing ? removeMarkup() : state.editor ? editorMarkup() : detailMarkup());
+    replaceMarkup(overlayHost, state.removing ? removeMarkup() : state.protocolEditor ? protocolEditorMarkup() : state.editor ? editorMarkup() : detailMarkup());
   }
 
   function hydrate(snapshot) {
@@ -1050,7 +1249,7 @@ export function mount(context = {}) {
       if (document.hidden) return;
       if (state.refreshing || state.refreshPromise) return;
       /* 编辑抽屉与删除确认打开时不轮询：整页重绘会把正在填的草稿顶掉。 */
-      if (state.detail || state.editor || state.removing || state.saving) return;
+      if (state.detail || state.editor || state.protocolEditor || state.removing || state.saving) return;
       refresh();
     }, 20000);
   }
@@ -1091,6 +1290,27 @@ export function mount(context = {}) {
       openEditor(create.dataset.objectCreate);
       return;
     }
+    if (event.target.closest('[data-protocol-create]')) {
+      openProtocolEditor();
+      return;
+    }
+    const protocolEdit = event.target.closest('[data-protocol-edit]');
+    if (protocolEdit) {
+      const item = state.source.flowd.data?.items.find((entry) => entry.id === protocolEdit.dataset.protocolEdit);
+      if (item) openProtocolEditor(item);
+      return;
+    }
+    const protocolRemove = event.target.closest('[data-protocol-remove]');
+    if (protocolRemove) {
+      const item = state.source.flowd.data?.items.find((entry) => entry.id === protocolRemove.dataset.protocolRemove);
+      if (!item) return;
+      state.detail = null;
+      state.protocolNotice = '';
+      state.removing = { resource: 'protocol', id: item.id, name: item.name, error: '' };
+      renderPage();
+      renderOverlay();
+      return;
+    }
     const edit = event.target.closest('[data-object-edit]');
     if (edit) {
       const item = state.source.flowObjects.data?.items.find((entry) => entry.id === edit.dataset.objectEdit);
@@ -1116,6 +1336,15 @@ export function mount(context = {}) {
     }
     if (event.target.closest('[data-object-editor-submit]')) {
       submitEditor();
+      return;
+    }
+    if (event.target.closest('[data-protocol-editor-close]')) {
+      if (state.saving) return;
+      closeProtocolEditor();
+      return;
+    }
+    if (event.target.closest('[data-protocol-editor-submit]')) {
+      submitProtocolEditor();
       return;
     }
     if (event.target.closest('[data-dwrt-confirm-accept]')) {
@@ -1147,6 +1376,14 @@ export function mount(context = {}) {
    * 需要改变可见结构的只有国家搜索（要过滤列表）和勾选（要更新计数）。
    */
   function onInput(event) {
+    const protocolDraft = state.protocolEditor;
+    if (protocolDraft && ownsEvent(event.target)) {
+      const protocolField = event.target.closest('[data-protocol-draft]');
+      if (protocolField) {
+        protocolDraft[protocolField.dataset.protocolDraft] = protocolField.value;
+        return;
+      }
+    }
     const draft = state.editor;
     if (!draft) return;
     if (!ownsEvent(event.target)) return;
@@ -1168,6 +1405,21 @@ export function mount(context = {}) {
   }
 
   function onChange(event) {
+    const protocolDraft = state.protocolEditor;
+    if (protocolDraft && ownsEvent(event.target)) {
+      const enabled = event.target.closest('[data-protocol-enabled]');
+      if (enabled) {
+        protocolDraft.enabled = enabled.checked;
+        return;
+      }
+      const field = event.target.closest('[data-protocol-draft]');
+      if (field) {
+        const key = field.dataset.protocolDraft;
+        protocolDraft[key] = field.value;
+        if (key === 'protoMode') renderOverlay();
+        return;
+      }
+    }
     const draft = state.editor;
     if (!draft) return;
     if (!ownsEvent(event.target)) return;
@@ -1234,10 +1486,14 @@ export function mount(context = {}) {
   function onKeydown(event) {
     if (event.key !== 'Escape') return;
     if (state.saving) return;
-    if (!state.editor && !state.removing) return;
+    if (!state.editor && !state.protocolEditor && !state.removing) return;
     if (state.removing) {
       state.removing = null;
       renderOverlay();
+      return;
+    }
+    if (state.protocolEditor) {
+      closeProtocolEditor();
       return;
     }
     if (state.editor) closeEditor();
