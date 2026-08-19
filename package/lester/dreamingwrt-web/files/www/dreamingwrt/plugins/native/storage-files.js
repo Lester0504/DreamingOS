@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260810-front-release-01';
+  const VERSION = '20260814-storage-files-403-write-contract-01';
   const ENDPOINT = '/api/v1/storage/files';
   /* 写入是**单入口 + action 分发**，不是每功能一条 REST 路由：后端只有
    * jmx_storage_files_mutate()，action 白名单仅 mkdir/create/write/rename

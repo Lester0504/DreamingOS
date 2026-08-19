@@ -409,7 +409,7 @@ export function mount(context = {}) {
     const members = preview.groups.reduce((sum, group) => sum + group.members.length, 0);
     return `<section class="terminal-group-import-preview">
       <div><strong>${escapeHtml(preview.fileName)}</strong><span>${escapeHtml(formatInteger(preview.groups.length))} 个分组 · ${escapeHtml(formatInteger(members))} 个成员</span></div>
-      <label><span>导入方式</span><select data-terminal-group-import-mode><option value="merge" ${state.importMode === 'merge' ? 'selected' : ''}>合并，按 ID / 名称更新</option><option value="replace" ${state.importMode === 'replace' ? 'selected' : ''} ${state.capabilities.replace_import ? '' : 'disabled'}>替换全部现有分组</option></select></label>
+      <label class="dwrt-kit-field" data-dwrt-component="field"><span>导入方式</span><select data-terminal-group-import-mode><option value="merge" ${state.importMode === 'merge' ? 'selected' : ''}>合并，按 ID / 名称更新</option><option value="replace" ${state.importMode === 'replace' ? 'selected' : ''} ${state.capabilities.replace_import ? '' : 'disabled'}>替换全部现有分组</option></select></label>
       <div class="terminal-group-import-list">${preview.groups.map((group) => `<div><strong>${escapeHtml(group.name)}</strong><span>${escapeHtml(formatInteger(group.members.length))} 个成员${group.description ? ` · ${escapeHtml(group.description)}` : ''}</span></div>`).join('')}</div>
       ${preview.errors.length ? `<div class="terminal-group-import-errors">${preview.errors.map((error) => `<span>${escapeHtml(error)}</span>`).join('')}</div>` : ''}
     </section>`;

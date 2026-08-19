@@ -37,8 +37,12 @@
  *     （`HandoffWorker-to-Backend-acl-expires-no-periodic-ruleset-rebuild.md`），
  *     所以本页文案不承诺「到点自动恢复」。
  *
- * 后端明确不支持、因此本页不做假控件的一项：
- *   - 白名单模式：`acl_mac_allow_supported=false`
+ * 白名单模式（2026-08-18）：
+ *   - `acl_mac_allow_supported=true` 时使用真实的 `network_control_whitelist(kind='mac')`。
+ *   - 成员通过 `/api/v1/network-control/mac-allowlist/members` 整体替换；模式启用期间成员
+ *     只读，需先停用再编辑，避免普通成员操作直接改变整个 LAN 的可达性。
+ *   - 启用 `/api/v1/network-control/mac-allowlist` 后必须在倒计时内调用 `/confirm`，
+ *     否则后端自动回滚；空名单禁止启用，当前管理会话来源由后端自动加入名单。
  *
  * 安全默认：新建规则一律 `enabled=false`。用户的原话是「我要亲自拉黑」，
  * 所以填完不断网，必须回列表再手动启用一次。
@@ -49,21 +53,32 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260810-front-release-01';
+  const VERSION = '20260818-terminal-policy-whitelist-23';
   const stage = root?.closest('.console-stage');
+  const modeHost = context.modeHost || null;
   const POLICY_TABLE = '/api/v1/policy-engine/policy-table';
+  const ALLOWLIST = '/api/v1/network-control/mac-allowlist';
+  const ALLOWLIST_MEMBERS = `${ALLOWLIST}/members`;
+  const ALLOWLIST_CONFIRM = `${ALLOWLIST}/confirm`;
   const MAC_ID_PREFIX = 'network_control.mac.';
 
   const state = {
     mounted: true,
     seq: 0,
     pollTimer: 0,
+    countdownTimer: 0,
     loading: true,
     refreshing: false,
     saving: false,
     clients: [],
     capabilities: {},
     rules: [],
+    mode: 'black',
+    allowlist: {},
+    allowlistMembers: [],
+    allowlistDraft: [],
+    allowlistDirty: false,
+    allowlistLoaded: false,
     requestOrigin: null,
     deviceTimezone: '',
     query: '',
@@ -205,6 +220,47 @@ export function mount(context = {}) {
   function whitelistBlockedReason(capabilities = {}) {
     if (capabilities.acl_mac_allow_supported === true) return '';
     return firstText(capabilities.acl_mac_allow_reason, '后端未声明 MAC 放行能力');
+  }
+
+  function allowlistSupported() {
+    return !whitelistBlockedReason(state.capabilities);
+  }
+
+  function normalizeAllowlist(payload = {}) {
+    const source = payload.mac_allowlist && typeof payload.mac_allowlist === 'object'
+      ? payload.mac_allowlist : {};
+    return {
+      enabled: bool(source.enabled, false),
+      confirmed: bool(source.confirmed, false),
+      confirmDeadline: Number(source.confirm_deadline || 0),
+      confirmSecondsRemaining: Number(source.confirm_seconds_remaining || 0),
+      elementCount: Number(source.element_count || 0),
+      adminMac: normalizeMac(source.admin_mac),
+      lastReason: firstText(source.last_reason),
+      mode: firstText(source.mode, 'ether_saddr_not_in_set_drop'),
+      enforcementHook: firstText(source.enforcement_hook, 'forward_lan_ingress_only'),
+      enforcementIfname: firstText(source.enforcement_iifname, 'br-lan')
+    };
+  }
+
+  function normalizeAllowlistMembers(payload = {}) {
+    const items = Array.isArray(payload.members) ? payload.members : [];
+    return Array.from(new Set(items.map(normalizeMac).filter(Boolean))).sort();
+  }
+
+  function allowlistPending() {
+    return state.allowlist.enabled === true && state.allowlist.confirmed !== true;
+  }
+
+  function allowlistSecondsRemaining() {
+    const deadline = Number(state.allowlist.confirmDeadline || 0);
+    if (!allowlistPending()) return 0;
+    if (deadline > 0) return Math.max(0, deadline - Math.floor(Date.now() / 1000));
+    return Math.max(0, Number(state.allowlist.confirmSecondsRemaining || 0));
+  }
+
+  function allowlistMemberClient(mac) {
+    return state.clients.find((client) => client.mac === mac) || null;
   }
 
   function scheduleBlockedReason(capabilities = {}) {
@@ -516,13 +572,7 @@ export function mount(context = {}) {
 
   function modeMarkup() {
     const blocked = whitelistBlockedReason(state.capabilities);
-    return `<section class="user-auth-main-surface cnc-mode-card dwrt-kit-glass-surface">
-      <header class="cnc-mode-head"><span class="cnc-mode-icon" aria-hidden="true">${icon('shield')}</span><div><strong>管控模式</strong><small>规则按 MAC 匹配，运行态为 nftables 丢弃，对静态 IP 与不走 DHCP 的 IPv6 终端同样生效</small></div></header>
-      <div class="cnc-mode-options" role="radiogroup" aria-label="管控模式">
-        <label class="cnc-mode-option is-active"><input type="radio" name="cnc-mode" value="black" checked><span><strong>黑名单模式</strong><small>仅列出的终端禁止联网，其余终端不受影响</small></span></label>
-        <label class="cnc-mode-option is-disabled"><input type="radio" name="cnc-mode" value="white" disabled><span><strong>白名单模式</strong><small>后端不支持，原因：${escapeHtml(blocked || '未声明')}</small></span></label>
-      </div>
-    </section>`;
+    return `<div class="cnc-mode-capsule" role="radiogroup" aria-label="MAC 管控模式"><button type="button" class="cnc-mode-pill ${state.mode === 'black' ? 'is-active' : ''}" data-cnc-mode="black" aria-checked="${state.mode === 'black' ? 'true' : 'false'}" data-dwrt-tooltip="仅列出的终端禁止联网"><span aria-hidden="true">${icon('shield')}</span>黑名单</button><button type="button" class="cnc-mode-pill ${state.mode === 'white' ? 'is-active' : ''} ${blocked ? 'is-disabled' : ''}" data-cnc-mode="white" aria-checked="${state.mode === 'white' ? 'true' : 'false'}" ${blocked ? 'disabled' : ''} data-dwrt-tooltip="${escapeHtml(blocked || '仅名单内终端可访问互联网')}"><span aria-hidden="true">${icon('shield')}</span>白名单</button></div>`;
   }
 
   function toolbarControls() {
@@ -566,36 +616,49 @@ export function mount(context = {}) {
         : rows.length
           ? rows.map(rowMarkup).join('')
           : `<tr><td colspan="6" class="dwrt-kit-table-empty">${state.rules.length ? '没有符合当前筛选的规则' : '当前没有任何断网规则，所有终端均可联网'}</td></tr>`;
-    return `<section class="user-auth-main-surface user-auth-table-card cnc-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface" data-cnc-table><div class="dwrt-kit-table-toolbar user-auth-table-toolbar-rich"><div class="dwrt-kit-table-title"><strong>断网规则</strong><span>新建的规则默认不启用，需要回列表手动启用后才会断网</span></div><span class="dwrt-kit-table-count">${rows.length} 条</span>${toolbarControls()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table user-auth-table cnc-table"><thead><tr><th>状态</th><th>终端</th><th>生效时段</th><th>备注</th><th>命中</th><th>操作</th></tr></thead><tbody>${body}</tbody></table></div></section>`;
+    return `<section class="user-auth-main-surface user-auth-table-card cnc-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface" data-cnc-table><div class="dwrt-kit-table-toolbar user-auth-table-toolbar-rich"><div class="dwrt-kit-table-title"><strong>断网规则</strong></div><span class="dwrt-kit-table-count">${rows.length} 条</span>${toolbarControls()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table user-auth-table cnc-table"><thead><tr><th>状态</th><th>终端</th><th>生效时段</th><th>备注</th><th>命中</th><th>操作</th></tr></thead><tbody>${body}</tbody></table></div></section>`;
   }
 
-  function capabilityMarkup() {
-    const schedule = scheduleBlockedReason(state.capabilities);
-    const whitelist = whitelistBlockedReason(state.capabilities);
-    const items = [];
-    if (whitelist) items.push(`白名单模式不可用：${whitelist}`);
-    if (schedule) items.push(`生效时段不可用：${schedule}`);
-    else items.push(`生效时段可用：每条规则一个时间窗，可选星期，时基为设备本地时间（${firstText(state.capabilities.acl_schedule_time_basis, 'device_local_time')}），不随浏览器时区变化`);
-    if (expiresReadable(state.capabilities)) {
-      /*
-       * 到期语义有两点容易被读成"到点自动恢复"，必须写清：过期只是不再进入 nft，
-       * 且真正放行要等下一次 apply（没有周期性 ruleset 重建）。
-       */
-      items.push(expiresWritable(state.capabilities)
-        ? `到期时间可设：单位为绝对时间戳，按设备本地时间${deviceTimezone() ? `（${deviceTimezone()}）` : ''}换算；到期后规则保留在列表里并标记失效、不再进入 nftables，但不会立刻放行，需等下一次应用规则后该终端才恢复联网`
-        : '到期时间：本页可显示规则的到期与失效状态，过期规则保留在列表里并可重新启用；当前固件未声明可写入的绝对时间戳语义，因此本页暂不提供到期时间设置');
-    }
-    if (groupBindingSupported(state.capabilities)) {
-      items.push(`终端分组可用：规则可绑定一个终端分组，应用时展开为该组每个成员 MAC。${groupRecomputeHint(state.capabilities)}；分组规则不占用单 MAC 的唯一性名额`);
-    } else {
-      items.push('终端分组不可用：当前固件的 MAC 规则只能绑定单个 MAC，后端尚未声明分组绑定能力');
-    }
-    if (selfDeviceCheckSupported()) {
-      items.push('本页会标出哪台终端是你正在使用的设备，避免把自己断网');
-    } else {
-      items.push(`本页无法可靠判断哪台终端是你正在使用的设备：${firstText(state.requestOrigin?.self_lockout_check_degraded_advice, '后端未能由请求来源 IP 反查到 MAC')}，因此每次启用都会完整列出目标终端供你自己核对`);
-    }
-    return `<section class="user-auth-main-surface cnc-capability-card dwrt-kit-glass-surface"><strong>当前固件的能力边界</strong><ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></section>`;
+  function allowlistStatusMarkup() {
+    const pending = allowlistPending();
+    const remain = allowlistSecondsRemaining();
+    const status = state.allowlist.enabled
+      ? pending
+        ? statusBadge(`待确认 ${remain}s`, 'warning')
+        : statusBadge('白名单已启用', 'success')
+      : statusBadge('白名单未启用', 'warning');
+    const enableDisabled = state.saving || state.allowlistDirty || state.allowlistMembers.length === 0;
+    return `<div class="cnc-allowlist-status"><span class="cnc-stack">${status}<small>${state.allowlist.enabled ? '名单外终端无法访问互联网' : state.allowlistDirty ? '名单有未保存的修改' : '当前不会按白名单限制终端'}</small></span><div class="cnc-allowlist-actions">${pending ? `<button type="button" class="policy-primary" data-cnc-allowlist-confirm ${state.saving ? 'disabled' : ''}>确认保持</button>` : ''}<button type="button" class="${state.allowlist.enabled ? 'policy-secondary' : 'policy-primary'}" data-cnc-allowlist-toggle ${state.allowlist.enabled || !enableDisabled ? '' : 'disabled'} ${state.saving ? 'disabled' : ''}>${state.allowlist.enabled ? '停用白名单' : '启用白名单'}</button></div></div>`;
+  }
+
+  function allowlistOptions() {
+    const selected = new Set(state.allowlistDraft);
+    return state.clients.slice().sort((left, right) => {
+      if (left.online !== right.online) return left.online ? -1 : 1;
+      return left.name.localeCompare(right.name, 'zh-Hans-CN');
+    }).filter((client) => !selected.has(client.mac)).map((client) =>
+      `<option value="${escapeHtml(client.mac)}">${escapeHtml(`${client.name} · ${clientLocator(client)} · ${client.online ? '在线' : '离线'}`)}</option>`
+    ).join('');
+  }
+
+  function allowlistMemberMarkup(mac) {
+    const client = allowlistMemberClient(mac);
+    const detail = client ? `${clientLocator(client)} · ${client.online ? '在线' : '离线'}` : '不在当前终端列表';
+    const admin = state.allowlist.adminMac === mac ? '<small class="cnc-self-device">当前管理终端</small>' : '';
+    return `<tr><td><span class="cnc-stack"><strong>${escapeHtml(client?.name || mac)}</strong><code>${escapeHtml(mac)}</code>${admin}</span></td><td>${escapeHtml(detail)}</td><td class="cnc-actions"><button type="button" class="user-auth-icon-button is-danger" data-cnc-allowlist-remove="${escapeHtml(mac)}" title="移出白名单" aria-label="移出白名单" ${state.allowlist.enabled || state.saving ? 'disabled' : ''}>${icon('trash')}</button></td></tr>`;
+  }
+
+  function allowlistMarkup() {
+    const members = state.allowlistDraft;
+    const options = allowlistOptions();
+    const body = members.length
+      ? members.map(allowlistMemberMarkup).join('')
+      : '<tr><td colspan="3" class="dwrt-kit-table-empty">白名单为空，至少添加一个终端后才能启用</td></tr>';
+    return `<section class="user-auth-main-surface user-auth-table-card cnc-table-card cnc-allowlist-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface" data-cnc-table><div class="dwrt-kit-table-toolbar user-auth-table-toolbar-rich"><div class="dwrt-kit-table-title"><strong>联网白名单</strong></div><span class="dwrt-kit-table-count">${members.length} 台</span>${allowlistStatusMarkup()}${state.allowlist.enabled ? '' : `<div class="cnc-allowlist-editor"><select data-cnc-allowlist-client ${options ? '' : 'disabled'}><option value="">${options ? '选择终端' : '没有可添加的终端'}</option>${options}</select><button type="button" class="policy-secondary" data-cnc-allowlist-add ${options && !state.saving ? '' : 'disabled'}>${icon('plus')}<span>添加</span></button><button type="button" class="policy-primary" data-cnc-allowlist-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存名单'}</button></div>`}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table user-auth-table cnc-allowlist-table"><thead><tr><th>终端</th><th>状态</th><th>操作</th></tr></thead><tbody>${body}</tbody></table></div></section>`;
+  }
+
+  function contentMarkup() {
+    return state.mode === 'white' ? allowlistMarkup() : tableMarkup();
   }
 
   function noticeMarkup() {
@@ -682,30 +745,32 @@ export function mount(context = {}) {
     </div>`;
   }
 
+  function sourceEditorMarkup(editor, editing) {
+    const options = clientOptions();
+    const manual = editor.source === 'manual' || !options.length;
+    return `${editing ? '' : `<div class="cnc-source-switch" role="group" aria-label="终端来源"><button type="button" data-cnc-source="list" class="${manual ? '' : 'is-active'}">从终端列表选择</button><button type="button" data-cnc-source="manual" class="${manual ? 'is-active' : ''}">手动填写 MAC</button></div>`}${editing
+      ? editorField('终端 MAC', 'mac', editor.mac, { disabled: true, wide: true, help: 'MAC 是规则身份，编辑时不可更改。需要换终端请新建规则。' })
+      : manual
+        ? editorField('终端 MAC', 'mac', editor.mac, { wide: true, placeholder: 'AA:BB:CC:DD:EE:FF', help: '支持冒号、连字符或无分隔写法' })
+        : editorField('终端', 'mac', editor.mac, { type: 'select', options, wide: true, help: '含离线、随机化 MAC 与仅 IPv6 终端' })}`;
+  }
+
+  function ruleDetailsMarkup(editor) {
+    return `${editorField('规则名称', 'name', editor.name, { wide: true, help: '留空时使用规则 ID' })}${editorField('优先级', 'priority', editor.priority, { type: 'number', min: 1, max: 65535, help: '数值越小越先匹配' })}`;
+  }
+
   function drawerMarkup() {
     if (!state.drawer) return '';
     const editor = state.editor;
     const editing = Boolean(editor.policyId);
-    const options = clientOptions();
-    const manual = editor.source === 'manual' || !options.length;
-    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-cnc-close aria-label="关闭断网规则编辑"></button><aside class="user-auth-drawer cnc-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" aria-label="${editing ? '编辑断网规则' : '新建断网规则'}"><header class="dwrt-kit-sheet-header"><div><span>CLIENT NETWORK CONTROL</span><strong>${editing ? '编辑断网规则' : '新建断网规则'}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-cnc-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body user-auth-drawer-body">
-      <div class="user-auth-drawer-section"><strong>规则状态</strong><label class="user-auth-setting-row"><span><strong>立即启用</strong><small>${editing ? '关闭后规则保留但不再断网' : '默认关闭。保存后回列表手动启用，避免填完就把终端断网'}</small></span><span class="dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-cnc-field="enabled" ${editor.enabled === true ? 'checked' : ''}></span></label></div>
-      ${editing ? '' : `<div class="cnc-source-switch" role="group" aria-label="终端来源"><button type="button" data-cnc-source="list" class="${manual ? '' : 'is-active'}">从终端列表选择</button><button type="button" data-cnc-source="manual" class="${manual ? 'is-active' : ''}">手动填写 MAC</button></div>`}
-      <div class="user-auth-form-grid">
-        ${editing
-          ? editorField('终端 MAC', 'mac', editor.mac, { disabled: true, wide: true, help: 'MAC 是规则身份，编辑时不可更改。需要换终端请新建规则。' })
-          : manual
-            ? editorField('终端 MAC', 'mac', editor.mac, { wide: true, placeholder: 'AA:BB:CC:DD:EE:FF', help: '支持冒号、连字符或无分隔写法' })
-            : editorField('终端', 'mac', editor.mac, { type: 'select', options, wide: true, help: '含离线、随机化 MAC 与仅 IPv6 终端' })}
-        ${editorField('规则名称', 'name', editor.name, { wide: true, help: '留空时使用规则 ID' })}
-        ${editorField('优先级', 'priority', editor.priority, { type: 'number', min: 1, max: 65535, help: '数值越小越先匹配' })}
-        ${editorField('备注', 'remark', editor.remark, { type: 'textarea', wide: true })}
-      </div>
-      ${scheduleEditorMarkup(editor)}
-      ${expiresEditorMarkup(editor)}
-      <div class="user-auth-capability">${escapeHtml(`动作固定为拒绝（后端 acl_mac_supported_actions=["deny"]）。${editor.scheduleMode === 'window' ? '规则只在所选时段内拦截，时段外自动放行。' : '规则一经启用即持续生效，直到你手动停用或删除。'}${expiresReadable(state.capabilities) && !expiresWritable(state.capabilities) ? '到期时间仅由列表展示：当前固件未声明可写入的绝对时间戳语义，因此这里不提供设置。' : ''}`)}</div>
-      ${state.notice ? noticeMarkup() : ''}
-    </div><footer class="dwrt-kit-sheet-footer user-auth-drawer-footer"><span></span><div><button class="policy-secondary" type="button" data-cnc-close>取消</button><button class="policy-primary" type="button" data-cnc-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存规则'}</button></div></footer></aside>`;
+    return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-cnc-close aria-label="关闭断网规则编辑"></button><aside class="user-auth-drawer cnc-drawer dwrt-kit-sheet is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" data-dwrt-surface="stable-glass" data-dwrt-sheet-motion="settled" aria-label="${editing ? '编辑断网规则' : '新建断网规则'}"><header class="dwrt-kit-sheet-header"><div><strong>${editing ? '编辑终端拦截规则' : '新建终端拦截规则'}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-cnc-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body user-auth-drawer-body cnc-drawer-body">
+      <section class="cnc-drawer-chamber"><span class="cnc-drawer-chamber-label">拦截目标与状态 <small>Target &amp; Status</small></span><label class="user-auth-setting-row"><span><strong>启用规则</strong></span><span class="dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-cnc-field="enabled" ${editor.enabled === true ? 'checked' : ''}></span></label><div class="cnc-target-field" data-cnc-target-editor>${sourceEditorMarkup(editor, editing)}</div></section>
+      <section class="cnc-drawer-chamber"><span class="cnc-drawer-chamber-label">规则与优先级 <small>Policy Meta</small></span><div class="user-auth-form-grid">${ruleDetailsMarkup(editor)}</div></section>
+      <div data-cnc-schedule-editor>${scheduleEditorMarkup(editor)}</div>
+      <div data-cnc-expires-editor>${expiresEditorMarkup(editor)}</div>
+      <section class="cnc-drawer-chamber cnc-drawer-note-chamber"><span class="cnc-drawer-chamber-label">备注 <small>Notes</small></span>${editorField('备注', 'remark', editor.remark, { type: 'textarea', wide: true })}</section>
+      <div data-cnc-drawer-notice>${state.notice ? noticeMarkup() : ''}</div>
+    </div><footer class="dwrt-kit-sheet-footer user-auth-drawer-footer"><span></span><div><button class="policy-secondary" type="button" data-cnc-close>取消</button><button class="policy-primary cnc-save-danger" type="button" data-cnc-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存拦截规则'}</button></div></footer></aside>`;
   }
 
   function confirmationMarkup() {
@@ -733,17 +798,34 @@ export function mount(context = {}) {
     if (!root) return;
     root.hidden = false;
     root.classList.add('route-workspace', 'user-authentication-route-host', 'client-network-control-route-host');
-    root.innerHTML = `<section class="user-auth-shell cnc-shell" data-cnc-version="${VERSION}"><main class="user-auth-workbench cnc-workbench">${noticeMarkup()}${modeMarkup()}${tableMarkup()}${capabilityMarkup()}</main><div class="cnc-overlay-host" data-cnc-overlays></div></section>`;
+    root.innerHTML = `<section class="user-auth-shell cnc-shell" data-cnc-version="${VERSION}"><main class="user-auth-workbench cnc-workbench">${noticeMarkup()}${modeHost ? '' : modeMarkup()}${contentMarkup()}</main><div class="cnc-overlay-host" data-cnc-sheet-host></div><div class="cnc-overlay-host" data-cnc-confirmation-host></div></section>`;
+    renderModeSlot();
     renderOverlays();
     ui.mountAll?.(root);
   }
 
+  function renderModeSlot() {
+    if (!modeHost) return;
+    modeHost.innerHTML = modeMarkup();
+    modeHost.hidden = false;
+  }
+
   function renderOverlays() {
-    const host = root?.querySelector('[data-cnc-overlays]');
+    renderDrawerOverlay();
+    renderConfirmationOverlay();
+  }
+
+  function renderDrawerOverlay() {
+    const host = root?.querySelector('[data-cnc-sheet-host]');
     if (!host) return;
-    const markup = `${drawerMarkup()}${confirmationMarkup()}`;
-    if (host.dataset.cncOverlayMarkup === markup) return;
-    host.dataset.cncOverlayMarkup = markup;
+    const markup = drawerMarkup();
+    if (host.dataset.cncDrawerMarkup === markup) return;
+    host.dataset.cncDrawerMarkup = markup;
+    const existingSheet = document.querySelector('#dwrtKitSheetPortal .cnc-drawer');
+    if (state.drawer && existingSheet) {
+      patchDrawerContent(existingSheet);
+      return;
+    }
     /*
      * 清空容器关不掉抽屉：kit 已把它搬到 body 级 portal，必须先让 kit 卸载搬走的那份。
      * `unmount(host)` 现在按 portalHome 反查得到传送出去的抽屉与遮罩，本页不再自备
@@ -754,11 +836,59 @@ export function mount(context = {}) {
     ui.mountAll?.(host);
   }
 
+  function renderConfirmationOverlay() {
+    const host = root?.querySelector('[data-cnc-confirmation-host]');
+    if (!host) return;
+    const markup = confirmationMarkup();
+    if (host.dataset.cncConfirmationMarkup === markup) return;
+    host.dataset.cncConfirmationMarkup = markup;
+    window.DWRT_UI_KIT?.unmount?.(host);
+    host.innerHTML = markup;
+    ui.mountAll?.(host);
+  }
+
+  function rememberDrawerMarkup() {
+    const host = root?.querySelector('[data-cnc-sheet-host]');
+    if (host) host.dataset.cncDrawerMarkup = drawerMarkup();
+  }
+
+  function patchDrawerRegion(selector, markup) {
+    const sheet = document.querySelector('#dwrtKitSheetPortal .cnc-drawer');
+    const region = sheet?.querySelector(selector);
+    if (!region) return false;
+    const body = region.closest('.dwrt-kit-sheet-body');
+    const scrollTop = body?.scrollTop || 0;
+    region.innerHTML = markup;
+    ui.mountAll?.(region);
+    if (body) body.scrollTop = scrollTop;
+    return true;
+  }
+
+  function patchDrawerContent(sheet) {
+    const current = sheet.querySelector('.dwrt-kit-sheet-body');
+    if (!current) return;
+    const scrollTop = current.scrollTop;
+    const active = document.activeElement;
+    const focusKey = active?.getAttribute?.('data-cnc-field') || '';
+    const template = document.createElement('template');
+    template.innerHTML = drawerMarkup();
+    const next = template.content.querySelector('.cnc-drawer');
+    const nextBody = next?.querySelector('.dwrt-kit-sheet-body');
+    const nextFooter = next?.querySelector('.dwrt-kit-sheet-footer');
+    if (!nextBody || !nextFooter) return;
+    current.innerHTML = nextBody.innerHTML;
+    const footer = sheet.querySelector('.dwrt-kit-sheet-footer');
+    if (footer) footer.innerHTML = nextFooter.innerHTML;
+    current.scrollTop = scrollTop;
+    ui.mountAll?.(current);
+    if (footer) ui.mountAll?.(footer);
+    if (focusKey) sheet.querySelector(`[data-cnc-field="${focusKey}"]`)?.focus({ preventScroll: true });
+  }
+
   function render() {
     if (!root) return;
-    const overlayOpen = Boolean(state.drawer || state.confirm);
     const mounted = root.querySelector('[data-cnc-version]');
-    if (!overlayOpen || !mounted || !root.querySelector('.dwrt-kit-sheet, [data-dwrt-component="modal"]')) {
+    if (!mounted) {
       renderShell();
       return;
     }
@@ -777,7 +907,8 @@ export function mount(context = {}) {
   }
 
   function patchPieces() {
-    patchToolbar();
+    renderModeSlot();
+    if (state.mode === 'black') patchToolbar();
     patchNotice();
     patchTable();
     renderOverlays();
@@ -829,7 +960,7 @@ export function mount(context = {}) {
     const preserve = ui.preserveInteractionState;
     if (typeof preserve === 'function' && preserve(current, (target) => {
       const template = document.createElement('template');
-      template.innerHTML = tableMarkup();
+      template.innerHTML = contentMarkup();
       const fresh = template.content.firstElementChild;
       if (fresh) {
         Array.from(fresh.attributes).forEach((attribute) => target.setAttribute(attribute.name, attribute.value));
@@ -839,7 +970,7 @@ export function mount(context = {}) {
     const scroll = current.querySelector('.dwrt-kit-table-scroll');
     const position = { top: scroll?.scrollTop || 0, left: scroll?.scrollLeft || 0 };
     const template = document.createElement('template');
-    template.innerHTML = tableMarkup();
+    template.innerHTML = contentMarkup();
     current.replaceWith(template.content.firstElementChild);
     const next = root.querySelector('[data-cnc-table] .dwrt-kit-table-scroll');
     if (next) { next.scrollTop = position.top; next.scrollLeft = position.left; }
@@ -862,11 +993,12 @@ export function mount(context = {}) {
        * 设备时区来自 /api/v1/system/basic 的 general.timezone，用于到期时间的墙上时间
        * 换算。和来源回显一样是可选增强：读失败只降级成浏览器时区并在控件上说明。
        */
-      const [policyResult, clientsResult, sessionResult, basicResult] = await Promise.allSettled([
+      const [policyResult, clientsResult, sessionResult, basicResult, allowlistResult] = await Promise.allSettled([
         requestJson(POLICY_TABLE),
         requestJson('/api/v1/clients'),
         requestJson('/api/v1/session'),
-        requestJson('/api/v1/system/basic')
+        requestJson('/api/v1/system/basic'),
+        requestJson(ALLOWLIST)
       ]);
       if (!state.mounted || seq !== state.seq) return;
       if (policyResult.status === 'rejected') throw policyResult.reason;
@@ -886,6 +1018,18 @@ export function mount(context = {}) {
       state.rules = rows
         .filter((row) => String(row?.id || '').startsWith(MAC_ID_PREFIX))
         .map((row, index) => normalizeRule(row, clientsByMac, index));
+      if (allowlistResult.status === 'fulfilled') {
+        state.allowlist = normalizeAllowlist(allowlistResult.value);
+        state.allowlistMembers = normalizeAllowlistMembers(allowlistResult.value);
+        if (!background || !state.allowlistDirty)
+          state.allowlistDraft = state.allowlistMembers.slice();
+        if (!state.allowlistLoaded && state.allowlist.enabled) state.mode = 'white';
+        state.allowlistLoaded = true;
+      } else {
+        state.allowlist = {};
+        state.allowlistMembers = [];
+        if (!state.allowlistDirty) state.allowlistDraft = [];
+      }
       state.loading = false;
       state.refreshing = false;
       if (clientsResult.status === 'rejected') {
@@ -893,6 +1037,9 @@ export function mount(context = {}) {
         state.noticeTone = 'warning';
       } else if (!canWriteMac(state.capabilities)) {
         state.notice = '后端未声明 MAC ACL 写入能力，本页当前只能查看规则。';
+        state.noticeTone = 'warning';
+      } else if (allowlistSupported() && allowlistResult.status === 'rejected') {
+        state.notice = '白名单状态读取失败，白名单操作暂不可用。';
         state.noticeTone = 'warning';
       }
       if (background) renderPreservingInteraction(); else render();
@@ -902,6 +1049,10 @@ export function mount(context = {}) {
       state.refreshing = false;
       state.capabilities = {};
       state.rules = [];
+      state.allowlist = {};
+      state.allowlistMembers = [];
+      state.allowlistDraft = [];
+      state.allowlistDirty = false;
       state.error = [401, 403].includes(Number(error.status))
         ? '当前账号没有读取策略表的权限，无法显示终端联网控制规则。'
         : `读取终端联网控制规则失败：${firstText(error.message, '未知错误')}`;
@@ -1027,6 +1178,153 @@ export function mount(context = {}) {
       confirmLabel: '确认删除'
     };
     renderOverlays();
+  }
+
+  function switchMode(mode) {
+    if (mode === 'white' && !allowlistSupported()) return;
+    if (mode === 'black' && state.allowlist.enabled) {
+      requestAllowlistToggle();
+      return;
+    }
+    state.mode = mode === 'white' ? 'white' : 'black';
+    state.notice = '';
+    state.confirm = null;
+    renderModeSlot();
+    patchNotice();
+    patchTable();
+  }
+
+  function addAllowlistMember() {
+    if (state.allowlist.enabled || state.saving) return;
+    const select = root?.querySelector('[data-cnc-allowlist-client]');
+    const mac = normalizeMac(select?.value);
+    if (!mac || state.allowlistDraft.includes(mac)) return;
+    state.allowlistDraft = [...state.allowlistDraft, mac].sort();
+    state.allowlistDirty = true;
+    patchTable();
+  }
+
+  function removeAllowlistMember(mac) {
+    if (state.allowlist.enabled || state.saving) return;
+    const normalized = normalizeMac(mac);
+    state.allowlistDraft = state.allowlistDraft.filter((item) => item !== normalized);
+    state.allowlistDirty = true;
+    patchTable();
+  }
+
+  async function saveAllowlistMembers() {
+    if (state.allowlist.enabled || state.saving) return;
+    state.saving = true;
+    patchTable();
+    try {
+      const response = await requestJson(ALLOWLIST_MEMBERS, {
+        method: 'PUT',
+        body: JSON.stringify({ members: state.allowlistDraft })
+      });
+      state.allowlistMembers = normalizeAllowlistMembers(response);
+      state.allowlistDraft = state.allowlistMembers.slice();
+      state.allowlistDirty = false;
+      state.notice = '白名单成员已保存。';
+      state.noticeTone = 'ok';
+    } catch (error) {
+      state.notice = `保存白名单失败：${firstText(error.message, '后端未接受名单')}`;
+      state.noticeTone = 'error';
+    } finally {
+      state.saving = false;
+      patchNotice();
+      patchTable();
+    }
+  }
+
+  function requestAllowlistToggle() {
+    if (state.saving) return;
+    if (state.allowlist.enabled) {
+      state.confirm = {
+        kind: 'allowlist-disable',
+        tone: 'warning',
+        title: '停用白名单模式',
+        description: '停用后，名单外终端将恢复互联网访问，白名单成员记录会保留。',
+        confirmLabel: '确认停用'
+      };
+    } else {
+      if (state.allowlistDirty) {
+        state.notice = '请先保存白名单成员，再启用白名单模式。';
+        state.noticeTone = 'warning';
+        patchNotice();
+        return;
+      }
+      if (state.allowlistMembers.length === 0) {
+        state.notice = '至少添加并保存一个白名单终端后才能启用。';
+        state.noticeTone = 'warning';
+        patchNotice();
+        return;
+      }
+      state.confirm = {
+        kind: 'allowlist-enable',
+        tone: 'danger',
+        title: '启用 MAC 白名单',
+        description: `启用后，除当前 ${state.allowlistMembers.length} 台白名单终端和后端自动加入的管理终端外，其余 LAN 终端都会失去互联网访问。操作后需在 180 秒内确认，否则系统自动回滚。`,
+        confirmLabel: '启用并开始倒计时'
+      };
+    }
+    renderOverlays();
+  }
+
+  async function setAllowlistEnabled(enabled) {
+    if (state.saving) return;
+    state.saving = true;
+    renderOverlays();
+    patchTable();
+    try {
+      const response = await requestJson(ALLOWLIST, {
+        method: 'POST',
+        body: JSON.stringify(enabled ? { enabled: true, confirm_timeout: 180 } : { enabled: false })
+      });
+      state.allowlist = normalizeAllowlist(response);
+      state.allowlistMembers = normalizeAllowlistMembers(response).length
+        ? normalizeAllowlistMembers(response) : state.allowlistMembers;
+      state.allowlistDraft = state.allowlistMembers.slice();
+      state.allowlistDirty = false;
+      state.mode = enabled ? 'white' : 'black';
+      const readback = await requestJson(ALLOWLIST);
+      state.allowlist = normalizeAllowlist(readback);
+      state.allowlistMembers = normalizeAllowlistMembers(readback);
+      state.allowlistDraft = state.allowlistMembers.slice();
+      state.notice = enabled
+        ? '白名单已临时启用，请在倒计时结束前确认保持。'
+        : '白名单模式已停用，名单外终端已恢复联网。';
+      state.noticeTone = enabled ? 'warning' : 'ok';
+    } catch (error) {
+      state.notice = `${enabled ? '启用' : '停用'}白名单失败：${firstText(error.message, '后端未接受操作')}`;
+      state.noticeTone = 'error';
+    } finally {
+      state.saving = false;
+      state.confirm = null;
+      patchNotice();
+      patchTable();
+      renderOverlays();
+    }
+  }
+
+  async function confirmAllowlist() {
+    if (!allowlistPending() || state.saving) return;
+    state.saving = true;
+    patchTable();
+    try {
+      const response = await requestJson(ALLOWLIST_CONFIRM, {
+        method: 'POST', body: JSON.stringify({})
+      });
+      state.allowlist = normalizeAllowlist(response);
+      state.notice = '白名单模式已确认保持。';
+      state.noticeTone = 'ok';
+    } catch (error) {
+      state.notice = `确认白名单失败：${firstText(error.message, '确认窗口可能已结束')}`;
+      state.noticeTone = 'error';
+    } finally {
+      state.saving = false;
+      patchNotice();
+      patchTable();
+    }
   }
 
   /* 写入必须显式 apply=true：后端 dry_run_default=true，不带 apply 只回 409 预览。 */
@@ -1187,6 +1485,8 @@ export function mount(context = {}) {
   function acceptConfirmation() {
     const request = state.confirm;
     if (!request) return;
+    if (request.kind === 'allowlist-enable') { setAllowlistEnabled(true); return; }
+    if (request.kind === 'allowlist-disable') { setAllowlistEnabled(false); return; }
     if (request.kind === 'create-enabled') { commitSave(editorPayload()); return; }
     const rule = findRule(request.policyId);
     if (!rule) { state.confirm = null; renderOverlays(); return; }
@@ -1198,12 +1498,32 @@ export function mount(context = {}) {
     if (event.target.closest('[data-cnc-close]')) { state.drawer = false; state.editor = {}; state.notice = ''; renderOverlays(); patchNotice(); return; }
     if (event.target.closest('[data-dwrt-confirm-cancel], [data-dwrt-modal-close]')) { state.confirm = null; renderOverlays(); return; }
     if (event.target.closest('[data-dwrt-confirm-accept]')) { acceptConfirmation(); return; }
+    const mode = event.target.closest('[data-cnc-mode]');
+    if (mode) { switchMode(mode.dataset.cncMode); return; }
+    if (event.target.closest('[data-cnc-allowlist-add]')) { addAllowlistMember(); return; }
+    if (event.target.closest('[data-cnc-allowlist-save]')) { saveAllowlistMembers(); return; }
+    if (event.target.closest('[data-cnc-allowlist-toggle]')) { requestAllowlistToggle(); return; }
+    if (event.target.closest('[data-cnc-allowlist-confirm]')) { confirmAllowlist(); return; }
+    const allowlistRemove = event.target.closest('[data-cnc-allowlist-remove]');
+    if (allowlistRemove) { removeAllowlistMember(allowlistRemove.dataset.cncAllowlistRemove); return; }
     if (event.target.closest('[data-cnc-create]')) { newEditor(); return; }
     if (event.target.closest('[data-cnc-save]')) { saveRule(); return; }
     const source = event.target.closest('[data-cnc-source]');
-    if (source) { state.editor.source = source.dataset.cncSource; if (state.editor.source === 'manual') state.editor.mac = ''; else state.editor.mac = clientOptions()[0]?.[0] || ''; renderOverlays(); return; }
+    if (source) {
+      state.editor.source = source.dataset.cncSource;
+      state.editor.mac = state.editor.source === 'manual' ? '' : clientOptions()[0]?.[0] || '';
+      rememberDrawerMarkup();
+      if (!patchDrawerRegion('[data-cnc-target-editor]', sourceEditorMarkup(state.editor, Boolean(state.editor.policyId)))) renderOverlays();
+      return;
+    }
     const scheduleMode = event.target.closest('[data-cnc-schedule-mode]');
-    if (scheduleMode) { state.editor.scheduleMode = scheduleMode.dataset.cncScheduleMode === 'window' ? 'window' : 'always'; renderOverlays(); return; }
+    if (scheduleMode) {
+      state.editor.scheduleMode = scheduleMode.dataset.cncScheduleMode === 'window' ? 'window' : 'always';
+      rememberDrawerMarkup();
+      const patched = patchDrawerRegion('[data-cnc-schedule-editor]', scheduleEditorMarkup(state.editor));
+      if (!patched) renderOverlays();
+      return;
+    }
     const expiresMode = event.target.closest('[data-cnc-expires-mode]');
     if (expiresMode) {
       state.editor.expiresMode = expiresMode.dataset.cncExpiresMode === 'at' ? 'at' : 'never';
@@ -1211,7 +1531,8 @@ export function mount(context = {}) {
       if (state.editor.expiresMode === 'at' && !firstText(state.editor.expiresAt)) {
         state.editor.expiresAt = epochToLocalInput(Math.floor(Date.now() / 1000) + 86400);
       }
-      renderOverlays();
+      rememberDrawerMarkup();
+      if (!patchDrawerRegion('[data-cnc-expires-editor]', expiresEditorMarkup(state.editor))) renderOverlays();
       return;
     }
     const filter = event.target.closest('[data-cnc-filter]');
@@ -1224,10 +1545,16 @@ export function mount(context = {}) {
     if (remove) { const rule = findRule(remove.dataset.cncDelete); if (rule) requestDelete(rule); }
   }
 
+  function onModeHostClick(event) {
+    const mode = event.target.closest('[data-cnc-mode]');
+    if (mode) switchMode(mode.dataset.cncMode);
+  }
+
   function updateEditor(target) {
     const key = target.dataset.cncField;
     if (!key) return;
     state.editor[key] = target.type === 'checkbox' ? target.checked : target.type === 'number' ? Number(target.value || 0) : target.value;
+    rememberDrawerMarkup();
   }
 
   function onInput(event) {
@@ -1244,7 +1571,8 @@ export function mount(context = {}) {
       const days = new Set(Array.isArray(state.editor.scheduleDays) ? state.editor.scheduleDays : []);
       if (weekday.checked) days.add(day); else days.delete(day);
       state.editor.scheduleDays = Array.from(days).sort((left, right) => left - right);
-      renderOverlays();
+      weekday.closest('label')?.classList.toggle('is-active', weekday.checked);
+      rememberDrawerMarkup();
       return;
     }
     const field = event.target.closest('[data-cnc-field]');
@@ -1263,6 +1591,7 @@ export function mount(context = {}) {
   root?.addEventListener('input', onInput);
   root?.addEventListener('change', onChange);
   document.addEventListener('keydown', onKeyDown);
+  modeHost?.addEventListener('click', onModeHostClick);
   stage?.classList.add('is-user-authentication');
   render();
   load();
@@ -1272,8 +1601,18 @@ export function mount(context = {}) {
     if (!state.mounted || document.hidden) return;
     if (state.loading || state.refreshing || state.saving) return;
     if (state.drawer || state.confirm) return;
+    if (state.mode === 'white' && state.allowlistDirty) return;
     load(true);
   }, 20000);
+
+  state.countdownTimer = window.setInterval(() => {
+    if (!state.mounted || document.hidden || state.mode !== 'white' || !allowlistPending()) return;
+    if (allowlistSecondsRemaining() > 0) {
+      if (!state.saving) patchTable();
+      return;
+    }
+    if (!state.loading && !state.refreshing && !state.saving) load(true);
+  }, 1000);
 
   return {
     refresh() { return load(true); },
@@ -1281,13 +1620,16 @@ export function mount(context = {}) {
       state.mounted = false;
       state.seq += 1;
       window.clearInterval(state.pollTimer);
+      window.clearInterval(state.countdownTimer);
       /* 路由离开：让 kit 回收本页传送到 portal 的抽屉与遮罩，别把遮罩留给下一页 */
       window.DWRT_UI_KIT?.unmount?.(root);
       root?.removeEventListener('click', onClick);
       root?.removeEventListener('input', onInput);
       root?.removeEventListener('change', onChange);
       document.removeEventListener('keydown', onKeyDown);
+      modeHost?.removeEventListener('click', onModeHostClick);
       root?.replaceChildren();
+      if (modeHost) { modeHost.replaceChildren(); modeHost.hidden = true; }
       root?.classList.remove('route-workspace', 'user-authentication-route-host', 'client-network-control-route-host');
       stage?.classList.remove('is-user-authentication');
     }

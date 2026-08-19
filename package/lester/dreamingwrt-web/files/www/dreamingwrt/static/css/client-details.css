@@ -1218,6 +1218,17 @@
   border-top: 1px solid rgba(255,255,255,0.08);
 }
 
+.client-connection-table tbody tr[data-client-connection-row] {
+  height: 54px;
+}
+
+.client-connection-table .client-connection-virtual-spacer td {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  pointer-events: none;
+}
+
 .client-connection-table tbody tr:hover td {
   background: rgba(101,244,219,0.055);
 }

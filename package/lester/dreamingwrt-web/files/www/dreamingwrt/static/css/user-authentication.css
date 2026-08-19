@@ -578,7 +578,7 @@
 .user-auth-form-footer { display: flex; justify-content: flex-end; gap: 10px; padding-top: 4px; }
 .user-auth-form-footer button { display: inline-flex; align-items: center; gap: 8px; }
 
-.user-auth-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form); --dwrt-kit-sheet-z: 72; }
+.dwrt-kit-sheet.user-auth-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); --dwrt-kit-sheet-z: 72; }
 .user-auth-drawer-body { display: grid; align-content: start; gap: 18px; padding: 18px var(--dwrt-kit-sheet-padding-x); }
 .user-auth-drawer-section { display: grid; gap: 0; }
 .user-auth-drawer-section > strong { padding-bottom: 9px; border-bottom: 1px solid rgba(255,255,255,.09); font-size: 13px; }
@@ -674,9 +674,9 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
  * 用 flex 而不是补一条固定行模板，是因为提示条会出现和消失，固定行数的网格一旦子节点
  * 数量变化就又会算错。
  */
-.client-speed-shell > .user-auth-workbench { display: flex; flex-direction: column; }
+.client-speed-shell > .user-auth-workbench { display: flex; flex-direction: column; min-height: 0; }
 .client-speed-shell > .user-auth-workbench > .user-auth-notice { flex: 0 0 auto; }
-.client-speed-shell > .user-auth-workbench > .client-speed-table-card { flex: 1 1 auto; min-height: 0; }
+.client-speed-shell > .user-auth-workbench > .client-speed-table-card { width: 100%; height: 100%; flex: 1 1 auto; min-height: 0; }
 /* IP 占位卡按内容高度，不吃剩余空间：它只有三段文字，撑满整屏会显得像加载失败。 */
 .client-speed-shell > .user-auth-workbench > .client-speed-ip-card { flex: 0 0 auto; min-height: 0; }
 .client-speed-header { flex: 0 0 auto; min-width: 0; }
@@ -719,7 +719,20 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
 .client-speed-status.is-success { color: #5ee59b; background: rgba(38,174,99,.12); }
 .client-speed-status.is-warning { color: #f2c66d; background: rgba(211,150,42,.12); }
 .client-speed-status.is-error { color: #ff8a94; background: rgba(211,51,72,.12); }
-.client-speed-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }
+.dwrt-kit-sheet.client-speed-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }
+.client-speed-drawer-body { gap: 18px; }
+.client-speed-drawer-chamber { min-width: 0; display: grid; gap: 14px; padding: 20px; border: 1px solid rgba(255,255,255,.10); border-radius: 20px; background: rgba(255,255,255,.05); box-shadow: inset 0 1px 0 rgba(255,255,255,.035); }
+.client-speed-chamber-label { color: var(--app-text-muted); font-size: 11px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+.client-speed-chamber-label small { margin-inline-start: 4px; font-size: 10px; font-weight: 650; letter-spacing: 0; text-transform: none; }
+.client-speed-combo { min-width: 0; display: flex; overflow: hidden; border: 1px solid rgba(255,255,255,.13); border-radius: 14px; background: rgba(8,14,26,.22); }
+.client-speed-combo input { flex: 1 1 auto; min-width: 0; height: 42px; border: 0; border-radius: 0; background: transparent; }
+.client-speed-combo select { flex: 0 0 auto; min-width: 82px; height: 42px; border: 0; border-inline-start: 1px solid rgba(255,255,255,.10); border-radius: 0; background: rgba(255,255,255,.07); }
+.client-speed-drawer-hint { color: var(--app-text-muted); font-size: 10px; line-height: 1.45; }
+.client-speed-time-range { display: grid; gap: 7px; }
+.client-speed-time-range > span { color: var(--app-text-secondary); font-size: 12px; font-weight: 700; }
+.client-speed-time-range > div { display: grid; grid-template-columns: minmax(0,1fr) auto minmax(0,1fr); align-items: center; gap: 8px; padding: 4px 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 14px; background: rgba(8,14,26,.22); }
+.client-speed-time-range input { min-width: 0; height: 34px; border: 0; background: transparent; color: var(--app-text); font: inherit; font-size: 13px; font-weight: 700; text-align: center; }
+.client-speed-time-range b { color: var(--app-text-muted); font-size: 11px; font-weight: 700; }
 .client-speed-weekdays { display: grid; gap: 8px; }
 .client-speed-weekdays > span { color: var(--app-text-secondary); font-size: 12px; font-weight: 700; }
 .client-speed-weekdays > div { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 5px; }
@@ -728,7 +741,13 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
 .client-speed-weekdays input { position: absolute; opacity: 0; pointer-events: none; }
 
 @media (max-width: 700px) {
-  .client-speed-toolbar .user-auth-toolbar-leading { min-width: max-content; flex-wrap: nowrap; }
+  .client-speed-table-controls { width: 100%; flex-wrap: wrap; align-items: center; justify-content: flex-start; }
+  .client-speed-table-controls .user-auth-toolbar-leading { width: 100%; min-width: 0; flex: 1 1 100%; flex-wrap: wrap; }
+  .client-speed-table-controls .user-auth-segmented { width: 100%; max-width: 100%; flex: 1 1 100%; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .client-speed-table-controls .user-auth-segmented::-webkit-scrollbar { display: none; }
+  .client-speed-table-controls .user-auth-segmented button { flex: 0 0 auto; white-space: nowrap; }
+  .client-speed-table-controls .policy-search-main { width: 36px; flex: 0 0 36px; }
+  .client-speed-table-controls .policy-toolbar-actions { margin-left: auto; }
   .client-speed-weekdays > div { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 
@@ -736,8 +755,8 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
 .client-network-control-route-host { min-height: 0; }
 /* 只有 shell 自己撑满视口高度；卡片一律 min-height:0，避免任一卡片被拉满整屏。 */
 .cnc-shell { min-height: 0; height: 100%; }
-/* 模式卡与能力说明卡按内容高度，表格卡吃掉剩余空间并在内部滚动。 */
-.cnc-workbench { min-width: 0; min-height: 0; display: grid; gap: 12px; grid-template-rows: auto auto minmax(0, 1fr) auto; align-content: start; }
+/* 提示条按内容高度，表格卡吃掉全部剩余空间并在内部滚动。 */
+.cnc-workbench { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 12px; }
 /*
  * 网格项默认 min-width:auto，会被表格的 min-content 撑开：实测移动端表格卡宽 499px
  * 而外层 shell 只有 322px，整卡连工具栏一起溢出视口。显式给 0 下限，让宽度回到容器，
@@ -766,7 +785,7 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
  * 一起越出卡片右边界（移动端表现为整片内容压出屏幕）。显式钉死单列宽度即可，
  * 表格自身的横向滚动仍由 .dwrt-kit-table-scroll 承担。
  */
-.cnc-table-card { min-width: 0; min-height: 0; grid-template-columns: minmax(0, 100%); }
+.cnc-table-card { width: 100%; height: 100%; min-width: 0; min-height: 0; flex: 1 1 auto; grid-template-columns: minmax(0, 100%); }
 .cnc-table-card > * { min-width: 0; }
 .cnc-table-controls { min-width: 0; flex: 1 1 auto; flex-wrap: wrap; row-gap: 8px; }
 .cnc-table-controls .user-auth-toolbar-leading { min-width: 0; flex: 1 1 auto; flex-wrap: wrap; row-gap: 8px; }
@@ -808,11 +827,18 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
 .cnc-table td small.cnc-self-device { white-space: normal; overflow: visible; font-weight: 700; line-height: 1.45; }
 .cnc-table td small.cnc-group-warning { color: #f2c66d; }
 .cnc-table td small.cnc-self-device { color: #ff8a94; }
-.cnc-capability-card { min-height: 0; display: grid; gap: 6px; padding: 12px 16px; }
-.cnc-capability-card strong { font-size: 12px; font-weight: 740; }
-.cnc-capability-card ul { margin: 0; padding-left: 16px; display: grid; gap: 3px; }
-.cnc-capability-card li { color: var(--app-text-muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
-.cnc-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }
+.dwrt-kit-sheet.cnc-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }
+.cnc-drawer-body { gap: 18px; }
+.cnc-drawer-chamber { min-width: 0; display: grid; gap: 14px; padding: 20px; border: 1px solid rgba(255,255,255,.10); border-radius: 20px; background: rgba(255,255,255,.05); box-shadow: inset 0 1px 0 rgba(255,255,255,.035); }
+.cnc-drawer-chamber-label { color: var(--app-text-muted); font-size: 11px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+.cnc-drawer-chamber-label small { margin-inline-start: 4px; font-size: 10px; font-weight: 650; letter-spacing: 0; text-transform: none; }
+.cnc-drawer-note-chamber { gap: 12px; }
+.cnc-deny-alert { display: flex; align-items: flex-start; gap: 9px; padding: 12px 14px; border: 1px solid rgba(255,69,58,.28); border-radius: 16px; color: var(--app-text-secondary); background: rgba(255,69,58,.10); font-size: 11px; line-height: 1.5; }
+.cnc-deny-alert > svg { flex: 0 0 auto; width: 18px; height: 18px; color: #ff6b64; }
+.cnc-deny-alert b { color: var(--app-text); }
+.cnc-save-danger { color: #fff !important; background: #ff453a !important; border-color: #ff453a !important; box-shadow: 0 4px 15px rgba(255,69,58,.24); }
+.cnc-target-field { min-width: 0; display: grid; gap: 13px; grid-column: 1 / -1; }
+.cnc-rule-details { min-width: 0; display: contents; }
 .cnc-source-switch { display: grid; gap: 5px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .cnc-source-switch button { min-width: 0; height: 32px; padding: 0 10px; border: 0; border-radius: var(--app-radius-control); color: var(--app-text-muted); background: var(--dwrt-control-material, rgba(255,255,255,.07)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.1); font-size: 11px; font-weight: 700; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cnc-source-switch button.is-active { color: #fff; background: rgba(47,126,234,.78); }
@@ -838,6 +864,9 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
 .cnc-table .cnc-schedule { white-space: nowrap; }
 
 @media (max-width: 700px) {
+  .terminal-policy-tabs { width: 100%; }
+  .terminal-policy-mode-rail { margin-inline-start: auto; }
+  .cnc-mode-pill { padding-inline: 8px; }
   .cnc-mode-options { grid-template-columns: minmax(0, 1fr); }
   /*
    * 这里不能照搬终端限速页的 `min-width: max-content; flex-wrap: nowrap`：
@@ -957,4 +986,176 @@ html[data-theme-resolved="light"] .user-auth-segmented { background: rgba(255,25
   .app-filter-catalog { grid-template-columns: minmax(0, 1fr); max-height: 218px; }
   .app-filter-weekdays { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .app-filter-coverage-metrics { grid-template-columns: minmax(0, 1fr); }
+}
+.terminal-policy-page {
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: var(--app-page-gap);
+  overflow: hidden;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+.terminal-policy-topbar { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.terminal-policy-tabs { width: fit-content; max-width: 100%; display: flex; align-items: center; }
+.terminal-policy-mode-rail { position: relative; z-index: 2; display: inline-flex; align-items: center; flex: 0 0 auto; margin-inline-start: auto; }
+.terminal-policy-mode-rail[hidden] { display: none; }
+.cnc-mode-capsule { display: inline-flex; align-items: center; gap: 2px; padding: 3px; border: 1px solid rgba(255,255,255,.12); border-radius: 14px; background: rgba(0,0,0,.26); box-shadow: inset 0 1px 0 rgba(255,255,255,.06); }
+.cnc-mode-pill { min-height: 34px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 0 11px; border: 0; border-radius: 11px; color: var(--app-text-muted); background: transparent; font: inherit; font-size: 11px; font-weight: 760; cursor: pointer; white-space: nowrap; }
+.cnc-mode-pill > svg { width: 14px; height: 14px; }
+.cnc-mode-pill.is-active { color: #fff; background: #2f7eea; box-shadow: 0 3px 10px rgba(47,126,234,.28); }
+.cnc-mode-pill.is-disabled { opacity: .42; cursor: not-allowed; }
+.cnc-allowlist-card .dwrt-kit-table-toolbar { gap: 12px; }
+.cnc-allowlist-status { min-width: 0; flex: 1 1 360px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.cnc-allowlist-actions,
+.cnc-allowlist-editor { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.cnc-allowlist-editor { flex: 1 1 100%; justify-content: flex-end; }
+.cnc-allowlist-editor select { min-width: 180px; max-width: 360px; height: 38px; border: 1px solid rgba(255,255,255,.12); border-radius: var(--app-radius-control); color: var(--app-text); background: var(--dwrt-control-material, rgba(255,255,255,.07)); padding: 0 10px; }
+.cnc-allowlist-table th:nth-child(1) { width: 48%; }
+.cnc-allowlist-table th:nth-child(2) { width: 36%; }
+.cnc-allowlist-table th:nth-child(3) { width: 90px; }
+.cnc-allowlist-table code { display: block; margin-top: 3px; color: var(--app-text-muted); }
+.cnc-allowlist-table .cnc-actions { text-align: right; }
+.terminal-policy-workbench {
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+@media (max-width: 700px) {
+  .cnc-allowlist-card .dwrt-kit-table-toolbar { width: 100%; max-width: 100%; }
+  .cnc-allowlist-status { width: 100%; max-width: 100%; flex: 1 1 100%; }
+  .cnc-allowlist-status { align-items: flex-start; flex-direction: column; }
+  .cnc-allowlist-actions { width: 100%; flex-wrap: wrap; }
+  .cnc-allowlist-editor { justify-content: flex-start; flex-wrap: wrap; }
+  .cnc-allowlist-editor select { flex: 1 1 100%; min-width: 0; max-width: none; }
+}
+.terminal-policy-table-card {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.terminal-policy-table-toolbar { flex: 0 0 auto; flex-wrap: wrap; }
+.terminal-policy-table-card .dwrt-kit-table-scroll { flex: 1 1 auto; min-width: 0; min-height: 0; overflow: auto; }
+.terminal-policy-table td strong,
+.terminal-policy-table td small { display: block; }
+.terminal-policy-table td small { margin-top: 3px; color: var(--dwrt-text-muted, #718096); word-break: break-word; }
+.terminal-policy-table td:last-child { min-width: 300px; }
+.terminal-policy-runtime.is-good { color: #16724b; }
+.terminal-policy-runtime.is-pending { color: #9a6500; }
+.terminal-policy-status { white-space: nowrap; }
+.terminal-policy-unavailable { display: grid; gap: 4px; }
+.dwrt-kit-sheet.terminal-policy-drawer {
+  --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
+  --dwrt-kit-sheet-max-width: calc(100vw - 28px);
+}
+.terminal-policy-drawer-header > div { min-width: 0; display: grid; gap: 4px; }
+.terminal-policy-drawer-header > div > span { color: var(--app-text-muted); font-size: 11px; line-height: 1.45; }
+.terminal-policy-drawer-content { display: grid; align-content: start; gap: 20px; padding: 22px var(--dwrt-kit-sheet-padding-x); }
+.terminal-policy-chamber { min-width: 0; display: grid; gap: 16px; padding: 20px; border: 1px solid rgba(255,255,255,.10); border-radius: 20px; background: rgba(255,255,255,.05); box-shadow: inset 0 1px 0 rgba(255,255,255,.035); }
+.terminal-policy-chamber-label { color: var(--app-text-muted); font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.terminal-policy-chamber-label small { margin-left: 5px; color: var(--app-text-muted); font-size: 10px; font-weight: 600; letter-spacing: .02em; text-transform: none; opacity: .8; }
+.terminal-policy-field { gap: 7px; }
+.terminal-policy-field > span:first-child { font-size: 12px; }
+.terminal-policy-field-hint { color: var(--app-text-muted); font-size: 11px; line-height: 1.45; }
+.terminal-policy-drawer-content .terminal-policy-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; }
+.terminal-policy-pill-switcher { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.terminal-policy-pill-switcher [data-dwrt-segment] { min-width: 0; min-height: 42px; padding: 8px 10px; font-size: 11px; line-height: 1.25; }
+.terminal-policy-target-entry-wrap { display: grid; gap: 8px; }
+.terminal-policy-target-entry { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.terminal-policy-target-entry > input,
+.terminal-policy-range-input { flex: 1 1 auto; min-width: 0; }
+.terminal-policy-range-input { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 6px; }
+.terminal-policy-range-input > span { color: var(--app-text-muted); font-size: 11px; }
+.terminal-policy-add-target { min-width: 62px !important; min-height: 40px !important; padding-inline: 11px !important; }
+.terminal-policy-target-tags { display: flex; flex-wrap: wrap; gap: 7px; }
+.terminal-policy-target-tag { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 5px 9px; border: 1px solid rgba(10,132,255,.34); border-radius: var(--app-radius-compact); color: var(--app-text); background: rgba(10,132,255,.16); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.25; }
+.terminal-policy-target-tag button { width: 18px; height: 18px; display: inline-grid; place-items: center; padding: 0; border: 0; border-radius: 999px; color: inherit; background: transparent; cursor: pointer; }
+.terminal-policy-target-tag button:hover { background: rgba(255,255,255,.12); }
+.terminal-policy-combo-input { min-width: 0; display: flex; align-items: stretch; overflow: hidden; border: 1px solid var(--color-border-control, color-mix(in srgb, var(--app-text) 18%, transparent)); border-radius: 14px; background: var(--color-surface-control, color-mix(in srgb, var(--app-text) 5%, transparent)); }
+.terminal-policy-combo-input > input { flex: 1 1 auto; min-width: 0; border: 0 !important; border-radius: 0 !important; background: transparent !important; }
+.terminal-policy-combo-input > .dwrt-kit-select,
+.terminal-policy-combo-suffix { flex: 0 0 auto; width: auto; min-width: 86px; border: 0 !important; border-left: 1px solid rgba(255,255,255,.10) !important; border-radius: 0 !important; background: rgba(255,255,255,.08) !important; }
+.terminal-policy-combo-suffix { display: flex; align-items: stretch; }
+.terminal-policy-combo-suffix > .dwrt-kit-select { min-width: 86px; border: 0 !important; background: transparent !important; }
+.terminal-policy-mode-pills { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.terminal-policy-proto-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
+.terminal-policy-proto-tile { min-width: 0; min-height: 58px; display: grid; place-items: center; padding: 9px 6px; border: 1px solid rgba(255,255,255,.09); border-radius: 12px; color: var(--app-text-muted); background: rgba(0,0,0,.18); font-size: 11px; font-weight: 700; text-align: center; cursor: pointer; transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease; }
+.terminal-policy-proto-tile input { position: absolute; opacity: 0; pointer-events: none; }
+.terminal-policy-proto-tile.is-banned { border-color: rgba(255,69,58,.42); color: #ff8a82; background: rgba(255,69,58,.16); }
+.terminal-policy-drawer-footer { justify-content: flex-end; }
+.terminal-policy-legacy-host {
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+.terminal-policy-legacy-host > .user-auth-shell {
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  flex: 1 1 auto;
+  gap: 0;
+}
+.terminal-policy-legacy-host .client-speed-shell > .user-auth-workbench,
+.terminal-policy-legacy-host .cnc-shell > .user-auth-workbench {
+  width: 100%;
+  height: 100%;
+  flex: 1 1 auto;
+}
+.terminal-policy-legacy-loading,
+.terminal-policy-legacy-error { padding: 18px; color: var(--dwrt-text-muted, #718096); }
+.terminal-policy-form-section { border-top: 1px solid var(--dwrt-border, #d7dde8); padding-top: 14px; margin-top: 14px; }
+.terminal-policy-form-section h3 { font-size: 15px; margin: 0 0 10px; }
+.terminal-policy-renew-drawer .terminal-policy-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 12px; }
+.terminal-policy-drawer label { margin-bottom: 12px; }
+.terminal-policy-drawer input,
+.terminal-policy-drawer textarea,
+.terminal-policy-drawer select { width: 100%; box-sizing: border-box; min-width: 0; }
+.terminal-policy-drawer textarea { min-height: 110px; font-family: ui-monospace, monospace; resize: vertical; }
+.terminal-policy-drawer fieldset { display: flex; gap: 14px; flex-wrap: wrap; border: 0; padding: 0; margin: 16px 0; }
+.terminal-policy-drawer fieldset label { display: inline-flex; flex-direction: row; align-items: center; margin: 0; }
+.terminal-policy-form-note { color: var(--dwrt-text-muted, #718096); font-size: 13px; }
+.terminal-policy-segmented { margin-bottom: 12px; }
+.terminal-policy-target-list { display: flex; flex-direction: column; gap: 8px; }
+.terminal-policy-target-row { display: grid; grid-template-columns: 110px minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.terminal-policy-target-row:has(input[data-target-start]) { grid-template-columns: 100px minmax(0, 1fr) minmax(0, 1fr) auto; }
+.terminal-policy-target-row input { min-width: 0; }
+.policy-icon-button { width: 44px; min-width: 44px; padding: 0; }
+.policy-inline-link { margin: 0 8px 4px 0; }
+.terminal-policy-table { min-width: 980px; }
+@media (max-width: 680px) {
+  .terminal-policy-topbar { align-items: stretch; flex-wrap: wrap; }
+  .terminal-policy-tabs { flex: 1 1 100%; width: 100%; }
+  .terminal-policy-mode-rail { margin-inline-start: auto; }
+  .terminal-policy-drawer-content .terminal-policy-form-grid { grid-template-columns: 1fr; }
+  .terminal-policy-target-row,
+  .terminal-policy-target-row:has(input[data-target-start]) { grid-template-columns: 1fr; }
+  .terminal-policy-table { min-width: 980px; }
+  .terminal-policy-proto-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* 与全局 AI 抽屉保持同一小屏几何：AI 在 760px 及以下铺满视口。 */
+@media (max-width: 760px) {
+  .dwrt-kit-sheet.terminal-policy-drawer,
+  .dwrt-kit-sheet.client-speed-drawer,
+  .dwrt-kit-sheet.cnc-drawer {
+    --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full);
+    --dwrt-kit-sheet-max-width: 100vw;
+  }
 }
