@@ -23,16 +23,33 @@
 
 .route-line-status .route-page-head {
   justify-content: flex-start;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
   min-height: 0;
 }
 
 .route-line-status .line-status-tabs {
+  display: flex;
+  width: fit-content;
+  max-width: 100%;
+  min-width: 0;
+  flex: 0 1 auto;
   min-height: 58px;
   padding: 5px;
   border-radius: 999px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.route-line-status .line-status-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .route-line-status .line-status-tabs .dwrt-kit-tab {
+  flex: 0 0 auto;
   min-width: 126px;
   height: 48px;
   padding: 0 20px;
@@ -137,139 +154,6 @@
 .route-line-status .line-load-core td:nth-child(6) {
   width: 22%;
   text-align: right;
-}
-
-/*
- * Kernel column layout. The two connection columns share the tail of the row, so
- * the conntrack column gives up width rather than pushing the table into a
- * horizontal scroll at 1024px.
- */
-.route-line-status .line-load-core.has-kernel-column {
-  min-width: 980px;
-}
-
-.route-line-status .line-load-core.has-kernel-column th:nth-child(6),
-.route-line-status .line-load-core.has-kernel-column td:nth-child(6) {
-  /*
-   * "conntrack 连接" measures 121px, so 13% (116-118px at 1024) clipped the
-   * header. The kernel column gives the width back; it holds a shorter label.
-   */
-  width: 15%;
-}
-
-.route-line-status .line-load-core.has-kernel-column th:nth-child(7),
-.route-line-status .line-load-core.has-kernel-column td:nth-child(7) {
-  width: 17%;
-  text-align: right;
-}
-
-.route-line-status .line-kernel-cell {
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  flex-wrap: wrap;
-  max-width: 100%;
-}
-
-.route-line-status .line-kernel-value {
-  font-weight: 760;
-  font-variant-numeric: tabular-nums;
-}
-
-.route-line-status .line-kernel-unavailable {
-  color: var(--app-text-muted);
-  font-weight: 720;
-}
-
-.route-line-status .line-kernel-flag {
-  padding: 1px 6px;
-  border-radius: 6px;
-  background: rgba(245, 166, 35, 0.14);
-  color: var(--dwrt-status-warn-text, #f7c66d);
-  font-size: 11px;
-  font-style: normal;
-  font-weight: 740;
-  white-space: nowrap;
-}
-
-.route-line-status .line-kernel-toggle {
-  padding: 2px 8px;
-  border: 0;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.09);
-  color: var(--app-text);
-  font-size: 11px;
-  font-weight: 740;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.route-line-status .line-kernel-toggle:hover {
-  background: rgba(255, 255, 255, 0.14);
-}
-
-.route-line-status .line-kernel-detail-row > td {
-  padding: 0 8px 12px;
-  overflow: visible;
-  text-overflow: clip;
-}
-
-.route-line-status .line-kernel-detail {
-  display: grid;
-  gap: 8px;
-  padding: 12px;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.04);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
-}
-
-.route-line-status .line-kernel-detail-meta {
-  font-size: 12px;
-  font-weight: 740;
-  /* Long meta strings wrap instead of stretching the table. */
-  overflow-wrap: anywhere;
-}
-
-.route-line-status .line-kernel-detail-notice {
-  color: var(--dwrt-status-warn-text, #f7c66d);
-  font-size: 12px;
-  font-weight: 720;
-  overflow-wrap: anywhere;
-}
-
-.route-line-status .line-kernel-detail-source {
-  color: var(--app-text-muted);
-  font-size: 11px;
-  overflow-wrap: anywhere;
-}
-
-.route-line-status .line-kernel-category-table {
-  width: 100%;
-  table-layout: fixed;
-  border-collapse: collapse;
-}
-
-.route-line-status .line-kernel-category-table th,
-.route-line-status .line-kernel-category-table td {
-  padding: 4px 6px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-}
-
-.route-line-status .line-kernel-category-table th:first-child,
-.route-line-status .line-kernel-category-table td:first-child {
-  width: 22%;
-  text-align: left;
-}
-
-.route-line-status .line-kernel-category-table tfoot td {
-  font-weight: 780;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.10);
 }
 
 .route-line-status .line-load-source-note {
@@ -500,6 +384,23 @@
   font-weight: 760;
 }
 
+/*
+ * 24H 丢包：探测口径的单值。合并上下行之后这一格只有一个数字，
+ * 与延迟/繁忙度一样用等宽数字对齐，避免多线路之间小数点跳动。
+ */
+.route-line-status .line-loss-value {
+  display: inline-flex;
+  justify-content: flex-end;
+  min-width: 4ch;
+  font-variant-numeric: tabular-nums;
+  font-weight: 720;
+}
+
+.route-line-status .line-loss-unavailable {
+  color: var(--app-text-muted);
+  font-weight: 720;
+}
+
 .route-line-status .line-mode {
   display: inline-flex;
   align-items: center;
@@ -537,6 +438,10 @@
 
 .route-line-status .health-bad {
   color: var(--dwrt-status-error-text, #ff8798);
+}
+
+.route-line-status .health-unknown {
+  color: var(--app-text-muted, rgba(220, 226, 235, 0.68));
 }
 
 .route-line-status .busy-meter {
@@ -658,7 +563,9 @@
   max-width: min(360px, calc(100vw - 20px));
   min-height: 34px;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
+  flex-direction: column;
+  justify-content: center;
   padding: 7px 11px;
   border: 1px solid var(--dwrt-interactive-hover-border, rgba(255,255,255,0.18));
   border-radius: 9px;
@@ -671,7 +578,9 @@
   -webkit-backdrop-filter: blur(14px) saturate(132%);
   font-size: 12px;
   font-weight: 680;
-  line-height: 1.35;
+  line-height: 1.5;
+  /* 健康条提示是逐行语义（时间/状态/延迟/丢包/采样），换行必须保留。 */
+  white-space: pre-line;
   pointer-events: none;
 }
 
@@ -708,7 +617,6 @@
 
   .route-line-status .line-status-tabs {
     width: 100%;
-    overflow-x: auto;
     border-radius: 22px;
   }
 
@@ -717,27 +625,6 @@
     height: 46px;
     padding: 0 16px;
     font-size: 14px;
-  }
-
-  /*
-   * The outer table already scrolls horizontally on narrow viewports, so the
-   * detail block is sized against the scrolled width rather than the viewport.
-   * Category rows drop to the two counters that matter at this width.
-   */
-  .route-line-status .line-kernel-detail {
-    padding: 10px;
-  }
-
-  .route-line-status .line-kernel-category-table th:nth-child(3),
-  .route-line-status .line-kernel-category-table td:nth-child(3),
-  .route-line-status .line-kernel-category-table th:nth-child(4),
-  .route-line-status .line-kernel-category-table td:nth-child(4) {
-    display: none;
-  }
-
-  .route-line-status .line-kernel-category-table th:first-child,
-  .route-line-status .line-kernel-category-table td:first-child {
-    width: 30%;
   }
 
   .route-line-status .line-load-source-note {

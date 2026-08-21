@@ -12,6 +12,14 @@ function nestedFunctionSource(name) {
 }
 
 const context = {
+  lossValue: (...values) => {
+    for (const value of values) {
+      if (value === undefined || value === null || value === '') continue;
+      const number = Number(value);
+      if (Number.isFinite(number)) return number;
+    }
+    return null;
+  },
   asArray: (value) => Array.isArray(value) ? value : [],
   firstText: (...values) => String(values.find((value) => value !== undefined && value !== null && String(value).trim()) || ''),
   firstNumber: (...values) => {

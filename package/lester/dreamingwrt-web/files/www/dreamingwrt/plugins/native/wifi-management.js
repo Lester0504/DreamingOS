@@ -1,4 +1,4 @@
-const VERSION = '20260810-front-release-01';
+const VERSION = '20260819-wifi-rssi-station-distribution-01';
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
@@ -298,6 +298,70 @@ export function mount(context = {}) {
     };
   }
 
+  function radioInterfaceNames(radio = {}) {
+    return asArray(radio.interfaces).map((item) => (
+      typeof item === 'string'
+        ? firstText(item)
+        : firstText(item?.interface, item?.ifname, item?.name, item?.id)
+    )).filter(Boolean);
+  }
+
+  function signalBucketIndex(value) {
+    const signal = optionalNumber(value);
+    if (signal === null) return -1;
+    const thresholds = [-90, -75, -60, -45, -30];
+    const clamped = Math.max(thresholds[0], signal);
+    for (let index = thresholds.length - 1; index >= 0; index -= 1) {
+      if (clamped >= thresholds[index]) return index;
+    }
+    return 0;
+  }
+
+  /*
+   * WebD already maps station interfaces to radios for clients/avg_signal. Keep
+   * the browser fallback equally strict: a station contributes only when its
+   * interface identifies exactly one radio. Missing RSSI, unknown interfaces,
+   * and ambiguous names stay out of every chart instead of being guessed into
+   * the first radio.
+   */
+  function deriveStationSignalDistributions(radios = [], stations = []) {
+    const rows = asArray(radios);
+    const distributions = rows.map(() => ({
+      counts: [0, 0, 0, 0, 0],
+      sample_count: 0,
+      matched_station_count: 0,
+      missing_signal_count: 0
+    }));
+    const interfaceOwners = new Map();
+
+    rows.forEach((radio, radioIndex) => {
+      radioInterfaceNames(radio).forEach((interfaceName) => {
+        const key = interfaceName.toLowerCase();
+        const owners = interfaceOwners.get(key) || [];
+        if (!owners.includes(radioIndex)) owners.push(radioIndex);
+        interfaceOwners.set(key, owners);
+      });
+    });
+
+    asArray(stations).forEach((station) => {
+      const interfaceName = firstText(station?.interface, station?.ifname, station?.device).toLowerCase();
+      if (!interfaceName) return;
+      const owners = interfaceOwners.get(interfaceName) || [];
+      if (owners.length !== 1) return;
+      const distribution = distributions[owners[0]];
+      distribution.matched_station_count += 1;
+      const bucketIndex = signalBucketIndex(station?.signal_dbm);
+      if (bucketIndex < 0) {
+        distribution.missing_signal_count += 1;
+        return;
+      }
+      distribution.counts[bucketIndex] += 1;
+      distribution.sample_count += 1;
+    });
+
+    return distributions;
+  }
+
   function normalizeAp(ap = {}, index = 0) {
     const runtime = ap.runtime && typeof ap.runtime === 'object' ? ap.runtime : {};
     const id = firstText(ap.ap_id, ap.id, ap.device_id, runtime.ap_id, `ap-${index}`);
@@ -532,15 +596,20 @@ export function mount(context = {}) {
     const neighborScan = environment.neighbor_scan && typeof environment.neighbor_scan === 'object' ? environment.neighbor_scan : {};
     const spectralFft = environment.spectral_fft && typeof environment.spectral_fft === 'object' ? environment.spectral_fft : {};
     const neighborSamples = asArray(neighborScan.samples);
+    const stations = asArray(source.stations || runtime.stations || source.clients);
+    const stationSignalDistributions = deriveStationSignalDistributions(radios, stations);
     return {
       ...base,
       ...source,
       capabilities: { ...base.capabilities, ...caps, wifi: bool(caps.wifi, radios.length > 0), scan: bool(caps.scan ?? caps.airtime_scan, false) },
       summary: { ...base.summary, ...(source.summary || {}) },
       managedAps: asArray(source.managed_aps, ['items']).map(normalizeAp),
-      radios,
+      radios: radios.map((radio, index) => ({
+        ...radio,
+        derived_signal_distribution: stationSignalDistributions[index]
+      })),
       ssids: asArray(source.ssids, ['wlans']).map(normalizeSsid),
-      stations: asArray(source.stations || runtime.stations || source.clients),
+      stations,
       interference: asArray(source.interference || runtime.interference).length ? asArray(source.interference || runtime.interference) : neighborSamples,
       connectivityEvents: asArray(source.connectivity_events || source.events || runtime.connectivity_events || runtime.events),
       environment: {
@@ -1642,15 +1711,12 @@ export function mount(context = {}) {
 
   function signalDistribution(radio) {
     const buckets = [-90, -75, -60, -45, -30];
-    const samples = radio.signal_distribution;
-    const counts = buckets.map((threshold, index) => {
-      const sample = samples[index] || samples.find((item) => Number(item.threshold ?? item.rssi ?? item.min) === threshold);
-      return firstNumber(sample?.count, sample?.clients, sample?.value);
-    });
-    const max = Math.max(1, ...counts);
-    const available = bool(state.status.capabilities.station_metrics, false) && samples.length > 0;
-    const empty = signalDistributionEmptyCopy(radio, samples);
-    return `<div class="airview-signal-distribution"><div class="airview-signal-scale" aria-hidden="true">${buckets.map((value, index) => `<span style="--signal-tone:${index}"></span>`).join('')}</div><div class="airview-signal-labels">${buckets.map((value) => `<span>${value}</span>`).join('')}</div><div class="airview-signal-bars" aria-label="${escapeHtml(`${radio.ap} 活动客户端信号分布`)}">${available ? counts.map((count, index) => `<i style="--bar:${Math.max(3, count / max * 100).toFixed(1)}%;--signal-tone:${index}" data-dwrt-tooltip="${escapeHtml(`${buckets[index]} dBm：${count} 个客户端`)}"></i>`).join('') : `<div class="airview-radio-chart-empty compact"><strong>${escapeHtml(empty.title)}</strong><span>${escapeHtml(empty.detail)}</span></div>`}</div></div>`;
+    const labels = ['≤ -76', '-75~-61', '-60~-46', '-45~-31', '≥ -30'];
+    const ranges = ['低于 -75 dBm', '-75 至低于 -60 dBm', '-60 至低于 -45 dBm', '-45 至低于 -30 dBm', '-30 dBm 及以上'];
+    const distribution = signalDistributionData(radio, buckets);
+    const max = Math.max(1, ...distribution.counts);
+    const empty = signalDistributionEmptyCopy(radio, distribution);
+    return `<div class="airview-signal-distribution"><div class="airview-signal-scale" aria-hidden="true">${buckets.map((value, index) => `<span style="--signal-tone:${index}"></span>`).join('')}</div><div class="airview-signal-labels">${labels.map((value) => `<span>${value}</span>`).join('')}</div><div class="airview-signal-bars" aria-label="${escapeHtml(`${radio.ap} 活动客户端信号分布`)}">${distribution.available ? distribution.counts.map((count, index) => `<i style="--bar:${Math.max(3, count / max * 100).toFixed(1)}%;--signal-tone:${index}" data-dwrt-tooltip="${escapeHtml(`${ranges[index]}：${count} 个客户端`)}"></i>`).join('') : `<div class="airview-radio-chart-empty compact"><strong>${escapeHtml(empty.title)}</strong><span>${escapeHtml(empty.detail)}</span></div>`}</div>${distribution.available ? `<p class="airview-signal-caption">${escapeHtml(signalDistributionCoverageCopy(radio, distribution))}</p>` : ''}</div>`;
   }
 
   function radioBandSheet(band, radios) {
@@ -1801,7 +1867,54 @@ export function mount(context = {}) {
      这个裸码——既不是中文，也把一个就绪信号说成了故障原因。三态要分开：
      能力 false 才陈述后端原因；能力 true 而分布为空时，空的原因是没有关联客户端
      或该 Radio 未上报分布，与能力无关。 */
-  function signalDistributionEmptyCopy(radio, samples) {
+  function signalDistributionData(radio, buckets = [-90, -75, -60, -45, -30]) {
+    if (radio.clients === 0) return { available: false, source: 'none', counts: buckets.map(() => 0), sample_count: 0 };
+    const samples = asArray(radio.signal_distribution);
+    if (samples.length) {
+      const counts = buckets.map((threshold, index) => {
+        const matched = samples.find((item) => Number(item?.threshold ?? item?.rssi ?? item?.min) === threshold);
+        const sample = matched ?? samples[index];
+        return Math.max(0, firstNumber(
+          typeof sample === 'number' ? sample : undefined,
+          sample?.count,
+          sample?.clients,
+          sample?.value
+        ));
+      });
+      return {
+        available: true,
+        source: 'server',
+        counts,
+        sample_count: counts.reduce((sum, count) => sum + count, 0)
+      };
+    }
+    const derived = radio.derived_signal_distribution && typeof radio.derived_signal_distribution === 'object'
+      ? radio.derived_signal_distribution
+      : {};
+    const counts = asArray(derived.counts).slice(0, buckets.length).map((count) => Math.max(0, firstNumber(count)));
+    while (counts.length < buckets.length) counts.push(0);
+    const sampleCount = firstNumber(derived.sample_count, counts.reduce((sum, count) => sum + count, 0));
+    return {
+      available: sampleCount > 0,
+      source: sampleCount > 0 ? 'stations' : 'none',
+      counts,
+      sample_count: sampleCount,
+      matched_station_count: firstNumber(derived.matched_station_count),
+      missing_signal_count: firstNumber(derived.missing_signal_count)
+    };
+  }
+
+  function signalDistributionCoverageCopy(radio, distribution) {
+    const expected = optionalNumber(radio.clients);
+    const sampleCount = firstNumber(distribution.sample_count);
+    const source = distribution.source === 'server' ? '后端分桶' : 'Station RSSI 派生';
+    if (expected !== null && expected !== sampleCount) {
+      return `${source}，覆盖 ${sampleCount}/${expected} 个在线客户端；未覆盖样本未计入图表。`;
+    }
+    return `${source}，共 ${sampleCount} 个有效样本。`;
+  }
+
+  function signalDistributionEmptyCopy(radio, distribution) {
     const caps = state.status.capabilities;
     const ready = bool(caps.station_metrics, false);
     const reason = firstText(caps.reasons?.station_metrics);
@@ -1814,10 +1927,10 @@ export function mount(context = {}) {
     if (radio.clients === 0) {
       return { title: '该 Radio 暂无关联客户端', detail: '没有关联客户端，因此没有 RSSI 样本可分布。' };
     }
-    if (!samples.length && radio.clients) {
+    if (!distribution.available && radio.clients) {
       return {
-        title: '尚未收到该 Radio 的信号分布',
-        detail: `能力已就绪，${radio.clients} 个客户端在线，但 AP 本次未上报分桶后的 RSSI 分布。`
+        title: '尚无可用 RSSI 样本',
+        detail: `${radio.clients} 个客户端在线，但本次快照没有能唯一映射到该 Radio 的有效 signal_dbm。`
       };
     }
     return { title: '暂无客户端信号样本', detail: '本次快照没有可分桶的 RSSI 样本。' };

@@ -882,15 +882,24 @@
 }
 
 .wireless-status-route-host .airview-view-tabs {
-  width: fit-content;
+  --dwrt-page-tab-height: 52px;
+  --dwrt-page-tab-pad: 4px;
+  width: 100%;
   max-width: 100%;
   min-width: 0;
-  flex: 0 1 auto;
+  flex: 1 1 auto;
+  overflow-x: hidden;
 }
 
-.airview-view-tabs .airview-view-tab { gap: 8px; }
+.wireless-status-route-host .airview-view-tabs .airview-view-tab {
+  min-width: 0;
+  flex: 1 1 0;
+  gap: 4px;
+  padding-inline: 6px;
+  font-size: 12px;
+}
 .airview-view-tabs .airview-view-tab span { display: inline; white-space: nowrap; }
-.airview-view-tabs .airview-view-tab svg { width: 20px; height: 20px; fill: currentColor; stroke: none; }
+.wireless-status-route-host .airview-view-tabs .airview-view-tab svg { width: 16px; height: 16px; fill: currentColor; stroke: none; }
 
 .airview-layout {
   display: grid;
@@ -1725,6 +1734,7 @@
 .airview-signal-bars { position: relative; display: flex; align-items: flex-end; gap: 7px; height: 118px; padding: 10px 18px 0; border: 1px solid var(--wifi-soft-line); background: repeating-linear-gradient(0deg, transparent 0 calc(33.333% - 1px), var(--wifi-soft-line) calc(33.333% - 1px) 33.333%); }
 .airview-signal-bars > i { flex: 1 1 0; height: var(--bar); min-height: 3px; border-radius: 4px 4px 0 0; background: hsl(calc(8deg + var(--signal-tone) * 31deg) 68% 58% / .72); }
 .airview-signal-bars .airview-radio-chart-empty.compact { inset: 1px; }
+.airview-signal-caption { margin: 7px 0 0; color: var(--wifi-muted); font-size: 10px; line-height: 1.45; }
 
 .sr-only {
   position: absolute;

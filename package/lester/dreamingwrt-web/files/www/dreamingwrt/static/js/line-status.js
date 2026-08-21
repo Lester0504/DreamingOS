@@ -392,6 +392,13 @@
       });
     }
 
+    function hasFiniteNumber(...values) {
+      return values.some((value) => {
+        if (value === undefined || value === null || value === '') return false;
+        return Number.isFinite(Number(value));
+      });
+    }
+
     function hasMeaningfulHealthBucket(bucket) {
       if (!bucket || typeof bucket !== 'object') return false;
       const status = String(firstText(bucket.status, bucket.state, bucket.reason)).toLowerCase();
@@ -427,7 +434,7 @@
       const history = asArray(wan.history);
       const status = String(firstText(wan.status, wan.state)).toLowerCase();
       const hasIdentity = firstText(wan.carrier_key, wan.carrier_name, wan.carrier, wan.carrier_logo, wan.accessMode, wan.ip, wan.ipv6, wan.gateway);
-      const hasRealHealth = hasUsefulNumber(wan.uptime, wan.upLoss24h, wan.downLoss24h, wan.latencyAvg, wan.avgUpRate, wan.avgDownRate, wan.busy) || history.some(hasMeaningfulHealthBucket);
+      const hasRealHealth = hasFiniteNumber(wan.uptime, wan.upLoss24h, wan.downLoss24h, wan.latencyAvg, wan.avgUpRate, wan.avgDownRate, wan.busy) || history.some(hasMeaningfulHealthBucket);
       if (!hasIdentity && !history.length && (wan.online === false || /down|offline|false/.test(status))) return false;
       if (!isGenericWanName(wan.name) || !isGenericWanName(wan.id)) return true;
       if (hasIdentity || firstText(wan.status)) return true;
@@ -548,8 +555,8 @@
           online: typeof wan.online === 'boolean' ? wan.online : undefined,
           healthKnown: wan.health !== undefined || wan.health_measured !== undefined || wan.online !== undefined || wan.status !== undefined || wan.state !== undefined,
           uptime: trustedConnectionSeconds(wan),
-          upLoss24h: firstNumber(wan.up_loss_24h, wan.loss_up_24h, wan.loss_up, wan.packet_loss_up, wan.packet_loss),
-          downLoss24h: firstNumber(wan.down_loss_24h, wan.loss_down_24h, wan.loss_down, wan.packet_loss_down, wan.packet_loss),
+          upLoss24h: lossValue(wan.up_loss_24h, wan.loss_up_24h, wan.loss_up, wan.packet_loss_up, wan.packet_loss),
+          downLoss24h: lossValue(wan.down_loss_24h, wan.loss_down_24h, wan.loss_down, wan.packet_loss_down, wan.packet_loss),
           /*
            * 单一丢包读数：上下行同源于一次 ping，取二者中有值的较大者即可，
            * 全缺时保持 null 以便渲染成「不可用」而不是 0%。
@@ -583,16 +590,22 @@
       const status = String(firstText(wan.status, wan.state)).toLowerCase();
       const offline = wan.online === false || /^(down|offline|bad|error|failed)$/.test(status);
       const latency = firstNumber(wan.latencyAvg, wan.latency, wan.latency_ms);
-      const loss = Math.max(firstNumber(wan.upLoss24h, wan.loss_up, wan.loss), firstNumber(wan.downLoss24h, wan.loss_down, wan.loss));
-      if (offline || loss > 20 || latency >= 300) return 'bad';
-      if (loss > 3 || latency >= 120) return 'warn';
-      return 'ok';
+      const lossValues = [lossValue(wan.upLoss24h, wan.loss_up, wan.loss), lossValue(wan.downLoss24h, wan.loss_down, wan.loss)]
+        .filter((value) => value !== null);
+      const loss = lossValues.length ? Math.max(...lossValues) : null;
+      if (offline || (loss !== null && loss > 20) || latency >= 300) return 'bad';
+      if ((loss !== null && loss > 3) || latency >= 120) return 'warn';
+      if (loss !== null || (Number.isFinite(latency) && latency > 0)) return 'ok';
+      const history = healthHistoryBuckets(wan);
+      const latest = [...history].reverse().find((bucket) => healthBucketTone(bucket) !== 'muted');
+      return latest ? healthBucketTone(latest) : 'unknown';
     }
 
     function healthClass(wan) {
       const tone = healthTone(wan);
       if (tone === 'bad') return 'health-bad';
       if (tone === 'warn') return 'health-warn';
+      if (tone === 'unknown' || tone === 'muted') return 'health-unknown';
       return 'health-good';
     }
 
@@ -605,12 +618,13 @@
       const status = String(firstText(bucket.status, bucket.state, bucket.health)).toLowerCase();
       const latency = firstNumber(bucket.latency_avg, bucket.latency, bucket.avg_latency, bucket.avg, bucket.ms);
       const loss = Math.max(
-        firstNumber(bucket.loss, bucket.packet_loss, bucket.loss_up, bucket.up_loss, bucket.packet_loss_up),
-        firstNumber(bucket.loss, bucket.packet_loss, bucket.loss_down, bucket.down_loss, bucket.packet_loss_down)
+        lossValue(bucket.loss, bucket.packet_loss, bucket.loss_up, bucket.up_loss, bucket.packet_loss_up) ?? -Infinity,
+        lossValue(bucket.loss, bucket.packet_loss, bucket.loss_down, bucket.down_loss, bucket.packet_loss_down) ?? -Infinity
       );
       if (/(bad|down|offline|unavailable|failed|error|loss)/.test(status) || loss > 20 || latency >= 300) return 'bad';
       if (/(warn|warning|degraded|unstable|latency_spike|packet_loss)/.test(status) || loss > 0 || latency >= 80) return 'warn';
       if (/(unknown|missing|pending)/.test(status)) return 'muted';
+      if (!Number.isFinite(latency) || latency <= 0 || loss === -Infinity) return 'muted';
       return 'ok';
     }
 
@@ -656,18 +670,20 @@
       const tone = healthTone(wan);
       const status = String(firstText(wan.status, wan.state)).toLowerCase();
       const latency = firstNumber(wan.latencyAvg, wan.latency, wan.latency_ms);
-      const loss = Math.max(firstNumber(wan.upLoss24h, wan.loss_up, wan.loss), firstNumber(wan.downLoss24h, wan.loss_down, wan.loss));
+      const lossValues = [lossValue(wan.upLoss24h, wan.loss_up, wan.loss), lossValue(wan.downLoss24h, wan.loss_down, wan.loss)]
+        .filter((value) => value !== null);
+      const loss = lossValues.length ? Math.max(...lossValues) : null;
       const history = healthHistoryBuckets(wan);
       const knownBuckets = history.filter((bucket) => healthBucketTone(bucket) !== 'muted');
       const healthyBuckets = knownBuckets.filter((bucket) => healthBucketTone(bucket) === 'ok');
       const online = wan.online !== false && !/^(down|offline|bad|error|failed)$/.test(status);
       const stateLabel = !online
         ? '离线'
-        : loss > 3
-          ? `丢包 ${loss.toFixed(1).replace(/\.0$/, '')}%`
-          : latency > 0
-            ? `${Math.round(latency)} ms`
-            : '正常';
+          : loss !== null && loss > 3
+            ? `丢包 ${loss.toFixed(1).replace(/\.0$/, '')}%`
+            : latency > 0
+              ? `${Math.round(latency)} ms`
+              : tone === 'unknown' ? '未知' : '正常';
       return {
         tone,
         value: knownBuckets.length ? healthyBuckets.length / knownBuckets.length * 100 : 0,
