@@ -27,6 +27,14 @@ void webd_wifi_merge_survey_history(struct json_object *data,
                                     struct json_object *response);
 
 /*
+ * Joins the AC's TX retry buckets onto data.radios[].tx_retry_history and sets
+ * the `tx_n_history` capability from the rows that actually came back, so the
+ * bit is never advertised ahead of the data behind it.
+ */
+void webd_wifi_merge_tx_retry_history(struct json_object *data,
+                                      struct json_object *response);
+
+/*
  * Joins client identity (display name, fingerprint model, image) onto
  * data.stations[] by MAC, using the /api/v1/clients inventory as the authority.
  * clients_response is the raw jmx response for the "clients" ubus method; when

@@ -114,6 +114,84 @@ def test_dhcp_apply_failure_restores_database_and_runtime() -> None:
     assert '"dhcp_apply_failed_rollback_failed"' in handler
 
 
+def test_ipv4_only_dhcp_apply_does_not_depend_on_dhcpv6_runtime() -> None:
+    start = DB.index("static int nc_dhcp_access_runtime_loaded(")
+    end = DB.index("/* ══════════════════════════════════════════════════════════════════════\n * UPnP", start)
+    section = DB[start:end]
+    assert 'if (entry_count <= 0)' in section
+    assert 'return nc_run_quiet("pidof dnsmasq >/dev/null 2>&1")' in section
+    assert 'nc_dhcpv6_static_reservations_present(lan_id)' in section
+    assert 'nc_dhcpv6_uci_reservations_present(ctx, pkg, lan_id)' in section
+    assert 'if (dhcpv6_static_present) {' in section
+    assert 'nc_dhcpv6_static_leases_readback_retry(lan_id)' in section
+    assert 'for (attempt = 0; attempt < 3; attempt++)' in section
+
+
+def test_dhcp_apply_exposes_stage_specific_failure_contract() -> None:
+    start = CORE.index("static int dw_handle_dhcp_service_set(")
+    end = CORE.index("static int dw_handle_dhcp_reservation_delete(", start)
+    handler = CORE[start:end]
+    for reason in (
+        "dnsmasq_reload_failed",
+        "dhcp_access_readback_failed",
+        "odhcpd_reload_failed",
+        "dhcpv6_readback_failed",
+        "dnsmasq_config_generation_failed",
+        "dhcpv6_config_generation_failed",
+        "dhcp_access_config_generation_failed",
+        "dhcp_uci_commit_failed",
+    ):
+        assert reason in DB
+    assert 'jmx_dhcp_service_apply_failure_reason(arc)' in handler
+    assert 'jmx_dhcp_service_apply_failure_stage(arc)' in handler
+    assert '"apply_failure_reason"' in handler
+    assert '"failure_stage"' in handler
+    assert '"failure_reason"' in handler
+    assert 'if (rc == 0 && arc != 0)' in handler
+
+
+def test_dhcp_validation_preserves_specific_machine_reason() -> None:
+    assert 'static __thread char g_dhcp_set_failure_reason[128]' in DB
+    assert 'jmx_dhcp_service_set_failure_reason(void)' in DB
+    assert 'return nc_dhcp_set_fail(-2, err)' in DB
+    for reason in (
+        "invalid_reservation_mac",
+        "invalid_reservation_ip",
+        "reservation_ip_outside_lan",
+        "duplicate_reservation_mac",
+        "duplicate_reservation_ip",
+        "dhcp_scope_conflict",
+    ):
+        assert reason in DB
+    start = CORE.index("static int dw_handle_dhcp_service_set(")
+    end = CORE.index("static int dw_handle_dhcp_reservation_delete(", start)
+    handler = CORE[start:end]
+    assert 'const char *save_reason = jmx_dhcp_service_set_failure_reason()' in handler
+
+
+def test_dhcp_save_apply_response_covers_success_and_rollback_outcomes() -> None:
+    start = CORE.index("static int dw_handle_dhcp_service_set(")
+    end = CORE.index("static int dw_handle_dhcp_reservation_delete(", start)
+    handler = CORE[start:end]
+    assert 'json_object_new_boolean(rc==0&&arc==0)' in handler
+    assert 'json_object_new_boolean(rc==0)' in handler
+    assert 'json_object_new_boolean(rolled_back)' in handler
+    assert 'jmx_dhcp_service_set(restore) == 0' in handler
+    assert 'jmx_dhcp_service_apply(lan_id) == 0' in handler
+    assert '"apply_failed_rolled_back"' in handler
+    assert '"apply_failed_rollback_failed"' in handler
+    assert 'rolled_back ? apply_reason : "dhcp_rollback_failed"' in handler
+    assert 'json_object_object_add(data,"readback",readback_data)' in handler
+
+
+def test_dhcp_delete_preserves_apply_failure_reason() -> None:
+    start = CORE.index("static int dw_handle_dhcp_reservation_delete(")
+    end = CORE.index("static int dw_handle_firewall_service_get(", start)
+    handler = CORE[start:end]
+    assert 'jmx_dhcp_service_apply_failure_stage(arc)' in handler
+    assert 'jmx_dhcp_service_apply_failure_reason(arc)' in handler
+
+
 
 def test_dhcpv6_static_prefix_reservations_contract() -> None:
     assert 'CREATE TABLE IF NOT EXISTS dhcpv6_prefix_reservation' in DB
@@ -165,5 +243,10 @@ if __name__ == "__main__":
     test_dhcp_allow_deny_list_persisted_validated_and_applied()
     test_dhcp_put_uses_partial_merge_for_lists()
     test_dhcp_apply_failure_restores_database_and_runtime()
+    test_ipv4_only_dhcp_apply_does_not_depend_on_dhcpv6_runtime()
+    test_dhcp_apply_exposes_stage_specific_failure_contract()
+    test_dhcp_validation_preserves_specific_machine_reason()
+    test_dhcp_save_apply_response_covers_success_and_rollback_outcomes()
+    test_dhcp_delete_preserves_apply_failure_reason()
     test_dhcpv6_static_prefix_reservations_contract()
     print("ok: DHCP standalone REST, apply, readback, and reservation contracts")

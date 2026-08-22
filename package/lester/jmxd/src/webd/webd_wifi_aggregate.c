@@ -2035,20 +2035,15 @@ void webd_wifi_merge_environment_scan(struct json_object *data,
         execution_available ? "scan_not_yet_run" :
                               "ap_control_v2_scan_execution_unavailable");
     /*
-     * TX retry ("TX n") history: reported false because it genuinely is not
-     * implemented. The APD collector does read the counter
-     * (apd_backend_openwrt.c: airtime "retries"), but nothing persists it as a
-     * series -- ac_radio_survey_bucket has no retry column, so there is no
-     * table to query for a chart.
-     *
-     * The bit exists so the page can stop hardcoding a denial. design.md asks
-     * for exactly this: a frontend string that says "the backend does not
-     * provide TX n history" keeps denying the feature after it ships, whereas a
-     * capability bit flips on its own.
+     * TX retry ("TX n") history starts denied here and is flipped later by
+     * webd_wifi_merge_tx_retry_history() once ac_radio_tx_retry_bucket actually
+     * returns two or more differenced samples for a radio. This is the default,
+     * not the verdict: the scan-capability pass runs before the history query,
+     * so leaving it true here would advertise a chart that may have no rows.
      */
     wifi_capability_bool(capabilities, "tx_n_history", 0);
     wifi_replace_string(reasons, "tx_n_history",
-                        "tx_retry_series_not_persisted");
+                        "tx_retry_history_not_queried");
 }
 
 struct wifi_survey_history_point {
@@ -2187,6 +2182,28 @@ void webd_wifi_merge_survey_history(struct json_object *data,
         free(matches);
         json_object_object_del(radio, "channel_history");
         json_object_object_add(radio, "channel_history", history);
+        /*
+         * `history_24h` is the same series the radio card draws, so it has to
+         * come from the same buckets rather than staying null with a
+         * "not collected" reason once the producer is live. A single point is
+         * not a series: below two complete numeric samples the field stays null
+         * and keeps a reason, which is what the AC's own warming_up state means.
+         */
+        if (complete_numeric_count >= 2) {
+            json_object_object_del(radio, "history_24h");
+            json_object_object_add(radio, "history_24h",
+                                   json_object_get(history));
+            wifi_replace_string(radio, "history_24h_source",
+                                "ac_radio_survey_bucket");
+            json_object_object_del(radio, "history_24h_reason");
+            json_object_object_add(radio, "history_24h_reason",
+                                   json_object_new_null());
+        } else {
+            wifi_replace_null(radio, "history_24h");
+            wifi_replace_string(radio, "history_24h_reason",
+                match_count > 0 ? "survey_history_warming_up" :
+                                  "survey_history_empty");
+        }
         if (match_count > 0)
             any_mapped_point = 1;
         if (complete_numeric_count >= 2)
@@ -2208,6 +2225,162 @@ void webd_wifi_merge_survey_history(struct json_object *data,
     wifi_capability_bool(capabilities, "airview_history", history_available);
     wifi_capability_reason(capabilities, "survey_history", reason);
     wifi_capability_reason(capabilities, "airview_history", reason);
+}
+
+/* Projects one `tx_retry_history` bucket onto the radio series. Only the
+ * differenced fields are published: `retry_rate_pct` is derived from the two
+ * deltas inside the bucket, so a point without them cannot be plotted. */
+static struct json_object *wifi_tx_retry_history_output_point(
+    struct json_object *source)
+{
+    struct json_object *timestamp = wifi_child(source, "timestamp");
+    struct json_object *source_name = wifi_child(source, "source");
+    struct json_object *point;
+    double value;
+    double rate;
+    int has_value = wifi_number(source, "value", &value);
+    int has_rate = wifi_number(source, "retry_rate_pct", &rate);
+    double tx_total_delta = 0.0;
+    double tx_retries_delta = 0.0;
+    int has_totals = wifi_number(source, "tx_total_delta", &tx_total_delta) &&
+                     wifi_number(source, "tx_retries_delta", &tx_retries_delta);
+
+    if (!timestamp || (!has_value && !has_rate))
+        return NULL;
+    point = json_object_new_object();
+    if (!point)
+        return NULL;
+    if (!has_value)
+        value = rate;
+    if (!has_rate)
+        rate = value;
+    json_object_object_add(point, "timestamp", json_object_get(timestamp));
+    json_object_object_add(point, "value", json_object_new_double(value));
+    json_object_object_add(point, "retry_rate_pct",
+                           json_object_new_double(rate));
+    json_object_object_add(point, "tx_total_delta", has_totals ?
+        json_object_new_int64((int64_t)tx_total_delta) : json_object_new_null());
+    json_object_object_add(point, "tx_retries_delta", has_totals ?
+        json_object_new_int64((int64_t)tx_retries_delta) :
+        json_object_new_null());
+    json_object_object_add(point, "source",
+        source_name && json_object_is_type(source_name, json_type_string) ?
+        json_object_get(source_name) : json_object_new_null());
+    json_object_object_add(point, "complete",
+                           json_object_new_boolean(
+                               wifi_bool(source, "complete", 0)));
+    return point;
+}
+
+/*
+ * Joins `dreamingwrt.ac tx_retry_history` onto data.radios[].tx_retry_history
+ * and decides the `tx_n_history` capability from what actually came back.
+ *
+ * The bit is the whole point of this function. It used to be hardcoded false
+ * with a reason saying the series was never persisted, and a hardcoded true
+ * would be just as wrong the other way: the page would draw an empty chart
+ * while the producer is still warming up. Two complete differenced buckets for
+ * at least one radio is the threshold, matching the AC's own `available`
+ * verdict, so the bit flips on its own once real samples land.
+ */
+void webd_wifi_merge_tx_retry_history(struct json_object *data,
+                                      struct json_object *response)
+{
+    struct json_object *radios;
+    struct json_object *capabilities;
+    struct json_object *root = wifi_response_root(response);
+    struct json_object *points = wifi_child_array(root, "points");
+    const char *response_reason = wifi_string(root, "reason", "");
+    const char *reason;
+    int any_mapped_point = 0;
+    int history_available = 0;
+    size_t radio_index;
+
+    if (!data || !json_object_is_type(data, json_type_object))
+        return;
+    radios = wifi_ensure_array(data, "radios");
+    capabilities = wifi_ensure_object(data, "capabilities");
+
+    for (radio_index = 0; radio_index < json_object_array_length(radios);
+         radio_index++) {
+        struct json_object *radio = json_object_array_get_idx(radios,
+                                                             radio_index);
+        struct json_object *history = json_object_new_array();
+        struct wifi_survey_history_point *matches = NULL;
+        size_t point_count = points ? json_object_array_length(points) : 0;
+        size_t match_count = 0;
+        size_t complete_numeric_count = 0;
+        size_t point_index;
+
+        if (!radio || !json_object_is_type(radio, json_type_object)) {
+            json_object_put(history);
+            continue;
+        }
+        if (point_count)
+            matches = calloc(point_count, sizeof(*matches));
+        for (point_index = 0; matches && point_index < point_count;
+             point_index++) {
+            struct json_object *source = json_object_array_get_idx(points,
+                                                                   point_index);
+            struct json_object *timestamp;
+            double value;
+
+            /* Same ap_id/radio_id join as the survey series, including the
+             * local_id spelling used for radios on the controller itself. */
+            if (!source || !json_object_is_type(source, json_type_object) ||
+                !wifi_survey_history_radio_matches(radio, source))
+                continue;
+            timestamp = wifi_child(source, "timestamp");
+            if (!timestamp ||
+                (!json_object_is_type(timestamp, json_type_int) &&
+                 !json_object_is_type(timestamp, json_type_double)) ||
+                (!wifi_number(source, "value", &value) &&
+                 !wifi_number(source, "retry_rate_pct", &value)))
+                continue;
+            matches[match_count].source = source;
+            matches[match_count].timestamp = json_object_get_int64(timestamp);
+            match_count++;
+            if (wifi_bool(source, "complete", 0))
+                complete_numeric_count++;
+        }
+        if (match_count > 1)
+            qsort(matches, match_count, sizeof(*matches),
+                  wifi_survey_history_point_compare);
+        for (point_index = 0; point_index < match_count; point_index++) {
+            struct json_object *point = wifi_tx_retry_history_output_point(
+                matches[point_index].source);
+
+            if (point)
+                json_object_array_add(history, point);
+        }
+        free(matches);
+        json_object_object_del(radio, "tx_retry_history");
+        json_object_object_add(radio, "tx_retry_history", history);
+        if (match_count > 0)
+            any_mapped_point = 1;
+        if (complete_numeric_count >= 2)
+            history_available = 1;
+    }
+
+    /*
+     * Reasons are deliberately specific about which link in the chain is
+     * missing, because "unavailable" alone sent acceptance looking in the wrong
+     * place twice: an AP whose driver has no cumulative retry counter looks
+     * identical to a controller that was never asked.
+     */
+    if (history_available)
+        reason = "available";
+    else if (!root)
+        reason = "tx_retry_source_unavailable";
+    else if (!points || json_object_array_length(points) == 0)
+        reason = response_reason[0] && strcmp(response_reason, "available") ?
+                 response_reason : "tx_retry_history_empty";
+    else if (!any_mapped_point)
+        reason = "tx_retry_history_radio_mapping_unavailable";
+    else
+        reason = "tx_retry_history_warming_up";
+    wifi_capability_bool(capabilities, "tx_n_history", history_available);
+    wifi_capability_reason(capabilities, "tx_n_history", reason);
 }
 
 static void wifi_collect_environment_samples(struct json_object *data,

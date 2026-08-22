@@ -10,6 +10,19 @@
 
 #include <sqlite3.h>
 
+struct json_object *jmx_log_center_event_add(struct json_object *cfg)
+{
+    struct json_object *response = json_object_new_object();
+    struct json_object *data = json_object_new_object();
+
+    assert(cfg != NULL);
+    json_object_object_add(response, "code", json_object_new_int(2000));
+    json_object_object_add(data, "bridged", json_object_new_int(1));
+    json_object_object_add(data, "bridge_failed", json_object_new_int(0));
+    json_object_object_add(response, "data", data);
+    return response;
+}
+
 static struct json_object *make_snapshot(int online, int64_t up_rate)
 {
     struct json_object *root = json_object_new_object();

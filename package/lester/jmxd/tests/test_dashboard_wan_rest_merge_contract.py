@@ -49,6 +49,8 @@ class DashboardWanRestMergeContractTest(unittest.TestCase):
             "conntrack_total",
             "conntrack_mapped_total",
             "conntrack_unmapped",
+            "conntrack_mark_matches",
+            "conntrack_local_source_ignored",
             "conntrack_source",
             "observed_at",
         ):

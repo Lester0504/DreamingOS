@@ -127,6 +127,18 @@ def test_response_health_fields_share_one_current_snapshot():
     assert 'json_object_new_boolean(snap.watchdog.handler_stuck)' not in append
 
 
+def test_sigsegv_diagnostics_are_symbolizable_and_signal_safe():
+    handler = body(MAIN, 'jmx_handle_sigsegv')
+
+    assert 'SA_SIGINFO | SA_RESETHAND' in MAIN
+    assert 'context->uc_mcontext.gregs[REG_RIP]' in handler
+    assert '" fault="' in handler
+    assert '" ip="' in handler
+    assert 'write(STDERR_FILENO' in handler
+    for forbidden in ('malloc(', 'calloc(', 'pthread_mutex', 'json_object_', 'ubus_'):
+        assert forbidden not in handler, forbidden
+
+
 if __name__ == "__main__":
     test_core_status_exports_watchdog_loop_and_ubus_contract_fields()
     test_all_core_ubus_methods_use_a_shared_dispatcher()
@@ -134,4 +146,5 @@ if __name__ == "__main__":
     test_watchdog_recovery_is_sanctioned_abort_only_no_other_control_planes()
     test_fixed_thresholds_and_fixed_memory_are_explicit()
     test_response_health_fields_share_one_current_snapshot()
+    test_sigsegv_diagnostics_are_symbolizable_and_signal_safe()
     print("ok: core watchdog observer contract")

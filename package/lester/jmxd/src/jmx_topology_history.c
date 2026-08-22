@@ -6,6 +6,10 @@
  */
 #include "jmx_topology_history.h"
 
+#define JTH_API_CODE_SUCCESS 2000
+
+extern struct json_object *jmx_log_center_event_add(struct json_object *cfg);
+
 #include <errno.h>
 #include <openssl/sha.h>
 #include <sqlite3.h>
@@ -539,8 +543,115 @@ static int jth_insert_event(int64_t ts_ms, const char *type, const char *entity_
     return rc == SQLITE_DONE ? sqlite3_changes(g_jth_db) : -1;
 }
 
+static void jth_queue_device_notification(struct json_object *notifications,
+                                          int64_t ts_ms, const char *type,
+                                          const char *group, const char *entity_id,
+                                          struct json_object *before,
+                                          struct json_object *after)
+{
+    struct json_object *event;
+    struct json_object *detail;
+    char event_id[65];
+    char dedupe_key[384];
+    char title[256];
+    char detail_text[512];
+    const char *mac = after ? jth_str(after, "mac") : jth_str(before, "mac");
+    const char *name = after ? jth_str(after, "name") : jth_str(before, "name");
+    int restored = type && !strcmp(type, "DEVICE_ONLINE");
+
+    if (!notifications || !type || !entity_id || !entity_id[0] ||
+        (strcmp(type, "DEVICE_OFFLINE") && strcmp(type, "DEVICE_ONLINE")))
+        return;
+    event = json_object_new_object();
+    detail = json_object_new_object();
+    if (!event || !detail) {
+        if (event) json_object_put(event);
+        if (detail) json_object_put(detail);
+        return;
+    }
+    jth_event_id(event_id, ts_ms, type, entity_id, -1);
+    snprintf(dedupe_key, sizeof(dedupe_key), "device:%s:presence", entity_id);
+    snprintf(title, sizeof(title), "%s %s", name && name[0] ? name : entity_id,
+             restored ? "restored" : "offline");
+    snprintf(detail_text, sizeof(detail_text),
+             "infrastructure device %s: group=%s node_id=%s mac=%s",
+             restored ? "restored" : "offline", group ? group : "unknown",
+             entity_id, mac ? mac : "");
+
+    json_object_object_add(detail, "node_id", json_object_new_string(entity_id));
+    json_object_object_add(detail, "device_group",
+                           json_object_new_string(group ? group : ""));
+    json_object_object_add(detail, "mac", json_object_new_string(mac ? mac : ""));
+    json_object_object_add(detail, "name", json_object_new_string(name ? name : ""));
+    json_object_object_add(detail, "before_online",
+                           json_object_new_boolean(jth_online(before, restored ? 0 : 1)));
+    json_object_object_add(detail, "online",
+                           json_object_new_boolean(jth_online(after, restored ? 1 : 0)));
+    json_object_object_add(detail, "transition",
+                           json_object_new_string(restored ? "offline_to_online" :
+                                                          "online_to_offline"));
+
+    json_object_object_add(event, "id", json_object_new_string(event_id));
+    json_object_object_add(event, "type",
+                           json_object_new_string(restored ? "system" : "warning"));
+    json_object_object_add(event, "level",
+                           json_object_new_string(restored ? "notice" : "warning"));
+    json_object_object_add(event, "severity",
+                           json_object_new_string(restored ? "notice" : "warning"));
+    json_object_object_add(event, "category", json_object_new_string("topology.device"));
+    json_object_object_add(event, "module", json_object_new_string("dreamingwrt-core"));
+    json_object_object_add(event, "source", json_object_new_string("topology_history"));
+    json_object_object_add(event, "event",
+                           json_object_new_string(restored ? "device_restored" :
+                                                          "device_offline"));
+    json_object_object_add(event, "title", json_object_new_string(title));
+    json_object_object_add(event, "detail", json_object_new_string(detail_text));
+    json_object_object_add(event, "detail_json", detail);
+    json_object_object_add(event, "target", json_object_new_string(entity_id));
+    json_object_object_add(event, "mac", json_object_new_string(mac ? mac : ""));
+    json_object_object_add(event, "state",
+                           json_object_new_string(restored ? "cleared" : "active"));
+    json_object_object_add(event, "dedupe_key", json_object_new_string(dedupe_key));
+    json_object_object_add(event, "ts", json_object_new_int64(ts_ms / 1000));
+    json_object_array_add(notifications, event);
+}
+
+static void jth_dispatch_notifications(struct json_object *notifications,
+                                       int *stored, int *bridged,
+                                       int *bridge_failed)
+{
+    size_t i;
+
+    if (!notifications)
+        return;
+    for (i = 0; i < json_object_array_length(notifications); i++) {
+        struct json_object *event = json_object_array_get_idx(notifications, i);
+        struct json_object *response = jmx_log_center_event_add(event);
+        struct json_object *code = NULL;
+        struct json_object *data = NULL;
+        struct json_object *value = NULL;
+
+        if (!response)
+            continue;
+        if (json_object_object_get_ex(response, "code", &code) &&
+            json_object_get_int(code) == JTH_API_CODE_SUCCESS) {
+            if (stored) (*stored)++;
+        }
+        if (json_object_object_get_ex(response, "data", &data) && data) {
+            if (bridged && json_object_object_get_ex(data, "bridged", &value))
+                *bridged += json_object_get_int(value);
+            if (bridge_failed &&
+                json_object_object_get_ex(data, "bridge_failed", &value))
+                *bridge_failed += json_object_get_int(value);
+        }
+        json_object_put(response);
+    }
+}
+
 static int jth_diff_array(int64_t ts_ms, struct json_object *before_arr,
-                          struct json_object *after_arr, int kind)
+                          struct json_object *after_arr, int kind,
+                          const char *group, int notify_device,
+                          struct json_object *notifications)
 {
     size_t i;
     int events = 0;
@@ -582,6 +693,9 @@ static int jth_diff_array(int64_t ts_ms, struct json_object *before_arr,
                     rc = jth_insert_event(ts_ms, type, id, before, after,
                                           kind == 3 ? jth_int(after, "index", -1) : -1,
                                           kind >= 2);
+                if (rc > 0 && notify_device)
+                    jth_queue_device_notification(notifications, ts_ms, type,
+                                                  group, id, before, after);
             }
             if (rc > 0)
                 events += rc;
@@ -613,7 +727,8 @@ static int jth_diff_array(int64_t ts_ms, struct json_object *before_arr,
 }
 
 static int jth_diff_devices(int64_t ts_ms, struct json_object *before,
-                            struct json_object *after)
+                            struct json_object *after,
+                            struct json_object *notifications)
 {
     static const char *const groups[] = { "gateways", "switches", "aps", "clients", NULL };
     struct json_object *bi = jth_infra(before);
@@ -622,7 +737,9 @@ static int jth_diff_devices(int64_t ts_ms, struct json_object *before,
     int i;
 
     for (i = 0; groups[i]; i++) {
-        int rc = jth_diff_array(ts_ms, jth_array(bi, groups[i]), jth_array(ai, groups[i]), 0);
+        int rc = jth_diff_array(ts_ms, jth_array(bi, groups[i]),
+                                jth_array(ai, groups[i]), 0, groups[i],
+                                i < 3, notifications);
         if (rc < 0)
             return -1;
         total += rc;
@@ -631,23 +748,27 @@ static int jth_diff_devices(int64_t ts_ms, struct json_object *before,
 }
 
 static int jth_generate_events(int64_t ts_ms, struct json_object *before,
-                               struct json_object *after)
+                               struct json_object *after,
+                               struct json_object *notifications)
 {
     struct json_object *bi = jth_infra(before);
     struct json_object *ai = jth_infra(after);
     int total;
     int rc;
 
-    total = jth_diff_devices(ts_ms, before, after);
+    total = jth_diff_devices(ts_ms, before, after, notifications);
     if (total < 0)
         return -1;
-    rc = jth_diff_array(ts_ms, jth_array(bi, "wans"), jth_array(ai, "wans"), 1);
+    rc = jth_diff_array(ts_ms, jth_array(bi, "wans"), jth_array(ai, "wans"),
+                        1, "wans", 0, notifications);
     if (rc < 0) return -1;
     total += rc;
-    rc = jth_diff_array(ts_ms, jth_array(bi, "links"), jth_array(ai, "links"), 2);
+    rc = jth_diff_array(ts_ms, jth_array(bi, "links"), jth_array(ai, "links"),
+                        2, "links", 0, notifications);
     if (rc < 0) return -1;
     total += rc;
-    rc = jth_diff_array(ts_ms, jth_array(bi, "ports"), jth_array(ai, "ports"), 3);
+    rc = jth_diff_array(ts_ms, jth_array(bi, "ports"), jth_array(ai, "ports"),
+                        3, "ports", 0, notifications);
     if (rc < 0) return -1;
     return total + rc;
 }
@@ -734,6 +855,7 @@ int jmx_topology_history_capture(struct json_object *snapshot, int force_anchor,
     int64_t latest_ts = 0;
     struct json_object *previous = NULL;
     struct json_object *result = NULL;
+    struct json_object *notifications = NULL;
     unsigned char *compressed = NULL;
     size_t compressed_len = 0;
     size_t raw_len = 0;
@@ -741,6 +863,9 @@ int jmx_topology_history_capture(struct json_object *snapshot, int force_anchor,
     int changed;
     int anchor;
     int events = 0;
+    int notification_stored = 0;
+    int notification_bridged = 0;
+    int notification_bridge_failed = 0;
     int pruned = 0;
     int rc = -1;
 
@@ -768,6 +893,7 @@ int jmx_topology_history_capture(struct json_object *snapshot, int force_anchor,
         previous = jth_snapshot_by_timestamp(latest_ts);
         if (!previous)
             goto done;
+        notifications = json_object_new_array();
     }
     if (jth_exec("BEGIN IMMEDIATE") != 0)
         goto done;
@@ -787,7 +913,7 @@ int jmx_topology_history_capture(struct json_object *snapshot, int force_anchor,
     }
     sqlite3_finalize(st); st = NULL;
     if (latest_ts && changed) {
-        events = jth_generate_events(now_ms, previous, snapshot);
+        events = jth_generate_events(now_ms, previous, snapshot, notifications);
         if (events < 0)
             goto rollback;
     }
@@ -796,12 +922,24 @@ int jmx_topology_history_capture(struct json_object *snapshot, int force_anchor,
         goto rollback_after_commit;
     sqlite3_wal_checkpoint_v2(g_jth_db, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
     jth_secure_files();
+    jth_dispatch_notifications(notifications, &notification_stored,
+                               &notification_bridged,
+                               &notification_bridge_failed);
     result = json_object_new_object();
     json_object_object_add(result, "captured", json_object_new_boolean(1));
     json_object_object_add(result, "timestamp", json_object_new_int64(now_ms));
     json_object_object_add(result, "changed", json_object_new_boolean(changed));
     json_object_object_add(result, "anchor", json_object_new_boolean(anchor));
     json_object_object_add(result, "events_created", json_object_new_int(events));
+    json_object_object_add(result, "notification_events",
+                           json_object_new_int(notifications ?
+                               (int)json_object_array_length(notifications) : 0));
+    json_object_object_add(result, "notification_stored",
+                           json_object_new_int(notification_stored));
+    json_object_object_add(result, "notification_bridged",
+                           json_object_new_int(notification_bridged));
+    json_object_object_add(result, "notification_bridge_failed",
+                           json_object_new_int(notification_bridge_failed));
     json_object_object_add(result, "pruned_rows", json_object_new_int(pruned));
     json_object_object_add(result, "state_hash", json_object_new_string(hash));
     json_object_object_add(result, "raw_bytes", json_object_new_int64((int64_t)raw_len));
@@ -818,6 +956,7 @@ rollback_after_commit:
 done:
     free(compressed);
     if (previous) json_object_put(previous);
+    if (notifications) json_object_put(notifications);
     if (rc != 0 && !result)
         result = jth_error(g_jth_db ? sqlite3_errmsg(g_jth_db) : "history_db_unavailable");
     if (result_out) *result_out = result;

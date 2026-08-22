@@ -14,6 +14,11 @@ struct logd_port_state {
     int speed;
     char operstate[32];
     char duplex[32];
+    int counters_valid;
+    uint64_t rx_errors;
+    uint64_t tx_errors;
+    uint64_t rx_dropped;
+    uint64_t tx_dropped;
 };
 
 struct logd_dhcp_lease {
@@ -69,6 +74,8 @@ static void logd_collector_config_default(const char *name, struct logd_collecto
     if (name && !strcmp(name, "port")) {
         cfg->interval_s = 5;
         cfg->cooldown_s = 30;
+        snprintf(cfg->options_json, sizeof(cfg->options_json),
+                 "%s", "{\"error_delta_warn\":10,\"drop_delta_warn\":64}");
     } else if (name && !strcmp(name, "system_log")) {
         cfg->interval_s = 15;
     } else if (name && !strcmp(name, "kernel_log")) {
@@ -1327,6 +1334,56 @@ static int logd_iface_skip(const char *ifname)
     return 0;
 }
 
+static int logd_file_read_u64(const char *path, uint64_t *value)
+{
+    char raw[64];
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (!value || logd_file_read_line(path, raw, sizeof(raw)) != 0)
+        return -1;
+    errno = 0;
+    parsed = strtoull(raw, &end, 10);
+    if (errno || end == raw || (*end && !isspace((unsigned char)*end)))
+        return -1;
+    *value = (uint64_t)parsed;
+    return 0;
+}
+
+static int logd_port_counter_delta(struct logd_port_state *ps,
+                                   uint64_t rx_errors, uint64_t tx_errors,
+                                   uint64_t rx_dropped, uint64_t tx_dropped,
+                                   uint64_t *rx_error_delta,
+                                   uint64_t *tx_error_delta,
+                                   uint64_t *rx_drop_delta,
+                                   uint64_t *tx_drop_delta)
+{
+    int reset;
+
+    if (!ps || !rx_error_delta || !tx_error_delta ||
+        !rx_drop_delta || !tx_drop_delta)
+        return -1;
+    *rx_error_delta = 0;
+    *tx_error_delta = 0;
+    *rx_drop_delta = 0;
+    *tx_drop_delta = 0;
+    reset = !ps->counters_valid || rx_errors < ps->rx_errors ||
+            tx_errors < ps->tx_errors || rx_dropped < ps->rx_dropped ||
+            tx_dropped < ps->tx_dropped;
+    if (!reset) {
+        *rx_error_delta = rx_errors - ps->rx_errors;
+        *tx_error_delta = tx_errors - ps->tx_errors;
+        *rx_drop_delta = rx_dropped - ps->rx_dropped;
+        *tx_drop_delta = tx_dropped - ps->tx_dropped;
+    }
+    ps->rx_errors = rx_errors;
+    ps->tx_errors = tx_errors;
+    ps->rx_dropped = rx_dropped;
+    ps->tx_dropped = tx_dropped;
+    ps->counters_valid = 1;
+    return reset ? 1 : 0;
+}
+
 static int logd_collect_ports(struct logd_collector_config *cfg)
 {
     DIR *dir;
@@ -1334,12 +1391,23 @@ static int logd_collect_ports(struct logd_collector_config *cfg)
     size_t i;
     int changes = 0;
     int cooldown_s = cfg ? cfg->cooldown_s : 30;
+    struct json_object *opts = logd_json_parse_or_object(cfg ? cfg->options_json : NULL);
+    int error_delta_warn = logd_json_int(opts, "error_delta_warn", 10);
+    int drop_delta_warn = logd_json_int(opts, "drop_delta_warn", 64);
+
+    if (error_delta_warn < 1) error_delta_warn = 1;
+    if (error_delta_warn > 1000000000) error_delta_warn = 1000000000;
+    if (drop_delta_warn < 1) drop_delta_warn = 1;
+    if (drop_delta_warn > 1000000000) drop_delta_warn = 1000000000;
 
     for (i = 0; i < ARRAY_SIZE(g_ports); i++)
         g_ports[i].seen = 0;
     dir = opendir("/sys/class/net");
-    if (!dir)
+    if (!dir) {
+        if (opts)
+            json_object_put(opts);
         return -1;
+    }
     while ((de = readdir(dir)) != NULL) {
         char path[256];
         char ifname[32];
@@ -1351,6 +1419,12 @@ static int logd_collect_ports(struct logd_collector_config *cfg)
         int carrier;
         int speed;
         int idx;
+        int counter_reads_ok = 1;
+        uint64_t rx_errors = 0, tx_errors = 0;
+        uint64_t rx_dropped = 0, tx_dropped = 0;
+        uint64_t rx_error_delta = 0, tx_error_delta = 0;
+        uint64_t rx_drop_delta = 0, tx_drop_delta = 0;
+        uint64_t error_delta = 0, drop_delta = 0;
         struct logd_port_state *ps;
 
         if (de->d_name[0] == '.' || logd_iface_skip(de->d_name))
@@ -1375,14 +1449,29 @@ static int logd_collect_ports(struct logd_collector_config *cfg)
         logd_file_read_line(path, oper, sizeof(oper));
         snprintf(path, sizeof(path), "/sys/class/net/%s/duplex", ifname);
         logd_file_read_line(path, duplex, sizeof(duplex));
+        snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/rx_errors", ifname);
+        if (logd_file_read_u64(path, &rx_errors) != 0) counter_reads_ok = 0;
+        snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/tx_errors", ifname);
+        if (logd_file_read_u64(path, &tx_errors) != 0) counter_reads_ok = 0;
+        snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/rx_dropped", ifname);
+        if (logd_file_read_u64(path, &rx_dropped) != 0) counter_reads_ok = 0;
+        snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/tx_dropped", ifname);
+        if (logd_file_read_u64(path, &tx_dropped) != 0) counter_reads_ok = 0;
+        if (counter_reads_ok)
+            logd_port_counter_delta(ps, rx_errors, tx_errors,
+                                    rx_dropped, tx_dropped,
+                                    &rx_error_delta, &tx_error_delta,
+                                    &rx_drop_delta, &tx_drop_delta);
+        else
+            ps->counters_valid = 0;
+        error_delta = rx_error_delta + tx_error_delta;
+        drop_delta = rx_drop_delta + tx_drop_delta;
         if (ps->carrier == -1) {
             ps->carrier = carrier;
             ps->speed = speed;
             snprintf(ps->operstate, sizeof(ps->operstate), "%s", oper);
             snprintf(ps->duplex, sizeof(ps->duplex), "%s", duplex);
-            continue;
-        }
-        if (ps->carrier != carrier) {
+        } else if (ps->carrier != carrier) {
             struct json_object *detail = json_object_new_object();
             snprintf(dedupe, sizeof(dedupe), "port:%s:carrier", ifname);
             snprintf(title, sizeof(title), "%s link %s", ifname, carrier ? "up" : "down");
@@ -1418,6 +1507,54 @@ static int logd_collect_ports(struct logd_collector_config *cfg)
             }
             if (detail) json_object_put(detail);
         }
+        if (counter_reads_ok && error_delta >= (uint64_t)error_delta_warn) {
+            struct json_object *detail = json_object_new_object();
+            snprintf(dedupe, sizeof(dedupe), "port:%s:counter_errors", ifname);
+            snprintf(title, sizeof(title), "%s TX/RX errors increased by %" PRIu64,
+                     ifname, error_delta);
+            if (detail) {
+                json_object_object_add(detail, "iface", json_object_new_string(ifname));
+                json_object_object_add(detail, "rx_errors", json_object_new_int64((int64_t)rx_errors));
+                json_object_object_add(detail, "tx_errors", json_object_new_int64((int64_t)tx_errors));
+                json_object_object_add(detail, "rx_error_delta", json_object_new_int64((int64_t)rx_error_delta));
+                json_object_object_add(detail, "tx_error_delta", json_object_new_int64((int64_t)tx_error_delta));
+                json_object_object_add(detail, "error_delta", json_object_new_int64((int64_t)error_delta));
+                json_object_object_add(detail, "threshold", json_object_new_int(error_delta_warn));
+                json_object_object_add(detail, "sample_interval_seconds",
+                                       json_object_new_int(cfg ? cfg->interval_s : 5));
+            }
+            if (logd_cooldown_allow("port", dedupe, cooldown_s) &&
+                logd_publish_event("warning", "port", "counter_errors", "port",
+                                   ifname, title, dedupe, detail) == 0) {
+                logd_cooldown_mark("port", dedupe, cooldown_s);
+                changes++;
+            }
+            if (detail) json_object_put(detail);
+        }
+        if (counter_reads_ok && drop_delta >= (uint64_t)drop_delta_warn) {
+            struct json_object *detail = json_object_new_object();
+            snprintf(dedupe, sizeof(dedupe), "port:%s:counter_drops", ifname);
+            snprintf(title, sizeof(title), "%s dropped traffic increased by %" PRIu64,
+                     ifname, drop_delta);
+            if (detail) {
+                json_object_object_add(detail, "iface", json_object_new_string(ifname));
+                json_object_object_add(detail, "rx_dropped", json_object_new_int64((int64_t)rx_dropped));
+                json_object_object_add(detail, "tx_dropped", json_object_new_int64((int64_t)tx_dropped));
+                json_object_object_add(detail, "rx_drop_delta", json_object_new_int64((int64_t)rx_drop_delta));
+                json_object_object_add(detail, "tx_drop_delta", json_object_new_int64((int64_t)tx_drop_delta));
+                json_object_object_add(detail, "drop_delta", json_object_new_int64((int64_t)drop_delta));
+                json_object_object_add(detail, "threshold", json_object_new_int(drop_delta_warn));
+                json_object_object_add(detail, "sample_interval_seconds",
+                                       json_object_new_int(cfg ? cfg->interval_s : 5));
+            }
+            if (logd_cooldown_allow("port", dedupe, cooldown_s) &&
+                logd_publish_event("warning", "port", "counter_drops", "port",
+                                   ifname, title, dedupe, detail) == 0) {
+                logd_cooldown_mark("port", dedupe, cooldown_s);
+                changes++;
+            }
+            if (detail) json_object_put(detail);
+        }
         ps->carrier = carrier;
         ps->speed = speed;
         snprintf(ps->operstate, sizeof(ps->operstate), "%s", oper);
@@ -1428,6 +1565,8 @@ static int logd_collect_ports(struct logd_collector_config *cfg)
         if (g_ports[i].known && !g_ports[i].seen)
             g_ports[i].known = 0;
     }
+    if (opts)
+        json_object_put(opts);
     return changes;
 }
 

@@ -145,7 +145,9 @@ class DashboardWanAtomicSampleContractTest(unittest.TestCase):
             "observed_at",
         ):
             self.assertIn(f'"{field}"', body)
-        self.assertIn('"per_wan_conntrack_attribution"', body)
+        self.assertIn('"ctmark"', body)
+        self.assertIn('"ctmark_with_fallback"', body)
+        self.assertNotIn('"per_wan_conntrack_attribution"', body)
         self.assertIn('"global_conntrack_single_wan"', body)
 
     def test_atomic_realtime_reuses_dashboard_conntrack_snapshot(self):

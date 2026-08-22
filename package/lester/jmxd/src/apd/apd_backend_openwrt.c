@@ -2212,6 +2212,225 @@ static int apd_airtime_collect(const char *path, const char *radio_netdev,
     return 0;
 }
 
+/* Cumulative TX retry counters for one radio, summed over its VAPs.
+ *
+ * The radio level (`apstats -r -i wifiN`) prints `Tx Data Packets` and
+ * `Tx failures` but no `Retries` at all -- verified on 31.31 (Xiaomi BE10000 /
+ * QWRT). `Retries` only exists per VAP (`apstats -v -i athN`), so the only
+ * honest cumulative retry numerator for a radio is the sum over every VAP that
+ * belongs to its wiphy. Both counters are monotonic since interface bring-up,
+ * which is what makes them differenceable into history buckets.
+ *
+ * A partial sum is worse than no answer: it would drop the traffic of whichever
+ * VAP failed to report and understate the retry rate, so any VAP that cannot be
+ * read makes the whole radio unsupported.
+ *
+ * `tx_failures` is deliberately not accepted as a substitute. A failure is a
+ * frame that exhausted its retries; a retry is an extra attempt. Substituting
+ * one for the other would fabricate a curve, which the handoff prohibits.
+ */
+#define APD_TX_RETRY_MAX_VAPS 32U
+
+struct apd_tx_retry_stats {
+    uint64_t tx_total;
+    uint64_t tx_retries;
+    unsigned int vap_count;
+    int available;
+    char reason[APD_SURVEY_REASON_LEN + 1];
+};
+
+/* Reads `Tx Data Packets` and `Retries` for a single VAP. Both must be present:
+ * a VAP that reports only one of them cannot contribute a ratio. */
+static int apd_tx_retry_collect_vap(const char *path, const char *vap,
+                                    uint64_t *tx_total, uint64_t *tx_retries,
+                                    char *reason, size_t reason_size)
+{
+    struct apd_command_result result = { 0 };
+    struct apd_airtime_stats stats;
+    char *line = NULL;
+    char *saved = NULL;
+
+    memset(&stats, 0, sizeof(stats));
+    if (!path || !path[0] || !vap || !vap[0] || !tx_total || !tx_retries) {
+        snprintf(reason, reason_size, "%s", "apstats_binary_unavailable");
+        return -1;
+    }
+    if (!apd_survey_safe_interface_name(vap)) {
+        snprintf(reason, reason_size, "%s", "apstats_vap_name_invalid");
+        return -1;
+    }
+    {
+        char *const argv[] = {
+            (char *)path, "-v", "-i", (char *)vap, NULL
+        };
+
+        if (apd_readonly_command(path, argv, &result) != 0) {
+            snprintf(reason, reason_size, "%s",
+                     result.timed_out ? "apstats_vap_timeout" :
+                                        "apstats_vap_failed_or_unsupported");
+            apd_command_result_free(&result);
+            return -1;
+        }
+    }
+    if (!result.text || !result.length) {
+        snprintf(reason, reason_size, "%s", "apstats_vap_no_output");
+        apd_command_result_free(&result);
+        return -1;
+    }
+    line = strtok_r(result.text, "\n", &saved);
+    while (line) {
+        char *trimmed = apd_survey_trim(line);
+
+        if (trimmed && trimmed[0])
+            apd_airtime_parse_line(trimmed, &stats);
+        line = strtok_r(NULL, "\n", &saved);
+    }
+    apd_command_result_free(&result);
+    if (!stats.has_retries) {
+        snprintf(reason, reason_size, "%s", "apstats_vap_retries_absent");
+        return -1;
+    }
+    if (!stats.has_tx_packets) {
+        snprintf(reason, reason_size, "%s", "apstats_vap_tx_packets_absent");
+        return -1;
+    }
+    *tx_total = stats.tx_packets;
+    *tx_retries = stats.retries;
+    return 0;
+}
+
+/* Sums the VAP counters for one wiphy. The radio netdev itself (ARPHRD type
+ * 801) is skipped: it is not a VAP and `apstats -v` does not apply to it. */
+static int apd_tx_retry_collect(const char *path, unsigned int wiphy_index,
+                                struct apd_tx_retry_stats *out)
+{
+    DIR *directory;
+    struct dirent *entry;
+    uint64_t total = 0;
+    uint64_t retries = 0;
+    unsigned int counted = 0;
+
+    if (!out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    if (!path || !path[0]) {
+        snprintf(out->reason, sizeof(out->reason), "%s",
+                 "apstats_binary_unavailable");
+        return -1;
+    }
+    directory = opendir(APD_NET_CLASS_PATH);
+    if (!directory) {
+        snprintf(out->reason, sizeof(out->reason), "%s",
+                 "apstats_sysfs_net_class_unreadable");
+        return -1;
+    }
+    while ((entry = readdir(directory)) != NULL) {
+        char path_buf[PATH_MAX];
+        char vap[IFNAMSIZ] = { 0 };
+        uint64_t vap_total = 0;
+        uint64_t vap_retries = 0;
+        unsigned int observed = 0;
+        unsigned int type = 0;
+        size_t name_len = strlen(entry->d_name);
+
+        if (entry->d_name[0] == '.' || name_len >= sizeof(vap))
+            continue;
+        if (snprintf(path_buf, sizeof(path_buf), "%s/%s/phy80211/index",
+                     APD_NET_CLASS_PATH, entry->d_name) >= (int)sizeof(path_buf) ||
+            apd_neighbor_read_uint_file(path_buf, &observed) != 0 ||
+            observed != wiphy_index)
+            continue;
+        if (snprintf(path_buf, sizeof(path_buf), "%s/%s/type",
+                     APD_NET_CLASS_PATH, entry->d_name) >= (int)sizeof(path_buf) ||
+            apd_neighbor_read_uint_file(path_buf, &type) != 0) {
+            closedir(directory);
+            snprintf(out->reason, sizeof(out->reason), "%s",
+                     "apstats_sysfs_net_class_unreadable");
+            return -1;
+        }
+        if (type == APD_ARPHRD_IEEE80211_RADIO)
+            continue;
+        if (counted >= APD_TX_RETRY_MAX_VAPS) {
+            closedir(directory);
+            snprintf(out->reason, sizeof(out->reason), "%s",
+                     "apstats_vap_count_exceeds_limit");
+            return -1;
+        }
+        memcpy(vap, entry->d_name, name_len + 1);
+        if (apd_tx_retry_collect_vap(path, vap, &vap_total, &vap_retries,
+                                     out->reason, sizeof(out->reason)) != 0) {
+            closedir(directory);
+            return -1;
+        }
+        /* Saturation would silently turn a sum into a smaller number, which the
+         * AC would read as a counter wrap and rebaseline forever. */
+        if (total > UINT64_MAX - vap_total ||
+            retries > UINT64_MAX - vap_retries) {
+            closedir(directory);
+            snprintf(out->reason, sizeof(out->reason), "%s",
+                     "apstats_vap_sum_overflow");
+            return -1;
+        }
+        total += vap_total;
+        retries += vap_retries;
+        counted++;
+    }
+    closedir(directory);
+    if (counted == 0) {
+        snprintf(out->reason, sizeof(out->reason), "%s",
+                 "apstats_no_vap_for_wiphy");
+        return -1;
+    }
+    if (retries > total) {
+        snprintf(out->reason, sizeof(out->reason), "%s",
+                 "apstats_vap_retries_exceed_tx_total");
+        return -1;
+    }
+    out->tx_total = total;
+    out->tx_retries = retries;
+    out->vap_count = counted;
+    out->available = 1;
+    return 0;
+}
+
+/* Adds the cumulative retry pair to an existing `air_stats` object. The AC
+ * ingest only differences counters carrying
+ * `tx_retry_counter_semantics == "cumulative"`, so the flag is the contract:
+ * emitting the numbers without it is a no-op on the controller side. */
+static void apd_tx_retry_decorate(struct json_object *air,
+                                  const struct apd_tx_retry_stats *stats)
+{
+    if (!air)
+        return;
+    if (!stats || !stats->available) {
+        json_object_object_add(air, "tx_retry_available",
+                               json_object_new_boolean(0));
+        json_object_object_add(air, "tx_retry_source", json_object_new_null());
+        json_object_object_add(air, "tx_retry_counter_semantics",
+                               json_object_new_null());
+        json_object_object_add(air, "tx_retry_reason",
+            (stats && stats->reason[0]) ?
+            json_object_new_string(stats->reason) :
+            json_object_new_string("apstats_vap_retry_unavailable"));
+        json_object_object_add(air, "tx_retry_vap_count",
+                               json_object_new_int(0));
+        return;
+    }
+    json_object_object_add(air, "tx_retry_available",
+                           json_object_new_boolean(1));
+    json_object_object_add(air, "tx_retry_source",
+        json_object_new_string("apstats_vap_aggregate"));
+    json_object_object_add(air, "tx_retry_counter_semantics",
+                           json_object_new_string("cumulative"));
+    json_object_object_add(air, "tx_retry_reason", json_object_new_null());
+    json_object_object_add(air, "tx_retry_vap_count",
+                           json_object_new_int((int)stats->vap_count));
+    json_object_object_add(air, "tx_total",
+                           json_object_new_int64((int64_t)stats->tx_total));
+    json_object_object_add(air, "tx_retries",
+                           json_object_new_int64((int64_t)stats->tx_retries));
+}
+
 /* Retry rate as a percentage of offered frames. `Retries` is VAP level, so at
  * radio level this derives from Tx failures over Tx packets, which is what the
  * frontend's retry-rate metric reads. Returns -1 when the inputs are missing or the
@@ -2359,6 +2578,7 @@ static int apd_survey_scan_collect(const char *path, const char *radio_id,
     char airtime_netdev[IFNAMSIZ] = { 0 };
     int have_airtime = 0;
     int airtime_attempted = 0;
+    struct apd_tx_retry_stats tx_retry;
 
     if (!out)
         return -1;
@@ -2421,6 +2641,11 @@ static int apd_survey_scan_collect(const char *path, const char *radio_id,
                                      &airtime) == 0)
             have_airtime = 1;
     }
+    /* Independent of the radio-level block above: the radio level has no
+     * `Retries` counter at all, so a working radio sample says nothing about
+     * whether retry history is available, and a failed one must not suppress it. */
+    (void)apd_tx_retry_collect(apd_find_apstats(), target.wiphy_index,
+                               &tx_retry);
     if (apd_survey_collect_raw(path, target.interface, target.frequency_mhz,
                                &raw) != 0 || !raw.complete) {
         reason = raw.reason[0] ? raw.reason : reason;
@@ -2537,8 +2762,10 @@ result:
         struct json_object *air = apd_airtime_json(&airtime, have_airtime,
                                                   airtime_netdev);
 
-        if (air)
+        if (air) {
+            apd_tx_retry_decorate(air, &tx_retry);
             json_object_object_add(root, "air_stats", air);
+        }
         json_object_object_add(root, "airtime_source", have_airtime ?
             json_object_new_string("apstats_radio") : json_object_new_null());
         json_object_object_add(root, "airtime_reason",
@@ -4643,6 +4870,7 @@ static struct json_object *apd_survey_json(const char *path,
      * overwrites a survey-derived value. */
     if (have_wiphy_index) {
         struct apd_airtime_stats stats;
+        struct apd_tx_retry_stats tx_retry;
         char radio_netdev[IFNAMSIZ] = { 0 };
         int available = 0;
         double vendor_pct = 0.0;
@@ -4660,12 +4888,17 @@ static struct json_object *apd_survey_json(const char *path,
                                          &stats) == 0)
                 available = 1;
         }
+        /* This is the block the controller differences into retry history, so
+         * the VAP sum is attached here regardless of the radio-level outcome. */
+        (void)apd_tx_retry_collect(apd_find_apstats(), wiphy_index, &tx_retry);
         {
             struct json_object *air = apd_airtime_json(&stats, available,
                                                        radio_netdev);
 
-            if (air)
+            if (air) {
+                apd_tx_retry_decorate(air, &tx_retry);
                 json_object_object_add(survey, "air_stats", air);
+            }
         }
         if (available && !sample.complete &&
             apd_airtime_utilization_pct(&stats, &vendor_pct) == 0) {

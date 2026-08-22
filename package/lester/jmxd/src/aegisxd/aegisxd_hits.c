@@ -1400,9 +1400,101 @@ static const char *aegisxd_suricata_risk_from_severity(int severity)
     return "low";
 }
 
+static int aegisxd_suricata_notify_logd(int event_id, int64_t event_ts,
+                                       const char *severity,
+                                       const char *action,
+                                       const char *signature,
+                                       const char *category,
+                                       int gid, int sid, int rev,
+                                       const char *src_ip, int src_port,
+                                       const char *dst_ip, int dst_port,
+                                       const char *proto,
+                                       const char *app_proto,
+                                       const char *flow_id,
+                                       const char *in_iface)
+{
+    struct json_object *event = NULL;
+    struct json_object *detail = NULL;
+    struct blob_buf blob = {};
+    uint32_t object_id = 0;
+    char stable_id[64];
+    char dedupe_key[64];
+    char event_id_text[32];
+    char title[AEGISXD_MAX_TEXT];
+    int blob_ready = 0;
+    int rc = -1;
+
+    if (!g_aegisxd_ubus || event_id <= 0 ||
+        ubus_lookup_id(g_aegisxd_ubus, "dreamingwrt.logd", &object_id) !=
+            UBUS_STATUS_OK)
+        return -1;
+    event = json_object_new_object();
+    detail = json_object_new_object();
+    if (!event || !detail)
+        goto done;
+    snprintf(stable_id, sizeof(stable_id), "aegis-suricata-%d", event_id);
+    snprintf(dedupe_key, sizeof(dedupe_key), "security-detection:%d", event_id);
+    snprintf(event_id_text, sizeof(event_id_text), "%d", event_id);
+    snprintf(title, sizeof(title), "Suricata %s: %s",
+             action && !strcmp(action, "drop") ? "blocked threat" : "detection",
+             signature && signature[0] ? signature : "unnamed rule");
+
+    aegisxd_json_add_string(detail, "aegis_event_id", event_id_text);
+    aegisxd_json_add_string(detail, "producer_event_id", stable_id);
+    json_object_object_add(detail, "rule_gid", json_object_new_int(gid));
+    json_object_object_add(detail, "rule_sid", json_object_new_int(sid));
+    json_object_object_add(detail, "rule_rev", json_object_new_int(rev));
+    aegisxd_json_add_string(detail, "rule_name", signature);
+    aegisxd_json_add_string(detail, "rule_category", category);
+    aegisxd_json_add_string(detail, "direction", "source_to_destination");
+    aegisxd_json_add_string(detail, "source_ip", src_ip);
+    json_object_object_add(detail, "source_port", json_object_new_int(src_port));
+    aegisxd_json_add_string(detail, "destination_ip", dst_ip);
+    json_object_object_add(detail, "destination_port", json_object_new_int(dst_port));
+    aegisxd_json_add_string(detail, "protocol", proto);
+    aegisxd_json_add_string(detail, "app_protocol", app_proto);
+    aegisxd_json_add_string(detail, "flow_id", flow_id);
+    aegisxd_json_add_string(detail, "in_interface", in_iface);
+    aegisxd_json_add_string(detail, "action", action);
+    json_object_object_add(detail, "production_event", json_object_new_boolean(1));
+    aegisxd_json_add_string(detail, "producer_source", "suricata_eve");
+
+    aegisxd_json_add_string(event, "id", stable_id);
+    aegisxd_json_add_string(event, "severity", severity);
+    aegisxd_json_add_string(event, "category", "security");
+    aegisxd_json_add_string(event, "event", "suricata_detection");
+    aegisxd_json_add_string(event, "source", "aegisxd.suricata");
+    aegisxd_json_add_string(event, "title", title);
+    aegisxd_json_add_string(event, "target", dst_ip);
+    aegisxd_json_add_string(event, "ip", src_ip);
+    aegisxd_json_add_string(event, "iface", in_iface);
+    aegisxd_json_add_string(event, "state", "active");
+    aegisxd_json_add_string(event, "dedupe_key", dedupe_key);
+    json_object_object_add(event, "ts", json_object_new_int64(event_ts));
+    json_object_object_add(event, "detail_json", detail);
+    detail = NULL;
+
+    blob_buf_init(&blob, 0);
+    blob_ready = 1;
+    if (!blobmsg_add_json_from_string(
+            &blob, json_object_to_json_string_ext(event, JSON_C_TO_STRING_PLAIN)))
+        goto done;
+    rc = ubus_invoke(g_aegisxd_ubus, object_id, "event_add", blob.head,
+                     NULL, NULL, 750);
+done:
+    if (blob_ready)
+        blob_buf_free(&blob);
+    if (detail)
+        json_object_put(detail);
+    if (event)
+        json_object_put(event);
+    return rc == UBUS_STATUS_OK ? 0 : -1;
+}
+
 static int aegisxd_hits_insert_suricata_event_ex(struct json_object *eve,
                                                   const char *ingest_source,
-                                                  int test_event)
+                                                  int test_event,
+                                                  int production_path)
 {
     sqlite3_stmt *st = NULL;
     struct json_object *meta = NULL;
@@ -1468,10 +1560,11 @@ static int aegisxd_hits_insert_suricata_event_ex(struct json_object *eve,
         return 0;
     risk = aegisxd_suricata_risk_from_severity(severity);
     event_source = (ingest_source && ingest_source[0]) ? ingest_source : "aegisxd.suricata";
-    manual_ingest = strstr(event_source, ".manual") != NULL ||
+    manual_ingest = !production_path ||
+        strstr(event_source, ".manual") != NULL ||
         strstr(event_source, "manual_") != NULL ||
         strstr(event_source, "manual") != NULL;
-    production_event = !manual_ingest && !test_event;
+    production_event = production_path && !manual_ingest && !test_event;
     if (test_event)
         reason = "suricata_eve_manual_test_ingest";
     else if (manual_ingest)
@@ -1550,6 +1643,8 @@ static int aegisxd_hits_insert_suricata_event_ex(struct json_object *eve,
     if (sqlite3_step(st) == SQLITE_DONE) {
         rc = 0;
         g_last_event_id = (int)sqlite3_last_insert_rowid(g_aegisxd_db);
+        sqlite3_finalize(st);
+        st = NULL;
         g_last_event_at = now;
         g_events_inserted++;
         g_suricata_last_event_id = g_last_event_id;
@@ -1561,6 +1656,16 @@ static int aegisxd_hits_insert_suricata_event_ex(struct json_object *eve,
             g_suricata_last_manual_ingest_at = now;
         }
         aegisxd_hits_prune_if_needed(now);
+        if (production_event &&
+            aegisxd_suricata_notify_logd(
+                g_last_event_id, event_ts,
+                strcmp(action, "drop") ? "warning" : "critical",
+                action, signature, category, gid, sid, rev,
+                src_ip, src_port, dst_ip, dst_port, proto, app_proto,
+                flow_id, in_iface) != 0)
+            fprintf(stderr,
+                    "[dreamingwrt-aegisxd] logd bridge failed for suricata event id=%d\n",
+                    g_last_event_id);
     }
 out:
     if (st)
@@ -1572,7 +1677,7 @@ out:
 
 static int aegisxd_hits_insert_suricata_event(struct json_object *eve)
 {
-    return aegisxd_hits_insert_suricata_event_ex(eve, "aegisxd.suricata", 0);
+    return aegisxd_hits_insert_suricata_event_ex(eve, "aegisxd.suricata", 0, 1);
 }
 
 static void aegisxd_suricata_ingest_result_add_reason(struct json_object *resp,
@@ -1622,7 +1727,7 @@ static int aegisxd_suricata_ingest_one(struct json_object *item, const char *sou
         aegisxd_suricata_ingest_result_add_reason(resp, "event_not_object");
         return -1;
     }
-    rc = aegisxd_hits_insert_suricata_event_ex(eve, source, test_event);
+    rc = aegisxd_hits_insert_suricata_event_ex(eve, source, test_event, 0);
     if (parsed_from_string)
         json_object_put(eve);
     if (rc == -2) {
