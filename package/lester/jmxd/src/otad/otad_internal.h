@@ -74,9 +74,11 @@
 #define OTAD_FIRMWARE_HEADER_BYTES (1024U * 1024U)
 #define OTAD_FIRMWARE_MAGIC "DREAMINGWRT-FIRMWARE-V1\n"
 #define OTAD_FIRMWARE_HEADER_NAME "firmware_info.json\n"
-#define OTAD_BOOT_CONFIRM_DELAY_MS 120000
-#define OTAD_REBOOT_RETRY_DELAY_MS 30000
-#define OTAD_STATUS_PROBE_CACHE_TTL_MS 300000
+#define OTAD_BOOT_CONFIRM_DELAY_MS 30000
+#define OTAD_BOOT_OBSERVATION_WINDOW_SEC 600
+#define OTAD_BOOT_RECHECK_DELAY_MS 30000
+#define OTAD_BOOT_HARD_FAILURE_CONFIRMATIONS 3
+#define OTAD_BOOT_RESTART_LIMIT 3
 #define OTAD_STATUS_PROBE_FAILURE_TTL_MS 30000
 #define OTAD_OPERATION_ID_LEN 36
 #define OTAD_UPLOAD_ID_LEN 36
@@ -197,6 +199,14 @@ struct otad_ab_topology {
     uint64_t data_size;
 };
 
+struct otad_boot_readiness {
+    int ready;
+    int degraded;
+    char dimension[64];
+    char reason[128];
+    char subject[160];
+};
+
 extern sqlite3 *g_otad_config_db;
 extern sqlite3 *g_otad_inventory_db;
 extern struct ubus_context *g_otad_ubus;
@@ -314,6 +324,16 @@ int otad_operation_complete_confirmed_boot(
     const char *target_slot, const char *expected_operation_id,
     const char *expected_build_id,
     char operation_id[OTAD_OPERATION_ID_LEN + 1]);
+int otad_operation_complete_automatic_rollback(
+    const char *target_slot, const char *expected_operation_id,
+    const char *error_code, const char *error_message,
+    char operation_id[OTAD_OPERATION_ID_LEN + 1]);
+int otad_boot_readiness_evaluate(struct json_object *health,
+                                 struct otad_boot_readiness *result);
+int otad_boot_services_evaluate(int core_available, int network_available,
+                                struct otad_boot_readiness *result);
+int otad_boot_readiness_requires_rollback(
+    const struct otad_boot_readiness *result);
 struct json_object *otad_operation_status(struct json_object *body);
 struct json_object *otad_operation_status_by_id(const char *operation_id);
 void otad_operations_reconcile_workers(void);

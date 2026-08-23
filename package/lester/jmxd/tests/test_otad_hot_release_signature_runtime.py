@@ -17,6 +17,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from otad_test_deps import find_host_dependencies
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -97,10 +99,6 @@ int syncfs(int);
 
 HARNESS = r'''
 #include "otad_internal.h"
-
-sqlite3 *g_otad_config_db;
-sqlite3 *g_otad_inventory_db;
-struct blob_buf g_otad_blob;
 
 char *blobmsg_format_json(struct blob_attr *attr, bool list)
 {
@@ -201,34 +199,6 @@ def canonical(obj) -> bytes:
     return json.dumps(obj, separators=(",", ":")).encode("utf-8")
 
 
-def find_json_include() -> Path:
-    configured = os.environ.get("JSON_C_INCLUDE", "").strip()
-    candidates = [Path(configured)] if configured else []
-    candidates += [Path("/opt/homebrew/include"), Path("/usr/local/include"),
-                   Path("/usr/include")]
-    for candidate in candidates:
-        if candidate.joinpath("json-c/json.h").is_file():
-            return candidate
-    raise RuntimeError("json-c headers not found")
-
-
-def find_json_library():
-    for root in (Path("/opt/homebrew"), Path("/usr/local"), Path("/usr")):
-        for name in ("libjson-c.a", "libjson-c.dylib", "libjson-c.so"):
-            candidate = root / "lib" / name
-            if candidate.is_file():
-                return candidate
-    return None
-
-
-def find_openssl(json_include: Path):
-    for root in (Path("/opt/homebrew/opt/openssl@3"), Path("/usr/local/opt/openssl@3"),
-                 json_include.parent, Path("/usr")):
-        if root.joinpath("include/openssl/evp.h").is_file() and (root / "lib").is_dir():
-            return root / "include", root / "lib"
-    raise RuntimeError("OpenSSL development files not found")
-
-
 def base_manifest(architecture: str = "") -> dict:
     architecture = architecture or host_architecture()
     return {
@@ -322,9 +292,7 @@ def flip_signature(manifest: dict) -> dict:
 
 
 def main() -> None:
-    json_include = find_json_include()
-    json_library = find_json_library()
-    openssl_include, openssl_lib = find_openssl(json_include)
+    deps = find_host_dependencies(ROOT)
     with tempfile.TemporaryDirectory(prefix="otad-hot-signature-") as td:
         temp = Path(td)
         stub_root = temp / "stubs"
@@ -383,8 +351,8 @@ def main() -> None:
             os.environ.get("CC", "cc"), "-std=gnu11", "-Wall", "-Wextra",
             "-Werror=implicit-function-declaration",
             "-I", str(stub_root),
-            "-I", str(json_include),
-            "-I", str(openssl_include),
+            "-I", str(deps.json_include),
+            "-I", str(deps.openssl_include),
             "-I", str(ROOT / "src/otad"),
             f'-DOTAD_TRUST_POLICY_PATH="{policy_path}"',
             f'-DOTAD_TRUST_KEY_DIR="{keys}"',
@@ -397,13 +365,13 @@ def main() -> None:
             str(ROOT / "src/otad/otad_trust.c"),
             str(ROOT / "src/otad/otad_common.c"),
         ]
-        command += [str(json_library)] if json_library else ["-ljson-c"]
-        command += ["-L", str(openssl_lib), "-lcrypto", "-o", str(binary)]
+        command += [str(deps.json_library)]
+        command += ["-L", str(deps.openssl_library_dir), "-lcrypto", "-o", str(binary)]
         subprocess.run(command, check=True)
 
         env = os.environ.copy()
         existing = env.get("LD_LIBRARY_PATH", "")
-        env["LD_LIBRARY_PATH"] = str(openssl_lib) + (f":{existing}" if existing else "")
+        env["LD_LIBRARY_PATH"] = str(deps.openssl_library_dir) + (f":{existing}" if existing else "")
 
         def run(manifest: dict, expected: str, label: str) -> None:
             path = temp / "manifest.json"
@@ -418,6 +386,17 @@ def main() -> None:
 
         # Forward: a properly signed package verifies.
         run(signed, "ok", "correctly signed package must verify")
+
+        # Device identity is fail-closed: a target component that cannot fit the
+        # signed identity field must be rejected instead of silently truncated.
+        (fixture / "openwrt_release").write_text(
+            f"DISTRIB_TARGET='{'x' * 64}/64'\nDISTRIB_ARCH='x86_64'\n",
+            encoding="ascii")
+        run(signed, "device_target_identity_unavailable",
+            "oversized device target identity must fail closed")
+        (fixture / "openwrt_release").write_text(
+            "DISTRIB_TARGET='x86/64'\nDISTRIB_ARCH='x86_64'\n",
+            encoding="ascii")
 
         # Reverse: one flipped signature byte is refused. Forward and reverse
         # both passing is what makes the forward case meaningful.

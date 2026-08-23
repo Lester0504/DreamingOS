@@ -14,6 +14,8 @@ def between(text: str, start: str, end: str) -> str:
 
 apk = between(SOURCE, "static void scan_apk_manifests", "static void scan_path_recursive")
 scan = between(SOURCE, "struct json_object *otad_inventory_scan", "struct json_object *otad_unknowns_json")
+transaction = between(SOURCE, "static int inventory_scan_transaction_work",
+                      "struct json_object *otad_inventory_scan")
 
 assert 'manifest_dir = "/lib/apk/packages"' in apk
 assert 'strcmp(de->d_name + name_len - 5, ".list")' in apk
@@ -35,7 +37,9 @@ assert 'otad_inventory_action_count("report_only", 0)' in FIRMWARE
 assert '"inventory_reports"' in FIRMWARE
 assert 'SELECT COUNT(*) FROM inventory_unknowns WHERE suggested_action=?1' in FIRMWARE
 assert 'int include_apk = otad_json_bool(body, "include_apk", 1)' in scan
-assert scan.index("scan_apk_manifests(&stats)") < scan.index("scan_metadata_roots(")
+assert transaction.index("scan_apk_manifests(work->stats)") < transaction.index(
+    "scan_metadata_roots(work->stats"
+)
 assert '"include_apk"' in scan
 
 print("ok: otad APK ownership inventory contract")

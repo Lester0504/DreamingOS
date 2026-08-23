@@ -5,6 +5,10 @@
 #include "otad_internal.h"
 #include <zlib.h>
 
+#ifndef OTAD_AB_SLOTS_SUPPORTED
+#define OTAD_AB_SLOTS_SUPPORTED 1
+#endif
+
 #define OTAD_BOOT_MOUNT "/tmp/dreamingwrt/otad-boot"
 #define OTAD_SLOT_MOUNT "/tmp/dreamingwrt/otad-slot"
 
@@ -1072,6 +1076,11 @@ struct json_object *otad_firmware_preflight(struct json_object *body)
     int auto_reboot = otad_json_bool(body, "auto_reboot", 1);
     int blockers = 0;
 
+    if (!OTAD_AB_SLOTS_SUPPORTED) {
+        json_object_put(options);
+        return otad_error("ab_slots_not_supported_on_target",
+                          "full firmware preflight requires an A/B slot target");
+    }
     memset(&info, 0, sizeof(info));
     if (body && json_object_object_get_ex(body, "path", &path_value)) {
         json_object_put(options);
@@ -1168,6 +1177,178 @@ static int otad_run(char *const argv[])
     return otad_run_exit_code(argv) == 0 ? 0 : -1;
 }
 
+static struct json_object *otad_run_json(char *const argv[])
+{
+    unsigned char buffer[4096];
+    struct json_tokener *tokener = NULL;
+    struct json_object *result = NULL;
+    char *text = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+    size_t parsed;
+    pid_t pid;
+    int pipefd[2];
+    int status = 0;
+    int waited = 0;
+    int overflow = 0;
+    ssize_t n;
+
+    if (!argv || !argv[0] || pipe(pipefd) != 0)
+        return NULL;
+    pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return NULL;
+    }
+    if (pid == 0) {
+        int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0)
+            _exit(127);
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDERR_FILENO);
+            close(null_fd);
+        }
+        close(pipefd[1]);
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    while ((n = read(pipefd[0], buffer, sizeof(buffer))) != 0) {
+        char *grown;
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (length + (size_t)n > OTAD_MAX_JSON_BYTES) {
+            overflow = 1;
+            break;
+        }
+        if (length + (size_t)n + 1 > capacity) {
+            size_t next = capacity ? capacity * 2 : 8192;
+
+            while (next < length + (size_t)n + 1)
+                next *= 2;
+            grown = realloc(text, next);
+            if (!grown)
+                break;
+            text = grown;
+            capacity = next;
+        }
+        memcpy(text + length, buffer, (size_t)n);
+        length += (size_t)n;
+    }
+    close(pipefd[0]);
+    for (;;) {
+        pid_t waited_pid = waitpid(pid, &status, 0);
+
+        if (waited_pid == pid) {
+            waited = 1;
+            break;
+        }
+        if (waited_pid < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    if (!waited || !WIFEXITED(status) || overflow || !text || !length ||
+        length > OTAD_MAX_JSON_BYTES)
+        goto done;
+    text[length] = '\0';
+    tokener = json_tokener_new();
+    if (!tokener)
+        goto done;
+    result = json_tokener_parse_ex(tokener, text, (int)length);
+    if (!result || json_tokener_get_error(tokener) != json_tokener_success) {
+        if (result) json_object_put(result);
+        result = NULL;
+        goto done;
+    }
+    parsed = json_tokener_get_parse_end(tokener);
+    while (parsed < length && isspace((unsigned char)text[parsed]))
+        parsed++;
+    if (parsed != length || !json_object_is_type(result, json_type_object)) {
+        json_object_put(result);
+        result = NULL;
+    }
+done:
+    if (tokener) json_tokener_free(tokener);
+    free(text);
+    return result;
+}
+
+static struct json_object *otad_boot_readiness_error(
+    const struct otad_boot_readiness *readiness)
+{
+    struct json_object *error = otad_error(
+        readiness && readiness->reason[0] ? readiness->reason :
+        "boot_readiness_unavailable",
+        "pending slot did not satisfy the structured boot-readiness contract");
+
+    otad_json_add_string(error, "dimension",
+                         readiness ? readiness->dimension : "health_contract");
+    otad_json_add_string(error, "reason",
+                         readiness ? readiness->reason :
+                         "boot_readiness_unavailable");
+    otad_json_add_string(error, "subject",
+                         readiness ? readiness->subject : "dreamingwrt-init");
+    return error;
+}
+
+/* /data is shared by both slots, so storage maintenance cannot justify A/B rollback. */
+static const char *otad_nonrollback_storage_class(const char *reason)
+{
+    if (!reason || !reason[0])
+        return NULL;
+    if (!strcmp(reason, "db_size_warning") ||
+        !strcmp(reason, "storage_watermark_exceeded") ||
+        !strcmp(reason, "retention_watermark_non_blocking") ||
+        !strcmp(reason, "table_rows_warning") ||
+        !strcmp(reason, "table_rows_critical"))
+        return "storage_warning";
+    if (!strcmp(reason, "sqlite_open_failed") ||
+        !strcmp(reason, "database_integrity_failed") ||
+        !strcmp(reason, "database_read_only") ||
+        !strcmp(reason, "required_table_missing") ||
+        !strcmp(reason, "required_schema_unavailable") ||
+        !strcmp(reason, "required_db_missing"))
+        return "data_integrity_failure";
+    return NULL;
+}
+
+static int otad_observation_window_status(int64_t *elapsed_out,
+                                          int64_t *remaining_out)
+{
+    char text[32] = "";
+    char normalized[32];
+    char *end = NULL;
+    int64_t now = otad_now_s();
+    long long started;
+    int64_t elapsed;
+
+    if (!elapsed_out || !remaining_out || now <= 0)
+        return -1;
+    otad_state_get("pending_observation_started_at", text, sizeof(text), "");
+    errno = 0;
+    started = strtoll(text, &end, 10);
+    if (errno || !end || end == text || *end || started <= 0 || started > now) {
+        started = now;
+        snprintf(normalized, sizeof(normalized), "%lld", started);
+        if (otad_state_set("pending_observation_started_at", normalized) != 0)
+            return -1;
+    }
+    elapsed = now - started;
+    if (elapsed < 0)
+        elapsed = 0;
+    *elapsed_out = elapsed;
+    *remaining_out = elapsed >= OTAD_BOOT_OBSERVATION_WINDOW_SEC ? 0 :
+        OTAD_BOOT_OBSERVATION_WINDOW_SEC - elapsed;
+    return 0;
+}
+
 static int otad_write_all_fd(int fd, const unsigned char *data, size_t len)
 {
     size_t written = 0;
@@ -1234,7 +1415,7 @@ static int otad_mount_label(const char *label, const char *mountpoint, char *dev
     return 0;
 }
 
-static int otad_attempts_from_tries(const char *tries)
+static int otad_restarts_from_tries(const char *tries)
 {
     char *end = NULL;
     long value;
@@ -1245,15 +1426,18 @@ static int otad_attempts_from_tries(const char *tries)
     value = strtol(tries, &end, 10);
     if (errno || !end || *end || value < 0 || value > 3)
         return -1;
-    return 3 - (int)value;
+    if (value >= OTAD_BOOT_RESTART_LIMIT)
+        return 0;
+    return OTAD_BOOT_RESTART_LIMIT - 1 - (int)value;
 }
 
-static void otad_slot_mark_pending_boot(const char *slot, int attempts)
+static void otad_slot_mark_pending_boot(const char *slot, int restarts)
 {
     sqlite3_stmt *st;
     int64_t now;
 
-    if (!slot || (slot[0] != 'A' && slot[0] != 'B') || slot[1] || attempts < 1)
+    if (!slot || (slot[0] != 'A' && slot[0] != 'B') || slot[1] ||
+        restarts < 0 || restarts >= OTAD_BOOT_RESTART_LIMIT)
         return;
     st = otad_config_prepare(
         "UPDATE ota_slots SET state='pending_boot',boot_attempts=?1,last_boot_at=?2,updated_at=?2 "
@@ -1262,7 +1446,7 @@ static void otad_slot_mark_pending_boot(const char *slot, int attempts)
     if (!st)
         return;
     now = otad_now_s();
-    sqlite3_bind_int(st, 1, attempts);
+    sqlite3_bind_int(st, 1, restarts);
     sqlite3_bind_int64(st, 2, now);
     sqlite3_bind_text(st, 3, slot, -1, SQLITE_TRANSIENT);
     sqlite3_step(st);
@@ -1396,19 +1580,6 @@ static void otad_state_set_slot_valid(const char *slot, int valid)
         (void)otad_state_set(key, valid ? "1" : "0");
 }
 
-static int otad_grubenv_slot_valid(const char *slot, int *valid)
-{
-    const char *key = otad_slot_valid_key(slot);
-    char value[16] = "";
-
-    if (!key || !valid || otad_grubenv_get(key, value, sizeof(value)) != 0)
-        return -1;
-    if (strcmp(value, "0") && strcmp(value, "1"))
-        return -1;
-    *valid = !strcmp(value, "1");
-    return 0;
-}
-
 static int otad_grubenv_prepare_target(const char *current, const char *target)
 {
     const char *target_key = otad_slot_valid_key(target);
@@ -1436,25 +1607,23 @@ static int otad_grubenv_set_slot_valid(const char *slot, int valid)
     return otad_grubenv_set_args(assignments, 1);
 }
 
-static int otad_grubenv_set_pending(const char *slot)
+static int otad_grubenv_set_pending_tries(const char *slot,
+                                          unsigned int tries)
 {
     char pending_arg[32];
-    char tries_arg[] = "tries_left=3";
+    char tries_arg[32];
     char *assignments[] = { pending_arg, tries_arg };
 
-    if (!otad_slot_valid_key(slot))
+    if (!otad_slot_valid_key(slot) || tries > OTAD_BOOT_RESTART_LIMIT)
         return -1;
     snprintf(pending_arg, sizeof(pending_arg), "pending_slot=%s", slot);
+    snprintf(tries_arg, sizeof(tries_arg), "tries_left=%u", tries);
     return otad_grubenv_set_args(assignments, 2);
 }
 
-static int otad_grubenv_clear_pending(void)
+static int otad_grubenv_set_pending(const char *slot)
 {
-    char pending_arg[] = "pending_slot=";
-    char tries_arg[] = "tries_left=0";
-    char *assignments[] = { pending_arg, tries_arg };
-
-    return otad_grubenv_set_args(assignments, 2);
+    return otad_grubenv_set_pending_tries(slot, OTAD_BOOT_RESTART_LIMIT);
 }
 
 static int otad_grubenv_clear_target(const char *current, const char *target)
@@ -1491,6 +1660,32 @@ static int otad_grubenv_set_boot_selection(const char *active,
              pending ? pending : "");
     snprintf(tries_arg, sizeof(tries_arg), "tries_left=%s", tries);
     snprintf(last_good_arg, sizeof(last_good_arg), "last_good_slot=%s", active);
+    return otad_grubenv_set_args(assignments,
+                                 sizeof(assignments) / sizeof(assignments[0]));
+}
+
+static int otad_grubenv_rollback_candidate(const char *candidate,
+                                           const char *fallback)
+{
+    const char *candidate_key = otad_slot_valid_key(candidate);
+    const char *fallback_key = otad_slot_valid_key(fallback);
+    char candidate_invalid_arg[32];
+    char fallback_valid_arg[32];
+    char active_arg[32];
+    char last_good_arg[32];
+    char pending_arg[] = "pending_slot=";
+    char tries_arg[] = "tries_left=0";
+    char *assignments[] = { candidate_invalid_arg, fallback_valid_arg,
+                            active_arg, pending_arg, tries_arg, last_good_arg };
+
+    if (!candidate_key || !fallback_key || !strcmp(candidate, fallback))
+        return -1;
+    snprintf(candidate_invalid_arg, sizeof(candidate_invalid_arg),
+             "%s=0", candidate_key);
+    snprintf(fallback_valid_arg, sizeof(fallback_valid_arg),
+             "%s=1", fallback_key);
+    snprintf(active_arg, sizeof(active_arg), "active_slot=%s", fallback);
+    snprintf(last_good_arg, sizeof(last_good_arg), "last_good_slot=%s", fallback);
     return otad_grubenv_set_args(assignments,
                                  sizeof(assignments) / sizeof(assignments[0]));
 }
@@ -1742,6 +1937,7 @@ static int otad_firmware_apply_worker(const char *operation_id,
     otad_slot_row_upsert(inactive, &info, "pending", "");
     otad_state_set("active_slot", current);
     otad_state_set("pending_slot", inactive);
+    otad_state_set("pending_observation_started_at", "");
     otad_state_set("state", "pending_reboot");
     otad_state_set("last_error", "");
     if (!result)
@@ -1749,7 +1945,11 @@ static int otad_firmware_apply_worker(const char *operation_id,
     json_object_object_add(result, "slot_written", json_object_new_boolean(1));
     json_object_object_add(result, "pending_reboot", json_object_new_boolean(1));
     json_object_object_add(result, "auto_reboot", json_object_new_boolean(auto_reboot));
-    json_object_object_add(result, "boot_attempts", json_object_new_int(3));
+    json_object_object_add(result, "boot_attempts", json_object_new_int(0));
+    json_object_object_add(result, "restart_limit",
+                           json_object_new_int(OTAD_BOOT_RESTART_LIMIT));
+    json_object_object_add(result, "observation_window_sec",
+                           json_object_new_int(OTAD_BOOT_OBSERVATION_WINDOW_SEC));
     if (otad_operation_update(operation_id, "rebooting", 90, "", "", result) != 0) {
         snprintf(error, sizeof(error), "operation_reboot_state_persist_failed");
         goto fail;
@@ -1880,6 +2080,13 @@ int otad_operation_worker(const char *operation_id)
         strcmp(work.kind, "firmware") || strcmp(work.action, "apply") ||
         strcmp(work.state, "writing"))
         return 1;
+    if (!OTAD_AB_SLOTS_SUPPORTED) {
+        (void)otad_operation_update(operation_id, "failed", 100,
+                                    "ab_slots_not_supported_on_target",
+                                    "full firmware apply requires an A/B slot target",
+                                    NULL);
+        return 1;
+    }
     options = json_tokener_parse(work.options_json);
     if (!options || !json_object_is_type(options, json_type_object)) {
         if (options)
@@ -1906,6 +2113,9 @@ struct json_object *otad_firmware_apply(struct json_object *body)
     char active_id[OTAD_OPERATION_ID_LEN + 1] = "";
     int rc;
 
+    if (!OTAD_AB_SLOTS_SUPPORTED)
+        return otad_error("ab_slots_not_supported_on_target",
+                          "full firmware apply requires an A/B slot target");
     if (body && (json_object_object_get_ex(body, "path", &path_value) ||
                  json_object_object_get_ex(body, "upload_id", &upload_value)))
         return otad_error("apply_requires_preflight_operation",
@@ -1976,10 +2186,21 @@ struct json_object *otad_confirm_boot(struct json_object *body)
     uint32_t network_id;
     sqlite3_stmt *st;
     int operation_rc;
+    int core_available;
+    int network_available;
+    int64_t observation_elapsed = 0;
+    int64_t observation_remaining = 0;
     char *check_argv[] = { "/usr/bin/dreamingwrt-init", "check", "--json", NULL };
+    struct json_object *health = NULL;
+    struct otad_boot_readiness readiness;
 
     char topology_error[128] = "";
 
+    (void)body;
+
+    if (!OTAD_AB_SLOTS_SUPPORTED)
+        return otad_error("ab_slots_not_supported_on_target",
+                          "pending-slot promotion requires an A/B slot target");
     if (otad_ab_topology_discover(&topology, topology_error,
                                   sizeof(topology_error)) != 0)
         return otad_error(topology_error[0] ? topology_error : "ab_topology_invalid",
@@ -1988,13 +2209,51 @@ struct json_object *otad_confirm_boot(struct json_object *body)
     otad_state_get("pending_slot", pending, sizeof(pending), "");
     if (!pending[0] || strcmp(current, pending))
         return otad_error("pending_slot_mismatch", "current boot is not the pending slot");
-    if (!g_otad_ubus || ubus_lookup_id(g_otad_ubus, "dreamingwrt", &core_id) != UBUS_STATUS_OK)
-        return otad_error("core_unhealthy", "dreamingwrt core ubus object is unavailable");
-    if (ubus_lookup_id(g_otad_ubus, "network.interface", &network_id) != UBUS_STATUS_OK)
-        return otad_error("network_unhealthy", "netifd network.interface ubus object is unavailable");
-    if (!otad_json_bool(body, "force", 0) &&
-        (access("/usr/bin/dreamingwrt-init", X_OK) != 0 || otad_run(check_argv) != 0))
-        return otad_error("supervisor_unhealthy", "dreamingwrt-init health check failed");
+    memset(&readiness, 0, sizeof(readiness));
+    core_available = g_otad_ubus &&
+        ubus_lookup_id(g_otad_ubus, "dreamingwrt", &core_id) == UBUS_STATUS_OK;
+    network_available = g_otad_ubus &&
+        ubus_lookup_id(g_otad_ubus, "network.interface", &network_id) == UBUS_STATUS_OK;
+    if (otad_boot_services_evaluate(core_available, network_available,
+                                    &readiness) != 0)
+        return otad_boot_readiness_error(&readiness);
+    if (access("/usr/bin/dreamingwrt-init", X_OK) != 0) {
+        snprintf(readiness.dimension, sizeof(readiness.dimension), "health_contract");
+        snprintf(readiness.reason, sizeof(readiness.reason), "dreamingwrt_init_unavailable");
+        snprintf(readiness.subject, sizeof(readiness.subject), "/usr/bin/dreamingwrt-init");
+        return otad_boot_readiness_error(&readiness);
+    }
+    health = otad_run_json(check_argv);
+    if (!health) {
+        snprintf(readiness.dimension, sizeof(readiness.dimension), "health_contract");
+        snprintf(readiness.reason, sizeof(readiness.reason), "boot_readiness_output_invalid");
+        snprintf(readiness.subject, sizeof(readiness.subject), "dreamingwrt-init");
+        return otad_boot_readiness_error(&readiness);
+    }
+    if (otad_boot_readiness_evaluate(health, &readiness) != 0) {
+        struct json_object *error = otad_boot_readiness_error(&readiness);
+        json_object_put(health);
+        return error;
+    }
+    json_object_put(health);
+    if (otad_observation_window_status(&observation_elapsed,
+                                       &observation_remaining) != 0)
+        return otad_error("boot_observation_state_unavailable",
+                          "pending slot observation state could not be persisted");
+    if (observation_remaining > 0) {
+        struct json_object *waiting = otad_error(
+            "boot_observation_in_progress",
+            "pending slot is healthy and remains inside the post-upgrade observation window");
+
+        otad_json_add_string(waiting, "dimension", "observation_window");
+        otad_json_add_string(waiting, "reason", "boot_observation_in_progress");
+        otad_json_add_string(waiting, "subject", current);
+        json_object_object_add(waiting, "observation_elapsed_sec",
+                               json_object_new_int64(observation_elapsed));
+        json_object_object_add(waiting, "observation_remaining_sec",
+                               json_object_new_int64(observation_remaining));
+        return waiting;
+    }
     if (otad_grubenv_promote(current) != 0)
         return otad_error("grubenv_confirm_failed", "failed to promote pending slot to active");
     otad_slot_status_cache_invalidate();
@@ -2008,6 +2267,7 @@ struct json_object *otad_confirm_boot(struct json_object *body)
     otad_state_set("active_slot", current);
     otad_state_set("pending_slot", "");
     otad_state_set("pending_operation_id", "");
+    otad_state_set("pending_observation_started_at", "");
     otad_state_set("state", "idle");
     otad_state_set("last_error", "");
     st = otad_config_prepare(
@@ -2039,6 +2299,11 @@ void otad_reconcile_boot_state(void)
     char grub_active[16] = "";
     char grub_pending[16] = "";
     char grub_tries[16] = "";
+    char expected_operation_id[OTAD_OPERATION_ID_LEN + 1] = "";
+    char completed_operation_id[OTAD_OPERATION_ID_LEN + 1] = "";
+    char last_readiness_error[OTAD_MAX_TEXT] = "";
+    char persisted_state[64] = "";
+    char rollback_error[OTAD_MAX_TEXT] = "boot_attempts_exhausted";
     int grub_active_rc;
     int grub_pending_rc;
     int grub_tries_rc;
@@ -2049,6 +2314,11 @@ void otad_reconcile_boot_state(void)
     snprintf(current, sizeof(current), "%s", topology.current_slot);
     otad_state_get("active_slot", active, sizeof(active), current);
     otad_state_get("pending_slot", pending, sizeof(pending), "");
+    otad_state_get("pending_operation_id", expected_operation_id,
+                   sizeof(expected_operation_id), "");
+    otad_state_get("last_error", last_readiness_error,
+                   sizeof(last_readiness_error), "");
+    otad_state_get("state", persisted_state, sizeof(persisted_state), "");
     grub_active_rc = otad_grubenv_get("active_slot", grub_active, sizeof(grub_active));
     grub_pending_rc = otad_grubenv_get("pending_slot", grub_pending, sizeof(grub_pending));
     grub_tries_rc = otad_grubenv_get("tries_left", grub_tries, sizeof(grub_tries));
@@ -2065,10 +2335,16 @@ void otad_reconcile_boot_state(void)
             otad_state_set("pending_slot", pending);
         }
         if (!strcmp(current, pending)) {
+            int64_t observation_elapsed = 0;
+            int64_t observation_remaining = 0;
+
             otad_state_set("state", "pending_boot");
             if (grub_tries_rc == 0)
                 otad_slot_mark_pending_boot(pending,
-                                            otad_attempts_from_tries(grub_tries));
+                                            otad_restarts_from_tries(grub_tries));
+            if (otad_observation_window_status(&observation_elapsed,
+                                               &observation_remaining) == 0)
+                (void)otad_db_persist_now();
         } else {
             otad_state_set("state", "pending_reboot");
         }
@@ -2076,8 +2352,47 @@ void otad_reconcile_boot_state(void)
     if (grub_active_rc == 0 && grub_pending_rc == 0 && grub_tries_rc == 0 &&
         !strcmp(current, grub_active) && !grub_pending[0] &&
         atoi(grub_tries) == 0 && !pending[0]) {
+        char rolled_back_slot[2] = "";
+        char rolled_back_state[32] = "";
         char good_build_id[OTAD_MAX_TEXT] = "";
         char completed_operation_id[OTAD_OPERATION_ID_LEN + 1] = "";
+
+        snprintf(rolled_back_slot, sizeof(rolled_back_slot), "%s",
+                 topology.inactive_slot);
+        st = otad_config_prepare(
+            "SELECT state FROM ota_slots WHERE slot_name=?1 LIMIT 1");
+        if (st) {
+            sqlite3_bind_text(st, 1, rolled_back_slot, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(st) == SQLITE_ROW)
+                snprintf(rolled_back_state, sizeof(rolled_back_state), "%s",
+                         sqlite3_column_text(st, 0) ?
+                         (const char *)sqlite3_column_text(st, 0) : "");
+            sqlite3_finalize(st);
+        }
+        if (!strcmp(persisted_state, "rolled_back") &&
+            !strcmp(rolled_back_state, "rolled_back")) {
+            const char *error_code =
+                !strncmp(last_readiness_error, "core_boot_readiness_failed", 26) ?
+                    "core_boot_readiness_failed" : "boot_attempts_exhausted";
+            int operation_rc = otad_operation_complete_automatic_rollback(
+                rolled_back_slot, expected_operation_id, error_code,
+                last_readiness_error[0] ? last_readiness_error : error_code,
+                completed_operation_id);
+
+            if (operation_rc < 0)
+                fprintf(stderr,
+                        "[dreamingwrt-otad] stale rollback operation reconciliation failed slot=%s\n",
+                        rolled_back_slot);
+            else {
+                otad_state_set("pending_operation_id", "");
+                otad_state_set("pending_observation_started_at", "");
+                (void)otad_db_persist_now();
+                fprintf(stderr,
+                        "[dreamingwrt-otad] reconciled stale rollback operation=%s slot=%s reason=%s\n",
+                        completed_operation_id, rolled_back_slot,
+                        last_readiness_error[0] ? last_readiness_error : error_code);
+            }
+        }
 
         st = otad_config_prepare(
             "SELECT build_id FROM ota_slots WHERE slot_name=?1 AND state='good' LIMIT 1");
@@ -2100,24 +2415,78 @@ void otad_reconcile_boot_state(void)
         otad_state_set("active_slot", current);
     if (!pending[0] || !strcmp(current, pending))
         return;
-    if (grub_pending_rc != 0 || grub_pending[0])
+    if (grub_active_rc != 0 || grub_pending_rc != 0 || grub_tries_rc != 0 ||
+        strcmp(current, grub_active) || grub_pending[0] || atoi(grub_tries) != 0)
         return;
+    {
+        const char *storage_class =
+            otad_nonrollback_storage_class(last_readiness_error);
+
+        if (storage_class) {
+            char storage_error[OTAD_MAX_TEXT];
+
+            snprintf(storage_error, sizeof(storage_error), "%s:%s",
+                     storage_class, last_readiness_error);
+            st = otad_config_prepare(
+                "UPDATE ota_slots SET state='degraded',last_error=?1,"
+                "updated_at=?2 WHERE slot_name=?3 AND state IN ('pending','pending_boot')");
+            if (st) {
+                sqlite3_bind_text(st, 1, storage_error, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(st, 2, otad_now_s());
+                sqlite3_bind_text(st, 3, pending, -1, SQLITE_TRANSIENT);
+                sqlite3_step(st);
+                sqlite3_finalize(st);
+            }
+            if (expected_operation_id[0])
+                (void)otad_operation_update(expected_operation_id, "failed", 100,
+                                             storage_class,
+                                             "A/B rollback is not a data recovery action; /data was preserved",
+                                             NULL);
+            otad_state_set("active_slot", current);
+            otad_state_set("pending_slot", "");
+            otad_state_set("pending_operation_id", "");
+            otad_state_set("pending_observation_started_at", "");
+            otad_state_set("state", "degraded");
+            otad_state_set("last_error", storage_error);
+            (void)otad_db_persist_now();
+            fprintf(stderr,
+                    "[dreamingwrt-otad] reconciled non-rollback storage state "
+                    "pending=%s active=%s class=%s reason=%s data_unchanged=1\n",
+                    pending, current, storage_class, last_readiness_error);
+            return;
+        }
+    }
+    if (last_readiness_error[0] &&
+        strcmp(last_readiness_error, "boot_attempts_exhausted"))
+        snprintf(rollback_error, sizeof(rollback_error),
+                 "boot_attempts_exhausted:%s", last_readiness_error);
 
     st = otad_config_prepare(
-        "UPDATE ota_slots SET state='rolled_back',last_error='boot_attempts_exhausted',"
-        "updated_at=?1 WHERE slot_name=?2 AND state IN ('pending','pending_boot')");
+        "UPDATE ota_slots SET state='rolled_back',last_error=?1,"
+        "updated_at=?2 WHERE slot_name=?3 AND state IN ('pending','pending_boot')");
     if (st) {
-        sqlite3_bind_int64(st, 1, otad_now_s());
-        sqlite3_bind_text(st, 2, pending, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 1, rollback_error, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, otad_now_s());
+        sqlite3_bind_text(st, 3, pending, -1, SQLITE_TRANSIENT);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
+    if (otad_operation_complete_automatic_rollback(
+            pending, expected_operation_id, "boot_attempts_exhausted",
+            rollback_error, completed_operation_id) < 0)
+        fprintf(stderr,
+                "[dreamingwrt-otad] failed to complete rolled-back operation pending=%s\n",
+                pending);
     otad_state_set("active_slot", current);
     otad_state_set("pending_slot", "");
+    otad_state_set("pending_operation_id", "");
+    otad_state_set("pending_observation_started_at", "");
     otad_state_set("state", "rolled_back");
-    otad_state_set("last_error", "boot_attempts_exhausted");
-    fprintf(stderr, "[dreamingwrt-otad] reconciled automatic rollback pending=%s active=%s\n",
-            pending, current);
+    otad_state_set("last_error", rollback_error);
+    (void)otad_db_persist_now();
+    fprintf(stderr,
+            "[dreamingwrt-otad] reconciled automatic rollback pending=%s active=%s operation=%s reason=%s\n",
+            pending, current, completed_operation_id, rollback_error);
 }
 
 struct json_object *otad_firmware_rollback(struct json_object *body)
@@ -2133,6 +2502,9 @@ struct json_object *otad_firmware_rollback(struct json_object *body)
     char boot_state_error[128] = "";
 
     (void)body;
+    if (!OTAD_AB_SLOTS_SUPPORTED)
+        return otad_error("ab_slots_not_supported_on_target",
+                          "firmware rollback requires an A/B slot target");
     if (otad_ab_topology_discover(&topology, topology_error,
                                   sizeof(topology_error)) != 0)
         return otad_error(topology_error[0] ? topology_error : "ab_topology_invalid",
@@ -2172,6 +2544,7 @@ struct json_object *otad_firmware_rollback(struct json_object *body)
                                     NULL);
     otad_state_set("pending_slot", "");
     otad_state_set("pending_operation_id", "");
+    otad_state_set("pending_observation_started_at", "");
     otad_state_set("state", "rollback_pending_reboot");
     otad_slot_status_cache_invalidate();
     {
@@ -2256,6 +2629,13 @@ static int64_t otad_status_probe_age_ms(int64_t now_ms)
     int64_t age = now_ms - g_otad_status_probe_cache.probed_monotonic_ms;
 
     return age > 0 ? age : 0;
+}
+
+static int otad_status_probe_cache_expired(
+    enum otad_status_probe_state state, int64_t age_ms)
+{
+    return state != OTAD_STATUS_PROBE_VERIFIED &&
+        age_ms > OTAD_STATUS_PROBE_FAILURE_TTL_MS;
 }
 
 static void otad_status_fingerprint_bytes(uint64_t *fingerprint,
@@ -2429,13 +2809,40 @@ struct json_object *otad_slot_status_json(int force_refresh)
     int64_t now_ms = otad_status_monotonic_ms();
     int64_t probe_age_ms = 0;
     uint64_t ota_metadata_fingerprint = 0;
-    int cache_ttl_ms = OTAD_STATUS_PROBE_CACHE_TTL_MS;
     int identity_verified;
     int ota_metadata_verified;
     int topology_verified = 0;
     int boot_state_verified = 0;
     int live_probe = 0;
 
+    if (!OTAD_AB_SLOTS_SUPPORTED) {
+        json_object_object_add(o, "supported", json_object_new_boolean(0));
+        json_object_object_add(o, "ab_slots_supported",
+                               json_object_new_boolean(0));
+        json_object_object_add(o, "single_slot", json_object_new_boolean(1));
+        otad_json_add_string(o, "mode", "single_slot");
+        otad_json_add_string(o, "layout", "single_slot");
+        json_object_object_add(o, "topology_readonly_verified",
+                               json_object_new_boolean(0));
+        json_object_object_add(o, "boot_state_readonly_verified",
+                               json_object_new_boolean(0));
+        json_object_object_add(o, "inactive_slot_write_target_verified",
+                               json_object_new_boolean(0));
+        json_object_object_add(o, "inactive_slot_bootable_verified",
+                               json_object_new_boolean(0));
+        otad_json_add_string(o, "boot_state_reason",
+                             "ab_slots_not_supported_on_target");
+        otad_json_add_string(probes, "reason",
+                             "ab_slots_not_supported_on_target");
+        otad_json_add_string(probes, "resolver", "target_capability");
+        json_object_array_add(missing,
+                              json_object_new_string("ab_slots"));
+        json_object_object_add(probes, "missing", missing);
+        json_object_object_add(probes, "configuration_values_trusted",
+                               json_object_new_boolean(1));
+        json_object_object_add(o, "probes", probes);
+        return o;
+    }
     memset(&topology, 0, sizeof(topology));
     memset(&identity, 0, sizeof(identity));
     memset(&verified_topology, 0, sizeof(verified_topology));
@@ -2448,15 +2855,13 @@ struct json_object *otad_slot_status_json(int force_refresh)
         otad_slot_status_cache_invalidate();
     if (g_otad_status_probe_cache.valid) {
         probe_age_ms = otad_status_probe_age_ms(now_ms);
-        cache_ttl_ms = g_otad_status_probe_cache.state ==
-            OTAD_STATUS_PROBE_VERIFIED ? OTAD_STATUS_PROBE_CACHE_TTL_MS :
-            OTAD_STATUS_PROBE_FAILURE_TTL_MS;
         if (!identity_verified || !ota_metadata_verified ||
             ota_metadata_fingerprint !=
                 g_otad_status_probe_cache.ota_metadata_fingerprint ||
             !otad_status_topology_identity_equal(
                 &identity, &g_otad_status_probe_cache.topology) ||
-            probe_age_ms > cache_ttl_ms) {
+            otad_status_probe_cache_expired(
+                g_otad_status_probe_cache.state, probe_age_ms)) {
             otad_slot_status_cache_invalidate();
         }
     }
@@ -2574,35 +2979,165 @@ struct json_object *otad_slot_status_json(int force_refresh)
     return o;
 }
 
+static unsigned int g_otad_hard_failure_confirmations;
+/*
+ * Dedupe key for a hard boot failure: "<dimension>:<reason>:<subject>" from
+ * struct otad_boot_readiness, sized to hold all three in full plus separators.
+ * At 256 a long readiness triple was truncated, and two genuinely different
+ * failures then compared equal -- the confirmation counter kept climbing across
+ * unrelated causes until it tripped a rollback reboot on mismatched evidence.
+ */
+static char g_otad_hard_failure_signature[sizeof(((struct otad_boot_readiness *)0)->dimension) +
+                                          sizeof(((struct otad_boot_readiness *)0)->reason) +
+                                          sizeof(((struct otad_boot_readiness *)0)->subject) + 2];
+
+static int otad_pending_boot_rollback(const struct otad_boot_readiness *readiness)
+{
+    struct otad_ab_topology topology;
+    char expected_operation_id[OTAD_OPERATION_ID_LEN + 1] = "";
+    char completed_operation_id[OTAD_OPERATION_ID_LEN + 1] = "";
+    char rollback_error[OTAD_MAX_TEXT];
+    sqlite3_stmt *st;
+
+    if (!readiness ||
+        otad_ab_topology_discover(&topology, NULL, 0) != 0 ||
+        otad_ab_boot_state_readonly_verify(&topology, NULL, 0) != 0 ||
+        !topology.boot_pending_slot[0] ||
+        strcmp(topology.current_slot, topology.boot_pending_slot) ||
+        !topology.boot_active_slot[0] ||
+        !strcmp(topology.current_slot, topology.boot_active_slot) ||
+        !topology.inactive_slot_bootable_verified)
+        return -1;
+    snprintf(rollback_error, sizeof(rollback_error),
+             "core_boot_readiness_failed:%s:%s:%s",
+             readiness->dimension[0] ? readiness->dimension : "unknown",
+             readiness->reason[0] ? readiness->reason : "unknown",
+             readiness->subject[0] ? readiness->subject : "unknown");
+    otad_state_get("pending_operation_id", expected_operation_id,
+                   sizeof(expected_operation_id), "");
+    if (otad_grubenv_rollback_candidate(topology.current_slot,
+                                        topology.boot_active_slot) != 0)
+        return -1;
+    otad_state_set_slot_valid(topology.current_slot, 0);
+    st = otad_config_prepare(
+        "UPDATE ota_slots SET state='rolled_back',last_error=?1,updated_at=?2 "
+        "WHERE slot_name=?3 AND state IN ('pending','pending_boot')");
+    if (st) {
+        sqlite3_bind_text(st, 1, rollback_error, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, otad_now_s());
+        sqlite3_bind_text(st, 3, topology.current_slot, -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    if (otad_operation_complete_automatic_rollback(
+            topology.current_slot, expected_operation_id,
+            "core_boot_readiness_failed", rollback_error,
+            completed_operation_id) < 0)
+        return -1;
+    otad_state_set("active_slot", topology.boot_active_slot);
+    otad_state_set("pending_slot", "");
+    otad_state_set("pending_operation_id", "");
+    otad_state_set("pending_observation_started_at", "");
+    otad_state_set("state", "rolled_back");
+    otad_state_set("last_error", rollback_error);
+    otad_slot_status_cache_invalidate();
+    if (otad_db_persist_now() != 0)
+        return -1;
+    fprintf(stderr,
+            "[dreamingwrt-otad] core boot failure rolled back candidate=%s fallback=%s operation=%s reason=%s\n",
+            topology.current_slot, topology.boot_active_slot,
+            completed_operation_id, rollback_error);
+    return 0;
+}
+
 static void otad_confirm_timer_cb(struct uloop_timeout *timeout)
 {
     struct json_object *body = json_object_new_object();
     struct json_object *resp = otad_confirm_boot(body);
-    const char *error;
+    struct otad_boot_readiness readiness;
+    const char *dimension;
+    const char *reason;
+    const char *subject;
+    char signature[sizeof(g_otad_hard_failure_signature)];
+    char observation[OTAD_MAX_TEXT];
 
     (void)timeout;
     if (!otad_json_bool(resp, "ok", 0)) {
-        char tries[16] = "";
         char *reboot_argv[] = { "/sbin/reboot", NULL };
+        int observation_remaining;
 
-        error = otad_json_str(resp, "error", "health_check_failed");
-        otad_state_set("state", "pending_boot_unhealthy");
-        otad_state_set("last_error", error);
-        (void)otad_grubenv_get("tries_left", tries, sizeof(tries));
-        fprintf(stderr, "[dreamingwrt-otad] pending boot not confirmed: %s\n",
-                error);
-        fprintf(stderr,
-                "[dreamingwrt-otad] requesting reboot for A/B retry tries_left=%s\n",
-                tries[0] ? tries : "unknown");
-
-        /* Keep a retry armed in case the reboot helper itself cannot signal init. */
-        uloop_timeout_set(&g_otad_confirm_timer, OTAD_REBOOT_RETRY_DELAY_MS);
-        sync();
-        if (otad_run(reboot_argv) != 0)
-            fprintf(stderr, "[dreamingwrt-otad] automatic reboot request failed\n");
+        memset(&readiness, 0, sizeof(readiness));
+        dimension = otad_json_str(resp, "dimension", "health_contract");
+        reason = otad_json_str(resp, "reason", "boot_readiness_unavailable");
+        subject = otad_json_str(resp, "subject", "dreamingwrt-init");
+        snprintf(readiness.dimension, sizeof(readiness.dimension), "%s", dimension);
+        snprintf(readiness.reason, sizeof(readiness.reason), "%s", reason);
+        snprintf(readiness.subject, sizeof(readiness.subject), "%s", subject);
+        snprintf(observation, sizeof(observation), "%s:%s:%s",
+                 readiness.dimension, readiness.reason, readiness.subject);
+        if (!strcmp(readiness.reason, "boot_observation_in_progress")) {
+            observation_remaining = otad_json_int(
+                resp, "observation_remaining_sec",
+                OTAD_BOOT_OBSERVATION_WINDOW_SEC);
+            g_otad_hard_failure_confirmations = 0;
+            g_otad_hard_failure_signature[0] = '\0';
+            otad_state_set("state", "pending_boot_observing");
+            otad_state_set("last_error", "");
+            fprintf(stderr,
+                    "[dreamingwrt-otad] pending slot healthy; observation remaining=%d sec\n",
+                    observation_remaining);
+            uloop_timeout_set(&g_otad_confirm_timer,
+                              OTAD_BOOT_RECHECK_DELAY_MS);
+            goto done;
+        }
+        otad_state_set("last_error", observation);
+        if (!otad_boot_readiness_requires_rollback(&readiness)) {
+            g_otad_hard_failure_confirmations = 0;
+            g_otad_hard_failure_signature[0] = '\0';
+            otad_state_set("state", "pending_boot_observing");
+            fprintf(stderr,
+                    "[dreamingwrt-otad] pending boot observation is non-fatal; no reboot: %s\n",
+                    observation);
+            uloop_timeout_set(&g_otad_confirm_timer,
+                              OTAD_BOOT_RECHECK_DELAY_MS);
+        } else {
+            snprintf(signature, sizeof(signature), "%s:%s:%s",
+                     readiness.dimension, readiness.reason, readiness.subject);
+            if (strcmp(signature, g_otad_hard_failure_signature)) {
+                snprintf(g_otad_hard_failure_signature,
+                         sizeof(g_otad_hard_failure_signature), "%s", signature);
+                g_otad_hard_failure_confirmations = 1;
+            } else if (g_otad_hard_failure_confirmations < UINT_MAX) {
+                g_otad_hard_failure_confirmations++;
+            }
+            otad_state_set("state", "pending_boot_hard_failure");
+            fprintf(stderr,
+                    "[dreamingwrt-otad] pending boot hard failure confirmation=%u/%u: %s\n",
+                    g_otad_hard_failure_confirmations,
+                    OTAD_BOOT_HARD_FAILURE_CONFIRMATIONS, observation);
+            if (g_otad_hard_failure_confirmations <
+                OTAD_BOOT_HARD_FAILURE_CONFIRMATIONS) {
+                uloop_timeout_set(&g_otad_confirm_timer,
+                                  OTAD_BOOT_RECHECK_DELAY_MS);
+            } else if (otad_pending_boot_rollback(&readiness) == 0) {
+                sync();
+                if (otad_run(reboot_argv) != 0) {
+                    otad_state_set("state", "rollback_reboot_failed");
+                    fprintf(stderr,
+                            "[dreamingwrt-otad] one-shot rollback reboot request failed\n");
+                }
+            } else {
+                otad_state_set("state", "rollback_prepare_failed");
+                fprintf(stderr,
+                        "[dreamingwrt-otad] refused reboot because rollback state could not be persisted\n");
+            }
+        }
     } else {
+        g_otad_hard_failure_confirmations = 0;
+        g_otad_hard_failure_signature[0] = '\0';
         fprintf(stderr, "[dreamingwrt-otad] pending slot confirmed active\n");
     }
+done:
     json_object_put(resp);
     json_object_put(body);
 }

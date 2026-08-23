@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+from otad_test_deps import find_host_dependencies
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -13,7 +15,10 @@ STUBS = {
     "libubox/blobmsg.h": r"""
 #pragma once
 struct blob_attr;
-struct blob_buf { int unused; };
+struct blob_buf { void *head; };
+void blob_buf_init(struct blob_buf *, int);
+void blob_buf_free(struct blob_buf *);
+int blobmsg_add_json_from_string(struct blob_buf *, const char *);
 """,
     "libubox/blobmsg_json.h": r"""
 #pragma once
@@ -33,7 +38,14 @@ struct uloop_process { pid_t pid; void (*cb)(struct uloop_process *, int); };
 """,
     "libubus.h": r"""
 #pragma once
+typedef unsigned int uint32_t;
 struct ubus_context;
+#define UBUS_STATUS_OK 0
+struct ubus_context *ubus_connect(const char *path);
+int ubus_lookup_id(struct ubus_context *, const char *, uint32_t *);
+int ubus_invoke(struct ubus_context *, uint32_t, const char *, void *,
+                void *, void *, int);
+void ubus_free(struct ubus_context *);
 """,
     "linux/fs.h": r"""
 #pragma once
@@ -61,6 +73,56 @@ sqlite3 *g_otad_inventory_db;
 struct ubus_context *g_otad_ubus;
 struct blob_buf g_otad_blob;
 struct uloop_timeout g_otad_confirm_timer;
+
+void blob_buf_init(struct blob_buf *buf, int id)
+{
+    (void)id;
+    buf->head = NULL;
+}
+
+void blob_buf_free(struct blob_buf *buf)
+{
+    buf->head = NULL;
+}
+
+int blobmsg_add_json_from_string(struct blob_buf *buf, const char *json)
+{
+    (void)buf;
+    (void)json;
+    return 0;
+}
+
+struct ubus_context *ubus_connect(const char *path)
+{
+    (void)path;
+    return NULL;
+}
+
+int ubus_lookup_id(struct ubus_context *ctx, const char *path, uint32_t *id)
+{
+    (void)ctx;
+    (void)path;
+    (void)id;
+    return -1;
+}
+
+int ubus_invoke(struct ubus_context *ctx, uint32_t id, const char *method,
+                void *message, void *callback, void *priv, int timeout)
+{
+    (void)ctx;
+    (void)id;
+    (void)method;
+    (void)message;
+    (void)callback;
+    (void)priv;
+    (void)timeout;
+    return -1;
+}
+
+void ubus_free(struct ubus_context *ctx)
+{
+    (void)ctx;
+}
 
 int64_t otad_now_s(void)
 {
@@ -328,38 +390,8 @@ int main(void)
 '''
 
 
-def dependency_roots() -> tuple[Path, ...]:
-    configured = os.environ.get("OTAD_TEST_DEP_ROOT", "")
-    roots: list[Path] = []
-
-    if configured:
-        root = Path(configured)
-        roots.append(root / "usr" if (root / "usr/include").is_dir() else root)
-    roots.extend((
-        Path("/opt/homebrew"),
-        Path("/usr/local"),
-        Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c/0.19"),
-    ))
-    return tuple(roots)
-
-
-def find_dependencies() -> tuple[Path, Path, Path, Path]:
-    roots = dependency_roots()
-    for root in roots:
-        header = root / "include/json-c/json.h"
-        library = root / "lib/libjson-c.a"
-        if not header.is_file() or not library.is_file():
-            continue
-        crypto_roots = (root, Path("/opt/homebrew/opt/openssl@3"), Path("/usr/local/opt/openssl@3"))
-        for crypto_root in crypto_roots:
-            if (crypto_root / "include/openssl/evp.h").is_file():
-                return (root / "include", library,
-                        crypto_root / "include", root / "lib")
-    raise RuntimeError("json-c and OpenSSL development files not found")
-
-
 def main() -> None:
-    json_include, json_library, crypto_include, library_dir = find_dependencies()
+    deps = find_host_dependencies(ROOT)
     with tempfile.TemporaryDirectory(prefix="otad-sqlite-runtime-") as td:
         temp = Path(td)
         for name, content in STUBS.items():
@@ -378,23 +410,18 @@ def main() -> None:
             "-Wextra",
             "-Werror=implicit-function-declaration",
             "-I", str(temp / "stubs"),
-            "-I", str(json_include),
-            "-I", str(crypto_include),
+            "-I", str(deps.json_include),
+            "-I", str(deps.openssl_include),
             "-I", str(ROOT / "src/otad"),
             f'-DOTAD_CONFIG_DB_PATH="{config_db}"',
             f'-DOTAD_INVENTORY_DB_PATH="{inventory_db}"',
             str(harness),
-            str(json_library),
-            "-L", str(library_dir),
+            str(deps.json_library),
             "-lsqlite3",
             "-o", str(binary),
         ]
         subprocess.run(command, check=True)
         run_env = os.environ.copy()
-        current_library_path = run_env.get("LD_LIBRARY_PATH", "")
-        run_env["LD_LIBRARY_PATH"] = str(library_dir) + (
-            f":{current_library_path}" if current_library_path else ""
-        )
         subprocess.run([str(binary)], check=True, env=run_env)
 
 

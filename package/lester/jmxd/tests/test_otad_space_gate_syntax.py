@@ -4,6 +4,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from otad_test_deps import find_host_dependencies
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = [
@@ -56,7 +58,11 @@ int uloop_process_add(struct uloop_process *);
 struct ubus_context;
 struct ubus_request_data;
 #define UBUS_STATUS_OK 0
+struct ubus_context *ubus_connect(const char *path);
 int ubus_lookup_id(struct ubus_context *, const char *, uint32_t *);
+int ubus_invoke(struct ubus_context *, uint32_t, const char *, void *,
+                void *, void *, int);
+void ubus_free(struct ubus_context *);
 ''',
     "linux/fs.h": r'''
 #pragma once
@@ -90,51 +96,11 @@ int syncfs(int);
 }
 
 
-def find_json_include() -> Path:
-    configured = os.environ.get("JSON_C_INCLUDE", "").strip()
-    if configured:
-        candidate = Path(configured)
-        if candidate.joinpath("json-c/json.h").is_file():
-            return candidate
-        raise RuntimeError(f"JSON_C_INCLUDE does not contain json-c/json.h: {candidate}")
-    dependency_root = os.environ.get("OTAD_TEST_DEP_ROOT", "").strip()
-    candidates = []
-    if dependency_root:
-        root = Path(dependency_root)
-        candidates.append(root / "usr/include" if (root / "usr/include").is_dir()
-                          else root / "include")
-    candidates.extend([
-        Path("/opt/homebrew/include"),
-        Path("/usr/local/include"),
-        Path("/usr/include"),
-    ])
-    for candidate in candidates:
-        if candidate.joinpath("json-c/json.h").is_file():
-            return candidate
-    for base in (Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c"),):
-        matches = list(base.glob("*/include/json-c/json.h"))
-        if matches:
-            return matches[0].parents[1]
-    raise RuntimeError("json-c headers not found")
-
-
-def find_openssl_include(json_include: Path) -> Path:
-    candidates = [
-        json_include,
-        Path("/opt/homebrew/opt/openssl@3/include"),
-        Path("/usr/local/opt/openssl@3/include"),
-        Path("/usr/include"),
-    ]
-    for candidate in candidates:
-        if candidate.joinpath("openssl/evp.h").is_file():
-            return candidate
-    raise RuntimeError("OpenSSL headers not found")
-
-
 def main() -> None:
     cc = os.environ.get("CC", "cc")
-    json_include = find_json_include()
-    openssl_include = find_openssl_include(json_include)
+    deps = find_host_dependencies(
+        ROOT, require_json_library=False, require_crypto_library=False
+    )
     with tempfile.TemporaryDirectory() as td:
         stub_root = Path(td)
         for name, content in STUBS.items():
@@ -147,17 +113,21 @@ def main() -> None:
             "-Wall",
             "-Wextra",
             "-Werror=implicit-function-declaration",
+            "-Werror=unused-parameter",
+            "-Werror=unused-function",
             "-fsyntax-only",
             "-I",
             str(stub_root),
             "-I",
-            str(json_include),
+            str(deps.json_include),
             "-I",
-            str(openssl_include),
+            str(deps.openssl_include),
             "-I",
             str(ROOT / "src/otad"),
             *map(str, SOURCES),
         ]
+        if os.uname().sysname == "Linux":
+            cmd.insert(4, "-Werror=format-truncation")
         subprocess.run(cmd, check=True)
     print("ok: otad changed sources pass host syntax check")
 

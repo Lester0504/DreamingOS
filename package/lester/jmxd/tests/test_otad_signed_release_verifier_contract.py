@@ -37,6 +37,11 @@ for token in (
 
 assert 'json_object_object_del(copy, "release_signature")' in TRUST
 assert 'json_object_equal(signed_json, outer_statement)' in TRUST
+assert "static int trust_identity_field_set(" in TRUST
+assert "value_len >= out_len" in TRUST
+assert "trust_identity_field_set(identity->architecture" in TRUST
+assert "trust_identity_field_set(identity->target" in TRUST
+assert "trust_identity_field_set(identity->subtarget" in TRUST
 assert 'region_offset != OTAD_FIRMWARE_HEADER_BYTES' in TRUST
 assert 'region_size != firmware_size - OTAD_FIRMWARE_HEADER_BYTES' in TRUST
 assert 'OTAD_TRUST_POLICY_PATH "/etc/dreamingwrt/ota-trust/policy.json"' in INTERNAL

@@ -372,6 +372,8 @@ static int otad_operation_state_ok(const char *state)
                      !strcmp(state, "success") || !strcmp(state, "failed"));
 }
 
+static sqlite3_stmt *otad_operation_prepare(const char *sql);
+
 static int otad_operation_transition_ok(const char *from, const char *to)
 {
     if (!otad_operation_state_ok(from) || !otad_operation_state_ok(to))
@@ -389,6 +391,114 @@ static int otad_operation_transition_ok(const char *from, const char *to)
     if (!strcmp(from, "reconnecting"))
         return !strcmp(to, "success") || !strcmp(to, "failed");
     return 0;
+}
+
+static int otad_notify_failed_operation(const char *operation_id,
+                                        int64_t completed_at)
+{
+    sqlite3_stmt *st = NULL;
+    struct json_object *event = NULL;
+    struct json_object *detail = NULL;
+    struct ubus_context *ctx = g_otad_ubus;
+    struct ubus_context *temporary_ctx = NULL;
+    struct blob_buf blob = {};
+    uint32_t object_id = 0;
+    char stable_id[80];
+    char dedupe_key[80];
+    char title[192];
+    char kind[32] = "";
+    char action[32] = "";
+    char from_version[128] = "";
+    char to_version[128] = "";
+    char build_id[128] = "";
+    char target_slot[16] = "";
+    char error_code[160] = "";
+    char error_message[512] = "";
+    int blob_ready = 0;
+    int rc = -1;
+
+    if (!otad_operation_id_ok(operation_id))
+        return -1;
+    st = otad_operation_prepare(
+        "SELECT kind,action,from_version,to_version,build_id,target_slot,"
+        "error_code,error_message FROM ota_operations "
+        "WHERE operation_id=?1 AND state='failed'");
+    if (!st)
+        return -1;
+    sqlite3_bind_text(st, 1, operation_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_ROW)
+        goto done;
+    snprintf(kind, sizeof(kind), "%s", sqlite3_column_text(st, 0));
+    snprintf(action, sizeof(action), "%s", sqlite3_column_text(st, 1));
+    snprintf(from_version, sizeof(from_version), "%s", sqlite3_column_text(st, 2));
+    snprintf(to_version, sizeof(to_version), "%s", sqlite3_column_text(st, 3));
+    snprintf(build_id, sizeof(build_id), "%s", sqlite3_column_text(st, 4));
+    snprintf(target_slot, sizeof(target_slot), "%s", sqlite3_column_text(st, 5));
+    snprintf(error_code, sizeof(error_code), "%s", sqlite3_column_text(st, 6));
+    snprintf(error_message, sizeof(error_message), "%s", sqlite3_column_text(st, 7));
+    sqlite3_finalize(st);
+    st = NULL;
+
+    if (!ctx) {
+        temporary_ctx = ubus_connect(NULL);
+        ctx = temporary_ctx;
+    }
+    if (!ctx || ubus_lookup_id(ctx, "dreamingwrt.logd", &object_id) != UBUS_STATUS_OK)
+        goto done;
+    event = json_object_new_object();
+    detail = json_object_new_object();
+    if (!event || !detail)
+        goto done;
+    snprintf(stable_id, sizeof(stable_id), "otad-failure-%s", operation_id);
+    snprintf(dedupe_key, sizeof(dedupe_key), "application-update:%s", operation_id);
+    snprintf(title, sizeof(title), "%s update failed: %s",
+             !strcmp(kind, "firmware") ? "Firmware" : "Application",
+             error_code[0] ? error_code : "unknown_error");
+
+    otad_json_add_string(detail, "operation_id", operation_id);
+    otad_json_add_string(detail, "producer_event_id", stable_id);
+    otad_json_add_string(detail, "kind", kind);
+    otad_json_add_string(detail, "action", action);
+    otad_json_add_string(detail, "from_version", from_version);
+    otad_json_add_string(detail, "to_version", to_version);
+    otad_json_add_string(detail, "build_id", build_id);
+    otad_json_add_string(detail, "target_slot", target_slot);
+    otad_json_add_string(detail, "error_code", error_code);
+    otad_json_add_string(detail, "error_message", error_message);
+    otad_json_add_string(detail, "state_before", "in_progress");
+    otad_json_add_string(detail, "state_after", "failed");
+
+    otad_json_add_string(event, "id", stable_id);
+    otad_json_add_string(event, "severity", "error");
+    otad_json_add_string(event, "category", "system");
+    otad_json_add_string(event, "event", "application_update_failed");
+    otad_json_add_string(event, "source", "otad.operation");
+    otad_json_add_string(event, "title", title);
+    otad_json_add_string(event, "target", operation_id);
+    otad_json_add_string(event, "state", "active");
+    otad_json_add_string(event, "dedupe_key", dedupe_key);
+    json_object_object_add(event, "ts", json_object_new_int64(completed_at));
+    json_object_object_add(event, "detail_json", detail);
+    detail = NULL;
+
+    blob_buf_init(&blob, 0);
+    blob_ready = 1;
+    if (!blobmsg_add_json_from_string(
+            &blob, json_object_to_json_string_ext(event, JSON_C_TO_STRING_PLAIN)))
+        goto done;
+    rc = ubus_invoke(ctx, object_id, "event_add", blob.head, NULL, NULL, 750);
+done:
+    if (st)
+        sqlite3_finalize(st);
+    if (blob_ready)
+        blob_buf_free(&blob);
+    if (detail)
+        json_object_put(detail);
+    if (event)
+        json_object_put(event);
+    if (temporary_ctx)
+        ubus_free(temporary_ctx);
+    return rc == UBUS_STATUS_OK ? 0 : -1;
 }
 
 static int otad_digest_hex_ok(const char *value)
@@ -698,7 +808,14 @@ int otad_operation_update(const char *operation_id, const char *state,
     sqlite3_bind_text(write_st, 9, current, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(write_st);
     sqlite3_finalize(write_st);
-    return rc == SQLITE_DONE && sqlite3_changes(g_otad_inventory_db) == 1 ? 0 : -1;
+    if (rc != SQLITE_DONE || sqlite3_changes(g_otad_inventory_db) != 1)
+        return -1;
+    if (!strcmp(state, "failed") &&
+        otad_notify_failed_operation(operation_id, now) != 0)
+        fprintf(stderr,
+                "[dreamingwrt-otad] logd bridge failed for operation=%s\n",
+                operation_id);
+    return 0;
 }
 
 int otad_operation_set_source(const char *operation_id, uint64_t source_size,
@@ -970,6 +1087,63 @@ int otad_operation_complete_confirmed_boot(
     return rc == SQLITE_DONE ? 1 : -1;
 }
 
+int otad_operation_complete_automatic_rollback(
+    const char *target_slot, const char *expected_operation_id,
+    const char *error_code, const char *error_message,
+    char operation_id[OTAD_OPERATION_ID_LEN + 1])
+{
+    sqlite3_stmt *st;
+    int64_t now = otad_now_s();
+    int rc;
+
+    const unsigned char *p;
+
+    if (!target_slot || (strcmp(target_slot, "A") && strcmp(target_slot, "B")) ||
+        !operation_id || !error_code || !error_code[0] ||
+        strlen(error_code) >= OTAD_MAX_TEXT ||
+        (error_message && strlen(error_message) >= OTAD_MAX_TEXT) ||
+        (expected_operation_id && expected_operation_id[0] &&
+         !otad_operation_id_ok(expected_operation_id)))
+        return -1;
+    for (p = (const unsigned char *)error_code; *p; p++)
+        if (*p < 0x20 || *p == 0x7f)
+            return -1;
+    for (p = (const unsigned char *)(error_message ? error_message : ""); *p; p++)
+        if ((*p < 0x20 && *p != '\t' && *p != '\n' && *p != '\r') ||
+            *p == 0x7f)
+            return -1;
+    operation_id[0] = '\0';
+    st = otad_operation_prepare(
+        "UPDATE ota_operations SET state='failed',progress=100,worker_pid=0,"
+        "error_code=?1,error_message=?2,updated_at=?3,completed_at=?3 "
+        "WHERE operation_id=(SELECT operation_id FROM ota_operations "
+        "WHERE kind='firmware' AND action='apply' AND target_slot=?4 "
+        "AND state IN ('rebooting','reconnecting') "
+        "AND (?5='' OR operation_id=?5 OR 1=(SELECT COUNT(*) FROM ota_operations "
+        "WHERE kind='firmware' AND action='apply' AND target_slot=?4 "
+        "AND state IN ('rebooting','reconnecting'))) "
+        "ORDER BY updated_at DESC,created_at DESC LIMIT 1) "
+        "RETURNING operation_id");
+    if (!st)
+        return -1;
+    sqlite3_bind_text(st, 1, error_code, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, error_message ? error_message : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 3, now);
+    sqlite3_bind_text(st, 4, target_slot, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, expected_operation_id ? expected_operation_id : "",
+                      -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW)
+        snprintf(operation_id, OTAD_OPERATION_ID_LEN + 1, "%s",
+                 sqlite3_column_text(st, 0));
+    if (rc == SQLITE_ROW)
+        rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (operation_id[0] && rc == SQLITE_DONE)
+        return 0;
+    return rc == SQLITE_DONE ? 1 : -1;
+}
+
 static struct json_object *otad_operation_row_json(sqlite3_stmt *st)
 {
     struct json_object *o = json_object_new_object();
@@ -1215,16 +1389,16 @@ int otad_inventory_add_unknown(const char *path, const char *reason,
  * Best effort by design: failing to flush must not abort an upgrade that is
  * otherwise fine, so the result is reported and the caller decides.
  */
-int otad_db_persist_now(void)
+static int otad_db_checkpoint_sync(sqlite3 *db, const char *path)
 {
     int rc = 0;
     int fd;
 
-    if (!g_otad_config_db)
+    if (!db || !path)
         return -1;
-    if (otad_exec(g_otad_config_db, "PRAGMA wal_checkpoint(TRUNCATE)") != 0)
+    if (otad_exec(db, "PRAGMA wal_checkpoint(TRUNCATE)") != 0)
         rc = -1;
-    fd = open(OTAD_CONFIG_DB_PATH, O_RDONLY | O_CLOEXEC);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd >= 0) {
         if (fsync(fd) != 0)
             rc = -1;
@@ -1232,5 +1406,16 @@ int otad_db_persist_now(void)
     } else {
         rc = -1;
     }
+    return rc;
+}
+
+int otad_db_persist_now(void)
+{
+    int rc = 0;
+
+    if (otad_db_checkpoint_sync(g_otad_config_db, OTAD_CONFIG_DB_PATH) != 0)
+        rc = -1;
+    if (otad_db_checkpoint_sync(g_otad_inventory_db, OTAD_INVENTORY_DB_PATH) != 0)
+        rc = -1;
     return rc;
 }

@@ -8,6 +8,10 @@
 #include <sys/sysmacros.h>
 #endif
 
+#ifndef OTAD_AB_SLOTS_SUPPORTED
+#define OTAD_AB_SLOTS_SUPPORTED 1
+#endif
+
 #ifndef OTAD_TOPOLOGY_SYS_BLOCK_DIR
 #define OTAD_TOPOLOGY_SYS_BLOCK_DIR "/sys/class/block"
 #endif
@@ -1337,6 +1341,11 @@ static int topology_discover(struct otad_ab_topology *topology,
     if (!topology)
         goto invalid;
     memset(topology, 0, sizeof(*topology));
+    if (!OTAD_AB_SLOTS_SUPPORTED) {
+        topology_error(error, error_len,
+                       "ab_slots_not_supported_on_target");
+        return -1;
+    }
     if (topology_partition_load(OTAD_SLOT_A_LABEL, &a) != 0 ||
         topology_partition_load(OTAD_SLOT_B_LABEL, &b) != 0 ||
         topology_partition_load(OTAD_BOOT_LABEL, &boot) != 0 ||

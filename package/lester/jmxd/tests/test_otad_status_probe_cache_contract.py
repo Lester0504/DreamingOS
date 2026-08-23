@@ -28,6 +28,7 @@ require(
     "FROM ota_slots ORDER BY slot_name",
     "otad_status_probe_store_verified",
     "otad_status_probe_store_failure",
+    "otad_status_probe_cache_expired",
     'return "live";',
     'return "cached";',
     'return "stale";',
@@ -50,10 +51,14 @@ assert "boot_state_verified = topology_verified &&" in FIRMWARE
 assert "otad_ab_topology_readonly_probe(" in FIRMWARE
 assert "otad_ab_topology_discover(&verified_topology" in FIRMWARE
 assert "OTAD_STATUS_PROBE_FAILURE_TTL_MS" in FIRMWARE
+assert "return state != OTAD_STATUS_PROBE_VERIFIED &&" in FIRMWARE
+assert "age_ms > OTAD_STATUS_PROBE_FAILURE_TTL_MS;" in FIRMWARE
+assert "OTAD_STATUS_PROBE_CACHE_TTL_MS" not in FIRMWARE
 assert "ota_metadata_fingerprint !=" in FIRMWARE
 assert "PRAGMA data_version" not in FIRMWARE
 
-require(HEADER, "OTAD_STATUS_PROBE_CACHE_TTL_MS", "OTAD_STATUS_PROBE_FAILURE_TTL_MS")
+require(HEADER, "OTAD_STATUS_PROBE_FAILURE_TTL_MS")
+assert "OTAD_STATUS_PROBE_CACHE_TTL_MS" not in HEADER
 require(STATUS, 'otad_json_bool(body, "refresh", 0)')
 require(UBUS, "otad_json_from_blob(msg)", "otad_payload_or_self(body)")
 

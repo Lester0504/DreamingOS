@@ -16,6 +16,18 @@ struct otad_target_identity {
     int boot_schema;
 };
 
+static int trust_identity_field_set(char *out, size_t out_len,
+                                    const char *value)
+{
+    size_t value_len;
+
+    if (!out || !out_len || !value || !(value_len = strlen(value)) ||
+        value_len >= out_len)
+        return -1;
+    memcpy(out, value, value_len + 1);
+    return 0;
+}
+
 static int trust_key_id_ok(const char *value)
 {
     const unsigned char *p;
@@ -185,6 +197,7 @@ static void trust_read_first_line(const char *path, char *out, size_t out_len)
 static int trust_device_identity(struct otad_target_identity *identity)
 {
     struct utsname uts;
+    const char *architecture;
     char *release = NULL;
     size_t release_len = 0;
     char distrib_target[128] = "";
@@ -194,9 +207,11 @@ static int trust_device_identity(struct otad_target_identity *identity)
     if (!identity || uname(&uts) != 0)
         return -1;
     memset(identity, 0, sizeof(*identity));
-    snprintf(identity->architecture, sizeof(identity->architecture), "%s", uts.machine);
-    if (!strcmp(identity->architecture, "amd64"))
-        snprintf(identity->architecture, sizeof(identity->architecture), "x86_64");
+    architecture = !strcmp(uts.machine, "amd64") ? "x86_64" : uts.machine;
+    if (trust_identity_field_set(identity->architecture,
+                                 sizeof(identity->architecture),
+                                 architecture) != 0)
+        return -1;
     if (otad_file_read_all(OTAD_OPENWRT_RELEASE_PATH, &release, &release_len,
                            64 * 1024) != 0 ||
         trust_release_assignment(release, "DISTRIB_TARGET", distrib_target,
@@ -209,8 +224,11 @@ static int trust_device_identity(struct otad_target_identity *identity)
     if (!slash || slash == distrib_target || !slash[1])
         return -1;
     *slash++ = '\0';
-    snprintf(identity->target, sizeof(identity->target), "%s", distrib_target);
-    snprintf(identity->subtarget, sizeof(identity->subtarget), "%s", slash);
+    if (trust_identity_field_set(identity->target, sizeof(identity->target),
+                                 distrib_target) != 0 ||
+        trust_identity_field_set(identity->subtarget,
+                                 sizeof(identity->subtarget), slash) != 0)
+        return -1;
     snprintf(sysinfo_path, sizeof(sysinfo_path), "%s/board_name", OTAD_SYSINFO_DIR);
     trust_read_first_line(sysinfo_path, identity->board, sizeof(identity->board));
     snprintf(sysinfo_path, sizeof(sysinfo_path), "%s/model", OTAD_SYSINFO_DIR);
