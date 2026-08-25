@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "aegisxd_internal.h"
+#include "jmx_strbuf.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -1216,7 +1217,14 @@ static void honeypot_source_mac(const char *source_ip, char *mac, size_t mac_len
     if (!fp) return;
     while (fgets(line, sizeof(line), fp))
         if (sscanf(line, "%63s %63s %63s %63s %63s %63s", ip, hw, flags, found, mask, dev) == 6 &&
-            !strcmp(ip, source_ip)) { snprintf(mac, mac_len, "%s", found); break; }
+            !strcmp(ip, source_ip)) {
+            /* found[] is scanned at width 63 but a real MAC is 17 characters;
+             * anything that does not fit the caller's field is not a MAC, so
+             * leave the field empty rather than store a truncated one. */
+            if (jmx_strbuf_copy(mac, mac_len, found) != 0)
+                mac[0] = '\0';
+            break;
+        }
     fclose(fp);
 }
 

@@ -413,8 +413,13 @@ static int aegisxd_suricata_ip_token_normalize(const char *token, char *out,
             return 0;
         if (prefix >= 0 && (prefix < 24 || prefix > 32))
             return 0;
-        snprintf(out, out_len, "%s%s%s", addr, prefix >= 0 ? "/" : "",
-                 prefix >= 0 ? slash : "");
+        /* out_len is only guaranteed to be 8, so a caller buffer too small for
+         * the CIDR must fail rather than yield a shortened prefix that would be
+         * imported as a different network. */
+        if ((size_t)snprintf(out, out_len, "%s%s%s", addr,
+                             prefix >= 0 ? "/" : "",
+                             prefix >= 0 ? slash : "") >= out_len)
+            return 0;
         if (kind_out)
             *kind_out = "ipv4";
         return 1;
@@ -423,8 +428,9 @@ static int aegisxd_suricata_ip_token_normalize(const char *token, char *out,
         return 0;
     if (prefix >= 0 && (prefix < 48 || prefix > 128))
         return 0;
-    snprintf(out, out_len, "%s%s%s", addr, prefix >= 0 ? "/" : "",
-             prefix >= 0 ? slash : "");
+    if ((size_t)snprintf(out, out_len, "%s%s%s", addr, prefix >= 0 ? "/" : "",
+                         prefix >= 0 ? slash : "") >= out_len)
+        return 0;
     if (kind_out)
         *kind_out = "ipv6";
     return 1;

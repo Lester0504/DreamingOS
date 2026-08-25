@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260810-front-release-01';
+  const VERSION = '20260822-user-auth-savebar-02';
   const MODULE_CLASS = 'user-authentication-route-host';
   const stage = root?.closest('.console-stage');
   const PAGE_BY_ID = {
@@ -77,6 +77,9 @@ export function mount(context = {}) {
     query: '',
     statusFilter: 'all',
     selected: new Set(),
+    accountEnabledBaseline: new Map(),
+    accountEnabledDraft: new Map(),
+    accountSaveResults: [],
     drawer: '',
     editor: {},
     /*
@@ -231,6 +234,11 @@ export function mount(context = {}) {
       const payload = await requestJson(ENDPOINT);
       if (!state.mounted || seq !== state.seq) return;
       state.data = normalizeData(payload);
+      const accounts = asArray(state.data.account_management.accounts);
+      state.accountEnabledBaseline = new Map(accounts.map((row, index) => [firstText(row.id, row.account, row.username, `account-${index}`), row.enabled !== false]));
+      Array.from(state.accountEnabledDraft.entries()).forEach(([id, enabled]) => {
+        if (!state.accountEnabledBaseline.has(id) || state.accountEnabledBaseline.get(id) === enabled) state.accountEnabledDraft.delete(id);
+      });
       if (state.page === 'web') state.webDraft = clone(state.data.web);
       if (state.page === 'notifications') state.notificationDraft = clone(state.data.notifications[state.tab] || {});
       state.loaded = true;
@@ -493,8 +501,10 @@ export function mount(context = {}) {
       if (state.statusFilter === 'all') return true;
       if (state.tab === 'accounts') {
         if (state.statusFilter === 'expired') return bool(row.expired, false);
-        if (state.statusFilter === 'disabled') return row.enabled === false && !bool(row.expired, false);
-        if (state.statusFilter === 'enabled') return row.enabled !== false && !bool(row.expired, false);
+        const id = firstText(row.id, row.account, row.username);
+        const enabled = accountEnabled(id, row);
+        if (state.statusFilter === 'disabled') return !enabled && !bool(row.expired, false);
+        if (state.statusFilter === 'enabled') return enabled && !bool(row.expired, false);
       }
       if (state.tab === 'vouchers') {
         if (state.statusFilter === 'expired') return bool(row.expired, false);
@@ -504,7 +514,7 @@ export function mount(context = {}) {
       return true;
     });
     if (state.tab === 'packages') return rows.map((row, index) => { const id = firstText(row.id, row.name, `package-${index}`); return `<tr>${selectedCell(id)}<td><strong>${escapeHtml(firstText(row.name, '--'))}</strong></td><td>${escapeHtml(firstText(row.validity, row.duration, '--'))}</td><td>${escapeHtml(firstText(row.price, row.fee, '--'))}</td><td>${escapeHtml(firstText(row.up_rate, row.upload, '--'))}</td><td>${escapeHtml(firstText(row.down_rate, row.download, '--'))}</td><td>${escapeHtml(firstText(row.note, '--'))}</td><td>${rowActions('package', id)}</td></tr>`; });
-    if (state.tab === 'accounts') return rows.map((row, index) => { const id = firstText(row.id, row.account, row.username, `account-${index}`); return `<tr>${selectedCell(id)}<td><strong>${escapeHtml(firstText(row.account, row.username, '--'))}</strong></td><td>${escapeHtml(firstText(row.name, '--'))}</td><td>${escapeHtml(firstText(row.auth_type, row.type, '--'))}</td><td>${escapeHtml(firstText(row.package_name, row.package, '--'))}</td><td>${escapeHtml(firstText(row.expires_at, row.expiry, '--'))}</td><td>${escapeHtml(firstText(row.online_duration, row.duration, '--'))}</td><td>${statusPill(row.enabled === false ? '停用' : row.expired ? '过期' : '启用', row.enabled !== false && !row.expired, row.expired)}</td><td>${escapeHtml(firstText(row.note, '--'))}</td><td>${rowActions('account', id)}</td></tr>`; });
+    if (state.tab === 'accounts') return rows.map((row, index) => { const id = firstText(row.id, row.account, row.username, `account-${index}`); const enabled = accountEnabled(id, row); const dirty = state.accountEnabledDraft.has(id); return `<tr>${selectedCell(id)}<td><strong>${escapeHtml(firstText(row.account, row.username, '--'))}</strong></td><td>${escapeHtml(firstText(row.name, '--'))}</td><td>${escapeHtml(firstText(row.auth_type, row.type, '--'))}</td><td>${escapeHtml(firstText(row.package_name, row.package, '--'))}</td><td>${escapeHtml(firstText(row.expires_at, row.expiry, '--'))}</td><td>${escapeHtml(firstText(row.online_duration, row.duration, '--'))}</td><td>${statusPill(row.expired ? '过期' : dirty ? (enabled ? '待启用' : '待停用') : enabled ? '启用' : '停用', enabled && !row.expired, row.expired)}</td><td>${escapeHtml(firstText(row.note, '--'))}</td><td>${rowActions('account', id)}</td></tr>`; });
     if (state.tab === 'ledger') return rows.map((row, index) => { const id = firstText(row.id, `ledger-${index}`); return `<tr>${selectedCell(id)}<td>${escapeHtml(firstText(row.account, '--'))}</td><td>${escapeHtml(firstText(row.name, '--'))}</td><td>${escapeHtml(firstText(row.charged_at, row.time, '--'))}</td><td>${escapeHtml(firstText(row.operator, '--'))}</td><td>${escapeHtml(firstText(row.description, '--'))}</td><td>${escapeHtml(firstText(row.amount, '--'))}</td><td>${escapeHtml(firstText(row.note, '--'))}</td><td>${rowActions('ledger', id)}</td></tr>`; });
     return rows.map((row, index) => { const id = firstText(row.id, row.code, `voucher-${index}`); return `<tr>${selectedCell(id)}<td>${voucherCodeCell(row)}</td><td>${escapeHtml(firstText(row.expires_at, row.expiry, '不过期'))}</td><td>${escapeHtml(firstText(row.duration, '按门户默认时长'))}</td><td>${escapeHtml(voucherUsageText(row))}</td><td>${statusPill(row.used ? '已使用' : row.expired ? '已过期' : '未使用', !row.used && !row.expired, row.expired)}</td><td>${escapeHtml(firstText(row.note, '--'))}</td><td>${rowActions('voucher', id)}</td></tr>`; });
   }
@@ -557,6 +567,28 @@ export function mount(context = {}) {
     const actions = `${batchActions}${voucherActions}${state.tab !== 'ledger' ? actionButton('导入', 'import-accounts', 'import', { disabled: !capability('write_accounts') }) : ''}${actionButton('导出', 'export-accounts', 'export')}${createLabel ? actionButton(createLabel, `add-${state.tab}`, 'plus', { primary: true, disabled: !capability('write_accounts') }) : ''}`;
     const leading = state.tab === 'accounts' || state.tab === 'vouchers' ? `<div class="user-auth-segmented">${(state.tab === 'accounts' ? [['all','全部'],['enabled','已启用'],['disabled','已停用'],['expired','已过期']] : [['all','全部'],['used','已使用'],['unused','未使用'],['expired','已过期']]).map(([id, label]) => `<button type="button" data-user-auth-filter="${id}" class="${state.statusFilter === id ? 'is-active' : ''}">${label}</button>`).join('')}</div>${searchMarkup(state.tab === 'accounts' ? '搜索账号、姓名或备注' : '搜索上网码或备注')}` : searchMarkup(state.tab === 'packages' ? '套餐名称 / 备注' : '搜索账号、人员或描述');
     return `${tableMarkup(title, subtitle, headings, accountRows(), '暂无内容', { select: true, toolbar: tableToolbarControls({ leading, actions }) })}`;
+  }
+
+  function accountEnabled(id, row = {}) {
+    return state.accountEnabledDraft.has(id) ? state.accountEnabledDraft.get(id) : row.enabled !== false;
+  }
+
+  function accountEnabledChanges() {
+    return Array.from(state.accountEnabledDraft.entries())
+      .filter(([id, enabled]) => state.accountEnabledBaseline.get(id) !== enabled);
+  }
+
+  function accountSavebarMarkup() {
+    const changes = accountEnabledChanges();
+    if (state.page !== 'accounts') return '';
+    return ui.floatingSavebarMarkup?.({
+      visible: changes.length > 0 || state.saving,
+      message: state.saving ? '正在保存账号状态…' : `${changes.length} 个账号状态待保存`,
+      busy: state.saving,
+      disabled: !changes.length || !capability('write_accounts'),
+      discardLabel: '撤销更改',
+      saveLabel: '保存账号状态'
+    }) || '';
   }
 
   function delegatedRows() {
@@ -729,7 +761,7 @@ export function mount(context = {}) {
     // 导致 alignPageToolbar() 找不到宿主、工具栏留在 workbench 内，
     // 页面顶部出现一整条空白带。只要该页有工具栏就必须建出 header。
     const needsHeader = Boolean(tabs) || state.page !== 'web';
-    target.innerHTML = `<section class="user-auth-shell is-${state.page}">${needsHeader ? `<header class="user-auth-page-header${tabs ? '' : ' is-toolbar-only'}">${tabs}</header>` : ''}${noticeMarkup()}<main class="user-auth-workbench">${mainMarkup()}</main>${drawerMarkup()}${previewMarkup()}<input type="file" data-user-auth-import-file accept=".json,.csv,application/json,text/csv" hidden></section>`;
+    target.innerHTML = `<section class="user-auth-shell is-${state.page}">${needsHeader ? `<header class="user-auth-page-header${tabs ? '' : ' is-toolbar-only'}">${tabs}</header>` : ''}${noticeMarkup()}<main class="user-auth-workbench">${mainMarkup()}</main>${accountSavebarMarkup()}${drawerMarkup()}${previewMarkup()}<input type="file" data-user-auth-import-file accept=".json,.csv,application/json,text/csv" hidden></section>`;
     // 工具栏搬迁必须作用在刚写入的容器上，否则离屏渲染时搬的是上一轮的节点。
     alignPageToolbar(target);
     ui.mountAll?.(target);
@@ -1181,20 +1213,51 @@ export function mount(context = {}) {
     }
   }
 
-  async function submitBatch(enabled) {
+  function submitBatch(enabled) {
     const ids = Array.from(state.selected);
     if (!ids.length || !capability('write_accounts')) return;
-    try {
-      await requestJson(`${ENDPOINT}/accounts/bulk`, { method: 'POST', body: JSON.stringify({ ids, enabled }) });
-      state.selected.clear();
-      state.notice = enabled ? '已启用所选账号' : '已停用所选账号';
-      state.noticeTone = 'ok';
-      await load(true);
-    } catch (error) {
-      state.notice = `批量操作失败：${firstText(error.message, '后端未接受操作')}`;
-      state.noticeTone = 'error';
-      render();
+    ids.forEach((id) => {
+      if (!state.accountEnabledBaseline.has(id)) return;
+      if (state.accountEnabledBaseline.get(id) === enabled) state.accountEnabledDraft.delete(id);
+      else state.accountEnabledDraft.set(id, enabled);
+    });
+    state.accountSaveResults = [];
+    state.notice = '';
+    state.selected.clear();
+    render();
+  }
+
+  async function saveAccountEnabledDrafts() {
+    const changes = accountEnabledChanges();
+    if (!changes.length || !capability('write_accounts') || state.saving) return;
+    state.saving = true;
+    state.accountSaveResults = [];
+    render();
+    for (const enabled of [true, false]) {
+      const ids = changes.filter((entry) => entry[1] === enabled).map((entry) => entry[0]);
+      if (!ids.length) continue;
+      try {
+        await requestJson(`${ENDPOINT}/accounts/bulk`, { method: 'POST', body: JSON.stringify({ ids, enabled }) });
+        ids.forEach((id) => state.accountSaveResults.push({ id, enabled, ok: true }));
+      } catch (error) {
+        ids.forEach((id) => state.accountSaveResults.push({ id, enabled, ok: false, error: firstText(error.message, '后端未接受操作') }));
+      }
     }
+    await load(true);
+    state.accountSaveResults.forEach((result) => {
+      if (result.ok && state.accountEnabledBaseline.get(result.id) !== result.enabled) {
+        result.ok = false;
+        result.error = '保存后回读与草稿不一致';
+        state.accountEnabledDraft.set(result.id, result.enabled);
+      }
+    });
+    const failed = state.accountSaveResults.filter((result) => !result.ok);
+    state.notice = failed.length
+      ? `${state.accountSaveResults.length - failed.length} 个账号已保存，${failed.length} 个失败并保留草稿。`
+      : `${state.accountSaveResults.length} 个账号状态已保存。`;
+    state.noticeTone = failed.length ? 'warning' : 'ok';
+    state.saving = false;
+    render();
   }
 
   async function cleanExpiredVouchers() {
@@ -1304,6 +1367,8 @@ export function mount(context = {}) {
   }
 
   function onClick(event) {
+    if (event.target.closest('[data-dwrt-savebar-discard]')) { state.accountEnabledDraft.clear(); state.accountSaveResults = []; state.notice = ''; render(); return; }
+    if (event.target.closest('[data-dwrt-savebar-save]')) { saveAccountEnabledDrafts(); return; }
     if (event.target.closest('[data-user-auth-web-reset]')) { state.webDraft = clone(state.data.web); rerenderWebDesigner(); return; }
     if (event.target.closest('[data-user-auth-web-save]')) { saveWebDesigner(); return; }
     if (event.target.closest('[data-user-auth-voucher-copy]')) { copyVoucherCodes(event.target.closest('[data-user-auth-voucher-copy]')); return; }

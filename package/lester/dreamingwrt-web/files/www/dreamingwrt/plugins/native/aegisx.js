@@ -4,7 +4,8 @@ export function mount(context = {}) {
   const api = context.api || {};
   const utils = context.utils || {};
   const ui = context.ui || {};
-  const VERSION = '20260810-front-release-01';
+  const VERSION = '20260822-aegisx-config-savebar-02';
+  const CONFIG_DRAFT_KEY = 'dwrt.aegisx.config-draft.v1';
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
   const ENDPOINTS = {
     status: '/api/v1/aegis/status',
@@ -150,6 +151,9 @@ export function mount(context = {}) {
      * 所以这里存的是分类结果，不是一个布尔。
      */
     netflowExport: null, netflowExportState: '', netflowExportReason: '', netflowExportDraft: null,
+    configBaseline: { geo: null, identification: null, logSettings: null, netflow: null },
+    identificationDraft: null,
+    configSaveErrors: {},
     feeds: {}, feedStatus: {}, feedImportStatus: {}, signatureCategories: {}, signaturePolicies: { items: [], counts: {}, total: 0, limit: 50, offset: 0 },
     contentDraft: null, appBlockDraft: null, honeypotDraft: null, signatureDraft: null, pcdnSyncPreview: null, pcdnPendingIntent: null, pcdnJobId: '', feedPreview: null,
     geoQuery: '', geoDraftEnabled: null, appQuery: '', eventQuery: '', signatureQuery: '', signaturePage: 0, jobPollAttempts: 0, mounted: true, seq: 0
@@ -187,6 +191,7 @@ export function mount(context = {}) {
     return [];
   }
   function unwrap(value) { return value?.data ?? value?.raw?.data ?? value?.raw ?? value ?? {}; }
+  function clone(value) { return value == null ? value : JSON.parse(JSON.stringify(value)); }
   function message(error, fallback = '操作失败') {
     const key = firstText(error?.error, error?.message, error?.code, error);
     return ERROR_TEXT[key] || key || fallback;
@@ -245,6 +250,11 @@ export function mount(context = {}) {
   }
   function runtime() { return state.runtime?.runtime || state.runtime || state.status?.runtime || {}; }
   function capabilities() { return state.status?.capabilities || {}; }
+  function currentRole() {
+    try { return firstText(localStorage.getItem('dreamingwrt.web.role')).toLowerCase(); }
+    catch (_) { return ''; }
+  }
+  function configWriteAllowed() { return !['viewer', 'user'].includes(currentRole()); }
   function bool(value) { return value === true || value === 1 || value === '1' || value === 'true' || value === 'enabled' || value === 'active' || value === 'running'; }
   function active(value) { return !['', 'off', 'stopped', 'disabled', 'inactive', 'false', '0'].includes(String(value ?? '').toLowerCase()); }
   function slug(prefix = 'resource') { return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`; }
@@ -330,14 +340,20 @@ export function mount(context = {}) {
       const [key] = requests[index];
       const value = result.value;
       if (key === 'events') state.events = asArray(value, ['events', 'items']);
-      else if (key === 'geo') state.geo = value?.data || value || state.geo;
+      else if (key === 'geo') {
+        if (!configResourceDirty('geo')) state.geo = value?.data || value || state.geo;
+      }
       else if (key === 'honeypotEvents') state.honeypotEvents = asArray(value, ['items', 'events']);
       else if (key === 'overrides') state.overrides = asArray(value, ['items']);
-      else if (key === 'identification') state.identification = value?.data || value || {};
+      else if (key === 'identification') {
+        if (!configResourceDirty('identification')) state.identification = value?.data || value || {};
+      }
       else if (key === 'appBlocks') state.appBlocks = value?.data || value || state.appBlocks;
       else if (key === 'appCatalog') state.appCatalog = asArray(value?.data || value, ['applications', 'items']);
       else if (key === 'pcdn') state.pcdn = value?.data || value || {};
-      else if (key === 'logSettings') state.logSettings = value?.data || value || {};
+      else if (key === 'logSettings') {
+        if (!configResourceDirty('logs')) state.logSettings = value?.data || value || {};
+      }
       else if (key === 'inspectionCa') state.inspectionCa = value?.data || value || {};
       else if (key === 'inspectionCaDistributions') state.inspectionCaDistributions = value?.data || value || state.inspectionCaDistributions;
       else if (key === 'lans') state.lans = asArray(value?.data || value, ['lans', 'items']);
@@ -349,6 +365,7 @@ export function mount(context = {}) {
       .filter(({ item, key }) => item.status === 'rejected' && !optionalKeys.has(key))
       .map(({ item }) => message(item.reason)).filter(Boolean);
     state.error = failures.length ? `部分状态读取失败：${[...new Set(failures)].join(' · ')}` : '';
+    hydrateConfigBaselines();
     state.loading = false;
     render();
   }
@@ -365,9 +382,10 @@ export function mount(context = {}) {
     try {
       const value = await requestJson(ENDPOINTS.flowdExportSettings, { method: 'GET' });
       if (!state.mounted || seq !== state.seq) return;
-      state.netflowExport = value?.data || value || {};
+      if (!configResourceDirty('netflow')) state.netflowExport = value?.data || value || {};
       state.netflowExportState = 'ok';
       state.netflowExportReason = '';
+      hydrateConfigBaselines();
     } catch (error) {
       if (!state.mounted || seq !== state.seq) return;
       state.netflowExport = null;
@@ -441,6 +459,106 @@ export function mount(context = {}) {
   }
   function geoControlEnabled() {
     return state.geoDraftEnabled === null ? geoConfiguredEnabled() : state.geoDraftEnabled;
+  }
+  function geoPayload(source = state.geo) {
+    const countries = asArray(source?.countries);
+    const rules = asArray(source?.rules);
+    const fallback = rules[0] || geoRule();
+    return {
+      countries: countries.map((item) => ({ id: item.id || item.code, enabled: bool(item.enabled) })),
+      rules: (rules.length ? rules : [fallback]).map((item) => ({
+        id: item.id || 'aegisx-region-default', name: item.name || '区域拦截',
+        action: item.action === 'allow' ? 'allow' : 'block',
+        direction: ['outbound', 'inbound'].includes(item.direction) ? item.direction : 'both',
+        src_zone: item.src_zone || 'wan', dst_zone: item.dst_zone || '', enabled: bool(item.enabled)
+      }))
+    };
+  }
+  function stable(value) { return JSON.stringify(value); }
+  function baselineLogLevels() {
+    const source = state.configBaseline.logSettings;
+    const levels = source?.settings?.log_levels || source?.log_levels || {};
+    return Object.fromEntries(LOG_LEVEL_GROUPS.map(([group]) => {
+      const entry = levels[group];
+      return [group, typeof entry === 'string' ? entry : firstText(entry?.level, 'auto')];
+    }));
+  }
+  function configResourceDirty(resource) {
+    if (resource === 'geo') return Boolean(state.configBaseline.geo) && stable(geoPayload()) !== stable(geoPayload(state.configBaseline.geo));
+    if (resource === 'identification') return state.identificationDraft !== null && state.identificationDraft !== identificationModeFrom(state.configBaseline.identification);
+    if (resource === 'logs') {
+      const baseline = baselineLogLevels();
+      return Object.entries(state.logLevelDraft).some(([group, value]) => baseline[group] !== value);
+    }
+    if (resource === 'netflow') return Boolean(state.netflowExportDraft && state.configBaseline.netflow)
+      && stable(netflowPayload(state.netflowExportDraft)) !== stable(netflowPayload(defaultNetflowDraft(state.configBaseline.netflow)));
+    return false;
+  }
+  function dirtyConfigResources() {
+    return ['geo', 'identification', 'logs', 'netflow'].filter(configResourceDirty);
+  }
+  function storedConfigDrafts() {
+    try {
+      const value = JSON.parse(sessionStorage.getItem(CONFIG_DRAFT_KEY) || '{}');
+      return value && typeof value === 'object' ? value : {};
+    } catch (_) { return {}; }
+  }
+  function persistConfigDrafts() {
+    const resources = dirtyConfigResources();
+    try {
+      if (!resources.length) {
+        sessionStorage.removeItem(CONFIG_DRAFT_KEY);
+        return;
+      }
+      const payload = {};
+      if (resources.includes('geo')) payload.geo = geoPayload();
+      if (resources.includes('identification')) payload.identification = state.identificationDraft;
+      if (resources.includes('logs')) payload.logs = clone(state.logLevelDraft);
+      if (resources.includes('netflow')) payload.netflow = clone(state.netflowExportDraft);
+      sessionStorage.setItem(CONFIG_DRAFT_KEY, JSON.stringify(payload));
+    } catch (_) {}
+  }
+  function restoreStoredConfigDrafts() {
+    if (!configWriteAllowed()) return;
+    const stored = storedConfigDrafts();
+    if (stored.geo && state.configBaseline.geo && !configResourceDirty('geo')) {
+      const enabledById = new Map(asArray(stored.geo.countries).map((item) => [firstText(item.id, item.code), bool(item.enabled)]));
+      const countries = asArray(state.configBaseline.geo.countries).map((item) => {
+        const id = firstText(item.id, item.code);
+        return enabledById.has(id) ? { ...clone(item), enabled: enabledById.get(id) } : clone(item);
+      });
+      state.geo = { ...clone(state.configBaseline.geo), countries, rules: clone(stored.geo.rules || state.configBaseline.geo.rules || []) };
+      state.geoDraftEnabled = bool(stored.geo.rules?.[0]?.enabled);
+    }
+    if (stored.identification && state.configBaseline.identification && !configResourceDirty('identification')) state.identificationDraft = stored.identification;
+    if (stored.logs && state.configBaseline.logSettings && !configResourceDirty('logs')) state.logLevelDraft = clone(stored.logs);
+    if (stored.netflow && state.configBaseline.netflow && !configResourceDirty('netflow')) state.netflowExportDraft = clone(stored.netflow);
+  }
+  function hydrateConfigBaselines() {
+    if (!state.configBaseline.geo && state.geo && Object.keys(state.geo).length) state.configBaseline.geo = clone(state.geo);
+    if (!state.configBaseline.identification && state.identification && Object.keys(state.identification).length) state.configBaseline.identification = clone(state.identification);
+    if (!state.configBaseline.logSettings && state.logSettings && Object.keys(state.logSettings).length) state.configBaseline.logSettings = clone(state.logSettings);
+    if (!state.configBaseline.netflow && state.netflowExportState === 'ok' && state.netflowExport) state.configBaseline.netflow = clone(state.netflowExport);
+    restoreStoredConfigDrafts();
+  }
+  function configSavebar() {
+    const dirtyResources = dirtyConfigResources();
+    if (!dirtyResources.length && !state.saving && !Object.keys(state.configSaveErrors).length) return '';
+    const labels = { geo: '区域规则', identification: '识别模式', logs: '日志级别', netflow: 'NetFlow' };
+    const failed = Object.keys(state.configSaveErrors);
+    const messageText = state.saving
+      ? '正在保存 AegisX 配置…'
+      : failed.length
+        ? `${failed.map((key) => labels[key]).join('、')}保存失败，草稿已保留`
+        : `${dirtyResources.length} 项配置待保存：${dirtyResources.map((key) => labels[key]).join('、')}`;
+    return ui.floatingSavebarMarkup?.({
+      visible: true,
+      busy: state.saving,
+      disabled: !dirtyResources.length || !configWriteAllowed(),
+      message: messageText,
+      discardLabel: '撤销更改',
+      saveLabel: '保存并应用'
+    }) || '';
   }
   function countryFlag(country) {
     const code = firstText(country?.code, country?.id).toLowerCase().replace(/[^a-z-]/g, '');
@@ -516,13 +634,15 @@ export function mount(context = {}) {
   function trafficHistoryClearSupported() {
     return bool(identificationCaps().traffic_history_clear_supported ?? capabilities().traffic_history_clear_supported);
   }
-  function identificationMode() {
-    const mode = firstText(identification().mode);
+  function identificationModeFrom(source) {
+    const value = source || {};
+    const mode = firstText(value.mode);
     if (mode === 'device_and_traffic' || mode === 'traffic_only' || mode === 'disabled') return mode;
-    if (bool(identification().device_identification_enabled)) return 'device_and_traffic';
-    if (bool(identification().traffic_identification_enabled)) return 'traffic_only';
+    if (bool(value.device_identification_enabled)) return 'device_and_traffic';
+    if (bool(value.traffic_identification_enabled)) return 'traffic_only';
     return 'disabled';
   }
+  function identificationMode() { return state.identificationDraft ?? identificationModeFrom(identification()); }
   function identificationBadge() {
     if (!identificationSupported()) return capabilityBadge(false, '');
     const mode = identificationMode();
@@ -679,18 +799,18 @@ export function mount(context = {}) {
     return `<section class="aegisx-panel dwrt-kit-glass-surface" aria-label="保护设置">
       ${row('简单应用阻止', '按全部终端或指定设备阻止签名库中的应用，并读取内核规则状态和命中计数。', `${actionButton('新建', 'app-block-new', appSupported)}${appItems.length ? actionButton('管理', 'app-block', appSupported) : ''}`)}
       ${row('区域拦截', '根据国家或地区以及流量方向阻止或允许连接。', `<div class="aegisx-region-config">
-        ${switchControl('geo-enabled', regionEnabled, !state.saving, '启用区域拦截')}
+        ${switchControl('geo-enabled', regionEnabled, configWriteAllowed() && !state.saving, '启用区域拦截')}
         ${regionEnabled ? `<div class="aegisx-region-dependent">
           <div class="aegisx-region-actions" role="group" aria-label="区域规则动作">
-            <button type="button" class="${regionRule.action !== 'allow' ? 'is-active' : ''}" data-geo-action="block" ${state.saving ? 'disabled' : ''}>${icon('shieldBan')}<span>阻止</span></button>
-            <button type="button" class="${regionRule.action === 'allow' ? 'is-active' : ''}" data-geo-action="allow" ${state.saving ? 'disabled' : ''}>${icon('shieldCheck')}<span>允许</span></button>
+            <button type="button" class="${regionRule.action !== 'allow' ? 'is-active' : ''}" data-geo-action="block" ${state.saving || !configWriteAllowed() ? 'disabled' : ''}>${icon('shieldBan')}<span>阻止</span></button>
+            <button type="button" class="${regionRule.action === 'allow' ? 'is-active' : ''}" data-geo-action="allow" ${state.saving || !configWriteAllowed() ? 'disabled' : ''}>${icon('shieldCheck')}<span>允许</span></button>
           </div>
-          <div class="aegisx-region-directions">${radio('geo-direction', 'both', !['outbound', 'inbound'].includes(regionRule.direction), '双向', true)}${radio('geo-direction', 'outbound', regionRule.direction === 'outbound', '传出', true)}${radio('geo-direction', 'inbound', regionRule.direction === 'inbound', '传入', true)}</div>
+          <div class="aegisx-region-directions">${radio('geo-direction', 'both', !['outbound', 'inbound'].includes(regionRule.direction), '双向', configWriteAllowed() && !state.saving)}${radio('geo-direction', 'outbound', regionRule.direction === 'outbound', '传出', configWriteAllowed() && !state.saving)}${radio('geo-direction', 'inbound', regionRule.direction === 'inbound', '传入', configWriteAllowed() && !state.saving)}</div>
           <div class="aegisx-region-country-action">${actionButton('选择国家或地区', 'geo-block', geoCountries().length > 0)}<small>${geoSelected.length ? `已选 ${geoSelected.length} 个国家或地区` : '尚未选择国家或地区'}</small></div>
         </div>` : ''}
       </div>`)}
       ${row('蜜罐', '检测并记录对指定 IPv4 地址的请求，以发现网络中的异常客户端。', `<div class="aegisx-honeypot-row">${hpItems.length ? `<div class="aegisx-inline-summary"><strong>${hpItems.length} 个蜜罐</strong><small>${bool(hpRuntime.active) ? `运行中 · ${formatNumber(hpRuntime.hits)} 次命中` : '当前未运行'}</small></div>${actionButton('管理', 'honeypot', hpSupported)}` : ''}${actionButton('新建', 'honeypot-new', hpSupported)}</div>`)}
-      ${row('识别', '识别设备类型和网关流量。', `<div class="aegisx-choice-row">${radio('identification', 'disabled', identificationMode() === 'disabled', '已禁用', identificationSupported() && !state.saving)}${radio('identification', 'device_traffic', identificationMode() === 'device_and_traffic', '设备和流量', identificationSupported() && !state.saving)}${radio('identification', 'traffic', identificationMode() === 'traffic_only', '仅流量', identificationSupported() && !state.saving)}</div>${identificationBadge()}`)}
+      ${row('识别', '识别设备类型和网关流量。', `<div class="aegisx-choice-row">${radio('identification', 'disabled', identificationMode() === 'disabled', '已禁用', configWriteAllowed() && identificationSupported() && !state.saving)}${radio('identification', 'device_traffic', identificationMode() === 'device_and_traffic', '设备和流量', configWriteAllowed() && identificationSupported() && !state.saving)}${radio('identification', 'traffic', identificationMode() === 'traffic_only', '仅流量', configWriteAllowed() && identificationSupported() && !state.saving)}</div>${identificationBadge()}`)}
       ${row('拦截页面', '为内容过滤命中的网站显示解释页面，需要先在终端安装并信任检查根证书。', `<div class="aegisx-certificate-row">
         <span class="aegisx-certificate">Aegisx SSL Certificate</span>
         ${stateBadge(inspectionCaState().label, inspectionCaState().tone)}
@@ -906,13 +1026,13 @@ export function mount(context = {}) {
         { key: 'honeypot', label: '蜜罐命中', value: formatNumber(stats.honeypot_hits), detail: '诱捕服务事件', tone: 'warn', icon: icon('trap') }
       ], 'Aegisx 流量日志概览')}
       <section class="aegisx-panel aegisx-unsupported-panel dwrt-kit-glass-surface">
-        ${row('NetFlow (IPFIX)', '采集流量元数据并按 NetFlow v9 或 IPFIX 导出到收集器。开启会把本网络的流量元数据发送到外部主机。', `${switchControl('netflow', netflowEnabled(), netflowSupported() && !state.saving, netflowSupported() ? '启用流量导出' : '导出配置尚未可读')}${netflowStatusBadge()}${actionButton('导出设置', 'netflow-export', netflowSupported())}`, { detail: `<p class="aegisx-explanation">${netflowExplanation()}</p>` })}
+        ${row('NetFlow (IPFIX)', '采集流量元数据并按 NetFlow v9 或 IPFIX 导出到收集器。开启会把本网络的流量元数据发送到外部主机。', `${switchControl('netflow', state.netflowExportDraft ? bool(state.netflowExportDraft.enabled) : netflowEnabled(), configWriteAllowed() && netflowSupported() && !state.saving, netflowSupported() ? '启用流量导出' : '导出配置尚未可读')}${netflowStatusBadge()}${actionButton('导出设置', 'netflow-export', configWriteAllowed() && netflowSupported())}`, { detail: `<p class="aegisx-explanation">${netflowExplanation()}</p>` })}
         ${row('流量日志', '选择记录所有安全流量或仅记录被阻止流量，并可附加 DNS、服务和设备管理事件。', `${radio('traffic-logging', 'all', true, '所有流量', trafficLogScopeSupported(), '后端缺少独立采集范围合同')}${radio('traffic-logging', 'blocked', false, '仅阻止的流量', trafficLogScopeSupported(), '后端缺少独立采集范围合同')}${capabilityBadge(trafficLogScopeSupported(), '可配置')}`, { detail: '<p class="aegisx-explanation">Gateway DNS、Aegisx 服务和设备管理三类额外流量仍缺独立设置与回读。</p>' })}
         ${row('活动日志 (Syslog)', '将活动日志保存在本机，或使用日志中心转发到 SIEM / Syslog 服务器。', `${radio('syslog', 'off', false, '关', false)}${radio('syslog', 'internal', syslogLoaded && !bool(syslog.enabled), '内部存储', false)}${radio('syslog', 'siem', bool(syslog.enabled), 'SIEM 服务器', false)}${stateBadge(syslogLoaded ? bool(syslog.enabled) ? '转发已启用' : '内部存储' : '状态不可用', syslogLoaded ? bool(syslog.enabled) ? 'ok' : 'info' : 'warn')}${actionButton('管理', 'log-center', syslogLoaded)}`, { detail: `<p class="aegisx-explanation">${bool(syslog.enabled) ? `${escapeHtml(firstText(syslog.server, '--'))}:${escapeHtml(firstText(syslog.port, 514))} · ${escapeHtml(firstText(syslog.protocol, 'udp').toUpperCase())}` : '日志保留、转发协议、TLS/mTLS、队列和测试统一由日志中心管理。'}</p>` })}
         ${row('数据保留', '控制本机日志保留，并清除设备与流量识别产生的历史数据。', `${stateBadge(logRetentionDays() ? `保留 ${logRetentionDays()} 天` : '自动', 'info')}${actionButton('保留设置', 'log-center', syslogLoaded)}${actionButton('清除流量历史', 'traffic-clear', clearSupported, { icon: 'trash' })}`)}
         ${row('SNMP 监控', '允许监控工具使用 SNMP 收集网络信息。', `${stateBadge('可保存，运行消费者未实现', 'neutral')}${actionButton('跨三层服务', 'cross-l3-service', true)}`, { detail: '<p class="aegisx-explanation">SNMP 的监听端口与版本可在“策略引擎 → 跨三层服务”中保存并回读，但设备上没有 SNMP 运行消费者，保存后不会真的开始应答。</p>' })}
         ${row('日志级别', '按设备、管理、远程访问和系统分别控制日志详细程度。', `<div class="aegisx-log-levels">
-          ${LOG_LEVEL_GROUPS.map(([group, label]) => `<label class="aegisx-log-level dwrt-kit-field" data-dwrt-component="field"><span>${escapeHtml(label)}</span><select class="dwrt-kit-select" data-dwrt-component="select" data-aegis-log-level="${group}" ${logLevelWritable() && !state.saving ? '' : 'disabled'} aria-label="${escapeHtml(`${label}日志级别`)}">${LOG_LEVEL_VALUES.map(([value, text]) => `<option value="${value}" ${logLevelValue(group) === value ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></label>`).join('')}
+          ${LOG_LEVEL_GROUPS.map(([group, label]) => `<label class="aegisx-log-level dwrt-kit-field" data-dwrt-component="field"><span>${escapeHtml(label)}</span><select class="dwrt-kit-select" data-dwrt-component="select" data-aegis-log-level="${group}" ${configWriteAllowed() && logLevelWritable() && !state.saving ? '' : 'disabled'} aria-label="${escapeHtml(`${label}日志级别`)}">${LOG_LEVEL_VALUES.map(([value, text]) => `<option value="${value}" ${logLevelValue(group) === value ? 'selected' : ''}>${escapeHtml(text)}</option>`).join('')}</select></label>`).join('')}
         </div>${stateBadge(logLevelSummary().label, logLevelSummary().tone)}`, { detail: `<p class="aegisx-explanation">${logLevelsSupported() ? '级别在采集入口生效，error 与 critical 永不被抑制。调试级会显著增加日志量。' : '日志设置读取失败，级别暂不可用。'}</p>` })}
       </section>
       <section class="aegisx-events-card dwrt-kit-glass-surface"><div class="dwrt-kit-table-toolbar aegisx-events-toolbar" data-dwrt-component="toolbar"><div class="dwrt-kit-table-title"><strong>近期活动</strong><span>来自 Aegisx 真实事件接口，最多显示最近 100 条。</span></div><label class="dwrt-kit-expand-search aegisx-event-search" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-event-search value="${escapeHtml(state.eventQuery)}" placeholder="搜索事件" aria-label="搜索安全事件"></label></div>
@@ -928,7 +1048,7 @@ export function mount(context = {}) {
     return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-aegis-close aria-label="关闭区域拦截配置"></button><aside class="aegisx-drawer aegisx-geo-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot">
       <header class="dwrt-kit-sheet-header"><div><span>REGION BLOCKING</span><strong>选择国家或地区</strong></div><button class="dwrt-kit-sheet-close" type="button" data-aegis-close>×</button></header>
       <div class="dwrt-kit-sheet-body aegisx-drawer-body"><div class="aegisx-drawer-intro">所选国家或地区将使用保护页设置的动作和流量方向。后端已提供 nftables preview、apply、disable 与 rollback；当前仍缺逐国家、逐规则命中计数和事件回读。</div><div class="aegisx-drawer-toolbar"><label class="aegisx-inline-search" data-dwrt-component="field">${icon('search')}<input type="search" data-geo-search value="${escapeHtml(state.geoQuery)}" placeholder="搜索国家或地区" aria-label="搜索国家或地区"></label><span>已选 ${selected} / 可配置 ${geoCountries().length}</span></div><div class="aegisx-country-list">${countries.map((country) => `<label><input type="checkbox" data-geo-country="${escapeHtml(country.id || country.code)}" ${country.enabled ? 'checked' : ''}><span class="aegisx-checkmark"></span>${countryFlag(country)}<b>${escapeHtml(COUNTRY_NAMES[country.code || country.id] || country.name || country.id)}</b><small>${escapeHtml(country.code || country.id)} · ${escapeHtml(country.continent || '')}</small></label>`).join('')}</div></div>
-      <footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-aegis-close>取消</button><button class="policy-primary" type="button" data-geo-save ${state.saving || !selected ? 'disabled' : ''}>${state.saving ? '正在保存' : selected ? '保存配置' : '请先选择国家或地区'}</button></footer>
+      <footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-aegis-close>关闭</button><button class="policy-primary" type="button" data-geo-save ${state.saving || !selected ? 'disabled' : ''}>${selected ? '完成' : '请先选择国家或地区'}</button></footer>
     </aside>`;
   }
   /*
@@ -937,8 +1057,8 @@ export function mount(context = {}) {
    * （design.md「Capability truth」第 10 条）。observation_domain 后端接受但
    * 属于协议标识而非用户可理解的选项，这里按读回值原样回送，不做成输入框。
    */
-  function defaultNetflowDraft() {
-    const settings = netflowExportSettings();
+  function defaultNetflowDraft(source = netflowExportSettings()) {
+    const settings = source || {};
     return {
       enabled: bool(settings.enabled),
       protocol: firstText(settings.protocol) === 'netflow9' ? 'netflow9' : 'ipfix',
@@ -1010,7 +1130,7 @@ export function mount(context = {}) {
           ${netflowLastError() ? `<small class="aegisx-netflow-warn">最近错误：${escapeHtml(netflowLastError())}</small>` : ''}
         </div>
       </div>
-      <footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-aegis-close>取消</button><button class="policy-primary" type="button" data-netflow-save ${state.saving || !netflowDraftReady() ? 'disabled' : ''}>${state.saving ? '正在保存' : draft.enabled && !firstText(draft.collector_host) ? '请先填写收集器地址' : '保存设置'}</button></footer>
+      <footer class="dwrt-kit-sheet-footer"><button class="policy-secondary" type="button" data-aegis-close>关闭</button><button class="policy-primary" type="button" data-netflow-save ${state.saving || !netflowDraftReady() ? 'disabled' : ''}>${draft.enabled && !firstText(draft.collector_host) ? '请先填写收集器地址' : '完成'}</button></footer>
     </aside>`;
   }
   function defaultHoneypotDraft(item = null) {
@@ -1437,7 +1557,7 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', 'policy-table-route-host', 'aegisx-route-host');
-    root.innerHTML = `<section class="policy-table-shell aegisx-shell" data-aegisx-version="${VERSION}">${renderTabs()}<div class="aegisx-view">${state.error ? `<div class="aegisx-notice is-error">${escapeHtml(state.error)}</div>` : ''}${state.notice ? `<div class="aegisx-notice">${escapeHtml(state.notice)}</div>` : ''}${state.loading ? '<div class="aegisx-loading dwrt-kit-glass-surface">正在读取 Aegisx 状态...</div>' : state.tab === 'protect' ? renderProtect() : state.tab === 'content' ? renderContent() : renderLogging()}</div></section>`;
+    root.innerHTML = `<section class="policy-table-shell aegisx-shell" data-aegisx-version="${VERSION}">${renderTabs()}<div class="aegisx-view">${state.error ? `<div class="aegisx-notice is-error">${escapeHtml(state.error)}</div>` : ''}${state.notice ? `<div class="aegisx-notice">${escapeHtml(state.notice)}</div>` : ''}${state.loading ? '<div class="aegisx-loading dwrt-kit-glass-surface">正在读取 Aegisx 状态...</div>' : state.tab === 'protect' ? renderProtect() : state.tab === 'content' ? renderContent() : renderLogging()}</div>${configSavebar()}</section>`;
     renderPortal();
     bindEvents();
     ui.mountAll?.(root);
@@ -1447,66 +1567,151 @@ export function mount(context = {}) {
   }
 
   function closeDrawer() { state.drawer = ''; state.contentDraft = null; state.appBlockDraft = null; state.honeypotDraft = null; state.certificateTarget = ''; render(); }
-  async function saveGeo(options = {}) {
-    state.saving = true; state.error = ''; render();
-    try {
-      const rules = geoRules().length ? geoRules() : [geoRule()];
-      await requestJson(ENDPOINTS.geo, { method: 'PUT', body: JSON.stringify({
-        countries: geoCountries().map((item) => ({ id: item.id || item.code, enabled: bool(item.enabled) })),
-        rules: rules.map((item) => ({
-          id: item.id || 'aegisx-region-default', name: item.name || '区域拦截',
-          action: item.action === 'allow' ? 'allow' : 'block',
-          direction: ['outbound', 'inbound'].includes(item.direction) ? item.direction : 'both',
-          src_zone: item.src_zone || 'wan', dst_zone: item.dst_zone || '', enabled: bool(item.enabled)
-        }))
-      }) });
-      state.notice = '区域配置已保存。生产拦截数据面仍以后端运行态为准。';
-      state.saving = false;
-      state.geoDraftEnabled = null;
-      if (options.closeDrawer !== false) state.drawer = '';
-      await load({ silent: true });
-    } catch (error) { state.error = message(error, '区域配置保存失败'); state.saving = false; state.geoDraftEnabled = null; await load({ silent: true }); }
-  }
-  async function saveIdentification(mode) {
+  function saveGeo() { state.drawer = ''; render(); }
+  function saveIdentification(mode) {
     const normalized = mode === 'device_traffic' ? 'device_and_traffic' : mode === 'traffic' ? 'traffic_only' : mode;
     if (!['disabled', 'device_and_traffic', 'traffic_only'].includes(normalized)) return;
-    state.saving = true; state.error = ''; render();
-    try {
-      const result = await requestJson(ENDPOINTS.identification, { method: 'POST', body: JSON.stringify({ mode: normalized }) });
-      state.identification = result?.data || result || state.identification;
-      state.notice = normalized === 'disabled' ? '已关闭设备与流量识别。' : normalized === 'traffic_only' ? '已切换为仅流量识别。' : '已切换为设备和流量识别。';
-      state.saving = false;
-      await load({ silent: true });
-    } catch (error) { state.error = message(error, '识别模式切换失败'); state.saving = false; await load({ silent: true }); }
+    state.identificationDraft = normalized;
+    state.configSaveErrors = {};
+    persistConfigDrafts();
+    render();
   }
-  /*
-   * 日志级别写入。
-   *
-   * 只提交 log_levels 一个键：后端 logd_settings_set 会先把 retention/max_* 从库里读出来
-   * 作为缺省，未提交的字段保持原值，所以这是安全的局部写，不会顺手把保留策略改掉。
-   * 写入格式与读回不同 —— 读回是 {level, min_severity_rank, keeps_debug} 对象，
-   * 写入必须是纯字符串，否则后端回 invalid_log_level。
-   */
-  async function saveLogLevel(group, value) {
-    if (!LOG_LEVEL_GROUPS.some(([key]) => key === group)) return;
-    if (!LOG_LEVEL_VALUES.some(([key]) => key === value)) return;
-    const previous = logLevelValue(group);
-    if (previous === value) return;
-    state.logLevelDraft = { ...state.logLevelDraft, [group]: value };
-    state.saving = true; state.error = ''; render();
-    try {
-      await requestJson(ENDPOINTS.logSettings, { method: 'POST', body: JSON.stringify({ log_levels: { [group]: value } }) });
-      state.notice = `${logLevelLabel(value)}：${(LOG_LEVEL_GROUPS.find(([key]) => key === group) || [])[1]}日志级别已保存。`;
-      state.saving = false;
-      state.logLevelDraft = {};
-      await load({ silent: true });
-    } catch (error) {
-      /* 写失败时回退草稿，否则选择器会停在一个后端并未接受的值上。 */
-      state.logLevelDraft = {};
-      state.error = message(error, '日志级别保存失败');
-      state.saving = false;
-      await load({ silent: true });
+  function saveLogLevel(group, value) {
+    if (!LOG_LEVEL_GROUPS.some(([key]) => key === group) || !LOG_LEVEL_VALUES.some(([key]) => key === value)) return;
+    if (baselineLogLevels()[group] === value) delete state.logLevelDraft[group];
+    else state.logLevelDraft[group] = value;
+    state.configSaveErrors = {};
+    persistConfigDrafts();
+    render();
+  }
+  function canonicalMismatch(resource) {
+    const error = new Error(`${resource} canonical readback mismatch`);
+    error.code = 'canonical_readback_mismatch';
+    return error;
+  }
+
+  async function saveGeoResource() {
+    const payload = geoPayload();
+    await requestJson(ENDPOINTS.geo, { method: 'PUT', body: JSON.stringify(payload) });
+    const canonical = await requestJson(ENDPOINTS.geo);
+    const value = canonical?.data || canonical || {};
+    if (stable(geoPayload(value)) !== stable(payload)) throw canonicalMismatch('geo');
+    state.geo = value;
+    state.configBaseline.geo = clone(value);
+    state.geoDraftEnabled = null;
+  }
+
+  async function saveIdentificationResource() {
+    const mode = state.identificationDraft;
+    if (!mode) return;
+    await requestJson(ENDPOINTS.identification, { method: 'POST', body: JSON.stringify({ mode }) });
+    const canonical = await requestJson(ENDPOINTS.identification);
+    const value = canonical?.data || canonical || {};
+    if (identificationModeFrom(value) !== mode) throw canonicalMismatch('identification');
+    state.identification = value;
+    state.configBaseline.identification = clone(value);
+    state.identificationDraft = null;
+  }
+
+  async function saveLogLevelsResource() {
+    const baseline = baselineLogLevels();
+    const changes = Object.fromEntries(Object.entries(state.logLevelDraft).filter(([group, value]) => baseline[group] !== value));
+    if (!Object.keys(changes).length) return;
+    await requestJson(ENDPOINTS.logSettings, { method: 'POST', body: JSON.stringify({ log_levels: changes }) });
+    const canonical = await requestJson(ENDPOINTS.logSettings);
+    const value = canonical?.data || canonical || {};
+    const levels = value?.settings?.log_levels || value?.log_levels || {};
+    for (const [group, expected] of Object.entries(changes)) {
+      const entry = levels[group];
+      const actual = typeof entry === 'string' ? entry : firstText(entry?.level);
+      if (actual !== expected) throw canonicalMismatch(`logs.${group}`);
     }
+    state.logSettings = value;
+    state.configBaseline.logSettings = clone(value);
+    state.logLevelDraft = {};
+  }
+
+  async function saveNetflowResource() {
+    const draft = state.netflowExportDraft;
+    if (!draft) return;
+    const payload = netflowPayload(draft);
+    await requestJson(ENDPOINTS.flowdExportSettings, { method: 'POST', body: JSON.stringify(payload) });
+    const canonical = await requestJson(ENDPOINTS.flowdExportSettings, { method: 'GET' });
+    const value = canonical?.data || canonical || {};
+    if (stable(netflowPayload(defaultNetflowDraft(value))) !== stable(payload)) throw canonicalMismatch('netflow');
+    state.netflowExport = value;
+    state.netflowExportState = 'ok';
+    state.configBaseline.netflow = clone(value);
+    state.netflowExportDraft = null;
+  }
+
+  function discardAegisxConfig() {
+    if (state.configBaseline.geo) state.geo = clone(state.configBaseline.geo);
+    if (state.configBaseline.identification) state.identification = clone(state.configBaseline.identification);
+    if (state.configBaseline.logSettings) state.logSettings = clone(state.configBaseline.logSettings);
+    if (state.configBaseline.netflow) state.netflowExport = clone(state.configBaseline.netflow);
+    state.geoDraftEnabled = null;
+    state.identificationDraft = null;
+    state.logLevelDraft = {};
+    state.netflowExportDraft = null;
+    state.configSaveErrors = {};
+    state.notice = '未保存的 AegisX 配置已撤销。';
+    state.drawer = '';
+    persistConfigDrafts();
+    render();
+  }
+
+  function requestAegisxConfigSave() {
+    const resources = dirtyConfigResources();
+    if (!resources.length || state.saving || !configWriteAllowed()) return;
+    const netflowTurningOn = resources.includes('netflow')
+      && bool(state.netflowExportDraft?.enabled)
+      && !bool(state.configBaseline.netflow?.enabled);
+    if (netflowTurningOn) {
+      const payload = netflowPayload(state.netflowExportDraft);
+      state.confirm = {
+        action: 'config-save', tone: 'warning', title: '保存并开启流量导出？',
+        description: `本次还会保存其他待提交的 AegisX 配置。流量元数据将持续发送到 ${payload.collector_host}:${payload.collector_port}，协议 ${payload.protocol === 'netflow9' ? 'NetFlow v9' : 'IPFIX'}。数据离开本机后不受网关控制，请确认收集器可信。`,
+        confirmLabel: '确认保存并导出'
+      };
+      render();
+      return;
+    }
+    commitAegisxConfig();
+  }
+
+  async function commitAegisxConfig() {
+    const resources = dirtyConfigResources();
+    if (!resources.length || state.saving) return;
+    const savers = {
+      geo: saveGeoResource,
+      identification: saveIdentificationResource,
+      logs: saveLogLevelsResource,
+      netflow: saveNetflowResource
+    };
+    const labels = { geo: '区域规则', identification: '识别模式', logs: '日志级别', netflow: 'NetFlow' };
+    const errors = {};
+    const saved = [];
+    state.confirm = null;
+    state.saving = true;
+    state.error = '';
+    state.configSaveErrors = {};
+    render();
+    for (const resource of resources) {
+      try {
+        await savers[resource]();
+        saved.push(labels[resource]);
+      } catch (error) {
+        errors[resource] = message(error, `${labels[resource]}保存失败`);
+      }
+    }
+    state.configSaveErrors = errors;
+    state.saving = false;
+    const failed = Object.keys(errors).map((key) => labels[key]);
+    state.notice = saved.length ? `${saved.join('、')}已保存并完成配置回读。${failed.length ? ` ${failed.join('、')}仍待处理。` : ''}` : '';
+    if (failed.length) state.error = failed.map((label) => `${label}：${errors[Object.keys(errors).find((key) => labels[key] === label)]}`).join(' · ');
+    persistConfigDrafts();
+    render();
   }
   /*
    * 检查根证书的写操作。generate / rotate / revoke 后端都要求 confirm=true，
@@ -1939,7 +2144,7 @@ export function mount(context = {}) {
   }
   function bindEvents() {
     queryAll('[data-aegis-tab]').forEach((button) => button.addEventListener('click', () => { state.tab = button.dataset.aegisTab; rememberTab(state.tab); state.drawer = ''; state.notice = ''; render(); }));
-    queryAll('[data-aegis-close], [data-dwrt-confirm-cancel]').forEach((button) => button.addEventListener('click', () => { if (button.closest('[data-dwrt-confirmation]')) state.confirm = null; else { state.drawer = ''; state.contentDraft = null; state.appBlockDraft = null; state.honeypotDraft = null; state.signatureDraft = null; state.feedPreview = null; state.certificateTarget = ''; state.netflowExportDraft = null; window.clearTimeout(jobPollTimer); } render(); }));
+    queryAll('[data-aegis-close], [data-dwrt-confirm-cancel]').forEach((button) => button.addEventListener('click', () => { if (button.closest('[data-dwrt-confirmation]')) state.confirm = null; else { state.drawer = ''; state.contentDraft = null; state.appBlockDraft = null; state.honeypotDraft = null; state.signatureDraft = null; state.feedPreview = null; state.certificateTarget = ''; window.clearTimeout(jobPollTimer); } render(); }));
     queryAll('[data-aegis-action]').forEach((button) => button.addEventListener('click', () => {
       if (button.disabled) return;
       const action = button.dataset.aegisAction;
@@ -1962,7 +2167,7 @@ export function mount(context = {}) {
       else if (action === 'certificate-download') { downloadCertificate(); return; }
       else if (action === 'certificate-distribute') { state.certificateTarget = ''; state.drawer = 'certificate-distribute'; render(); return; }
       else if (action === 'traffic-clear') { state.confirm = { action: 'traffic-clear', tone: 'danger', title: '清除流量历史？', description: '将永久清除设备与流量识别产生的日汇总、明细和客户端快照。安全事件日志不受影响。', confirmLabel: '清除历史' }; render(); return; }
-      else if (action === 'netflow-export') { state.netflowExportDraft = defaultNetflowDraft(); state.drawer = 'netflow-export'; render(); return; }
+      else if (action === 'netflow-export') { if (!state.netflowExportDraft) state.netflowExportDraft = defaultNetflowDraft(); state.drawer = 'netflow-export'; render(); return; }
       else state.drawer = action;
       render();
     }));
@@ -1970,44 +2175,63 @@ export function mount(context = {}) {
       const enabled = event.target.checked;
       state.geoDraftEnabled = enabled;
       updateGeoRule({ enabled });
-      if (enabled) render();
-      else saveGeo({ closeDrawer: false });
+      state.configSaveErrors = {};
+      persistConfigDrafts();
+      render();
     });
-    queryAll('[data-geo-action]').forEach((button) => button.addEventListener('click', () => { updateGeoRule({ action: button.dataset.geoAction }); if (selectedCountries().length) saveGeo({ closeDrawer: false }); else render(); }));
-    queryAll('input[name="geo-direction"]').forEach((input) => input.addEventListener('change', () => { updateGeoRule({ direction: input.value }); if (selectedCountries().length) saveGeo({ closeDrawer: false }); else render(); }));
-    queryAll('input[name="identification"]').forEach((input) => input.addEventListener('change', () => { if (input.checked) saveIdentification(input.value); }));
-    queryAll('[data-aegis-log-level]').forEach((select) => select.addEventListener('change', () => saveLogLevel(select.dataset.aegisLogLevel, select.value)));
+    queryAll('[data-geo-action]').forEach((button) => button.addEventListener('click', () => { updateGeoRule({ action: button.dataset.geoAction }); state.configSaveErrors = {}; persistConfigDrafts(); render(); }));
+    queryAll('input[name="geo-direction"]').forEach((input) => input.addEventListener('change', () => { if (!input.checked) return; updateGeoRule({ direction: input.value }); state.configSaveErrors = {}; persistConfigDrafts(); render(); }));
+    queryAll('input[name="identification"]').forEach((input) => input.addEventListener('change', () => {
+      if (!input.checked) return;
+      state.identificationDraft = input.value === 'device_traffic' ? 'device_and_traffic' : input.value === 'traffic' ? 'traffic_only' : input.value;
+      state.configSaveErrors = {};
+      persistConfigDrafts();
+      render();
+    }));
+    queryAll('[data-aegis-log-level]').forEach((select) => select.addEventListener('change', () => {
+      const group = select.dataset.aegisLogLevel;
+      if (!LOG_LEVEL_GROUPS.some(([key]) => key === group) || !LOG_LEVEL_VALUES.some(([key]) => key === select.value)) return;
+      const baseline = baselineLogLevels()[group];
+      if (baseline === select.value) delete state.logLevelDraft[group];
+      else state.logLevelDraft[group] = select.value;
+      state.configSaveErrors = {};
+      persistConfigDrafts();
+      render();
+    }));
     query('[data-certificate-target]')?.addEventListener('change', (event) => { state.certificateTarget = event.target.value; render(); });
     query('[data-certificate-distribute-save]')?.addEventListener('click', commitCertificateDistribution);
     query('[data-geo-search]')?.addEventListener('input', (event) => { state.geoQuery = event.target.value; rerenderWithFocus('[data-geo-search]', state.geoQuery); });
     queryAll('[data-geo-country]').forEach((input) => input.addEventListener('change', () => {
       const item = geoCountries().find((country) => firstText(country.id, country.code) === input.dataset.geoCountry);
       if (item) item.enabled = input.checked;
+      state.configSaveErrors = {};
+      persistConfigDrafts();
       const count = query('.aegisx-drawer-toolbar > span');
       if (count) count.textContent = `已选 ${selectedCountries().length} / 可配置 ${geoCountries().length}`;
     }));
-    query('[data-geo-save]')?.addEventListener('click', saveGeo);
+    query('[data-geo-save]')?.addEventListener('click', () => { state.drawer = ''; render(); });
     query('[data-event-search]')?.addEventListener('input', (event) => { state.eventQuery = event.target.value; rerenderWithFocus('[data-event-search]', state.eventQuery); });
     queryAll('[data-content-field]').forEach((input) => input.addEventListener('input', () => { state.contentDraft[input.dataset.contentField] = input.value; }));
     query('[data-aegis-toggle="content-enabled"]')?.addEventListener('change', (event) => { state.contentDraft.enabled = event.target.checked; });
     /*
      * 设置行上的导出开关。
      *
-     * 打开时**不直接写**：导出需要收集器地址，而这一行没有地方填。直接提交只会拿到
-     * collector_host_required，用户看到的是"点了就报错"。所以开的动作转成打开设置抽屉，
-     * 开关先弹回原位，真正的开启在抽屉里连同地址一起提交（并有二次确认）。
-     * 关闭没有这个问题，也没有外发风险，就地提交。
+     * 打开时进入设置抽屉补齐收集器；关闭只修改页面草稿。两条路径都不写后端，
+     * 最终统一由共享保存岛提交。
      */
     query('[data-aegis-toggle="netflow"]')?.addEventListener('change', (event) => {
       const wanted = event.target.checked;
       if (wanted) {
-        event.target.checked = netflowEnabled();
-        state.netflowExportDraft = { ...defaultNetflowDraft(), enabled: true };
+        state.netflowExportDraft = { ...(state.netflowExportDraft || defaultNetflowDraft()), enabled: true };
         state.drawer = 'netflow-export';
+        persistConfigDrafts();
         render();
         return;
       }
-      commitNetflowExport(netflowPayload({ ...defaultNetflowDraft(), enabled: false }));
+      state.netflowExportDraft = { ...(state.netflowExportDraft || defaultNetflowDraft()), enabled: false };
+      state.configSaveErrors = {};
+      persistConfigDrafts();
+      render();
     });
     query('[data-aegis-toggle="content-ad-block"]')?.addEventListener('change', (event) => { state.contentDraft.ad_block = event.target.checked; });
     queryAll('[data-content-safe-search]').forEach((input) => input.addEventListener('change', () => { state.contentDraft.safe_search[input.dataset.contentSafeSearch] = input.checked; }));
@@ -2088,19 +2312,27 @@ export function mount(context = {}) {
     queryAll('[data-netflow-field]').forEach((input) => input.addEventListener('input', () => {
       if (!state.netflowExportDraft) return;
       state.netflowExportDraft[input.dataset.netflowField] = input.value;
+      state.configSaveErrors = {};
+      persistConfigDrafts();
       syncNetflowSaveState();
     }));
     query('[data-aegis-toggle="netflow-draft-enabled"]')?.addEventListener('change', (event) => {
       if (!state.netflowExportDraft) return;
       state.netflowExportDraft.enabled = event.target.checked;
+      state.configSaveErrors = {};
+      persistConfigDrafts();
       render();
     });
     queryAll('input[name="netflow-protocol"]').forEach((input) => input.addEventListener('change', () => {
       if (!state.netflowExportDraft || !input.checked) return;
       state.netflowExportDraft.protocol = input.value;
+      state.configSaveErrors = {};
+      persistConfigDrafts();
     }));
-    query('[data-netflow-save]')?.addEventListener('click', validateNetflowExport);
-    query('[data-dwrt-confirm-accept]')?.addEventListener('click', () => { const confirm = state.confirm; if (!confirm) return; if (confirm.action === 'content-save') commitContent(confirm.payload); else if (confirm.action === 'app-block-save') commitAppBlock(confirm.payload, confirm.revision); else if (confirm.action === 'pcdn-save') commitPcdn(confirm.enabled); else if (confirm.action === 'pcdn-sync') commitPcdnSync(); else if (confirm.action === 'feed-import') startFeedImport(); else if (confirm.action === 'signature-suppress') setSignatureSuppressed(confirm.signature); else if (confirm.action === 'traffic-clear') clearTrafficHistory(); else if (confirm.action === 'honeypot-save') commitHoneypot(confirm.payload); else if (confirm.action === 'netflow-save') commitNetflowExport(confirm.payload); else if (confirm.action === 'certificate-generate') commitCertificate('generate'); else if (confirm.action === 'certificate-rotate') commitCertificate('rotate'); else if (confirm.action === 'certificate-revoke') commitCertificate('revoke'); else deleteResource(confirm.resourceKind, confirm.resourceId); });
+    query('[data-netflow-save]')?.addEventListener('click', () => { if (!netflowDraftReady()) return; state.drawer = ''; persistConfigDrafts(); render(); });
+    query('[data-dwrt-savebar-discard]')?.addEventListener('click', discardAegisxConfig);
+    query('[data-dwrt-savebar-save]')?.addEventListener('click', requestAegisxConfigSave);
+    query('[data-dwrt-confirm-accept]')?.addEventListener('click', () => { const confirm = state.confirm; if (!confirm) return; if (confirm.action === 'content-save') commitContent(confirm.payload); else if (confirm.action === 'app-block-save') commitAppBlock(confirm.payload, confirm.revision); else if (confirm.action === 'pcdn-save') commitPcdn(confirm.enabled); else if (confirm.action === 'pcdn-sync') commitPcdnSync(); else if (confirm.action === 'feed-import') startFeedImport(); else if (confirm.action === 'signature-suppress') setSignatureSuppressed(confirm.signature); else if (confirm.action === 'traffic-clear') clearTrafficHistory(); else if (confirm.action === 'honeypot-save') commitHoneypot(confirm.payload); else if (confirm.action === 'config-save') commitAegisxConfig(); else if (confirm.action === 'netflow-save') commitNetflowExport(confirm.payload); else if (confirm.action === 'certificate-generate') commitCertificate('generate'); else if (confirm.action === 'certificate-rotate') commitCertificate('rotate'); else if (confirm.action === 'certificate-revoke') commitCertificate('revoke'); else deleteResource(confirm.resourceKind, confirm.resourceId); });
   }
 
   stage?.classList.add('is-aegisx');
@@ -2108,5 +2340,5 @@ export function mount(context = {}) {
   load();
   /* 导出配置独立一条请求，见 loadNetflowExport() 的注释。 */
   loadNetflowExport();
-  return { unmount() { state.mounted = false; state.seq += 1; window.clearTimeout(jobPollTimer); window.clearInterval(deferredRenderTimer); deferredRenderTimer = 0; portal?.remove(); portal = null; stage?.classList.remove('is-aegisx'); root?.replaceChildren(); root?.classList.remove('aegisx-route-host', 'policy-table-route-host', 'route-workspace'); } };
+  return { unmount() { persistConfigDrafts(); state.mounted = false; state.seq += 1; window.clearTimeout(jobPollTimer); window.clearInterval(deferredRenderTimer); deferredRenderTimer = 0; portal?.remove(); portal = null; stage?.classList.remove('is-aegisx'); root?.replaceChildren(); root?.classList.remove('aegisx-route-host', 'policy-table-route-host', 'route-workspace'); } };
 }

@@ -53,7 +53,9 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260818-terminal-policy-whitelist-23';
+  const VERSION = '20260822-terminal-policy-savebar-24';
+  const embedded = context.embedded === true;
+  const parentDraftController = context.enabledDraftController || null;
   const stage = root?.closest('.console-stage');
   const modeHost = context.modeHost || null;
   const POLICY_TABLE = '/api/v1/policy-engine/policy-table';
@@ -90,6 +92,37 @@ export function mount(context = {}) {
     editor: {},
     confirm: null
   };
+  const localEnabledBaseline = new Map();
+  const localEnabledDraft = new Map();
+
+  function ruleEnabled(rule) {
+    return parentDraftController
+      ? parentDraftController.value('network', rule.policyId, rule.enabled)
+      : localEnabledDraft.has(rule.policyId) ? localEnabledDraft.get(rule.policyId) : Boolean(rule.enabled);
+  }
+
+  function enabledDirty(rule) {
+    return parentDraftController
+      ? parentDraftController.dirty('network', rule.policyId)
+      : localEnabledDraft.has(rule.policyId);
+  }
+
+  function localEnabledChanges() {
+    return Array.from(localEnabledDraft.entries()).filter(([id, enabled]) => localEnabledBaseline.get(id) !== enabled);
+  }
+
+  function localSavebarMarkup() {
+    if (parentDraftController || embedded) return '';
+    const changes = localEnabledChanges();
+    return ui.floatingSavebarMarkup?.({
+      visible: changes.length > 0 || state.saving,
+      message: state.saving ? '正在保存 MAC 断网状态…' : `${changes.length} 条断网规则状态待保存`,
+      busy: state.saving,
+      disabled: !changes.length,
+      discardLabel: '撤销更改',
+      saveLabel: '保存并应用'
+    }) || '';
+  }
 
   function firstText(...values) {
     for (const value of values) {
@@ -539,13 +572,15 @@ export function mount(context = {}) {
   }
 
   function ruleStatus(rule) {
+    const enabled = ruleEnabled(rule);
     /*
      * 已启用但已过期的规则不再进入 nft（生成器按 expires 过滤），行还留着。
      * 必须和「断网中」区分开，否则用户会以为终端仍被拦着。
      */
-    if (rule.enabled && rule.expired) return { label: '已失效', tone: 'warning', detail: '已到期，规则保留但不再拦截，可改期后重新启用' };
-    if (rule.enabled && rule.schedule.mode === 'window') return { label: '按时段断网', tone: 'error', detail: `仅 ${scheduleText(rule)} 拦截（设备本地时间）` };
-    if (rule.enabled) return { label: '断网中', tone: 'error', detail: 'nftables 已丢弃该 MAC 流量' };
+    if (enabledDirty(rule)) return { label: enabled ? '待启用' : '待停用', tone: 'warning', detail: '尚未保存，不会立即改变终端联网状态' };
+    if (enabled && rule.expired) return { label: '已失效', tone: 'warning', detail: '已到期，规则保留但不再拦截，可改期后重新启用' };
+    if (enabled && rule.schedule.mode === 'window') return { label: '按时段断网', tone: 'error', detail: `仅 ${scheduleText(rule)} 拦截（设备本地时间）` };
+    if (enabled) return { label: '断网中', tone: 'error', detail: 'nftables 已丢弃该 MAC 流量' };
     return { label: '未启用', tone: 'warning', detail: '规则已保存，尚未进入运行态' };
   }
 
@@ -560,8 +595,9 @@ export function mount(context = {}) {
   function filteredRules() {
     const query = state.query.trim().toLowerCase();
     return state.rules.filter((rule) => {
-      if (state.filter === 'enabled' && (!rule.enabled || rule.expired)) return false;
-      if (state.filter === 'disabled' && rule.enabled) return false;
+      const enabled = ruleEnabled(rule);
+      if (state.filter === 'enabled' && (!enabled || rule.expired)) return false;
+      if (state.filter === 'disabled' && enabled) return false;
       if (state.filter === 'expired' && !rule.expired) return false;
       if (state.filter === 'offlist' && rule.client) return false;
       if (!query) return true;
@@ -583,6 +619,8 @@ export function mount(context = {}) {
 
   function rowMarkup(rule) {
     const status = ruleStatus(rule);
+    const enabled = ruleEnabled(rule);
+    const dirty = enabledDirty(rule);
     const writable = canWriteMac(state.capabilities);
     const onlineText = rule.online === null ? '' : (rule.online ? '在线' : '离线');
     /*
@@ -593,14 +631,14 @@ export function mount(context = {}) {
     const isGroup = rule.sourceKind === 'group';
     const groupCell = `<span class="cnc-stack"><strong>${escapeHtml(`分组 ${firstText(rule.sourceRef, '未知分组')}`)}</strong><span>${escapeHtml(rule.groupMemberMacs === null ? '成员数未知' : `该组 ${rule.groupMemberMacs} 台设备`)}</span>${groupWarning ? `<small class="cnc-group-warning">${escapeHtml(groupWarning)}</small>` : ''}</span>`;
     const selfTag = isSelfDevice(rule.mac) ? '<small class="cnc-self-device">你正在使用的设备</small>' : '';
-    return `<tr>
+    return `<tr class="${dirty ? 'is-dirty' : ''}">
       <td><span class="cnc-stack">${statusBadge(status.label, status.tone)}<small>${escapeHtml(status.detail)}</small></span></td>
       <td class="cnc-client">${isGroup ? groupCell : `<span class="cnc-stack"><strong>${escapeHtml(rule.clientName)}</strong><code>${escapeHtml(rule.mac || '—')}</code><span>${escapeHtml([rule.clientLocator, onlineText].filter(Boolean).join(' · '))}</span>${selfTag}</span>`}</td>
       <td class="cnc-schedule"><span class="cnc-stack"><strong>${escapeHtml(scheduleText(rule))}</strong><small>${escapeHtml(expiresText(rule))}</small></span></td>
       <td class="cnc-remark">${escapeHtml(rule.remark || '—')}</td>
       <td><span class="cnc-stack"><strong>${escapeHtml(String(rule.hits))}</strong><small>${escapeHtml(lastHitText(rule))}</small></span></td>
       <td class="cnc-actions"><span class="cnc-actions-inner">
-        <button type="button" class="user-auth-icon-button" data-cnc-toggle="${escapeHtml(rule.policyId)}" title="${rule.enabled ? '停用规则（恢复联网）' : '启用规则（立即断网）'}" aria-label="${rule.enabled ? '停用规则' : '启用规则'}" ${writable ? '' : 'disabled'}>${icon(rule.enabled ? 'pause' : 'play')}</button>
+        <button type="button" class="user-auth-icon-button" data-cnc-toggle="${escapeHtml(rule.policyId)}" title="${enabled ? '暂存停用规则' : '暂存启用规则'}" aria-label="${enabled ? '暂存停用规则' : '暂存启用规则'}" ${writable ? '' : 'disabled'}>${icon(enabled ? 'pause' : 'play')}</button>
         <button type="button" class="user-auth-icon-button" data-cnc-edit="${escapeHtml(rule.policyId)}" title="编辑规则" aria-label="编辑规则" ${writable ? '' : 'disabled'}>${icon('edit')}</button>
         <button type="button" class="user-auth-icon-button is-danger" data-cnc-delete="${escapeHtml(rule.policyId)}" title="删除规则" aria-label="删除规则" ${writable ? '' : 'disabled'}>${icon('trash')}</button>
       </span></td>
@@ -798,7 +836,7 @@ export function mount(context = {}) {
     if (!root) return;
     root.hidden = false;
     root.classList.add('route-workspace', 'user-authentication-route-host', 'client-network-control-route-host');
-    root.innerHTML = `<section class="user-auth-shell cnc-shell" data-cnc-version="${VERSION}"><main class="user-auth-workbench cnc-workbench">${noticeMarkup()}${modeHost ? '' : modeMarkup()}${contentMarkup()}</main><div class="cnc-overlay-host" data-cnc-sheet-host></div><div class="cnc-overlay-host" data-cnc-confirmation-host></div></section>`;
+    root.innerHTML = `<section class="user-auth-shell cnc-shell" data-cnc-version="${VERSION}"><main class="user-auth-workbench cnc-workbench">${noticeMarkup()}${modeHost ? '' : modeMarkup()}${contentMarkup()}</main><div data-cnc-savebar-host>${localSavebarMarkup()}</div><div class="cnc-overlay-host" data-cnc-sheet-host></div><div class="cnc-overlay-host" data-cnc-confirmation-host></div></section>`;
     renderModeSlot();
     renderOverlays();
     ui.mountAll?.(root);
@@ -911,7 +949,15 @@ export function mount(context = {}) {
     if (state.mode === 'black') patchToolbar();
     patchNotice();
     patchTable();
+    patchLocalSavebar();
     renderOverlays();
+  }
+
+  function patchLocalSavebar() {
+    const host = root?.querySelector('[data-cnc-savebar-host]');
+    if (!host) return;
+    host.innerHTML = localSavebarMarkup();
+    ui.mountAll?.(host);
   }
 
   function patchToolbar() {
@@ -1018,6 +1064,22 @@ export function mount(context = {}) {
       state.rules = rows
         .filter((row) => String(row?.id || '').startsWith(MAC_ID_PREFIX))
         .map((row, index) => normalizeRule(row, clientsByMac, index));
+      if (parentDraftController) {
+        parentDraftController.register('network', state.rules, {
+          id: (rule) => rule.policyId,
+          enabled: (rule) => rule.enabled,
+          canWrite: () => canWriteMac(state.capabilities),
+          describe: (rule) => `${rule.clientName || rule.mac} · ${rule.name}`,
+          render,
+          refresh: () => load(true),
+          save: saveEnabledCanonical
+        });
+      } else {
+        state.rules.forEach((rule) => {
+          localEnabledBaseline.set(rule.policyId, Boolean(rule.enabled));
+          if (localEnabledDraft.has(rule.policyId) && localEnabledDraft.get(rule.policyId) === Boolean(rule.enabled)) localEnabledDraft.delete(rule.policyId);
+        });
+      }
       if (allowlistResult.status === 'fulfilled') {
         state.allowlist = normalizeAllowlist(allowlistResult.value);
         state.allowlistMembers = normalizeAllowlistMembers(allowlistResult.value);
@@ -1419,38 +1481,49 @@ export function mount(context = {}) {
     }
   }
 
-  async function toggleRule(rule, skipConfirm = false) {
+  function toggleRule(rule) {
     if (!rule || state.saving || !canWriteMac(state.capabilities)) return;
-    if (rule.enabled === false && !skipConfirm) { requestEnable(rule); return; }
+    const enabled = !ruleEnabled(rule);
+    if (parentDraftController) parentDraftController.toggle('network', rule, enabled);
+    else if (localEnabledBaseline.get(rule.policyId) === enabled) localEnabledDraft.delete(rule.policyId); else localEnabledDraft.set(rule.policyId, enabled);
+    state.notice = '';
+    render();
+  }
+
+  async function saveEnabledCanonical(rule, enabled) {
+    await requestJson(`${POLICY_TABLE}/${encodeURIComponent(rule.policyId)}`, {
+      method: 'PATCH',
+      body: writeBody({ operation: enabled ? 'enable' : 'disable' })
+    });
+    const payload = await requestJson(POLICY_TABLE);
+    const found = (Array.isArray(payload.rows) ? payload.rows : []).find((row) => firstText(row?.id, row?.raw?.id) === rule.policyId);
+    if (!found) throw new Error('保存后回读找不到断网规则');
+    return bool(found?.raw?.enabled, bool(found?.enabled, false));
+  }
+
+  async function saveLocalEnabledDrafts() {
+    const changes = localEnabledChanges();
+    if (!changes.length || state.saving) return;
+    const risky = changes.filter(([, enabled]) => enabled).map(([id]) => state.rules.find((rule) => rule.policyId === id)).filter(Boolean);
+    if (risky.length && window.confirm && !window.confirm(`以下规则启用后可能影响终端联网：\n\n${risky.map((rule) => `- ${rule.clientName || rule.mac} · ${rule.name}：停用 → 启用`).join('\n')}\n\n确认保存？`)) return;
     state.saving = true;
     render();
-    try {
-      const response = await requestJson(`${POLICY_TABLE}/${encodeURIComponent(rule.policyId)}`, {
-        method: 'PATCH',
-        body: writeBody({ operation: rule.enabled ? 'disable' : 'enable' })
-      });
-      state.saving = false;
-      state.confirm = null;
-      /*
-       * 对一条已过期的规则点启用，后端会成功但生成器不渲染任何 nft 规则。
-       * 沿用写入响应里的 expires_warning，避免报出"该终端现在无法联网"这种假结论。
-       */
-      const warning = rule.enabled ? '' : expiresWarningText(response);
-      if (warning) {
-        state.notice = `${warning}需要它立刻断网，请编辑规则改期。`;
-        state.noticeTone = 'warning';
-      } else {
-        state.notice = rule.enabled ? '规则已停用，该终端恢复联网。' : '规则已启用，该终端现在无法联网。';
-        state.noticeTone = 'ok';
+    const failed = [];
+    for (const [id, enabled] of changes) {
+      const rule = state.rules.find((item) => item.policyId === id);
+      try {
+        if (!rule || await saveEnabledCanonical(rule, enabled) !== enabled) throw new Error('保存后回读与草稿不一致');
+        localEnabledDraft.delete(id);
+      } catch (error) {
+        failed.push(`${rule?.name || id}（${firstText(error.message, '保存失败')}）`);
       }
-      await load(true);
-    } catch (error) {
-      state.saving = false;
-      state.confirm = null;
-      state.notice = `操作失败：${firstText(error.message, '后端未接受操作')}`;
-      state.noticeTone = 'error';
-      render();
     }
+    state.saving = false;
+    state.notice = failed.length
+      ? `${changes.length - failed.length} 条已保存，${failed.length} 条失败并保留草稿：${failed.join('、')}`
+      : `${changes.length} 条断网规则状态已保存。`;
+    state.noticeTone = failed.length ? 'warning' : 'ok';
+    await load(true);
   }
 
   async function deleteRule(rule) {
@@ -1490,11 +1563,13 @@ export function mount(context = {}) {
     if (request.kind === 'create-enabled') { commitSave(editorPayload()); return; }
     const rule = findRule(request.policyId);
     if (!rule) { state.confirm = null; renderOverlays(); return; }
-    if (request.kind === 'enable') { toggleRule(rule, true); return; }
+    if (request.kind === 'enable') { state.confirm = null; toggleRule(rule); return; }
     if (request.kind === 'delete') { deleteRule(rule); }
   }
 
   function onClick(event) {
+    if (event.target.closest('[data-dwrt-savebar-discard]')) { localEnabledDraft.clear(); state.notice = ''; render(); return; }
+    if (event.target.closest('[data-dwrt-savebar-save]')) { saveLocalEnabledDrafts(); return; }
     if (event.target.closest('[data-cnc-close]')) { state.drawer = false; state.editor = {}; state.notice = ''; renderOverlays(); patchNotice(); return; }
     if (event.target.closest('[data-dwrt-confirm-cancel], [data-dwrt-modal-close]')) { state.confirm = null; renderOverlays(); return; }
     if (event.target.closest('[data-dwrt-confirm-accept]')) { acceptConfirmation(); return; }

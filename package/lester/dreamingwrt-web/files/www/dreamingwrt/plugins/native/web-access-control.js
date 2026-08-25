@@ -30,7 +30,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260810-front-release-01';
+  const VERSION = '20260822-web-access-savebar-02';
   const stage = root?.closest('.console-stage');
   const POLICY_ID = 'web-access-control';
   const POLICY_NAME = '网址浏览控制';
@@ -54,6 +54,9 @@ export function mount(context = {}) {
     categoriesAvailable: null,
     categoriesError: '',
     overrides: [],
+    overrideEnabledBaseline: new Map(),
+    overrideEnabledDraft: new Map(),
+    overrideSaveResults: [],
     clients: [],
     clientsError: '',
     runtime: {},
@@ -687,6 +690,35 @@ export function mount(context = {}) {
     });
   }
 
+  function overrideEnabled(item) {
+    return state.overrideEnabledDraft.has(item.id)
+      ? state.overrideEnabledDraft.get(item.id)
+      : Boolean(item.enabled);
+  }
+
+  function overrideEnabledChanges() {
+    return Array.from(state.overrideEnabledDraft.entries())
+      .filter(([id, enabled]) => state.overrideEnabledBaseline.get(id) !== enabled);
+  }
+
+  function setOverrideEnabledDraft(id, enabled) {
+    if (state.overrideEnabledBaseline.get(id) === enabled) state.overrideEnabledDraft.delete(id);
+    else state.overrideEnabledDraft.set(id, enabled);
+    state.overrideSaveResults = [];
+  }
+
+  function overrideSavebarMarkup() {
+    const changes = overrideEnabledChanges();
+    return ui.floatingSavebarMarkup?.({
+      visible: changes.length > 0 || state.saving,
+      message: state.saving ? '正在保存域名规则状态…' : `${changes.length} 条域名规则状态待保存`,
+      busy: state.saving,
+      disabled: !changes.length || !overridesWritable(),
+      discardLabel: '撤销更改',
+      saveLabel: '保存并应用'
+    }) || '';
+  }
+
   function rulesTableMarkup() {
     const rows = filteredOverrides();
     const canWrite = overridesWritable();
@@ -695,7 +727,9 @@ export function mount(context = {}) {
       ? '<tr><td colspan="6" class="dwrt-kit-table-empty">正在读取域名规则</td></tr>'
       : rows.length ? rows.map((item) => {
         const runtime = runtimeStatus(item);
-        return `<tr data-web-access-row="${escapeHtml(item.id)}"><td><code class="web-access-domain">${escapeHtml(item.domain)}</code></td><td><span class="web-access-action is-${escapeHtml(item.action)}">${item.action === 'allow' ? '放行' : '拦截'}</span></td><td>${escapeHtml(item.note || '--')}</td><td><div class="web-access-runtime">${statusBadge(runtime.label, runtime.tone)}<small title="${escapeHtml(runtime.detail)}">${escapeHtml(runtime.detail)}</small></div></td><td>${item.enabled ? '已启用' : '已停用'}</td><td><div class="user-auth-row-actions"><button class="user-auth-icon-button" type="button" data-web-access-toggle="${escapeHtml(item.id)}" ${canWrite && !state.saving ? '' : 'disabled'} aria-label="${item.enabled ? '停用' : '启用'}" data-dwrt-tooltip="${item.enabled ? '停用' : '启用'}">${icon(item.enabled ? 'pause' : 'play')}</button><button class="user-auth-icon-button" type="button" data-web-access-edit="${escapeHtml(item.id)}" ${canWrite && !state.saving ? '' : 'disabled'} aria-label="编辑" data-dwrt-tooltip="编辑">${icon('edit')}</button><button class="user-auth-icon-button danger" type="button" data-web-access-delete="${escapeHtml(item.id)}" ${canWrite && !state.saving ? '' : 'disabled'} aria-label="删除" data-dwrt-tooltip="删除">${icon('trash')}</button></div></td></tr>`;
+        const enabled = overrideEnabled(item);
+        const dirty = state.overrideEnabledDraft.has(item.id);
+        return `<tr data-web-access-row="${escapeHtml(item.id)}"><td><code class="web-access-domain">${escapeHtml(item.domain)}</code></td><td><span class="web-access-action is-${escapeHtml(item.action)}">${item.action === 'allow' ? '放行' : '拦截'}</span></td><td>${escapeHtml(item.note || '--')}</td><td><div class="web-access-runtime">${statusBadge(runtime.label, runtime.tone)}<small title="${escapeHtml(runtime.detail)}">${escapeHtml(runtime.detail)}</small></div></td><td>${dirty ? (enabled ? '待启用' : '待停用') : (enabled ? '已启用' : '已停用')}</td><td><div class="user-auth-row-actions"><button class="user-auth-icon-button" type="button" data-web-access-toggle="${escapeHtml(item.id)}" ${canWrite && !state.saving ? '' : 'disabled'} aria-label="${enabled ? '停用' : '启用'}" data-dwrt-tooltip="${enabled ? '停用' : '启用'}">${icon(enabled ? 'pause' : 'play')}</button><button class="user-auth-icon-button" type="button" data-web-access-edit="${escapeHtml(item.id)}" ${canWrite && !state.saving ? '' : 'disabled'} aria-label="编辑" data-dwrt-tooltip="编辑">${icon('edit')}</button><button class="user-auth-icon-button danger" type="button" data-web-access-delete="${escapeHtml(item.id)}" ${canWrite && !state.saving ? '' : 'disabled'} aria-label="删除" data-dwrt-tooltip="删除">${icon('trash')}</button></div></td></tr>`;
       }).join('')
         : `<tr><td colspan="6" class="dwrt-kit-table-empty">${state.overrides.length ? '没有符合筛选条件的域名规则' : '暂无自定义域名规则，点击「拉黑域名」手动添加'}</td></tr>`;
     return `<section class="dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface web-access-table-card" data-web-access-table><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>自定义域名</strong><span>${escapeHtml(overridesScopeSubtitle())}</span></div><span class="dwrt-kit-table-count">${rows.length} 条</span><div class="user-auth-table-controls web-access-table-controls"><div class="user-auth-toolbar-leading"><div class="user-auth-segmented">${filters.map(([id, label]) => `<button type="button" data-web-access-filter="${id}" class="${state.filter === id ? 'is-active' : ''}">${escapeHtml(label)}</button>`).join('')}</div><label class="policy-search policy-search-main" data-dwrt-component="expand-search"><span class="dwrt-kit-expand-search-original-icon">${icon('search')}</span><input type="search" data-web-access-search value="${escapeHtml(state.query)}" placeholder="搜索域名或备注"></label></div><div class="policy-toolbar-actions"><button class="policy-create-button" type="button" data-web-access-create ${canWrite && !state.saving ? '' : 'disabled'}>${icon('plus')}<span>拉黑域名</span></button></div></div></div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table web-access-table"><thead><tr><th>域名</th><th>动作</th><th>备注</th><th>运行状态</th><th>状态</th><th>操作</th></tr></thead><tbody>${body}</tbody></table></div></section>`;
@@ -773,7 +807,7 @@ export function mount(context = {}) {
     if (!root) return;
     root.hidden = false;
     root.classList.add('route-workspace', 'user-authentication-route-host', 'web-access-control-route-host');
-    root.innerHTML = `<section class="user-auth-shell web-access-shell" data-web-access-version="${VERSION}"><div class="user-auth-page-header is-toolbar-only web-access-header">${tabsMarkup()}</div>${overviewMarkup()}<main class="user-auth-workbench web-access-workbench">${noticeMarkup()}${workbenchMarkup()}</main><div class="web-access-overlay-host" data-web-access-overlays></div></section>`;
+    root.innerHTML = `<section class="user-auth-shell web-access-shell" data-web-access-version="${VERSION}"><div class="user-auth-page-header is-toolbar-only web-access-header">${tabsMarkup()}</div>${overviewMarkup()}<main class="user-auth-workbench web-access-workbench">${noticeMarkup()}${workbenchMarkup()}</main>${overrideSavebarMarkup()}<div class="web-access-overlay-host" data-web-access-overlays></div></section>`;
     renderOverlays();
     ui.mountAll?.(root);
   }
@@ -882,6 +916,10 @@ export function mount(context = {}) {
 
       if (overridesResult.status === 'fulfilled') {
         state.overrides = asArray(overridesResult.value, ['items']).map(normalizeOverride);
+        state.overrideEnabledBaseline = new Map(state.overrides.map((item) => [item.id, Boolean(item.enabled)]));
+        Array.from(state.overrideEnabledDraft.entries()).forEach(([id, enabled]) => {
+          if (!state.overrideEnabledBaseline.has(id) || state.overrideEnabledBaseline.get(id) === enabled) state.overrideEnabledDraft.delete(id);
+        });
       } else {
         state.overrides = [];
         state.notice = failureText(overridesResult.reason, '自定义域名列表');
@@ -1075,35 +1113,50 @@ export function mount(context = {}) {
     await load(true);
   }
 
-  async function toggleOverride(entry) {
+  function toggleOverride(entry) {
     if (!entry || !overridesWritable() || state.saving) return;
-    state.saving = true;
+    setOverrideEnabledDraft(entry.id, !overrideEnabled(entry));
+    state.notice = '';
     patchWorkbench();
-    try {
-      await requestJson('/api/v1/aegis/domain-overrides', {
-        method: 'POST',
-        body: JSON.stringify({
-          id: entry.id,
-          policy_id: POLICY_ID,
-          domain: entry.domain,
-          action: entry.action,
-          enabled: !entry.enabled,
-          note: entry.note,
-          confirm: true,
-          apply: true
-        })
-      });
-      state.saving = false;
-      state.notice = entry.enabled ? '规则已停用。' : '规则已启用。';
-      state.noticeTone = 'ok';
-      await load(true);
-    } catch (error) {
-      state.saving = false;
-      if (Number(error.status) === 403) { state.readOnly = true; state.readOnlyReason = '当前账号为只读角色'; }
-      state.notice = `操作失败：${firstText(error.message, '后端未接受操作')}`;
-      state.noticeTone = 'error';
-      patchWorkbench();
+    const savebar = root?.querySelector('[data-dwrt-savebar]');
+    if (savebar) savebar.outerHTML = overrideSavebarMarkup();
+  }
+
+  async function saveOverrideEnabledDrafts() {
+    const changes = overrideEnabledChanges();
+    if (!changes.length || !overridesWritable() || state.saving) return;
+    state.saving = true;
+    state.overrideSaveResults = [];
+    render();
+    for (const [id, enabled] of changes) {
+      const entry = findOverride(id);
+      if (!entry) continue;
+      try {
+        await requestJson('/api/v1/aegis/domain-overrides', {
+          method: 'POST',
+          body: JSON.stringify({ id: entry.id, policy_id: POLICY_ID, domain: entry.domain, action: entry.action, enabled, note: entry.note, confirm: true, apply: true })
+        });
+        state.overrideSaveResults.push({ id, domain: entry.domain, enabled, ok: true });
+      } catch (error) {
+        if (Number(error.status) === 403) { state.readOnly = true; state.readOnlyReason = '当前账号为只读角色'; }
+        state.overrideSaveResults.push({ id, domain: entry.domain, enabled, ok: false, error: firstText(error.message, '后端未接受操作') });
+      }
     }
+    await load(true);
+    state.overrideSaveResults.forEach((result) => {
+      if (result.ok && state.overrideEnabledBaseline.get(result.id) !== result.enabled) {
+        result.ok = false;
+        result.error = '保存后回读与草稿不一致';
+        state.overrideEnabledDraft.set(result.id, result.enabled);
+      }
+    });
+    const failed = state.overrideSaveResults.filter((result) => !result.ok);
+    state.notice = failed.length
+      ? `${state.overrideSaveResults.length - failed.length} 条已保存，${failed.length} 条失败并保留草稿：${failed.map((item) => `${item.domain}（${item.error}）`).join('、')}`
+      : `${state.overrideSaveResults.length} 条域名规则状态已保存；运行态以回读状态列为准。`;
+    state.noticeTone = failed.length ? 'warning' : 'ok';
+    state.saving = false;
+    render();
   }
 
   async function deleteOverride() {
@@ -1142,6 +1195,8 @@ export function mount(context = {}) {
     if (event.target.closest('[data-web-access-create]')) { newEditor(); return; }
     if (event.target.closest('[data-web-access-save]')) { saveOverride(); return; }
     if (event.target.closest('[data-web-access-save-policy]')) { savePolicy(); return; }
+    if (event.target.closest('[data-dwrt-savebar-discard]')) { state.overrideEnabledDraft.clear(); state.overrideSaveResults = []; state.notice = ''; render(); return; }
+    if (event.target.closest('[data-dwrt-savebar-save]')) { saveOverrideEnabledDrafts(); return; }
     const scopeMode = event.target.closest('[data-web-access-scope-mode]');
     if (scopeMode) {
       const policy = state.policy || emptyPolicy();

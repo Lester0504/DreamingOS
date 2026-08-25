@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "aegisxd_internal.h"
+#include "jmx_strbuf.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -805,7 +806,11 @@ static int aegisxd_nft_parse_ipv4_item(const char *s, struct aegisxd_nft_ipv4_it
 
     if (!s || !out || !aegisxd_plan_value_ip_ok(s) || strchr(s, ':'))
         return 0;
-    snprintf(buf, sizeof(buf), "%s", s);
+    /* aegisxd_plan_value_ip_ok admits up to 128 characters, one more than buf
+     * can hold with its NUL, so refuse the copy instead of parsing a silently
+     * shortened address that would match a different network. */
+    if (jmx_strbuf_copy(buf, sizeof(buf), s) != 0)
+        return 0;
     slash = strchr(buf, '/');
     if (slash) {
         *slash++ = '\0';
@@ -896,7 +901,10 @@ static int aegisxd_plan_value_public_ip_ok(const char *s, int *family_out)
         *family_out = 0;
     if (!aegisxd_plan_value_ip_ok(s))
         return 0;
-    snprintf(buf, sizeof(buf), "%s", s);
+    /* Same 128-vs-128 boundary as aegisxd_nft_parse_ipv4_item: a truncated
+     * address must not be treated as public. */
+    if (jmx_strbuf_copy(buf, sizeof(buf), s) != 0)
+        return 0;
     slash = strchr(buf, '/');
     if (slash)
         *slash = '\0';

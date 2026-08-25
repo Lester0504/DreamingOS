@@ -270,8 +270,12 @@ static int content_mac_normalize(const char *raw, char out[18])
         return -1;
     if (!(byte[0] | byte[1] | byte[2] | byte[3] | byte[4] | byte[5]))
         return -1;
-    snprintf(out, 18, "%02x:%02x:%02x:%02x:%02x:%02x", byte[0], byte[1],
-             byte[2], byte[3], byte[4], byte[5]);
+    /* Each byte is masked to 8 bits above, so "%02x" emits exactly two hex
+     * digits and the 17-char result plus NUL fills out[18] exactly. The mask
+     * is what lets the compiler see that; without it %02x could widen. */
+    snprintf(out, 18, "%02x:%02x:%02x:%02x:%02x:%02x", byte[0] & 0xff,
+             byte[1] & 0xff, byte[2] & 0xff, byte[3] & 0xff, byte[4] & 0xff,
+             byte[5] & 0xff);
     return 0;
 }
 

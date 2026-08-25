@@ -16,7 +16,7 @@ export function mount(context = {}) {
     return { name, ok, data: json?.data ?? json, raw: json, error: ok ? null : new Error(apiErrorText(json, response.statusText)) };
   });
 
-  const VERSION = '20260810-front-release-01';
+  const VERSION = '20260822-ai-settings-savebar-02';
   const INSTANCE_ID = `ai-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
   const MODULE_CLASS = 'ai-assistant-route-host';
   const ACTIVE_CONVERSATION_KEY = 'dreamingwrt.ai.activeConversation';
@@ -142,6 +142,7 @@ export function mount(context = {}) {
     currentTouchedAt: activeConversation.at,
     config: normalizeConfig({}),
     baseline: '',
+    baselineConfig: null,
     models: [],
     modelsListed: false,
     history: [],
@@ -173,7 +174,7 @@ export function mount(context = {}) {
      * `error` 已按状态码分类（见 classifyApiFailure），不混用一句通用失败文案。
      */
     providers: { items: [], count: 0, loaded: false, loading: false, error: '', errorKind: '' },
-    dispatch: { policy: null, loaded: false, loading: false, error: '', errorKind: '', saving: '' },
+    dispatch: { policy: null, baselineStrategy: '', draftStrategy: '', loaded: false, loading: false, error: '', errorKind: '', saving: '' },
     providerBusy: { id: '', action: '' },
     providerRemoveId: '',
     tools: [],
@@ -563,10 +564,21 @@ export function mount(context = {}) {
 
   function markBaseline() {
     state.baseline = configComparable();
+    state.baselineConfig = JSON.parse(JSON.stringify(state.config));
   }
 
   function configDirty() {
     return Boolean(state.baseline) && state.baseline !== configComparable();
+  }
+
+  function dispatchDirty() {
+    return Boolean(state.dispatch.baselineStrategy)
+      && Boolean(state.dispatch.draftStrategy)
+      && state.dispatch.baselineStrategy !== state.dispatch.draftStrategy;
+  }
+
+  function settingsDirty() {
+    return configDirty() || dispatchDirty();
   }
 
   function providerDefinition(id = state.config.provider) {
@@ -1205,11 +1217,23 @@ export function mount(context = {}) {
     try {
       const policy = normalizeDispatchPolicy(await requestJson(ENDPOINTS.dispatchPolicy));
       if (!state.mounted) return null;
-      state.dispatch = { policy, loaded: true, loading: false, error: '', errorKind: '', saving: '' };
+      const previousDraft = state.dispatch.draftStrategy;
+      const previousBaseline = state.dispatch.baselineStrategy;
+      const preserveDraft = Boolean(previousBaseline && previousDraft && previousDraft !== previousBaseline);
+      state.dispatch = {
+        policy,
+        baselineStrategy: policy.strategy,
+        draftStrategy: preserveDraft ? previousDraft : policy.strategy,
+        loaded: true,
+        loading: false,
+        error: '',
+        errorKind: '',
+        saving: ''
+      };
     } catch (error) {
       if (!state.mounted) return null;
       const classified = classifyApiFailure(error, '调度策略');
-      state.dispatch = { policy: null, loaded: false, loading: false, error: classified.message, errorKind: classified.kind, saving: '' };
+      state.dispatch = { ...state.dispatch, policy: null, loaded: false, loading: false, error: classified.message, errorKind: classified.kind, saving: '' };
     }
     if (options.render !== false) render();
     return state.dispatch;
@@ -1501,7 +1525,7 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.toggle('ai-global-host', isGlobal);
     root.classList.toggle('ai-settings-route-host', !isGlobal);
-    root.innerHTML = isGlobal ? globalMarkup() : `<main class="ai-assistant-shell ai-settings-route-shell"><header class="ai-settings-route-header">${settingsTabsMarkup()}</header><div class="ai-view-host">${settingsView()}</div></main>`;
+    root.innerHTML = isGlobal ? globalMarkup() : `<main class="ai-assistant-shell ai-settings-route-shell"><header class="ai-settings-route-header">${settingsTabsMarkup()}</header><div class="ai-view-host">${settingsView()}</div>${settingsSavebarMarkup()}</main>`;
     ui.mountAll?.(root);
     bindEvents();
     if (isGlobal) bindGlobalEvents();
@@ -1940,6 +1964,18 @@ export function mount(context = {}) {
     `;
   }
 
+  function settingsSavebarMarkup() {
+    const dirtyResources = Number(configDirty()) + Number(dispatchDirty());
+    return ui.floatingSavebarMarkup?.({
+      visible: dirtyResources > 0 || state.saving,
+      message: state.saving ? '正在保存 AI 设置…' : `${dirtyResources} 项 AI 配置待保存`,
+      busy: state.saving,
+      disabled: !dirtyResources,
+      discardLabel: '撤销更改',
+      saveLabel: '保存并应用'
+    }) || '';
+  }
+
   /* 总开关卡片。demo 把「启用 LLM 服务」做成一张独立主控卡，开关在右侧；
      关闭时下方配置主体折叠成一条占位说明，避免摆一屏点了没意义的字段。 */
   function settingsMasterCard() {
@@ -2095,7 +2131,7 @@ export function mount(context = {}) {
     if (!item.logo) return `<span class="ai-provider-mark is-glyph" aria-hidden="true"><i>${mark}</i></span>`;
     return `<span class="ai-provider-mark" aria-hidden="true">`
       + `<img src="/static/images/logo/${encodeURIComponent(item.logo)}" alt="" loading="lazy" decoding="async"`
-      + ` onerror="this.remove();this.parentElement.classList.add('is-glyph')">`
+      + ` onerror="this.parentElement?.classList.add('is-glyph');this.remove()">`
       + `<i>${mark}</i></span>`;
   }
 
@@ -2145,12 +2181,12 @@ export function mount(context = {}) {
       // 枚举拿不到时不自造选项，如实说明。
       body = `<p class="ai-configured-note">当前策略 ${escapeHtml(strategyLabel(policy.strategy))}。后端未返回可选策略集合，暂不提供切换。</p>`;
     } else {
-      const active = policy.strategy;
-      const busy = Boolean(state.dispatch.saving);
+      const active = state.dispatch.draftStrategy || policy.strategy;
+      const busy = Boolean(state.saving);
       body = `<div class="ai-strategy-switcher" role="radiogroup" aria-label="全局调度策略">
             ${strategies.map((id) => `
               <button class="ai-strategy-pill ${active === id ? 'is-active' : ''}" type="button" role="radio" aria-checked="${active === id ? 'true' : 'false'}" data-ai-strategy="${escapeHtml(id)}" ${busy ? 'disabled' : ''}>
-                ${state.dispatch.saving === id ? icon('loader') : ''}<span>${escapeHtml(strategyLabel(id))}</span>
+                <span>${escapeHtml(strategyLabel(id))}</span>
               </button>
             `).join('')}
           </div>`;
@@ -2376,12 +2412,11 @@ export function mount(context = {}) {
     return `<div class="ai-settings-footer">
           <div class="ai-settings-status">
             ${connectionBadge()}
-            <span>${state.notice ? escapeHtml(state.notice) : configDirty() ? '有未保存的修改' : '配置已同步'}</span>
+            <span>${state.notice ? escapeHtml(state.notice) : settingsDirty() ? '有未保存的修改' : '配置已同步'}</span>
           </div>
           <div class="ai-settings-actions">
             ${state.config.capabilities.provider_test ? `<button class="ai-secondary-button" type="button" data-ai-test-provider ${state.testingProvider || !credentialReady() ? 'disabled' : ''} ${credentialReady() ? '' : 'title="需要先启用 AI 并配置凭据"'}>${state.testingProvider ? icon('loader') : icon('link')}测试连接</button>` : ''}
             <button class="ai-secondary-button" type="button" data-ai-sync-models ${state.syncingModels ? 'disabled' : ''}>${state.syncingModels ? icon('loader') : icon('refresh')}${state.config.capabilities.provider_models_sync ? '同步模型' : '刷新模型列表'}</button>
-            <button class="ai-primary-button" type="button" data-ai-save ${state.saving || !configDirty() ? 'disabled' : ''}>${state.saving ? icon('loader') : icon('save')}保存设置</button>
           </div>
         </div>`;
   }
@@ -2596,7 +2631,8 @@ export function mount(context = {}) {
     });
     root.querySelector('[data-ai-sync-models]')?.addEventListener('click', syncModels);
     root.querySelector('[data-ai-test-provider]')?.addEventListener('click', testProvider);
-    root.querySelector('[data-ai-save]')?.addEventListener('click', saveConfig);
+    root.querySelector('[data-dwrt-savebar-discard]')?.addEventListener('click', discardSettingsDraft);
+    root.querySelector('[data-dwrt-savebar-save]')?.addEventListener('click', saveConfig);
     root.querySelectorAll('[data-ai-strategy]').forEach((button) => button.addEventListener('click', () => setDispatchStrategy(button.dataset.aiStrategy)));
     root.querySelector('[data-ai-provider-add]')?.addEventListener('click', addProvider);
     root.querySelectorAll('[data-ai-provider-test]').forEach((button) => button.addEventListener('click', () => runProviderAction(button.dataset.aiProviderTest, 'test')));
@@ -3069,10 +3105,9 @@ export function mount(context = {}) {
       const output = root.querySelector('[data-ai-temperature-output]');
       if (output) output.textContent = Number(state.config.temperature).toFixed(1);
     }
-    const save = root.querySelector('[data-ai-save]');
-    if (save) save.disabled = state.saving || !configDirty();
     const status = root.querySelector('.ai-settings-status > span:last-child');
-    if (status) status.textContent = configDirty() ? '有未保存的修改' : '配置已同步';
+    if (status) status.textContent = settingsDirty() ? '有未保存的修改' : '配置已同步';
+    render();
   }
 
   async function syncModels() {
@@ -3143,40 +3178,24 @@ export function mount(context = {}) {
     render();
   }
 
-  /*
-   * 调度策略写入。`PUT /api/v1/ai/dispatch-policy`。
-   * 422 `primary_required` 是契约里的正常分支（single 缺主供应商），
-   * 渲染成「请先指定主供应商」的引导文案，不当成失败弹窗。
-   */
-  async function setDispatchStrategy(strategy) {
+  /* 策略 pill 只改草稿；持久写由页面统一 Savebar 触发。 */
+  function setDispatchStrategy(strategy) {
     const id = firstText(strategy);
-    if (!id || state.dispatch.saving) return;
-    if (state.dispatch.policy?.strategy === id) return;
+    if (!id || state.saving) return;
+    if (state.dispatch.draftStrategy === id) return;
     if (!dispatchStrategies().includes(id)) return;
-    state.dispatch.saving = id;
+    state.dispatch.draftStrategy = id;
     state.settingsError = '';
     state.notice = '';
     render();
-    try {
-      await requestJson(ENDPOINTS.dispatchPolicy, { method: 'PUT', body: JSON.stringify({ strategy: id }) });
-      if (!state.mounted) return;
-      state.dispatch.saving = '';
-      await loadDispatchPolicy({ render: false });
-      if (!state.mounted) return;
-      state.notice = `调度策略已切换为${strategyLabel(id)}`;
-    } catch (error) {
-      if (!state.mounted) return;
-      state.dispatch.saving = '';
-      const code = firstText(error?.payload?.error?.code, error?.payload?.code);
-      const status = Math.round(firstNumber(error?.status, 0));
-      if (status === 422 || code === 'primary_required') {
-        state.settingsError = '';
-        state.notice = '请先把一个供应商设为主通道，再切换到单供应商策略。';
-      } else {
-        state.settingsError = classifyApiFailure(error, '调度策略', 'write').message;
-      }
-    }
-    if (!state.mounted) return;
+  }
+
+  function discardSettingsDraft() {
+    if (state.saving) return;
+    if (state.baselineConfig) state.config = JSON.parse(JSON.stringify(state.baselineConfig));
+    state.dispatch.draftStrategy = state.dispatch.baselineStrategy;
+    state.settingsError = '';
+    state.notice = '';
     render();
   }
 
@@ -3287,14 +3306,18 @@ export function mount(context = {}) {
   }
 
   async function saveConfig() {
-    if (state.saving || !configDirty()) return;
+    const saveMainConfig = configDirty();
+    const saveDispatch = dispatchDirty();
+    if (state.saving || (!saveMainConfig && !saveDispatch)) return;
     state.saving = true;
     state.settingsError = '';
     state.notice = '';
     render();
     const apiKey = state.config.api_key_input.trim();
-    try {
-      await postJson(ENDPOINTS.config, {
+    const results = [];
+    if (saveMainConfig) {
+      try {
+        await postJson(ENDPOINTS.config, {
         provider: state.config.provider,
         api_base: state.config.api_base.trim(),
         ...(apiKey ? { api_key: apiKey } : {}),
@@ -3308,19 +3331,45 @@ export function mount(context = {}) {
         enabled: Boolean(state.config.enabled),
         reasoning_effort: state.config.reasoning_effort,
         reasoning_api_shape: state.config.reasoning_api_shape
-      });
-      const result = await fetchApi('ai-config', ENDPOINTS.config);
-      if (!result?.ok) throw result?.error || new Error('保存后无法读取配置');
-      state.config = normalizeConfig(result.data);
-      state.oauth.available = state.config.oauth.available;
-      state.oauth.catalog = state.config.oauth.catalog;
-      if (state.config.auth_mode === 'oauth') await loadOAuthStatus(state.config.provider, { quiet: true });
-      markBaseline();
-      state.notice = '设置已保存';
-      notifyConfigUpdated();
-    } catch (error) {
-      state.settingsError = error?.message || '设置保存失败';
+        });
+        const result = await fetchApi('ai-config', ENDPOINTS.config);
+        if (!result?.ok) throw result?.error || new Error('保存后无法读取配置');
+        const canonical = normalizeConfig(result.data);
+        if (apiKey && !canonical.api_key_set) throw new Error('保存后回读未确认 API Key 已写入');
+        if (state.config.clear_api_key && canonical.api_key_set) throw new Error('保存后回读仍显示 API Key 已保存');
+        state.config = canonical;
+        state.oauth.available = state.config.oauth.available;
+        state.oauth.catalog = state.config.oauth.catalog;
+        if (state.config.auth_mode === 'oauth') await loadOAuthStatus(state.config.provider, { quiet: true });
+        markBaseline();
+        notifyConfigUpdated();
+        results.push('主配置已保存');
+      } catch (error) {
+        state.settingsError = `主配置未保存：${firstText(error?.message, '保存失败')}`;
+      }
     }
+    if (saveDispatch) {
+      const wanted = state.dispatch.draftStrategy;
+      try {
+        await requestJson(ENDPOINTS.dispatchPolicy, { method: 'PUT', body: JSON.stringify({ strategy: wanted }) });
+        const canonical = normalizeDispatchPolicy(await requestJson(ENDPOINTS.dispatchPolicy));
+        if (canonical.strategy !== wanted) throw new Error('保存后回读与草稿不一致');
+        state.dispatch.policy = canonical;
+        state.dispatch.baselineStrategy = canonical.strategy;
+        state.dispatch.draftStrategy = canonical.strategy;
+        state.dispatch.loaded = true;
+        state.dispatch.error = '';
+        results.push('调度策略已保存');
+      } catch (error) {
+        const code = firstText(error?.payload?.error?.code, error?.payload?.code);
+        const status = Math.round(firstNumber(error?.status, 0));
+        const message = status === 422 || code === 'primary_required'
+          ? '请先把一个供应商设为主通道，再切换到单供应商策略'
+          : classifyApiFailure(error, '调度策略', 'write').message;
+        state.settingsError = `${state.settingsError ? `${state.settingsError}；` : ''}调度策略未保存：${message}`;
+      }
+    }
+    state.notice = results.length ? results.join('，') : '';
     state.saving = false;
     render();
   }

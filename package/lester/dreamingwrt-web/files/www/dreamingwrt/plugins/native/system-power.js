@@ -4,7 +4,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260810-front-release-01';
+  const VERSION = '20260819-system-power-savebar-01';
   const MODULE_CLASS = 'system-power-route-host';
   const stage = root?.closest('.console-stage');
   const ENDPOINTS = {
@@ -28,6 +28,9 @@ export function mount(context = {}) {
     uptimeMeasuredAt: 0,
     schedulesKnown: false,
     schedules: [],
+    scheduleEnabledBaseline: new Map(),
+    scheduleEnabledDraft: new Map(),
+    saveResults: [],
     capabilities: emptyCapabilities(),
     drawer: '',
     selected: null,
@@ -188,7 +191,22 @@ export function mount(context = {}) {
     if (declaredSchedules) {
       state.schedulesKnown = true;
       state.schedules = declaredSchedules.map(normalizeSchedule);
+      const baseline = new Map(state.schedules.map((schedule) => [schedule.id, Boolean(schedule.enabled)]));
+      state.scheduleEnabledBaseline = baseline;
+      Array.from(state.scheduleEnabledDraft.entries()).forEach(([id, enabled]) => {
+        if (!baseline.has(id) || baseline.get(id) === enabled) state.scheduleEnabledDraft.delete(id);
+      });
     }
+  }
+
+  function scheduleEnabled(schedule) {
+    return state.scheduleEnabledDraft.has(schedule.id)
+      ? state.scheduleEnabledDraft.get(schedule.id)
+      : Boolean(schedule.enabled);
+  }
+
+  function scheduleEnabledChanges() {
+    return Array.from(state.scheduleEnabledDraft.entries()).filter(([id, enabled]) => state.scheduleEnabledBaseline.get(id) !== enabled);
   }
 
   async function load(background = false) {
@@ -279,7 +297,7 @@ export function mount(context = {}) {
   }
 
   function nextSchedule() {
-    return state.schedules.filter((item) => item.enabled && item.nextRun).sort((left, right) => left.nextRun - right.nextRun)[0] || null;
+    return state.schedules.filter((item) => scheduleEnabled(item) && item.nextRun).sort((left, right) => left.nextRun - right.nextRun)[0] || null;
   }
 
   function summaryMarkup() {
@@ -287,7 +305,7 @@ export function mount(context = {}) {
     const next = nextSchedule();
     const cards = [
       { key: 'uptime', label: '运行时间', value: formatUptime(currentUptime()), detail: state.uptime === null ? '等待系统状态接口' : '自本次系统启动', tone: 'info', icon: icon('clock') },
-      { key: 'schedule-count', label: '计划条数', value: state.schedulesKnown ? String(state.schedules.length) : '--', detail: state.schedulesKnown ? `${state.schedules.filter((item) => item.enabled).length} 条已启用` : firstText(state.error, '电源计划读取失败'), tone: 'ok', icon: icon('list') },
+      { key: 'schedule-count', label: '计划条数', value: state.schedulesKnown ? String(state.schedules.length) : '--', detail: state.schedulesKnown ? `${state.schedules.filter((item) => scheduleEnabled(item)).length} 条已启用` : firstText(state.error, '电源计划读取失败'), tone: 'ok', icon: icon('list') },
       { key: 'next-run', label: '下次执行', value: next ? formatDateTime(next.nextRun) : '--', detail: next ? `${eventLabel(next.event)} · ${next.name}` : state.schedulesKnown ? '暂无待执行计划' : firstText(state.error, '电源计划读取失败'), tone: 'warn', icon: icon('calendar') }
     ];
     return typeof renderer === 'function'
@@ -341,7 +359,20 @@ export function mount(context = {}) {
   }
 
   function scheduleRow(schedule) {
-    return `<tr><td class="system-power-check-cell"><input type="checkbox" aria-label="选择 ${escapeHtml(schedule.name)}"></td><td><button class="system-power-name" type="button" data-power-edit="${escapeHtml(schedule.id)}">${escapeHtml(schedule.name)}</button></td><td><span class="system-power-event is-${schedule.event === 'shutdown' ? 'shutdown' : 'reboot'}">${eventLabel(schedule.event)}</span></td><td>${periodLabel(schedule)}</td><td>${escapeHtml(dateLabel(schedule))}</td><td><code>${escapeHtml(schedule.time || '--')}</code></td><td class="system-power-note">${escapeHtml(schedule.note || '--')}</td><td><label class="system-power-switch dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-power-toggle="${escapeHtml(schedule.id)}" ${schedule.enabled ? 'checked' : ''} ${state.capabilities.scheduleUpdate && !state.saving ? '' : 'disabled'}><span>${schedule.enabled ? '启用' : '停用'}</span></label></td><td><div class="system-power-row-actions"><button type="button" data-power-edit="${escapeHtml(schedule.id)}" title="编辑计划">${icon('edit')}</button><button class="is-danger" type="button" data-power-delete="${escapeHtml(schedule.id)}" title="删除计划" ${state.capabilities.scheduleDelete && !state.saving ? '' : 'disabled'}>${icon('trash')}</button></div></td></tr>`;
+    const enabled = scheduleEnabled(schedule);
+    return `<tr><td class="system-power-check-cell"><input type="checkbox" aria-label="选择 ${escapeHtml(schedule.name)}"></td><td><button class="system-power-name" type="button" data-power-edit="${escapeHtml(schedule.id)}">${escapeHtml(schedule.name)}</button></td><td><span class="system-power-event is-${schedule.event === 'shutdown' ? 'shutdown' : 'reboot'}">${eventLabel(schedule.event)}</span></td><td>${periodLabel(schedule)}</td><td>${escapeHtml(dateLabel(schedule))}</td><td><code>${escapeHtml(schedule.time || '--')}</code></td><td class="system-power-note">${escapeHtml(schedule.note || '--')}</td><td><label class="system-power-switch dwrt-kit-switch" data-dwrt-component="switch"><input type="checkbox" data-power-toggle="${escapeHtml(schedule.id)}" ${enabled ? 'checked' : ''} ${state.capabilities.scheduleUpdate && !state.saving ? '' : 'disabled'}><span>${enabled ? '启用' : '停用'}</span></label></td><td><div class="system-power-row-actions"><button type="button" data-power-edit="${escapeHtml(schedule.id)}" title="编辑计划">${icon('edit')}</button><button class="is-danger" type="button" data-power-delete="${escapeHtml(schedule.id)}" title="删除计划" ${state.capabilities.scheduleDelete && !state.saving ? '' : 'disabled'}>${icon('trash')}</button></div></td></tr>`;
+  }
+
+  function savebarMarkup() {
+    const changes = scheduleEnabledChanges();
+    return ui.floatingSavebarMarkup?.({
+      visible: changes.length > 0 || state.saving,
+      message: state.saving ? '正在保存电源计划状态…' : `${changes.length} 条电源计划状态待保存`,
+      busy: state.saving,
+      disabled: !changes.length || !state.capabilities.scheduleUpdate,
+      discardLabel: '撤销更改',
+      saveLabel: '保存并应用'
+    }) || '';
   }
 
   function schedulesMarkup() {
@@ -433,7 +464,7 @@ export function mount(context = {}) {
     root.hidden = false;
     root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home', 'route-log-center-host');
     root.classList.add('route-workspace', MODULE_CLASS);
-    target.innerHTML = `<section class="system-power-shell ${hasNotice ? 'has-notice' : ''}">${tabsMarkup()}${noticeMarkup()}${state.tab === 'overview' ? overviewMarkup() : schedulesMarkup()}${drawerMarkup()}${confirmMarkup()}</section>`;
+    target.innerHTML = `<section class="system-power-shell ${hasNotice ? 'has-notice' : ''}">${tabsMarkup()}${noticeMarkup()}${state.tab === 'overview' ? overviewMarkup() : schedulesMarkup()}${drawerMarkup()}${confirmMarkup()}${savebarMarkup()}</section>`;
     ui.mountAll?.(target);
     patchUptime();
   }
@@ -528,18 +559,36 @@ export function mount(context = {}) {
     }
   }
 
-  async function toggleSchedule(schedule) {
-    if (!state.capabilities.scheduleUpdate || state.saving) return;
+  async function saveScheduleToggles() {
+    const changes = scheduleEnabledChanges();
+    if (!state.capabilities.scheduleUpdate || state.saving || !changes.length) return;
     state.saving = true;
-    try {
-      await requestJson(`${ENDPOINTS.schedules}/${encodeURIComponent(schedule.id)}`, { method: 'PUT', body: JSON.stringify({ ...schedulePayloadFrom(schedule), enabled: !schedule.enabled }) });
-      await load(true);
-    } catch (error) {
-      state.notice = `更新失败：${firstText(error.message, 'unknown')}`;
-    } finally {
-      state.saving = false;
-      render();
+    state.notice = '';
+    state.saveResults = [];
+    renderPreservingInteraction();
+    for (const [id, enabled] of changes) {
+      const schedule = state.schedules.find((item) => item.id === id);
+      if (!schedule) continue;
+      try {
+        await requestJson(`${ENDPOINTS.schedules}/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify({ ...schedulePayloadFrom(schedule), enabled }) });
+        state.saveResults.push({ id, name: schedule.name, enabled, ok: true });
+      } catch (error) {
+        state.saveResults.push({ id, name: schedule.name, enabled, ok: false, error: firstText(error.message, 'unknown') });
+      }
     }
+    await load(true);
+    state.saveResults.forEach((result) => {
+      if (result.ok && state.scheduleEnabledBaseline.get(result.id) !== result.enabled) {
+        result.ok = false;
+        result.error = '保存后回读与草稿不一致';
+      }
+    });
+    const failed = state.saveResults.filter((item) => !item.ok);
+    state.notice = failed.length
+      ? `${state.saveResults.length - failed.length} 条已保存，${failed.length} 条失败并保留草稿：${failed.map((item) => `${item.name}（${item.error}）`).join('、')}`
+      : `${state.saveResults.length} 条电源计划状态已保存。`;
+    state.saving = false;
+    renderPreservingInteraction();
   }
 
   function schedulePayloadFrom(schedule) {
@@ -593,6 +642,8 @@ export function mount(context = {}) {
     if (remove && !remove.disabled) { state.confirmDelete = remove.dataset.powerDelete; render(); return; }
     if (event.target.closest('[data-power-close], [data-dwrt-confirm-cancel]')) { closeTransient(); return; }
     if (event.target.closest('[data-power-save]')) { saveSchedule(); return; }
+    if (event.target.closest('[data-dwrt-savebar-discard]')) { state.scheduleEnabledDraft.clear(); state.saveResults = []; state.notice = ''; renderPreservingInteraction(); return; }
+    if (event.target.closest('[data-dwrt-savebar-save]')) { saveScheduleToggles(); return; }
     if (event.target.closest('[data-dwrt-confirm-accept]')) { executeConfirmed(); return; }
   }
 
@@ -621,7 +672,14 @@ export function mount(context = {}) {
     const toggle = event.target.closest('[data-power-toggle]');
     if (toggle) {
       const schedule = state.schedules.find((item) => item.id === toggle.dataset.powerToggle);
-      if (schedule) toggleSchedule(schedule);
+      if (schedule) {
+        const baseline = state.scheduleEnabledBaseline.get(schedule.id);
+        if (toggle.checked === baseline) state.scheduleEnabledDraft.delete(schedule.id);
+        else state.scheduleEnabledDraft.set(schedule.id, toggle.checked);
+        state.saveResults = [];
+        state.notice = '';
+        renderPreservingInteraction();
+      }
     }
   }
 

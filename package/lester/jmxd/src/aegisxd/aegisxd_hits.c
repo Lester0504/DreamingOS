@@ -318,7 +318,11 @@ static int aegisxd_hits_lookup_arp(const char *ip, char *mac, size_t mac_len,
     fp = fopen("/proc/net/arp", "r");
     if (!fp)
         return 0;
-    (void)fgets(line, sizeof(line), fp);
+    /* Skip the column header. An empty /proc/net/arp has nothing to scan. */
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return 0;
+    }
     while (fgets(line, sizeof(line), fp)) {
         char aip[64] = "";
         char hwtype[32] = "";
