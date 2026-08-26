@@ -90,9 +90,15 @@ static const char *const ac_fields_activation_complete[] = {
 static const char *const ac_fields_session_hello[] = {
     "protocol", "kind", "controller_id", "certificate_id", "ap_id"
 };
+static const char *const ac_fields_session_hello_v3[] = {
+    "protocol", "kind", "controller_id", "certificate_id", "ap_id", "capabilities"
+};
 static const char *const ac_fields_session_ready[] = {
     "protocol", "kind", "controller_id", "certificate_id", "ap_id",
     "session_epoch"
+};
+static const char *const ac_fields_session_ready_v3[] = {
+    "protocol", "kind", "controller_id", "certificate_id", "ap_id", "session_epoch", "capabilities"
 };
 static const char *const ac_fields_heartbeat[] = {
     "protocol", "kind", "ap_id", "session_epoch", "sequence", "timestamp"
@@ -224,6 +230,7 @@ struct ac_transport_state {
     int running;
     int listening;
     int stopping;
+    int write_capable;
     int port;
     const char *reason;
     char controller_id[AC_ENROLLMENT_ID_LEN + 1];
@@ -243,6 +250,7 @@ static _Thread_local char g_ac_transport_reason_copy[AC_TRANSPORT_REASON_MAX];
 static _Thread_local char
     g_ac_transport_controller_id_copy[AC_ENROLLMENT_ID_LEN + 1];
 static _Thread_local const char *g_ac_wire_protocol = AC_TRANSPORT_PROTOCOL_V1;
+
 
 static int64_t ac_transport_monotonic_ms(void)
 {
@@ -785,7 +793,21 @@ static int ac_alpn_select(SSL *ssl, const unsigned char **out,
 
     (void)ssl;
     (void)opaque;
-    /* Prefer v2 when the AP explicitly offers it; v1 remains compatible. */
+    /* Prefer v3, then v2; v1 remains compatible. */
+    while (offset < input_length) {
+        unsigned int length = input[offset++];
+
+        if (length > input_length - offset)
+            return SSL_TLSEXT_ERR_ALERT_FATAL;
+        if (length == sizeof(AP_CONTROL_ALPN_V3) - 1 &&
+            CRYPTO_memcmp(input + offset, AP_CONTROL_ALPN_V3, length) == 0) {
+            *out = (const unsigned char *)AP_CONTROL_ALPN_V3;
+            *out_length = (unsigned char)length;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        offset += length;
+    }
+    offset = 0;
     while (offset < input_length) {
         unsigned int length = input[offset++];
 
@@ -2142,22 +2164,52 @@ static int ac_handle_session(SSL *ssl, struct json_object *hello,
     unsigned char session_epoch_raw[32];
     struct ac_device_model_report model_report;
     struct ac_radio_job_replay radio_replay;
+    struct ap_control_capabilities peer_capabilities = {0};
+    const struct ap_control_capabilities local_capabilities = {
+        .config_executor = 1,
+        .validate = 1,
+        .stage = 1,
+        .apply = 1,
+        .readback = 1,
+        .rollback = 1,
+    };
     int64_t sequence = 0;
     int64_t previous_sequence = -1;
     int64_t observed_at = 0;
     int64_t timestamp = 0;
+    int write_capable = 0;
     int rc = -1;
 
     memset(&model_report, 0, sizeof(model_report));
     memset(&radio_replay, 0, sizeof(radio_replay));
     memset(session_epoch_raw, 0, sizeof(session_epoch_raw));
 
-    if (ac_identity_hello_parse(hello, ac_fields_session_hello,
-            AC_ARRAY_SIZE(ac_fields_session_hello), "session_hello", 0,
+    if (ac_identity_hello_parse(hello,
+            ap_control_ssl_selected_alpn_version(ssl) == 3 ?
+                ac_fields_session_hello_v3 : ac_fields_session_hello,
+            ap_control_ssl_selected_alpn_version(ssl) == 3 ?
+                AC_ARRAY_SIZE(ac_fields_session_hello_v3) : AC_ARRAY_SIZE(ac_fields_session_hello),
+            "session_hello", 0,
             controller_id, enrollment_id, certificate_id, ap_id) != 0) {
         ac_transport_log_stage("session_rejected", "hello");
         goto denied;
     }
+    if (ap_control_ssl_selected_alpn_version(ssl) == 3) {
+        struct json_object *capabilities = NULL;
+        if (!json_object_object_get_ex(hello, "capabilities", &capabilities) ||
+            ap_control_capabilities_parse(capabilities, &peer_capabilities) !=
+                AP_CONTROL_WIRE_OK) {
+            ac_send_error(ssl, "invalid_request", "invalid_session_capabilities");
+            goto denied;
+        }
+    }
+    write_capable =
+        ap_control_ssl_selected_alpn_version(ssl) == 3 &&
+        ap_control_capabilities_all_true(&local_capabilities) &&
+        ap_control_capabilities_all_true(&peer_capabilities);
+    pthread_mutex_lock(&g_ac_transport.lock);
+    g_ac_transport.write_capable = write_capable;
+    pthread_mutex_unlock(&g_ac_transport.lock);
     if (!ac_peer_authorize(certificate_id, ap_id, peer, 1)) {
         ac_transport_log_stage("session_rejected", "authorize");
         goto denied;
@@ -2170,9 +2222,10 @@ static int ac_handle_session(SSL *ssl, struct json_object *hello,
         goto done;
     }
     ac_db_enter();
-    if (ac_db_ap_session_begin(ap_id, session_epoch,
-            !strcmp(g_ac_wire_protocol, AC_TRANSPORT_PROTOCOL_V2) ? 2 : 1,
-            ac_now_s()) != 0) {
+    if (ac_db_ap_session_begin_with_capabilities(ap_id, session_epoch,
+            !strcmp(g_ac_wire_protocol, AP_CONTROL_PROTOCOL_V3) ? 3 :
+            (!strcmp(g_ac_wire_protocol, AC_TRANSPORT_PROTOCOL_V2) ? 2 : 1),
+            write_capable, ac_now_s()) != 0) {
         ac_db_leave();
         ac_transport_log_stage("session_rejected", "epoch_store");
         goto done;
@@ -2184,10 +2237,14 @@ static int ac_handle_session(SSL *ssl, struct json_object *hello,
         ac_json_add_string(response, "certificate_id", certificate_id) != 0 ||
         ac_json_add_string(response, "ap_id", ap_id) != 0 ||
         ac_json_add_string(response, "session_epoch", session_epoch) != 0 ||
-        ap_control_json_object_exact(response, ac_fields_session_ready,
-                AC_ARRAY_SIZE(ac_fields_session_ready),
-                ac_fields_session_ready,
-                AC_ARRAY_SIZE(ac_fields_session_ready)) !=
+        (ap_control_ssl_selected_alpn_version(ssl) == 3 &&
+         ap_control_capabilities_add(response, &local_capabilities) !=
+             AP_CONTROL_WIRE_OK) ||
+        ap_control_json_object_exact(response,
+                ap_control_ssl_selected_alpn_version(ssl) == 3 ? ac_fields_session_ready_v3 : ac_fields_session_ready,
+                ap_control_ssl_selected_alpn_version(ssl) == 3 ? AC_ARRAY_SIZE(ac_fields_session_ready_v3) : AC_ARRAY_SIZE(ac_fields_session_ready),
+                ap_control_ssl_selected_alpn_version(ssl) == 3 ? ac_fields_session_ready_v3 : ac_fields_session_ready,
+                ap_control_ssl_selected_alpn_version(ssl) == 3 ? AC_ARRAY_SIZE(ac_fields_session_ready_v3) : AC_ARRAY_SIZE(ac_fields_session_ready)) !=
             AP_CONTROL_WIRE_OK ||
         ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, response) !=
             AP_CONTROL_WIRE_OK) {
@@ -2210,8 +2267,10 @@ static int ac_handle_session(SSL *ssl, struct json_object *hello,
             ac_transport_log_stage("session_closed", "frame_kind");
             goto done;
         }
-        if (!strcmp(g_ac_wire_protocol, AC_TRANSPORT_PROTOCOL_V2) &&
-            (!strncmp(kind, "radio_job_", strlen("radio_job_")) ||
+        if ((!strcmp(g_ac_wire_protocol, AC_TRANSPORT_PROTOCOL_V2) &&
+             !strncmp(kind, "radio_job_", strlen("radio_job_"))) ||
+            (!strcmp(g_ac_wire_protocol, AP_CONTROL_PROTOCOL_V3) &&
+             write_capable &&
              !strncmp(kind, "config_job_", strlen("config_job_")))) {
             struct ac_radio_job_request radio_request;
             unsigned char request_sha256[SHA256_DIGEST_LENGTH];
@@ -2464,8 +2523,10 @@ static void ac_connection_run(int fd)
         ac_transport_log_stage("connection_rejected", "alpn");
         goto done;
     }
-    g_ac_wire_protocol = ap_control_ssl_selected_alpn_version(ssl) == 2 ?
-        AC_TRANSPORT_PROTOCOL_V2 : AC_TRANSPORT_PROTOCOL_V1;
+    g_ac_wire_protocol = ap_control_ssl_selected_alpn_version(ssl) == 3 ?
+        AP_CONTROL_PROTOCOL_V3 :
+        (ap_control_ssl_selected_alpn_version(ssl) == 2 ?
+            AC_TRANSPORT_PROTOCOL_V2 : AC_TRANSPORT_PROTOCOL_V1);
     if (ac_peer_identity(ssl, &peer) != 0) {
         ac_transport_log_stage("connection_rejected", "peer_identity");
         goto done;
@@ -2491,6 +2552,9 @@ static void ac_connection_run(int fd)
     else
         ac_send_error(ssl, "invalid_request", "message_kind_not_allowed");
 done:
+    pthread_mutex_lock(&g_ac_transport.lock);
+    g_ac_transport.write_capable = 0;
+    pthread_mutex_unlock(&g_ac_transport.lock);
     json_object_put(message);
     if (ssl)
         SSL_shutdown(ssl);
@@ -2715,6 +2779,7 @@ static void ac_transport_threads_stop(size_t worker_count, int accept_started)
     pthread_mutex_lock(&g_ac_transport.lock);
     g_ac_transport.stopping = 1;
     g_ac_transport.listening = 0;
+    g_ac_transport.write_capable = 0;
     if (g_ac_transport.listen_fd >= 0)
         shutdown(g_ac_transport.listen_fd, SHUT_RDWR);
     for (i = 0; i < AC_TRANSPORT_WORKERS_MAX; i++)
@@ -2859,6 +2924,7 @@ void ac_transport_stop(void)
     g_ac_transport.running = 0;
     g_ac_transport.listening = 0;
     g_ac_transport.stopping = 0;
+    g_ac_transport.write_capable = 0;
     g_ac_transport.port = 0;
     g_ac_transport.reason = "stopped";
     pthread_mutex_unlock(&g_ac_transport.lock);

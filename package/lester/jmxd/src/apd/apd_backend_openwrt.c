@@ -2,6 +2,7 @@
 #ifndef APD_HOSTAPD_STANDALONE_TEST
 #include "apd_internal.h"
 #include "apd_readonly_command.h"
+#include "jmx_strbuf.h"
 #else
 #include <dirent.h>
 #include <errno.h>
@@ -34,6 +35,7 @@
  * stays testable apart from the collectors in this file.
  */
 #include "apd_vendor_chanlist.h"
+#include "ap_radio_id.h"
 
 #ifndef IFNAMSIZ
 #define IFNAMSIZ 16
@@ -562,6 +564,8 @@ struct apd_neighbor_target {
     char wiphy_name[64];
     char interface[IFNAMSIZ];
     unsigned int wiphy_index;
+    unsigned int radio_index;
+    int has_radio_index;
     unsigned int ifindex;
     int frequency_mhz;
     int preferred;
@@ -628,26 +632,13 @@ static int apd_neighbor_read_uint_file(const char *path, unsigned int *out)
     return 0;
 }
 
-static int apd_neighbor_radio_id(const char *radio_id, unsigned int *index)
+static int apd_neighbor_radio_id(const char *radio_id,
+                                 unsigned int *wiphy_index,
+                                 unsigned int *radio_index,
+                                 int *has_radio_index)
 {
-    const char *digits;
-    char *end = NULL;
-    unsigned long value;
-
-    if (!radio_id || strncmp(radio_id, "phy", 3) || !radio_id[3])
-        return -1;
-    digits = radio_id + 3;
-    if (digits[0] == '0' && digits[1])
-        return -1;
-    for (const char *p = digits; *p; p++)
-        if (!isdigit((unsigned char)*p))
-            return -1;
-    errno = 0;
-    value = strtoul(digits, &end, 10);
-    if (errno == ERANGE || !end || *end || value > UINT_MAX)
-        return -1;
-    *index = (unsigned int)value;
-    return 0;
+    return dreamingwrt_ap_radio_id_parse(radio_id, wiphy_index, radio_index,
+                                         has_radio_index);
 }
 
 static int apd_neighbor_wiphy_name(unsigned int index, char *out, size_t out_size)
@@ -718,6 +709,8 @@ static int apd_neighbor_interface_runtime_valid(const char *interface,
 
 static void apd_neighbor_target_consider(struct apd_neighbor_target *best,
                                          int *found, unsigned int wiphy_index,
+                                         int has_radio_index,
+                                         int interface_radio_match,
                                          const char *interface,
                                          unsigned int ifindex, int frequency,
                                          int type_ap, int has_ssid)
@@ -725,7 +718,9 @@ static void apd_neighbor_target_consider(struct apd_neighbor_target *best,
     int preferred;
     int best_preferred;
 
-    if (!type_ap || frequency <= 0 || !interface || !interface[0] ||
+    if (!type_ap || frequency <= 0 ||
+        (has_radio_index && !interface_radio_match) ||
+        !interface || !interface[0] ||
         !apd_neighbor_interface_runtime_valid(interface, wiphy_index, ifindex))
         return;
     /* QWRT/QSDK "wifiN" radio nodes reject scan triggers with EPERM
@@ -751,19 +746,25 @@ static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
     char *saveptr = NULL;
     char interface[IFNAMSIZ] = { 0 };
     unsigned int requested_index = 0;
+    unsigned int requested_radio = 0;
+    int has_requested_radio = 0;
     unsigned int current_index = UINT_MAX;
     unsigned int ifindex = 0;
     int frequency = 0;
     int type_ap = 0;
     int has_ssid = 0;
+    int interface_radio_match = 0;
     int found = 0;
 
     memset(target, 0, sizeof(*target));
-    if (apd_neighbor_radio_id(radio_id, &requested_index) != 0) {
+    if (apd_neighbor_radio_id(radio_id, &requested_index, &requested_radio,
+                              &has_requested_radio) != 0) {
         snprintf(reason, APD_NEIGHBOR_REASON_LEN + 1, "%s", "radio_id_invalid");
         return -1;
     }
     target->wiphy_index = requested_index;
+    target->radio_index = requested_radio;
+    target->has_radio_index = has_requested_radio;
     snprintf(target->radio_id, sizeof(target->radio_id), "%s", radio_id);
     if (apd_neighbor_wiphy_name(requested_index, target->wiphy_name,
                                 sizeof(target->wiphy_name)) != 0) {
@@ -782,6 +783,8 @@ static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
 
         if (!strncmp(value, "phy#", 4)) {
             apd_neighbor_target_consider(target, &found, requested_index,
+                                         has_requested_radio,
+                                         interface_radio_match,
                                          interface, ifindex, frequency,
                                          type_ap, has_ssid);
             interface[0] = '\0';
@@ -789,6 +792,7 @@ static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
             frequency = 0;
             type_ap = 0;
             has_ssid = 0;
+            interface_radio_match = 0;
             current_index = (unsigned int)strtoul(value + 4, NULL, 10);
             continue;
         }
@@ -796,6 +800,8 @@ static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
             continue;
         if (!strncmp(value, "Interface ", 10)) {
             apd_neighbor_target_consider(target, &found, requested_index,
+                                         has_requested_radio,
+                                         interface_radio_match,
                                          interface, ifindex, frequency,
                                          type_ap, has_ssid);
             snprintf(interface, sizeof(interface), "%s", value + 10);
@@ -803,6 +809,7 @@ static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
             frequency = 0;
             type_ap = 0;
             has_ssid = 0;
+            interface_radio_match = 0;
         } else if (!strncmp(value, "ifindex ", 8)) {
             unsigned long parsed = strtoul(value + 8, NULL, 10);
             if (parsed <= UINT_MAX)
@@ -817,9 +824,31 @@ static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
             if (sscanf(value, "channel %d (%d MHz)", &channel,
                        &parsed_frequency) == 2 && parsed_frequency > 0)
                 frequency = parsed_frequency;
+        } else if (!strncmp(value, "Radios:", 7)) {
+            const char *cursor = value + 7;
+
+            while (*cursor) {
+                char *end = NULL;
+                unsigned long parsed;
+
+                while (*cursor && isspace((unsigned char)*cursor))
+                    cursor++;
+                if (!*cursor)
+                    break;
+                errno = 0;
+                parsed = strtoul(cursor, &end, 10);
+                if (errno == ERANGE || !end || end == cursor ||
+                    parsed > UINT_MAX)
+                    break;
+                if ((unsigned int)parsed == requested_radio)
+                    interface_radio_match = 1;
+                cursor = end;
+            }
         }
     }
-    apd_neighbor_target_consider(target, &found, requested_index, interface,
+    apd_neighbor_target_consider(target, &found, requested_index,
+                                 has_requested_radio,
+                                 interface_radio_match, interface,
                                  ifindex, frequency, type_ap, has_ssid);
     free(copy);
     if (!found) {
@@ -4147,7 +4176,11 @@ static int apd_hostapd_collect_raw(int phy_count,
                 continue;
             }
             memcpy(names[name_count], entry->d_name, name_len + 1);
-            snprintf(dirs[name_count], APD_HOSTAPD_DIR_LEN, "%s", scan_dir);
+            /* scan_dirs[] and dirs[] rows have identical extent, so this always
+             * fits. Copying rather than formatting keeps the compiler from
+             * treating scan_dir as a pointer into the flat scan_dirs array,
+             * where the apparent source bound is every remaining row at once. */
+            jmx_strbuf_copy(dirs[name_count], APD_HOSTAPD_DIR_LEN, scan_dir);
             name_count++;
         }
         closedir(dir);
@@ -4941,6 +4974,8 @@ static void apd_collect_radio_surveys(const char *path,
         size_t j;
         struct json_object *radio_id = NULL;
         unsigned int wiphy_index = 0;
+        unsigned int radio_index = 0;
+        int has_radio_index = 0;
         int have_wiphy_index = 0;
 
         /* Radio ids are `phyN`; the airtime fallback needs that index to find
@@ -4948,7 +4983,8 @@ static void apd_collect_radio_surveys(const char *path,
         if (json_object_object_get_ex(radio, "id", &radio_id) &&
             json_object_is_type(radio_id, json_type_string) &&
             apd_neighbor_radio_id(json_object_get_string(radio_id),
-                                  &wiphy_index) == 0)
+                                  &wiphy_index, &radio_index,
+                                  &has_radio_index) == 0)
             have_wiphy_index = 1;
 
         if (!json_object_object_get_ex(radio, "interfaces", &interfaces) ||

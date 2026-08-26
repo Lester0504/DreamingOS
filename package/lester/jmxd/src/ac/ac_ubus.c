@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "ac_internal.h"
+#include "../ap_radio_id.h"
 #include "ac_discovery.h"
 
 static int ac_reply_json(struct ubus_context *ctx,
@@ -132,6 +133,42 @@ static const struct blobmsg_policy ac_survey_history_parse_policy[
     [AC_SURVEY_AFTER_ID] = { .name = "after_id", .type = BLOBMSG_TYPE_UNSPEC },
 };
 
+/* TX retry history is a separate contract: it never reuses Survey's
+ * utilization fields or its capability bit. */
+static const struct blobmsg_policy ac_tx_retry_history_policy[
+    __AC_SURVEY_MAX] = {
+    [AC_SURVEY_AP_ID] = { .name = "ap_id", .type = BLOBMSG_TYPE_STRING },
+    [AC_SURVEY_RADIO_ID] = { .name = "radio_id", .type = BLOBMSG_TYPE_STRING },
+    [AC_SURVEY_START] = { .name = "start", .type = BLOBMSG_TYPE_INT64 },
+    [AC_SURVEY_END] = { .name = "end", .type = BLOBMSG_TYPE_INT64 },
+    [AC_SURVEY_RESOLUTION] = { .name = "resolution", .type = BLOBMSG_TYPE_STRING },
+    [AC_SURVEY_LIMIT] = { .name = "limit", .type = BLOBMSG_TYPE_INT32 },
+    [AC_SURVEY_AFTER_ID] = { .name = "after_id", .type = BLOBMSG_TYPE_INT64 },
+};
+
+static const struct blobmsg_policy ac_tx_retry_history_parse_policy[
+    __AC_SURVEY_MAX] = {
+    [AC_SURVEY_AP_ID] = { .name = "ap_id", .type = BLOBMSG_TYPE_STRING },
+    [AC_SURVEY_RADIO_ID] = { .name = "radio_id", .type = BLOBMSG_TYPE_STRING },
+    [AC_SURVEY_START] = { .name = "start", .type = BLOBMSG_TYPE_UNSPEC },
+    [AC_SURVEY_END] = { .name = "end", .type = BLOBMSG_TYPE_UNSPEC },
+    [AC_SURVEY_RESOLUTION] = { .name = "resolution", .type = BLOBMSG_TYPE_STRING },
+    [AC_SURVEY_LIMIT] = { .name = "limit", .type = BLOBMSG_TYPE_INT32 },
+    [AC_SURVEY_AFTER_ID] = { .name = "after_id", .type = BLOBMSG_TYPE_UNSPEC },
+};
+
+enum {
+    AC_TRAFFIC_RANGE,
+    AC_TRAFFIC_AP_ID,
+    __AC_TRAFFIC_MAX,
+};
+
+static const struct blobmsg_policy ac_traffic_history_policy[
+    __AC_TRAFFIC_MAX] = {
+    [AC_TRAFFIC_RANGE] = { .name = "range", .type = BLOBMSG_TYPE_STRING },
+    [AC_TRAFFIC_AP_ID] = { .name = "ap_id", .type = BLOBMSG_TYPE_STRING },
+};
+
 enum {
     AC_STATION_EVENTS_AP_ID,
     AC_STATION_EVENTS_EVENT,
@@ -164,6 +201,52 @@ enum {
     AC_WIFI_VALIDATE_IDEMPOTENCY_KEY,
     AC_WIFI_VALIDATE_CHANGES,
     __AC_WIFI_VALIDATE_MAX,
+};
+
+enum {
+    AC_WIFI_TX_ACTOR_ID,
+    AC_WIFI_TX_IDEMPOTENCY_KEY,
+    AC_WIFI_TX_CONSISTENCY,
+    AC_WIFI_TX_BASE_REVISION,
+    AC_WIFI_TX_TARGETS,
+    __AC_WIFI_TX_MAX,
+};
+
+static const struct blobmsg_policy ac_wifi_tx_policy[__AC_WIFI_TX_MAX] = {
+    [AC_WIFI_TX_ACTOR_ID] = {
+        .name = "actor_id", .type = BLOBMSG_TYPE_STRING },
+    [AC_WIFI_TX_IDEMPOTENCY_KEY] = {
+        .name = "idempotency_key", .type = BLOBMSG_TYPE_STRING },
+    [AC_WIFI_TX_CONSISTENCY] = {
+        .name = "consistency", .type = BLOBMSG_TYPE_STRING },
+    [AC_WIFI_TX_BASE_REVISION] = {
+        .name = "base_revision", .type = BLOBMSG_TYPE_INT64 },
+    [AC_WIFI_TX_TARGETS] = {
+        .name = "targets", .type = BLOBMSG_TYPE_STRING },
+};
+
+static const struct blobmsg_policy ac_wifi_tx_parse_policy[__AC_WIFI_TX_MAX] = {
+    [AC_WIFI_TX_ACTOR_ID] = {
+        .name = "actor_id", .type = BLOBMSG_TYPE_STRING },
+    [AC_WIFI_TX_IDEMPOTENCY_KEY] = {
+        .name = "idempotency_key", .type = BLOBMSG_TYPE_STRING },
+    [AC_WIFI_TX_CONSISTENCY] = {
+        .name = "consistency", .type = BLOBMSG_TYPE_STRING },
+    [AC_WIFI_TX_BASE_REVISION] = {
+        .name = "base_revision", .type = BLOBMSG_TYPE_UNSPEC },
+    [AC_WIFI_TX_TARGETS] = {
+        .name = "targets", .type = BLOBMSG_TYPE_STRING },
+};
+
+enum {
+    AC_WIFI_TX_STATUS_TRANSACTION_ID,
+    __AC_WIFI_TX_STATUS_MAX,
+};
+
+static const struct blobmsg_policy ac_wifi_tx_status_policy[
+    __AC_WIFI_TX_STATUS_MAX] = {
+    [AC_WIFI_TX_STATUS_TRANSACTION_ID] = {
+        .name = "transaction_id", .type = BLOBMSG_TYPE_STRING },
 };
 
 /* The desired changeset travels as a JSON document in a string field:
@@ -369,14 +452,7 @@ static int ac_radio_job_ap_id_valid(const char *value)
 
 static int ac_radio_job_radio_id_valid(const char *value)
 {
-    size_t i;
-
-    if (!value || strncmp(value, "phy", 3) != 0 || !value[3] || strlen(value) > 31)
-        return 0;
-    for (i = 3; value[i]; i++)
-        if (value[i] < '0' || value[i] > '9')
-            return 0;
-    return 1;
+    return dreamingwrt_ap_radio_id_valid(value);
 }
 
 static int ac_radio_job_mode_valid(const char *value)
@@ -783,6 +859,48 @@ static int ac_handle_survey_history(
         ap_id, radio_id, start, end, resolution_seconds, limit, after_id));
 }
 
+static int ac_handle_tx_retry_history(
+    struct ubus_context *ctx, struct ubus_object *obj,
+    struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    struct blob_attr *tb[__AC_SURVEY_MAX] = {0};
+    const char *ap_id = "";
+    const char *radio_id = "";
+    const char *resolution = "auto";
+    int resolution_seconds = 0;
+    int64_t now = ac_now_s();
+    int64_t start = now - 12 * 60 * 60;
+    int64_t end = now;
+    int64_t after_id = 0;
+    int limit = 2048;
+
+    (void)obj;
+    (void)method;
+    if (msg && blob_len(msg) != 0 &&
+        (!ac_message_is_strict(msg, ac_tx_retry_history_policy,
+                               __AC_SURVEY_MAX, 0) ||
+         blobmsg_parse(ac_tx_retry_history_parse_policy, __AC_SURVEY_MAX, tb,
+                       blob_data(msg), blob_len(msg)) != 0))
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    if (tb[AC_SURVEY_AP_ID]) ap_id = blobmsg_get_string(tb[AC_SURVEY_AP_ID]);
+    if (tb[AC_SURVEY_RADIO_ID]) radio_id = blobmsg_get_string(tb[AC_SURVEY_RADIO_ID]);
+    if (tb[AC_SURVEY_START]) start = ac_attr_get_s64(tb[AC_SURVEY_START]);
+    if (tb[AC_SURVEY_END]) end = ac_attr_get_s64(tb[AC_SURVEY_END]);
+    if (tb[AC_SURVEY_RESOLUTION])
+        resolution = blobmsg_get_string(tb[AC_SURVEY_RESOLUTION]);
+    if (tb[AC_SURVEY_LIMIT]) limit = (int)blobmsg_get_u32(tb[AC_SURVEY_LIMIT]);
+    if (tb[AC_SURVEY_AFTER_ID]) after_id = ac_attr_get_s64(tb[AC_SURVEY_AFTER_ID]);
+    if (!strcmp(resolution, "300")) resolution_seconds = 300;
+    else if (strcmp(resolution, "auto")) return UBUS_STATUS_INVALID_ARGUMENT;
+    if ((ap_id[0] && !ac_radio_job_ap_id_valid(ap_id)) ||
+        (radio_id[0] && (!ap_id[0] || !ac_radio_job_radio_id_valid(radio_id))) ||
+        start <= 0 || end < start || limit < 1 ||
+        limit > AC_TX_RETRY_HISTORY_LIMIT_MAX || after_id < 0)
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    return ac_reply_json(ctx, req, ac_db_tx_retry_history_json(
+        ap_id, radio_id, start, end, resolution_seconds, limit, after_id));
+}
+
 static int ac_handle_station_events(
     struct ubus_context *ctx, struct ubus_object *obj,
     struct ubus_request_data *req, const char *method, struct blob_attr *msg)
@@ -827,6 +945,34 @@ static int ac_handle_station_events(
         ap_id, event, start, end, limit, after_id));
 }
 
+static int ac_handle_traffic_history(
+    struct ubus_context *ctx, struct ubus_object *obj,
+    struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    struct blob_attr *tb[__AC_TRAFFIC_MAX] = {0};
+    const char *range = "1h";
+    const char *ap_id = "all";
+
+    (void)obj;
+    (void)method;
+    if (msg && blob_len(msg) != 0 &&
+        (!ac_message_is_strict(msg, ac_traffic_history_policy,
+                               __AC_TRAFFIC_MAX, 0) ||
+         blobmsg_parse(ac_traffic_history_policy, __AC_TRAFFIC_MAX, tb,
+                       blob_data(msg), blob_len(msg)) != 0))
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    if (tb[AC_TRAFFIC_RANGE])
+        range = blobmsg_get_string(tb[AC_TRAFFIC_RANGE]);
+    if (tb[AC_TRAFFIC_AP_ID])
+        ap_id = blobmsg_get_string(tb[AC_TRAFFIC_AP_ID]);
+    if ((strcmp(range, "1h") && strcmp(range, "1d") &&
+         strcmp(range, "1w") && strcmp(range, "1m")) ||
+        (strcmp(ap_id, "all") && !ac_radio_job_ap_id_valid(ap_id)))
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    return ac_reply_json(ctx, req,
+                         ac_db_ap_traffic_history_json(range, ap_id));
+}
+
 /* Phase W1 read-only static validate; no capability is flipped and the
  * 2026-07-20 write gates stay fail-closed. */
 static int ac_handle_wifi_transaction_validate(
@@ -861,6 +1007,66 @@ static int ac_handle_wifi_transaction_validate(
         return UBUS_STATUS_INVALID_ARGUMENT;
     return ac_reply_json(ctx, req, ac_db_wifi_transaction_validate_json(
         ap_id, base_revision, idempotency_key, changes, ac_now_s()));
+}
+
+static int ac_handle_wifi_transaction_apply(
+    struct ubus_context *ctx, struct ubus_object *obj,
+    struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    struct blob_attr *tb[__AC_WIFI_TX_MAX] = {0};
+    const char *actor_id;
+    const char *idempotency_key;
+    const char *consistency;
+    const char *targets;
+    int64_t base_revision;
+    const unsigned int required = (1U << AC_WIFI_TX_ACTOR_ID) |
+        (1U << AC_WIFI_TX_IDEMPOTENCY_KEY) |
+        (1U << AC_WIFI_TX_CONSISTENCY) |
+        (1U << AC_WIFI_TX_BASE_REVISION) |
+        (1U << AC_WIFI_TX_TARGETS);
+
+    (void)obj;
+    (void)method;
+    if (!ac_message_is_strict(msg, ac_wifi_tx_policy, __AC_WIFI_TX_MAX,
+                              required) ||
+        blobmsg_parse(ac_wifi_tx_parse_policy, __AC_WIFI_TX_MAX, tb,
+                      blob_data(msg), blob_len(msg)) != 0)
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    actor_id = blobmsg_get_string(tb[AC_WIFI_TX_ACTOR_ID]);
+    idempotency_key = blobmsg_get_string(tb[AC_WIFI_TX_IDEMPOTENCY_KEY]);
+    consistency = blobmsg_get_string(tb[AC_WIFI_TX_CONSISTENCY]);
+    base_revision = ac_attr_get_s64(tb[AC_WIFI_TX_BASE_REVISION]);
+    targets = blobmsg_get_string(tb[AC_WIFI_TX_TARGETS]);
+    if (!ac_radio_job_ap_id_valid(actor_id) ||
+        !ac_radio_job_idempotency_valid(idempotency_key) ||
+        (strcmp(consistency, "all_or_nothing") &&
+         strcmp(consistency, "per_target")) || base_revision < 0 ||
+        !targets[0])
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    return ac_reply_json(ctx, req, ac_wifi_transaction_apply_json(
+        actor_id, idempotency_key, consistency, base_revision, targets));
+}
+
+static int ac_handle_wifi_transaction_status(
+    struct ubus_context *ctx, struct ubus_object *obj,
+    struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    struct blob_attr *tb[__AC_WIFI_TX_STATUS_MAX] = {0};
+    const char *transaction_id;
+
+    (void)obj;
+    (void)method;
+    if (!ac_message_is_strict(msg, ac_wifi_tx_status_policy,
+                              __AC_WIFI_TX_STATUS_MAX,
+                              1U << AC_WIFI_TX_STATUS_TRANSACTION_ID) ||
+        blobmsg_parse(ac_wifi_tx_status_policy, __AC_WIFI_TX_STATUS_MAX, tb,
+                      blob_data(msg), blob_len(msg)) != 0)
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    transaction_id = blobmsg_get_string(tb[AC_WIFI_TX_STATUS_TRANSACTION_ID]);
+    if (!ac_radio_job_ap_id_valid(transaction_id))
+        return UBUS_STATUS_INVALID_ARGUMENT;
+    return ac_reply_json(ctx, req,
+                         ac_wifi_transaction_status_json(transaction_id));
 }
 
 static int ac_parse_token_id(struct blob_attr *msg, const char **token_id)
@@ -968,6 +1174,10 @@ static const struct ubus_method ac_methods[] = {
                       ac_handle_radio_job_latest_results),
     UBUS_METHOD("survey_history", ac_handle_survey_history,
                 ac_survey_history_policy),
+    UBUS_METHOD("tx_retry_history", ac_handle_tx_retry_history,
+                ac_tx_retry_history_policy),
+    UBUS_METHOD("traffic_history", ac_handle_traffic_history,
+                ac_traffic_history_policy),
     UBUS_METHOD_NOARG("survey_schedule_get", ac_handle_survey_schedule_get),
     UBUS_METHOD("survey_schedule_set", ac_handle_survey_schedule_set,
                 ac_survey_schedule_policy),
@@ -976,6 +1186,10 @@ static const struct ubus_method ac_methods[] = {
     UBUS_METHOD("wifi_transaction_validate",
                 ac_handle_wifi_transaction_validate,
                 ac_wifi_validate_policy),
+    UBUS_METHOD("wifi_transaction_apply", ac_handle_wifi_transaction_apply,
+                ac_wifi_tx_policy),
+    UBUS_METHOD("wifi_transaction_status", ac_handle_wifi_transaction_status,
+                ac_wifi_tx_status_policy),
 };
 
 static struct ubus_object_type ac_object_type =

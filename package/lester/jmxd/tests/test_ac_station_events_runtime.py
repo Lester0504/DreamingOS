@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -24,6 +25,13 @@ JSON_PREFIX = Path(_ENV_PREFIX) if _ENV_PREFIX else Path(
 _ENV_OPENSSL = os.environ.get("AC_SURVEY_TEST_OPENSSL_PREFIX", "")
 OPENSSL_PREFIX = Path(_ENV_OPENSSL) if _ENV_OPENSSL else (
     JSON_PREFIX if _ENV_PREFIX else Path("/opt/homebrew/opt/openssl@3"))
+
+
+def schema_version() -> int:
+    match = re.search(r"#define AC_SCHEMA_VERSION (\d+)",
+                      SOURCE.read_text(encoding="utf-8"))
+    assert match, "AC_SCHEMA_VERSION not found in ac_db.c"
+    return int(match.group(1))
 
 
 def static_contract() -> None:
@@ -76,6 +84,7 @@ def run(binary: Path, database: Path, *args: str) -> subprocess.CompletedProcess
 
 def main() -> None:
     static_contract()
+    expected_schema = schema_version()
     with tempfile.TemporaryDirectory(prefix="ac-station-events-") as raw:
         directory = Path(raw)
         binary = directory / "fixture"
@@ -96,7 +105,7 @@ def main() -> None:
         with sqlite3.connect(migration) as connection:
             assert connection.execute(
                 "SELECT version FROM ac_schema_meta WHERE singleton=1"
-            ).fetchone() == (11,)
+            ).fetchone() == (expected_schema,)
             assert connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name='ac_station_events'"
@@ -104,7 +113,7 @@ def main() -> None:
 
         database = directory / "runtime.db"
         result = run(binary, database)
-        assert "schema=11" in result.stdout
+        assert f"schema={expected_schema}" in result.stdout
         assert "diff_events=3" in result.stdout
         assert "gated=1" in result.stdout
         assert "window_bounded=1" in result.stdout

@@ -2,6 +2,7 @@
 /* DreamingWrt AP node agent. */
 #include "apd_config_job_journal.h"
 #include "apd_internal.h"
+#include "apd_beacon.h"
 
 static void apd_handle_signal(int signo)
 {
@@ -81,12 +82,19 @@ int main(int argc, char **argv)
         goto fail_ubus;
     }
 
+    /* Discovery beacon is optional; a failure here must not stop the AP
+     * agent from serving its normal duties. */
+    if (apd_beacon_start() != 0)
+        fprintf(stderr, "[%s] beacon unavailable reason=%s\n",
+                APD_SERVICE_NAME, apd_beacon_reason());
+
     fprintf(stderr,
             "[%s] started contract=%s schema=%d transport=%s\n",
             APD_SERVICE_NAME, APD_CONTRACT_VERSION, APD_SCHEMA_VERSION,
             apd_transport_reason());
     uloop_run();
 
+    apd_beacon_stop();
     apd_transport_stop();
     apd_ubus_stop();
     uloop_done();

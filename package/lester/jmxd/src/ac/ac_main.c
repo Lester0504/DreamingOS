@@ -1,11 +1,38 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* DreamingWrt centralized AP controller. */
 #include "ac_internal.h"
+#include "ac_discovery.h"
 
 static void ac_handle_signal(int signo)
 {
     (void)signo;
     uloop_end();
+}
+
+/*
+ * Periodic survey collection.
+ *
+ * The tick itself is cheap and fixed at 30s; whether anything is dispatched is
+ * decided by ac_survey_schedule (disabled by default, interval 60..3600s). The
+ * timer runs regardless so that enabling the schedule takes effect without a
+ * restart, and so a disabled schedule costs one DB read per half minute.
+ *
+ * Only survey jobs are created here. Neighbour scans do leave the working
+ * channel, so scheduling them would interrupt associated clients; they stay a
+ * manual action.
+ */
+static struct uloop_timeout ac_survey_schedule_timer;
+
+#define AC_SURVEY_SCHEDULE_TICK_MS 30000
+
+static void ac_survey_schedule_tick_cb(struct uloop_timeout *t)
+{
+    int dispatched = 0;
+
+    if (ac_db_survey_schedule_tick(ac_now_s(), &dispatched) == 0 && dispatched > 0)
+        fprintf(stderr, "[%s] survey schedule dispatched jobs=%d\n",
+                AC_SERVICE_NAME, dispatched);
+    uloop_timeout_set(t, AC_SURVEY_SCHEDULE_TICK_MS);
 }
 
 int main(int argc, char **argv)
@@ -54,6 +81,19 @@ int main(int argc, char **argv)
         goto fail_ubus;
     }
 
+    /*
+     * Discovery is best-effort: if the beacon port cannot be bound the
+     * controller still runs and simply reports the capability as
+     * unavailable with a reason. Failing startup over an optional
+     * convenience feature would be the wrong trade.
+     */
+    if (ac_discovery_start() != 0)
+        fprintf(stderr, "[%s] discovery unavailable reason=%s\n",
+                AC_SERVICE_NAME, ac_discovery_reason());
+
+    ac_survey_schedule_timer.cb = ac_survey_schedule_tick_cb;
+    uloop_timeout_set(&ac_survey_schedule_timer, AC_SURVEY_SCHEDULE_TICK_MS);
+
     fprintf(stderr,
             "[%s] started contract=%s schema=%d transport=%s port=%d\n",
             AC_SERVICE_NAME, AC_CONTRACT_VERSION, AC_SCHEMA_VERSION,
@@ -61,6 +101,8 @@ int main(int argc, char **argv)
             ac_transport_port());
     uloop_run();
 
+    uloop_timeout_cancel(&ac_survey_schedule_timer);
+    ac_discovery_stop();
     ac_transport_stop();
     ac_ubus_stop();
     uloop_done();

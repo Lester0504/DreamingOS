@@ -25,7 +25,7 @@
 #include "../jmx.h"
 #include "check_main.h"
 
-#define INTERNET_CHECK_INTERVAL 30
+#define INTERNET_CHECK_INTERVAL 10
 #define LOG_DIR_PATH "/tmp/log"
 #define LOG_DIR_MAX_SIZE_KB 10240
 #define LOG_DIR_TARGET_SIZE_KB 8192
@@ -36,14 +36,20 @@
 #define WAN_HEALTH_PROTO_LEN 16
 #define WAN_HEALTH_REASON_LEN 32
 #define WAN_HEALTH_TARGET_LEN 64
+#define WAN_HEALTH_MODE_LEN 32
+#define WAN_HEALTH_URL_LEN 256
 
 typedef struct {
     char name[WAN_HEALTH_NAME_LEN];
     char device[WAN_HEALTH_DEVICE_LEN];
     char proto[WAN_HEALTH_PROTO_LEN];
     char target[WAN_HEALTH_TARGET_LEN];
+    char health_mode[WAN_HEALTH_MODE_LEN];
+    char check_url[WAN_HEALTH_URL_LEN];
+    char gateway[WAN_HEALTH_TARGET_LEN];
     char reason[WAN_HEALTH_REASON_LEN];
     int disabled;
+    int health_enabled;
     int checked;
     int online;
     int latency_ms;
@@ -55,6 +61,15 @@ typedef struct {
      */
     int probe_loss_pct;
     int probe_packets_sent;
+    int jitter_ms;
+    int jitter_samples;
+    int jitter_over_80_pct;
+    int gateway_checked;
+    int gateway_ok;
+    int ping_checked;
+    int ping_ok;
+    int http_checked;
+    int http_ok;
     /*
      * Real loss comes from the interface counters, split by direction:
      *   down = rx_drop / rx_packets, up = tx_drop / tx_packets
@@ -606,6 +621,7 @@ static int health_load_wans(health_wan_state_t *wans, int max_wans)
     if (!wans || max_wans <= 0)
         return 0;
     memset(&cur, 0, sizeof(cur));
+    cur.health_enabled = 1;
     fp = fopen("/etc/config/network", "r");
     if (!fp)
         return 0;
@@ -619,6 +635,7 @@ static int health_load_wans(health_wan_state_t *wans, int max_wans)
             if (in_iface)
                 health_store_wan(wans, &count, &cur);
             memset(&cur, 0, sizeof(cur));
+            cur.health_enabled = 1;
             health_copy_string(cur.name, sizeof(cur.name), value);
             in_iface = 1;
             if (count >= max_wans)
@@ -634,6 +651,15 @@ static int health_load_wans(health_wan_state_t *wans, int max_wans)
             health_copy_string(cur.proto, sizeof(cur.proto), value);
         } else if (health_parse_uci_value(line, "option disabled", value, sizeof(value)) == 0) {
             cur.disabled = atoi(value) != 0;
+        } else if (health_parse_uci_value(line, "option check_enable", value, sizeof(value)) == 0 ||
+                   health_parse_uci_value(line, "option health_enabled", value, sizeof(value)) == 0) {
+            cur.health_enabled = atoi(value) != 0;
+        } else if (health_parse_uci_value(line, "option health_mode", value, sizeof(value)) == 0) {
+            health_copy_string(cur.health_mode, sizeof(cur.health_mode), value);
+        } else if (health_parse_uci_value(line, "option check_host", value, sizeof(value)) == 0) {
+            health_copy_string(cur.target, sizeof(cur.target), value);
+        } else if (health_parse_uci_value(line, "option check_url", value, sizeof(value)) == 0) {
+            health_copy_string(cur.check_url, sizeof(cur.check_url), value);
         }
     }
     if (in_iface)
@@ -642,12 +668,16 @@ static int health_load_wans(health_wan_state_t *wans, int max_wans)
     return count;
 }
 
-static int health_parse_ping_output(const char *path, int *loss, int *latency)
+static int health_parse_ping_output(const char *path, int *loss, int *latency,
+                                    int *jitter_ms, int *jitter_samples,
+                                    int *jitter_over_80_pct)
 {
     FILE *fp = fopen(path, "r");
     char line[256];
     int got_loss = 0;
     int got_latency = 0;
+    double rtts[8];
+    int rtt_count = 0;
 
     if (!fp)
         return -1;
@@ -655,8 +685,21 @@ static int health_parse_ping_output(const char *path, int *loss, int *latency)
         *loss = 100;
     if (latency)
         *latency = 0;
+    if (jitter_ms)
+        *jitter_ms = 0;
+    if (jitter_samples)
+        *jitter_samples = 0;
+    if (jitter_over_80_pct)
+        *jitter_over_80_pct = 0;
     while (fgets(line, sizeof(line), fp)) {
         char *p = strstr(line, "% packet loss");
+        char *timep = strstr(line, "time=");
+
+        if (timep && rtt_count < (int)(sizeof(rtts) / sizeof(rtts[0]))) {
+            double sample;
+            if (sscanf(timep + 5, "%lf", &sample) == 1 && sample >= 0)
+                rtts[rtt_count++] = sample;
+        }
 
         if (p && loss) {
             char *start = p;
@@ -686,11 +729,28 @@ static int health_parse_ping_output(const char *path, int *loss, int *latency)
         }
     }
     fclose(fp);
+    if (rtt_count > 1) {
+        double sum = 0;
+        int over = 0;
+        int i;
+
+        for (i = 1; i < rtt_count; i++) {
+            double delta = rtts[i] - rtts[i - 1];
+            if (delta < 0) delta = -delta;
+            sum += delta;
+            if (delta > 80.0) over++;
+        }
+        if (jitter_ms) *jitter_ms = (int)(sum / (rtt_count - 1) + 0.5);
+        if (jitter_samples) *jitter_samples = rtt_count - 1;
+        if (jitter_over_80_pct)
+            *jitter_over_80_pct = (over * 100) / (rtt_count - 1);
+    }
     return (got_loss || got_latency) ? 0 : -1;
 }
 
 static int health_ping_bound(const char *dev, const char *target,
-                             int *loss, int *latency)
+                             int *loss, int *latency, int *jitter_ms,
+                             int *jitter_samples, int *jitter_over_80_pct)
 {
     char tmp[] = "/tmp/dw_health_ping_XXXXXX";
     pid_t pid;
@@ -726,7 +786,8 @@ static int health_ping_bound(const char *dev, const char *target,
     }
     close(tmpfd);
     rc = health_wait_child(pid, 6);
-    if (health_parse_ping_output(tmp, loss, latency) != 0) {
+    if (health_parse_ping_output(tmp, loss, latency, jitter_ms, jitter_samples,
+                                 jitter_over_80_pct) != 0) {
         if (loss)
             *loss = 100;
         if (latency)
@@ -734,6 +795,98 @@ static int health_ping_bound(const char *dev, const char *target,
     }
     unlink(tmp);
     return rc == 0 ? 0 : -1;
+}
+
+static int health_mode_has(const char *mode, const char *part)
+{
+    return mode && part && strstr(mode, part) != NULL;
+}
+
+static int health_url_ok(const char *url)
+{
+    const unsigned char *p = (const unsigned char *)url;
+
+    if (!url || (strncmp(url, "http://", 7) != 0 &&
+                 strncmp(url, "https://", 8) != 0))
+        return 0;
+    for (; *p; p++)
+        if (iscntrl(*p) || isspace(*p))
+            return 0;
+    return strlen(url) < WAN_HEALTH_URL_LEN;
+}
+
+static int health_http_bound(const char *dev, const char *url)
+{
+    pid_t pid;
+
+    if (!health_url_ok(url))
+        return -1;
+    pid = fork();
+    if (pid == 0) {
+        int fd = open("/dev/null", O_RDWR);
+        if (fd >= 0) {
+            dup2(fd, STDIN_FILENO);
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            close(fd);
+        }
+        if (dev && dev[0] && health_netdev_name_ok(dev))
+            execl("/usr/bin/curl", "curl", "-4", "-fsS", "--interface", dev,
+                  "--connect-timeout", "1", "--max-time", "3", "--", url,
+                  (char *)NULL);
+        else
+            execl("/usr/bin/curl", "curl", "-4", "-fsS",
+                  "--connect-timeout", "1", "--max-time", "3", "--", url,
+                  (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0)
+        return -1;
+    return health_wait_child(pid, 5) == 0 ? 0 : -1;
+}
+
+static int health_gateway_for_device(const char *dev, char *out, size_t out_len)
+{
+    FILE *fp;
+    char line[256];
+    struct in_addr peer = { 0 };
+    int have_peer = 0;
+
+    if (!health_netdev_name_ok(dev) || !out || out_len == 0)
+        return -1;
+    out[0] = '\0';
+    fp = fopen("/proc/net/route", "r");
+    if (!fp)
+        return -1;
+    while (fgets(line, sizeof(line), fp)) {
+        char iface[WAN_HEALTH_DEVICE_LEN];
+        unsigned long destination, gateway, flags;
+        struct in_addr addr;
+
+        if (sscanf(line, "%63s %lx %lx %lx", iface, &destination, &gateway, &flags) != 4)
+            continue;
+        if (strcmp(iface, dev))
+            continue;
+        if (destination == 0 && gateway != 0 && (flags & 0x2)) {
+            addr.s_addr = (uint32_t)gateway;
+            if (inet_ntop(AF_INET, &addr, out, out_len)) {
+                fclose(fp);
+                return 0;
+            }
+        }
+        /* PPPoE lines without a main-table default route still expose their
+         * peer as an UP+HOST /32 route. Use that peer as the gateway probe
+         * target after preferring a conventional default-route gateway. */
+        if (!have_peer && destination != 0 && gateway == 0 &&
+            (flags & 0x1) && (flags & 0x4)) {
+            peer.s_addr = (uint32_t)destination;
+            have_peer = 1;
+        }
+    }
+    fclose(fp);
+    if (have_peer && inet_ntop(AF_INET, &peer, out, out_len))
+        return 0;
+    return -1;
 }
 
 /*
@@ -882,22 +1035,34 @@ static void health_sample_wan_counters(health_wan_state_t *wan)
 
 static void health_probe_wan(health_wan_state_t *wan)
 {
-    static const char * const targets[] = {
-        "223.5.5.5",
-        "119.29.29.29",
-        NULL
-    };
-    int i;
+    const char *mode;
+    const char *ping_target;
+    const char *http_url;
+    int external_ok = 0;
+    int requested = 0;
 
     if (!wan)
         return;
     wan->checked = 1;
     wan->online = 0;
-    wan->latency_ms = 999;
+    wan->latency_ms = -1;
     wan->probe_loss_pct = 100;
     wan->probe_packets_sent = 0;
-    wan->target[0] = '\0';
+    wan->jitter_ms = 0;
+    wan->jitter_samples = 0;
+    wan->jitter_over_80_pct = 0;
+    wan->gateway_checked = wan->gateway_ok = 0;
+    wan->ping_checked = wan->ping_ok = 0;
+    wan->http_checked = wan->http_ok = 0;
     health_copy_string(wan->reason, sizeof(wan->reason), "probe_failed");
+    if (!wan->health_enabled) {
+        wan->checked = 0;
+        wan->online = health_device_link_up(wan->device);
+        wan->latency_ms = -1;
+        wan->probe_loss_pct = -1;
+        health_copy_string(wan->reason, sizeof(wan->reason), "check_disabled");
+        return;
+    }
 
     if (!wan->device[0]) {
         health_copy_string(wan->reason, sizeof(wan->reason), "no_device");
@@ -908,26 +1073,64 @@ static void health_probe_wan(health_wan_state_t *wan)
         return;
     }
 
-    for (i = 0; targets[i]; i++) {
+    mode = wan->health_mode[0] ? wan->health_mode : "http_ping_gateway";
+    ping_target = wan->target[0] ? wan->target : "223.5.5.5";
+    http_url = wan->check_url[0] ? wan->check_url :
+        "https://www.baidu.com/";
+
+    if (health_mode_has(mode, "gateway")) {
+        int loss = 100;
+        int latency = 0;
+        int unused_jitter = 0, unused_samples = 0, unused_ratio = 0;
+
+        requested++;
+        wan->gateway_checked = 1;
+        if (health_gateway_for_device(wan->device, wan->gateway,
+                                      sizeof(wan->gateway)) == 0 &&
+            (health_ping_bound(wan->device, wan->gateway, &loss, &latency,
+                               &unused_jitter, &unused_samples, &unused_ratio) == 0 ||
+             loss < 100))
+            wan->gateway_ok = 1;
+    }
+    if (health_mode_has(mode, "ping")) {
         int loss = 100;
         int latency = 0;
 
-        health_copy_string(wan->target, sizeof(wan->target), targets[i]);
-        if (health_ping_bound(wan->device, targets[i], &loss, &latency) == 0 || loss < 100) {
-            wan->online = loss < 100;
-            wan->latency_ms = latency > 0 ? latency : (loss < 100 ? 1 : 999);
+        requested++;
+        wan->ping_checked = 1;
+        if (health_ping_bound(wan->device, ping_target, &loss, &latency,
+                              &wan->jitter_ms, &wan->jitter_samples,
+                              &wan->jitter_over_80_pct) == 0 || loss < 100) {
+            wan->ping_ok = loss < 100;
+            external_ok |= wan->ping_ok;
+            wan->latency_ms = latency > 0 ? latency : (loss < 100 ? 1 : -1);
             wan->probe_loss_pct = loss;
-            wan->probe_packets_sent = 3;   /* ping -c 3 above */
-            if (loss == 0 && wan->latency_ms < 80)
-                health_copy_string(wan->reason, sizeof(wan->reason), "ok");
-            else if (loss >= 50)
-                health_copy_string(wan->reason, sizeof(wan->reason), "packet_loss");
-            else if (wan->latency_ms >= 180)
-                health_copy_string(wan->reason, sizeof(wan->reason), "high_latency");
-            else
-                health_copy_string(wan->reason, sizeof(wan->reason), "unstable");
-            return;
+            wan->probe_packets_sent = 3;
         }
+    }
+    if (health_mode_has(mode, "http")) {
+        requested++;
+        wan->http_checked = 1;
+        wan->http_ok = health_http_bound(wan->device, http_url) == 0;
+        external_ok |= wan->http_ok;
+    }
+
+    wan->online = health_mode_has(mode, "gateway") ?
+        (wan->gateway_ok || external_ok) : external_ok;
+    if (requested == 0) {
+        wan->online = 0;
+        health_copy_string(wan->reason, sizeof(wan->reason), "invalid_mode");
+    } else if (!wan->online) {
+        health_copy_string(wan->reason, sizeof(wan->reason), "all_probes_failed");
+    } else if ((wan->gateway_checked && !wan->gateway_ok) ||
+               (wan->ping_checked && !wan->ping_ok) ||
+               (wan->http_checked && !wan->http_ok)) {
+        health_copy_string(wan->reason, sizeof(wan->reason), "partial_probe_fail");
+    } else if (wan->ping_checked && (wan->probe_loss_pct > 0 ||
+               wan->latency_ms >= 180 || wan->jitter_over_80_pct > 0)) {
+        health_copy_string(wan->reason, sizeof(wan->reason), "unstable");
+    } else {
+        health_copy_string(wan->reason, sizeof(wan->reason), "ok");
     }
 }
 
@@ -946,17 +1149,41 @@ static void health_write_wan_status(health_wan_state_t *wans, int count,
         return;
     fprintf(fp, "updated_at=%u\nwan_count=%d\n", ts, count);
     for (i = 0; i < count; i++) {
+        int forwarding_loss_pct;
+        double forwarding_loss;
+
         /*
-         * loss= is kept as the probe value for compatibility with readers that
-         * still parse it, but it is now also published under probe_loss= so no
-         * caller has to guess which measurement it is holding. The real
-         * forwarding loss is up_loss=/down_loss=, which are -1 when there is no
-         * sample yet rather than a misleading 0.
+         * loss= is the compatibility field consumed by line_health and older
+         * clients, so it must describe forwarding quality rather than the
+         * three-packet ICMP sample. A live WAN uses the worse directional loss
+         * from interface counters; a WAN for which all configured reachability
+         * checks failed remains an explicit 100%. probe_loss= stays available
+         * as diagnostic telemetry and never masquerades as line loss.
          */
+        if (!wans[i].online) {
+            forwarding_loss_pct = 100;
+        } else if (wans[i].counters_valid &&
+                   wans[i].up_loss_pct >= 0.0 &&
+                   wans[i].down_loss_pct >= 0.0) {
+            forwarding_loss = wans[i].up_loss_pct;
+            if (wans[i].down_loss_pct > forwarding_loss)
+                forwarding_loss = wans[i].down_loss_pct;
+            if (forwarding_loss < 0.0)
+                forwarding_loss = 0.0;
+            if (forwarding_loss > 100.0)
+                forwarding_loss = 100.0;
+            forwarding_loss_pct = (int)(forwarding_loss + 0.5);
+        } else {
+            /* No baseline yet: unknown must not inherit probe loss. */
+            forwarding_loss_pct = 0;
+        }
         fprintf(fp,
                 "wan=%s device=%s proto=%s checked=%d online=%d latency=%d loss=%d "
-                "probe_loss=%d probe_packets=%d counters_valid=%d counter_ifname=%s "
-                "up_loss=%.4f down_loss=%.4f rx_packets_delta=%llu rx_drops_delta=%llu "
+                "probe_loss=%d probe_packets=%d jitter_ms=%d jitter_samples=%d jitter_over_80_pct=%d "
+                "health_mode=%s gateway=%s gateway_ok=%d ping_ok=%d http_ok=%d "
+                "counters_valid=%d counter_ifname=%s "
+                "up_loss_pct=%.4f down_loss_pct=%.4f up_loss=%.4f down_loss=%.4f "
+                "rx_packets_delta=%llu rx_drops_delta=%llu "
                 "tx_packets_delta=%llu tx_drops_delta=%llu counter_window=%lld "
                 "target=%s reason=%s\n",
                 wans[i].name,
@@ -965,11 +1192,21 @@ static void health_write_wan_status(health_wan_state_t *wans, int count,
                 wans[i].checked ? 1 : 0,
                 wans[i].online ? 1 : 0,
                 wans[i].latency_ms,
-                wans[i].probe_loss_pct,
+                forwarding_loss_pct,
                 wans[i].probe_loss_pct,
                 wans[i].probe_packets_sent,
+                wans[i].jitter_ms,
+                wans[i].jitter_samples,
+                wans[i].jitter_over_80_pct,
+                wans[i].health_mode[0] ? wans[i].health_mode : "http_ping_gateway",
+                wans[i].gateway[0] ? wans[i].gateway : "-",
+                wans[i].gateway_checked ? wans[i].gateway_ok : -1,
+                wans[i].ping_checked ? wans[i].ping_ok : -1,
+                wans[i].http_checked ? wans[i].http_ok : -1,
                 wans[i].counters_valid ? 1 : 0,
                 wans[i].counter_ifname[0] ? wans[i].counter_ifname : "-",
+                wans[i].up_loss_pct,
+                wans[i].down_loss_pct,
                 wans[i].up_loss_pct,
                 wans[i].down_loss_pct,
                 (unsigned long long)wans[i].rx_packets_delta,
@@ -983,16 +1220,100 @@ static void health_write_wan_status(health_wan_state_t *wans, int count,
     health_publish_status_file(fp, tmp_path, JMX_WAN_HEALTH_STATUS_PATH);
 }
 
+static int health_write_full(int fd, const void *buf, size_t len)
+{
+    const unsigned char *p = buf;
+
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int health_read_full(int fd, void *buf, size_t len)
+{
+    unsigned char *p = buf;
+
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
 static void check_wan_health(void)
 {
     health_wan_state_t wans[WAN_HEALTH_MAX_WANS];
+    struct {
+        pid_t pid;
+        int read_fd;
+    } jobs[WAN_HEALTH_MAX_WANS];
     int count;
     int i;
 
     memset(wans, 0, sizeof(wans));
+    memset(jobs, 0, sizeof(jobs));
+    for (i = 0; i < WAN_HEALTH_MAX_WANS; i++)
+        jobs[i].read_fd = -1;
     count = health_load_wans(wans, WAN_HEALTH_MAX_WANS);
     for (i = 0; i < count; i++) {
-        health_probe_wan(&wans[i]);
+        int pipefd[2];
+        pid_t pid;
+
+        if (pipe(pipefd) != 0) {
+            health_probe_wan(&wans[i]);
+            continue;
+        }
+        pid = fork();
+        if (pid == 0) {
+            health_wan_state_t result = wans[i];
+
+            close(pipefd[0]);
+            health_probe_wan(&result);
+            (void)health_write_full(pipefd[1], &result, sizeof(result));
+            close(pipefd[1]);
+            _exit(0);
+        }
+        close(pipefd[1]);
+        if (pid < 0) {
+            close(pipefd[0]);
+            health_probe_wan(&wans[i]);
+            continue;
+        }
+        jobs[i].pid = pid;
+        jobs[i].read_fd = pipefd[0];
+    }
+    for (i = 0; i < count; i++) {
+        if (jobs[i].pid > 0) {
+            health_wan_state_t result;
+            int child_rc = health_wait_child(jobs[i].pid, 8);
+            int read_rc = health_read_full(jobs[i].read_fd, &result, sizeof(result));
+
+            close(jobs[i].read_fd);
+            if (child_rc == 0 && read_rc == 0)
+                wans[i] = result;
+            else {
+                wans[i].checked = 1;
+                wans[i].online = 0;
+                wans[i].latency_ms = -1;
+                wans[i].probe_loss_pct = 100;
+                health_copy_string(wans[i].reason, sizeof(wans[i].reason),
+                                   "probe_worker_failed");
+            }
+        }
         /*
          * Counter sampling is deliberately independent of the probe: an
          * unreachable ping target must not zero or invalidate real loss, and a

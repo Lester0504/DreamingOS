@@ -557,7 +557,9 @@ static int apdctl_write_bootstrap(const struct apd_paircode_controller *cfg,
 {
     struct json_object *root;
     const char *text;
-    char temporary[512];
+    /* Exactly the constant it always holds, so the reason strings below cannot
+     * be told they might be formatting half a kilobyte of path. */
+    char temporary[sizeof(APDCTL_BOOTSTRAP_PATH ".tmp")];
     int fd;
     ssize_t written;
     size_t length;

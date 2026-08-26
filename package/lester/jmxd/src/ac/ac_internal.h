@@ -23,7 +23,7 @@
 
 #define AC_CONFIG_DB_PATH "/etc/dreamingwrt/config.db"
 #define AC_CONTRACT_VERSION "ap-control.v1"
-#define AC_SCHEMA_VERSION 12
+#define AC_SCHEMA_VERSION 14
 #define AC_SECRETS_KEY_PATH "/etc/dreamingwrt/ac-secrets.key"
 #define AC_SERVICE_NAME "dreamingwrt-ac"
 #define AC_NODE_TRANSPORT_ENABLED 1
@@ -79,6 +79,14 @@
 #define AC_SURVEY_HOUR_RETENTION_SECONDS (31 * 24 * 60 * 60)
 #define AC_SURVEY_HOUR_RETENTION_ROWS 744
 #define AC_SURVEY_HISTORY_LIMIT_MAX 4096
+#define AC_TX_RETRY_FINE_RESOLUTION_SECONDS 300
+#define AC_TX_RETRY_FINE_RETENTION_SECONDS (48 * 60 * 60)
+#define AC_TX_RETRY_FINE_RETENTION_ROWS 576
+#define AC_TX_RETRY_HISTORY_LIMIT_MAX 4096
+#define AC_AP_TRAFFIC_SAMPLE_MAX_SECONDS 3600
+#define AC_AP_TRAFFIC_RESOLUTION_SECONDS 60
+#define AC_AP_TRAFFIC_RETENTION_SECONDS (31 * 24 * 60 * 60)
+#define AC_AP_TRAFFIC_RETENTION_ROWS 44640
 
 struct ac_pki;
 struct ac_pki_issued_certificate;
@@ -245,10 +253,15 @@ int ac_db_count(const char *table);
 int ac_db_managed_ap_counts(int64_t online_since, int *total, int *online);
 int ac_db_ap_session_begin(const char *ap_id, const char *session_epoch,
                            int protocol_version, int64_t received_at);
+int ac_db_ap_session_begin_with_capabilities(
+    const char *ap_id, const char *session_epoch, int protocol_version,
+    int write_capable, int64_t received_at);
 int ac_db_ap_session_end(const char *ap_id, const char *session_epoch);
 int ac_db_ap_heartbeat(const char *ap_id, const char *session_epoch,
                        int64_t received_at);
 int ac_db_scan_execution_available(int64_t online_since, int *ap_count);
+int ac_db_wifi_write_execution_available(int64_t online_since,
+                                         int *ap_count);
 int ac_db_ap_identity_report(const char *ap_id,
                              const struct ac_device_model_report *report);
 int ac_db_ap_telemetry_store(const char *ap_id, const char *session_epoch,
@@ -264,10 +277,37 @@ int ac_db_radio_job_status(const char *job_id, struct ac_radio_job *out);
 int ac_db_radio_job_list(const char *ap_id, ac_radio_job_visit_fn visit,
                          void *opaque, int *limited);
 int ac_db_radio_jobs_prune(int64_t now);
+
+/* ── Periodic survey schedule ────────────────────────────────────────────
+ * Only mode='survey' is schedulable. A neighbour scan leaves the working
+ * channel and stays manual; see the ac_survey_schedule DDL in ac_db.c.
+ */
+#define AC_SURVEY_SCHEDULE_MIN_INTERVAL 60
+#define AC_SURVEY_SCHEDULE_MAX_INTERVAL 3600
+#define AC_SURVEY_SCHEDULE_DEFAULT_INTERVAL 300
+#define AC_SURVEY_SCHEDULE_INVALID_INTERVAL (-2)
+
+struct ac_survey_schedule {
+    int enabled;
+    char mode[9];
+    int interval_seconds;
+    int64_t last_run_at;
+    int last_dispatched;
+    char last_error[64];
+};
+
+int ac_db_survey_schedule_load(struct ac_survey_schedule *out);
+/* enabled < 0 or interval_seconds <= 0 leaves that field unchanged. */
+int ac_db_survey_schedule_save(int enabled, int interval_seconds);
+/* Dispatches one survey job per eligible radio when the interval has elapsed. */
+int ac_db_survey_schedule_tick(int64_t now, int *dispatched_out);
 int ac_db_radio_job_cancel(const char *job_id, struct ac_radio_job *out);
 int ac_db_radio_job_result_metadata(const char *job_id,
                                     struct ac_radio_job *out);
 int ac_db_ap_session_is_current(const char *ap_id, const char *session_epoch);
+/* 1 when ac_aps.adoption_state is 'adopted'. 0 on unknown ap_id or db error, so
+ * discovery errs toward listing a candidate rather than hiding a real AP. */
+int ac_db_ap_is_adopted(const char *ap_id);
 int ac_db_radio_job_lease_next(const char *ap_id, const char *session_epoch,
                                int64_t now, struct ac_radio_job *out);
 int ac_db_radio_job_mark_running(const char *job_id, const char *attempt_id,
@@ -301,6 +341,13 @@ struct json_object *ac_db_survey_history_json(const char *ap_id,
                                               int64_t start, int64_t end,
                                               int resolution_seconds,
                                               int limit, int64_t after_id);
+struct json_object *ac_db_tx_retry_history_json(const char *ap_id,
+                                                const char *radio_id,
+                                                int64_t start, int64_t end,
+                                                int resolution_seconds,
+                                                int limit, int64_t after_id);
+struct json_object *ac_db_ap_traffic_history_json(const char *range,
+                                                 const char *ap_id);
 struct json_object *ac_db_station_events_json(const char *ap_id,
                                               const char *event,
                                               int64_t start, int64_t end,
@@ -322,6 +369,7 @@ enum ac_config_job_result {
     AC_CONFIG_JOB_NOT_FOUND = 2,
     AC_CONFIG_JOB_CONFLICT = 3,
     AC_CONFIG_JOB_INVALID = 4,
+    AC_CONFIG_JOB_UNAVAILABLE = 5,
 };
 
 #define AC_CONFIG_JOB_CANDIDATE_MAX_BYTES (16 * 1024)
@@ -371,12 +419,10 @@ int ac_db_config_job_finish(const char *job_id, const char *attempt_id,
                             struct ac_config_job *out);
 int ac_db_config_jobs_recover(int64_t now);
 
-/* ---- Phase W3: wifi transaction orchestration.  One apply fans out to
- * one ac_transactions row, one ac_transaction_targets row per AP and one
- * queued ac_config_jobs row per AP.  Dormant end to end: the config jobs
- * stay queued because no APD leases them (apd_config_executor_enabled()
- * is 0), and the REST/capability surface stays fail-closed until an APD
- * declares config_executor=true on a live v2 session. ---- */
+/* Managed Wi-Fi transaction orchestration. One apply fans out to one
+ * ac_transactions row, one ac_transaction_targets row per AP and one queued
+ * ac_config_jobs row per AP. Creation is allowed only for adopted targets on
+ * a current write-capable ap-control.v3 session. */
 
 #define AC_WIFI_TX_TARGETS_MAX 32
 #define AC_WIFI_TX_CANDIDATE_MAX_BYTES (16 * 1024)
@@ -389,6 +435,12 @@ int ac_db_wifi_transaction_apply(const char *actor_id,
                                  char transaction_id_out[AC_RADIO_JOB_ID_LEN + 1],
                                  char *error_out, size_t error_len);
 struct json_object *ac_db_wifi_transaction_status_json(
+    const char *transaction_id);
+struct json_object *ac_wifi_transaction_apply_json(
+    const char *actor_id, const char *idempotency_key,
+    const char *consistency, int64_t base_revision,
+    const char *targets_json);
+struct json_object *ac_wifi_transaction_status_json(
     const char *transaction_id);
 int ac_db_pairing_token_create(int64_t ttl_seconds, int max_attempts,
                                const char *site_id,

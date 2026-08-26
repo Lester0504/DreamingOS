@@ -81,6 +81,13 @@ def assert_boolean_false(body: str, capability: str) -> None:
     assert re.search(pattern, body), f"Phase 0 write capability must be explicitly false: {capability}"
 
 
+def assert_boolean_dynamic(body: str, capability: str) -> None:
+    pattern = rf'\b(?:ac|apd)_capability\s*\([^;]*?"{re.escape(capability)}"\s*,\s*wifi_write_execution\s*,'
+    assert re.search(pattern, body), (
+        f"managed-AP capability must follow the live v3 write gate: {capability}"
+    )
+
+
 def test_all_phase0_write_capabilities_are_explicitly_false() -> None:
     ac = source_bundle(SRC / "ac")
     capabilities = function_body(ac, "ac_capabilities_json")
@@ -90,16 +97,15 @@ def test_all_phase0_write_capabilities_are_explicitly_false() -> None:
         "ssid_update",
         "ssid_delete",
         "password_rotation",
-        "radio_update",
         "offline_queue",
-        "transactional_apply",
-        "automatic_rollback",
     ):
         assert_boolean_false(capabilities, capability)
+    for capability in ("radio_update", "transactional_apply", "automatic_rollback"):
+        assert_boolean_dynamic(capabilities, capability)
     assert "ac_transport_reason()" in capabilities
 
 
-def test_write_dispatch_is_canonically_fail_closed_without_side_effects() -> None:
+def test_write_dispatch_is_gated_and_candidate_aware() -> None:
     ac = source_bundle(SRC / "ac")
     apd = source_bundle(SRC / "apd")
     for source, helper in (
@@ -118,15 +124,16 @@ def test_write_dispatch_is_canonically_fail_closed_without_side_effects() -> Non
         assert "system(" not in rejection and "popen(" not in rejection
 
     openwrt = read_required(SRC / "apd/apd_backend_openwrt.c")
-    for symbol in (
-        "apd_openwrt_validate",
-        "apd_openwrt_stage",
-        "apd_openwrt_apply",
-        "apd_openwrt_rollback",
+    for symbol, operation in (
+        ("apd_openwrt_validate", "apd_config_candidate_validate"),
+        ("apd_openwrt_stage", "apd_config_stage"),
+        ("apd_openwrt_apply", "apd_config_apply"),
+        ("apd_openwrt_readback", "apd_config_readback"),
+        ("apd_openwrt_rollback", "apd_config_rollback"),
     ):
         body = function_body(openwrt, symbol)
-        assert "apd_openwrt_disabled(" in body, (
-            f"Phase 0 backend write bypasses the canonical fail-closed path: {symbol}"
+        assert operation in body, (
+            f"candidate executor backend operation is not live: {symbol}"
         )
 
 
@@ -143,6 +150,7 @@ def test_local_ubus_has_bounded_management_and_public_readback() -> None:
         "radio_job_create", "radio_job_status", "radio_job_cancel",
         "radio_job_result", "radio_job_list", "radio_job_latest_results",
         "survey_history", "station_events", "wifi_transaction_validate",
+        "wifi_transaction_apply", "wifi_transaction_status",
         # Read-only enumeration of APs seen on the wire but not yet adopted.
         "discovery_list",
         # Inventory-only write. Its policy accepts exactly ap_id, name and
@@ -168,6 +176,14 @@ def test_local_ubus_has_bounded_management_and_public_readback() -> None:
         # transactional-apply surface.
         "survey_schedule_get",
         "survey_schedule_set",
+        # Read-only history query over ac_radio_tx_retry_bucket, the retry twin
+        # of survey_history. It runs SELECTs against buckets the telemetry
+        # ingest already wrote, takes no interface or command name, dispatches
+        # nothing to the AP, and its policy accepts only ap_id, radio_id, the
+        # time window, a fixed 300s resolution and paging. So it reaches no AP
+        # configuration and does not widen the frozen transactional-apply
+        # surface.
+        "tx_retry_history",
     }, (
         "AC ubus must expose only health, managed-AP readback, administrator "
         "pairing-token methods, the bounded radio scan job control plane, "
@@ -322,8 +338,8 @@ def test_status_event_and_readback_outputs_cannot_serialize_secrets() -> None:
         read_required(SRC / "apd/apd_backend_openwrt.c"),
         "apd_openwrt_readback",
     )
-    assert "apd_openwrt_disabled(" in readback, (
-        "Phase 0 readback must not expose unreviewed hostapd/UCI secret material"
+    assert "apd_config_readback(" in readback, (
+        "candidate readback must stay behind the executor contract"
     )
 
 
@@ -351,7 +367,7 @@ def test_phase1e_node_transport_is_authenticated_and_bounded() -> None:
 
 if __name__ == "__main__":
     test_all_phase0_write_capabilities_are_explicitly_false()
-    test_write_dispatch_is_canonically_fail_closed_without_side_effects()
+    test_write_dispatch_is_gated_and_candidate_aware()
     test_local_ubus_has_bounded_management_and_public_readback()
     test_ac_health_is_independent_of_local_wifi_phy()
     test_apd_openwrt_backend_is_behind_the_single_vtable_boundary()

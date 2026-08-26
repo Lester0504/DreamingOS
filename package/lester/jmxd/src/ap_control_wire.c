@@ -542,6 +542,9 @@ int ap_control_ssl_selected_alpn_version(SSL *ssl)
     if (!ssl)
         return 0;
     SSL_get0_alpn_selected(ssl, &selected, &length);
+    if (selected && length == sizeof(AP_CONTROL_ALPN_V3) - 1 &&
+        CRYPTO_memcmp(selected, AP_CONTROL_ALPN_V3, length) == 0)
+        return 3;
     if (selected && length == sizeof(AP_CONTROL_ALPN_V2) - 1 &&
         CRYPTO_memcmp(selected, AP_CONTROL_ALPN_V2, length) == 0)
         return 2;
@@ -656,4 +659,63 @@ int ap_control_uuid4(char out[37])
     out[output] = '\0';
     OPENSSL_cleanse(raw, sizeof(raw));
     return AP_CONTROL_WIRE_OK;
+}
+
+static const char *const ap_control_capability_names[] = {
+    "config_executor", "validate", "stage", "apply", "readback", "rollback"
+};
+
+int ap_control_capabilities_add(struct json_object *object,
+                                const struct ap_control_capabilities *caps)
+{
+    const int values[AP_CONTROL_CAPABILITY_COUNT] = {
+        caps ? caps->config_executor : 0, caps ? caps->validate : 0,
+        caps ? caps->stage : 0, caps ? caps->apply : 0,
+        caps ? caps->readback : 0, caps ? caps->rollback : 0
+    };
+    size_t i;
+
+    struct json_object *nested;
+
+    if (!object || !caps || !(nested = json_object_new_object()))
+        return AP_CONTROL_WIRE_INVALID_FIELDS;
+    for (i = 0; i < AP_CONTROL_CAPABILITY_COUNT; i++)
+        json_object_object_add(nested, ap_control_capability_names[i],
+                               json_object_new_boolean(values[i] != 0));
+    json_object_object_add(object, "capabilities", nested);
+    return AP_CONTROL_WIRE_OK;
+}
+
+int ap_control_capabilities_parse(struct json_object *object,
+                                  struct ap_control_capabilities *caps)
+{
+    int *values[AP_CONTROL_CAPABILITY_COUNT];
+    size_t i;
+
+    if (!object || !caps ||
+        !json_object_is_type(object, json_type_object))
+        return AP_CONTROL_WIRE_INVALID_FIELDS;
+    values[0] = &caps->config_executor; values[1] = &caps->validate;
+    values[2] = &caps->stage; values[3] = &caps->apply;
+    values[4] = &caps->readback; values[5] = &caps->rollback;
+    memset(caps, 0, sizeof(*caps));
+    for (i = 0; i < AP_CONTROL_CAPABILITY_COUNT; i++) {
+        struct json_object *value = NULL;
+
+        if (!json_object_object_get_ex(object, ap_control_capability_names[i],
+                                       &value) || !value ||
+            !json_object_is_type(value, json_type_boolean))
+            return AP_CONTROL_WIRE_INVALID_FIELDS;
+        *values[i] = json_object_get_boolean(value) ? 1 : 0;
+    }
+    return ap_control_json_object_exact(object, ap_control_capability_names,
+        AP_CONTROL_CAPABILITY_COUNT, ap_control_capability_names,
+        AP_CONTROL_CAPABILITY_COUNT);
+}
+
+int ap_control_capabilities_all_true(
+    const struct ap_control_capabilities *caps)
+{
+    return caps && caps->config_executor && caps->validate && caps->stage &&
+           caps->apply && caps->readback && caps->rollback;
 }

@@ -65,6 +65,13 @@ def fields(output: str) -> dict[str, str]:
     return dict(re.findall(r"([a-z_]+)=([^\s]+)", output))
 
 
+def schema_version() -> int:
+    match = re.search(r"#define AC_SCHEMA_VERSION (\d+)",
+                      DB_SOURCE.read_text(encoding="utf-8"))
+    assert match, "AC_SCHEMA_VERSION not found in ac_db.c"
+    return int(match.group(1))
+
+
 def create(binary: Path, database: Path, mode: str, key: str) -> dict[str, str]:
     result = fields(run(binary, database, "create", AP_ID, "phy0", mode, key).stdout)
     assert result["result"] in {"0", "1"}
@@ -97,7 +104,9 @@ def test_schema_target_validation_and_idempotency(binary: Path, database: Path) 
             "error_code", "expected_impact", "idempotency_key",
         }
         assert required <= columns
-        assert connection.execute("SELECT version FROM ac_schema_meta").fetchone() == (11,)
+        assert connection.execute(
+            "SELECT version FROM ac_schema_meta"
+        ).fetchone() == (schema_version(),)
         runtime_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(ac_ap_runtime)")
         }

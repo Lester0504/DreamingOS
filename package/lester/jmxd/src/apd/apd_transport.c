@@ -377,9 +377,15 @@ static const char *const apd_fields_activation_complete[] = {
 static const char *const apd_fields_session_hello[] = {
     "protocol", "kind", "controller_id", "certificate_id", "ap_id"
 };
+static const char *const apd_fields_session_hello_v3[] = {
+    "protocol", "kind", "controller_id", "certificate_id", "ap_id", "capabilities"
+};
 static const char *const apd_fields_session_ready[] = {
     "protocol", "kind", "controller_id", "certificate_id", "ap_id",
     "session_epoch"
+};
+static const char *const apd_fields_session_ready_v3[] = {
+    "protocol", "kind", "controller_id", "certificate_id", "ap_id", "session_epoch", "capabilities"
 };
 static const char *const apd_fields_heartbeat[] = {
     "protocol", "kind", "ap_id", "session_epoch", "sequence", "timestamp"
@@ -479,6 +485,7 @@ struct apd_transport_state {
     int running;
     int stop;
     int connected;
+    int write_capable;
     int active_fd;
     uint64_t sequence;
     char reason[64];
@@ -487,7 +494,7 @@ struct apd_transport_state {
 
 static struct apd_transport_state g_apd_transport = {
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, (pthread_t)0,
-    0, 0, 0, -1, 0, "not_started", {0, {0}, 0, {0}}
+    0, 0, 0, 0, -1, 0, "not_started", {0, {0}, 0, {0}}
 };
 static _Thread_local const char *g_apd_wire_protocol = APD_TRANSPORT_PROTOCOL_V1;
 
@@ -649,6 +656,8 @@ static void apd_transport_set_connected(int connected)
 {
     pthread_mutex_lock(&g_apd_transport.lock);
     g_apd_transport.connected = connected ? 1 : 0;
+    if (!connected)
+        g_apd_transport.write_capable = 0;
     pthread_mutex_unlock(&g_apd_transport.lock);
 }
 
@@ -1198,10 +1207,10 @@ static int apd_tls_open(const struct apd_transport_endpoint *endpoint,
                         struct apd_tls_connection *out)
 {
     static const unsigned char alpn_v1[] = "\x10" AP_CONTROL_ALPN_V1;
-    static const unsigned char alpn_v2[] =
-        "\x10" AP_CONTROL_ALPN_V2 "\x10" AP_CONTROL_ALPN_V1;
-    const unsigned char *alpn = offer_v2 ? alpn_v2 : alpn_v1;
-    size_t alpn_length = offer_v2 ? sizeof(alpn_v2) - 1 : sizeof(alpn_v1) - 1;
+    static const unsigned char alpn_v3[] =
+        "\x10" AP_CONTROL_ALPN_V3 "\x10" AP_CONTROL_ALPN_V2 "\x10" AP_CONTROL_ALPN_V1;
+    const unsigned char *alpn = offer_v2 ? alpn_v3 : alpn_v1;
+    size_t alpn_length = offer_v2 ? sizeof(alpn_v3) - 1 : sizeof(alpn_v1) - 1;
     struct apd_tls_connection connection;
 
     memset(&connection, 0, sizeof(connection));
@@ -2391,18 +2400,9 @@ static int apd_v2_poll(SSL *ssl,
                        const struct apd_enrollment_metadata *metadata,
                        const char *session_epoch);
 
-/* Phase W2c: the config job wire is compiled but dormant.  This gate is a
- * hard compile-time 0 in production — the executor stays behind the
- * 2026-07-20 write capabilities, so no production AP ever emits a
- * config_job_poll.  Fixtures define APD_CONFIG_JOBS_TEST_ENABLE to drive
- * the enabled path; the W3 capability flip is what turns it on for real. */
 static int apd_config_executor_enabled(void)
 {
-#ifdef APD_CONFIG_JOBS_TEST_ENABLE
-    return 1;
-#else
-    return 0;
-#endif
+    return apd_config_executor_available_default();
 }
 
 static int apd_config_wire_step(
@@ -2422,11 +2422,6 @@ static int apd_v2_jobs_step(
         apd_v2_pending_finish_replay(ssl, metadata, session_epoch) != 0)
         return -1;
     if (apd_v2_poll(ssl, metadata, session_epoch) != 0)
-        return -1;
-    /* Dormant in production: apd_config_executor_enabled() is 0 so this
-     * returns before any config_job frame is written. */
-    if (apd_config_executor_enabled() &&
-        apd_config_wire_step(ssl, metadata, session_epoch) != 0)
         return -1;
     return 0;
 }
@@ -2836,6 +2831,43 @@ done:
     return rc;
 }
 
+static int apd_config_pending_finish_replay(
+    SSL *ssl, const struct apd_enrollment_metadata *metadata,
+    const char *session_epoch)
+{
+    struct apd_config_job_pending_reconcile pending;
+    struct apd_config_job_journal_entry rebound;
+    int result;
+    int rc = -1;
+
+    memset(&pending, 0, sizeof(pending));
+    memset(&rebound, 0, sizeof(rebound));
+    result = apd_config_job_pending_reconcile_get(metadata->ap_id, &pending);
+    if (result == APD_CONFIG_JOB_JOURNAL_NOT_FOUND)
+        return 0;
+    if (result != APD_CONFIG_JOB_JOURNAL_OK)
+        return -1;
+    result = apd_config_job_session_rebind(&pending.entry.assignment,
+                                           session_epoch, apd_now_s(),
+                                           &rebound);
+    if (result != APD_CONFIG_JOB_JOURNAL_OK &&
+        result != APD_CONFIG_JOB_JOURNAL_IDEMPOTENT)
+        goto done;
+    if (apd_config_finish_send(ssl, metadata, session_epoch,
+            &rebound.assignment, rebound.finish_id, rebound.outcome,
+            rebound.error_code, pending.readback_json) != 0)
+        goto done;
+    result = apd_config_job_finish_ack(&rebound.assignment,
+        rebound.finish_id, apd_now_s(), &rebound);
+    if (result != APD_CONFIG_JOB_JOURNAL_OK &&
+        result != APD_CONFIG_JOB_JOURNAL_IDEMPOTENT)
+        goto done;
+    rc = 0;
+done:
+    apd_config_job_pending_reconcile_free(&pending);
+    return rc;
+}
+
 /* Execute the leased candidate through the durable state machine.  Any
  * failure after 'applying' rolls back and reports rolled_back; readback
  * mismatch is treated the same.  The finish outcome is recorded in the
@@ -3047,6 +3079,8 @@ static int apd_session_run(const struct apd_enrollment_metadata *metadata)
     int ready = 0;
     int rc = -1;
     struct apd_telemetry_gate telemetry_gate;
+    struct ap_control_capabilities peer_capabilities = {0};
+    struct ap_control_capabilities local_capabilities = {0};
 
     memset(&connection, 0, sizeof(connection));
     connection.fd = -1;
@@ -3055,21 +3089,34 @@ static int apd_session_run(const struct apd_enrollment_metadata *metadata)
     if (!metadata || apd_transport_endpoint_get(&endpoint) != 0 ||
         apd_tls_open(&endpoint, 1, 1, &connection) != 0)
         goto done;
-    g_apd_wire_protocol = connection.protocol_version == 2 ?
-        APD_TRANSPORT_PROTOCOL_V2 : APD_TRANSPORT_PROTOCOL_V1;
+    g_apd_wire_protocol = connection.protocol_version == 3 ?
+        AP_CONTROL_PROTOCOL_V3 :
+        (connection.protocol_version == 2 ? APD_TRANSPORT_PROTOCOL_V2 : APD_TRANSPORT_PROTOCOL_V1);
+    if (connection.protocol_version == 3) {
+        local_capabilities.config_executor = apd_config_executor_enabled();
+        local_capabilities.validate = local_capabilities.config_executor;
+        local_capabilities.stage = local_capabilities.config_executor;
+        local_capabilities.apply = local_capabilities.config_executor;
+        local_capabilities.readback = local_capabilities.config_executor;
+        local_capabilities.rollback = local_capabilities.config_executor;
+    }
     if (!(request = apd_identity_message_new("session_hello", metadata, 0)) ||
-        ap_control_json_object_exact(request, apd_fields_session_hello,
-                APD_ARRAY_SIZE(apd_fields_session_hello),
-                apd_fields_session_hello,
-                APD_ARRAY_SIZE(apd_fields_session_hello)) !=
+        (connection.protocol_version == 3 &&
+         ap_control_capabilities_add(request, &local_capabilities) != AP_CONTROL_WIRE_OK) ||
+        ap_control_json_object_exact(request,
+                connection.protocol_version == 3 ? apd_fields_session_hello_v3 : apd_fields_session_hello,
+                connection.protocol_version == 3 ? APD_ARRAY_SIZE(apd_fields_session_hello_v3) : APD_ARRAY_SIZE(apd_fields_session_hello),
+                connection.protocol_version == 3 ? apd_fields_session_hello_v3 : apd_fields_session_hello,
+                connection.protocol_version == 3 ? APD_ARRAY_SIZE(apd_fields_session_hello_v3) : APD_ARRAY_SIZE(apd_fields_session_hello)) !=
             AP_CONTROL_WIRE_OK ||
         ap_control_ssl_write_json(connection.ssl, AP_CONTROL_IO_TIMEOUT_MS,
                                   request) != AP_CONTROL_WIRE_OK)
         goto done;
     json_object_put(request);
     request = NULL;
-    if (apd_message_receive(connection.ssl, apd_fields_session_ready,
-            APD_ARRAY_SIZE(apd_fields_session_ready), "session_ready",
+    if (apd_message_receive(connection.ssl,
+            connection.protocol_version == 3 ? apd_fields_session_ready_v3 : apd_fields_session_ready,
+            connection.protocol_version == 3 ? APD_ARRAY_SIZE(apd_fields_session_ready_v3) : APD_ARRAY_SIZE(apd_fields_session_ready), "session_ready",
             &response) != 0 ||
         ap_control_json_get_string(response, "controller_id", &text, 36, 36) !=
             AP_CONTROL_WIRE_OK || strcmp(text, metadata->controller_id) != 0 ||
@@ -3082,6 +3129,19 @@ static int apd_session_run(const struct apd_enrollment_metadata *metadata)
         snprintf(session_epoch, sizeof(session_epoch), "%s", session_epoch_text) >=
             (int)sizeof(session_epoch))
         goto done;
+    if (connection.protocol_version == 3) {
+        struct json_object *capabilities = NULL;
+
+        if (!json_object_object_get_ex(response, "capabilities", &capabilities) ||
+            ap_control_capabilities_parse(capabilities, &peer_capabilities) != AP_CONTROL_WIRE_OK)
+            goto done;
+    }
+    pthread_mutex_lock(&g_apd_transport.lock);
+    g_apd_transport.write_capable =
+        connection.protocol_version == 3 &&
+        ap_control_capabilities_all_true(&local_capabilities) &&
+        ap_control_capabilities_all_true(&peer_capabilities);
+    pthread_mutex_unlock(&g_apd_transport.lock);
     json_object_put(response);
     response = NULL;
     ready = 1;
@@ -3093,6 +3153,17 @@ static int apd_session_run(const struct apd_enrollment_metadata *metadata)
     }
     if (connection.protocol_version == 2 &&
         apd_v2_jobs_step(connection.ssl, metadata, session_epoch) != 0) {
+        rc = 1;
+        goto done;
+    }
+    if (connection.protocol_version == 3 && g_apd_transport.write_capable &&
+        apd_config_pending_finish_replay(connection.ssl, metadata,
+                                         session_epoch) != 0) {
+        rc = 1;
+        goto done;
+    }
+    if (connection.protocol_version == 3 && g_apd_transport.write_capable &&
+        apd_config_wire_step(connection.ssl, metadata, session_epoch) != 0) {
         rc = 1;
         goto done;
     }
@@ -3110,6 +3181,12 @@ static int apd_session_run(const struct apd_enrollment_metadata *metadata)
         }
         if (connection.protocol_version == 2 &&
             apd_v2_jobs_step(connection.ssl, metadata, session_epoch) != 0) {
+            rc = 1;
+            goto done;
+        }
+        if (connection.protocol_version == 3 &&
+            g_apd_transport.write_capable &&
+            apd_config_wire_step(connection.ssl, metadata, session_epoch) != 0) {
             rc = 1;
             goto done;
         }
