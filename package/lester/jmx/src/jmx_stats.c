@@ -55,6 +55,13 @@ static void jmx_stats_sum(struct jmx_stats_cpu *out)
 		out->miss += c->miss;
 		out->shadow_hit += c->shadow_hit;
 		out->v3_budget_exhausted += c->v3_budget_exhausted;
+		out->gate_direction_unknown += c->gate_direction_unknown;
+		out->gate_direction_unready += c->gate_direction_unready;
+		out->gate_direction_lan_wan += c->gate_direction_lan_wan;
+		out->gate_direction_fail_open += c->gate_direction_fail_open;
+		out->gate_license_fail_open += c->gate_license_fail_open;
+		out->gate_license_would_drop += c->gate_license_would_drop;
+		out->gate_license_allow += c->gate_license_allow;
 		for (i = 0; i < JMX_POOL_MAX; i++) {
 			out->pool_alloc[i] += c->pool_alloc[i];
 			out->pool_free[i] += c->pool_free[i];
@@ -227,6 +234,22 @@ static int jmx_cache_stats_show(struct seq_file *s, void *v)
 	seq_puts(s, "\n# observational only, never produces a classification\n");
 	seq_printf(s, "v3_shadow_hit      %llu\n", t.shadow_hit);
 	seq_printf(s, "v3_budget_exhausted %llu\n", t.v3_budget_exhausted);
+	seq_puts(s, "\n# direction gate observation; no authorization drop is performed here\n");
+	seq_printf(s, "gate_direction_unknown   %llu\n",
+		   t.gate_direction_unknown);
+	seq_printf(s, "gate_direction_unready   %llu\n",
+		   t.gate_direction_unready);
+	seq_printf(s, "gate_direction_lan_wan   %llu\n",
+		   t.gate_direction_lan_wan);
+	seq_printf(s, "gate_direction_fail_open %llu\n",
+		   t.gate_direction_fail_open);
+	seq_puts(s, "\n# license gate; SHADOW mode always NF_ACCEPT\n");
+	seq_printf(s, "gate_license_fail_open    %llu\n",
+		   t.gate_license_fail_open);
+	seq_printf(s, "gate_license_would_drop   %llu\n",
+		   t.gate_license_would_drop);
+	seq_printf(s, "gate_license_allow        %llu\n",
+		   t.gate_license_allow);
 	return 0;
 }
 
@@ -365,23 +388,20 @@ static void jmx_rule_seq_stop(struct seq_file *s, void *v)
 static int jmx_rule_seq_show(struct seq_file *s, void *v)
 {
 	struct jmx_rule_iter *it = s->private;
-	const struct jmx_stats_rule_row *row;
+	u64 total = 0;
+	u32 i;
 
-	if (v == SEQ_START_TOKEN) {
-		seq_printf(s, "# v3 generation %u, %u rules\n",
-			   it->generation, it->count);
-		seq_puts(s, "# match_cnt is a real counter; an unmatched rule reads 0\n");
-		seq_printf(s, "%-12s %-12s %-10s %s\n",
-			   "rule_id", "appid", "priority", "match_cnt");
-		return 0;
-	}
-	row = v;
-	seq_printf(s, "%-12u %-12u %-10u %llu\n",
-		   row->signature_rule_id, row->appid, row->priority,
-		   row->match_cnt);
+	if (v != SEQ_START_TOKEN)
+		return 0; /* Only show header once, no per-rule iteration */
+
+	/* Sum all match counts */
+	for (i = 0; i < it->count; i++)
+		total += it->rows[i].match_cnt;
+
+	seq_printf(s, "# v3 generation %u, %u rules\n", it->generation, it->count);
+	seq_printf(s, "# Total match_cnt (aggregate): %llu\n", total);
 	return 0;
 }
-
 static const struct seq_operations jmx_rule_seq_ops = {
 	.start = jmx_rule_seq_start,
 	.next  = jmx_rule_seq_next,

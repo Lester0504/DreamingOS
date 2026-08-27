@@ -62,6 +62,13 @@ struct jmx_stats_cpu {
 	u64 miss;			/* attempts that resolved nothing */
 	u64 shadow_hit;			/* v3 matched in shadow mode */
 	u64 v3_budget_exhausted;	/* AC scan aborted on work budget */
+	u64 gate_direction_unknown;
+	u64 gate_direction_unready;
+	u64 gate_direction_lan_wan;
+	u64 gate_direction_fail_open;
+	u64 gate_license_fail_open;	/* license FAIL_OPEN conditions */
+	u64 gate_license_would_drop;	/* invalid license, SHADOW records */
+	u64 gate_license_allow;		/* valid license, traffic allowed */
 	u64 pool_alloc[JMX_POOL_MAX];
 	u64 pool_free[JMX_POOL_MAX];
 	u64 pool_alloc_fail[JMX_POOL_MAX];
@@ -99,6 +106,41 @@ static inline void jmx_stats_shadow_hit(void)
 static inline void jmx_stats_v3_budget_exhausted(void)
 {
 	this_cpu_inc(jmx_stats_pcpu.v3_budget_exhausted);
+}
+
+static inline void jmx_stats_gate_direction_unknown(void)
+{
+	this_cpu_inc(jmx_stats_pcpu.gate_direction_unknown);
+}
+
+static inline void jmx_stats_gate_direction_unready(void)
+{
+	this_cpu_inc(jmx_stats_pcpu.gate_direction_unready);
+}
+
+static inline void jmx_stats_gate_direction_lan_wan(void)
+{
+	this_cpu_inc(jmx_stats_pcpu.gate_direction_lan_wan);
+}
+
+static inline void jmx_stats_gate_direction_fail_open(void)
+{
+	this_cpu_inc(jmx_stats_pcpu.gate_direction_fail_open);
+}
+
+static inline void jmx_stats_gate_license_fail_open(void)
+{
+	this_cpu_inc(jmx_stats_pcpu.gate_license_fail_open);
+}
+
+static inline void jmx_stats_gate_license_would_drop(void)
+{
+	this_cpu_inc(jmx_stats_pcpu.gate_license_would_drop);
+}
+
+static inline void jmx_stats_gate_license_allow(void)
+{
+	this_cpu_inc(jmx_stats_pcpu.gate_license_allow);
 }
 
 static inline void jmx_stats_pool_alloc(enum jmx_stats_pool pool)

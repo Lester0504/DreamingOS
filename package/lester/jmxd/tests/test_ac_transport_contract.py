@@ -15,6 +15,8 @@ import sys
 import tempfile
 import time
 
+import apd_test_deps
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src/ac/ac_transport.c"
@@ -23,12 +25,14 @@ FIXTURE = ROOT / "tests/ac_transport_runtime_fixture.c"
 TELEMETRY_FIXTURE = ROOT / "tests/ac_transport_telemetry_fixture.c"
 HEADER = ROOT / "tests/ac_enrollment_fixture.h"
 TRANSPORT_HEADER = ROOT / "tests/ac_transport_fixture.h"
-OPENSSL = Path("/opt/homebrew/opt/openssl@3")
-JSON_C = Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c/0.19")
+JSON_PREFIX, JSON_SHARED = apd_test_deps.resolve_json_prefix()
+OPENSSL_PREFIX, _OPENSSL_SHARED = apd_test_deps.resolve_openssl_prefix()
 PROTOCOL = "ap-control.v1"
 ALPN = "dreamingwrt-ap/1"
 PROTOCOL_V2 = "ap-control.v2"
 ALPN_V2 = "dreamingwrt-ap/2"
+PROTOCOL_V3 = "ap-control.v3"
+ALPN_V3 = "dreamingwrt-ap/3"
 CONTROLLER_ID = "11111111-1111-5111-8111-111111111111"
 AP_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -42,19 +46,27 @@ def lowercase_hex(value: object, length: int | None = None) -> bool:
 
 
 def compile_fixture(output: Path) -> None:
-    prefix = Path(os.environ.get("AC_TRANSPORT_TEST_PREFIX", OPENSSL))
-    json_prefix = Path(os.environ.get("AC_TRANSPORT_JSON_PREFIX", JSON_C))
+    prefix = Path(os.environ.get("AC_TRANSPORT_TEST_PREFIX", OPENSSL_PREFIX))
+    json_prefix = Path(os.environ.get("AC_TRANSPORT_JSON_PREFIX", JSON_PREFIX))
+    if JSON_SHARED:
+        json_link = ["-L", str(json_prefix / "lib"),
+                     f"-Wl,-rpath,{json_prefix / 'lib'}", "-ljson-c"]
+    else:
+        json_link = [str(json_prefix / "lib/libjson-c.a")]
     command = [
         os.environ.get("CC", "cc"), "-std=c11",
         "-D_DARWIN_C_SOURCE" if sys.platform == "darwin" else "-D_GNU_SOURCE",
         "-DAC_TRANSPORT_TEST_STANDALONE", "-Wall", "-Wextra", "-Werror",
         f"-include{TRANSPORT_HEADER}",
-        f"-I{prefix / 'include'}", f"-I{json_prefix / 'include'}",
+        f"-I{prefix / 'include'}",
+        # The OpenWrt host prefix also carries an older OpenSSL header set.
+        # Search it only after the native system headers so json-c can be used
+        # without mixing incompatible OpenSSL declarations into this host
+        # fixture build.
+        "-idirafter", str(json_prefix / "include"),
         f"-L{prefix / 'lib'}", f"-Wl,-rpath,{prefix / 'lib'}",
         str(FIXTURE), str(TELEMETRY_FIXTURE), str(SOURCE), str(WIRE),
-        "-lssl", "-lcrypto", str(json_prefix / "lib/libjson-c.a"),
-        "-lpthread", "-o", str(output),
-    ]
+    ] + json_link + ["-lssl", "-lcrypto", "-lpthread", "-o", str(output)]
     subprocess.run(command, check=True, capture_output=True, text=True)
 
 
@@ -63,6 +75,7 @@ def protocol_version_contract() -> None:
     wire_header = (ROOT / "src/ap_control_wire.h").read_text(encoding="utf-8")
     assert '#define AC_TRANSPORT_PROTOCOL_V1 "ap-control.v1"' in source
     assert '#define AC_TRANSPORT_PROTOCOL_V2 "ap-control.v2"' in source
+    assert "AP_CONTROL_ALPN_V3" in source
     assert "AP_CONTROL_ALPN_V2" in source and "AP_CONTROL_ALPN_V1" in source
     assert '#define AP_CONTROL_ALPN_V2 "dreamingwrt-ap/2"' in wire_header
     assert "ap_control_ssl_selected_alpn_version" in source
@@ -727,22 +740,29 @@ def radio_job_v2_old_epoch_rejected(directory: Path, port: int,
         assert denied["reply_to"] == 1
 
 
-def config_job_v2_session(directory: Path, port: int,
+def config_job_v3_session(directory: Path, port: int,
                           certificate_id: str) -> None:
     """W2c config job wire: offer/accept/finish with idempotent finish
     replay and idle after the terminal state."""
-    with connect(directory, port, mtls=True, alpn=ALPN_V2) as connection:
-        assert connection.selected_alpn_protocol() == ALPN_V2
+    capabilities = {
+        "config_executor": True, "validate": True, "stage": True,
+        "apply": True, "readback": True, "rollback": True,
+    }
+    with connect(directory, port, mtls=True, alpn=ALPN_V3) as connection:
+        assert connection.selected_alpn_protocol() == ALPN_V3
         frame_send(connection, {
-            "protocol": PROTOCOL_V2, "kind": "session_hello",
+            "protocol": PROTOCOL_V3, "kind": "session_hello",
             "controller_id": CONTROLLER_ID,
             "certificate_id": certificate_id, "ap_id": AP_ID,
+            "capabilities": capabilities,
         })
         ready = frame_receive(connection)
         assert ready["kind"] == "session_ready"
+        assert ready["protocol"] == PROTOCOL_V3
+        assert ready["capabilities"] == capabilities
         epoch = ready["session_epoch"]
         frame_send(connection, {
-            "protocol": PROTOCOL_V2, "kind": "config_job_poll",
+            "protocol": PROTOCOL_V3, "kind": "config_job_poll",
             "ap_id": AP_ID, "session_epoch": epoch, "sequence": 1,
         })
         offer = frame_receive(connection)
@@ -757,7 +777,7 @@ def config_job_v2_session(directory: Path, port: int,
             "request_digest": offer["request_digest"],
         }
         frame_send(connection, {
-            "protocol": PROTOCOL_V2, "kind": "config_job_accept",
+            "protocol": PROTOCOL_V3, "kind": "config_job_accept",
             "ap_id": AP_ID, "session_epoch": epoch, "sequence": 2,
             **identity,
         })
@@ -765,12 +785,16 @@ def config_job_v2_session(directory: Path, port: int,
         assert ack["kind"] == "config_job_accept_ack", ack
         assert ack["controller_state"] == "running"
         finish = {
-            "protocol": PROTOCOL_V2, "kind": "config_job_finish",
+            "protocol": PROTOCOL_V3, "kind": "config_job_finish",
             "ap_id": AP_ID, "session_epoch": epoch, "sequence": 3,
             **identity,
             "finish_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
             "outcome": "applied", "error_code": "",
-            "readback": "{\"match\":true}",
+            "readback": "{\"ok\":true,\"match\":true,"
+                        "\"candidate_digest\":\"" +
+                        offer["candidate_digest"] + "\","
+                        "\"readback_digest\":\"" +
+                        offer["candidate_digest"] + "\"}",
         }
         frame_send(connection, finish)
         finish_ack = frame_receive(connection)
@@ -784,11 +808,76 @@ def config_job_v2_session(directory: Path, port: int,
         assert replay_ack["kind"] == "config_job_finish_ack", replay_ack
         assert replay_ack["controller_state"] == "applied"
         frame_send(connection, {
-            "protocol": PROTOCOL_V2, "kind": "config_job_poll",
+            "protocol": PROTOCOL_V3, "kind": "config_job_poll",
             "ap_id": AP_ID, "session_epoch": epoch, "sequence": 5,
         })
         idle = frame_receive(connection)
         assert idle["kind"] == "config_job_idle", idle
+
+
+def txpower_mode_v2_method_absent(directory: Path, port: int,
+                                  certificate_id: str) -> None:
+    """Verify fixed txpower framing, replay guards, Boolean parsing, and session binding."""
+    with connect(directory, port, mtls=True, alpn=ALPN_V2) as connection:
+        frame_send(connection, {
+            "protocol": PROTOCOL_V2, "kind": "session_hello",
+            "controller_id": CONTROLLER_ID,
+            "certificate_id": certificate_id, "ap_id": AP_ID,
+        })
+        epoch = frame_receive(connection)["session_epoch"]
+        poll = {
+            "protocol": PROTOCOL_V2, "kind": "txpower_mode_poll",
+            "ap_id": AP_ID, "session_epoch": epoch, "sequence": 1,
+        }
+        frame_send(connection, poll)
+        idle = frame_receive(connection)
+        assert idle == {
+            "protocol": PROTOCOL_V2, "kind": "txpower_mode_idle",
+            "ap_id": AP_ID, "session_epoch": epoch, "reply_to": 1,
+        }
+        frame_send(connection, poll)
+        assert frame_receive(connection) == idle
+
+        invalid = {
+            "protocol": PROTOCOL_V2, "kind": "txpower_mode_finish",
+            "ap_id": AP_ID, "session_epoch": epoch, "sequence": 2,
+            "operation": "set", "mode": "regulatory",
+            "confirm": "true",
+            "result": {"ok": False, "error": "apd_method_absent",
+                       "reason": "apd_method_absent"},
+        }
+        frame_send(connection, invalid)
+        denied = frame_receive(connection)
+        assert denied["kind"] == "radio_job_error"
+        assert denied["error"] == "invalid_request"
+
+        changed = dict(invalid)
+        changed["unexpected"] = True
+        frame_send(connection, changed)
+        conflict = frame_receive(connection)
+        assert conflict["kind"] == "radio_job_error"
+        assert conflict["error"] == "sequence_conflict"
+        assert conflict["reason"] == "sequence_payload_changed"
+
+    with connect(directory, port, mtls=True, alpn=ALPN_V2) as connection:
+        frame_send(connection, {
+            "protocol": PROTOCOL_V2, "kind": "session_hello",
+            "controller_id": CONTROLLER_ID,
+            "certificate_id": certificate_id, "ap_id": AP_ID,
+        })
+        epoch = frame_receive(connection)["session_epoch"]
+        poll = {
+            "protocol": PROTOCOL_V2, "kind": "txpower_mode_poll",
+            "ap_id": AP_ID, "session_epoch": epoch, "sequence": 1,
+        }
+
+        mismatched = dict(poll)
+        mismatched["session_epoch"] = "0" * 64
+        frame_send(connection, mismatched)
+        denied = frame_receive(connection)
+        assert denied["kind"] == "radio_job_error"
+        assert denied["error"] == "invalid_session"
+        assert denied["reason"] == "session_not_current"
 
 
 def telemetry_rejected(directory: Path, port: int, certificate_id: str,
@@ -880,6 +969,10 @@ def tls_gates(directory: Path, port: int) -> None:
     except (ssl.SSLError, ConnectionError, OSError):
         raw.close()
 
+    # Both negative handshakes consume accept-rate tokens.  The full live
+    # contract deliberately exceeds the initial burst, so wait for one
+    # production-rate token before asserting the final valid connection.
+    time.sleep(0.2)
     with connect(directory, port) as connection:
         connection.sendall(struct.pack("!I", 64 * 1024 + 1))
         connection.settimeout(3)
@@ -897,6 +990,7 @@ def live_contract(binary: Path, root: Path) -> None:
         [str(binary)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True,
     )
+    failure: BaseException | None = None
     try:
         fields: dict[str, str] = {}
         for _ in range(3):
@@ -915,16 +1009,24 @@ def live_contract(binary: Path, root: Path) -> None:
         radio_job_v2_telemetry_heartbeat_poll(root, port, certificate_id)
         radio_job_v2_session(root, port, certificate_id)
         radio_job_v2_old_epoch_rejected(root, port, certificate_id)
-        config_job_v2_session(root, port, certificate_id)
+        config_job_v3_session(root, port, certificate_id)
+        txpower_mode_v2_method_absent(root, port, certificate_id)
         telemetry_rejected(root, port, certificate_id, "ap_id")
         telemetry_rejected(root, port, certificate_id, "sequence_rollback")
         telemetry_rejected(root, port, certificate_id, "missing_snapshot")
         telemetry_rejected(root, port, certificate_id, "system_not_object")
         oversized_telemetry_rejected(root, port, certificate_id)
         tls_gates(root, port)
+    except BaseException as error:
+        failure = error
     finally:
         process.send_signal(signal.SIGTERM)
         stdout, stderr = process.communicate(timeout=12)
+    if failure is not None:
+        raise AssertionError(
+            f"AC transport fixture failed: {failure!r}\n"
+            f"stdout={stdout}\nstderr={stderr}"
+        ) from failure
     assert process.returncode == 0, (stdout, stderr)
     assert "stopped=1" in stdout and "reason=stopped" in stdout
     assert "heartbeats=3" in stdout
@@ -975,6 +1077,9 @@ def static_contract() -> None:
         "ac_fields_radio_job_idle", "ac_fields_radio_job_offer",
         "ac_fields_radio_job_ack", "ac_fields_radio_job_reconcile_ack",
         "ac_fields_radio_job_finish_ack", "ac_fields_radio_job_error",
+        "ac_fields_txpower_mode_poll", "ac_fields_txpower_mode_idle",
+        "ac_fields_txpower_mode_offer", "ac_fields_txpower_mode_finish",
+        "ac_fields_txpower_mode_finish_ack",
     ):
         assert source.count(fields) >= 2, fields
     assert '"token"' not in source[source.index("static int ac_send_error"):
@@ -982,6 +1087,11 @@ def static_contract() -> None:
     controller_getter = source[source.index("const char *ac_transport_controller_id") :]
     assert "return g_ac_transport_controller_id_copy;" in controller_getter
     assert "return NULL" not in controller_getter
+    txpower = source[source.index("struct ac_txpower_pending"):
+                     source.index("static struct json_object *ac_radio_error_new")]
+    assert "ac_json_copy_boolean(message, \"confirm\"" in txpower
+    assert "ac_txpower_pending_find_locked(ap_id, session_epoch)" in txpower
+    assert "pending->result = json_object_get(result)" in txpower
 
 
 def main() -> None:

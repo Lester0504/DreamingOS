@@ -42,6 +42,7 @@
 #define JMX_NL_ACT_CARRIER_ADD      41
 #define JMX_NL_ACT_APPCAT_FLUSH     42
 #define JMX_NL_ACT_APPCAT_ADD       43
+#define JMX_NL_ACT_ROUTE_ADD_V2     44
 
 struct jmx_nl_wan_register_v1 {
 	int32_t action;
@@ -529,7 +530,10 @@ int jmx_v2_nl_handle(const char *data, int len, u32 portid,
 	case JMX_NL_ACT_ROUTE_ADD: {
 		struct { int32_t action; jmx_route_rule_t rule; } __packed *m;
 		int rc;
-		if (len < (int)sizeof(*m)) return 1;
+		if (len != (int)sizeof(*m)) {
+			pr_warn_ratelimited("jmx_route: reject legacy rule payload len=%d\n", len);
+			return 1;
+		}
 		m = (void *)data;
 		rc = jmx_route_rule_add(&m->rule);
 		if (rc)
@@ -538,6 +542,30 @@ int jmx_v2_nl_handle(const char *data, int len, u32 portid,
 		else
 			JMX_DEBUG_RATELIMITED(1, "jmx_route: rule added prio=%u appid=%u mode=%u wans=%u\n",
 				m->rule.prio, m->rule.appid, m->rule.sticky_mode, m->rule.wan_count);
+		return 1;
+	}
+
+	case JMX_NL_ACT_ROUTE_ADD_V2: {
+		struct {
+			int32_t action;
+			jmx_route_rule_t rule;
+			u32 enhancements;
+		} __packed *m;
+		int rc;
+
+		if (len != (int)sizeof(*m)) {
+			pr_warn_ratelimited("jmx_route: reject rule v2 payload len=%d\n", len);
+			return 1;
+		}
+		m = (void *)data;
+		rc = jmx_route_rule_add_with_enhancements(&m->rule, m->enhancements);
+		if (rc)
+			pr_warn("jmx_route: v2 rule rejected prio=%u mode=%u enhancements=0x%x rc=%d\n",
+				m->rule.prio, m->rule.sticky_mode, m->enhancements, rc);
+		else
+			JMX_DEBUG_RATELIMITED(1,
+				"jmx_route: v2 rule added prio=%u mode=%u enhancements=0x%x\n",
+				m->rule.prio, m->rule.sticky_mode, m->enhancements);
 		return 1;
 	}
 

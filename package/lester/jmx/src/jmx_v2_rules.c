@@ -143,7 +143,7 @@ static int jmx_v2_tx_check_owner_locked(u32 owner_portid)
 static void jmx_v2_tx_refresh_locked(void)
 {
 	staging_deadline = jiffies + JMX_V2_TX_TIMEOUT;
-	mod_delayed_work(system_wq, &rules_tx_expire_work,
+	mod_delayed_work(system_dfl_wq, &rules_tx_expire_work,
 			 JMX_V2_TX_TIMEOUT);
 }
 

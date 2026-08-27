@@ -30,6 +30,12 @@
 #include "jmx_log.h"
 #include "jmx_conntrack.h"
 
+/* Keep the route-add netlink payload aligned with jmxd's native wire struct. */
+static_assert(offsetof(jmx_route_rule_t, wan_ids) == 31);
+static_assert(offsetof(jmx_route_rule_t, wan_weights) == 40);
+static_assert(offsetof(jmx_route_rule_t, hit_count) == 72);
+static_assert(sizeof(jmx_route_rule_t) == 88);
+
 static void jmx_wan_proc_dir_create(u8 wan_id);
 static void jmx_wan_proc_dir_remove(u8 wan_id);
 static int  jmx_route_stats_init_procfs(void);
@@ -37,6 +43,12 @@ static void jmx_route_stats_exit_procfs(void);
 
 static jmx_wan_iface_t g_wans[JMX_MAX_WAN_IFACES];
 static jmx_route_rule_t g_rules[JMX_MAX_ROUTE_RULES];
+struct jmx_route_rule_enhancement_state {
+	u16 prio;
+	u32 flags;
+};
+static struct jmx_route_rule_enhancement_state
+	g_rule_enhancements[JMX_MAX_ROUTE_RULES];
 static int g_rule_count;
 
 typedef struct jmx_carrier_prefix {
@@ -50,6 +62,48 @@ static int g_carrier_count;
 static u32 g_wan_generation;
 static u64 g_new_flow_seq[JMX_MAX_ROUTE_RULES];
 static DEFINE_SPINLOCK(jmx_route_lock);
+
+static u32 jmx_route_enhancements_nolock(u16 prio)
+{
+	int i;
+
+	for (i = 0; i < JMX_MAX_ROUTE_RULES; i++)
+		if (g_rule_enhancements[i].prio == prio)
+			return g_rule_enhancements[i].flags;
+	return 0;
+}
+
+static int jmx_route_set_enhancements_nolock(u16 prio, u32 flags)
+{
+	int i;
+	int free_slot = -1;
+
+	for (i = 0; i < JMX_MAX_ROUTE_RULES; i++) {
+		if (g_rule_enhancements[i].prio == prio) {
+			g_rule_enhancements[i].flags = flags;
+			return 0;
+		}
+		if (!g_rule_enhancements[i].prio && free_slot < 0)
+			free_slot = i;
+	}
+	if (free_slot < 0)
+		return -ENOSPC;
+	g_rule_enhancements[free_slot].prio = prio;
+	g_rule_enhancements[free_slot].flags = flags;
+	return 0;
+}
+
+static void jmx_route_clear_enhancements_nolock(u16 prio)
+{
+	int i;
+
+	for (i = 0; i < JMX_MAX_ROUTE_RULES; i++)
+		if (g_rule_enhancements[i].prio == prio) {
+			memset(&g_rule_enhancements[i], 0,
+			       sizeof(g_rule_enhancements[i]));
+			return;
+		}
+}
 
 /*
  * appid -> category slot map.
@@ -237,6 +291,7 @@ int jmx_wan_register(u8 wan_id, const char *name, u32 fwmark, u32 table_id,
 	char normalized_name[sizeof(wan->name)];
 	u32 effective_table;
 	unsigned long flags;
+	bool new_incarnation;
 
 	if (!jmx_wan_idx_valid(wan_id) || !fwmark || !weight)
 		return -EINVAL;
@@ -245,9 +300,10 @@ int jmx_wan_register(u8 wan_id, const char *name, u32 fwmark, u32 table_id,
 	effective_table = table_id ? table_id : (JMX_ROUTE_TABLE_BASE + wan_id);
 	spin_lock_irqsave(&jmx_route_lock, flags);
 	wan = &g_wans[wan_id - 1];
-	if (wan->wan_id != wan_id || wan->fwmark != fwmark ||
-	    wan->table_id != effective_table ||
-	    strncmp(wan->name, normalized_name, sizeof(wan->name))) {
+	new_incarnation = wan->wan_id != wan_id || wan->fwmark != fwmark ||
+		wan->table_id != effective_table ||
+		strncmp(wan->name, normalized_name, sizeof(wan->name));
+	if (new_incarnation) {
 		int c;
 		memset(wan, 0, sizeof(*wan));
 		wan->generation = jmx_wan_next_generation_nolock();
@@ -260,13 +316,14 @@ int jmx_wan_register(u8 wan_id, const char *name, u32 fwmark, u32 table_id,
 			atomic64_set(&wan->cats[c].tx_bytes, 0);
 			atomic64_set(&wan->cats[c].rx_bytes, 0);
 		}
+		wan->health = 1;
+		wan->adaptive_weight = 100;
 	}
 	wan->wan_id = wan_id;
 	strscpy(wan->name, normalized_name, sizeof(wan->name));
 	wan->fwmark = fwmark;
 	wan->table_id = effective_table;
 	wan->gateway = gateway;
-	wan->health = 1;
 	wan->weight = weight;
 	spin_unlock_irqrestore(&jmx_route_lock, flags);
 
@@ -276,6 +333,62 @@ int jmx_wan_register(u8 wan_id, const char *name, u32 fwmark, u32 table_id,
 	JMX_DEBUG_RATELIMITED(1,
 		"jmx_route: register wan id=%u name=%s fwmark=0x%x table=%u weight=%u\n",
 		wan_id, name ? name : "", fwmark, effective_table, weight);
+	return 0;
+}
+
+int jmx_wan_set_weight(u8 wan_id, u32 weight)
+{
+	jmx_wan_iface_t *wan;
+	unsigned long flags;
+	u32 old_weight = 0;
+	bool changed = false;
+
+	if (!jmx_wan_idx_valid(wan_id) || weight < 1 || weight > 100)
+		return -EINVAL;
+
+	spin_lock_irqsave(&jmx_route_lock, flags);
+	wan = jmx_wan_by_id_nolock(wan_id);
+	if (!wan) {
+		spin_unlock_irqrestore(&jmx_route_lock, flags);
+		return -ENOENT;
+	}
+	old_weight = wan->weight;
+	wan->weight = weight;
+	changed = old_weight != weight;
+	spin_unlock_irqrestore(&jmx_route_lock, flags);
+
+	if (changed)
+		JMX_DEBUG_RATELIMITED(1,
+			"jmx_route: wan weight changed id=%u old=%u new=%u\n",
+			wan_id, old_weight, weight);
+	return 0;
+}
+
+int jmx_wan_set_adaptive_weight(u8 wan_id, u32 weight)
+{
+	jmx_wan_iface_t *wan;
+	unsigned long flags;
+	u32 old_weight = 0;
+	bool changed = false;
+
+	if (!jmx_wan_idx_valid(wan_id) || weight < 1 || weight > 100)
+		return -EINVAL;
+
+	spin_lock_irqsave(&jmx_route_lock, flags);
+	wan = jmx_wan_by_id_nolock(wan_id);
+	if (!wan) {
+		spin_unlock_irqrestore(&jmx_route_lock, flags);
+		return -ENOENT;
+	}
+	old_weight = wan->adaptive_weight;
+	wan->adaptive_weight = weight;
+	changed = old_weight != weight;
+	spin_unlock_irqrestore(&jmx_route_lock, flags);
+
+	if (changed)
+		JMX_DEBUG_RATELIMITED(1,
+			"jmx_route: wan adaptive weight changed id=%u old=%u new=%u\n",
+			wan_id, old_weight, weight);
 	return 0;
 }
 
@@ -612,14 +725,16 @@ u8 jmx_carrier_lookup(u32 ip)
 	return carrier;
 }
 
-int jmx_route_rule_add(const jmx_route_rule_t *rule)
+int jmx_route_rule_add_with_enhancements(const jmx_route_rule_t *rule,
+						 u32 enhancements)
 {
 	int i;
 	unsigned long flags;
 
 	if (!rule || !rule->enabled || rule->wan_count == 0 ||
 	    rule->wan_count > JMX_MAX_WAN_IFACES ||
-	    rule->sticky_mode > JMX_STICKY_CONN_CNT)
+	    rule->sticky_mode > JMX_STICKY_MAX ||
+	    (enhancements & ~JMX_ROUTE_ENHANCEMENT_KNOWN))
 		return -EINVAL;
 
 	spin_lock_irqsave(&jmx_route_lock, flags);
@@ -632,6 +747,10 @@ int jmx_route_rule_add(const jmx_route_rule_t *rule)
 			g_rules[i] = *rule;
 			g_rules[i].hit_count = hit_count;
 			g_rules[i].last_hit_jiffies = last_hit_jiffies;
+			if (jmx_route_set_enhancements_nolock(rule->prio, enhancements)) {
+				spin_unlock_irqrestore(&jmx_route_lock, flags);
+				return -ENOSPC;
+			}
 			jmx_route_sort_rules_nolock();
 			memset(g_new_flow_seq, 0, sizeof(g_new_flow_seq));
 			spin_unlock_irqrestore(&jmx_route_lock, flags);
@@ -645,10 +764,20 @@ int jmx_route_rule_add(const jmx_route_rule_t *rule)
 	}
 
 	g_rules[g_rule_count++] = *rule;
+	if (jmx_route_set_enhancements_nolock(rule->prio, enhancements)) {
+		g_rule_count--;
+		spin_unlock_irqrestore(&jmx_route_lock, flags);
+		return -ENOSPC;
+	}
 	jmx_route_sort_rules_nolock();
 	memset(g_new_flow_seq, 0, sizeof(g_new_flow_seq));
 	spin_unlock_irqrestore(&jmx_route_lock, flags);
 	return 0;
+}
+
+int jmx_route_rule_add(const jmx_route_rule_t *rule)
+{
+	return jmx_route_rule_add_with_enhancements(rule, 0);
 }
 
 void jmx_route_rule_del(u16 prio)
@@ -663,6 +792,7 @@ void jmx_route_rule_del(u16 prio)
 		for (j = i; j < g_rule_count - 1; j++)
 			g_rules[j] = g_rules[j + 1];
 		memset(&g_rules[g_rule_count - 1], 0, sizeof(g_rules[0]));
+		jmx_route_clear_enhancements_nolock(prio);
 		g_rule_count--;
 		memset(g_new_flow_seq, 0, sizeof(g_new_flow_seq));
 		break;
@@ -692,6 +822,7 @@ void jmx_route_rule_flush(void)
 
 	spin_lock_irqsave(&jmx_route_lock, flags);
 	memset(g_rules, 0, sizeof(g_rules));
+	memset(g_rule_enhancements, 0, sizeof(g_rule_enhancements));
 	memset(g_new_flow_seq, 0, sizeof(g_new_flow_seq));
 	g_rule_count = 0;
 	memset(g_carriers, 0, sizeof(g_carriers));
@@ -766,6 +897,7 @@ static u32 jmx_route_hash4(const jmx_route_rule_t *r,
 		return 0;
 	case JMX_STICKY_DOWNLOAD:
 	case JMX_STICKY_CONN_CNT:
+	case JMX_STICKY_ADAPTIVE_PENALTY:
 		return jhash_3words(src_ip ^ dst_ip,
 				    ((u32)src_port << 16) | dst_port,
 				    ((u32)proto << 24) | r->prio, 0x51a7e006);
@@ -802,6 +934,7 @@ static u32 jmx_route_hash6(const jmx_route_rule_t *r,
 		return 0;
 	case JMX_STICKY_DOWNLOAD:
 	case JMX_STICKY_CONN_CNT:
+	case JMX_STICKY_ADAPTIVE_PENALTY:
 		words[8] = ((u32)key->src_port << 16) | key->dst_port;
 		words[9] = ((u32)key->proto << 24) | r->prio;
 		return jhash2(words, 10, 0x51a7e006);
@@ -821,13 +954,13 @@ static u32 jmx_route_hash(const jmx_route_rule_t *r,
 	return jmx_route_hash4(r, key);
 }
 
-static int jmx_weighted_metric_cmp(u64 left, u32 left_weight,
-				   u64 right, u32 right_weight)
+static int jmx_weighted_metric_cmp(u64 left, u64 left_weight,
+				   u64 right, u64 right_weight)
 {
 	u64 left_q = div64_u64(left, left_weight);
 	u64 right_q = div64_u64(right, right_weight);
-	u32 left_r;
-	u32 right_r;
+	u64 left_r;
+	u64 right_r;
 	u64 left_fraction;
 	u64 right_fraction;
 
@@ -847,8 +980,17 @@ static int jmx_weighted_metric_cmp(u64 left, u32 left_weight,
 	return 0;
 }
 
-static jmx_wan_iface_t *jmx_weighted_tie_select(jmx_wan_iface_t **candidates,
-						 int count, u32 hash)
+struct jmx_route_candidate {
+	jmx_wan_iface_t *wan;
+	u32 policy_weight;
+};
+
+static u64 jmx_selection_weight(const struct jmx_route_candidate *candidate,
+					bool adaptive);
+
+static jmx_wan_iface_t *
+jmx_weighted_tie_select(const struct jmx_route_candidate *candidates,
+			int count, u32 hash, bool adaptive)
 {
 	u64 total_weight = 0;
 	u64 point;
@@ -856,61 +998,77 @@ static jmx_wan_iface_t *jmx_weighted_tie_select(jmx_wan_iface_t **candidates,
 	int i;
 
 	for (i = 0; i < count; i++)
-		total_weight += candidates[i]->weight;
+		total_weight += jmx_selection_weight(&candidates[i], adaptive);
 	if (!total_weight)
-		return candidates[hash % count];
+		return candidates[hash % count].wan;
 
 	hash64 = ((u64)hash << 32) | jhash_1word(hash, 0x51a7e007);
 	point = hash64 % total_weight;
 	for (i = 0; i < count; i++) {
-		if (point < candidates[i]->weight)
-			return candidates[i];
-		point -= candidates[i]->weight;
+		if (point < jmx_selection_weight(&candidates[i], adaptive))
+			return candidates[i].wan;
+		point -= jmx_selection_weight(&candidates[i], adaptive);
 	}
-	return candidates[count - 1];
+	return candidates[count - 1].wan;
 }
 
-static jmx_wan_iface_t *jmx_weighted_slot_select(jmx_wan_iface_t **candidates,
-						  int count, u64 slot)
+static u64 jmx_selection_weight(const struct jmx_route_candidate *candidate,
+				bool adaptive)
+{
+	u64 weight = candidate->policy_weight;
+
+	if (adaptive)
+		weight *= candidate->wan->adaptive_weight ?
+			candidate->wan->adaptive_weight : 100;
+	return weight;
+}
+
+static jmx_wan_iface_t *
+jmx_weighted_slot_select(const struct jmx_route_candidate *candidates,
+			 int count, u64 slot, bool adaptive)
 {
 	u64 total_weight = 0;
 	u64 point;
 	int i;
 
 	for (i = 0; i < count; i++)
-		total_weight += candidates[i]->weight;
+		total_weight += jmx_selection_weight(&candidates[i], adaptive);
 	if (!total_weight)
-		return candidates[slot % count];
+		return candidates[slot % count].wan;
 
 	point = slot % total_weight;
 	for (i = 0; i < count; i++) {
-		if (point < candidates[i]->weight)
-			return candidates[i];
-		point -= candidates[i]->weight;
+		u64 weight = jmx_selection_weight(&candidates[i], adaptive);
+
+		if (point < weight)
+			return candidates[i].wan;
+		point -= weight;
 	}
-	return candidates[count - 1];
+	return candidates[count - 1].wan;
 }
 
-static jmx_wan_iface_t *jmx_select_min_metric_nolock(jmx_wan_iface_t **candidates,
-						      int count, bool by_connections,
-						      u32 hash)
+static jmx_wan_iface_t *
+jmx_select_min_metric_nolock(const struct jmx_route_candidate *candidates,
+			     int count, bool by_connections, u32 hash, bool adaptive)
 {
-	jmx_wan_iface_t *ties[JMX_MAX_WAN_IFACES];
+	struct jmx_route_candidate ties[JMX_MAX_WAN_IFACES];
 	u64 best_metric;
 	int i;
 	int tie_count = 1;
 
 	ties[0] = candidates[0];
 	best_metric = by_connections ?
-		(u64)atomic64_read(&candidates[0]->active_conn) :
-		(u64)atomic64_read(&candidates[0]->rx_bytes);
+		(u64)atomic64_read(&candidates[0].wan->active_conn) :
+		(u64)atomic64_read(&candidates[0].wan->rx_bytes);
 
 	for (i = 1; i < count; i++) {
 		u64 metric = by_connections ?
-			(u64)atomic64_read(&candidates[i]->active_conn) :
-			(u64)atomic64_read(&candidates[i]->rx_bytes);
-		int cmp = jmx_weighted_metric_cmp(metric, candidates[i]->weight,
-						  best_metric, ties[0]->weight);
+			(u64)atomic64_read(&candidates[i].wan->active_conn) :
+			(u64)atomic64_read(&candidates[i].wan->rx_bytes);
+		int cmp = jmx_weighted_metric_cmp(metric,
+			jmx_selection_weight(&candidates[i], adaptive),
+			best_metric,
+			jmx_selection_weight(&ties[0], adaptive));
 
 		if (cmp < 0) {
 			ties[0] = candidates[i];
@@ -921,44 +1079,54 @@ static jmx_wan_iface_t *jmx_select_min_metric_nolock(jmx_wan_iface_t **candidate
 		}
 	}
 
-	return jmx_weighted_tie_select(ties, tie_count, hash);
+	return jmx_weighted_tie_select(ties, tie_count, hash, adaptive);
 }
 
 static jmx_wan_iface_t *jmx_select_wan_nolock(jmx_route_rule_t *r,
 					       const struct jmx_route_flow_key *key)
 {
-	jmx_wan_iface_t *candidates[JMX_MAX_WAN_IFACES];
+	struct jmx_route_candidate candidates[JMX_MAX_WAN_IFACES];
 	int rule_idx = r - g_rules;
 	u32 hash;
+	u32 enhancements = jmx_route_enhancements_nolock(r->prio);
+	bool adaptive = (enhancements & JMX_ROUTE_ENHANCEMENT_ADAPTIVE_PENALTY) ||
+			r->sticky_mode == JMX_STICKY_ADAPTIVE_PENALTY;
 	int i, n = 0;
 
 	for (i = 0; i < r->wan_count && i < JMX_MAX_WAN_IFACES; i++) {
 		jmx_wan_iface_t *wan = jmx_wan_by_id_nolock(r->wan_ids[i]);
 		if (!wan || !wan->health || !wan->fwmark)
 			continue;
-		candidates[n++] = wan;
+		candidates[n].wan = wan;
+		candidates[n].policy_weight = r->wan_weights[i] ?
+			r->wan_weights[i] : wan->weight;
+		if (!candidates[n].policy_weight)
+			candidates[n].policy_weight = 1;
+		n++;
 	}
 
 	if (n == 0)
 		return NULL;
 
 	if (r->sticky_mode == JMX_STICKY_PRIMARY_BACKUP)
-		return candidates[0];
+		return candidates[0].wan;
 	if (r->sticky_mode == JMX_STICKY_DOWNLOAD)
 		return jmx_select_min_metric_nolock(candidates, n, false,
-			jmx_route_hash(r, key));
+			jmx_route_hash(r, key), adaptive);
 	if (r->sticky_mode == JMX_STICKY_CONN_CNT)
 		return jmx_select_min_metric_nolock(candidates, n, true,
-			jmx_route_hash(r, key));
+			jmx_route_hash(r, key), adaptive);
 
-	if (r->sticky_mode == JMX_STICKY_NEW_CONN &&
+	if ((r->sticky_mode == JMX_STICKY_NEW_CONN ||
+	     r->sticky_mode == JMX_STICKY_ADAPTIVE_PENALTY) &&
 	    rule_idx >= 0 && rule_idx < JMX_MAX_ROUTE_RULES)
 		return jmx_weighted_slot_select(candidates, n,
-			g_new_flow_seq[rule_idx]++);
+			g_new_flow_seq[rule_idx]++,
+			adaptive);
 
 	hash = jmx_route_hash(r, key);
 	return jmx_weighted_slot_select(candidates, n,
-		((u64)hash << 32) | jhash_1word(hash, 0x51a7e008));
+		((u64)hash << 32) | jhash_1word(hash, 0x51a7e008), adaptive);
 }
 
 static int jmx_route_select_wan_internal(const struct jmx_route_flow_key *key,
@@ -1112,32 +1280,49 @@ static int jmx_route_proc_show(struct seq_file *s, void *v)
 	(void)v;
 	spin_lock_irqsave(&jmx_route_lock, flags);
 
+	seq_printf(s, "RouteRuleAbi: 2 enhancements: 0x%x\n",
+		   JMX_ROUTE_ENHANCEMENT_KNOWN);
 	seq_printf(s, "CarrierPrefixes: %d\n\n", g_carrier_count);
 	seq_puts(s, "WANs:\n");
-	seq_puts(s, "id name fwmark table gateway health weight active_conn rx_bytes generation\n");
+	seq_puts(s, "id name fwmark table gateway health weight adaptive_weight active_conn rx_bytes generation rebind_requested rebind_killed rebind_sensitive rebind_mode rebind_at rebind_pending\n");
 	for (i = 0; i < JMX_MAX_WAN_IFACES; i++) {
 		jmx_wan_iface_t *w = &g_wans[i];
+		struct jmx_wan_rebind_stats rebind;
 		if (!w->wan_id)
 			continue;
-		seq_printf(s, "%u %s 0x%x %u %pI4 %u %u %llu %llu %u\n",
+		jmx_wan_rebind_stats_snapshot(w->wan_id, &rebind);
+		seq_printf(s, "%u %s 0x%x %u %pI4 %u %u %u %llu %llu %u %llu %llu %llu %u %llu %u\n",
 			   w->wan_id, w->name, w->fwmark, w->table_id, &w->gateway,
-			   w->health, w->weight,
+			   w->health, w->weight, w->adaptive_weight,
 			   (unsigned long long)atomic64_read(&w->active_conn),
 			   (unsigned long long)atomic64_read(&w->rx_bytes),
-			   w->generation);
+			   w->generation,
+			   (unsigned long long)rebind.requested,
+			   (unsigned long long)rebind.killed,
+			   (unsigned long long)rebind.skipped_sensitive,
+			   rebind.last_mode,
+			   (unsigned long long)rebind.last_at,
+			   rebind.pending_mode);
 	}
 
 	seq_puts(s, "\nRules:\n");
-	seq_puts(s, "prio en proto appid carrier src/mask dst/mask dport mode hits last_hit_s wans\n");
+	seq_puts(s, "prio en proto appid carrier src/mask dst/mask dport mode hits last_hit_s enhancements members\n");
 	for (i = 0; i < g_rule_count; i++) {
 		jmx_route_rule_t *r = &g_rules[i];
-		seq_printf(s, "%u %u %u %u %u %pI4/%pI4 %pI4/%pI4 %u %u %llu %lu ",
+		seq_printf(s, "%u %u %u %u %u %pI4/%pI4 %pI4/%pI4 %u %u %llu %lu 0x%x ",
 			   r->prio, r->enabled, r->proto, r->appid, r->carrier_id,
 			   &r->src_addr, &r->src_mask, &r->dst_addr, &r->dst_mask,
 			   r->dst_port, r->sticky_mode, r->hit_count,
-			   (unsigned long)(r->last_hit_jiffies ? jiffies_to_msecs(jiffies - r->last_hit_jiffies) / 1000 : 0));
-		for (j = 0; j < r->wan_count && j < JMX_MAX_WAN_IFACES; j++)
-			seq_printf(s, "%u%s", r->wan_ids[j], j + 1 == r->wan_count ? "" : ",");
+			   (unsigned long)(r->last_hit_jiffies ? jiffies_to_msecs(jiffies - r->last_hit_jiffies) / 1000 : 0),
+			   jmx_route_enhancements_nolock(r->prio));
+		for (j = 0; j < r->wan_count && j < JMX_MAX_WAN_IFACES; j++) {
+			jmx_wan_iface_t *wan = jmx_wan_by_id_nolock(r->wan_ids[j]);
+			u32 weight = r->wan_weights[j] ? r->wan_weights[j] :
+				(wan && wan->weight ? wan->weight : 1);
+
+			seq_printf(s, "%u:%u%s", r->wan_ids[j], weight,
+				   j + 1 == r->wan_count ? "" : ",");
+		}
 		seq_putc(s, '\n');
 	}
 
@@ -1495,6 +1680,7 @@ int jmx_route_init(void)
 	if (!g_wan_generation)
 		g_wan_generation = 1;
 	memset(g_rules, 0, sizeof(g_rules));
+	memset(g_rule_enhancements, 0, sizeof(g_rule_enhancements));
 	memset(g_new_flow_seq, 0, sizeof(g_new_flow_seq));
 	g_rule_count = 0;
 	memset(g_carriers, 0, sizeof(g_carriers));

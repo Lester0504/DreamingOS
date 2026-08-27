@@ -54,6 +54,7 @@ struct jmx_v3_ac {
 	struct v3_ac_node *nodes;
 	struct v3_ac_edge *edges;
 	struct v3_ac_output *outputs;
+	u32 root_next[256];
 	u32 node_count;
 	u32 edge_count;
 	u32 output_count;
@@ -258,6 +259,14 @@ int jmx_v3_ac_build(const struct jmx_v3_ac_pattern *patterns, u32 count,
 		}
 		sort_edges(&ac->edges[ac->nodes[i].edge_begin],
 		   ac->nodes[i].edge_count);
+		if (!i) {
+			for (j = 0; j < ac->nodes[i].edge_count; j++) {
+				const struct v3_ac_edge *edge =
+					&ac->edges[ac->nodes[i].edge_begin + j];
+
+				ac->root_next[edge->byte] = edge->target;
+			}
+		}
 		for (item = bnodes[i].first_output; item != V3_AC_NONE;
 		     item = boutputs[item].next) {
 			ac->outputs[outputs].rule_index = boutputs[item].rule_index;
@@ -347,10 +356,7 @@ int jmx_v3_ac_scan(const struct jmx_v3_ac *ac, const u8 *payload, u32 len,
 			(*work_budget)--;
 			state = ac->nodes[state].fail;
 		}
-		found = find_child(ac, 0, byte, &next, work_budget);
-		if (found < 0)
-			return found;
-		state = found ? next : 0;
+		state = ac->root_next[byte];
 		goto emit;
 found:
 		state = next;

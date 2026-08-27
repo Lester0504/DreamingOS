@@ -151,7 +151,7 @@ static void v3_expire_work_fn(struct work_struct *work)
 		generation = v3_tx.generation;
 		memset(&v3_tx, 0, sizeof(v3_tx));
 	} else if (v3_tx.set) {
-		mod_delayed_work(system_wq, &v3_expire_work,
+		mod_delayed_work(system_dfl_wq, &v3_expire_work,
 				 deadline - now);
 	}
 	mutex_unlock(&v3_update_lock);
@@ -290,7 +290,7 @@ static void renew_transaction_locked(void)
 {
 	lockdep_assert_held(&v3_update_lock);
 	v3_tx.deadline = jiffies + JMX_V3_TX_TIMEOUT;
-	mod_delayed_work(system_wq, &v3_expire_work, JMX_V3_TX_TIMEOUT);
+	mod_delayed_work(system_dfl_wq, &v3_expire_work, JMX_V3_TX_TIMEOUT);
 }
 
 void jmx_v3_tx_fail(u32 owner_portid, u32 generation,
@@ -1111,8 +1111,11 @@ u32 jmx_v3_match_payload(const u8 *payload, u32 len,
 		ctx.best_priority = U32_MAX;
 		if (rc == -E2BIG) {
 			long long count = atomic64_inc_return(&v3_budget_exhausted);
-			pr_warn_ratelimited("jmx_v3: packet work budget exhausted total=%lld len=%u\n",
-				count, len);
+
+			jmx_stats_v3_budget_exhausted();
+			if (count > 0 && !(count & (count - 1)))
+				pr_warn("jmx_v3: packet work budget exhausted total=%lld len=%u\n",
+					count, len);
 		}
 	}
 out:

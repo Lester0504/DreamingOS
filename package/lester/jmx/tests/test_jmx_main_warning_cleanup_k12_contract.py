@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN = (ROOT / "src" / "jmx_main.c").read_text()
 HEADER = (ROOT / "src" / "jmx.h").read_text()
 CLIENT_HEADER = (ROOT / "src" / "jmx_client.h").read_text()
+CONNTRACK_HEADER = (ROOT / "src" / "jmx_conntrack.h").read_text()
 
 
 def require(pattern: str, text: str, message: str) -> None:
@@ -48,6 +49,8 @@ expected_external_definitions = {
     "jmx_v2_update_active_app",
     "jmx_v2_update_active_app_ex",
     "jmx_v2_update_active_app6_ex",
+    "jmx_wan_rebind_request",
+    "jmx_wan_rebind_stats_snapshot",
 }
 if external_definitions != expected_external_definitions:
     raise AssertionError(
@@ -58,7 +61,7 @@ if external_definitions != expected_external_definitions:
 for symbol in external_definitions:
     require(
         rf"\b{symbol}\s*\([^;]*;",
-        HEADER + CLIENT_HEADER,
+        HEADER + CLIENT_HEADER + CONNTRACK_HEADER,
         f"external definition {symbol} must be declared in an existing header",
     )
 

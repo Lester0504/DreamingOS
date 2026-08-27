@@ -55,6 +55,10 @@
 #include "jmx_mac_filter.h"
 #include "jmx_app_filter.h"
 #include "jmx_stats.h"
+#include "jmx_direction.h"
+#include "jmx_license.h"
+#include "jmx_license_nl.h"
+#include "jmx_hwoffload.h"
 #include <linux/version.h>
 #include <linux/timer.h>
 
@@ -3106,6 +3110,7 @@ static u_int32_t jmx_hook_gateway_forward_enforce(struct sk_buff *skb)
 	enum ip_conntrack_info ctinfo;
 	struct nf_conn *ct;
 	af_client_info_t *client = NULL;
+	enum jmx_offload_decision hw_decision;
 	enum jmx_client_packet_direction direction =
 		JMX_CLIENT_PACKET_DIRECTION_UNKNOWN;
 
@@ -3116,13 +3121,53 @@ static u_int32_t jmx_hook_gateway_forward_enforce(struct sk_buff *skb)
 	if (!ct)
 		return NF_ACCEPT;
 
+	hw_decision = jmx_hwoffload_decide(
+		ct, jmx_app_cat_slot(ct->jmx_data.app_id), false);
+	if (hw_decision != JMX_OFFLOAD_DENY) {
+		ct->jmx_data.match_status &= ~JMX_MATCH_STATUS_NO_OFFLOAD;
+		if (hw_decision == JMX_OFFLOAD_ALLOW_QOS)
+			jmx_hwoffload_apply_qos(skb, ct,
+						ct->jmx_data.app_id,
+						flow.src ? flow.src :
+						flow.dst);
+	}
+
 	if (ct->jmx_data.action) {
 		AF_LMT_DEBUG("gateway forward enforce drop, appid=%u\n",
 			     ct->jmx_data.app_id);
 		return NF_DROP;
 	}
 
-	if (g_record_enable && ct->jmx_data.app_id > 0 &&
+	/* ── Enterprise license gate (DWLC v1) ──────────────────────────── */
+	{
+		struct jmx_direction_decision decision;
+		const struct net_device *in = NULL;
+		const struct net_device *out = NULL;
+
+		/* Reconstruct direction context from skb */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
+		in = skb->dev;
+		out = skb_dst(skb) ? skb_dst(skb)->dev : NULL;
+#else
+		in = skb->dev;
+		if (skb_dst(skb) && skb_dst(skb)->dev)
+			out = skb_dst(skb)->dev;
+#endif
+
+		if (in && out && 
+		    jmx_direction_classify_skb(skb, in, out, &decision) == 0 &&
+		    jmx_license_gate_decision(&decision)) {
+			AF_LMT_DEBUG("license gate drop\n");
+			return NF_DROP;
+		}
+	}
+
+	/* Once a backend owns the flow, per-packet accounting stops; its
+	 * read_flow_counter() contract must supply the periodic merge instead.
+	 */
+	if (hw_decision != JMX_OFFLOAD_DENY)
+		jmx_hwoffload_account_tick();
+	else if (g_record_enable && ct->jmx_data.app_id > 0 &&
 	    (ct->jmx_data.match_status & JMX_MATCH_STATUS_RELIABLE) &&
 	    !(ct->jmx_data.match_status & JMX_MATCH_STATUS_IGNORE)) {
 		memset(&flow, 0, sizeof(flow));
@@ -3210,7 +3255,8 @@ static u_int32_t jmx_hook(void *priv,
 								 const struct nf_hook_state *state)
 {
 	(void)priv;
-	(void)state;
+	if (state)
+		jmx_direction_observe_skb(skb, state->in, state->out);
 
 #else
 static u_int32_t jmx_hook(unsigned int hook,
@@ -3219,6 +3265,7 @@ static u_int32_t jmx_hook(unsigned int hook,
 								 const struct net_device *out,
 								 int (*okfn)(struct sk_buff *))
 {
+	jmx_direction_observe_skb(skb, in, out);
 #endif
 	if (AF_MODE_BYPASS == af_work_mode)
 		return NF_ACCEPT;
@@ -3525,7 +3572,7 @@ static void jmx_active_conn_reconcile_work(struct work_struct *work)
 
 again:
 	if (jmx_active_conn_work_running)
-		mod_delayed_work(system_wq, &jmx_active_conn_work,
+		mod_delayed_work(system_dfl_wq, &jmx_active_conn_work,
 				 JMX_ACTIVE_CONN_RECONCILE_SEC * HZ);
 }
 
@@ -3533,7 +3580,7 @@ static void jmx_active_conn_reconcile_init(void)
 {
 	jmx_active_conn_work_running = true;
 	INIT_DELAYED_WORK(&jmx_active_conn_work, jmx_active_conn_reconcile_work);
-	mod_delayed_work(system_wq, &jmx_active_conn_work,
+	mod_delayed_work(system_dfl_wq, &jmx_active_conn_work,
 			 JMX_ACTIVE_CONN_RECONCILE_SEC * HZ);
 }
 
@@ -3743,6 +3790,8 @@ enum jmx_init_stage {
 	JMX_INIT_STATS_PROC      = BIT(19),
 	JMX_INIT_ACTIVE_CONN_RECONCILE = BIT(20),
 	JMX_INIT_WAN_REBIND       = BIT(21),
+	JMX_INIT_DIRECTION        = BIT(22),
+	JMX_INIT_LICENSE          = BIT(23),
 };
 
 static int jmx_v3_reply_to_portid(u32 portid, u32 nlmsg_seq,
@@ -3886,7 +3935,9 @@ static void jmx_netlink_msg_rcv(struct sk_buff *skb)
 			return;
 		udata = umsg + sizeof(struct af_msg_hdr);
 
-		if (udata)
+		if (udata &&
+		    !jmx_direction_nl_handle(udata, af_hdr->len) &&
+		    !jmx_license_nl_handle(udata, af_hdr->len))
 			jmx_user_msg_handle(udata, af_hdr->len,
 					    NETLINK_CB(skb).portid,
 					    nlh->nlmsg_seq);
@@ -3931,6 +3982,7 @@ static void jmx_cleanup(void)
 
 	/* Stop control-plane and packet ingress before releasing shared state. */
 	jmx_init_state = 0;
+	jmx_hwoffload_exit();
 	/*
 	 * Remove the stats proc entries first: they read the conn, client and
 	 * rule caches, so they must be unreachable before those are torn down.
@@ -3950,6 +4002,10 @@ static void jmx_cleanup(void)
 		af_client_exit();
 	if (state & JMX_INIT_NETLINK)
 		netlink_jmx_exit();
+	if (state & JMX_INIT_LICENSE)
+		jmx_license_exit();
+	if (state & JMX_INIT_DIRECTION)
+		jmx_direction_exit();
 	if (state & JMX_INIT_WAN_REBIND)
 		jmx_wan_rebind_exit();
 
@@ -4078,6 +4134,14 @@ static int __init jmx_init(void)
 	jmx_init_state |= JMX_INIT_ROUTE_PROC;
 	jmx_wan_rebind_init();
 	jmx_init_state |= JMX_INIT_WAN_REBIND;
+	err = jmx_direction_init();
+	if (err)
+		goto fail;
+	jmx_init_state |= JMX_INIT_DIRECTION;
+	err = jmx_license_init();
+	if (err)
+		goto fail;
+	jmx_init_state |= JMX_INIT_LICENSE; /* JMX_INIT_LICENSE */
 #if IS_ENABLED(CONFIG_NF_CONNTRACK_CHAIN_EVENTS)
 	err = nf_conntrack_register_notifier(&init_net, &jmx_route_ct_notifier);
 	if (err)
@@ -4094,6 +4158,7 @@ static int __init jmx_init(void)
 	if (err)
 		goto fail;
 	jmx_init_state |= JMX_INIT_NETLINK;
+	jmx_hwoffload_init();
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
 	err = nf_register_net_hooks(&init_net, jmx_ops, ARRAY_SIZE(jmx_ops));
 #else
@@ -4304,6 +4369,13 @@ static int jmx_features_status_show(struct seq_file *s, void *v)
 	jmx_feature_emit(s, "ipv6_inspect", JMX_FEATURE_UNSUPPORTED,
 			 "build:CONFIG_IPV6=n");
 #endif
+
+	seq_printf(s, "%-24s : %-12s %s\n", "hwoffload_backend",
+		   jmx_hwoffload_available() ? "enabled" : "unsupported",
+		   jmx_hwoffload_backend_name());
+	seq_printf(s, "%-24s : %-12s %s\n", "hwoffload_flow_counter",
+		   jmx_hwoffload_flow_counter_ready() ? "enabled" :
+		   "unsupported", "backend:read_flow_counter");
 
 	return 0;
 }
