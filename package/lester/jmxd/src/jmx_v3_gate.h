@@ -5,9 +5,9 @@
 #include <stdint.h>
 #include "jmx_nl_rule_v3.h"
 
-/* Keep production closed until the bundled jmx.ko/dreamingwrt-core path has
- * passed loaded-kernel fault injection and packet-level shadow acceptance. */
-#define JMX_V3_PRODUCTION_GATE_ENABLED 0
+/* The reviewed phase-1 catalog starts in SHADOW. ACTIVE remains an explicit
+ * operator choice after loaded-kernel acceptance on the test router. */
+#define JMX_V3_PRODUCTION_GATE_ENABLED 1
 
 static inline uint8_t jmx_v3_effective_mode(uint8_t requested_mode)
 {

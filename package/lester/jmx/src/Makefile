@@ -3,4 +3,7 @@ jmx-objs += jmx_conntrack.o  jmx_mac.o jmx_config.o jmx_mac_filter.o
 jmx-objs += jmx_app_filter.o
 jmx-objs += jmx_v2_rules.o jmx_v2_nl_handler.o jmx_v2_ac.o
 jmx-objs += jmx_v3_rules.o jmx_v3_nl_handler.o jmx_v3_ac.o
+jmx-objs += jmx_direction.o
+jmx-objs += jmx_license.o
+jmx-objs += jmx_stats.o
 obj-m += jmx.o

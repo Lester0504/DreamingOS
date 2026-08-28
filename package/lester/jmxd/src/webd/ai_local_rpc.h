@@ -12,4 +12,10 @@ struct webd_ai_local_rpc_hooks {
 int webd_ai_local_rpc_init(const struct webd_ai_local_rpc_hooks *hooks);
 void webd_ai_local_rpc_done(void);
 
+/*
+ * Drop the inherited listener in a forked child without touching the socket
+ * path. webd_ai_local_rpc_done() unlinks it, which a child must never do.
+ */
+void webd_ai_local_rpc_close_in_child(void);
+
 #endif

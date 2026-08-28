@@ -8,10 +8,13 @@ MAIN = ROOT.parent / "jmx" / "src" / "jmx_main.c"
 RULES = ROOT.parent / "jmx" / "src" / "jmx_v3_rules.c"
 
 
-def test_v3_production_gate_is_closed() -> None:
+def test_v3_production_gate_is_open_with_explicit_mode_only() -> None:
     gate = GATE.read_text(encoding="utf-8")
-    assert "#define JMX_V3_PRODUCTION_GATE_ENABLED 0" in gate
+    main = (ROOT / "src" / "main.c").read_text(encoding="utf-8")
+    assert "#define JMX_V3_PRODUCTION_GATE_ENABLED 1" in gate
     assert "return JMX_V3_MODE_OFF;" in gate
+    assert "uint8_t requested_mode = JMX_V3_MODE_OFF;" in main
+    assert "static uint8_t mode = JMX_V3_MODE_OFF;" in main
 
 
 def test_shadow_match_cannot_reach_conntrack_appid_write() -> None:
@@ -24,6 +27,6 @@ def test_shadow_match_cannot_reach_conntrack_appid_write() -> None:
 
 
 if __name__ == "__main__":
-    test_v3_production_gate_is_closed()
+    test_v3_production_gate_is_open_with_explicit_mode_only()
     test_shadow_match_cannot_reach_conntrack_appid_write()
     print("ok: v3 production gate and shadow write contract passed")

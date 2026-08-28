@@ -11,6 +11,10 @@
 struct jmx_route_db_tx;
 
 int jmx_route_db_config_get(struct json_object **config);
+/* Read-only fast path for periodic health ticks. It must not run schema
+ * migration or issue writes; a busy database fails quickly instead of
+ * stalling the core uloop for the normal configuration timeout. */
+int jmx_route_db_config_get_readonly(struct json_object **config);
 int jmx_route_db_replace_begin(struct json_object *request,
                                struct jmx_route_db_tx **tx,
                                struct json_object **previous,
