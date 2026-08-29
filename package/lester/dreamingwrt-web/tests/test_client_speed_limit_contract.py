@@ -29,12 +29,19 @@ assert "control_type: 'IP限速'" in MODULE
 assert "limit_mode: '独立限速'" in MODULE
 assert "line: ''" in MODULE
 assert "['任意', 'TCP', 'UDP', 'ICMP', 'ICMPv6']" in MODULE
-assert "共享限速和应用级管控没有数据面合同" in MODULE
+# 抽屉不再追加能力边界说明卡；页面只保留可编辑字段和真实状态。
+assert "共享限速与应用级管控即将开放" not in MODULE
+assert "运行范围为终端 MAC" not in MODULE
+assert "保存后由终端管控调度器应用并回读运行状态" not in MODULE
 assert "window.confirm" not in MODULE
 assert "confirmationMarkup" in MODULE
 assert 'data-dwrt-sheet-variant="copilot"' in MODULE
+assert 'data-dwrt-surface="stable-glass"' in MODULE
+assert 'data-dwrt-sheet-motion="settled"' in MODULE
 assert ".client-speed-drawer { --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard); }" in STYLE
-assert "client-speed-limit.js" in MENU
+assert '"id": "authentication-terminal-policy"' in MENU
+assert '"module": "native/terminal-policy.js"' in MENU
+assert "authentication-client-speed-limit" not in MENU
 assert '"availability": "available"' in MENU
 
 print("ok: client speed-limit page uses one rule collection read, client identity join and fail-closed CRUD")
