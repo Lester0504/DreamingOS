@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/dwrt-theme.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/menu-shell.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/line-status.css">
+  <style>
+    * { box-sizing:border-box; }
+    html,body { margin:0; min-height:100%; background:#121a24; color:#eef3fa; font:13px/1.45 system-ui,sans-serif; }
+    .console-stage { padding:12px; }
+  </style>
+</head>
+<body>
+  <div class="console-stage"><main id="routePreview"></main></div>
+  <script src="../../files/www/dreamingwrt/static/js/line-status.js"></script>
+  <script>
+    localStorage.setItem('dreamingwrt.web.lineStatus.tab','line-health');
+    const health = {wans:[
+      {id:'wan1',name:'中国联通',ifname:'pppoe-wan',access_mode:'PPPoE',ip:'203.0.113.10',gateway:'203.0.113.1',online:true,status:'up',connected_seconds:7200,up_loss_24h:null,down_loss_24h:null,latency_avg:null,avg_up_rate:1000000,avg_down_rate:8000000,busy:14,status_history:[]},
+      {id:'wan2',name:'中国电信',ifname:'wan2',access_mode:'DHCP',ip:'198.51.100.8',gateway:'198.51.100.1',online:true,status:'up',connected_seconds:3600,up_loss_24h:0.0,down_loss_24h:0.0,latency_avg:18,avg_up_rate:2000000,avg_down_rate:12000000,busy:22,status_history:[]}
+    ]};
+    const wans = {wans:[{id:'wan1',ifname:'pppoe-wan'},{id:'wan2',ifname:'wan2'}]};
+    const system = {system:{uptime:86400}};
+    window.fixtureController = window.DWRTLineStatus.create({
+      routePreview:document.getElementById('routePreview'),
+      refreshMs:3600000,
+      carrierMarkup:()=>'<span class="line-port-icon"></span>',
+      mountUiKit:()=>{}, scheduleGlassCardsRender:()=>{}, realtime:null,
+      fetchApiResource:async(name,url)=>String(url).includes('/network/wans')
+        ? {name,ok:true,data:wans}
+        : String(url).includes('/system/status')
+          ? {name,ok:true,data:system}
+          : {name,ok:true,data:health}
+    });
+    window.fixtureController.mount();
+  </script>
+</body>
+</html>

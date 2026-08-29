@@ -26,6 +26,7 @@ struct flowd_tc_runtime_state {
 };
 
 int flowd_tc_apply_executor_available(void);
+int flowd_runtime_db_probe(int *present, int *openable, int *populated);
 int flowd_tc_runtime_state_read(struct flowd_tc_runtime_state *out);
 void flowd_tc_runtime_contract_state(struct flowd_runtime_contract_input *input);
 struct json_object *flowd_tc_apply(const struct flowd_settings *settings);

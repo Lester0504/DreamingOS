@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from jmxd.tests.webd_sources import webd_dispatch_text
 
 
-SOURCE = (Path(__file__).resolve().parents[1] / "src/webd/jmx_app_api.c").read_text()
+SOURCE = webd_dispatch_text()
 
 
 def main():

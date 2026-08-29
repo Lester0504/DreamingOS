@@ -3,7 +3,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEBD = (ROOT / "src/webd/jmx_app_api.c").read_text()
+import sys
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text
+WEBD = webd_dispatch_text()
 NETCONFIG = (ROOT / "src/jmx_netconfig_db.c").read_text()
 
 

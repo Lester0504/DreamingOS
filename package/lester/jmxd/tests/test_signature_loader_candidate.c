@@ -10,12 +10,15 @@ int main(int argc, char **argv)
 	jmx_rule_set_t legacy;
 	jmx_chain_rule_set_t chain;
 	int chain_status = -1;
+	unsigned long expected_ready = 0;
 	int rc;
 
-	if (argc != 2) {
-		fprintf(stderr, "usage: %s SIGNATURE_DB\n", argv[0]);
+	if (argc != 2 && argc != 3) {
+		fprintf(stderr, "usage: %s SIGNATURE_DB [EXPECTED_V3_READY]\n", argv[0]);
 		return 2;
 	}
+	if (argc == 3)
+		expected_ready = strtoul(argv[2], NULL, 10);
 	rc = jmx_load_signature_db_with_chain(
 		argv[1], &legacy, &chain, JMX_V3_CAP_PHASE1_MASK, &chain_status);
 	assert(rc == 0);
@@ -25,11 +28,13 @@ int main(int argc, char **argv)
 	assert(legacy.total_rules == legacy.fast_rules + legacy.slow_rules);
 	assert(chain.schema_v2_present == 1);
 	assert(chain.stats.chain_db_rules == 6191);
-	assert(chain.stats.chain_unresolved_rules == 6191);
-	assert(chain.rule_count == 0);
-	assert(chain.step_count == 0);
+	assert(chain.stats.chain_verified_rules == expected_ready);
+	assert(chain.stats.chain_enabled_rules == expected_ready);
+	assert(chain.stats.chain_unresolved_rules == 6191 - expected_ready);
+	assert(chain.rule_count == expected_ready);
+	assert(chain.step_count >= expected_ready);
 	assert(chain.port_count == 0);
-	assert(chain.stats.chain_ready_rules == 0);
+	assert(chain.stats.chain_ready_rules == expected_ready);
 	assert(chain.stats.rejected_records == 0);
 	printf(
 		"ok apps=%u legacy=%u fast=%u slow=%u chain_db=%u chain_active=%zu\n",

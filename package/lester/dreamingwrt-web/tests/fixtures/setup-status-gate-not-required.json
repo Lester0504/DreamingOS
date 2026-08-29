@@ -1,0 +1,23 @@
+{
+  "code": 2000,
+  "data": {
+    "initialized": false,
+    "wizard_completed": false,
+    "first_run": true,
+    "router_setup_initialized": false,
+    "wizard_required": true,
+    "current_step": "intro",
+    "setup_id": "setup-1786180006",
+    "initialized_scope": "setup_wizard_completion",
+    "initialized_meaning": "the_setup_wizard_ran_to_completion_not_whether_the_device_is_usable",
+    "initialized_source": "config.db:setup_state.initialized",
+    "login_capable": true,
+    "web_user_count": 2,
+    "web_user_count_known": true,
+    "setup_gate_required": false,
+    "setup_gate_authority": "login_capability_web_user_count",
+    "setup_gate_reason": "device_has_accounts_and_is_usable_do_not_force_wizard",
+    "provisioned_outside_wizard": true,
+    "config_ready": true
+  }
+}

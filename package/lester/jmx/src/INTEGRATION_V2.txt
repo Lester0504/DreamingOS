@@ -1,0 +1,39 @@
+=== V2 Rules Integration Guide ===
+
+To integrate v2 binary rules into the existing jmx kernel module:
+
+1. Add to jmx_main.c:
+
+   #include "jmx_v2_rules.h"
+   extern int jmx_v2_nl_handle(const char *data, int len);
+
+2. In jmx_user_msg_handle(), add a case for v2 messages:
+
+   case JMX_NL_MSG_ADD_FEATURE:  // existing
+       af_add_feature_msg_handle(msg_data, ...);
+       break;
+   default:
+       // Try v2 handler
+       if (!jmx_v2_nl_handle(msg_data, len - sizeof(af_msg_t)))
+           AF_WARN("unknown action: %d\n", msg->action);
+       break;
+
+3. In jmx_init(), add:
+
+   jmx_v2_rules_init();
+
+4. In jmx_fini(), add:
+
+   jmx_v2_rules_exit();
+
+5. Add to Kbuild/Makefile:
+
+   jmx-objs += jmx_v2_rules.o jmx_v2_nl_handler.o
+
+6. In the DPI matching hot path, after existing feature matching:
+
+   if (app_id == 0) {
+       app_id = jmx_v2_match_payload(payload, len,
+                                      proto, dir, dport, pkt_seq,
+                                      &priority);
+   }
