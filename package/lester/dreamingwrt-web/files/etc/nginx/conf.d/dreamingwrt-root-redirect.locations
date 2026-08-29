@@ -1,0 +1,15 @@
+# Redirect the bare HTTP root to the DreamingOS console.
+#
+# The :80 _lan server block in nginx.conf uses `include conf.d/*.locations`,
+# so this file is picked up automatically. The :443 server block includes
+# conf.d/dreamingwrt-webd.locations by name (not glob) and already has its
+# own `location = /` redirect, so this file does not affect HTTPS.
+# The :12517 LuCI server block also includes luci.locations by name.
+#
+# Only the exact root path is matched; /api/v1/*, /app/*, /login/*, and
+# every other prefix continue to work unchanged.
+
+location = / {
+	return 302 https://$host/app/;
+}
+

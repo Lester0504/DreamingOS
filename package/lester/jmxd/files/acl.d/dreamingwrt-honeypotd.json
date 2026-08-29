@@ -3,6 +3,9 @@
 	"access": {
 		"dreamingwrt.aegis": {
 			"methods": [ "honeypot_event_ingest" ]
+		},
+		"dreamingos.aegis": {
+			"methods": [ "honeypot_event_ingest" ]
 		}
 	}
 }
