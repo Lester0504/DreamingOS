@@ -1,0 +1,357 @@
+.airview-channel-ai-sidebar {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-column: 1 / -1;
+  align-content: start;
+  overflow: auto;
+  overscroll-behavior: contain;
+  gap: 16px;
+  letter-spacing: 0;
+}
+
+.airview-channel-ai-bands {
+  width: 100%;
+  grid-auto-columns: minmax(0, 1fr);
+}
+
+.airview-channel-ai-bands [data-dwrt-segment] {
+  padding-inline: 4px;
+  white-space: normal;
+}
+
+.airview-channel-ai-refresh {
+  width: 100%;
+}
+
+.airview-channel-ai-refresh > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+
+.airview-channel-ai-refresh svg {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+}
+
+.airview-channel-ai-section {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.airview-channel-ai-section > legend {
+  padding: 0 0 8px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.airview-channel-ai-check {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: center;
+  min-height: 36px;
+  gap: 8px;
+}
+
+.airview-channel-ai-check input {
+  margin: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--color-accent, var(--app-accent));
+}
+
+.airview-channel-ai-check > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.airview-channel-ai-slider {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+
+.airview-channel-ai-slider [data-dwrt-slider-output] {
+  text-align: start;
+}
+
+.airview-channel-ai-ruler {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.airview-channel-ai-note,
+.airview-channel-ai-missing small {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  color: var(--color-text-muted, var(--app-text-muted));
+}
+
+.airview-channel-ai-table .airview-cell-spark {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.airview-channel-ai-table .airview-cell-spark svg {
+  flex: 0 0 72px;
+  width: 72px;
+  height: 18px;
+  overflow: visible;
+}
+
+.airview-channel-ai-table .airview-cell-spark polyline {
+  fill: none;
+  stroke: var(--color-accent, var(--app-accent));
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.airview-channel-ai-table .airview-cell-spark small,
+.airview-channel-ai-table .airview-cell-reason small {
+  font-size: 12px;
+}
+
+.airview-channel-ai-table .airview-cell-reason {
+  display: grid;
+  gap: 5px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.airview-channel-ai-catalog {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(30px, 1fr));
+  gap: 4px;
+}
+
+.airview-channel-ai-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  font-size: 12px;
+}
+
+.airview-channel-ai-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.airview-channel-ai-legend .airview-channel-ai-cell {
+  width: 12px;
+  height: 12px;
+  min-height: 0;
+}
+
+.airview-channel-ai-results {
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  letter-spacing: 0;
+}
+
+.airview-channel-ai-toolbar {
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.airview-channel-ai-notice {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 16px;
+  padding: 10px 16px;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.airview-channel-ai-notice[role="alert"] {
+  color: var(--color-danger, var(--dwrt-risk-critical));
+}
+
+.airview-channel-ai-scroll {
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  overflow: auto;
+  overscroll-behavior-inline: contain;
+}
+
+.airview-channel-ai-table {
+  table-layout: fixed;
+  font-variant-numeric: tabular-nums;
+}
+
+.airview-channel-ai-table th,
+.airview-channel-ai-table td {
+  padding: 12px;
+  vertical-align: middle;
+}
+
+.airview-channel-ai-table th {
+  position: static;
+}
+
+.airview-channel-ai-track {
+  display: grid;
+  grid-template-columns: repeat(var(--airview-channel-ai-track-columns), minmax(0, 1fr));
+  gap: 2px;
+  align-items: center;
+}
+
+.airview-channel-ai-axis {
+  min-height: 28px;
+  text-align: center;
+  font-size: 12px;
+}
+
+.airview-channel-ai-cell {
+  display: inline-grid;
+  place-items: center;
+  box-sizing: border-box;
+  min-width: 0;
+  height: 28px;
+  border: 1px solid var(--color-border-control, var(--app-border));
+  border-radius: var(--app-radius-compact);
+  font-size: 12px;
+  font-style: normal;
+  line-height: 1;
+}
+
+.airview-channel-ai-cell-catalog {
+  background: var(--color-surface-control, var(--dwrt-kit-panel));
+}
+
+.airview-channel-ai-cell-dfs {
+  border-color: var(--dwrt-risk-suspicious);
+}
+
+.airview-channel-ai-cell-unavailable,
+.airview-channel-ai-cell-excluded {
+  border-style: dashed;
+  opacity: .6;
+}
+
+.airview-channel-ai-cell-unknown {
+  border-style: dotted;
+}
+
+.airview-channel-ai-cell-current {
+  background: var(--dwrt-risk-low);
+  border-color: var(--dwrt-risk-low);
+  color: var(--color-surface-solid, var(--app-surface-solid));
+}
+
+.airview-channel-ai-cell-proposed {
+  outline: 2px solid var(--color-accent, var(--app-accent));
+  outline-offset: -2px;
+}
+
+.airview-channel-ai-device {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.airview-channel-ai-device > span:last-child,
+.airview-channel-ai-plan,
+.airview-channel-ai-missing {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.airview-channel-ai-device strong,
+.airview-channel-ai-device small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.airview-channel-ai-device small,
+.airview-channel-ai-plan small {
+  font-size: 12px;
+}
+
+.airview-channel-ai-device-image {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 40px;
+}
+
+.airview-channel-ai-device-image img,
+.airview-channel-ai-device-image svg {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.airview-channel-ai-plan {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+
+.airview-channel-ai-empty {
+  display: grid;
+  gap: 12px;
+  justify-items: start;
+  padding: 24px 0;
+  max-width: 280px;
+  white-space: normal;
+}
+
+.airview-channel-ai-empty > svg {
+  width: 24px;
+  height: 24px;
+}
+
+.airview-channel-ai-footer {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  padding: 12px 16px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .airview-channel-ai-results {
+    min-height: 400px;
+    height: min(680px, 85dvh);
+  }
+
+  .airview-channel-ai-notice,
+  .airview-channel-ai-footer {
+    padding-inline: 12px;
+  }
+}

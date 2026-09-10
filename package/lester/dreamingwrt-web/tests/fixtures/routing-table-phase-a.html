@@ -33,18 +33,22 @@
       source_of_truth: 'policy_table', table_crud: true, object_crud: true,
       cross_service_config_crud: true, cross_service_runtime: false,
       cross_service_runtime_reason: 'runtime_consumer_not_implemented',
-      reference_conflict: true, external_policies_read_only: true, runtime_resolve: true
+      reference_conflict: true, runtime_resolve: true,
+      static_route_create: true, static_route_update: true, static_route_delete: true, static_route_enable_disable: true,
+      pbr_create: true, pbr_update: true, pbr_delete: true, pbr_enable_disable: true,
+      static_route_update_reason: 'static_route_update_blocked', pbr_delete_reason: 'pbr_delete_blocked'
     };
+    let policyRows = [
+      { id: 'route-wan2', policy_type: 'static_route', enabled: true, name: '办公网段', family: 'ipv4', destination: '10.20.0.0/16', interface: 'wan2', raw: { table: 'wan2', metric: 10, mtu: 1500, route_kind: 'unicast' } },
+      { id: 'pbr-office', policy_type: 'pbr', enabled: true, name: '办公出口', source: 'office', destination: 'any', raw: { route_table: 'wan2', priority: 1000, hit_count: 42, last_hit: 1785411000 } }
+    ];
     const payloads = {
       '/api/v1/routing': { ok: true, source: 'dreamingwrt.routed', revision: 19, capabilities },
-      '/api/v1/policy-engine/policy-table?include_default=0': { rows: [
-        { id: 'route-wan2', policy_type: 'static_route', enabled: true, name: '办公网段', destination: '10.20.0.0/16', interface: 'wan2', raw: { table: 'wan2', metric: 10 } },
-        { id: 'pbr-office', policy_type: 'pbr', enabled: true, name: '办公出口', source: 'office', destination: 'any', raw: { route_table: 'wan2', priority: 1000, hit_count: 42, last_hit: 1785411000 } }
-      ]},
+      '/api/v1/policy-engine/policy-table?include_default=0': { rows: policyRows },
       '/api/v1/routing/tables': { items: [{ id: 'wan2', name: 'WAN2', table_id: 102, role: 'wan', gateway: '192.0.2.1', metric: 10, enabled: true, ref_count: 1, references: [{ id: 'pbr-office', name: '办公出口' }] }], capabilities },
       '/api/v1/routing/objects': { items: [{ id: 'office', name: '办公网段', type: 'ip_group', family: 'ipv4', value: '10.20.0.0/16', members: [{ value: '10.20.0.0/16', label: '办公' }], enabled: true, ref_count: 1, references: [{ id: 'pbr-office', name: '办公出口' }] }], capabilities },
       '/api/v1/routing/cross-services': { items: [{ id: 'office-snmp', name: '办公 SNMP', service_type: 'snmp', server_ip: '10.20.0.10', scope: 'office', listen_port: '161', version: 'V2', access_rate: '', remark: '', enabled: true, runtime_supported: false }], capabilities },
-      '/api/v1/routing/external-policies': { items: [{ id: 'mwan3:wan2:1', name: 'wan2', source: 'mwan3', section_type: 'member', path: '/etc/config/mwan3', read_only: true }], capabilities }
+      '/api/v1/routing/external-policies': { items: [{ id: 'mwan3:wan2:1', name: 'wan2', source: 'mwan3', section_type: 'member', path: '/etc/config/mwan3', actions: ['adopt'], action_urls: {}, reason: 'source_owner_required' }], capabilities }
     };
     const requests = [];
     let scenario = 'ready';
@@ -53,11 +57,20 @@
     const fixtureFetch = async (name, url) => {
       if (scenario === 'fail-closed' && url === '/api/v1/routing') throw new Error('routing source unavailable');
       const data = structuredClone(payloads[url] || {});
+      if (url === '/api/v1/policy-engine/policy-table?include_default=0') data.rows = structuredClone(policyRows);
       if (scenario === 'runtime-missing' && data.capabilities) {
         data.capabilities.table_crud = false;
         data.capabilities.object_crud = false;
         data.capabilities.cross_service_config_crud = false;
         data.capabilities.runtime_resolve = false;
+        data.capabilities.static_route_create = false;
+        data.capabilities.static_route_update = false;
+        data.capabilities.static_route_delete = false;
+        data.capabilities.static_route_enable_disable = false;
+        data.capabilities.pbr_create = false;
+        data.capabilities.pbr_update = false;
+        data.capabilities.pbr_delete = false;
+        data.capabilities.pbr_enable_disable = false;
       }
       return { name, ok: true, data, raw: data };
     };
@@ -66,6 +79,23 @@
       const body = options.body ? JSON.parse(options.body) : null;
       requests.push({ url: String(url), method, body });
       if (scenario === 'reference-conflict' && method === 'DELETE') return new Response(JSON.stringify({ ok: false, error: 'reference_conflict', message: 'route table is still referenced', references: [{ id: 'pbr-office', name: '办公出口' }] }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+      if (scenario === 'apply-mismatch' && method !== 'GET' && String(url).includes('/policy-engine/policy-table')) return new Response(JSON.stringify({ ok: true, id: body?.id || 'route-new', apply_state: 'mismatch', runtime_readback: false, code: 'readback_mismatch', rollback: 'rollback_succeeded' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      if (scenario === 'rollback-failed' && method !== 'GET' && String(url).includes('/policy-engine/policy-table')) return new Response(JSON.stringify({ ok: true, id: body?.id || 'route-new', apply_state: 'failed', code: 'apply_failed', rollback: 'rollback_failed' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      if (String(url).includes('/policy-engine/policy-table')) {
+        if (method === 'POST' && !/\/(enable|disable)\?/.test(String(url))) {
+          const row = { ...body, id: body?.id || 'route-new', name: body?.name || '新策略', destination: body?.destination || body?.dest_object || 'any', interface: body?.interface || '--', raw: { ...body, table: body?.table || body?.route_table, route_table: body?.route_table, metric: body?.metric, priority: body?.priority } };
+          policyRows = [...policyRows, row];
+        } else if (method === 'PATCH') {
+          const id = String(url).split('/policy-table/')[1]?.split('?')[0];
+          policyRows = policyRows.map((row) => row.id === id ? { ...row, ...body, raw: { ...row.raw, ...body } } : row);
+        } else if (method === 'DELETE') {
+          const id = String(url).split('/policy-table/')[1]?.split('?')[0];
+          policyRows = policyRows.filter((row) => row.id !== id);
+        } else if (method === 'POST' && /(\/enable|\/disable)\?/.test(String(url))) {
+          const match = String(url).match(/\/policy-table\/([^/]+)\/(enable|disable)/);
+          if (match) policyRows = policyRows.map((row) => row.id === match[1] ? { ...row, enabled: match[2] === 'enable' } : row);
+        }
+      }
       if (String(url).endsWith('/runtime-resolve')) return new Response(JSON.stringify({ ok: true, route_table: body.route_table || 'wan2', table_id: 102, gateway: '192.0.2.1', interface: 'wan2', action: 'route_table', resolved: true, reason: 'explicit_route_table_selected', runtime_validation: 'configured_resolution_not_per_flow_conntrack_decision' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       return new Response(JSON.stringify({ ok: true, id: body?.id || 'deleted' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     };
@@ -95,7 +125,7 @@
         requests: [...requests]
       };
     }
-    window.ROUTING_FIXTURE = { remount, contract, requests, scenarios: ['ready', 'fail-closed', 'reference-conflict', 'runtime-missing'] };
+    window.ROUTING_FIXTURE = { remount, contract, requests, scenarios: ['ready', 'fail-closed', 'reference-conflict', 'runtime-missing', 'apply-mismatch', 'rollback-failed', 'external-action'] };
     await remount('ready');
   </script>
 </body>

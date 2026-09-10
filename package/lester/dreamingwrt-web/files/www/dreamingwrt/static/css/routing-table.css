@@ -66,6 +66,7 @@
  */
 .routing-page-tabs.dwrt-kit-tabs { justify-self: start; }
 
+.routing-row-actions { display: inline-flex; align-items: center; justify-content: center; gap: 4px; max-width: 100%; }
 .routing-row-action svg { width: 17px; height: 17px; display: block; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 
 /* Search + create, now living in the table card's toolbar rather than a page header. */
@@ -103,6 +104,8 @@
   cursor: pointer;
 }
 .routing-row-action:hover { color: var(--app-text); background: var(--dwrt-interactive-hover-bg, rgba(255,255,255,.09)); }
+.routing-row-action-danger { color: var(--color-danger, #ff7582); }
+.routing-row-action-danger:hover { color: #fff; background: rgba(255,76,96,.16); }
 .routing-create-button { min-height: 38px; display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
 .routing-create-button:disabled { cursor: not-allowed; opacity: .46; }
 
@@ -139,7 +142,7 @@
 .routing-resource-table td small { margin-top: 2px; color: var(--app-text-muted); font-size: 10px; }
 .routing-resource-table tr.is-disabled td { opacity: .58; }
 .routing-resource-table th:first-child { width: 86px; }
-.routing-resource-table th:last-child { width: 72px; text-align: center; }
+.routing-resource-table th:last-child { width: 132px; text-align: center; }
 .routing-resource-table td:last-child { overflow: visible; text-align: center; }
 .routing-resource-table .routing-row-action { width: 32px; height: 32px; }
 .routing-cell-ellipsis { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -208,6 +211,14 @@
   --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard);
   --dwrt-kit-sheet-max-width: calc(100vw - 28px);
 }
+@media (max-width: 720px) {
+  .routing-drawer.dwrt-kit-sheet {
+    inset: 0 0 0 auto;
+    --dwrt-kit-sheet-width: calc(100vw - 18px);
+    --dwrt-kit-sheet-max-width: calc(100vw - 18px);
+    width: min(var(--dwrt-kit-sheet-width), var(--dwrt-kit-sheet-max-width));
+  }
+}
 .routing-drawer .dwrt-kit-sheet-header span { display: block; color: var(--app-text-muted); font-size: 10px; font-weight: 760; }
 .routing-drawer .dwrt-kit-sheet-header strong { display: block; margin-top: 2px; color: var(--app-text); font-size: 17px; }
 .routing-drawer-body { display: grid; align-content: start; gap: 16px; padding: 18px var(--dwrt-kit-sheet-padding-x) 28px; }
@@ -230,6 +241,11 @@
 .routing-switch input:disabled { cursor: not-allowed; opacity: .45; }
 
 .routing-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.routing-policy-type-picker { min-width: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+.routing-policy-type { min-width: 0; display: inline-flex; align-items: center; gap: 7px; min-height: 36px; padding: 0 12px; border-radius: var(--app-radius-control, 12px); color: var(--app-text-secondary); background: var(--color-surface-control, rgba(255,255,255,.045)); box-shadow: inset 0 0 0 1px var(--color-border-subtle, rgba(255,255,255,.09)); cursor: pointer; }
+.routing-policy-type input { position: absolute; opacity: 0; pointer-events: none; }
+.routing-policy-type.is-active { color: var(--app-text); background: rgba(70,148,255,.14); box-shadow: inset 0 0 0 1px rgba(70,148,255,.42); }
+.routing-policy-type.is-disabled { cursor: not-allowed; opacity: .5; }
 .routing-field { min-width: 0; display: grid; align-content: start; gap: 6px; }
 .routing-field.is-wide { grid-column: 1 / -1; }
 .routing-field > span { color: var(--app-text-secondary); font-size: 12px; font-weight: 720; }

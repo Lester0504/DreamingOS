@@ -10,7 +10,7 @@ export function mount(context = {}) {
     return { name, ok: response.ok && json?.ok !== false, data: json?.data ?? json, raw: json };
   });
 
-  const VERSION = '20260810-front-release-01';
+  const VERSION = '20260831-routing-action-surface-01';
   const POLICY_ENDPOINT = '/api/v1/policy-engine/policy-table';
   const ROUTING_ENDPOINT = '/api/v1/routing';
   const RESOURCE_ENDPOINTS = {
@@ -92,6 +92,101 @@ export function mount(context = {}) {
   function unwrapResult(result) { return result?.data ?? result?.raw?.data ?? result?.raw ?? result ?? {}; }
   function normalizeKey(value) { return String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_'); }
   function cap(name) { return state.capabilities?.[name] === true; }
+  function policyCapability(type, action) {
+    const key = normalizeKey(type);
+    const prefix = key === 'static_route' ? 'static_route' : key === 'pbr' ? 'pbr' : key;
+    const direct = state.capabilities?.[`${prefix}_${action}`];
+    if (typeof direct === 'boolean') return direct;
+    const nested = state.capabilities?.policy_actions?.[prefix]?.[action];
+    return nested === true;
+  }
+  function policyCapabilityReason(type, action) {
+    const key = normalizeKey(type);
+    const prefix = key === 'static_route' ? 'static_route' : key === 'pbr' ? 'pbr' : key;
+    const reasons = state.capabilities?.policy_action_reasons;
+    return firstText(
+      reasons?.[prefix]?.[action],
+      state.capabilities?.[`${prefix}_${action}_reason`],
+      state.capabilities?.[`${prefix}_reason`],
+      state.capabilities?.policy_action_reason
+    );
+  }
+  function policyActionLabel(action) {
+    return ({ create: '新建', update: '编辑', delete: '删除', enable_disable: '启停' })[action] || action;
+  }
+  function policyTypes() { return [['static_route', '静态路由'], ['pbr', '策略路由']]; }
+  function routePolicyDraft(type = 'static_route', item = null) {
+    const raw = item?.raw || {};
+    if (type === 'pbr') return {
+      policy_type: 'pbr', id: item?.id || '', name: item?.name || '', enabled: item?.enabled !== false,
+      source_kind: item?.sourceKind || firstText(raw.source_kind, 'object'), source_ref: item?.sourceRef || firstText(raw.source_ref),
+      source_object: firstText(raw.source_object, item?.source), destination: firstText(raw.dest_object, item?.destination, 'any'),
+      target: firstText(raw.route_table, raw.target, item?.table, item?.target), route_table: firstText(raw.route_table, raw.target, item?.table, item?.target),
+      priority: item?.priorityValue ?? item?.priority ?? firstNumber(raw.priority, 1000), protocol: firstText(raw.protocol, raw.proto, 'all'),
+      ports: firstText(raw.ports, 'any'), action: firstText(raw.action, 'route_table'), comment: item?.comment || firstText(raw.comment)
+    };
+    return {
+      policy_type: 'static_route', id: item?.id || '', name: item?.name || '', enabled: item?.enabled !== false,
+      family: item?.family || firstText(raw.family, 'ipv4'), destination: firstText(raw.destination, raw.target, item?.destination),
+      gateway_mode: item ? (item?.gateway ? 'next_hop' : item?.interface ? 'interface' : 'blackhole') : 'next_hop', gateway: item?.gateway || firstText(raw.gateway),
+      interface: item?.interface === '--' ? '' : (item?.interface || firstText(raw.interface)), table: firstText(raw.route_table, raw.table, item?.table, 'main'),
+      metric: item?.metric ?? item?.priority ?? firstNumber(raw.metric, 0), mtu: item?.mtu ?? firstNumber(raw.mtu, 1500),
+      route_kind: item?.routeKind || firstText(raw.route_kind, raw.route_type, 'unicast'), source: firstText(raw.source), comment: item?.comment || firstText(raw.comment)
+    };
+  }
+  function policyDraftTypeCanCreate(type) { return policyCapability(type, 'create'); }
+  function policyEditorWritable() {
+    const type = state.editor?.policy_type;
+    const action = state.editorMode === 'edit' ? 'update' : 'create';
+    return Boolean(type && policyCapability(type, action));
+  }
+  function policyPayload(draft) {
+    const common = { policy_type: draft.policy_type, enabled: Boolean(draft.enabled), apply: true };
+    if (draft.policy_type === 'static_route') return {
+      ...common, name: String(draft.name || '').trim(), family: draft.family || 'ipv4', target: String(draft.destination || '').trim(),
+      destination: String(draft.destination || '').trim(), gateway: draft.gateway_mode === 'next_hop' ? String(draft.gateway || '').trim() : '',
+      interface: draft.gateway_mode === 'interface' ? String(draft.interface || '').trim() : '', table: String(draft.table || 'main').trim() || 'main',
+      metric: Number(draft.metric) || 0, mtu: Number(draft.mtu) || 1500, route_kind: draft.gateway_mode === 'blackhole' ? 'blackhole' : (draft.route_kind || 'unicast'), source: String(draft.source || '').trim(), comment: String(draft.comment || '').trim()
+    };
+    const kind = normalizeKey(draft.source_kind) || 'object';
+    const source = kind === 'object' ? (String(draft.source_object || '').trim() || 'any') : 'any';
+    return {
+      ...common, name: String(draft.name || '').trim(), source_kind: kind, source_object: source,
+      ...(kind === 'object' ? {} : { source_ref: String(draft.source_ref || '').trim() }),
+      dest_object: String(draft.destination || 'any').trim() || 'any', protocol: draft.protocol || 'all', ports: String(draft.ports || 'any').trim() || 'any',
+      action: draft.action || 'route_table', target: String(draft.route_table || draft.target || '').trim(), route_table: String(draft.route_table || draft.target || '').trim(),
+      priority: Number(draft.priority) || 1000, schedule: 'always', comment: String(draft.comment || '').trim(), reload_route: true
+    };
+  }
+  function policyDraftValidation(draft) {
+    if (!String(draft.name || '').trim()) return '请填写策略名称。';
+    if (draft.policy_type === 'static_route') {
+      if (!String(draft.destination || '').trim()) return '请填写目标网络。';
+      if (draft.gateway_mode === 'next_hop' && !String(draft.gateway || '').trim()) return '请填写下一跳地址。';
+      if (draft.gateway_mode === 'interface' && !String(draft.interface || '').trim()) return '请选择出口接口。';
+      if (!String(draft.table || '').trim()) return '请填写路由表。';
+    } else {
+      if (!String(draft.route_table || draft.target || '').trim()) return '请选择出口路由表。';
+      if (normalizeKey(draft.source_kind) !== 'object' && !String(draft.source_ref || '').trim()) return '请选择来源接口、区域或网络。';
+    }
+    return '';
+  }
+  function policyReadbackMatches(expected, actual) {
+    if (!actual || actual.id !== expected.id || actual.type !== expected.policy_type || actual.enabled !== Boolean(expected.enabled)) return false;
+    const raw = actual.raw || {};
+    const actualTable = firstText(actual.table, raw.route_table, raw.table, raw.routing_table);
+    const expectedTable = firstText(expected.table, expected.route_table, expected.target);
+    const actualDestination = firstText(actual.destination, raw.destination, raw.target, raw.dest_object);
+    const expectedDestination = firstText(expected.destination, expected.target, expected.dest_object);
+    if (String(actual.name || '') !== String(expected.name || '')) return false;
+    if (expected.policy_type === 'static_route') {
+      return String(actualDestination || '') === String(expectedDestination || '')
+        && String(actualTable || '') === String(expectedTable || '')
+        && Number(actual.metric ?? raw.metric ?? 0) === Number(expected.metric ?? 0);
+    }
+    return String(actualTable || '') === String(expectedTable || '')
+      && Number(actual.priorityValue ?? actual.priority ?? raw.priority ?? 1000) === Number(expected.priority ?? 1000);
+  }
   /*
    * 会话闸门适配器。此前这里是裸 fetch 直接读 localStorage 的 access token，token 过期时
    * 既不刷新也不重试，并发请求会集体拿 401（通知推送页就表现为 unauthorized 六连）。
@@ -126,7 +221,13 @@ export function mount(context = {}) {
     const payload = error?.payload || {};
     const references = asArray(payload.references).map((item) => firstText(item.name, item.id, item.type)).filter(Boolean);
     const base = firstText(error?.message, payload.message, payload.error, 'unknown');
-    return `${prefix}${base}${references.length ? `；仍被 ${references.join('、')} 引用` : ''}`;
+    const stage = firstText(payload.stage, payload.failure_stage, payload.apply_stage);
+    const code = firstText(payload.code, payload.error_code);
+    const rollback = firstText(payload.rollback, payload.rollback_result, payload.rollback_status);
+    const draft = firstText(payload.draft_field, payload.field, payload.path);
+    const rollbackText = rollback === 'rollback_failed' ? '自动回滚失败，请停止继续尝试并检查设备状态' : rollback;
+    const details = [stage && `阶段：${stage}`, code && `错误码：${code}`, draft && `字段：${draft}`, rollbackText && `回滚：${rollbackText}`].filter(Boolean);
+    return `${prefix}${base}${details.length ? `；${details.join('；')}` : ''}${references.length ? `；仍被 ${references.join('、')} 引用` : ''}`;
   }
   function icon(name) {
     const paths = {
@@ -135,7 +236,8 @@ export function mount(context = {}) {
       refresh: '<path d="M20 11a8 8 0 1 0 1 4"></path><path d="M20 4v7h-7"></path>',
       edit: '<path d="m4 20 4.2-1 10.9-10.9a2 2 0 0 0-2.8-2.8L5.4 16.2 4 20Z"></path>',
       eye: '<path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"></path><circle cx="12" cy="12" r="2.5"></circle>',
-      route: '<circle cx="6" cy="19" r="2"></circle><circle cx="18" cy="5" r="2"></circle><path d="M8 19h3a4 4 0 0 0 4-4V9m0 0-3 3m3-3 3 3"></path>'
+      route: '<circle cx="6" cy="19" r="2"></circle><circle cx="18" cy="5" r="2"></circle><path d="M8 19h3a4 4 0 0 0 4-4V9m0 0-3 3m3-3 3 3"></path>',
+      trash: '<path d="M4 7h16"></path><path d="M10 11v6m4-6v6"></path><path d="m6 7 1 13h10l1-13"></path><path d="M9 7V4h6v3"></path>'
     };
     return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.edit}</svg>`;
   }
@@ -190,7 +292,18 @@ export function mount(context = {}) {
       hits: firstNumber(raw.hit_count, raw.hits, row.hit_count, row.hits),
       lastHit: firstNumber(raw.last_hit, raw.last_hit_at, row.last_hit),
       enabled: row.enabled !== false && raw.enabled !== false && raw.disabled !== '1',
-      comment: firstText(raw.comment, raw.remark, row.description), raw: { ...raw, ...row }
+      comment: firstText(raw.comment, raw.remark, row.description),
+      family: firstText(row.family, raw.family, raw.ip_family, type === 'static_route' ? 'ipv4' : ''),
+      gateway: firstText(row.gateway, raw.gateway, raw.gw, raw.next_hop),
+      routeKind: firstText(row.route_kind, raw.route_kind, raw.route_type, raw.type),
+      metric: nullableNumber(row.metric, raw.metric),
+      mtu: nullableNumber(row.mtu, raw.mtu),
+      sourceKind: firstText(row.source_kind, raw.source_kind),
+      sourceRef: firstText(row.source_ref, raw.source_ref),
+      priorityValue: nullableNumber(row.priority, raw.priority),
+      revision: firstText(row.revision, row.etag, raw.revision, raw.etag),
+      sourceOwner: firstText(row.source_owner, row.owner, raw.source_owner, raw.owner),
+      raw: { ...raw, ...row }
     };
   }
   /*
@@ -220,7 +333,7 @@ export function mount(context = {}) {
     } else if (key === 'tables') state.tables = asArray(data).map(normalizeTable).filter((item) => item.id);
     else if (key === 'objects') state.objects = asArray(data).map(normalizeObject).filter((item) => item.id);
     else if (key === 'cross') state.crossServices = asArray(data).map(normalizeCross).filter((item) => item.id);
-    else if (key === 'external') state.externalPolicies = asArray(data).map((item) => ({ ...item, read_only: true }));
+    else if (key === 'external') state.externalPolicies = asArray(data).map((item) => ({ ...item, actions: asArray(item.actions, ['actions', 'available_actions']), capabilities: item.capabilities || {} }));
   }
   /* background=true 是那条 20s 轮询：不打 loading 态、刷新走保状态路径。 */
   async function load(background = false) {
@@ -282,10 +395,11 @@ export function mount(context = {}) {
   /* Rendered inside the table card, so it is re-created with the card and must be
      re-bound each time (see bindEvents). */
   function tableControlsMarkup() {
-    const creatable = ['tables', 'objects', 'cross'].includes(state.tab);
-    const labels = { tables: '新建路由表', objects: '新建路由对象', cross: '新建服务' };
-    const capability = { tables: 'table_crud', objects: 'object_crud', cross: 'cross_service_config_crud' }[state.tab];
-    return `<div class="routing-table-controls"><label class="routing-search" data-dwrt-component="expand-search">${icon('search')}<input type="search" data-routing-search value="${escapeHtml(state.query)}" placeholder="搜索当前视图" aria-label="搜索当前视图"></label>${creatable ? `<button class="dwrt-kit-button routing-create-button" data-dwrt-component="button" data-variant="primary" type="button" data-routing-create="${state.tab}" ${cap(capability) ? '' : 'disabled'}>${icon('plus')}<span>${labels[state.tab]}</span></button>` : ''}</div>`;
+    const creatable = ['policies', 'tables', 'objects', 'cross'].includes(state.tab);
+    const labels = { policies: '新建策略', tables: '新建路由表', objects: '新建路由对象', cross: '新建服务' };
+    const capability = { policies: policyCapability('static_route', 'create') || policyCapability('pbr', 'create'), tables: cap('table_crud'), objects: cap('object_crud'), cross: cap('cross_service_config_crud') }[state.tab];
+    const reason = state.tab === 'policies' && !capability ? firstText(policyCapabilityReason('static_route', 'create'), policyCapabilityReason('pbr', 'create'), '后端未开放路由策略创建能力') : '';
+    return `<div class="routing-table-controls"><label class="routing-search" data-dwrt-component="expand-search">${icon('search')}<input type="search" data-routing-search value="${escapeHtml(state.query)}" placeholder="搜索当前视图" aria-label="搜索当前视图"></label>${creatable ? `<button class="dwrt-kit-button routing-create-button" data-dwrt-component="button" data-variant="primary" type="button" data-routing-create="${state.tab}" ${capability ? '' : 'disabled'} title="${escapeHtml(reason)}">${icon('plus')}<span>${labels[state.tab]}</span></button>` : ''}</div>`;
   }
   function noticeMarkup(message = state.notice, tone = 'warning') {
     if (!message) return '';
@@ -301,7 +415,12 @@ export function mount(context = {}) {
     return `<section class="routing-resource-table dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface ${className}" data-dwrt-component="data-table"><div class="dwrt-kit-table-toolbar"><div class="dwrt-kit-table-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(meta)}</span></div>${controls}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table"><thead><tr>${headings.map((heading) => `<th>${escapeHtml(heading)}</th>`).join('')}</tr></thead><tbody>${state.loading ? `<tr><td class="dwrt-kit-table-empty" colspan="${headings.length}">正在读取真实配置</td></tr>` : rows.length ? rows.join('') : `<tr><td class="dwrt-kit-table-empty" colspan="${headings.length}">${escapeHtml(empty)}</td></tr>`}</tbody></table></div></section>`;
   }
   function actionButton(kind, item, readOnly = false) {
-    return `<button class="routing-row-action" type="button" data-routing-open="${escapeHtml(kind)}" data-routing-id="${escapeHtml(item.id)}" aria-label="${readOnly ? '查看' : '编辑'} ${escapeHtml(item.name)}">${icon(readOnly ? 'eye' : 'edit')}</button>`;
+    if (kind !== 'policy') return `<button class="routing-row-action" type="button" data-routing-open="${escapeHtml(kind)}" data-routing-id="${escapeHtml(item.id)}" aria-label="${readOnly ? '查看' : '编辑'} ${escapeHtml(item.name)}">${icon(readOnly ? 'eye' : 'edit')}</button>`;
+    const edit = policyCapability(item.type, 'update');
+    const toggle = policyCapability(item.type, 'enable_disable');
+    const remove = policyCapability(item.type, 'delete');
+    const reason = policyCapabilityReason(item.type, edit ? 'update' : 'create');
+    return `<span class="routing-row-actions" data-routing-policy-actions="${escapeHtml(item.id)}">${edit ? `<button class="routing-row-action" type="button" data-routing-open="policy" data-routing-id="${escapeHtml(item.id)}" aria-label="编辑 ${escapeHtml(item.name)}" title="编辑">${icon('edit')}</button>` : `<button class="routing-row-action" type="button" data-routing-open="policy" data-routing-id="${escapeHtml(item.id)}" aria-label="查看 ${escapeHtml(item.name)}" title="${escapeHtml(reason || '编辑能力未开放')}" >${icon('eye')}</button>`}${toggle ? `<button class="routing-row-action" type="button" data-routing-policy-toggle="${escapeHtml(item.id)}" aria-label="${item.enabled ? '停用' : '启用'} ${escapeHtml(item.name)}" title="${item.enabled ? '停用' : '启用'}">${icon('route')}</button>` : ''}${remove ? `<button class="routing-row-action routing-row-action-danger" type="button" data-routing-policy-delete="${escapeHtml(item.id)}" aria-label="删除 ${escapeHtml(item.name)}" title="删除">${icon('trash')}</button>` : ''}</span>`;
   }
   /*
    * 跃点 / 优先级单元格。三种状态必须分开，因为排查方向不同：
@@ -351,8 +470,13 @@ export function mount(context = {}) {
     return String(number);
   }
   function policiesMarkup() {
-    const rows = state.policies.filter((item) => matchesQuery([item.name, item.typeLabel, item.source, item.destination, item.target, item.interface, item.table])).map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><span class="routing-kind is-${item.type}">${escapeHtml(item.typeLabel)}</span></td><td><strong>${escapeHtml(item.name)}</strong>${item.comment ? `<small>${escapeHtml(item.comment)}</small>` : ''}</td><td>${escapeHtml(item.source)}</td><td>${escapeHtml(item.destination)}</td><td>${escapeHtml(item.target)}</td><td>${escapeHtml(item.interface)}</td><td><span class="routing-table-pill">${escapeHtml(item.table)}</span></td><td>${priorityCell(item)}</td><td>${item.type === 'pbr' ? item.hits : '--'}</td><td>${item.type === 'pbr' ? escapeHtml(formatTime(item.lastHit)) : '--'}</td><td>${actionButton('policy', item, true)}</td></tr>`);
-    return `${capabilityBanner('静态路由与 PBR 在此仅作统一索引；创建、修改和删除继续由“策略表”作为唯一写入口。', 'info')}${state.errors.policies ? capabilityBanner(`路由策略读取失败：${state.errors.policies}`, 'danger') : ''}${tableShell('路由策略', `${rows.length} 条 · 只读索引`, ['状态', '类型', '名称', '源', '目标网络', '下一跳 / 目标', '接口', '路由表', '跃点 / 优先级', '命中', '最后命中', '详情'], rows, state.errors.policies || '没有路由策略', 'is-policy-table', tableControlsMarkup())}`;
+    const rows = state.policies.filter((item) => matchesQuery([item.name, item.typeLabel, item.source, item.destination, item.target, item.interface, item.table])).map((item) => `<tr class="${item.enabled ? '' : 'is-disabled'}"><td>${statusBadge(item.enabled ? '启用' : '停用', item.enabled ? 'success' : 'muted')}</td><td><span class="routing-kind is-${item.type}">${escapeHtml(item.typeLabel)}</span></td><td><strong>${escapeHtml(item.name)}</strong>${item.comment ? `<small>${escapeHtml(item.comment)}</small>` : ''}</td><td>${escapeHtml(item.source)}</td><td>${escapeHtml(item.destination)}</td><td>${escapeHtml(item.target)}</td><td>${escapeHtml(item.interface)}</td><td><span class="routing-table-pill">${escapeHtml(item.table)}</span></td><td>${priorityCell(item)}</td><td>${item.type === 'pbr' ? item.hits : '--'}</td><td>${item.type === 'pbr' ? escapeHtml(formatTime(item.lastHit)) : '--'}</td><td>${actionButton('policy', item)}</td></tr>`);
+    const capabilityText = policyTypes().map(([type, label]) => {
+      const actions = ['create', 'update', 'delete', 'enable_disable'];
+      const summary = actions.map((action) => `${policyActionLabel(action)}${policyCapability(type, action) ? '可用' : `关闭${policyCapabilityReason(type, action) ? `（${policyCapabilityReason(type, action)}）` : ''}`}`).join('、');
+      return `${label}：${summary}`;
+    }).join('；');
+    return `${capabilityBanner(`本页通过策略引擎统一合同管理静态路由与 PBR。${capabilityText}`, 'info')}${state.errors.policies ? capabilityBanner(`路由策略读取失败：${state.errors.policies}`, 'danger') : ''}${tableShell('路由策略', `${rows.length} 条 · 配置与运行回读`, ['状态', '类型', '名称', '源', '目标网络', '下一跳 / 目标', '接口', '路由表', '跃点 / 优先级', '命中', '最后命中', '操作'], rows, state.errors.policies || '没有路由策略', 'is-policy-table', tableControlsMarkup())}`;
   }
   function tablesMarkup() {
     const writable = cap('table_crud');
@@ -384,8 +508,13 @@ export function mount(context = {}) {
     const pbr = state.policies.filter((item) => item.type === 'pbr');
     const options = state.resolveMode === 'rule' ? pbr.map((item) => [item.id, item.name]) : [['main', 'main (254)'], ...state.tables.map((item) => [item.id, `${item.name} (${item.table_id})`])];
     const external = state.externalPolicies.filter((item) => matchesQuery([item.id, item.name, item.source, item.section_type, item.path]));
-    const rows = external.map((item) => `<tr><td><strong>${escapeHtml(item.name || item.id)}</strong><small>${escapeHtml(item.id)}</small></td><td>${escapeHtml(item.source || '--')}</td><td>${escapeHtml(item.section_type || '--')}</td><td><span class="routing-cell-ellipsis" title="${escapeHtml(item.path || '')}">${escapeHtml(item.path || '--')}</span></td><td>${statusBadge('只读', 'muted')}</td></tr>`);
-    return `<section class="routing-runtime-layout"><section class="routing-runtime-panel" data-dwrt-component="surface"><header><div><strong>运行解析</strong><span>验证配置如何解析到路由表</span></div>${statusBadge(canResolve ? '可用' : '不可用', canResolve ? 'success' : 'error')}</header>${!canResolve ? capabilityBanner('后端未明确声明 runtime_resolve，解析入口已关闭。', 'danger') : ''}<div class="routing-resolve-controls"><label><span>解析方式</span><select data-routing-resolve-mode ${canResolve ? '' : 'disabled'}><option value="table" ${state.resolveMode === 'table' ? 'selected' : ''}>按路由表</option><option value="rule" ${state.resolveMode === 'rule' ? 'selected' : ''}>按策略规则</option></select></label><label><span>${state.resolveMode === 'rule' ? '策略规则' : '路由表'}</span><select data-routing-resolve-value ${canResolve ? '' : 'disabled'}><option value="">请选择</option>${options.map(([value, label]) => `<option value="${escapeHtml(value)}" ${state.resolveValue === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label><button class="dwrt-kit-button" data-dwrt-component="async-button" data-variant="primary" type="button" data-routing-resolve ${canResolve && state.resolveValue && !state.resolving ? '' : 'disabled'}>${state.resolving ? '正在解析' : '执行解析'}</button></div>${resolutionMarkup()}${capabilityBanner('解析结果是配置级解析，不代表逐 flow 的 conntrack 命中或实际选路证明。', 'info')}</section>${state.errors.external ? capabilityBanner(`外部策略读取失败：${state.errors.external}`, 'danger') : ''}${tableShell('外部策略', `${external.length} 条 · pbr / mwan3 只读发现`, ['名称 / ID', '来源', '类型', '配置路径', '权限'], rows, state.errors.external || '没有发现外部策略', 'is-external-table', tableControlsMarkup())}</section>`;
+    const rows = external.map((item) => {
+      const actions = item.actions.map((action) => normalizeKey(typeof action === 'object' ? action.action || action.name : action)).filter(Boolean);
+      const reason = firstText(item.reason, item.capabilities.reason, item.migration?.reason, '该来源未发布安全写合同');
+      const actionMarkup = actions.length ? actions.map((action) => `<button class="routing-row-action" type="button" data-routing-external-action="${escapeHtml(action)}" data-routing-id="${escapeHtml(item.id)}" aria-label="${escapeHtml(action)} ${escapeHtml(item.name || item.id)}" title="${escapeHtml(action)}">${icon(action === 'adopt' || action === 'import' ? 'route' : action === 'delete' ? 'trash' : 'edit')}</button>`).join('') : `<span class="routing-cell-muted" title="${escapeHtml(reason)}">诊断 / 迁移</span>`;
+      return `<tr><td><strong>${escapeHtml(item.name || item.id)}</strong><small>${escapeHtml(item.id)}</small></td><td>${escapeHtml(item.source || '--')}</td><td>${escapeHtml(item.section_type || '--')}</td><td><span class="routing-cell-ellipsis" title="${escapeHtml(item.path || '')}">${escapeHtml(item.path || '--')}</span></td><td>${actionMarkup}</td></tr>`;
+    });
+    return `<section class="routing-runtime-layout"><section class="routing-runtime-panel" data-dwrt-component="surface"><header><div><strong>运行解析</strong><span>验证配置如何解析到路由表</span></div>${statusBadge(canResolve ? '可用' : '不可用', canResolve ? 'success' : 'error')}</header>${!canResolve ? capabilityBanner('后端未明确声明 runtime_resolve，解析入口已关闭。', 'danger') : ''}<div class="routing-resolve-controls"><label><span>解析方式</span><select data-routing-resolve-mode ${canResolve ? '' : 'disabled'}><option value="table" ${state.resolveMode === 'table' ? 'selected' : ''}>按路由表</option><option value="rule" ${state.resolveMode === 'rule' ? 'selected' : ''}>按策略规则</option></select></label><label><span>${state.resolveMode === 'rule' ? '策略规则' : '路由表'}</span><select data-routing-resolve-value ${canResolve ? '' : 'disabled'}><option value="">请选择</option>${options.map(([value, label]) => `<option value="${escapeHtml(value)}" ${state.resolveValue === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label><button class="dwrt-kit-button" data-dwrt-component="async-button" data-variant="primary" type="button" data-routing-resolve ${canResolve && state.resolveValue && !state.resolving ? '' : 'disabled'}>${state.resolving ? '正在解析' : '执行解析'}</button></div>${resolutionMarkup()}${capabilityBanner('解析结果是配置级解析，不代表逐 flow 的 conntrack 命中或实际选路证明。', 'info')}</section>${state.errors.external ? capabilityBanner(`外部策略读取失败：${state.errors.external}`, 'danger') : ''}${tableShell('外部策略', `${external.length} 条 · 来源动作由后端能力决定`, ['名称 / ID', '来源', '类型', '配置路径', '动作'], rows, state.errors.external || '没有发现外部策略', 'is-external-table', tableControlsMarkup())}</section>`;
   }
   function contentMarkup() {
     if (state.tab === 'tables') return tablesMarkup();
@@ -405,8 +534,16 @@ export function mount(context = {}) {
   function switchField(label, description, checked, disabled = false) {
     return `<label class="routing-switch dwrt-kit-switch" data-dwrt-component="switch"><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(description)}</small></span><input type="checkbox" data-routing-field-check="enabled" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}></label>`;
   }
+  function routePolicyFieldsMarkup() {
+    const editor = state.editor;
+    const editing = state.editorMode === 'edit';
+    const typeOptions = policyTypes().map(([value, label]) => `<label class="routing-policy-type ${editor.policy_type === value ? 'is-active' : ''} ${policyDraftTypeCanCreate(value) || editing ? '' : 'is-disabled'}"><input type="radio" name="routing-policy-type" data-routing-policy-type="${value}" value="${value}" ${editor.policy_type === value ? 'checked' : ''} ${editing || policyDraftTypeCanCreate(value) ? '' : 'disabled'}><span>${label}</span></label>`).join('');
+    const staticFields = editor.policy_type === 'static_route' ? `<div class="routing-form">${field('地址族', 'family', editor.family, { type: 'select', options: [['ipv4', 'IPv4'], ['ipv6', 'IPv6']] })}${field('目标网络', 'destination', editor.destination, { required: true, wide: true, placeholder: '例如 10.20.0.0/16' })}${field('网关模式', 'gateway_mode', editor.gateway_mode, { type: 'select', options: [['next_hop', '下一跳'], ['interface', '接口直连'], ['blackhole', '黑洞']] })}${editor.gateway_mode === 'interface' ? field('出口接口', 'interface', editor.interface, { required: true, placeholder: '例如 wan2' }) : field('下一跳地址', 'gateway', editor.gateway, { required: editor.gateway_mode === 'next_hop', placeholder: '例如 192.0.2.1' })}${field('路由表', 'table', editor.table || 'main', { required: true, placeholder: 'main 或自定义表 ID' })}${field('Metric', 'metric', editor.metric, { type: 'number', min: 0 })}${field('MTU', 'mtu', editor.mtu, { type: 'number', min: 576, max: 65535 })}${field('路由类型', 'route_kind', editor.route_kind, { type: 'select', options: [['unicast', '单播'], ['blackhole', '黑洞'], ['unreachable', '不可达'], ['prohibit', '禁止']] })}${field('来源备注', 'source', editor.source, { wide: true, placeholder: '可选：来源接口或迁移标识' })}${field('备注', 'comment', editor.comment, { wide: true })}</div>` : `<div class="routing-form">${field('来源类型', 'source_kind', editor.source_kind, { type: 'select', options: [['object', 'IP 组 / 对象'], ['interface', '接口'], ['zone', '区域'], ['network', '网络']] })}${editor.source_kind === 'object' ? field('来源对象', 'source_object', editor.source_object, { placeholder: 'any 或对象 ID' }) : field('来源引用', 'source_ref', editor.source_ref, { required: true, placeholder: '接口、区域或网络 ID' })}${field('目标网络 / 对象', 'destination', editor.destination || 'any', { wide: true, placeholder: 'any 或对象 ID' })}${field('出口路由表', 'route_table', editor.route_table || editor.target, { required: true, placeholder: '例如 wan2' })}${field('优先级', 'priority', editor.priority, { type: 'number', min: 1 })}${field('协议', 'protocol', editor.protocol || 'all', { placeholder: 'all / tcp / udp' })}${field('端口', 'ports', editor.ports || 'any', { placeholder: 'any 或 80,443' })}${field('备注', 'comment', editor.comment, { wide: true })}</div>`;
+    return `${switchField('启用策略', '保存后由策略引擎 apply，并按配置与运行回读确认', editor.enabled)}${!policyEditorWritable() ? capabilityBanner(`当前动作未开放：${policyActionLabel(editing ? 'update' : 'create')}。${policyCapabilityReason(editor.policy_type, editing ? 'update' : 'create') || '后端未声明可执行原因。'}`, 'danger') : ''}<div class="routing-policy-type-picker" role="radiogroup" aria-label="路由策略类型">${typeOptions}</div><div class="routing-form">${field('策略名称', 'name', editor.name, { required: true, wide: true, placeholder: '例如 办公网段出口' })}</div>${staticFields}`;
+  }
   function editorFieldsMarkup() {
     const editor = state.editor;
+    if (state.editorKind === 'policy') return routePolicyFieldsMarkup();
     const editing = state.editorMode === 'edit';
     if (state.editorKind === 'table') return `${switchField('启用路由表', '保存后触发 route_reload，并回读事务结果', editor.enabled)}<div class="routing-form">${field('资源 ID', 'id', editor.id, { required: true, disabled: editing, placeholder: '例如 wan2_table' })}${field('显示名称', 'name', editor.name, { required: true })}${field('Table ID', 'table_id', editor.table_id, { type: 'number', min: 1, max: 32767, required: true })}${field('角色', 'role', editor.role, { placeholder: 'wan / vpn / custom' })}${field('默认网关', 'gateway', editor.gateway, { placeholder: '可留空' })}${field('Metric', 'metric', editor.metric, { type: 'number' })}</div>`;
     if (state.editorKind === 'object') return `${switchField('启用路由对象', '对象仅供 routed 子系统引用', editor.enabled)}<div class="routing-form">${field('资源 ID', 'id', editor.id, { required: true, disabled: editing, placeholder: '例如 office_targets' })}${field('显示名称', 'name', editor.name, { required: true })}${field('类型', 'type', editor.type, { type: 'select', options: [['ip_group', 'IP / CIDR 组'], ['domain_group', '域名组'], ['interface_group', '接口组'], ['custom', '自定义']] })}${field('地址族', 'family', editor.family, { type: 'select', options: [['ipv4', 'IPv4'], ['ipv6', 'IPv6'], ['mixed', '混合']] })}${field('主值', 'value', editor.value, { wide: true, placeholder: '单个值或摘要，可留空' })}${field('成员（每行一个）', 'membersText', editor.membersText, { type: 'textarea', rows: 7, wide: true, placeholder: '192.0.2.0/24\n198.51.100.10' })}${field('备注', 'comment', editor.comment, { wide: true })}</div>`;
@@ -414,17 +551,22 @@ export function mount(context = {}) {
     return `${switchField('启用配置', '保存配置不等于运行服务已生效', editor.enabled)}${!cap('cross_service_runtime') ? capabilityBanner('运行消费者未实现；本编辑器只维护配置。', 'warning') : ''}${multicast ? capabilityBanner('mDNS / SSDP 的实际组播运行配置由“组播服务”拥有，此处仅保存跨三层引用配置。', 'info') : ''}<div class="routing-form">${field('资源 ID', 'id', editor.id, { required: true, disabled: editing, placeholder: '例如 office_snmp' })}${field('显示名称', 'name', editor.name, { required: true })}${field('服务类型', 'service_type', editor.service_type, { type: 'select', options: [['snmp', 'SNMP'], ['mdns', 'mDNS 引用'], ['ssdp', 'SSDP 引用'], ['custom', '自定义']] })}${field('服务器 IP', 'server_ip', editor.server_ip, { placeholder: '可按服务类型留空' })}${field('作用域', 'scope', editor.scope, { wide: true, placeholder: '网段、区域或接口范围' })}${field('监听端口', 'listen_port', editor.listen_port)}${field('版本', 'version', editor.version)}${field('访问频率', 'access_rate', editor.access_rate)}${field('备注', 'remark', editor.remark, { wide: true })}</div>`;
   }
   function drawerTitle() {
-    const labels = { table: '路由表', object: '路由对象', cross: '跨三层服务', policy: '路由策略详情' };
-    return `${state.editorMode === 'create' ? '新建' : state.editorKind === 'policy' ? '' : '编辑'}${labels[state.editorKind] || ''}`;
+    const labels = { table: '路由表', object: '路由对象', cross: '跨三层服务', policy: state.editorMode === 'view' ? '路由策略详情' : '路由策略' };
+    return `${state.editorMode === 'create' ? '新建' : state.editorMode === 'view' ? '' : '编辑'}${labels[state.editorKind] || ''}`;
   }
   function drawerMarkup() {
     if (!state.drawer) return '';
-    const readOnly = state.editorKind === 'policy' || !editorWritable();
-    return `${drawerBackdrop('关闭编辑器')}<aside class="routing-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" aria-label="${escapeHtml(drawerTitle())}"><header class="dwrt-kit-sheet-header"><div><span>ROUTING</span><strong>${escapeHtml(drawerTitle())}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-routing-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body routing-drawer-body">${state.editorKind === 'policy' ? policyDetailMarkup() : editorFieldsMarkup()}${state.notice ? noticeMarkup(state.notice, /失败|冲突|引用|错误/.test(state.notice) ? 'danger' : 'warning') : ''}${readOnly && state.editorKind !== 'policy' ? capabilityBanner('写能力未由后端明确开放，当前详情保持只读。', 'danger') : ''}</div><footer class="dwrt-kit-sheet-footer routing-sheet-footer">${state.editorMode === 'edit' && state.editorKind !== 'policy' && !readOnly ? `<button class="dwrt-kit-button routing-danger-button" data-dwrt-component="button" data-variant="danger" type="button" data-routing-delete ${state.saving ? 'disabled' : ''}>删除</button>` : '<span></span>'}<div><button class="dwrt-kit-button" data-dwrt-component="button" data-variant="ghost" type="button" data-routing-close>${readOnly ? '关闭' : '取消'}</button>${!readOnly ? `<button class="dwrt-kit-button" data-dwrt-component="async-button" data-variant="primary" type="button" data-routing-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存'}</button>` : ''}</div></footer></aside>`;
+    const isPolicy = state.editorKind === 'policy';
+    const readOnly = state.editorMode === 'view' || (isPolicy ? !policyEditorWritable() : !editorWritable());
+    const canDelete = isPolicy ? policyCapability('' + state.editor?.policy_type, 'delete') : state.editorMode === 'edit' && editorWritable();
+    const canToggle = isPolicy ? policyCapability('' + state.editor?.policy_type, 'enable_disable') : false;
+    const body = isPolicy && state.editorMode === 'view' ? policyDetailMarkup() : editorFieldsMarkup();
+    return `${drawerBackdrop('关闭编辑器')}<aside class="routing-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" aria-label="${escapeHtml(drawerTitle())}"><header class="dwrt-kit-sheet-header"><div><span>ROUTING</span><strong>${escapeHtml(drawerTitle())}</strong></div><button class="dwrt-kit-sheet-close" type="button" data-routing-close aria-label="关闭">×</button></header><div class="dwrt-kit-sheet-body routing-drawer-body">${body}${state.notice ? noticeMarkup(state.notice, /失败|冲突|引用|错误|回读|回滚/.test(state.notice) ? 'danger' : 'warning') : ''}${readOnly && !isPolicy ? capabilityBanner('写能力未由后端明确开放，当前详情保持只读。', 'danger') : ''}</div><footer class="dwrt-kit-sheet-footer routing-sheet-footer">${state.editorMode === 'edit' && canDelete ? `<button class="dwrt-kit-button routing-danger-button" data-dwrt-component="button" data-variant="danger" type="button" data-routing-delete ${state.saving ? 'disabled' : ''}>删除</button>` : '<span></span>'}<div><button class="dwrt-kit-button" data-dwrt-component="button" data-variant="ghost" type="button" data-routing-close>${readOnly ? '关闭' : '取消'}</button>${state.editorMode === 'view' && canToggle ? `<button class="dwrt-kit-button" data-dwrt-component="button" type="button" data-routing-policy-toggle-drawer>${state.editor?.enabled ? '停用' : '启用'}</button>` : ''}${state.editorMode === 'view' && canDelete ? `<button class="dwrt-kit-button routing-danger-button" data-dwrt-component="button" type="button" data-routing-policy-delete-drawer>删除</button>` : ''}${state.editorMode !== 'view' && !readOnly ? `<button class="dwrt-kit-button" data-dwrt-component="async-button" data-variant="primary" type="button" data-routing-save ${state.saving ? 'disabled' : ''}>${state.saving ? '正在保存' : '保存'}</button>` : ''}</div></footer></aside>`;
   }
   function policyDetailMarkup() {
     const item = state.selected || {};
-    return `${capabilityBanner('此处仅展示统一路由索引。请在“策略表”中修改或删除该路由，避免双写。', 'info')}<dl class="routing-detail-list"><div><dt>名称</dt><dd>${escapeHtml(item.name || '--')}</dd></div><div><dt>类型</dt><dd>${escapeHtml(item.typeLabel || '--')}</dd></div><div><dt>状态</dt><dd>${item.enabled ? '启用' : '停用'}</dd></div><div><dt>源</dt><dd>${escapeHtml(item.source || '--')}</dd></div><div><dt>目标</dt><dd>${escapeHtml(item.destination || '--')}</dd></div><div><dt>下一跳 / 目标</dt><dd>${escapeHtml(item.target || '--')}</dd></div><div><dt>接口</dt><dd>${escapeHtml(item.interface || '--')}</dd></div><div><dt>路由表</dt><dd>${escapeHtml(item.table || '--')}</dd></div></dl>`;
+    const reasons = ['update', 'delete', 'enable_disable'].filter((action) => !policyCapability(item.type, action)).map((action) => `${policyActionLabel(action)}：${policyCapabilityReason(item.type, action) || '后端未开放'}`);
+    return `${reasons.length ? capabilityBanner(reasons.join('；'), 'warning') : ''}<dl class="routing-detail-list"><div><dt>稳定 ID</dt><dd>${escapeHtml(item.id || '--')}</dd></div><div><dt>名称</dt><dd>${escapeHtml(item.name || '--')}</dd></div><div><dt>类型</dt><dd>${escapeHtml(item.typeLabel || '--')}</dd></div><div><dt>状态</dt><dd>${item.enabled ? '启用' : '停用'}</dd></div><div><dt>地址族</dt><dd>${escapeHtml(item.family || '--')}</dd></div><div><dt>源</dt><dd>${escapeHtml(item.source || '--')}</dd></div><div><dt>目标</dt><dd>${escapeHtml(item.destination || '--')}</dd></div><div><dt>下一跳 / 目标</dt><dd>${escapeHtml(item.target || '--')}</dd></div><div><dt>接口</dt><dd>${escapeHtml(item.interface || '--')}</dd></div><div><dt>路由表</dt><dd>${escapeHtml(item.table || '--')}</dd></div><div><dt>跃点 / 优先级</dt><dd>${escapeHtml(String(item.priority ?? item.priorityValue ?? '--'))}</dd></div><div><dt>来源 owner</dt><dd>${escapeHtml(item.sourceOwner || '--')}</dd></div></dl>`;
   }
   function drawerBackdrop(label) { return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-routing-close aria-label="${escapeHtml(label)}"></button>`; }
   function editorWritable() {
@@ -435,7 +577,7 @@ export function mount(context = {}) {
     const renderer = ui.confirmationMarkup || window.DWRT_UI_KIT?.confirmationMarkup;
     if (typeof renderer !== 'function') return '';
     const references = asArray(state.selected.references);
-    const label = { table: '路由表', object: '路由对象', cross: '跨三层服务' }[state.editorKind] || '资源';
+    const label = { table: '路由表', object: '路由对象', cross: '跨三层服务', policy: '路由策略' }[state.editorKind] || '资源';
     return renderer({
       id: 'routing-delete-confirmation', action: 'delete-routing-resource', tone: 'danger',
       title: `删除${label}`,
@@ -472,6 +614,11 @@ export function mount(context = {}) {
     return { ...item };
   }
   function openCreate(kind) {
+    if (kind === 'policies') {
+      const type = policyCapability('static_route', 'create') ? 'static_route' : policyCapability('pbr', 'create') ? 'pbr' : '';
+      if (!type) return;
+      state.drawer = 'editor'; state.editorKind = 'policy'; state.editorMode = 'create'; state.selected = null; state.editor = routePolicyDraft(type); state.notice = ''; render(); return;
+    }
     const map = { tables: 'table', objects: 'object', cross: 'cross' };
     const editorKind = map[kind];
     if (!editorKind) return;
@@ -481,13 +628,14 @@ export function mount(context = {}) {
     const source = kind === 'policy' ? state.policies : kind === 'table' ? state.tables : kind === 'object' ? state.objects : state.crossServices;
     const item = source.find((entry) => entry.id === id);
     if (!item) return;
-    state.drawer = 'editor'; state.editorKind = kind; state.editorMode = 'edit'; state.selected = item; state.editor = editorFromItem(kind, item); state.notice = ''; render();
+    state.drawer = 'editor'; state.editorKind = kind; state.editorMode = kind === 'policy' && !policyCapability(item.type, 'update') ? 'view' : 'edit'; state.selected = item; state.editor = kind === 'policy' ? routePolicyDraft(item.type, item) : editorFromItem(kind, item); state.notice = ''; render();
   }
   function closeDrawer() {
     state.drawer = ''; state.editorKind = ''; state.editorMode = ''; state.editor = {}; state.selected = null; state.confirmDelete = false; state.notice = ''; render();
   }
   function validateEditor() {
     const editor = state.editor;
+    if (state.editorKind === 'policy') return policyDraftValidation(editor);
     if (!String(editor.id || '').trim() || !String(editor.name || '').trim()) return '资源 ID 和显示名称不能为空。';
     if (state.editorKind === 'table') {
       const tableId = Number(editor.table_id);
@@ -498,11 +646,13 @@ export function mount(context = {}) {
   }
   function editorPayload() {
     const editor = state.editor;
+    if (state.editorKind === 'policy') return policyPayload(editor);
     if (state.editorKind === 'table') return { id: String(editor.id).trim(), name: String(editor.name).trim(), table_id: Number(editor.table_id), role: String(editor.role || '').trim(), gateway: String(editor.gateway || '').trim(), metric: Number(editor.metric) || 0, enabled: Boolean(editor.enabled) };
     if (state.editorKind === 'object') return { id: String(editor.id).trim(), name: String(editor.name).trim(), type: editor.type || 'ip_group', family: editor.family || 'mixed', value: String(editor.value || '').trim(), members: String(editor.membersText || '').split(/\r?\n/).map((value) => value.trim()).filter(Boolean).map((value) => ({ value, label: value })), comment: String(editor.comment || '').trim(), enabled: Boolean(editor.enabled) };
     return { id: String(editor.id).trim(), name: String(editor.name).trim(), service_type: editor.service_type || 'snmp', server_ip: String(editor.server_ip || '').trim(), scope: String(editor.scope || '').trim(), listen_port: String(editor.listen_port || '').trim(), version: String(editor.version || '').trim(), access_rate: String(editor.access_rate || '').trim(), remark: String(editor.remark || '').trim(), enabled: Boolean(editor.enabled) };
   }
   async function saveEditor() {
+    if (state.editorKind === 'policy') return savePolicyEditor();
     if (!editorWritable() || state.saving) return;
     const validation = validateEditor();
     if (validation) { state.notice = validation; render(); return; }
@@ -516,6 +666,65 @@ export function mount(context = {}) {
       state.saving = false; state.notice = errorText(error, '保存失败：'); render();
     }
   }
+  async function savePolicyEditor() {
+    if (!policyEditorWritable() || state.saving) return;
+    const validation = policyDraftValidation(state.editor);
+    if (validation) { state.notice = validation; render(); return; }
+    const editing = state.editorMode === 'edit';
+    const id = state.selected?.id || state.editor.id;
+    const url = editing ? `${POLICY_ENDPOINT}/${encodeURIComponent(id)}?apply=true` : `${POLICY_ENDPOINT}?apply=true`;
+    const method = editing ? 'PATCH' : 'POST';
+    const expected = { ...state.editor, id: id || state.editor.id };
+    state.saving = true; state.notice = ''; render();
+    try {
+      const result = await requestJson(url, { method, body: JSON.stringify(policyPayload(state.editor)) });
+      if (result?.runtime_readback === false || result?.runtime_mismatch === true || normalizeKey(result?.apply_state) === 'failed' || normalizeKey(result?.apply_state) === 'mismatch') {
+        throw Object.assign(new Error('运行态回读与请求不一致'), { payload: { ...result, stage: 'runtime_readback', code: firstText(result.code, 'runtime_readback_mismatch'), rollback: firstText(result.rollback, result.rollback_status, '后端未提供') } });
+      }
+      const responseId = firstText(result.id, result.policy_id, id);
+      await load();
+      const actual = state.policies.find((item) => item.id === responseId || item.id === id || (item.type === expected.policy_type && item.name === expected.name));
+      if (!actual || !policyReadbackMatches({ ...expected, id: actual.id }, actual)) {
+        throw Object.assign(new Error('配置回读与草稿不一致'), { payload: { stage: 'config_readback', code: 'readback_mismatch', draft_field: `${expected.name} / ${expected.destination || expected.route_table}`, rollback: firstText(result.rollback, result.rollback_status, '后端未提供') } });
+      }
+      state.saving = false; state.drawer = ''; state.editorKind = ''; state.editorMode = ''; state.selected = null; state.notice = `策略已保存并完成配置/运行回读（${actual.id}）。`; render();
+    } catch (error) {
+      state.saving = false; state.notice = errorText(error, '策略保存失败：'); render();
+    }
+  }
+  async function deletePolicyEditor() {
+    const item = state.selected;
+    if (!item || !policyCapability(item.type, 'delete') || state.saving) return;
+    if (!state.confirmDelete) { state.confirmDelete = true; render(); return; }
+    state.saving = true; state.notice = ''; render();
+    try {
+      const result = await requestJson(`${POLICY_ENDPOINT}/${encodeURIComponent(item.id)}?apply=true`, { method: 'DELETE', body: JSON.stringify({ policy_type: item.type, apply: true, reload_route: item.type === 'pbr' }) });
+      await load();
+      if (state.policies.some((row) => row.id === item.id)) throw Object.assign(new Error('删除后仍能回读到原策略'), { payload: { stage: 'config_readback', code: 'delete_readback_mismatch', rollback: firstText(result.rollback, result.rollback_status, '后端未提供') } });
+      state.saving = false; state.confirmDelete = false; state.drawer = ''; state.editorKind = ''; state.editorMode = ''; state.selected = null; state.notice = `策略 ${item.id} 已删除并完成回读。`; render();
+    } catch (error) {
+      state.saving = false; state.notice = errorText(error, '策略删除失败：'); render();
+    }
+  }
+  async function togglePolicyEditor() {
+    const item = state.selected;
+    if (!item || !policyCapability(item.type, 'enable_disable') || state.saving) return;
+    const enabled = !item.enabled;
+    const operation = enabled ? 'enable' : 'disable';
+    state.saving = true; state.notice = ''; render();
+    try {
+      const result = await requestJson(`${POLICY_ENDPOINT}/${encodeURIComponent(item.id)}/${operation}?apply=true`, { method: 'POST', body: JSON.stringify({ policy_type: item.type, apply: true, reload_route: item.type === 'pbr' }) });
+      if (result?.runtime_readback === false || result?.runtime_mismatch === true || normalizeKey(result?.apply_state) === 'failed' || normalizeKey(result?.apply_state) === 'mismatch') {
+        throw Object.assign(new Error('运行态回读与启停请求不一致'), { payload: { ...result, stage: 'runtime_readback', code: firstText(result.code, 'runtime_readback_mismatch'), rollback: firstText(result.rollback, result.rollback_status, '后端未提供') } });
+      }
+      await load();
+      const actual = state.policies.find((row) => row.id === item.id);
+      if (!actual || actual.enabled !== enabled) throw Object.assign(new Error('启停后回读状态不一致'), { payload: { stage: 'runtime_readback', code: 'runtime_readback_mismatch', rollback: firstText(result.rollback, result.rollback_status, '后端未提供') } });
+      state.saving = false; state.drawer = ''; state.editorKind = ''; state.editorMode = ''; state.selected = null; state.notice = `策略已${enabled ? '启用' : '停用'}并完成回读。`; render();
+    } catch (error) {
+      state.saving = false; state.notice = errorText(error, '策略启停失败：'); render();
+    }
+  }
   async function deleteEditor() {
     if (!state.selected || !editorWritable() || state.saving || !state.confirmDelete) return;
     const endpoint = state.editorKind === 'table' ? RESOURCE_ENDPOINTS.tables : state.editorKind === 'object' ? RESOURCE_ENDPOINTS.objects : RESOURCE_ENDPOINTS.cross;
@@ -526,6 +735,25 @@ export function mount(context = {}) {
       await load();
     } catch (error) {
       state.saving = false; state.confirmDelete = false; state.notice = errorText(error, '删除失败：'); render();
+    }
+  }
+  async function externalAction(action, id) {
+    const item = state.externalPolicies.find((entry) => entry.id === id);
+    if (!item) return;
+    const urls = item.action_urls || item.actions_urls || {};
+    const url = firstText(urls[action], typeof item.actions?.find === 'function' ? item.actions.find((entry) => normalizeKey(entry?.action || entry?.name) === action)?.url : '');
+    if (!url) {
+      state.notice = `外部策略动作“${action}”暂未发布可执行 endpoint：${firstText(item.reason, item.migration?.reason, '请使用诊断或迁移入口')}`;
+      render();
+      return;
+    }
+    state.saving = true; state.notice = ''; render();
+    try {
+      await requestJson(url, { method: firstText(item.action_methods?.[action], 'POST'), body: JSON.stringify({ id, source: item.source, action, apply: true }) });
+      await load();
+      state.saving = false; state.notice = `外部策略动作“${action}”已提交，并完成列表回读。`; render();
+    } catch (error) {
+      state.saving = false; state.notice = errorText(error, `外部策略${action}失败：`); render();
     }
   }
   async function resolveRuntime() {
@@ -545,11 +773,32 @@ export function mount(context = {}) {
     scope.querySelectorAll('[data-routing-open]').forEach((button) => button.addEventListener('click', () => openItem(button.dataset.routingOpen, button.dataset.routingId)));
     scope.querySelectorAll('[data-routing-close]').forEach((button) => button.addEventListener('click', closeDrawer));
     scope.querySelectorAll('[data-routing-field]').forEach((input) => input.addEventListener('input', () => { state.editor[input.dataset.routingField] = input.type === 'number' ? Number(input.value) : input.value; state.notice = ''; }));
+    scope.querySelectorAll('[data-routing-field="gateway_mode"], [data-routing-field="source_kind"]').forEach((input) => input.addEventListener('change', () => { state.editor[input.dataset.routingField] = input.value; state.notice = ''; render(); }));
     scope.querySelectorAll('[data-routing-field-check]').forEach((input) => input.addEventListener('change', () => { state.editor[input.dataset.routingFieldCheck] = input.checked; }));
+    scope.querySelectorAll('[data-routing-policy-type]').forEach((input) => input.addEventListener('change', () => {
+      if (state.editorMode !== 'create' || !policyDraftTypeCanCreate(input.value)) return;
+      const current = state.editor;
+      state.editor = { ...routePolicyDraft(input.value), name: current.name || '', enabled: current.enabled !== false };
+      state.notice = '';
+      render();
+    }));
     scope.querySelectorAll('[data-routing-save]').forEach((button) => button.addEventListener('click', saveEditor));
     scope.querySelectorAll('[data-routing-delete]').forEach((button) => button.addEventListener('click', () => { state.confirmDelete = true; render(); }));
+    scope.querySelectorAll('[data-routing-policy-toggle]').forEach((button) => button.addEventListener('click', () => {
+      const item = state.policies.find((row) => row.id === button.dataset.routingPolicyToggle);
+      if (!item) return;
+      state.selected = item; state.editorKind = 'policy'; state.editorMode = 'view'; state.editor = routePolicyDraft(item.type, item); togglePolicyEditor();
+    }));
+    scope.querySelectorAll('[data-routing-policy-delete]').forEach((button) => button.addEventListener('click', () => {
+      const item = state.policies.find((row) => row.id === button.dataset.routingPolicyDelete);
+      if (!item || !policyCapability(item.type, 'delete')) return;
+      state.selected = item; state.editorKind = 'policy'; state.editorMode = 'view'; state.editor = routePolicyDraft(item.type, item); state.confirmDelete = true; render();
+    }));
+    scope.querySelectorAll('[data-routing-policy-toggle-drawer]').forEach((button) => button.addEventListener('click', togglePolicyEditor));
+    scope.querySelectorAll('[data-routing-policy-delete-drawer]').forEach((button) => button.addEventListener('click', deletePolicyEditor));
     scope.querySelectorAll('[data-dwrt-confirm-cancel]').forEach((button) => button.addEventListener('click', () => { state.confirmDelete = false; render(); }));
-    scope.querySelectorAll('[data-dwrt-confirm-accept]').forEach((button) => button.addEventListener('click', deleteEditor));
+    scope.querySelectorAll('[data-dwrt-confirm-accept]').forEach((button) => button.addEventListener('click', () => state.editorKind === 'policy' ? deletePolicyEditor() : deleteEditor()));
+    scope.querySelectorAll('[data-routing-external-action]').forEach((button) => button.addEventListener('click', () => externalAction(button.dataset.routingExternalAction, button.dataset.routingId)));
     scope.querySelectorAll('[data-routing-resolve-mode]').forEach((select) => select.addEventListener('change', () => { state.resolveMode = select.value; state.resolveValue = ''; state.resolution = null; render(); }));
     scope.querySelectorAll('[data-routing-resolve-value]').forEach((select) => select.addEventListener('change', () => { state.resolveValue = select.value; state.resolution = null; render(); }));
     scope.querySelectorAll('[data-routing-resolve]').forEach((button) => button.addEventListener('click', resolveRuntime));
